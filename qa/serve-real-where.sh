@@ -79,7 +79,9 @@ node_rows() {
 }
 
 fail=0
+ran=0
 compare() { # <label> <node-query> <isql-select-body>
+    ran=$((ran + 1))
     fc=$(node_rows "$2")
     is=$(run_isql <<EOF | strip | grep -v '^$' | sort
 SET HEADING OFF;
@@ -93,6 +95,20 @@ EOF
         printf '%s\n' "$is" > /tmp/fc-where-is.txt; printf '%s\n' "$fc" > /tmp/fc-where-fc.txt
         diff /tmp/fc-where-is.txt /tmp/fc-where-fc.txt | head -8 | sed 's/^/     /'
         fail=1
+    fi
+}
+
+# A TEXT cell whose literal matches NOTHING compares empty with empty and
+# passes while measuring NOTHING - two such cells sat here under the
+# mkjoindb fixture (EMP.NAME is 'emp42', never 'emp 42'; every DEPT.NAME
+# sorts below 'dept 5').  This variant fails a cell that selects no row, so
+# a literal that stops matching says so instead of going quiet.
+compare_rows() { # <label> <node-query> <isql-select-body>
+    compare "$1" "$2" "$3"
+    local n
+    n=$(node_rows "$2" | grep -c .)
+    if [ "${n:-0}" -eq 0 ]; then
+        echo "FAIL $1 - THE CELL MEASURED NOTHING: both sides are empty"; fail=1
     fi
 }
 
@@ -112,9 +128,9 @@ if has_table EMP; then
     compare "EMP AND-OR precedence" \
       "SELECT ID FROM EMP WHERE DEPT_ID = 2 AND ID < 25 OR ID = 500" \
       "SELECT ID FROM EMP WHERE DEPT_ID = 2 AND ID < 25 OR ID = 500"
-    compare "EMP text =" \
-      "SELECT ID FROM EMP WHERE NAME = 'emp 42'" \
-      "SELECT ID FROM EMP WHERE NAME = 'emp 42'"
+    compare_rows "EMP text =" \
+      "SELECT ID FROM EMP WHERE NAME = 'emp42'" \
+      "SELECT ID FROM EMP WHERE NAME = 'emp42'"
     compare "EMP lowercase kw" \
       "select ID from EMP where DEPT_ID = 3 and ID <= 44" \
       "SELECT ID FROM EMP WHERE DEPT_ID = 3 AND ID <= 44"
@@ -124,9 +140,9 @@ if has_table EMP; then
 fi
 
 if has_table DEPT; then
-    compare "DEPT text >=" \
-      "SELECT ID FROM DEPT WHERE NAME >= 'dept 5'" \
-      "SELECT ID FROM DEPT WHERE NAME >= 'dept 5'"
+    compare_rows "DEPT text >=" \
+      "SELECT ID FROM DEPT WHERE NAME >= 'Finance'" \
+      "SELECT ID FROM DEPT WHERE NAME >= 'Finance'"
 fi
 
 # IS [NOT] NULL against any user table that has a nullable column with NULLs
@@ -148,4 +164,12 @@ if [ -n "$nulltab" ]; then
       "SELECT A FROM T WHERE A > 1"
 fi
 
+# THE FLOOR IS COUNTED FROM A MEASURED RUN, never typed: 9 cells under
+# qa/mkjoindb.sh's fixture (the T section needs a table that fixture has
+# not got).  It catches what a pass/fail tally cannot - a cell that stops
+# running reads exactly like one that passes.
+if [ "$ran" -lt 9 ]; then
+    echo "FAIL only $ran checks ran; 9 were measured under qa/mkjoindb.sh's fixture - cells went missing"
+    fail=1
+fi
 exit $fail

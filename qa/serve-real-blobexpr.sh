@@ -186,8 +186,33 @@ refuses "a blob in arithmetic refuses" \
   "SELECT B + 1 FROM T WHERE ID=1;"
 refuses "a blob-valued SCALAR SUBQUERY refuses" \
   "SELECT ID FROM T WHERE B = (SELECT B FROM T WHERE ID=1);"
-refuses "a blob-valued expression inside a DERIVED TABLE refuses" \
-  "SELECT X FROM (SELECT B || '!' AS X FROM T WHERE ID=1);"
+# --- a blob-valued expression inside a DERIVED TABLE now ANSWERS -------
+# PROMOTED 2026-09-20 from a recorded `refuses` boundary that had fired.
+# Both the working-tree binary and the previous committed binary
+# (/tmp/fcwire-prev-0e5a8f4) answer it, so the gap was closed by an
+# EARLIER chunk and simply never unrecorded. Re-measured against the live
+# engine today: `SELECT X FROM (SELECT B || '!' AS X FROM T WHERE ID=1)`
+# answers the blob CONTENT `blob one!` under
+#   01: sqltype: 520 BLOB Nullable scale: 0 subtype: 1 len: 8 charset: 4 UTF8
+# and a derived blob column survives being selected, measured and ordered
+# (`UPPER(B)` -> `BLOB ONE`/8, `SECOND VALUE`/12). The blob id is each
+# server's own and normalises out, so the CONTENT is the answer. This one
+# cell asserts the VALUE *and* the whole DESCRIBE, because a blob-valued
+# derived column is exactly where a narrowed describe would hide.
+ran=$((ran + 1))
+dq="SELECT X FROM (SELECT B || '!' AS X FROM T WHERE ID=1); SELECT X, CHAR_LENGTH(X) FROM (SELECT UPPER(B) AS X FROM T) WHERE X IS NOT NULL ORDER BY 2;"
+de=$(printf '%s\n' "$dq" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)
+dc=$(printf '%s\n' "$dq" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
+ded=$(printf 'SET SQLDA_DISPLAY ON;\n%s\n' "$dq" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | grep -a sqltype | norm)
+dcd=$(printf 'SET SQLDA_DISPLAY ON;\n%s\n' "$dq" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | grep -a sqltype | norm)
+if [ "$dc" = "$de" ] && [ "$dcd" = "$ded" ] && [ -n "$de" ] && [ -n "$ded" ]; then
+    echo "OK   a blob-valued expression inside a DERIVED TABLE answers the content ('blob one!', BLOB sub_type 1 UTF8) exactly as the engine"
+else
+    echo "DIFF a blob-valued expression inside a DERIVED TABLE"
+    [ "$dcd" = "$ded" ] || { echo "     describe engine: $ded"; echo "     describe fcwire: $dcd"; }
+    [ "$dc" = "$de" ] || { echo "     value engine: $de"; echo "     value fcwire: $dc"; }
+    fail=1
+fi
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 # --- a blob LENGTH is a BIGINT, however the blob is spelled -------------
 # CHAR_LENGTH/OCTET_LENGTH over a blob describe INT64 len 8, not the
@@ -312,5 +337,13 @@ bcs "control: the same blob cast to OCTETS" \
 
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi
+# THE FLOOR IS COUNTED FROM A MEASURED RUN, never typed: 53 cells on
+# 2026-09-20.  A pass/fail tally cannot see a cell that STOPS RUNNING -
+# an early exit, a helper renamed, a fixture that failed to load - and a
+# cell that measures nothing reads exactly like one that passes.
+if [ "$ran" -lt 53 ]; then
+    echo "FAIL only $ran checks ran; 53 were measured - cells went missing"
+    fail=1
+fi
 echo "ran $ran checks"
 exit $fail

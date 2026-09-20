@@ -23,11 +23,15 @@
 #  2. THE NONE PAIRINGS ARE ASYMMETRIC. `<none> LIKE <none>` matches;
 #     `<none value> LIKE <real pattern>` MISSES the non-ASCII row and does
 #     NOT raise; `<real value> LIKE <none pattern>` RAISES 22000 Malformed
-#     string. Three different answers, none of them guessable.
+#     string. Three different answers, none of them guessable. This server
+#     now reproduces ALL THREE (5e3dae2), so all three cells below are
+#     `agree`/`both_raise` and hold the asymmetry rather than record it.
 #
-# THIS SLICE IS `LIKE` ONLY. STARTING WITH, CONTAINING and SIMILAR TO with
-# an expression pattern still refuse; they are recorded as gaps below so the
-# day someone implements them, those cells go red and ask to be promoted.
+# THIS SLICE WAS `LIKE` ONLY. STARTING WITH, CONTAINING (a84b09f) and
+# SIMILAR TO (d7b5a77) have since been implemented too, and the cells that
+# recorded them as gaps went red and were promoted. Nothing in this gate is
+# a `LIKE`-family gap any more; the two `gap` cells that remain are the
+# unrelated `IS UNKNOWN` refusal and the COLLATE-canonical left side.
 #
 # Usage: qa/serve-real-exprpattern.sh [port]   (default 4361)
 set -u
@@ -118,25 +122,24 @@ gap() { # <label> <sql> [client-charset]
     fi
 }
 
-# A RECORDED GAP WHERE THE ENGINE RAISES. `gap` cannot express this: it
-# scores an engine failure as VACUOUS, and `agree` scores two different
-# failures as equal because sig() collapses both to the word REFUSE. So
-# this asserts the two failures are DIFFERENT and each is the right one -
-# the engine's 22000 *Malformed string* against this server's 42000
-# decline. Goes red if the engine stops raising, if this server starts
-# ANSWERING, or if it starts raising 22000 itself (which would be the
-# promotion signal: implement the raise, then make this a both-raise cell).
-gap_raise() { # <label> <sql> [client-charset]
+# BOTH SIDES RAISE THE SAME ERROR. `agree` cannot express this: sig()
+# collapses every failure to the word REFUSE, so a 22000 *Malformed string*
+# and a 42000 *feature not supported* would score EQUAL - which is exactly
+# how this cell read while the server was still declining. So this asserts
+# the sqlstate AND the message text on both sides, separately. It goes red
+# if the engine stops raising 22000, if this server stops raising 22000
+# (a decline is NOT a pass here any more), or if either one ANSWERS.
+both_raise() { # <label> <sql> [client-charset]
     ran=$((ran + 1))
     local ch="" e f
     [ -n "${3:-}" ] && ch="-ch $3"
     e=$(printf 'set list on;\n%s\n' "$2" | "$ISQL" -q $ch -user "$U" -pas "$P" "127.0.0.1/$REAL:$ENG" 2>&1 | tr -d '\r' | grep -a . | paste -sd'|' -)
     f=$(printf 'set list on;\n%s\n' "$2" | "$ISQL" -q $ch -user "$U" -pas "$P" "127.0.0.1/$PORT:$FC" 2>&1 | tr -d '\r' | grep -a . | paste -sd'|' -)
-    case "$e" in *22000*) ;; *) echo "FAIL $1: the ENGINE no longer raises 22000 [$e]"; fail=1; return;; esac
+    case "$e" in *22000*Malformed*) ;; *) echo "FAIL $1: the ENGINE no longer raises 22000 Malformed string [$e]"; fail=1; return;; esac
     case "$f" in
-        *22000*) echo "FAIL $1 now RAISES 22000 too - promote this cell to a both-raise"; fail=1;;
-        *4200*)  echo "OK   engine raises 22000, this server declines: $1";;
-        *)       echo "FAIL $1: this server neither raises nor declines [$f]"; fail=1;;
+        *22000*Malformed*) echo "OK   both raise 22000 Malformed string: $1";;
+        *4200*)  echo "FAIL $1: this server DECLINES where it must raise 22000 [$f]"; fail=1;;
+        *)       echo "FAIL $1: this server does not raise 22000 Malformed string [$f]"; fail=1;;
     esac
 }
 
@@ -169,15 +172,27 @@ agree "w LIKE pw @UTF8"               "select id from t where w like pw order by
 # one byte-space rule to apply, and answering by resolving both sides and
 # comparing gave three WRONG ANSWERS on the first cut - `n LIKE pu` listed
 # the row the engine misses, `u LIKE pn` answered rows where the engine
-# raises. So the two MIXED pairings now refuse, and only the matched pair
-# is answered. Refusing is a gap; answering was wrong.
-echo "-- 3. the ASYMMETRIC NONE pairings - matched pair answered, MIXES refused --"
-agree "n LIKE pn (carrier BOTH sides: answered)" "select id from t where n like pn order by id;"
-gap "n LIKE pu (carrier value, real pattern - engine MISSES the non-ASCII row)" \
+# raises. So the two MIXED pairings were made to REFUSE, and recorded here
+# as gaps: refusing is a gap; answering wrongly was worse.
+#
+# PROMOTED 2026-09-20. The mix is now answered, and the three cells that
+# recorded it fired. The gap was closed by 5e3dae2 "The carrier/real
+# charset mix is answered, in all four families": the PREVIOUS COMMITTED
+# binary (/tmp/fcwire-prev-0e5a8f4) closes all three exactly as the working
+# tree does, so this is pre-existing and nothing in this session moved it.
+# Re-measured against the live engine before promoting, and the VALUE and
+# the DESCRIBE agree on every one:
+#   n LIKE pu counted -> N1  (the non-ASCII row is MISSED, not matched: a
+#                             plain `count(*)` over all four rows is 1)
+#   n LIKE pu listed  -> ID2 (row 1 absent, which is the whole point)
+#   u LIKE pn         -> SQLSTATE 22000 Malformed string, on BOTH sides
+echo "-- 3. the ASYMMETRIC NONE pairings - all three reproduced --"
+agree "n LIKE pn (carrier BOTH sides: matches)" "select id from t where n like pn order by id;"
+agree "n LIKE pu counted (carrier value, real pattern: MISSES the non-ASCII row, engine N1)" \
     "select count(*) n from t where n like pu;"
-gap "n LIKE pu listed (same mix, listing form)" \
+agree "n LIKE pu listed (same mix, listing form: engine ID2, row 1 absent)" \
     "select id from t where n like pu order by id;"
-gap_raise "u LIKE pn (real value, carrier pattern - engine raises 22000)" \
+both_raise "u LIKE pn (real value, carrier pattern: engine raises 22000 Malformed string)" \
     "select id from t where u like pn order by id;"
 
 echo "-- 4. NULL on either side is UNKNOWN, never a raise --"
@@ -208,10 +223,17 @@ gap "a COLLATE-canonical left side" \
 # PROMOTED, and this is what those cells were for. The LIKE slice recorded
 # these three as gaps so that the day the server answered them they would go
 # RED and ask to be promoted rather than quietly passing. STARTING WITH and
-# CONTAINING now answer (their own gate is serve-real-exprpattern2.sh);
-# SIMILAR TO stays a gap - its pattern is a compiled SimRe, so a per-row
-# pattern means sim_compile per row, a cost to measure before shipping.
-echo "-- 7. the other families: two promoted, SIMILAR still refuses --"
+# CONTAINING answer (their own gate is serve-real-exprpattern2.sh), and
+# SIMILAR TO - the last holdout, whose pattern is a compiled SimRe and so
+# needed a sim_compile per row - now answers too.
+#
+# PROMOTED 2026-09-20. Closed by d7b5a77 "SIMILAR TO takes an expression
+# pattern, in all three worlds"; the PREVIOUS COMMITTED binary closes it as
+# well, so this is pre-existing. Re-measured live: the engine lists ID1 and
+# ID2 - SIMILAR TO spells its any-run wildcard `%` just as LIKE does, so the
+# same two pattern columns match the same two rows - and the describe agrees
+# (LONG Nullable, name/alias ID, table T schema PUBLIC) on both sides.
+echo "-- 7. the other families: all three now answer --"
 # COUNTED, not listed: `u starting with pu` legitimately matches NOTHING
 # (pu is a LIKE pattern, and STARTING WITH reads `%` as a literal), and an
 # empty listing is indistinguishable from a refusal in sig() - the first run
@@ -219,7 +241,8 @@ echo "-- 7. the other families: two promoted, SIMILAR still refuses --"
 # engine's answer `N0`: still an answer, and still not a refusal.
 agree "STARTING WITH an expression"   "select count(*) n from t where u starting with pu;"
 agree "CONTAINING an expression"      "select count(*) n from t where u containing pu;"
-gap "SIMILAR TO an expression"        "select id from t where u similar to pu order by id;"
+agree "SIMILAR TO an expression (engine ID1ID2)" \
+      "select id from t where u similar to pu order by id;"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$ENG" "$FC"

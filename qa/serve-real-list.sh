@@ -31,6 +31,22 @@
 # through a BLOB column's id are unpinned; a blob id opened after its
 # transaction ends degrades to empty rather than the engine's invalid-id.
 #
+# 2026-09-20.  Two repairs, both recorded where they happened:
+#   - THE FIXTURE NEVER LOADED.  The setup block was a single-quoted
+#     bash string carrying doubled SQL quotes, so every INSERT arrived
+#     unquoted and was rejected; both databases stayed EMPTY and all 37
+#     cells compared NULL with NULL and printed OK.  It is a heredoc now
+#     and a COUNT(*) sentinel guards it before the first cell runs.
+#   - With rows finally in the tables, one cell turned out to measure an
+#     unrelated defect: `<UTF8 column> || '<non-ASCII literal>'` under a
+#     NONE attachment re-encodes the literal's bytes here where the
+#     engine keeps them (qa/serve-real-litcs.sh's propagation law, via a
+#     literal instead of a NONE column).  Pinned as a cqdiff, both sides
+#     measured, so it fires when the concat is fixed.
+#   - The `LIST inside a derived table` boundary is GONE: this server
+#     answers it, correctly, and so does the previous committed binary -
+#     the cell is a full cq now.
+#
 #   qa/serve-real-list.sh [port]
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
@@ -64,55 +80,69 @@ check() { ran=$((ran + 1)); if [ "$2" = "$3" ]; then echo "OK   $1"; else
 # blob ids differ between servers by nature: normalise them out
 norm() { grep -v '^$' | sed 's/[0-9a-f][0-9a-f]*:[0-9a-f][0-9a-f]*$/BLOBID/' | sed 's/  */ /g; s/ *$//' | tr '\n' '|'; }
 
-SET='CREATE TABLE T (ID INTEGER, G INTEGER, S VARCHAR(20), N NUMERIC(9,2), C CHAR(5), DP DOUBLE PRECISION, B BLOB SUB_TYPE TEXT, SEP VARCHAR(5), SU VARCHAR(10) CHARACTER SET UTF8, CU CHAR(4) CHARACTER SET UTF8);
-INSERT INTO T VALUES (1, 1, ''aa'', 1.50, ''ab'', 2.5, ''blob1'', ''-'', ''x€y'', ''Ж'');
-INSERT INTO T VALUES (2, 1, ''bb'', 2.25, ''cd'', 1.25, ''blob2'', NULL, ''plain'', ''ab'');
-INSERT INTO T VALUES (3, 2, ''cc'', NULL, ''ab'', 300, NULL, ''+'', NULL, ''Жab'');
-INSERT INTO T VALUES (4, 2, NULL, 4.00, NULL, 0.001, ''b3'', ''*'', ''€€'', NULL);
-INSERT INTO T VALUES (5, 2, ''aa'', 5.75, ''xy'', NULL, ''x'', '';'', ''x€y'', ''cdef'');
-INSERT INTO T VALUES (6, 3, '''', 1.00, ''AB'', 7, '''', ''.'', '''', ''g'');
+SET=$(cat <<'SETSQL'
+CREATE TABLE T (ID INTEGER, G INTEGER, S VARCHAR(20), N NUMERIC(9,2), C CHAR(5), DP DOUBLE PRECISION, B BLOB SUB_TYPE TEXT, SEP VARCHAR(5), SU VARCHAR(10) CHARACTER SET UTF8, CU CHAR(4) CHARACTER SET UTF8);
+INSERT INTO T VALUES (1, 1, 'aa', 1.50, 'ab', 2.5, 'blob1', '-', 'x€y', 'Ж');
+INSERT INTO T VALUES (2, 1, 'bb', 2.25, 'cd', 1.25, 'blob2', NULL, 'plain', 'ab');
+INSERT INTO T VALUES (3, 2, 'cc', NULL, 'ab', 300, NULL, '+', NULL, 'Жab');
+INSERT INTO T VALUES (4, 2, NULL, 4.00, NULL, 0.001, 'b3', '*', '€€', NULL);
+INSERT INTO T VALUES (5, 2, 'aa', 5.75, 'xy', NULL, 'x', ';', 'x€y', 'cdef');
+INSERT INTO T VALUES (6, 3, '', 1.00, 'AB', 7, '', '.', '', 'g');
 CREATE TABLE T6 (G INTEGER, V VARCHAR(10), W VARCHAR(10));
-INSERT INTO T6 VALUES (1, ''b'', ''z'');
-INSERT INTO T6 VALUES (1, ''c'', ''y'');
-INSERT INTO T6 VALUES (1, ''a'', ''x'');
-INSERT INTO T6 VALUES (2, ''q'', ''x'');
-INSERT INTO T6 VALUES (2, ''p'', ''z'');
-INSERT INTO T6 VALUES (2, ''r'', ''y'');
+INSERT INTO T6 VALUES (1, 'b', 'z');
+INSERT INTO T6 VALUES (1, 'c', 'y');
+INSERT INTO T6 VALUES (1, 'a', 'x');
+INSERT INTO T6 VALUES (2, 'q', 'x');
+INSERT INTO T6 VALUES (2, 'p', 'z');
+INSERT INTO T6 VALUES (2, 'r', 'y');
 CREATE TABLE T9 (G INTEGER, V VARCHAR(10), W VARCHAR(10));
-INSERT INTO T9 VALUES (1, ''b'', NULL);
-INSERT INTO T9 VALUES (1, ''c'', ''y'');
-INSERT INTO T9 VALUES (1, ''a'', ''x'');
-INSERT INTO T9 VALUES (2, ''p'', ''z'');
-INSERT INTO T9 VALUES (2, ''q'', NULL);
+INSERT INTO T9 VALUES (1, 'b', NULL);
+INSERT INTO T9 VALUES (1, 'c', 'y');
+INSERT INTO T9 VALUES (1, 'a', 'x');
+INSERT INTO T9 VALUES (2, 'p', 'z');
+INSERT INTO T9 VALUES (2, 'q', NULL);
 CREATE TABLE TA (G INTEGER, V VARCHAR(10), K INTEGER);
-INSERT INTO TA VALUES (1, ''b'', 1);
-INSERT INTO TA VALUES (1, ''aa'', 2);
-INSERT INTO TA VALUES (1, ''c'', 3);
+INSERT INTO TA VALUES (1, 'b', 1);
+INSERT INTO TA VALUES (1, 'aa', 2);
+INSERT INTO TA VALUES (1, 'c', 3);
 CREATE TABLE TI (G INTEGER, V VARCHAR(10), K INTEGER);
-INSERT INTO TI VALUES (1, ''x'', 256);
-INSERT INTO TI VALUES (1, ''y'', 1);
-INSERT INTO TI VALUES (1, ''z'', -5);
+INSERT INTO TI VALUES (1, 'x', 256);
+INSERT INTO TI VALUES (1, 'y', 1);
+INSERT INTO TI VALUES (1, 'z', -5);
 CREATE TABLE TK (G INTEGER, V VARCHAR(10), K INTEGER);
-INSERT INTO TK VALUES (1, ''x'', 5);
-INSERT INTO TK VALUES (1, ''y'', NULL);
-INSERT INTO TK VALUES (1, ''z'', 1);
+INSERT INTO TK VALUES (1, 'x', 5);
+INSERT INTO TK VALUES (1, 'y', NULL);
+INSERT INTO TK VALUES (1, 'z', 1);
 CREATE TABLE TR (G INTEGER, V VARCHAR(10));
-INSERT INTO TR VALUES (1, ''ba'');
-INSERT INTO TR VALUES (1, ''ab'');
-INSERT INTO TR VALUES (1, ''ca'');
+INSERT INTO TR VALUES (1, 'ba');
+INSERT INTO TR VALUES (1, 'ab');
+INSERT INTO TR VALUES (1, 'ca');
 CREATE TABLE TW (G INTEGER, V VARCHAR(10), B8 BIGINT);
-INSERT INTO TW VALUES (1, ''x'', 4294967296);
-INSERT INTO TW VALUES (1, ''y'', 3);
-INSERT INTO TW VALUES (1, ''z'', -1);
+INSERT INTO TW VALUES (1, 'x', 4294967296);
+INSERT INTO TW VALUES (1, 'y', 3);
+INSERT INTO TW VALUES (1, 'z', -1);
 CREATE TABLE TD (G INTEGER, ID INTEGER, V VARCHAR(10));
-INSERT INTO TD VALUES (1, 1, ''c'');
-INSERT INTO TD VALUES (1, 2, ''a'');
-INSERT INTO TD VALUES (1, 3, ''b'');
-INSERT INTO TD VALUES (2, 4, ''q'');
+INSERT INTO TD VALUES (1, 1, 'c');
+INSERT INTO TD VALUES (1, 2, 'a');
+INSERT INTO TD VALUES (1, 3, 'b');
+INSERT INTO TD VALUES (2, 4, 'q');
 CREATE VIEW VTD (G, V) AS SELECT G, V FROM TD;
-COMMIT;'
+COMMIT;
+SETSQL
+)
 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" <<< "$SET" >/dev/null 2>&1
 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" <<< "$SET" >/dev/null 2>&1
+
+# SENTINEL - the fixture must REALLY be there.  Until 2026-09-20 the
+# block above was a single-quoted bash string, so `''aa''` reached isql
+# as the bare identifier `aa` and EVERY INSERT was rejected: both sides
+# held empty tables, every fold compared NULL with NULL, and all 37
+# cells printed OK while measuring nothing.  The heredoc fixes it; this
+# guard makes the silent version impossible to reintroduce.
+for _cs in "127.0.0.1/$PORT:$A" "127.0.0.1/$REAL:$B"; do
+    _n=$(echo "SET HEADING OFF; SELECT COUNT(*) FROM T;" | "$ISQL" -q -user "$U" -pas "$P" "$_cs" 2>&1 | tr -d ' \n')
+    [ "$_n" = "6" ] || { echo "FAIL fixture did not load on $_cs: COUNT(*) FROM T = [$_n], expected 6"; exit 1; }
+done
 
 # --- the C client: describe + info numbers + segment framing + content ---
 cq() { # $1 label, $2 sql
@@ -122,6 +152,22 @@ cq() { # $1 label, $2 sql
     c=$("$D/listblob" "127.0.0.1/$PORT:$A" "$2" 2>&1)
     if [ "$e" = "$c" ]; then echo "OK   $1"; else
         echo "DIFF $1"; echo "     got:  [$c]"; echo "     want: [$e]"; fail=1; fi
+}
+# ... and a cell that PINS a recorded divergence: $3 is the engine's
+# measured answer, $4 this server's.  It fails when the two agree (the
+# gap closed - promote it to cq), and when either side moves.
+cqdiff() { # $1 label, $2 sql, $3 engine's measured answer, $4 fc's
+    ran=$((ran + 1))
+    local e c
+    e=$("$D/listblob" "127.0.0.1/$REAL:$B" "$2" 2>&1)
+    c=$("$D/listblob" "127.0.0.1/$PORT:$A" "$2" 2>&1)
+    if [ "$e" = "$c" ]; then
+        echo "FAIL $1 - THIS SERVER NOW AGREES WITH THE ENGINE [$e]; promote this cell to cq"; fail=1
+    elif [ "$e" != "$3" ]; then
+        echo "FAIL $1 - the ENGINE moved: [$e] (recorded [$3])"; fail=1
+    elif [ "$c" != "$4" ]; then
+        echo "FAIL $1 - this server's answer moved: [$c] (recorded [$4])"; fail=1
+    else echo "OK   $1 (recorded divergence)"; fi
 }
 cq "plain fold: value and separator each a segment" "SELECT LIST(S) FROM T"
 cq "explicit separator" "SELECT LIST(S, ';') FROM T"
@@ -135,7 +181,26 @@ cq "CHAR pads to its CHARACTER count" "SELECT LIST(C) FROM T"
 cq "multibyte CHAR: 4 characters, 5 bytes" "SELECT LIST(CU) FROM T"
 cq "DISTINCT CHAR: the full BYTE image" "SELECT LIST(DISTINCT CU) FROM T"
 cq "a BLOB argument joins by content, one segment" "SELECT LIST(B) FROM T"
-cq "a text expression (multibyte)" "SELECT LIST(SU || '€') FROM T WHERE ID < 3"
+# A text expression over a MULTIBYTE column: measured 2026-09-20, the
+# moment the fixture above started loading rows at all.  The fold itself
+# is right on both sides (3 segments, value/separator/value) but the
+# BYTES differ, and not because of LIST: `<UTF8 column> || '€'` already
+# diverges on its own under a NONE attachment.  The engine keeps the
+# NONE literal's three bytes (E2 82 AC -> 8 octets, "x€y€"); this server
+# re-reads each of them as a Latin-1 codepoint and re-encodes
+# (C3 A2 C2 82 C2 AC -> 11 octets), which is exactly the PROPAGATION
+# half of the law qa/serve-real-litcs.sh owns ("a byte carrier is never
+# transliterated") reached through a *literal* rather than a NONE
+# column - a vector that gate does not carry yet.  Pinned here, both
+# sides, so it fires the day the concat is fixed.
+cqdiff "a text expression (multibyte): engine keeps the NONE literal's bytes, fc re-encodes them" \
+    "SELECT LIST(SU || '€') FROM T WHERE ID < 3" \
+    "cols 1: type 521 sub 1 scale 4 len 8
+info: 4=3 5=8 6=17 7=0
+segs: [8:x€y€] [1:,] [8:plain€] end=0" \
+    "cols 1: type 521 sub 1 scale 4 len 8
+info: 4=3 5=11 6=23 7=0
+segs: [11:x€yâ¬] [1:,] [11:plainâ¬] end=0"
 cq "a single value: one segment, no separator" "SELECT LIST(S) FROM T WHERE ID = 1"
 cq "an empty set answers NULL" "SELECT LIST(S) FROM T WHERE ID > 100"
 cq "a per-row separator column (one NULL poisons)" "SELECT LIST(S, SEP) FROM T"
@@ -242,7 +307,16 @@ bref "LIST inside an expression refuses" "SELECT CHAR_LENGTH(LIST(S)) FROM T;"
 bref "HAVING over a LIST refuses" "SELECT G FROM T GROUP BY G HAVING LIST(S) = 'aa,bb';"
 bref "a scalar-subquery LIST refuses" "SELECT (SELECT LIST(X.S) FROM T X WHERE X.G = T.G) FROM T WHERE ID = 1;"
 bref "the window form refuses" "SELECT LIST(S) OVER () FROM T;"
-bref "a LIST inside a derived table refuses" "SELECT * FROM (SELECT LIST(S) AS L FROM T);"
+# PROMOTED 2026-09-20: this was an `eng_only` boundary (fc refused a
+# LIST inside a derived table).  It no longer is - and the gap is
+# PRE-EXISTING: /tmp/fcwire-prev-0e5a8f4, the previous committed binary,
+# closes it too, so some earlier chunk landed the derived-table flatten
+# and nobody unrecorded the boundary.  Re-measured against the live
+# engine today: both servers answer one row, 8 segments
+# (aa , bb , cc , aa ,), info 4=8 5=2 6=12 7=0, describe type 521 sub 1
+# len 8 - so it is a full `cq` now, value AND describe.
+cq "a LIST inside a derived table folds like the base query (8 segments, aa,bb,cc,aa,)" \
+    "SELECT * FROM (SELECT LIST(S) AS L FROM T)"
 bref "three arguments refuse" "SELECT LIST(S, ',', 'x') FROM T;"
 bref "LIST(*) refuses" "SELECT LIST(*) FROM T;"
 # the engine's DISTINCT keys a blob by its DESCRIPTOR (the id) - equal
@@ -264,5 +338,13 @@ gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file (a computed blob leaves no storage)"; else echo "DIFF gfix: $gf"; fail=1; fi
 
+# THE FLOOR IS COUNTED FROM A MEASURED RUN, never typed: 37 cells on
+# 2026-09-20.  A pass/fail tally cannot see a cell that STOPS RUNNING -
+# an early exit, a helper renamed, a fixture that failed to load - and a
+# cell that measures nothing reads exactly like one that passes.
+if [ "$ran" -lt 37 ]; then
+    echo "FAIL only $ran checks ran; 37 were measured - cells went missing"
+    fail=1
+fi
 echo "ran $ran checks"
 exit $fail

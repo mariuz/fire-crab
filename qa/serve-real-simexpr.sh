@@ -153,7 +153,7 @@ agree "row 5 EXCLUDED: must ANSWER"   "select count(*) as n from t where id <> 5
 # when it passes.
 agree "row 5 excluded, value world"   "select (u similar to v) as n from t where id <> 5 order by id;"
 
-echo "-- 6. the carrier pairings: matched answers, the MIX refuses --"
+echo "-- 6. the carrier pairings: carrier/carrier AND carrier/UTF8 both answer --"
 # BOTH SIDES ARE CARRIERS here (no default charset on this database), which
 # is the pairing that answers - the same rule the other three families
 # follow. This cell was first written as a `gap` claiming a "real pattern",
@@ -161,8 +161,16 @@ echo "-- 6. the carrier pairings: matched answers, the MIX refuses --"
 # column in it at all.
 agree "n SIMILAR TO v (BOTH carriers - answers)" \
       "select count(*) as n from t where id < 5 and n similar to v;"
-# ...and the genuine mix, against the explicitly-UTF8 pattern column
-gap "n SIMILAR TO vu (carrier value, UTF8 pattern)" \
+# ...and the genuine mix, against the explicitly-UTF8 pattern column.
+# PROMOTED 2026-09-20: this was a `gap` recording that the carrier/real MIX
+# refused here while the engine answered 2. It refuses no longer, and the
+# answer is the engine's: 2, with the describe agreeing too (the value world
+# `select (n similar to vu)` gives <true><true><false><null> on both). The
+# PREVIOUS binary /tmp/fcwire-prev-0e5a8f4 closes it as well, so the gap was
+# shut by an EARLIER chunk and merely never unrecorded - not by this session.
+# The MIX therefore no longer refuses at all, and the group's title above
+# ("the MIX refuses") is now a historical note, not a live law.
+agree "n SIMILAR TO vu (carrier value, UTF8 pattern - answers 2)" \
     "select count(*) as n from t where id < 5 and n similar to vu;"
 
 echo "-- 7. the LITERAL forms in all three worlds must not move --"

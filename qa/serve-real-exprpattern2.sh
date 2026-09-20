@@ -16,13 +16,20 @@
 #   <real> CONTAINING <carrier>    ANSWERS 2, no raise
 #   <real> STARTING WITH <carrier> RAISES 22000
 #
-# This server REFUSES every carrier/real mix in both families. That is a
-# deliberate gap, not an oversight: the literal arms reach their answers by
+# This server USED TO REFUSE every carrier/real mix in both families - a
+# deliberate gap, recorded because the literal arms reach their answers by
 # transcoding a LITERAL at prepare, which a per-row pattern cannot do, and
-# this server has no STARTING raise mechanism at all (Term::MalformedLike
-# is built only from carrier_expr_like and param_or_typed_term, both LIKE's).
-# Refusing turns no correct answer wrong; guessing a shared byte-space rule
-# is what produced three wrong answers in the LIKE slice.
+# because this server had no STARTING raise mechanism at all.
+#
+# PROMOTED 2026-09-20: all four section-5 cells and the SIMILAR TO cell in
+# section 9 were re-measured and now MATCH the engine exactly - the three
+# CONTAINING/STARTING mixes answer the same ROWS (1 and 2), and
+# `<real> STARTING WITH <carrier>` raises the same `22000 Malformed string`.
+# The gap was closed by some EARLIER chunk and nobody unrecorded it: the
+# PREVIOUS committed binary (/tmp/fcwire-prev-0e5a8f4) closes all five too,
+# so this is pre-existing, not the work in flight. Section 6 (a
+# COLLATE-canonical left side) is the part that still refuses, and stays a
+# recorded `gap`.
 #
 # Usage: qa/serve-real-exprpattern2.sh [port]   (default 4362)
 set -u
@@ -105,20 +112,20 @@ gap() { # <label> <sql> [client-charset]
     fi
 }
 
-# the engine RAISES 22000 and this server DECLINES 42000. `gap` scores an
-# engine failure as vacuous and `agree` scores two different failures as
-# equal, so this asserts they are DIFFERENT and each is the right one.
-gap_raise() { # <label> <sql>
+# BOTH sides raise 22000. This replaces the old `gap_raise` (engine raises
+# 22000, this server declines 42000), which fired on 2026-09-20 because the
+# server now raises. `agree` cannot serve here: sig() maps EVERY failure to
+# the single token REFUSE, so it would score a 42000 decline equal to the
+# engine's 22000. This asserts the engine still raises 22000 AND that the two
+# failure texts are character-for-character the same.
+agree_raise() { # <label> <sql>
     ran=$((ran + 1))
     local e f
     e=$(printf 'set list on;\n%s\n' "$2" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$ENG" 2>&1 | tr -d '\r' | grep -a . | paste -sd'|' -)
     f=$(printf 'set list on;\n%s\n' "$2" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$FC" 2>&1 | tr -d '\r' | grep -a . | paste -sd'|' -)
     case "$e" in *22000*) ;; *) echo "FAIL $1: the ENGINE no longer raises 22000 [$e]"; fail=1; return;; esac
-    case "$f" in
-        *22000*) echo "FAIL $1 now RAISES 22000 too - promote this cell to a both-raise"; fail=1;;
-        *4200*)  echo "OK   engine raises 22000, this server declines: $1";;
-        *)       echo "FAIL $1: this server neither raises nor declines [$f]"; fail=1;;
-    esac
+    if [ "$e" = "$f" ]; then echo "OK   both raise 22000: $1"
+    else echo "FAIL $1"; echo "     eng=[$e] fc=[$f]"; fail=1; fi
 }
 
 echo "-- 1. CONTAINING with a pattern that is a value --"
@@ -151,16 +158,29 @@ echo "-- 4. two byte carriers need no reconciliation: both sides NONE --"
 agree "cnt n CONTAINING subn"         "select count(*) n from t where n containing subn;"
 agree "cnt n STARTING WITH pren"      "select count(*) n from t where n starting with pren;"
 
-echo "-- 5. the carrier/real MIXES: refused here, deliberately --"
-gap "n CONTAINING sub (carrier value, real pattern)" \
+# PROMOTED 2026-09-20, all four: this server matches the engine on every
+# carrier/real mix now, and the PREVIOUS committed binary
+# (/tmp/fcwire-prev-0e5a8f4) matches too - the gap was closed by an earlier
+# chunk and only the recording was stale. Each answer was re-measured against
+# the live engine on 2026-09-20 before the cell was promoted.
+echo "-- 5. the carrier/real MIXES: answered here now, and they MATCH --"
+# engine: N2, and the same ROWS (1, 2) as the listed form.
+agree "cnt n CONTAINING sub (carrier value, real pattern)" \
     "select count(*) n from t where n containing sub;"
-gap "u CONTAINING subn (real value, carrier pattern - engine ANSWERS, no raise)" \
+# engine: N2, no raise - CONTAINING is the family that does not raise here.
+agree "cnt u CONTAINING subn (real value, carrier pattern - no raise)" \
     "select count(*) n from t where u containing subn;"
-gap "n STARTING WITH pre (carrier value, real pattern)" \
+# engine: N2, rows 1 and 2.
+agree "cnt n STARTING WITH pre (carrier value, real pattern)" \
     "select count(*) n from t where n starting with pre;"
-gap_raise "u STARTING WITH pren (real value, carrier pattern - engine RAISES)" \
+# engine: `Statement failed, SQLSTATE = 22000 | Malformed string`, and this
+# server now raises that same text - the third of the three different
+# carrier answers in the header, and the one this server had no mechanism for.
+agree_raise "u STARTING WITH pren (real value, carrier pattern - BOTH raise 22000 Malformed string)" \
     "select id from t where u starting with pren order by id;"
 
+# STILL A GAP on 2026-09-20 (re-measured): the engine answers N2 for both and
+# this server refuses. This is the last recorded boundary left in this gate.
 echo "-- 6. a COLLATE-canonical left side: still refused (the !is_cmp guard) --"
 gap "ci CONTAINING sub"               "select count(*) n from t where ci containing sub;"
 gap "ci STARTING WITH pre"            "select count(*) n from t where ci starting with pre;"
@@ -179,13 +199,19 @@ agree "cnt u STARTING WITH 'ca'"      "select count(*) n from t where u starting
 agree "cnt u CONTAINING 'AF' (case-insensitive)" "select count(*) n from t where u containing 'AF';"
 agree "cnt u LIKE 'caf%'"             "select count(*) n from t where u like 'caf%';"
 
-echo "-- 9. the LIKE capability must not move, and SIMILAR still refuses --"
+echo "-- 9. the LIKE capability must not move, and SIMILAR is answered too --"
 agree "cnt u LIKE sub (LIKE, expression pattern)" "select count(*) n from t where u like sub;"
 # COUNTED: `u similar to sub` legitimately matches NOTHING (sub is a
 # substring, not a SQL:2008 regex), and an empty listing is indistinguishable
 # from a refusal in sig() - the first run scored this cell VACUOUS for
 # exactly that reason. `count(*)` makes the engine's answer `N0`.
-gap "u SIMILAR TO sub (not this slice)" "select count(*) n from t where u similar to sub;"
+# PROMOTED 2026-09-20: this server answers N0 too, and returns the same
+# (empty) row set in the listed form. The previous committed binary
+# (/tmp/fcwire-prev-0e5a8f4) answers it as well, so this too is pre-existing.
+# The count form is kept ON PURPOSE: `N0` from both sides is a real cell,
+# where two empty listings would be the vacuous one this started as.
+agree "cnt u SIMILAR TO sub (matches nothing - sub is a substring, not a regex)" \
+    "select count(*) n from t where u similar to sub;"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$ENG" "$FC"

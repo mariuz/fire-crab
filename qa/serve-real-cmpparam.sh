@@ -3019,7 +3019,16 @@ eng_only "R12 K4 SELECT ID FROM T WHERE COALESCE(TRIM(?), 'a') = 'b' ORDER BY ID
 eng_only "R12 K4 SELECT IIF(ID = 2, TRIM(?), 'a') AS X FROM T ORDER BY ID" "SELECT IIF(ID = 2, TRIM(?), 'a') AS X FROM T ORDER BY ID" '["b"]'
 eng_only "R12 K4 SELECT ID FROM T WHERE NULLIF(TRIM(LEADING FROM ?), 'a') = 'b' ORDER B" "SELECT ID FROM T WHERE NULLIF(TRIM(LEADING FROM ?), 'a') = 'b' ORDER BY ID" '["b"]'
 eng_only "R12 K4 SELECT IIF(COALESCE(?, S) = 'cd', 1, 0) FROM T ORDER BY ID" "SELECT IIF(COALESCE(?, S) = 'cd', 1, 0) FROM T ORDER BY ID" '["cd"]'
-eng_only "R12 K4 SELECT CASE WHEN IIF(ID = 2, UPPER(?), 'q') = 'CD' THEN 1 ELSE 0 END F" "SELECT CASE WHEN IIF(ID = 2, UPPER(?), 'q') = 'CD' THEN 1 ELSE 0 END FROM T ORDER BY ID" '["cd"]'
+# RE-MEASURED 2026-09-20 and RE-RECORDED: this was an `eng_only` cell
+# saying the engine ANSWERS it.  It does not - the engine PREPARES it and
+# then RAISES at execute, gdscode 335544321 *Arithmetic exception, numeric
+# overflow, or string truncation / string right truncation* (the CASE
+# reconciles UPPER(?) with the one-character 'q' arm).  This server
+# refuses at PREPARE, gdscode 335544569, and so does the previous
+# committed binary /tmp/fcwire-prev-0e5a8f4 - byte for byte, so the
+# re-recording is not this session's change.  Reproduced standalone on an
+# idle box against the live engine before touching the cell.
+eng_raises_fc_refuses "R12 K4 SELECT CASE WHEN IIF(ID = 2, UPPER(?), 'q') = 'CD' THEN 1 ELSE 0 END F - the engine prepares and raises 22003, this server refuses at prepare" "SELECT CASE WHEN IIF(ID = 2, UPPER(?), 'q') = 'CD' THEN 1 ELSE 0 END FROM T ORDER BY ID" '["cd"]'
 dml_rb_eng_only "R12 K4 UPDATE T SET S = COALESCE(TRIM(?), 'q')" "UPDATE T SET S = COALESCE(TRIM(?), 'q') WHERE ID = 1" '["b"]' "SELECT ID, S FROM T ORDER BY ID"
 desc_differs "R12 (recorded describe gap, shared with prev) K4 control SELECT ID FROM T WHERE IIF(ID = 2, TRIM(' ' FROM ?), 'a') = 'b' ORDER  [b ..2]" "SELECT ID FROM T WHERE IIF(ID = 2, TRIM(' ' FROM ?), 'a') = 'b' ORDER BY ID" '["b "]'
 dml_rb "R12 K4 control UPDATE T SET S = TRIM(?) WHERE ID = 1 [ ab ..4]" "UPDATE T SET S = TRIM(?) WHERE ID = 1" '[" ab "]' "SELECT ID, S FROM T ORDER BY ID"
@@ -3112,7 +3121,12 @@ eng_only "HAVING N * 2 > ?"                                    "SELECT N FROM T 
 # date arithmetic under an aggregate: the engine types the ? DATE
 eng_only "HAVING MAX(DT) > ? + 1 - a DATE slot"                "SELECT N FROM T GROUP BY N HAVING MAX(DT) > ? + 1" '["2024-02-10"]'
 # other-side descriptors this server does not synthesise for arithmetic
-eng_only "ID * ? = '2' - a TEXT len 1 slot"                    "SELECT ID FROM T WHERE ID * ? = '2'" '["2"]'
+# RE-MEASURED 2026-09-20 and RE-RECORDED: recorded as `eng_only`, but the
+# ENGINE REFUSES this one too - *Dynamic SQL Error, Expression evaluation
+# not supported, Invalid data type for multiplication*, gdscode 335544569,
+# the SAME gdscode this server gives.  Identical on the previous committed
+# binary, and reproduced standalone against the live engine.
+both_refuse "ID * ? = '2' - a TEXT len 1 slot: the ENGINE refuses it too (invalid data type for multiplication)" "SELECT ID FROM T WHERE ID * ? = '2'" '["2"]'
 eng_only "ID * ? = CAST(2.5 AS DECFLOAT) - a DECFLOAT slot"    "SELECT ID FROM T WHERE ID * ? = CAST(2.5 AS DECFLOAT)" '["1.25"]'
 eng_only "ID * ? = 2 * 1.5 - an INT128 scale -1 slot"          "SELECT ID FROM T WHERE ID * ? = 2 * 1.5" '["1.5"]'
 eng_only "ID * ? > ALL (SELECT 1 FROM RDB\$DATABASE) - a quantified side" "SELECT ID FROM T WHERE ID * ? > ALL (SELECT 1 FROM RDB\$DATABASE)" '[1]'

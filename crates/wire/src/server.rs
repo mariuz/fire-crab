@@ -10002,7 +10002,12 @@ AlterDomainRename {
         /// value, a COALESCE / NULLIF / IIF / CASE value arm, a `||`
         /// operand), where the slot cast carries [CS_SLOT_CAST]; any other
         /// marker's cast is an operand's [CS_SLOT_OPERAND] (round 9).
-        param_slots: Vec<(Descriptor, bool, bool)>,
+        /// The fourth: `Some(sibling)` marks a NULLIF OPERAND, where the
+        /// engine compares the CLIENT'S value before the slot converts it
+        /// ([NULLIF_DOUBLE_REFUSAL]); the payload is the OTHER operand's
+        /// literal value, which decides whether the conversion would flip
+        /// the verdict ([nullif_double_flips_slot]).
+        param_slots: Vec<(Descriptor, bool, bool, Option<Option<f64>>)>,
     },
     /// `DELETE FROM <t> [WHERE ...]`: op_execute rewrites each matching
     /// primary record as a deleted stub over its version chain
@@ -11308,7 +11313,14 @@ enum Rhs {
     /// consumer refuses, which fails closed.
     Oct(Vec<u8>),
     Null,
-    Param(usize, ColKind),
+    /// A `?` placeholder: (slot, the kind that types the bind, WHETHER
+    /// THE `?` WAS WRITTEN FIRST).  The third field is
+    /// [RawTerm::mirrored] carried into the resolved term - [parse_leaf]
+    /// rewrites `? op X` into `X mirror(op) ?`, so one term is both
+    /// spellings, and the engine's NaN comparison is NOT symmetric under
+    /// that rewrite ([nan_cmp_verdict]).  Every reader but the NaN bind
+    /// ignores it.
+    Param(usize, ColKind, bool),
 }
 
 /// A resolved WHERE term: a column (by field id) tested against a
@@ -11560,7 +11572,11 @@ enum Term {
     /// value as a literal and the term becomes an ordinary [ExprCond].
     /// The trailing `u8` is the expression side's charset for the
     /// 22018 spelling when a numeric bind wraps it in [Expr::TextNum].
-    ExprParam(Box<Expr>, Cmp, usize, ColKind, u8),
+    /// (the tested side, the operator AS THE TREE HOLDS IT, the slot,
+    /// the binding kind, the error-spelling charset, WHETHER THE `?` WAS
+    /// WRITTEN FIRST).  The last field is [RawTerm::mirrored]: only the
+    /// NaN bind reads it ([nan_cmp_verdict]).
+    ExprParam(Box<Expr>, Cmp, usize, ColKind, u8, bool),
     /// `? IS [NOT] NULL` - ROW-INDEPENDENT, decided at bind, and
     /// TYPE-BLIND there (probed: a text value in the slot answers 0
     /// rows, no error). The slot describes as SQL_NULL (32766/len 0),
@@ -11626,11 +11642,41 @@ enum Term {
 /// [Predicate::key_conversion] converts a literal at OPEN. It is empty
 /// wherever a relation's catalog is not in hand (a CHECK constraint, a
 /// join's combined row), and an empty one converts nothing.
+///
+/// `keys_known` is the difference between "this relation has no keyable
+/// column" and "NOTHING HERE KNOWS what the relation's keys are", which
+/// an empty `keys` alone cannot tell apart.  [Predicate::with_keys] sets
+/// it: the three RELATION retrievals that read a catalog (the
+/// single-table planner, UPDATE and DELETE), and [resolve_having], which
+/// says with an EMPTY list that a grouped fold's row has no keyable
+/// column at all - an aggregate is never an index key.  Every ROUTER
+/// path leaves it FALSE: a JOIN's combined row, a derived table, a CTE,
+/// a UNION leg, a view, a CHECK constraint.
+///
+/// [wide_whole_side_double] is its only reader, and it reads it because
+/// the engine's answer SPLITS ON THE ACCESS PATH: an INT64-backed index
+/// bound ROUNDS a bound double and a scan does not, so `BI > (?)` [2.5]
+/// is 3;9 on a heap and 9 on its indexed twin.  Until 2026-09-20 this
+/// field was written, carried and never read, and the rung took an empty
+/// `keys` for "no index leads with this column" - SEVEN measured wrong
+/// answers through a derived table, a CTE, a view, a JOIN and a UNION
+/// leg over an indexed relation, every one of them also wrong on the
+/// previous binary.  An UNKNOWN path now refuses, which is the policy
+/// the BARE `?` spelling already had ([ColKind::WideExact] is marked
+/// from the column's WIDTH alone, with no index knowledge).  The price
+/// is four shapes over a HEAP relation that used to answer correctly and
+/// now refuse, gated as `11E COST` cells in `qa/serve-real-dblparam.sh`.
+///
+/// It is NOT what refuses a NaN: that refusal is BLANKET (measured on a
+/// heap, an indexed twin, a derived table, a CTE, a view and a JOIN -
+/// 11 of 11 cells, where the previous binary answered every row on all
+/// of them), so it needs no access-path knowledge.
 #[derive(Clone)]
 struct Predicate {
     groups: Vec<Vec<Term>>,
     tags: Vec<Vec<u32>>,
     keys: Vec<usize>,
+    keys_known: bool,
 }
 
 impl Predicate {
@@ -11645,7 +11691,7 @@ impl Predicate {
         } else {
             groups.iter().map(|g| vec![0; g.len()]).collect()
         };
-        Predicate { groups, tags, keys: Vec::new() }
+        Predicate { groups, tags, keys: Vec::new(), keys_known: false }
     }
 
     fn tagged(groups: Vec<Vec<Term>>, tags: Vec<Vec<u32>>) -> Predicate {
@@ -11653,18 +11699,29 @@ impl Predicate {
             groups.iter().map(Vec::len).collect::<Vec<_>>(),
             tags.iter().map(Vec::len).collect::<Vec<_>>(),
         );
-        Predicate { groups, tags, keys: Vec::new() }
+        Predicate { groups, tags, keys: Vec::new(), keys_known: false }
     }
 
     /// `WHERE 1=0`: no group to satisfy, matches nothing.
     fn empty() -> Predicate {
-        Predicate { groups: vec![], tags: vec![], keys: Vec::new() }
+        Predicate { groups: vec![], tags: vec![], keys: Vec::new(), keys_known: false }
     }
 
     /// The keyable columns of the relation this filter reads, for the
     /// open-time [Predicate::key_conversion].
     fn with_keys(mut self, keys: Vec<usize>) -> Predicate {
         self.keys = keys;
+        self.keys_known = true;
+        self
+    }
+
+    /// Carry the ACCESS-PATH knowledge of the predicate this one was
+    /// rebuilt from - the bind and the invariant strip both rebuild a
+    /// `Predicate` and must not turn an UNKNOWN path into a known empty
+    /// one ([Predicate::keys_known]).
+    fn keyed_like(mut self, src: &Predicate) -> Predicate {
+        self.keys = src.keys.clone();
+        self.keys_known = src.keys_known;
         self
     }
 
@@ -11892,6 +11949,17 @@ impl Predicate {
                 }
                 (ColKind::Temporal(_), WireParam::Date(d)) => Some(Expr::DateLit(*d)),
                 (ColKind::Approx, WireParam::Double(x)) => Some(Expr::Double(*x)),
+                // AN EXACT EXPRESSION SIDE AGAINST A DOUBLE MESSAGE
+                // compares AS A DOUBLE, never rounded into the announced
+                // slot ([double_exact_term] carries the measurements);
+                // `value_cmp`'s approx arm converts the row's exact value
+                // with [exact_to_f64]. A NaN refuses ([NAN_CMP_REFUSAL]).
+                (ColKind::Int | ColKind::Numeric, WireParam::Double(x)) => {
+                    if x.is_nan() {
+                        return Err(NAN_CMP_REFUSAL.into());
+                    }
+                    Some(Expr::Double(*x))
+                }
                 (ColKind::Bool, WireParam::Bool(b)) => Some(Expr::Bool(*b)),
                 // an exact value for an approximate slot converts, the
                 // way an exact literal in the SQL text would
@@ -12094,13 +12162,29 @@ impl Predicate {
                     // arm, raising 22018 from the first non-NULL row
                     // exactly as the engine does (both binds probed
                     // raising from the same first value).
-                    Term::Cmp(fid, op, Rhs::Param(idx, kind @ ColKind::Text)) => {
+                    Term::Cmp(fid, op, Rhs::Param(idx, kind @ ColKind::Text, ..)) => {
                         match args.get(*idx).ok_or("missing parameter value")? {
                             WireParam::Int(v, 0) => {
                                 Term::TextNumCmp(*fid, *op, Rhs::Int(*v))
                             }
                             WireParam::Int(v, ws) => {
                                 Term::TextNumCmp(*fid, *op, Rhs::Num(*v, *ws))
+                            }
+                            // a NaN double against a TEXT column: `<>` is
+                            // TRUE on a scan AND on an index (every
+                            // convertible row, measured on both), which
+                            // the UNKNOWN the NaN sentinel answers got
+                            // wrong - and with it `NOT IN`, `IS DISTINCT
+                            // FROM` and `NOT (S = ?)`.  `=`, `<` and `<=`
+                            // keep today's FALSE, which is the engine's
+                            // answer on both paths.  `>` and `>=` DEPEND
+                            // ON THE ACCESS PATH (every row on a heap,
+                            // none on an indexed twin) and keep today's
+                            // reading too: it is the engine's answer on
+                            // the indexed half, and refusing would take
+                            // that right answer back.
+                            WireParam::Double(d) if d.is_nan() && matches!(op, Cmp::Ne) => {
+                                Term::TextNumCmp(*fid, Cmp::Ge, Rhs::Dbl(f64::NEG_INFINITY))
                             }
                             WireParam::Double(d) => {
                                 Term::TextNumCmp(*fid, *op, Rhs::Dbl(*d))
@@ -12111,8 +12195,20 @@ impl Predicate {
                             },
                         }
                     }
-                    Term::Cmp(fid, op, Rhs::Param(idx, kind)) => {
-                        match lenient_param(idx, *fid, *op, kind) {
+                    Term::Cmp(fid, op, Rhs::Param(idx, kind0, ..)) => {
+                        // A DOUBLE MESSAGE INTO AN EXACT SLOT - every
+                        // driver that sends a JS/Python/Delphi fraction
+                        // does this. It compares AS A DOUBLE, unrounded
+                        // ([double_exact_term]); the WideExact marker
+                        // refuses the values an INT64/INT128 index would
+                        // round ([ColKind::WideExact]).
+                        let (kind_v, wide) = kind0.unwide();
+                        let short = kind0.short_scale();
+                        let kind = &kind_v;
+                        match double_exact_term(args.get(*idx), *fid, *op, kind, wide, short) {
+                            Err(e) => return Err(ExecErr::Text(e.to_string())),
+                            Ok(Some(t)) => t,
+                            Ok(None) => match lenient_param(idx, *fid, *op, kind) {
                             Some(t) => t,
                             None => match bind_rhs(idx, kind)? {
                                 None => Term::Unknown,
@@ -12125,20 +12221,29 @@ impl Predicate {
                                 Some(rhs @ Rhs::Num(..)) => Term::NumCmp(*fid, *op, rhs),
                                 Some(rhs) => Term::Cmp(*fid, *op, rhs),
                             },
-                        }
-                    }
-                    Term::NumCmp(fid, op, Rhs::Param(idx, kind)) => {
-                        match decfloat_param_term(args.get(*idx), *fid, *op, kind)
-                            .or_else(|| lenient_param(idx, *fid, *op, kind))
-                        {
-                            Some(t) => t,
-                            None => match bind_rhs(idx, kind)? {
-                                None => Term::Unknown,
-                                Some(rhs) => Term::NumCmp(*fid, *op, rhs),
                             },
                         }
                     }
-                    Term::Like(fid, Rhs::Param(idx, _), escape, negated) => {
+                    Term::NumCmp(fid, op, Rhs::Param(idx, kind0, ..)) => {
+                        // the scaled twin of the arm above
+                        let (kind_v, wide) = kind0.unwide();
+                        let short = kind0.short_scale();
+                        let kind = &kind_v;
+                        match double_exact_term(args.get(*idx), *fid, *op, kind, wide, short) {
+                            Err(e) => return Err(ExecErr::Text(e.to_string())),
+                            Ok(Some(t)) => t,
+                            Ok(None) => match decfloat_param_term(args.get(*idx), *fid, *op, kind)
+                                .or_else(|| lenient_param(idx, *fid, *op, kind))
+                            {
+                                Some(t) => t,
+                                None => match bind_rhs(idx, kind)? {
+                                    None => Term::Unknown,
+                                    Some(rhs) => Term::NumCmp(*fid, *op, rhs),
+                                },
+                            },
+                        }
+                    }
+                    Term::Like(fid, Rhs::Param(idx, _, ..), escape, negated) => {
                         match bind_rhs(idx, &ColKind::Text)? {
                             // LIKE NULL is UNKNOWN - per row, on the
                             // column side (probed: a later bad-escape
@@ -12160,7 +12265,7 @@ impl Predicate {
                             Some(_) => Term::Unknown,
                         }
                     }
-                    Term::Starting(fid, Rhs::Param(idx, _), negated) => {
+                    Term::Starting(fid, Rhs::Param(idx, _, ..), negated) => {
                         match bind_rhs(idx, &ColKind::Text)? {
                             // STARTING WITH NULL is UNKNOWN under both
                             // polarities (probed: zero rows either way)
@@ -12196,7 +12301,7 @@ impl Predicate {
                         };
                         let pat = match pattern {
                             Rhs::Str(p) => Some(p.clone()),
-                            Rhs::Param(pslot, _) => fetch(*pslot)?,
+                            Rhs::Param(pslot, _, ..) => fetch(*pslot)?,
                             _ => None,
                         };
                         match pat {
@@ -12227,7 +12332,7 @@ impl Predicate {
                         };
                         let (pat, literal_pat) = match pattern {
                             Rhs::Str(p) => (Some(p.clone()), true),
-                            Rhs::Param(pslot, _) => (fetch(*pslot)?, false),
+                            Rhs::Param(pslot, _, ..) => (fetch(*pslot)?, false),
                             _ => (None, false),
                         };
                         match pat {
@@ -12284,7 +12389,7 @@ impl Predicate {
                         };
                         let pre = match prefix {
                             Rhs::Str(p) => Some(p.clone()),
-                            Rhs::Param(pslot, _) => fetch(*pslot)?,
+                            Rhs::Param(pslot, _, ..) => fetch(*pslot)?,
                             _ => None,
                         };
                         match pre {
@@ -12363,7 +12468,21 @@ impl Predicate {
                     // mechanism-consistent with [cmp_sides]' wrap for
                     // the literal spelling of the same comparison
                     // (the gate pins the plain-column rows).
-                    Term::ExprParam(lhs, op, idx, kind, cs) => {
+                    Term::ExprParam(lhs, op, idx, kind, cs, mirrored) => {
+                        // A NaN THAT REACHES THIS SIDE AS A DOUBLE has no
+                        // single engine order ([nan_param_reaches] lets
+                        // through the casts the engine converts at, where
+                        // NaN is 0 and the comparison is ordinary)
+                        if nan_param_reaches(lhs, args) {
+                            return Err(NAN_CMP_REFUSAL.into());
+                        }
+                        let (kind_v, wide) = kind.unwide();
+                        // a SINGLE-PRECISION side has its own NaN order
+                        // ([ColKind::ApproxSingle]); the marker is read
+                        // BEFORE [ColKind::unwide] hands back the plain
+                        // `Approx` every other reader here expects
+                        let single = matches!(kind, ColKind::ApproxSingle);
+                        let kind = &kind_v;
                         // the tested side's OWN `?`s bind here too
                         // (`CAST(? AS INTEGER) = ?`, `IIF(ID = ?, 1, 0) = ?`
                         // - engine 1;2;3 and 2; this server errored at
@@ -12377,6 +12496,54 @@ impl Predicate {
                             lhs.clone()
                         };
                         let lhs = &lhs_b;
+                        // the BOUND side's own NaN and wide-key checks: a
+                        // TEXT side has an order for `=`, `<`, `<=` and
+                        // `<>` and none for `>` / `>=` ([text_nan_term]);
+                        // an exact one has none at all; and a double an
+                        // INT64/INT128 expression index would round
+                        // refuses ([ColKind::WideExact], measured on a
+                        // table with an index COMPUTED BY (ID + 0))
+                        let special: Option<Term> = match args.get(*idx) {
+                            Some(WireParam::Double(x)) if x.is_nan() => {
+                                match text_nan_term(lhs, *op, kind, *cs) {
+                                    Some(t) => Some(t),
+                                    // a TEXT side [text_nan_term] declines
+                                    // (a bare collated column's `>` / `>=`)
+                                    // keeps its previous reading; every
+                                    // other side has no order at all
+                                    None if matches!(kind, ColKind::Text) => None,
+                                    // A SINGLE-PRECISION SIDE AND `<`:
+                                    // the ONE operator whose verdict is
+                                    // the engine's in BOTH written orders
+                                    // ([ColKind::ApproxSingle] carries the
+                                    // measurement). [parse_leaf] mirrors
+                                    // `? > FL` into `FL < ?`, so this one
+                                    // term is both spellings and the
+                                    // engine answers no row for each, on
+                                    // the heap and on the indexed twin -
+                                    // which is what the previous binary's
+                                    // equal-reading answers too. Every
+                                    // other operator has one spelling the
+                                    // engine reads the other way, and a
+                                    // DOUBLE side has no such operator at
+                                    // all.
+                                    None if single && matches!(*op, Cmp::Lt) => None,
+                                    None => return Err(NAN_CMP_REFUSAL.into()),
+                                }
+                            }
+                            Some(WireParam::Double(x)) => {
+                                if let Some(sc) = wide {
+                                    if !double_exact_at(*x, sc) {
+                                        return Err(WIDE_DOUBLE_REFUSAL.into());
+                                    }
+                                }
+                                None
+                            }
+                            _ => None,
+                        };
+                        if let Some(t) = special {
+                            t
+                        } else {
                         let num_lit = if matches!(kind, ColKind::Text) {
                             match args.get(*idx).ok_or("missing parameter value")? {
                                 WireParam::Int(v, 0) => Some(Expr::Int(*v)),
@@ -12461,6 +12628,7 @@ impl Predicate {
                                 }
                             }
                         }
+                        }
                     }
                     // a `?` INSIDE an expression - `I = CAST(? AS
                     // INTEGER)`. The value becomes a literal under the
@@ -12469,16 +12637,25 @@ impl Predicate {
                     // from (probed: a NULL column still raises, an empty
                     // table does not, a FALSE conjunct in front silences
                     // it - exactly what an ordinary ExprCond does).
-                    Term::ExprCond(c) if cond_has_param(c) => Term::ExprCond(Box::new(
-                        subst_params_cond(c, args)
-                            .ok_or("parameter type does not match its column")?,
-                    )),
+                    Term::ExprCond(c) if cond_has_param(c) => {
+                        // a chunk WHOLE-SIDE rung typed from an INT64
+                        // side (`BI > (?)`, `BI > -?`) refuses where an
+                        // index BOUND could round it - this retrieval's
+                        // own keys decide ([wide_whole_side_double])
+                        if wide_whole_side_double(c, args, &self.keys, self.keys_known) {
+                            return Err(WIDE_DOUBLE_REFUSAL.into());
+                        }
+                        Term::ExprCond(Box::new(
+                            subst_params_cond(c, args)
+                                .ok_or("parameter type does not match its column")?,
+                        ))
+                    }
                     other => other.clone(),
                 });
             }
             groups.push(terms);
         }
-        let bound = Predicate::tagged(groups, self.tags.clone()).with_keys(self.keys.clone());
+        let bound = Predicate::tagged(groups, self.tags.clone()).keyed_like(self);
         // the invariant pass, conjunct by conjunct in written order.
         // A conjunct is INVARIANT when every term it contributed to
         // the DNF is row-independent; its verdict is the same
@@ -12520,7 +12697,7 @@ impl Predicate {
             bound.key_conversion()?;
             return Ok(bound);
         }
-        let keys = bound.keys.clone();
+        let (keys, keys_known) = (bound.keys.clone(), bound.keys_known);
         let mut groups = Vec::new();
         let mut tags = Vec::new();
         for (g, gt) in bound.groups.into_iter().zip(bound.tags) {
@@ -12537,7 +12714,9 @@ impl Predicate {
             groups.push(g);
             tags.push(gt);
         }
-        let stripped = Predicate::tagged(groups, tags).with_keys(keys);
+        let mut stripped = Predicate::tagged(groups, tags);
+        stripped.keys = keys;
+        stripped.keys_known = keys_known;
         stripped.key_conversion()?;
         Ok(stripped)
     }
@@ -12573,6 +12752,40 @@ impl Predicate {
                     Some((*fid, Some(*cmp)))
                 }
                 Term::IsNull(fid) if self.keys.contains(fid) => Some((*fid, None)),
+                // A BOUND DOUBLE against a keyed column is a segment
+                // writer too - it arrives as an [Term::ExprCond] rather
+                // than a `Term::Cmp` ([double_exact_term]), and the
+                // optimizer that decides this timing does not care which
+                // shape this server chose. Measured on an EMPTY table
+                // with an indexed INTEGER K: `K = 'zz' OR K = ?` [2.5]
+                // RAISES 22018 on the engine and `K = 'zz' AND K = ?`
+                // answers none, so the double is the last writer that
+                // never raises - exactly the literal `K = 'zz' AND
+                // K = 2.5e0` law, which the same line fixes (the literal
+                // twins were a pre-existing DIFF: the engine raises on the
+                // OR and answers none on the AND, this server did the
+                // reverse). BIGINT and NUMERIC keys behave the same.
+                Term::ExprCond(c) => match c.as_ref() {
+                    Cond2::Cmp(a, cmp, b) if !matches!(*cmp, Cmp::Ne) => {
+                        let dbl = |e: &Expr| match e {
+                            Expr::Double(_) => true,
+                            Expr::Cast(x, CastTarget::Approx, _) => {
+                                matches!(**x, Expr::Double(_))
+                            }
+                            _ => false,
+                        };
+                        match (a.as_ref(), b.as_ref()) {
+                            (Expr::Col(fid), r) if dbl(r) && self.keys.contains(fid) => {
+                                Some((*fid, Some(*cmp)))
+                            }
+                            (l, Expr::Col(fid)) if dbl(l) && self.keys.contains(fid) => {
+                                Some((*fid, Some(mirror_cmp(*cmp))))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                },
                 _ => None,
             }
         };
@@ -12879,6 +13092,17 @@ fn subst_params_cond(c: &Cond2, args: &[WireParam]) -> Option<Cond2> {
     }
     Some(match c {
         Cond2::Cmp(a, op, b) => {
+            // A NaN THAT REACHES EITHER SIDE AS A DOUBLE refuses the
+            // statement: its order is node-specific and path-specific
+            // ([NAN_CMP_REFUSAL]). A cast the engine CONVERTS at absorbs
+            // it as 0 and binds normally ([nan_param_reaches]) - which is
+            // what keeps `ID = CAST(? AS INTEGER)` [NaN] answering the 0
+            // row and `ID > ? + 0` every row.
+            if (nan_param_reaches(a, args) || nan_param_reaches(b, args))
+                && !nan_whole_side_keeps(a, *op, b, args)
+            {
+                return None;
+            }
             // a number bound into a whole-side TEXT rung turns the
             // comparison numeric ([bind_whole_side_text_cmp]); every
             // other pair substitutes side by side (a whole-side EXACT
@@ -33388,6 +33612,93 @@ fn exact_int_le(dtype: u8, stored: i128) -> Option<Vec<u8>> {
     })
 }
 
+/// What [approx_to_exact] answers when it has no value.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ApproxFit {
+    /// the engine's 22003 *numeric value is out of range*: +-Infinity, or
+    /// a magnitude the target's storage width cannot hold after rounding
+    OutOfRange,
+    /// an INT128 magnitude at or past 2^53, where a double's DECIMAL
+    /// significance and its binary value part company and the engine's
+    /// choice is unmeasured (node cannot send such a double) - the caller
+    /// keeps whatever refusal it had before
+    TooWide,
+}
+
+/// Is `x` a value an INT64/INT128 KEY at `scale` holds EXACTLY, so the
+/// engine's ROUNDED index bound selects exactly the rows a double compare
+/// selects ([ColKind::WideExact])? Measured: the pairs that agree indexed
+/// and scanned are the ones whose bound survives the round trip
+/// (`N18 = 2.5` 2 on both, `H2 > 2.49` 2;9 on both), and +-Infinity agrees
+/// too (`BI < Inf` all, `BI > Inf` none on both). A finite value qualifies
+/// when its rounded key converts back to it AND the key is below 2^52, so
+/// no second double maps to the same key. NaN never does.
+fn double_exact_at(x: f64, scale: i8) -> bool {
+    if x.is_infinite() {
+        return true;
+    }
+    if !x.is_finite() {
+        return false;
+    }
+    let scaled = x * 10f64.powi(-(scale as i32));
+    if !(scaled.abs() < 4_503_599_627_370_496.0) {
+        return false;
+    }
+    exact_to_f64(scaled.round() as i128, scale as i32) == x
+}
+
+/// THE ENGINE'S RUNTIME double -> exact conversion (cvt.cpp CVT_get_int64):
+/// scale to the target, add (0.5 + eps) AS ONE CONSTANT away from zero,
+/// truncate, then fit the storage width. `eps` is 1e-14 for a DOUBLE
+/// source and 1e-5 for a FLOAT one. NaN converts to 0 (measured four ways:
+/// INSERT, UPDATE, CAST and a procedure argument all store 0); +-Infinity
+/// and an overflow are 22003. INT128 takes the same law BELOW 2^53 (a
+/// runtime 10.075 stores 10.07 where the double LITERAL 10.075e0 stores
+/// 10.08 by its decimal text); at or past 2^53 it answers `TooWide`.
+/// Callers pass ONLY RUNTIME values.
+fn approx_to_exact(x: f64, eps: f64, dt: u8, scale: i8) -> Result<i128, ApproxFit> {
+    if x.is_nan() {
+        return Ok(0);
+    }
+    let scaled = x * 10f64.powi(-(scale as i32));
+    if !scaled.is_finite() {
+        return Err(ApproxFit::OutOfRange);
+    }
+    if dt == dtype::INT128 {
+        if scaled.abs() >= 9_007_199_254_740_992.0 {
+            return Err(ApproxFit::TooWide);
+        }
+    } else if scaled.abs() >= 9_223_372_036_854_775_808.0 {
+        return Err(ApproxFit::OutOfRange);
+    }
+    let r = if scaled > 0.0 { scaled + (0.5 + eps) } else { scaled - (0.5 + eps) }.trunc() as i128;
+    if exact_int_le(dt, r).is_none() {
+        return Err(ApproxFit::OutOfRange);
+    }
+    Ok(r)
+}
+
+/// A bare `?`'s DOUBLE / FLOAT message into an INT128 column - a RUNTIME
+/// value by construction, so it takes the eps law ([approx_to_exact])
+/// rather than the double literal's decimal text. The exact wire value it
+/// answers with encodes through the ordinary Int arm. `Ok(None)` is "not
+/// this case", which keeps the caller's own refusal.
+fn bound_double_into_int128(d: &Descriptor, wp: &WireParam) -> Result<Option<WireParam>, EvalErr> {
+    if d.dtype != dtype::INT128 {
+        return Ok(None);
+    }
+    let (x, eps) = match wp {
+        WireParam::Double(x) => (*x, 1e-14),
+        WireParam::Single(f) => (*f as f64, 1e-5),
+        _ => return Ok(None),
+    };
+    match approx_to_exact(x, eps, d.dtype, d.scale) {
+        Ok(r) => Ok(i64::try_from(r).ok().map(|v| WireParam::Int(v, d.scale))),
+        Err(ApproxFit::TooWide) => Ok(None),
+        Err(ApproxFit::OutOfRange) => Err(EvalErr::NumericOutOfRange),
+    }
+}
+
 fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> {
     let flen = d.length as usize;
     let int_bytes = |stored: i128| -> Option<Vec<u8>> { exact_int_le(d.dtype, stored) };
@@ -33567,13 +33878,7 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
         WireParam::Single(f) => Some(match d.dtype {
             dtype::REAL => f.to_le_bytes().to_vec(),
             dtype::SHORT | dtype::LONG | dtype::INT64 => {
-                let scaled = (*f as f64) * 10f64.powi(-(d.scale as i32));
-                if !scaled.is_finite() || scaled.abs() >= i64::MAX as f64 {
-                    return None;
-                }
-                let adjusted =
-                    if scaled > 0.0 { scaled + (0.5 + 1e-5) } else { scaled - (0.5 + 1e-5) };
-                int_bytes(adjusted.trunc() as i128)?
+                int_bytes(approx_to_exact(*f as f64, 1e-5, d.dtype, d.scale).ok()?)?
             }
             dtype::TEXT | dtype::VARYING => {
                 text_bytes_for(&approx_store_text(*f as f64, true, d)?, fire_crab_ods::intl::CS_UTF8, d, flen)?
@@ -33597,18 +33902,13 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                 // representation edge the decimal way (1.005e0 into a
                 // NUMERIC(9,2) is 1.01, not the 1.00 a bare .round()
                 // gives; the serve-real-rounding slice pinned the same
-                // constant for ROUND)
-                let scaled = x * 10f64.powi(-(d.scale as i32));
-                if !scaled.is_finite() || scaled.abs() >= i64::MAX as f64 {
-                    return None;
-                }
-                let adjusted =
-                    // the engine adds (0.5 + epsilon) as ONE constant: an
-                    // integer-valued double in [2^52, 2^53) lands one higher
-                    // (8000000000000000e0 stores 8000000000000001, measured);
-                    // adding 0.5 first rounded the tie to even and lost it
-                    if scaled > 0.0 { scaled + (0.5 + 1e-14) } else { scaled - (0.5 + 1e-14) };
-                int_bytes(adjusted.trunc() as i128)?
+                // constant for ROUND). [approx_to_exact] is that law, and
+                // it also carries the NaN rule the old `!is_finite`
+                // refusal got wrong: a NaN STORES 0 (measured on UPDATE,
+                // INSERT, RETURNING and the UPDATE OR INSERT insert half),
+                // while +-Infinity and an overflow stay refusals - which
+                // [wire_value_fit_error] turns into the engine's 22003.
+                int_bytes(approx_to_exact(*x, 1e-14, d.dtype, d.scale).ok()?)?
             }
             // an approximate value into a TEXT column renders the
             // engine's 16-significant-digit form (probed: SQRT(2) into a
@@ -36516,6 +36816,18 @@ fn execute_dml_collecting_inner(
             for (fid, slot) in param_fields {
                 let d = descs.get(*fid).ok_or("field beyond format")?;
                 let arg = args.get(*slot).ok_or("missing parameter value")?;
+                // a bare `?`'s DOUBLE into an INT128 column - a RUNTIME
+                // value, so it takes the eps law rather than the double
+                // literal's decimal text ([bound_double_into_int128])
+                let conv;
+                let arg = match bound_double_into_int128(d, arg) {
+                    Ok(Some(w)) => {
+                        conv = w;
+                        &conv
+                    }
+                    Ok(None) => arg,
+                    Err(ev) => return Err(ExecErr::Eval(ev)),
+                };
                 match encode_wire_value(d, arg)
                     .ok_or_else(|| fit_or(d, arg, "parameter type does not match its column"))?
                 {
@@ -36861,6 +37173,17 @@ fn execute_dml_collecting_inner(
                             blob_sets.push((*fid, *slot));
                             continue;
                         }
+                        // the INSERT arm's twin: a runtime DOUBLE into an
+                        // INT128 column ([bound_double_into_int128])
+                        let conv;
+                        let arg = match bound_double_into_int128(d, arg) {
+                            Ok(Some(w)) => {
+                                conv = w;
+                                &conv
+                            }
+                            Ok(None) => arg,
+                            Err(ev) => return Err(ExecErr::Eval(ev)),
+                        };
                         encode_wire_value(d, arg).ok_or_else(|| {
                             fit_or(d, arg, "parameter type does not match its column")
                         })?
@@ -38052,6 +38375,22 @@ fn wire_value_fit_error(d: &Descriptor, wp: &WireParam) -> Option<EvalErr> {
                 .and_then(|s| exact_int_le(d.dtype, s))
                 .is_none()
             {
+                return Some(EvalErr::NumericOutOfRange);
+            }
+        }
+        // ...and the APPROXIMATE twin: an out-of-range or infinite double
+        // store answered the generic *Dynamic SQL Error* where the engine
+        // sends 22003 (`SET N = ?` [2147483647.6] / [3000000000.5] /
+        // [+Inf], `SET SM = ?` [40000.5], `SET NM = ?` [2147483647.4] -
+        // which INTEGER takes and NUMERIC(9,2) refuses). It sits INSIDE
+        // this block: the `return None` below would make it dead code.
+        let approx = match wp {
+            WireParam::Double(x) => Some((*x, 1e-14)),
+            WireParam::Single(f) => Some((*f as f64, 1e-5)),
+            _ => None,
+        };
+        if let Some((x, eps)) = approx {
+            if approx_to_exact(x, eps, d.dtype, d.scale) == Err(ApproxFit::OutOfRange) {
                 return Some(EvalErr::NumericOutOfRange);
             }
         }
@@ -40371,7 +40710,7 @@ fn resolve_join_predicate(
                         if !comb_cols.iter().any(|k| col_name_is(&k.name, bare)) {
                             return None; // ambiguous, or not in the view
                         }
-                        RawTerm { lhs: RawLhs::Col(bare.to_string()), kind: rt.kind }
+                        RawTerm { lhs: RawLhs::Col(bare.to_string()), kind: rt.kind, mirrored: rt.mirrored }
                     }
                     _ => rt,
                 };
@@ -40384,7 +40723,7 @@ fn resolve_join_predicate(
             let (idx, d, _) = resolve_join_col(sides, col)?;
             match col_kind(d) {
                 Some(kind) => {
-                    terms.push(param_or_typed_term(idx, kind, rt.kind, d, params)?)
+                    terms.push(param_or_typed_term(idx, kind, rt.kind, d, params, rt.mirrored)?)
                 }
                 // A scaled NUMERIC, temporal, approximate or boolean
                 // column takes the EXPRESSION path here for the same
@@ -40411,6 +40750,7 @@ fn resolve_join_predicate(
                     let rt2 = RawTerm {
                         lhs: RawLhs::Col(name.to_string()),
                         kind: rt.kind,
+                        mirrored: rt.mirrored,
                     };
                     terms.push(resolve_expr_term(&rt2, &comb_cols, &comb_descs, params)?);
                 }
@@ -61797,6 +62137,507 @@ fn param_to_expr(p: &WireParam) -> Option<Expr> {
     })
 }
 
+/// A NaN in a comparison HAS NO SINGLE ENGINE ORDER, so it refuses.
+/// Against a DOUBLE column cmp(D, NaN) = cmp(NaN, D) = -1, so `D < ?` is
+/// TRUE and `D > ?` FALSE in BOTH operand orders, while `D IN (?, 99)`
+/// takes every row and `D BETWEEN ? AND 99` none; against an EXACT column
+/// NaN sorts BELOW everything on a SCAN and the INDEXED answer is the
+/// opposite (`T.ID > ?` every row, `TI.ID > ?` none). Modelling any one of
+/// those is a wrong answer on the others, and the previous binary's
+/// `partial_cmp().unwrap_or(Equal)` made NaN EQUAL to everything - twenty
+/// five wrong answers, one of them a wrong DELETE.
+const NAN_CMP_REFUSAL: &str =
+    "a NaN parameter in a comparison has no single engine order (refused)";
+/// A DOUBLE against an INT64/INT128 key the key cannot hold exactly: the
+/// engine's index bound is the ROUNDED value and its scan compares the
+/// double, so the two access paths answer different rows
+/// ([ColKind::WideExact]).
+/// A DOUBLE a SHORT-BACKED column's EQUALITY cannot decide: a multi-item
+/// `IN` list converts it into the column's own type and an equality
+/// written out does not, and this server has one tree for both
+/// ([ColKind::WideExact]'s `short`).
+const SHORT_IN_REFUSAL: &str = "a DOUBLE equality on a SHORT-backed column is an \
+                                IN-list conversion or a double compare, and the \
+                                spelling that decides it is lost at parse";
+
+const WIDE_DOUBLE_REFUSAL: &str = "a DOUBLE compared with an INT64/INT128 column the \
+    key cannot hold exactly (refused: the engine's index rounds the bound)";
+/// NULLIF compares the CLIENT'S value before its slot converts it
+/// (`NULLIF(?, 3)` [3.4] answers 3, not NULL), which no slot-cast reading
+/// reproduces - the previous binary answered NULL and WROTE NULL.
+const MERGE_ARITH_PARAM_REFUSAL: &str =
+    "a MERGE condition computes with a parameter this server would read \
+     before its slot converts it";
+const NULLIF_DOUBLE_REFUSAL: &str =
+    "NULLIF compares the client's DOUBLE before its slot converts it (refused)";
+
+fn wire_is_nan(p: Option<&WireParam>) -> bool {
+    match p {
+        Some(WireParam::Double(x)) => x.is_nan(),
+        Some(WireParam::Single(f)) => f.is_nan(),
+        _ => false,
+    }
+}
+
+/// Does a NaN-bound `?` reach this comparison side AS A DOUBLE? A cast the
+/// engine CONVERTS at stops it, because NaN converts to 0 there and the
+/// comparison is then an ordinary one (`ID > CAST(? AS INTEGER)` [NaN]
+/// answers every row, `ID = CAST(? AS INTEGER)` the 0 row, `ID > ? + 0`
+/// every row - measured). A cast the engine does NOT convert at - a
+/// VALUE-position slot cast ([CS_SLOT_CAST]) and a WHOLE-SIDE rung
+/// ([CS_WHOLE_SIDE]) - passes the double through. An unlisted `?`-carrier
+/// refuses whenever any NaN is bound: never a silent pass.
+fn nan_param_reaches(e: &Expr, args: &[WireParam]) -> bool {
+    match e {
+        Expr::Param(i) => wire_is_nan(args.get(*i)),
+        Expr::Cast(_, CastTarget::Int { .. } | CastTarget::Numeric { .. }, cs)
+            if !(matches!(*cs, CS_SLOT_CAST) || is_whole_side(*cs)) =>
+        {
+            false
+        }
+        Expr::Cast(a, _, _) | Expr::Neg(a) => nan_param_reaches(a, args),
+        Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
+            nan_param_reaches(a, args) || nan_param_reaches(b, args)
+        }
+        Expr::Coalesce(v) | Expr::Func(_, v) => v.iter().any(|x| nan_param_reaches(x, args)),
+        // a conditional's CONDITION is checked where [subst_params_cond]
+        // binds it; its ARMS are value positions and are checked here
+        Expr::Iif(_, a, b) => nan_param_reaches(a, args) || nan_param_reaches(b, args),
+        Expr::Case(br, el) => {
+            br.iter().any(|(_, t)| nan_param_reaches(t, args))
+                || el.as_deref().is_some_and(|x| nan_param_reaches(x, args))
+        }
+        Expr::TextNum(a, _)
+        | Expr::TextNumKey(a, _)
+        | Expr::TextBool(a, _)
+        | Expr::CollKey(a, _)
+        | Expr::CollCanon(a, _, _)
+        | Expr::Collate(a, _)
+        | Expr::OctKey(a, _)
+        | Expr::CarrierEnc(a, _)
+        | Expr::CarrierDec(a, _, _) => nan_param_reaches(a, args),
+        Expr::AtTimeZone(a, z) => {
+            nan_param_reaches(a, args) || z.as_deref().is_some_and(|x| nan_param_reaches(x, args))
+        }
+        // [corr_literal] refuses a non-finite double outright; a nested
+        // Cond binds its own comparisons through [subst_params_cond]
+        Expr::CorrSub { .. } | Expr::Cond(_) => false,
+        other => expr_has_param(other) && args.iter().any(|a| wire_is_nan(Some(a))),
+    }
+}
+
+/// A WHOLE-SIDE exact rung ([whole_side_rung]) typed from an INT64-BACKED
+/// side ([CS_WHOLE_SIDE_W]), bound a double that side's key cannot hold,
+/// AND SITTING WHERE AN INDEX BOUND COULD ROUND IT: `TI.BI > (?)` [2.5]
+/// answers 9 where the heap `T.BI > (?)` answers 3;9.
+///
+/// TWO THINGS DECIDE IT, and round 1 of this chunk had neither:
+///
+///  * THE SOURCE WIDTH, which travels in the STAMP and not in the cast
+///    target - [cmp_param_rung] casts every exact slot at eight bytes,
+///    so keying on `bytes: 8 | 16` refused an INTEGER, SMALLINT,
+///    NUMERIC(9,2) and NUMERIC(4,1) column too. A SHORT- or LONG-backed
+///    key IS a double key and never rounds: `T.ID > (?)` and `TI.ID >
+///    (?)` [2.5] both answer 3;9, and so do `SM`, `NM` [2.495] and `N41`
+///    [2.45] on both tables, in every operator, both operand orders,
+///    BETWEEN both ways, IN, NOT, OR, JOIN, derived, CTE, view, UNION,
+///    EXISTS, HAVING, a selectable procedure's output and the UPDATE /
+///    DELETE WHERE twins (163 binds re-measured 2026-09-20 on the private
+///    engine, all three sides agreeing).
+///
+///  * THE ACCESS PATH. Only a bound the ENGINE can match to an index
+///    SEGMENT rounds; a scan compares as a double. [Predicate::keys] is
+///    the measured notion of that (the leading segment of every index on
+///    the relation - [index_key_fids], the same list
+///    [Predicate::key_conversion] reads), so a rung whose partner is an
+///    UNKEYED PLAIN COLUMN answers as a double: `T.BI > (?)` [2.5] is
+///    3;9 like the engine, and so are the JOIN / derived / CTE / view /
+///    UNION routers over the heap, `UPDATE U .. WHERE BI > (?)`, its
+///    DELETE twin, `HAVING SUM(ID) > (?)` (an aggregate is never a key)
+///    and `SELECT RA FROM P1(1,1) WHERE RA < (?)`.
+///    ANYTHING ELSE REFUSES: a KEYED column (the indexed twin, where the
+///    two answers differ for `>` at [2.5] and would have to be guessed),
+///    and a partner that is not a plain column at all - an EXPRESSION
+///    side may carry an index COMPUTED BY (BI + 0), which rounds exactly
+///    like a column index (`TE.BI + 0 > (?)` [2.5] is 9 on the engine
+///    where the scan is 3;9, measured), and nothing here says whether one
+///    exists.
+///
+/// Only the Predicate's own `Cond2` skeleton is walked - an IIF/CASE
+/// condition is never index-matched (`IIF(BI > ?, 1, 0) = 1` [2.5] is
+/// 3;9 indexed AND scanned), so it keeps the double compare.
+fn wide_whole_side_double(
+    c: &Cond2,
+    args: &[WireParam],
+    keys: &[usize],
+    keys_known: bool,
+) -> bool {
+    // the rung's SLOT SCALE when this side is an INT64-backed whole-side
+    // rung bound a double that scale cannot hold
+    fn rung(e: &Expr, args: &[WireParam]) -> bool {
+        let mut e = e;
+        while let Expr::Neg(a) = e {
+            e = a;
+        }
+        let Expr::Cast(inner, t, cs) = e else { return false };
+        if *cs != CS_WHOLE_SIDE_W {
+            return false;
+        }
+        let Expr::Param(i) = **inner else { return false };
+        let scale = match t {
+            CastTarget::Int { .. } => 0,
+            CastTarget::Numeric { scale, .. } => *scale,
+            _ => return false,
+        };
+        match args.get(i) {
+            Some(WireParam::Double(x)) => !double_exact_at(*x, scale),
+            Some(WireParam::Single(f)) => !double_exact_at(*f as f64, scale),
+            _ => false,
+        }
+    }
+    // the side the rung is compared WITH: a plain column no index on
+    // this relation leads with is a SCAN and compares as a double
+    // ...and ONLY where this retrieval knows its relation's keys. A
+    // router (a JOIN's combined row, a derived table, a CTE, a UNION
+    // leg, a view) leaves [Predicate::keys] EMPTY because nothing there
+    // read a catalog, and an empty list used to read as "no index leads
+    // with this column" - which answered the SCAN reading where the
+    // engine gives the INDEX one. Measured 2026-09-20 on the indexed
+    // twin: a derived table, a CTE and a view over `BI > (?)` [2.5] all
+    // answered 3;9 against the engine's 9, a JOIN answered 3 against
+    // (none), and `N18 > (?)` [2.45] the same at scale 1 - SIX WRONG
+    // ANSWERS, one of them reached through a DML IN-list. An UNKNOWN
+    // path therefore refuses, which is exactly the policy the BARE `?`
+    // spelling already had: [numeric_term] and its column twin mark
+    // `ColKind::WideExact` from the column's WIDTH alone, with no index
+    // knowledge, so `X.BI > ?` refuses through every router already.
+    // The cost is measured and it is the whole cost: a router over a
+    // HEAP relation, where the scan reading was right, now refuses too
+    // (gated).
+    let scanned = |other: &Expr| match other {
+        Expr::Col(fid) => keys_known && !keys.contains(fid),
+        _ => false,
+    };
+    match c {
+        Cond2::Cmp(a, _, b) => {
+            (rung(a, args) && !scanned(b)) || (rung(b, args) && !scanned(a))
+        }
+        Cond2::Not(x) => wide_whole_side_double(x, args, keys, keys_known),
+        Cond2::And(v) | Cond2::Or(v) => {
+            v.iter().any(|p| wide_whole_side_double(p, args, keys, keys_known))
+        }
+        _ => false,
+    }
+}
+
+/// A NaN BOUND INTO A WHOLE-SIDE RUNG, where the WRITTEN OPERAND ORDER
+/// SURVIVES: can the previous binary's reading be kept?
+///
+/// THE ENGINE HAS TWO NaN ORDERS and the OTHER side's precision picks
+/// which (measured 2026-09-20, 1344 three-way cells on a heap and an
+/// indexed twin):
+///  * against a DOUBLE side the compare is NOT SYMMETRIC - the FIRST
+///    operand is the lesser whichever way round it is written: `D <= (?)`
+///    is every row and `D > (?)`, `(?) > D` are none, while `D >= (?)`
+///    is none and `(?) < D` every row;
+///  * against a SINGLE (FLOAT) or an EXACT side a NaN sorts BELOW
+///    everything, a consistent order: `FL < (?)`, `ID < (?)`, `(?) > FL`
+///    and `(?) > ID` are none, `FL >= (?)` and `ID >= (?)` every row.
+/// The previous binary read a NaN as EQUAL to everything
+/// (partial_cmp().unwrap_or(Equal)), which is the engine's verdict on
+/// exactly the operators listed below and WRONG on all the others.
+///
+/// AND AN INDEX BOUND OVER A NaN IS EMPTY: a NaN sorts at the TOP of the
+/// key, so `TI.D >= (?)` and `TI.FL >= (?)` answer no row where the heap
+/// answers every row, while an UPPER bound (`<=`, `<`) leaves the range
+/// unrestricted and the per-row recheck decides. Only the operators whose
+/// verdict is FALSE - which an empty range cannot change - and the one
+/// UPPER-bound TRUE verdict are therefore kept; every lower-bound TRUE
+/// verdict refuses, because this server does not know the access path
+/// the engine chose.
+///
+/// This is the whole of what CAN be kept. The BARE forms (`D <= ?`,
+/// `FL >= ?`) cannot: [parse_leaf] rewrites `? op X` into `X mirror(op)
+/// ?`, so one term carries both spellings, and against a DOUBLE side the
+/// two spellings have OPPOSITE engine answers (`D <= ?` every row,
+/// `? >= D` none). A single-precision side is the exception and keeps its
+/// `<` ([ColKind::ApproxSingle]). An explicit `CAST(? AS DOUBLE
+/// PRECISION)` is not kept either - the class follows the OTHER side's
+/// own precision (`D <= CAST(? AS DOUBLE PRECISION)` is every row,
+/// `ID < CAST(? AS DOUBLE PRECISION)` none) and nothing here carries it.
+fn nan_whole_side_keeps(a: &Expr, op: Cmp, b: &Expr, args: &[WireParam]) -> bool {
+    // the rung's SLOT CLASS: true when the slot - and so the other side -
+    // is DOUBLE PRECISION, false for a FLOAT or an exact slot
+    fn rung_double(e: &Expr) -> Option<bool> {
+        let Expr::Cast(inner, t, cs) = e else { return None };
+        if !is_whole_side(*cs) || !matches!(**inner, Expr::Param(_)) {
+            return None;
+        }
+        match t {
+            CastTarget::Approx => Some(true),
+            CastTarget::Float | CastTarget::Int { .. } | CastTarget::Numeric { .. } => Some(false),
+            _ => None,
+        }
+    }
+    let (dbl, rung_left) = match (rung_double(a), rung_double(b)) {
+        (Some(d), None) => (d, true),
+        (None, Some(d)) => (d, false),
+        // a rung on BOTH sides, or on neither: nothing measured
+        _ => return false,
+    };
+    // the OTHER side must not carry a NaN of its own
+    let other = if rung_left { b } else { a };
+    if nan_param_reaches(other, args) {
+        return false;
+    }
+    // ...and the rung's own value must be the NaN (a finite bind never
+    // reaches here)
+    let nan = match a {
+        _ if rung_left => nan_param_reaches(a, args),
+        _ => nan_param_reaches(b, args),
+    };
+    if !nan {
+        return false;
+    }
+    match (dbl, rung_left, op) {
+        // THE ONE SHAPE BOTH ORDERS AGREE ON, whatever the other side's
+        // precision: `NaN > X` is FALSE for a DOUBLE side (the first
+        // operand is the lesser) and FALSE for a SINGLE or EXACT one (a
+        // NaN is below everything) - and FALSE is what the previous
+        // binary's equal reading answers. A FALSE verdict is also the one
+        // an emptied index range cannot change, so it holds on the
+        // indexed twin too.
+        (_, true, Cmp::Gt) => true,
+        // ...and with the rung written SECOND the verdict depends on the
+        // other side's precision, which the rung's own slot does NOT
+        // carry: [param_desc_from_expr] announces DOUBLE for a FLOAT
+        // column as well, so `FL > (?)` and `D > (?)` build the same
+        // rung and the engine answers every row for one and none for the
+        // other. Only a side that is DOUBLE BY CONSTRUCTION is kept -
+        // arithmetic (FLOAT arithmetic widens: `FL + 0` and `FL * 1`
+        // answer exactly as `D + 0` does) and an explicit CAST to DOUBLE
+        // PRECISION. `X <= NaN` is TRUE and an UPPER bound an index
+        // cannot narrow; `X > NaN` is FALSE.
+        (true, false, Cmp::Le | Cmp::Gt) if double_by_construction(other) => true,
+        _ => false,
+    }
+}
+
+/// An expression the engine types DOUBLE PRECISION whatever its columns
+/// are: arithmetic (FLOAT arithmetic widens to double) and an explicit
+/// CAST AS DOUBLE PRECISION. A bare column, ABS, a unary minus and a CAST
+/// AS FLOAT all KEEP single precision ([approx_expr_single]) and are not
+/// this.
+fn double_by_construction(e: &Expr) -> bool {
+    matches!(e, Expr::Bin(..)) || matches!(e, Expr::Cast(_, CastTarget::Approx, _))
+}
+
+/// The value a `?`'s IMPLICIT slot cast would hand NULLIF's comparison,
+/// as an f64 - the engine does NOT convert there, so this is exactly the
+/// value the previous reading used and the client's own is the engine's.
+fn slot_converted(t: &CastTarget, x: f64, eps: f64) -> Option<f64> {
+    let dt = |bytes: u8| match bytes {
+        2 => dtype::SHORT,
+        4 => dtype::LONG,
+        16 => dtype::INT128,
+        _ => dtype::INT64,
+    };
+    match t {
+        CastTarget::Int { bytes } => {
+            approx_to_exact(x, eps, dt(*bytes), 0).ok().map(|r| r as f64)
+        }
+        CastTarget::Numeric { scale, bytes, .. } => approx_to_exact(x, eps, dt(*bytes), *scale)
+            .ok()
+            .map(|r| exact_to_f64(r, *scale as i32)),
+        CastTarget::Approx => Some(x),
+        CastTarget::Float => Some(x as f32 as f64),
+        _ => None,
+    }
+}
+
+/// The same, from a DESTINATION DESCRIPTOR - what MERGE has instead of a
+/// cast target.
+fn slot_converted_desc(d: &Descriptor, x: f64, eps: f64) -> Option<f64> {
+    match d.dtype {
+        dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 => {
+            approx_to_exact(x, eps, d.dtype, d.scale).ok().map(|r| exact_to_f64(r, d.scale as i32))
+        }
+        dtype::DOUBLE => Some(x),
+        dtype::REAL => Some(x as f32 as f64),
+        _ => None,
+    }
+}
+
+/// A NULLIF operand read two ways: (the CLIENT'S value, the value its
+/// implicit slot cast would produce). A plain numeric literal reads the
+/// same both ways; anything this cannot read is None.
+fn nullif_operand_values(e: &Expr, args: &[WireParam]) -> Option<(f64, f64)> {
+    let mut e = e;
+    let mut neg = false;
+    while let Expr::Neg(a) = e {
+        e = a;
+        neg = !neg;
+    }
+    let sign = if neg { -1.0 } else { 1.0 };
+    let lit = |v: f64| Some((sign * v, sign * v));
+    match e {
+        Expr::Int(n) => lit(*n as f64),
+        Expr::Int128(v) => lit(*v as f64),
+        Expr::Dec(r, sc) => lit(exact_to_f64(*r as i128, *sc as i32)),
+        Expr::Double(d) => lit(*d),
+        Expr::Cast(inner, t, cs) if *cs >= CS_IMPLICIT_FLOOR => {
+            let Expr::Param(i) = **inner else { return None };
+            let (x, eps) = match args.get(i)? {
+                WireParam::Double(x) => (*x, 1e-14),
+                WireParam::Single(f) => (*f as f64, 1e-5),
+                _ => return None,
+            };
+            let conv = slot_converted(t, x, eps)?;
+            Some((sign * x, sign * conv))
+        }
+        _ => None,
+    }
+}
+
+/// Did the slot change this operand at all? (NaN to NaN has not.)
+fn nullif_operand_changed(v: &Option<(f64, f64)>) -> bool {
+    v.is_some_and(|(r, c)| !(r == c || (r.is_nan() && c.is_nan())))
+}
+
+/// NULLIF COMPARES THE CLIENT'S VALUE, not the slot's conversion of it,
+/// and then answers the CONVERTED one: `NULLIF(?, 3)` [3.4] is 3 where
+/// reading through the cast answers NULL, while `NULLIF(?, 0)` [1.25] is
+/// 1 BOTH ways.  So the statement only has to refuse when the conversion
+/// would FLIP THE VERDICT - which is also what keeps the shapes the
+/// previous binary answered right answering.
+fn nullif_double_flips(a: &Expr, b: &Expr, args: &[WireParam]) -> bool {
+    let va = nullif_operand_values(a, args);
+    let vb = nullif_operand_values(b, args);
+    if !nullif_operand_changed(&va) && !nullif_operand_changed(&vb) {
+        return false;
+    }
+    match (va, vb) {
+        (Some((ra, ca)), Some((rb, cb))) => (ra == rb) != (ca == cb),
+        // one side moved and the other is a column or an expression whose
+        // per-row value decides it - refuse
+        _ => true,
+    }
+}
+
+/// The MERGE twin, which has the destination DESCRIPTOR and the sibling's
+/// literal value rather than the tree ([nullif_operand_params]).
+fn nullif_double_flips_slot(d: &Descriptor, arg: Option<&WireParam>, sib: Option<f64>) -> bool {
+    let (x, eps) = match arg {
+        Some(WireParam::Double(x)) => (*x, 1e-14),
+        Some(WireParam::Single(f)) => (*f as f64, 1e-5),
+        _ => return false,
+    };
+    let Some(conv) = slot_converted_desc(d, x, eps) else { return true };
+    if x == conv || (x.is_nan() && conv.is_nan()) {
+        return false;
+    }
+    match sib {
+        Some(v) => (x == v) != (conv == v),
+        None => true,
+    }
+}
+
+/// A TEXT side against a NaN double. Measured on a scan AND on an index:
+/// `=`, `<` and `<=` are FALSE and `<>` TRUE on both, while `>` and `>=`
+/// DEPEND ON THE PATH (every row on a heap, none on an indexed twin) and
+/// refuse (None). The rows keep their per-row [Expr::TextNum] conversion,
+/// so a non-numeric row still raises 22018 exactly where it did.
+fn text_nan_term(lhs: &Expr, op: Cmp, kind: &ColKind, cs: u8) -> Option<Term> {
+    if !matches!(kind, ColKind::Text) {
+        return None;
+    }
+    let base = match lhs {
+        Expr::CollKey(inner, _) => inner.clone(),
+        other => Box::new(other.clone()),
+    };
+    let op2 = match op {
+        // nothing is BELOW -Infinity
+        Cmp::Eq | Cmp::Lt | Cmp::Le => Cmp::Lt,
+        // everything is at or above it
+        Cmp::Ne => Cmp::Ge,
+        // A GENUINE EXPRESSION SIDE is never index-matched, and there
+        // `>` and `>=` have ONE law: TRUE. Measured identically on the
+        // heap and on the indexed twin - `S || '' > ?`, `S || '' >= ?`,
+        // `UPPER(S) > ?` and `UPPER(S) >= ?` bound NaN all take every
+        // convertible row on T AND on TI, where the same operators on a
+        // BARE COLUMN take every row on T and none on TI.
+        Cmp::Gt | Cmp::Ge if !matches!(*base, Expr::Col(_)) => Cmp::Ge,
+        // ...and a bare column's `>` / `>=` keeps the previous binary's
+        // reading rather than refusing: its answer DEPENDS ON THE ACCESS
+        // PATH, and today's UNKNOWN is the engine's answer on the indexed
+        // half. Refusing would take back a right answer; the heap half
+        // stays the pre-existing wrong one, recorded.
+        Cmp::Gt | Cmp::Ge => return None,
+    };
+    Some(Term::ExprCond(Box::new(Cond2::Cmp(
+        Box::new(Expr::TextNum(base, cs)),
+        op2,
+        Box::new(Expr::Double(f64::NEG_INFINITY)),
+    ))))
+}
+
+/// THE COMPARISON LAW: a DOUBLE message against an EXACT column compares
+/// AS A DOUBLE and is NEVER rounded to its announced INTEGER/NUMERIC slot
+/// - `ID = ?` [2.5] takes no row where a rounded bound takes row 2 or 3,
+/// `ID > ?` [2.9999999] takes 3;9 where a rounded one takes 9, and
+/// `ID < ?` [3000000000.5] never raises. That is exactly [value_cmp]'s
+/// approx arm (the column converts with [exact_to_f64]), reached as an
+/// [Term::ExprCond]: NEVER as `Rhs::Dbl`, which `Term::Cmp` evaluates to
+/// None and would silently drop every row.
+fn double_exact_term(
+    arg: Option<&WireParam>,
+    fid: usize,
+    op: Cmp,
+    kind: &ColKind,
+    wide: Option<i8>,
+    short: Option<i8>,
+) -> Result<Option<Term>, &'static str> {
+    let Some(WireParam::Double(x)) = arg else { return Ok(None) };
+    if !matches!(kind, ColKind::Int | ColKind::Numeric) {
+        return Ok(None);
+    }
+    if x.is_nan() {
+        return Err(NAN_CMP_REFUSAL);
+    }
+    if let Some(sc) = wide {
+        if !double_exact_at(*x, sc) {
+            return Err(WIDE_DOUBLE_REFUSAL);
+        }
+    }
+    // a SHORT-backed column's EQUALITY: an `IN` list converts there and a
+    // written OR does not, and both are one tree here
+    // ([ColKind::WideExact]'s `short`, [SHORT_IN_REFUSAL]). `<>` goes with
+    // it because `NOT IN` desugars into exactly that.
+    if matches!(op, Cmp::Eq | Cmp::Ne) {
+        if let Some(sc) = short {
+            if !double_exact_at(*x, sc) {
+                return Err(SHORT_IN_REFUSAL);
+            }
+        }
+    }
+    Ok(Some(Term::ExprCond(Box::new(Cond2::Cmp(
+        Box::new(Expr::Col(fid)),
+        op,
+        Box::new(Expr::Double(*x)),
+    )))))
+}
+
+/// Give a bound term back the kind every other reader expects
+/// ([ColKind::unwide]) - used where the marked width is NOT an index key
+/// (an aggregate's own output).
+fn unwide_term(t: Term) -> Term {
+    match t {
+        Term::Cmp(f, o, Rhs::Param(s, k, m)) => Term::Cmp(f, o, Rhs::Param(s, k.unwide().0, m)),
+        Term::NumCmp(f, o, Rhs::Param(s, k, m)) => Term::NumCmp(f, o, Rhs::Param(s, k.unwide().0, m)),
+        other => other,
+    }
+}
+
 thread_local! {
     /// Which slots of the client's CURRENT input message arrived in a
     /// FOUR-BYTE integer form (blr_short / blr_long), recorded by
@@ -62076,10 +62917,23 @@ fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
                 None => None,
             },
         ),
-        Expr::NullIf(a, b) => Expr::NullIf(
-            Box::new(subst_params_expr(a, args)?),
-            Box::new(subst_params_expr(b, args)?),
-        ),
+        // NULLIF COMPARES THE CLIENT'S VALUE, not the slot's conversion of
+        // it: `NULLIF(?, 3)` [3.4] answers 3 and `NULLIF(3, ?)` [2.5]
+        // answers 3, where reading through the implicit slot cast answers
+        // NULL - and writes NULL (`UPDATE .. SET N = NULLIF(?, 3)`,
+        // `INSERT .. VALUES (7, NULLIF(?, 3))`). An operand the cast would
+        // CHANGE refuses ([nullif_raw_double]); one it would not
+        // (`NULLIF(?, 3)` [3], an explicit `CAST(? AS INTEGER)`) binds as
+        // before.
+        Expr::NullIf(a, b) => {
+            if nullif_double_flips(a, b, args) {
+                return None;
+            }
+            Expr::NullIf(
+                Box::new(subst_params_expr(a, args)?),
+                Box::new(subst_params_expr(b, args)?),
+            )
+        }
         Expr::Cond(c) => Expr::Cond(Box::new(subst_params_cond(c, args)?)),
         // the [cmp_sides] wrappers, rebuilt around their bound operand
         Expr::TextNum(a, cs) => Expr::TextNum(Box::new(subst_params_expr(a, args)?), *cs),
@@ -69673,6 +70527,64 @@ fn raw_param_in_condition(e: &RawExpr) -> bool {
     }
 }
 
+/// Is any `?` in this expression an OPERAND OF ARITHMETIC rather than a
+/// whole side?  MERGE needs the difference: it desugars its ON predicate
+/// and its WHEN .. AND condition into TEXT, and an operand `?` is one the
+/// engine CONVERTS AT ITS SLOT before the arithmetic runs (the
+/// comparison-typing law), while a whole side is read as it arrived.
+/// Spelling the operand as its raw value therefore computes from the
+/// wrong number - measured 2026-09-20, `MERGE .. ON T.ID = ? + 0` [2.5]
+/// matched NOTHING where the engine rounds to 3, matched row 3 and
+/// DELETED it, and then ran the NOT MATCHED branch and INSERTED a row the
+/// engine never inserts: two row-mutating divergences from one statement.
+fn raw_param_under_arith(e: &RawExpr) -> bool {
+    match e {
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) => {
+            raw_has_param(a) || raw_has_param(b)
+                || raw_param_under_arith(a)
+                || raw_param_under_arith(b)
+        }
+        RawExpr::Neg(a) => raw_has_param(a) || raw_param_under_arith(a),
+        RawExpr::Cast(a, _) => raw_param_under_arith(a),
+        RawExpr::NullIf(a, b) => raw_param_under_arith(a) || raw_param_under_arith(b),
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) => v.iter().any(raw_param_under_arith),
+        RawExpr::Iif(c, a, b) => {
+            raw_cond_param_under_arith(c)
+                || raw_param_under_arith(a)
+                || raw_param_under_arith(b)
+        }
+        RawExpr::Case(branches, else_, _) => {
+            branches
+                .iter()
+                .any(|(c, t)| raw_cond_param_under_arith(c) || raw_param_under_arith(t))
+                || else_.as_deref().is_some_and(raw_param_under_arith)
+        }
+        RawExpr::Cond(c) => raw_cond_param_under_arith(c),
+        _ => false,
+    }
+}
+
+fn raw_cond_param_under_arith(c: &RawCond) -> bool {
+    match c {
+        RawCond::Cmp(a, _, b) => raw_param_under_arith(a) || raw_param_under_arith(b),
+        RawCond::IsNull(a) | RawCond::IsNotNull(a) | RawCond::IsUnknown(a, _) => {
+            raw_param_under_arith(a)
+        }
+        RawCond::Like(a, ..)
+        | RawCond::Starting(a, ..)
+        | RawCond::Containing(a, ..)
+        | RawCond::Similar(a, ..) => raw_param_under_arith(a),
+        RawCond::LikeExpr(a, p, ..)
+        | RawCond::StartingExpr(a, p, ..)
+        | RawCond::ContainingExpr(a, p, ..)
+        | RawCond::SimilarExpr(a, p, ..) => {
+            raw_param_under_arith(a) || raw_param_under_arith(p)
+        }
+        RawCond::Not(inner) => raw_cond_param_under_arith(inner),
+        RawCond::And(v) | RawCond::Or(v) => v.iter().any(raw_cond_param_under_arith),
+    }
+}
+
 /// [raw_param_in_condition] over a value's TEXT (a `?` spelled as such); a
 /// text the raw parser does not read answers false, leaving the caller's
 /// own path as it was.
@@ -69854,15 +70766,28 @@ fn resolve_dest_param_expr(
     // it - E0425, caught by the compiler rather than by a gate. They are
     // module-level below; they capture nothing, taking `&RawExpr` and
     // returning bool, so lifting them changes no behaviour here.
-    fn set(sink: &mut Vec<Option<Descriptor>>, i: usize, d: Descriptor) {
+    // AN UNNUMBERED SLOT IS `usize::MAX`, and `i + 1` WRAPPED TO 0 in a
+    // release build: `resize(0)` then `sink[usize::MAX]` PANICKED the
+    // connection thread, which reaches the client as *Connection to
+    // Firebird server was lost* - a crash wearing a refusal's clothes.
+    // Measured 2026-09-20 on BOTH this binary and the previous committed
+    // one: `SELECT ID, SUM(CAST(? AS INTEGER)) OVER () FROM T` dropped the
+    // connection with `index out of bounds: the len is 0 but the index is
+    // 18446744073709551615`.  A parameter no router numbered is a shape
+    // this server cannot answer, so it REFUSES at prepare instead.
+    fn set(sink: &mut Vec<Option<Descriptor>>, i: usize, d: Descriptor) -> Option<()> {
+        if i == usize::MAX {
+            return None;
+        }
         if sink.len() <= i {
             sink.resize(i + 1, None);
         }
         sink[i] = Some(d);
+        Some(())
     }
     Some(match raw {
         RawExpr::Param(i) => {
-            set(sink, *i, dest.clone());
+            set(sink, *i, dest.clone())?;
             // THE VALUE CONVERTS INTO THE SLOT BEFORE THE ARITHMETIC, not
             // after it. The engine reads the driver's value AT THE SLOT
             // the describe announced and evaluates from there, so
@@ -69896,7 +70821,7 @@ fn resolve_dest_param_expr(
                 if generated_slot_cast(*i)
                     && matches!(t, CastTarget::Int { .. } | CastTarget::Numeric { .. } | CastTarget::Approx)
                 {
-                    set(sink, *i, td);
+                    set(sink, *i, td)?;
                     note_implicit_int(t);
                     return Some(Expr::Cast(Box::new(Expr::Param(*i)), *t, CS_SLOT_CAST));
                 }
@@ -69915,7 +70840,7 @@ fn resolve_dest_param_expr(
                 if matches!(t, CastTarget::Int { bytes: 2 | 4 | 8 } | CastTarget::Numeric { .. })
                     && dest_cast_target(&td) == Some(*t)
                 {
-                    set(sink, *i, td.clone());
+                    set(sink, *i, td.clone())?;
                     // a written NUMERIC cast reads the previous binary's
                     // fraction zeros ([note_implicit_int], round 11)
                     if matches!(t, CastTarget::Numeric { .. }) {
@@ -70005,7 +70930,7 @@ fn resolve_dest_param_expr(
                 && dest_cast_target(dest).is_some_and(|t| matches!(t, CastTarget::Numeric { .. }));
             let left = match (lp, scale0) {
                 (Some((i, negated)), true) => {
-                    set(sink, i, dest.clone());
+                    set(sink, i, dest.clone())?;
                     let bytes = match dest.dtype {
                         dtype::SHORT => 2,
                         dtype::LONG => 4,
@@ -70143,6 +71068,80 @@ fn resolve_dest_param_expr(
         // refuses. `LEFT(S, ?)`, `MOD(?, 2)`, `MOD(5, ?)`, `SUBSTRING(?
         // FROM 1 FOR 1)` keep answering (the engine types those).
         RawExpr::Func(f, args) if strfn_bare_param_untypable(*f, args) => return None,
+        // A NUMERIC FUNCTION'S BARE `?` IS A **DOUBLE** SLOT, NOT THE
+        // DESTINATION'S.  Measured on the engine's own input SQLDA
+        // 2026-09-20: `UPDATE ST SET N = ABS(?)` announces `sqltype 480
+        // DOUBLE len 8`, and so do SIGN, ROUND, ROUND(?,n), TRUNC,
+        // TRUNC(?,n), FLOOR, CEIL and CEILING - the destination plays no
+        // part, exactly as it plays none in a CONDITION.  Passing the
+        // destination down instead CONVERTED THE VALUE BEFORE THE
+        // FUNCTION READ IT, and the fraction the function exists to
+        // inspect was gone: `SET N = FLOOR(?)` [2.5] stored 3 against the
+        // engine's 2, `CEIL(?)` [2.1] stored 2 against 3, `SIGN(?)` [0.4]
+        // stored 0 against 1 - A SIGN FLIPPED TO ZERO - and
+        // `ROUND(?, 1)` [2.45] stored 2 against 3.
+        //
+        // IT BYPASSED CONSTRAINTS, which is the worst shape this chunk
+        // has turned up: `INSERT INTO CK (ID, N) VALUES (5, FLOOR(?))`
+        // [3.5] COMMITTED a row where the engine's FLOOR(3.5) = 3 fires
+        // `CHECK (N <> 3)` and it has none, and `INSERT INTO UO (ID, V)
+        // VALUES (FLOOR(?), 5)` [3.5] inserted a new PRIMARY KEY where
+        // the engine collides on key 3 and raises.  The wrong value also
+        // travelled through a BEFORE trigger and a COMPUTED column (three
+        // columns wrong from one bind).  Every one of them was wrong on
+        // the previous binary too, so none is a regression - the rule
+        // simply never existed.
+        //
+        // The scaled destinations were already right by luck (rounding
+        // 2.5 into NUMERIC(9,2) is 2.50 and FLOOR sees the same fraction)
+        // and stay right, because the function now reads the double and
+        // its RESULT meets the destination's store law afterwards.
+        RawExpr::Func(f, args)
+            if matches!(
+                f,
+                SysFn::Abs
+                    | SysFn::Sign
+                    | SysFn::Round
+                    | SysFn::Trunc
+                    | SysFn::Floor
+                    | SysFn::Ceil
+                    | SysFn::Ceiling
+            ) && args.iter().any(|a| matches!(a, RawExpr::Param(_)))
+                // CAPPED AT AN INT128-BACKED DESTINATION, and the cap is
+                // measured, not cautious: this server's DML store path
+                // REFUSES AT PREPARE when an INT128 / NUMERIC(38,x)
+                // column is fed an APPROXIMATE source, so typing the
+                // slot DOUBLE there turned `SET H2 = CEIL(?)` [2.1] and
+                // `SET H2 = FLOOR(?)` / `ABS(?)` - which the previous
+                // binary answered EXACTLY like the engine - into
+                // refusals.  Three floor cells for one wrong answer is
+                // the wrong trade, so the INT128 widths keep the
+                // destination's own slot and their one remaining
+                // divergence (`SET H = CEIL(?)` [2.1] stores 2 where the
+                // engine stores 3) is RECORDED rather than swapped for a
+                // regression.  Lifting the cap means teaching the store
+                // path an approximate INT128 source, which is its own
+                // chunk.
+                && dest.dtype != dtype::INT128 =>
+        {
+            let approx = Descriptor {
+                dtype: dtype::DOUBLE,
+                scale: 0,
+                length: 8,
+                sub_type: 0,
+                flags: dest.flags,
+                offset: dest.offset,
+            };
+            Expr::Func(
+                *f,
+                args.iter()
+                    .map(|a| {
+                        let d = if matches!(a, RawExpr::Param(_)) { &approx } else { dest };
+                        resolve_dest_param_expr(a, d, columns, descs, sink).map(slot_operand)
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            )
+        }
         RawExpr::Func(f, args) => Expr::Func(
             *f,
             args.iter()
@@ -70498,6 +71497,48 @@ fn is_text_param_rung(e: &Expr) -> bool {
 /// field - which nothing but the 22018 spelling of an EVALUATED cast
 /// reads, and a whole-side rung is collapsed at bind and never evaluated.
 const CS_WHOLE_SIDE: u8 = 0xFE;
+
+/// [CS_WHOLE_SIDE] for a rung typed from an INT64-BACKED exact slot
+/// (BIGINT, NUMERIC(10..18,s)) - the ONE width whose INDEX BOUND the
+/// engine rounds ([ColKind::WideExact] carries the law and the probes).
+/// [cmp_param_rung] casts every exact slot at EIGHT bytes whatever the
+/// slot's own width, so the CastTarget alone cannot tell a LONG-backed
+/// column from an INT64-backed one; round 1 of this chunk keyed
+/// [wide_whole_side_double] on `bytes: 8 | 16` and so refused every
+/// fractional double on an INTEGER / SMALLINT / NUMERIC(9,2) /
+/// NUMERIC(4,1) column too - 163 binds the previous binary answered
+/// exactly like the engine, on the HEAP and on the INDEXED twin alike,
+/// because a SHORT- or LONG-backed key IS a double key and never rounds.
+/// The stamp carries the source width instead of the cast target, so
+/// nothing about the tree's TYPE changes. Every reader of
+/// [CS_WHOLE_SIDE] takes this one too ([is_whole_side]); only
+/// [wide_whole_side_double] tells them apart. An INT128 slot never gets
+/// here at all - [cmp_param_rung] has no encoder for it and returns None.
+const CS_WHOLE_SIDE_W: u8 = 0xF8;
+
+/// [CS_WHOLE_SIDE] for a rung whose OTHER SIDE IS SINGLE PRECISION - a
+/// FLOAT column, `CAST(.. AS FLOAT)`, ABS / a unary minus / ROUND over
+/// one, or a conditional whose every branch is single or exact
+/// ([approx_expr_single]).  It exists for ONE reader, the NaN order.
+///
+/// THE SLOT CANNOT CARRY IT: [param_desc_from_expr] announces DOUBLE
+/// PRECISION (480) for a FLOAT column too, so `FL > (?)` and `D > (?)`
+/// build the SAME rung - and the engine answers every row for one and
+/// no row for the other, because a NaN sorts BELOW a single or exact
+/// side and the FIRST WRITTEN OPERAND is the lesser against a double one
+/// ([nan_cmp_verdict], 864 three-way cells 2026-09-20).  The stamp
+/// carries the partner's precision instead, so nothing about the
+/// describe moves - the announced slot is the same DOUBLE either way,
+/// and the pre-existing 482-versus-480 gap is unchanged.
+const CS_WHOLE_SIDE_S: u8 = 0xF6;
+
+/// Any whole-side stamp ([CS_WHOLE_SIDE], [CS_WHOLE_SIDE_W],
+/// [CS_WHOLE_SIDE_S]) - the three differ only in what they REMEMBER
+/// about the sides (the source width, the partner's precision), never in
+/// what the rung IS.
+fn is_whole_side(cs: u8) -> bool {
+    matches!(cs, CS_WHOLE_SIDE | CS_WHOLE_SIDE_W | CS_WHOLE_SIDE_S)
+}
 
 /// The charset stamp of an IMPLICIT SLOT CAST - the `CAST(? AS <slot>)`
 /// [resolve_dest_param_expr] builds for a bare `?` whose described slot
@@ -71113,7 +72154,7 @@ const CS_CMP_RAISE: u8 = 0xF3;
 /// IIF(DT < ?..)` updates row 1, `UPDATE TS .. WHERE IIF(TM > ?..)` every
 /// row) follow. A BOOLEAN slot keeps the plain evaluated cast, which
 /// measured right (`IIF(? = TRUE, ..)`).
-fn whole_side_rung(i: usize, slot: &Descriptor) -> Option<Expr> {
+fn whole_side_rung(i: usize, slot: &Descriptor, other_single: bool) -> Option<Expr> {
     // A TIME slot INSIDE A SUBQUERY BODY refuses at prepare. node-firebird
     // binds every string into a TIME slot as a blr_timestamp message; the
     // outer whole side promotes it per row ([bind_whole_side_temporal],
@@ -71134,13 +72175,26 @@ fn whole_side_rung(i: usize, slot: &Descriptor) -> Option<Expr> {
     if matches!(slot.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) && CORR_INNER_PLAN.with(|c| c.get()) {
         CORR_WHOLE_EXACT.with(|c| c.borrow_mut().push(i));
     }
+    // an INT64-backed exact slot is the one width whose INDEX BOUND the
+    // engine rounds, and [cmp_param_rung] casts every exact slot at
+    // eight bytes - so the SOURCE width travels in the stamp
+    // ([CS_WHOLE_SIDE_W]), not in the cast target
+    let stamp = if slot.dtype == dtype::INT64 { CS_WHOLE_SIDE_W } else { CS_WHOLE_SIDE };
+    // ...and an APPROXIMATE slot remembers the PARTNER'S precision
+    // instead ([CS_WHOLE_SIDE_S]): the slot itself is DOUBLE for a FLOAT
+    // side as well, and the NaN order splits on exactly that
+    let approx_stamp = if other_single { CS_WHOLE_SIDE_S } else { CS_WHOLE_SIDE };
     Some(match cmp_param_rung(i, slot)? {
         Expr::Cast(
             p,
             t @ (CastTarget::Int { .. }
-            | CastTarget::Numeric { .. }
-            | CastTarget::Text { .. }
-            | CastTarget::Approx
+            | CastTarget::Numeric { .. }),
+            _,
+        ) => Expr::Cast(p, t, stamp),
+        Expr::Cast(p, t @ CastTarget::Approx, _) => Expr::Cast(p, t, approx_stamp),
+        Expr::Cast(
+            p,
+            t @ (CastTarget::Text { .. }
             | CastTarget::Float
             | CastTarget::Temporal(_)),
             _,
@@ -71164,8 +72218,8 @@ fn whole_side_exact(e: &Expr) -> Option<(usize, u32)> {
             | CastTarget::Approx
             | CastTarget::Float
             | CastTarget::Temporal(_),
-            CS_WHOLE_SIDE,
-        ) => {
+            cs,
+        ) if is_whole_side(*cs) => {
             match **inner {
                 Expr::Param(i) => Some(i),
                 _ => None,
@@ -71370,7 +72424,9 @@ fn bind_whole_side_exact_cmp(a: &Expr, op: Cmp, b: &Expr, args: &[WireParam]) ->
     use fire_crab_ods::intl::CS_UTF8;
     let rung = |e: &Expr| -> Option<(usize, i8)> {
         match e {
-            Expr::Cast(inner, t @ (CastTarget::Int { .. } | CastTarget::Numeric { .. }), CS_WHOLE_SIDE) => {
+            Expr::Cast(inner, t @ (CastTarget::Int { .. } | CastTarget::Numeric { .. }), cs)
+                if is_whole_side(*cs) =>
+            {
                 let Expr::Param(i) = **inner else { return None };
                 let scale = match t {
                     CastTarget::Numeric { scale, .. } => *scale,
@@ -71836,9 +72892,10 @@ fn resolve_cmp_param_side(
     descs: &[Descriptor],
     sink: &mut Vec<Option<Descriptor>>,
     whole: bool,
+    other_single: bool,
 ) -> Option<Expr> {
     let (e, fresh) = marking_chunk_new(sink, |sink| {
-        resolve_cmp_param_side_body(raw, slot, columns, descs, sink, whole)
+        resolve_cmp_param_side_body(raw, slot, columns, descs, sink, whole, other_single)
     })?;
     let whole_slot = match raw {
         RawExpr::Param(i) if whole => Some(*i),
@@ -71862,6 +72919,7 @@ fn resolve_cmp_param_side_body(
     descs: &[Descriptor],
     sink: &mut Vec<Option<Descriptor>>,
     whole: bool,
+    other_single: bool,
 ) -> Option<Expr> {
     let arith_ok = matches!(
         slot.dtype,
@@ -71892,7 +72950,7 @@ fn resolve_cmp_param_side_body(
         RawExpr::Param(i) => {
             claim_param_slot(sink, *i, slot)?;
             if whole {
-                whole_side_rung(*i, slot)?
+                whole_side_rung(*i, slot, other_single)?
             } else {
                 cmp_param_rung(*i, slot)?
             }
@@ -71921,7 +72979,7 @@ fn resolve_cmp_param_side_body(
             if w {
                 return None;
             }
-            Expr::Neg(Box::new(resolve_cmp_param_side(a, slot, columns, descs, sink, w)?))
+            Expr::Neg(Box::new(resolve_cmp_param_side(a, slot, columns, descs, sink, w, other_single)?))
         }
         RawExpr::Bin(a, op, b) => {
             if !arith_ok {
@@ -71945,11 +73003,11 @@ fn resolve_cmp_param_side_body(
             }
             let (da, db) = (direct_param(a), direct_param(b));
             let mut l = match da {
-                None => Some(resolve_cmp_param_side(a, slot, columns, descs, sink, false)?),
+                None => Some(resolve_cmp_param_side(a, slot, columns, descs, sink, false, other_single)?),
                 Some(_) => None,
             };
             let mut r = match db {
-                None => Some(resolve_cmp_param_side(b, slot, columns, descs, sink, false)?),
+                None => Some(resolve_cmp_param_side(b, slot, columns, descs, sink, false, other_single)?),
                 Some(_) => None,
             };
             // a direct `?` SIBLING is handed over as None whether or not
@@ -72006,8 +73064,8 @@ fn resolve_cmp_param_side_body(
                 return None;
             }
             Expr::Concat(
-                Box::new(resolve_cmp_param_side(a, slot, columns, descs, sink, false)?),
-                Box::new(resolve_cmp_param_side(b, slot, columns, descs, sink, false)?),
+                Box::new(resolve_cmp_param_side(a, slot, columns, descs, sink, false, other_single)?),
+                Box::new(resolve_cmp_param_side(b, slot, columns, descs, sink, false, other_single)?),
             )
         }
         other => resolve_expr_sink(other, columns, descs, sink)?,
@@ -72040,7 +73098,7 @@ fn resolve_cmp_pair(
         if !param_target_ok(&slot) {
             return None;
         }
-        (resolve_cmp_param_side(a, &slot, columns, descs, sink, true)?, other)
+        (resolve_cmp_param_side(a, &slot, columns, descs, sink, true, approx_expr_single(&other, descs))?, other)
     } else if bb {
         let other = resolve_expr(a, columns, descs)?;
         if matches!(other, Expr::Null) || expr_reads_zoned_col(&other, descs) {
@@ -72050,7 +73108,8 @@ fn resolve_cmp_pair(
         if !param_target_ok(&slot) {
             return None;
         }
-        (other, resolve_cmp_param_side(b, &slot, columns, descs, sink, true)?)
+        let single = approx_expr_single(&other, descs);
+        (other, resolve_cmp_param_side(b, &slot, columns, descs, sink, true, single)?)
     } else {
         // (a conditional's bare `?` branch against an INT128 / DECFLOAT
         // other side refuses here too - [raw_conditional_bare_param])
@@ -72188,16 +73247,29 @@ fn resolve_proj_expr(
         cap_note("K4 (a one-operand TRIM over a `?` in a conditional's value arm)");
         return None;
     }
-    fn set(sink: &mut Vec<Option<Descriptor>>, i: usize, d: Descriptor) {
+    // AN UNNUMBERED SLOT IS `usize::MAX`, and `i + 1` WRAPPED TO 0 in a
+    // release build: `resize(0)` then `sink[usize::MAX]` PANICKED the
+    // connection thread, which reaches the client as *Connection to
+    // Firebird server was lost* - a crash wearing a refusal's clothes.
+    // Measured 2026-09-20 on BOTH this binary and the previous committed
+    // one: `SELECT ID, SUM(CAST(? AS INTEGER)) OVER () FROM T` dropped the
+    // connection with `index out of bounds: the len is 0 but the index is
+    // 18446744073709551615`.  A parameter no router numbered is a shape
+    // this server cannot answer, so it REFUSES at prepare instead.
+    fn set(sink: &mut Vec<Option<Descriptor>>, i: usize, d: Descriptor) -> Option<()> {
+        if i == usize::MAX {
+            return None;
+        }
         if sink.len() <= i {
             sink.resize(i + 1, None);
         }
         sink[i] = Some(d);
+        Some(())
     }
     Some(match raw {
         RawExpr::Cast(inner, t) => {
             if let RawExpr::Param(i) = &**inner {
-                set(sink, *i, cast_target_descriptor(t)?);
+                set(sink, *i, cast_target_descriptor(t)?)?;
                 // a trigger view's GENERATED `CAST(? AS <slot>)` is an
                 // implicit slot cast ([GENERATED_SLOT_CASTS], round 9);
                 // a CAST the statement wrote keeps the written stamp
@@ -77267,6 +78339,13 @@ fn round_places(nv: Option<&Value>) -> Result<i32, EvalErr> {
 /// the fudge that recovers 1.005 -> 1.01 from its 1.00499.. binary form);
 /// the DOUBLE-typed result is that scaled integer converted back.
 fn round_double(mut d: f64, s: i32, eps: f64) -> Result<Value, EvalErr> {
+    // a NaN ROUNDS TO 0, as every other exact conversion of one does
+    // ([approx_to_exact]) - measured over a STORED NaN: `ROUND(D, 0)` and
+    // `CAST(ROUND(D, 0) AS VARCHAR)` are 0 on the engine where the
+    // non-finite gate below raised 22003
+    if d.is_nan() {
+        d = 0.0;
+    }
     if s > 0 {
         d /= 10f64.powi(s);
     } else if s < 0 {
@@ -77532,8 +78611,10 @@ impl Expr {
                         ColKind::Numeric
                         | ColKind::Temporal(_)
                         | ColKind::Approx
+                        | ColKind::ApproxSingle
                         | ColKind::DecFloat { .. }
-                        | ColKind::Bool,
+                        | ColKind::Bool
+                        | ColKind::WideExact { .. },
                     ) => None,
                     None if is_numeric_col(d) => Some(ExprType::Numeric),
                     None if is_approx_col(d) => Some(ExprType::Approx),
@@ -79494,9 +80575,23 @@ impl Expr {
                                 // answers, not 0 (the NUMERIC arm and the
                                 // store path pin the same constant)
                                 let x = approx_of(&v).unwrap_or(0.0);
-                                if !x.is_finite() {
+                                // +-Infinity is the engine's 22003, and a
+                                // NaN CONVERTS TO 0 (measured on INSERT,
+                                // UPDATE, CAST and a procedure argument
+                                // alike, and on a stored NaN's
+                                // `CAST(D AS INTEGER)`). A VALUE-position
+                                // slot cast keeps today's refusal: the
+                                // engine does not convert there at all
+                                // (`MAXVALUE(?, -2)` [NaN] is -2, not 0),
+                                // and answering 0 would be a new wrong
+                                // answer beside NULLIF and MAXVALUE.
+                                if x.is_infinite() {
+                                    return Err(EvalErr::NumericOutOfRange);
+                                }
+                                if x.is_nan() && (matches!(*cs, CS_SLOT_CAST) || is_whole_side(*cs)) {
                                     return Err(EvalErr::ConversionError(None));
                                 }
+                                let x = if x.is_nan() { 0.0 } else { x };
                                 let eps = if matches!(v, Value::Float(_)) && approx_source_is_single(e) {
                                     1e-5
                                 } else {
@@ -79841,6 +80936,17 @@ impl Expr {
                             // rescale from
                             v if approx_of(v).is_some() => {
                                 let d = approx_of(v).unwrap_or(0.0);
+                                // the Int arm's law, at this target too:
+                                // +-Infinity is 22003 and a NaN converts
+                                // to 0 everywhere but a VALUE-position
+                                // slot cast
+                                if d.is_infinite() {
+                                    return Err(EvalErr::NumericOutOfRange);
+                                }
+                                if d.is_nan() && (matches!(*cs, CS_SLOT_CAST) || is_whole_side(*cs)) {
+                                    return Err(EvalErr::ConversionError(None));
+                                }
+                                let d = if d.is_nan() { 0.0 } else { d };
                                 let scaled = d * 10f64.powi(-(*scale) as i32);
                                 if !scaled.is_finite() {
                                     return Err(EvalErr::ConversionError(None));
@@ -79859,7 +80965,19 @@ impl Expr {
                                 // overflow at i64 or below, so their
                                 // double source cannot reach a noisy
                                 // in-range value and keeps the direct form.
-                                if *bytes == 16 {
+                                // A RUNTIME value below 2^53 takes the eps
+                                // law, where a double LITERAL takes its
+                                // DECIMAL TEXT: `CAST(? AS NUMERIC(38,2))`
+                                // [10.075] is 10.07 and [5.015] is 5.01,
+                                // while `CAST(10.075e0 AS NUMERIC(38,2))`
+                                // is 10.08 and `CAST(5.015e0 ...)` 5.02
+                                // (measured both ways). [approx_const_fold]
+                                // is the split; at or past 2^53 the
+                                // decimal path keeps every value it had.
+                                if *bytes == 16
+                                    && (approx_const_fold(e)
+                                        || scaled.abs() >= 9_007_199_254_740_992.0)
+                                {
                                     if scaled.round().abs()
                                         >= 1.701_411_834_604_692_3e38
                                     {
@@ -88066,6 +89184,17 @@ fn matching_paren(b: &[u8], open: usize) -> Option<usize> {
 struct RawTerm {
     lhs: RawLhs,
     kind: RawKind,
+    /// THE WRITTEN OPERAND ORDER, and the one thing the resolved tree
+    /// cannot recover: [parse_leaf] rewrites `? op X` into `X
+    /// mirror(op) ?` (the engine describes the slot from the other side
+    /// whichever way it is written), so ONE term carries BOTH spellings
+    /// - and the engine's NaN comparison is NOT symmetric under that
+    /// rewrite.  `WHERE D <= ?` [NaN] is every row while `WHERE ? >= D`
+    /// is none, one `Cmp::Le` term either way.  True means the `?` was
+    /// written FIRST; only [parse_leaf]'s mirror sets it, and
+    /// [negate_term] and the LHS rewrites carry it along.  Read by
+    /// [nan_cmp_verdict] and nothing else.
+    mirrored: bool,
 }
 #[derive(Clone)]
 enum RawLhs {
@@ -88298,6 +89427,7 @@ fn parse_unary(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             Some(Ast::Leaf(RawTerm {
                 lhs: RawLhs::Col(String::new()),
                 kind: RawKind::Const(b),
+                mirrored: false,
             }))
         }
         _ => parse_leaf(t, pos, np),
@@ -88329,7 +89459,7 @@ fn parse_value(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
         Tok::Param => {
             *np += 1;
             // the ColKind is a placeholder until resolution knows the column
-            Rhs::Param(*np - 1, ColKind::Int)
+            Rhs::Param(*np - 1, ColKind::Int, false)
         }
         _ => return None,
     };
@@ -88612,13 +89742,18 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     return Some(Ast::Leaf(RawTerm {
                         lhs,
                         kind: RawKind::Cmp(mirror_cmp(op), param),
+                        // THE `?` WAS WRITTEN FIRST ([RawTerm::mirrored]):
+                        // the leaf reads `X mirror(op) ?` from here on,
+                        // and only this flag remembers that the engine
+                        // saw `? op X`
+                        mirrored: true,
                     }));
                 }
             }
             // The slot number, for the shapes below that keep the `?`
             // as the TESTED side
             let slot = match &param {
-                Rhs::Param(s, _) => *s,
+                Rhs::Param(s, _, ..) => *s,
                 _ => return None, // parse_value on Tok::Param yields Param
             };
             // `? IS [NOT] NULL` / `? IS UNKNOWN` (UNKNOWN lexes as
@@ -88640,6 +89775,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     return Some(Ast::Leaf(RawTerm {
                         lhs: RawLhs::Param(slot),
                         kind: if not { RawKind::IsNotNull } else { RawKind::IsNull },
+                        mirrored: false,
                     }));
                 }
                 // `? IS TRUE/FALSE/DISTINCT FROM` with a param left
@@ -88707,6 +89843,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     return Some(Ast::Leaf(RawTerm {
                         lhs: RawLhs::Param(slot),
                         kind: RawKind::Like(pattern, escape, negated),
+                        mirrored: false,
                     }));
                 }
                 // `? [NOT] STARTING [WITH] <prefix>` - same shape,
@@ -88726,6 +89863,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     return Some(Ast::Leaf(RawTerm {
                         lhs: RawLhs::Param(slot),
                         kind: RawKind::Starting(prefix, negated),
+                        mirrored: false,
                     }));
                 }
                 // `? [NOT] SIMILAR TO <pattern> [ESCAPE 'c']` - the last
@@ -88766,6 +89904,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     return Some(Ast::Leaf(RawTerm {
                         lhs: RawLhs::Param(slot),
                         kind: RawKind::Similar(pattern, escape, negated),
+                        mirrored: false,
                     }));
                 }
                 // `? [NOT] BETWEEN <lo> AND <hi>` desugars into the
@@ -88794,6 +89933,9 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         Some(Ast::Leaf(RawTerm {
                             lhs: RawLhs::Expr(raw_of(bound)?),
                             kind: RawKind::Cmp(op, param.clone()),
+                            // `? BETWEEN lo AND hi` is WRITTEN `? >= lo`
+                            // and `? <= hi`; the desugar mirrors both
+                            mirrored: true,
                         }))
                     };
                     // THE LOW BOUND TYPES THE SLOT, and it does so
@@ -88875,6 +90017,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         ors.push(Ast::Leaf(RawTerm {
                             lhs: RawLhs::Expr(raw_of(item)?),
                             kind: RawKind::Cmp(Cmp::Eq, param.clone()),
+                            mirrored: true,
                         }));
                     }
                     let body = Ast::Or(ors);
@@ -88906,6 +90049,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                 return Some(Ast::Leaf(RawTerm {
                     lhs: RawLhs::Expr(RawExpr::Bool(true)),
                     kind: RawKind::Cmp(Cmp::Eq, param),
+                    mirrored: false,
                 }));
             }
         }
@@ -88937,7 +90081,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             e => RawLhs::Expr(e),
         },
     };
-    let leaf = |kind: RawKind| Ast::Leaf(RawTerm { lhs: lhs.clone(), kind });
+    let leaf = |kind: RawKind| Ast::Leaf(RawTerm { lhs: lhs.clone(), kind, mirrored: false });
     // an optional NOT immediately before LIKE/BETWEEN/IN/STARTING/
     // CONTAINING (the last three lex as Idents - each is a usable
     // column name, probed: CREATE TABLE T2 (STARTING INT) succeeds -
@@ -89071,10 +90215,12 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         Side::Val(v) => Ast::Leaf(RawTerm {
                             lhs: lhs.clone(),
                             kind: RawKind::Cmp(op, v.clone()),
+                            mirrored: false,
                         }),
                         Side::Expr(e) => Ast::Leaf(RawTerm {
                             lhs: lhs.clone(),
                             kind: RawKind::CmpExpr(op, e.clone()),
+                            mirrored: false,
                         }),
                     }
                 };
@@ -89084,18 +90230,18 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         cmp_leaf(Cmp::Eq),
                         Ast::And(vec![
                             leaf(RawKind::IsNull),
-                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull }),
+                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull, mirrored: false }),
                         ]),
                     ]),
                     (false, Some(rl)) => Ast::Or(vec![
                         cmp_leaf(Cmp::Ne),
                         Ast::And(vec![
                             leaf(RawKind::IsNull),
-                            Ast::Leaf(RawTerm { lhs: rl.clone(), kind: RawKind::IsNotNull }),
+                            Ast::Leaf(RawTerm { lhs: rl.clone(), kind: RawKind::IsNotNull, mirrored: false }),
                         ]),
                         Ast::And(vec![
                             leaf(RawKind::IsNotNull),
-                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull }),
+                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull, mirrored: false }),
                         ]),
                     ]),
                     // the right side is a value that is not NULL
@@ -89441,7 +90587,7 @@ fn negate_term(t: &RawTerm) -> Option<RawTerm> {
         // three-valued subtlety, it is TRUE or FALSE, never UNKNOWN
         RawKind::Const(b) => RawKind::Const(!b),
     };
-    Some(RawTerm { lhs: t.lhs.clone(), kind })
+    Some(RawTerm { lhs: t.lhs.clone(), kind, mirrored: t.mirrored })
 }
 
 /// Split a token slice on top-level commas only - commas nested inside
@@ -89503,6 +90649,85 @@ enum ColKind {
     DecFloat { wide: bool },
     /// a BOOLEAN parameter target - a binding marker only
     Bool,
+    /// an INT64/INT128-backed exact target (BIGINT, NUMERIC(10..18,s),
+    /// INT128, NUMERIC(19..38,s), or an exact EXPRESSION of that width) -
+    /// a DOUBLE-BINDING MARKER ONLY, never a kind any other reader sees.
+    ///
+    /// THE LAW IT CARRIES: an index on such a column builds its bound by
+    /// ROUNDING the bound double to the key's scale and then re-checks
+    /// each row as a double, so the INDEXED and the SCANNED answers
+    /// DIFFER - `BI > ?` [2.5] is 3;9 on a heap and 9 on an indexed twin,
+    /// `N18 = ?` [900719925474099.25] is 9 on a heap and none indexed, and
+    /// an index COMPUTED BY (BI + 0) rounds the same way. SHORT- and
+    /// LONG-backed keys (INTEGER, SMALLINT, NUMERIC(4,1), NUMERIC(9,2))
+    /// are DOUBLE keys and do not round, which is why only this width is
+    /// marked. A double the key holds EXACTLY ([double_exact_at]) picks
+    /// the same rows either way and is answered; every other one refuses,
+    /// because this server cannot tell which access path the engine chose.
+    /// [ColKind::unwide] gives back the kind every other bind reads.
+    ///
+    /// `short` flips the marker to the OTHER width whose backing shows:
+    /// a SHORT-BACKED exact column (SMALLINT, NUMERIC(1..4,s)) CONVERTS a
+    /// bound double INTO ITS OWN TYPE inside a MULTI-ITEM `IN` LIST, where
+    /// every other width compares as a double - `SM IN (?, 99)` [2.5]
+    /// takes the SM = 3 row and `N41 IN (?, 99)` [2.45] the N41 = 2.5 row,
+    /// while `SM = ?`, `SM IN (?)` (one item) and the INTEGER, BIGINT,
+    /// NUMERIC(9,2), NUMERIC(18,1) and INT128 twins all take none
+    /// (measured 2026-09-20, both tables). An `IN` desugars at parse into
+    /// the same OR of equalities a written `SM = ? OR SM = 99` builds -
+    /// and THAT one takes none - so the two spellings are one tree here
+    /// and the equality REFUSES rather than pick a side. `<>`, `<`, `<=`,
+    /// `>`, `>=` and BETWEEN are unaffected: they compare as doubles in
+    /// every width. `short` carries NO wide-key law ([ColKind::unwide]
+    /// hands back `None`).
+    WideExact { numeric: bool, scale: i8, short: bool },
+    /// A SINGLE-PRECISION approximate target - a FLOAT column, or an
+    /// expression the engine still types FLOAT ([approx_expr_single]:
+    /// ABS / unary minus over one, CAST(.. AS FLOAT), a conditional whose
+    /// branches are all single or exact). A NaN-BINDING MARKER ONLY -
+    /// [ColKind::unwide] hands every other reader the plain `Approx`, and
+    /// the announced slot is the same DOUBLE either way.
+    ///
+    /// THE LAW IT CARRIES: the engine has TWO NaN orders, and the other
+    /// side's precision picks which. Against a SINGLE side (and against
+    /// an exact one) a NaN sorts BELOW everything, a consistent order:
+    /// `FL < ?` and `? > FL` are no row, `FL >= ?` and `? <= FL` every
+    /// row. Against a DOUBLE side the compare is NOT symmetric - the
+    /// FIRST operand is the lesser whichever way round it is written, so
+    /// `D <= ?` is every row while `? >= D` is none. The previous
+    /// binary's reading (partial_cmp().unwrap_or(Equal): a NaN equals
+    /// everything) is the engine's answer exactly where the two verdicts
+    /// coincide, which for a single side is `<` in both written orders -
+    /// and [parse_leaf] has already MIRRORED `? > FL` into `FL < ?`, so
+    /// only an operator whose BOTH written orders agree can be answered
+    /// at all. Measured 2026-09-20 over 596 + 1344 three-way cells.
+    ApproxSingle,
+}
+
+impl ColKind {
+    /// The kind to bind with, and the key scale a DOUBLE must be exact at
+    /// (None when the target is not an INT64/INT128-backed key).
+    fn unwide(self) -> (ColKind, Option<i8>) {
+        match self {
+            ColKind::WideExact { numeric, scale, short } => (
+                if numeric { ColKind::Numeric } else { ColKind::Int },
+                if short { None } else { Some(scale) },
+            ),
+            // a NaN-only marker: every other bind reads the plain kind
+            ColKind::ApproxSingle => (ColKind::Approx, None),
+            k => (k, None),
+        }
+    }
+
+    /// The key scale of a SHORT-BACKED exact target, where a MULTI-ITEM
+    /// `IN` list converts the bound double ([ColKind::WideExact]'s
+    /// `short`); None for every other width.
+    fn short_scale(self) -> Option<i8> {
+        match self {
+            ColKind::WideExact { scale, short: true, .. } => Some(scale),
+            _ => None,
+        }
+    }
 }
 // ===================================================================
 // PSQL EXECUTION
@@ -91703,6 +92928,8 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
     // is compared with. Anything else keeps the old refusal.
     // (the markers the value typing finds at a VALUE position - round 9)
     let mut value_slots: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut raw_cmp_slots: std::collections::HashMap<usize, Option<f64>> =
+        std::collections::HashMap::new();
     let params: Vec<Descriptor> = if nparams == 0 {
         Vec::new()
     } else {
@@ -91716,7 +92943,7 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
             }
             match act {
                 MergeAction::Update(sets) => {
-                    type_markers_in_sets(sets, &columns, descs, &tgt_alias, &mut slots, &mut value_slots)?
+                    type_markers_in_sets(sets, &columns, descs, &tgt_alias, &mut slots, &mut value_slots, &mut raw_cmp_slots)?
                 }
                 MergeAction::Delete => {}
             }
@@ -91725,7 +92952,7 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
             if let Some(c) = cond {
                 type_markers_in_cond(c, &columns, descs, &tgt_alias, &mut slots)?;
             }
-            type_markers_in_values(cols.as_ref(), vals, &columns, descs, &mut slots, &mut value_slots)?;
+            type_markers_in_values(cols.as_ref(), vals, &columns, descs, &mut slots, &mut value_slots, &mut raw_cmp_slots)?;
         }
         // a marker in the SOURCE query - or anywhere else this walk did
         // not reach - has no type here
@@ -91746,7 +92973,7 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
     for (_, _, vals) in &not_matched {
         merge_scale0_slots(vals, &mut scale0);
     }
-    let param_slots: Vec<(Descriptor, bool, bool)> = params
+    let param_slots: Vec<(Descriptor, bool, bool, Option<Option<f64>>)> = params
         .iter()
         .enumerate()
         .map(|(i, d)| {
@@ -91755,7 +92982,12 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
                 dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128
             );
             let s0 = scale0.contains(&i) && exact && d.scale != 0;
-            (d.clone(), s0, !s0 && value_slots.contains(&i))
+            (
+                d.clone(),
+                s0,
+                !s0 && value_slots.contains(&i),
+                raw_cmp_slots.get(&i).copied(),
+            )
         })
         .collect();
     Some((
@@ -91959,6 +93191,7 @@ fn type_markers_in_sets(
     tgt_alias: &str,
     params: &mut [Option<Descriptor>],
     value_slots: &mut std::collections::HashSet<usize>,
+    raw_cmp_slots: &mut std::collections::HashMap<usize, Option<f64>>,
 ) -> Option<()> {
     for part in split_set_list(sets) {
         let eq = part.find('=')?;
@@ -91984,10 +93217,13 @@ fn type_markers_in_sets(
         // the value is not a tree that resolver reads.
         match merge_marker_descs(&part[eq + 1..], &d, columns, descs) {
             Some(typed) => {
-                for (slot, sd, value) in typed {
+                for (slot, sd, value, raw_cmp) in typed {
                     set_marker_desc(params, slot, sd)?;
                     if value {
                         value_slots.insert(slot);
+                    }
+                    if let Some(sib) = raw_cmp {
+                        raw_cmp_slots.insert(slot, sib);
                     }
                 }
             }
@@ -92070,7 +93306,7 @@ fn merge_marker_descs(
     dest: &Descriptor,
     columns: &[RelationColumn],
     descs: &[Descriptor],
-) -> Option<Vec<(usize, Descriptor, bool)>> {
+) -> Option<Vec<(usize, Descriptor, bool, Option<Option<f64>>)>> {
     let slots = marker_slots(value);
     let mut raw = parse_raw_expr_any(&merge_markers_as_params(value)?)?;
     let mut next = 0usize;
@@ -92091,11 +93327,17 @@ fn merge_marker_descs(
     // per-row text is spelled from the same distinction (round 9, P1).
     let mut vals = Vec::new();
     value_slot_params(&tree, &mut vals);
+    // ...and WHICH ARE NULLIF OPERANDS, where the engine compares the raw
+    // client value ([nullif_operand_params])
+    let mut raws = Vec::new();
+    nullif_operand_params(&tree, &mut raws);
     slots
         .into_iter()
         .zip(sink)
         .enumerate()
-        .map(|(k, (s, d))| Some((s, d?, vals.contains(&k))))
+        .map(|(k, (s, d))| {
+            Some((s, d?, vals.contains(&k), raws.iter().find(|(i, _)| *i == k).map(|(_, v)| *v)))
+        })
         .collect()
 }
 
@@ -92133,6 +93375,68 @@ fn value_slot_params(e: &Expr, out: &mut Vec<usize>) {
     }
 }
 
+/// The `?` indexes that are a NULLIF OPERAND's implicit slot cast, each
+/// with the value of the OTHER operand when that is a plain numeric
+/// literal ([nullif_double_flips_slot] needs it to tell a conversion that
+/// flips the verdict from one that does not). MERGE reads this where the
+/// other paths read the tree itself ([nullif_double_flips]).
+fn nullif_operand_params(e: &Expr, out: &mut Vec<(usize, Option<f64>)>) {
+    // a plain numeric literal under any number of unary minuses
+    fn lit_of(e: &Expr) -> Option<f64> {
+        let mut e = e;
+        let mut neg = false;
+        while let Expr::Neg(a) = e {
+            e = a;
+            neg = !neg;
+        }
+        let sign = if neg { -1.0 } else { 1.0 };
+        Some(sign * match e {
+            Expr::Int(n) => *n as f64,
+            Expr::Int128(v) => *v as f64,
+            Expr::Dec(r, sc) => exact_to_f64(*r as i128, *sc as i32),
+            Expr::Double(d) => *d,
+            _ => return None,
+        })
+    }
+    match e {
+        Expr::NullIf(a, b) => {
+            for (s, other) in [(a, b), (b, a)] {
+                let mut x: &Expr = s;
+                while let Expr::Neg(y) = x {
+                    x = y;
+                }
+                if let Expr::Cast(inner, _, cs) = x {
+                    if *cs >= CS_IMPLICIT_FLOOR {
+                        if let Expr::Param(i) = **inner {
+                            out.push((i, lit_of(other)));
+                        }
+                    }
+                }
+                nullif_operand_params(s, out);
+            }
+        }
+        Expr::Cast(a, _, _) | Expr::Neg(a) => nullif_operand_params(a, out),
+        Expr::Bin(a, _, b) | Expr::Concat(a, b) => {
+            nullif_operand_params(a, out);
+            nullif_operand_params(b, out);
+        }
+        Expr::Coalesce(v) | Expr::Func(_, v) => {
+            v.iter().for_each(|x| nullif_operand_params(x, out))
+        }
+        Expr::Iif(_, a, b) => {
+            nullif_operand_params(a, out);
+            nullif_operand_params(b, out);
+        }
+        Expr::Case(branches, else_) => {
+            branches.iter().for_each(|(_, t)| nullif_operand_params(t, out));
+            if let Some(x) = else_ {
+                nullif_operand_params(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Every `FC$P<n>` marker back to the `?` it was made from, so the raw
 /// parser sees the statement the client sent.
 fn merge_markers_as_params(value: &str) -> Option<String> {
@@ -92160,6 +93464,7 @@ fn type_markers_in_values(
     descs: &[Descriptor],
     params: &mut [Option<Descriptor>],
     value_slots: &mut std::collections::HashSet<usize>,
+    raw_cmp_slots: &mut std::collections::HashMap<usize, Option<f64>>,
 ) -> Option<()> {
     let items = split_set_list(vals);
     let targets: Vec<&RelationColumn> = match cols {
@@ -92194,10 +93499,13 @@ fn type_markers_in_values(
         // the SET list's twin, one column at a time
         match merge_marker_descs(item, &d, columns, descs) {
             Some(typed) => {
-                for (slot, sd, value) in typed {
+                for (slot, sd, value, raw_cmp) in typed {
                     set_marker_desc(params, slot, sd)?;
                     if value {
                         value_slots.insert(slot);
+                    }
+                    if let Some(sib) = raw_cmp {
+                        raw_cmp_slots.insert(slot, sib);
                     }
                 }
             }
@@ -92332,7 +93640,7 @@ fn merge_subst(
     // per `?` slot: the destination descriptor and the scale-0 flag
     // ([Plan::Merge::param_slots]) - a marker in a VALUE POSITION
     // (`typed_mode` 1) is spelled as its value CONVERTED THROUGH THIS
-    slots: &[(Descriptor, bool, bool)],
+    slots: &[(Descriptor, bool, bool, Option<Option<f64>>)],
     // per SOURCE column: is its value a RUNTIME approximate to the engine
     // ([approx_runtime_expr] of the source's select-list expression; a
     // plain column is)? Only such a value is spelled as its TYPED cast
@@ -92420,6 +93728,71 @@ fn merge_subst(
                         continue;
                     }
                 }
+                // A NULLIF OPERAND compares the CLIENT'S value before
+                // the slot converts it, so a double the slot would change
+                // refuses rather than write the convert-first row - the
+                // UPDATE / INSERT twin of [nullif_raw_double], measured:
+                // `MERGE .. SET N = NULLIF(?, 3)` [2.5] stores 3 on the
+                // engine where this path stored NULL.
+                if let Some((d, _, _, Some(sib))) = slots.get(n) {
+                    if nullif_double_flips_slot(d, args.get(n), *sib) {
+                        return Err(NULLIF_DOUBLE_REFUSAL.into());
+                    }
+                }
+                // A DOUBLE MESSAGE IN A MERGE **CONDITION** - the ON
+                // predicate (`typed_mode` 2) or a WHEN .. AND
+                // (`typed_mode` 0).  MERGE DESUGARS ITS CONDITION INTO
+                // THE TEXT of a per-row UPDATE / DELETE, so the `?` is
+                // gone by the time the predicate is planned and the
+                // double's reading is gone with it: the value is spelled
+                // as a decimal literal, which an INT64-backed key
+                // compares EXACTLY.  Measured 2026-09-20 - `MERGE INTO
+                // MBI T USING (..) S ON T.BI > ? WHEN MATCHED THEN
+                // UPDATE` [2.5] UPDATED ROW 3 where the engine's indexed
+                // reading rounds the bound to 3 and matches NOTHING, and
+                // the DELETE arm, the `WHEN MATCHED AND` arm and the
+                // multi-row `USING SRC .. ON T.ID = S.ID AND T.BI > ?`
+                // form each did the same: FOUR ROW-MUTATING WRONG
+                // ANSWERS, all of them wrong on the previous binary too.
+                // COUNT THE ROUTERS - the plain `UPDATE .. WHERE BI > ?`
+                // twin already refused, and MERGE's condition is a
+                // different router that the rule never reached.
+                //
+                // It refuses here rather than being modelled, and that
+                // costs NOTHING against its own sibling: the plain DML
+                // twin refuses this bind on the HEAP as well as on the
+                // indexed twin (measured), because the bare `?` marks
+                // [ColKind::WideExact] from the column's WIDTH alone.
+                if typed_mode != 1 {
+                    if let (Some(WireParam::Double(x)), Some((d, ..))) =
+                        (args.get(n), slots.get(n))
+                    {
+                        if x.is_nan() {
+                            return Err(NAN_CMP_REFUSAL.to_string());
+                        }
+                        if matches!(d.dtype, dtype::INT64 | dtype::INT128)
+                            && !double_exact_at(*x, d.scale)
+                        {
+                            return Err(WIDE_DOUBLE_REFUSAL.to_string());
+                        }
+                        // ...and a `?` that is an OPERAND OF ARITHMETIC
+                        // inside the condition is one the engine CONVERTS
+                        // AT ITS SLOT before the arithmetic runs, where a
+                        // whole side is read as it arrived
+                        // ([raw_param_under_arith] carries the two
+                        // row-mutating measurements). The desugar spells
+                        // it as its raw value, so a double the slot's
+                        // scale cannot hold computes from the wrong
+                        // number - refuse rather than model it in text.
+                        if !double_exact_at(*x, d.scale)
+                            && merge_markers_as_params(text)
+                                .and_then(|t| parse_raw_expr_any(&t))
+                                .is_some_and(|r| raw_param_under_arith(&r))
+                        {
+                            return Err(MERGE_ARITH_PARAM_REFUSAL.to_string());
+                        }
+                    }
+                }
                 // IN A VALUE POSITION the value converts AT ITS SLOT
                 // first - the engine reads the driver's value there and
                 // evaluates from it, so `SET I = ? * 2` bound 1.6 is
@@ -92427,7 +93800,7 @@ fn merge_subst(
                 // condition are COMPARISONS, not assignments, and keep
                 // the value as it arrived.
                 let e = match (typed_mode == 1, slots.get(n)) {
-                    (true, Some((d, s0, v))) => merge_slot_cast(e, d, *s0, *v),
+                    (true, Some((d, s0, v, _))) => merge_slot_cast(e, d, *s0, *v),
                     _ => e,
                 };
                 let v = match e.eval(&[]) {
@@ -95227,6 +96600,36 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
                     }
                 }
             }
+            // A DOUBLE ARGUMENT into an exact parameter - the same
+            // conversion the store path makes ([approx_to_exact]), which
+            // is the law the engine's argument binding uses too:
+            // `P1(?, ?)` [2.5, 7.245] gives 3 and 7.25, [NaN, NaN] gives
+            // 0 and 0.00, and [2147483647.4] into a NUMERIC(9,2) is the
+            // engine's 22003 where the same value into an INTEGER fits.
+            (Value::Double(x), k) if matches!(k, Some(ColKind::Int)) || is_numeric_col(d) => {
+                use fire_crab_ods::format::dtype as dt;
+                match approx_to_exact(*x, 1e-14, d.dtype, d.scale) {
+                    Ok(r) if d.dtype == dt::INT128 => Value::Int128(r, d.scale),
+                    Ok(r) if d.scale == 0 => Value::Int(r as i64),
+                    Ok(r) => Value::Scaled(r as i64, d.scale),
+                    Err(ApproxFit::OutOfRange) => {
+                        return Err(ProcErr {
+                            rows: Vec::new(),
+                            text: format!(
+                                "procedure {}: {} out of range for {}",
+                                name, x, param.name
+                            ),
+                            status: Some(EvalErr::NumericOutOfRange),
+                        })
+                    }
+                    Err(ApproxFit::TooWide) => {
+                        return Err(ProcErr::from(format!(
+                            "procedure {}: argument type does not match parameter {}",
+                            name, param.name
+                        )))
+                    }
+                }
+            }
             _ => {
                 return Err(ProcErr::from(format!(
                     "procedure {}: argument type does not match parameter {}",
@@ -97339,12 +98742,12 @@ fn resolve_predicate(
                 continue;
             }
             let term = match col_kind(d) {
-                Some(kind) => param_or_typed_term(fid, kind, rt.kind, d, params)?,
+                Some(kind) => param_or_typed_term(fid, kind, rt.kind, d, params, rt.mirrored)?,
                 // scaled NUMERIC/DECIMAL and INT128 columns: the exact
                 // numeric comparison surface
-                None if is_numeric_col(d) => numeric_term(fid, rt.kind, d, params)?,
+                None if is_numeric_col(d) => numeric_term(fid, rt.kind, d, params, rt.mirrored)?,
                 // DECFLOAT columns: the decimal128 comparison surface
-                None if is_decfloat_col(d) => decfloat_term(fid, rt.kind, d, params)?,
+                None if is_decfloat_col(d) => decfloat_term(fid, rt.kind, d, params, rt.mirrored)?,
                 // a DATE/TIME/TIMESTAMP column takes the EXPRESSION
                 // path. Its comparison rules already live there -
                 // `value_cmp` converts a DATE to midnight against a
@@ -97442,12 +98845,12 @@ fn resolve_param_lhs(
                     claim(slot, lit_pat_desc(p.chars().count()));
                     Term::ParamLike(slot, pattern.clone(), *escape, *negated)
                 }
-                Rhs::Param(pslot, _) => {
+                Rhs::Param(pslot, _, ..) => {
                     claim(slot, lit_pat_desc(param_pat_chars));
                     claim(*pslot, lit_pat_desc(param_pat_chars));
                     Term::ParamLike(
                         slot,
-                        Rhs::Param(*pslot, ColKind::Text),
+                        Rhs::Param(*pslot, ColKind::Text, false),
                         *escape,
                         *negated,
                     )
@@ -97468,10 +98871,10 @@ fn resolve_param_lhs(
                     claim(slot, lit_pat_desc(p.chars().count()));
                     Term::ParamStarting(slot, prefix.clone(), *negated)
                 }
-                Rhs::Param(pslot, _) => {
+                Rhs::Param(pslot, _, ..) => {
                     claim(slot, lit_pat_desc(param_pat_chars));
                     claim(*pslot, lit_pat_desc(param_pat_chars));
-                    Term::ParamStarting(slot, Rhs::Param(*pslot, ColKind::Text), *negated)
+                    Term::ParamStarting(slot, Rhs::Param(*pslot, ColKind::Text, false), *negated)
                 }
                 Rhs::Null => {
                     claim(slot, text_desc_chars(1));
@@ -97493,12 +98896,12 @@ fn resolve_param_lhs(
                     claim(slot, lit_pat_desc(p.chars().count()));
                     Term::ParamSimilarLhs(slot, pattern.clone(), *escape, *negated)
                 }
-                Rhs::Param(pslot, _) => {
+                Rhs::Param(pslot, _, ..) => {
                     claim(slot, lit_pat_desc(param_pat_chars));
                     claim(*pslot, lit_pat_desc(param_pat_chars));
                     Term::ParamSimilarLhs(
                         slot,
-                        Rhs::Param(*pslot, ColKind::Text),
+                        Rhs::Param(*pslot, ColKind::Text, false),
                         *escape,
                         *negated,
                     )
@@ -97575,7 +98978,7 @@ fn resolve_expr_term(
             if !param_target_ok(&slot) {
                 return None;
             }
-            let l = resolve_cmp_param_side(e, &slot, columns, descs, params, true)?;
+            let l = resolve_cmp_param_side(e, &slot, columns, descs, params, true, approx_expr_single(&other, descs))?;
             let (l, r) = cmp_sides(l, other, descs)?;
             // EVERY `?` THIS BRANCH TYPES IS ONE THE PREVIOUS BINARY
             // REFUSED ([plan_unmixed]): a `?` inside comparison arithmetic
@@ -97752,7 +99155,7 @@ fn resolve_expr_term(
         }
         // a `?` against the expression side: synthesize the bind
         // target from the expression's type and defer to bind()
-        RawKind::Cmp(op, Rhs::Param(slot, _)) => {
+        RawKind::Cmp(op, Rhs::Param(slot, _, ..)) => {
             // THE SLOT TAKES THE OTHER SIDE'S OWN DESCRIPTOR, which is
             // what the engine announces - measured slot by slot with
             // SQLDA_DISPLAY: `? = 1` is a LONG (not this server's
@@ -97770,6 +99173,53 @@ fn resolve_expr_term(
             // [param_desc_from_expr] is that block, lifted so the
             // arithmetic-`?` branch above types from the same rule.
             let (mut desc, kind) = param_desc_from_expr(&lhs, descs)?;
+            // AN EXPRESSION SIDE MAY CARRY AN EXPRESSION INDEX, which
+            // rounds a bound double exactly as a column index does: an
+            // index COMPUTED BY (ID + 0) answers `ID + 0 > ?` [2.5] with
+            // row 9 where the heap answers 3;9, and the same for (BI + 0)
+            // and (NM + 0). Nothing at prepare says whether one exists, so
+            // an INT64/INT128-WIDE side is marked and answers only the
+            // doubles a key of that width holds exactly
+            // ([ColKind::WideExact]). A LONG-typed side (`COALESCE(ID, 0)`,
+            // `-ID`, `CAST(ID AS SMALLINT)`) is a DOUBLE key and is not
+            // marked. A side reading only the HAVING view's aggregate
+            // slots ([agg_slot_name]) is never keyed and is not marked.
+            let key = match &lhs {
+                Expr::Col(f) => descs.get(*f).map(|cd| (cd.dtype, cd.scale)),
+                _ => Some((desc.dtype, desc.scale)),
+            };
+            let agg_slot = |fid: usize| {
+                columns
+                    .iter()
+                    .any(|c| c.field_id as usize == fid && c.name.starts_with('\u{0}'))
+            };
+            let kind = match (kind, key) {
+                (k @ (ColKind::Int | ColKind::Numeric), Some((dt, sc)))
+                    if matches!(dt, dtype::INT64 | dtype::INT128)
+                        && expr_reads(&lhs, &|f| !agg_slot(f)) =>
+                {
+                    ColKind::WideExact {
+                        numeric: matches!(k, ColKind::Numeric),
+                        scale: sc,
+                        short: false,
+                    }
+                }
+                // ...and a SHORT-BACKED column carries the IN-list
+                // conversion law instead ([ColKind::WideExact]'s `short`)
+                (k @ (ColKind::Int | ColKind::Numeric), Some((dtype::SHORT, sc))) => {
+                    ColKind::WideExact {
+                        numeric: matches!(k, ColKind::Numeric),
+                        scale: sc,
+                        short: true,
+                    }
+                }
+                // ...and a SINGLE-PRECISION side is marked for the NaN
+                // bind, which has a different engine order there
+                // ([ColKind::ApproxSingle]). The slot is the same DOUBLE
+                // either way, so nothing about the describe moves.
+                (ColKind::Approx, _) if approx_expr_single(&lhs, descs) => ColKind::ApproxSingle,
+                (k, _) => k,
+            };
             // ROUND 12: A `?` COMPARED WITH A SIDE THAT ITSELF CARRIES A
             // `?` (`IIF(ID = 2, ?, 0) = ?`, `COALESCE(?, 0) = ?`, `CAST(?
             // AS INTEGER) = ?`) is chunk-new: the previous binary prepared
@@ -97787,7 +99237,7 @@ fn resolve_expr_term(
             }
             params[*slot] = Some(desc);
             let cs = err_spell_charset(&lhs, descs);
-            return Some(Term::ExprParam(Box::new(lhs), *op, *slot, kind, cs));
+            return Some(Term::ExprParam(Box::new(lhs), *op, *slot, kind, cs, rt.mirrored));
         }
         RawKind::Cmp(op, rhs) => {
             let (l, r) = cmp_sides(lhs, rhs_expr(rhs)?, descs)?;
@@ -97821,7 +99271,7 @@ fn resolve_expr_term(
                 // an Rhs::Param; `ID = (?)` and `ID = -?` do, and the
                 // previous binary refused both)
                 cmp_new = true;
-                resolve_cmp_param_side(e, &slot, columns, descs, params, true)?
+                resolve_cmp_param_side(e, &slot, columns, descs, params, true, approx_expr_single(&lhs, descs))?
             } else if raw_has_param(e) {
                 // the twin of the lhs arm above: `I = CAST(? AS INTEGER)`;
                 // and the narrow S4 refusal with the sides swapped
@@ -97866,7 +99316,7 @@ fn resolve_expr_term(
                 return Some(octets_like_term(lhs, &p, *negated));
             }
             return resolve_expr_term(
-                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Like(Rhs::Str(p), *escape, *negated) },
+                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Like(Rhs::Str(p), *escape, *negated), mirrored: rt.mirrored },
                 columns,
                 descs,
                 params,
@@ -97875,7 +99325,7 @@ fn resolve_expr_term(
         RawKind::Starting(Rhs::Oct(b), negated) => {
             let p = fire_crab_ods::intl::carrier_decode(b);
             return resolve_expr_term(
-                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Starting(Rhs::Str(p), *negated) },
+                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Starting(Rhs::Str(p), *negated), mirrored: rt.mirrored },
                 columns,
                 descs,
                 params,
@@ -97977,7 +99427,7 @@ fn resolve_expr_term(
         // answers). Text and integer sides only, the same restriction
         // the literal STARTING arm carries; the slot claims the
         // synthesized text descriptor.
-        RawKind::Like(Rhs::Param(slot, _), escape, negated) => {
+        RawKind::Like(Rhs::Param(slot, _, ..), escape, negated) => {
             // a BOUND pattern against an OCTETS side would need the
             // wildcard-free match above over a value known only at
             // bind: refused rather than answered with wildcards live
@@ -98032,7 +99482,7 @@ fn resolve_expr_term(
         RawKind::Similar(Rhs::Oct(b), escape, negated) => {
             let p = fire_crab_ods::intl::carrier_decode(b);
             return resolve_expr_term(
-                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Similar(Rhs::Str(p), *escape, *negated) },
+                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Similar(Rhs::Str(p), *escape, *negated), mirrored: rt.mirrored },
                 columns,
                 descs,
                 params,
@@ -98181,7 +99631,7 @@ fn resolve_expr_term(
         // pattern is [param_or_typed_term]'s (it claims the column's own
         // descriptor, which is what the engine announces), and a text
         // EXPRESSION's slot width is unprobed.
-        RawKind::Containing(Rhs::Param(slot, _), negated) => {
+        RawKind::Containing(Rhs::Param(slot, _, ..), negated) => {
             if !matches!(lhs.type_of(descs)?, ExprType::Int | ExprType::Numeric) {
                 return None;
             }
@@ -99133,6 +100583,7 @@ fn numeric_term(
     raw: RawKind,
     d: &Descriptor,
     params: &mut Vec<Option<Descriptor>>,
+    mirrored: bool,
 ) -> Option<Term> {
     // the engine describes the pattern slot of ANY numeric-LHS
     // LIKE/STARTING as plain VARYING text, not the column's own shape
@@ -99163,7 +100614,7 @@ fn numeric_term(
         // this resolver. Measured: `N92 CONTAINING ?` bound '1.5' takes
         // 1.50 and -1.50, and '.' takes every non-NULL row - the
         // rendering carries its decimal point.
-        RawKind::Containing(Rhs::Param(slot, _), negated) => {
+        RawKind::Containing(Rhs::Param(slot, _, ..), negated) => {
             claim_text(slot);
             Term::ExprContainingParam(Box::new(Expr::Col(idx)), 0, slot, negated)
         }
@@ -99185,7 +100636,7 @@ fn numeric_term(
         // via [value_as_dec]); it never keys an index.
         RawKind::Cmp(op, Rhs::DecFloat34(b)) => Term::NumCmp(idx, op, Rhs::DecFloat34(b)),
         RawKind::Cmp(_, Rhs::Null) => Term::Unknown,
-        RawKind::Cmp(op, Rhs::Param(slot, _)) => {
+        RawKind::Cmp(op, Rhs::Param(slot, _, ..)) => {
             if !param_target_ok(d) {
                 return None;
             }
@@ -99193,7 +100644,24 @@ fn numeric_term(
                 params.resize(slot + 1, None);
             }
             params[slot] = Some(d.clone());
-            Term::NumCmp(idx, op, Rhs::Param(slot, ColKind::Numeric))
+            // an INT64/INT128-backed column is marked, because an index on
+            // it ROUNDS a bound double ([ColKind::WideExact])
+            Term::NumCmp(
+                idx,
+                op,
+                Rhs::Param(
+                    slot,
+                    if matches!(d.dtype, dtype::INT64 | dtype::INT128) {
+                        ColKind::WideExact { numeric: true, scale: d.scale, short: false }
+                    } else if d.dtype == dtype::SHORT {
+                        // the IN-list conversion law ([ColKind::WideExact])
+                        ColKind::WideExact { numeric: true, scale: d.scale, short: true }
+                    } else {
+                        ColKind::Numeric
+                    },
+                    mirrored,
+                ),
+            )
         }
         // a text LITERAL converts with the same strict grammar the
         // INTEGER arm uses; the exact compare aligns scales in i128
@@ -99222,7 +100690,7 @@ fn numeric_term(
         RawKind::Like(Rhs::Str(p), escape, negated) => {
             Term::ExprLike(Box::new(Expr::Col(idx)), p, escape, negated)
         }
-        RawKind::Like(Rhs::Param(slot, _), escape, negated) => {
+        RawKind::Like(Rhs::Param(slot, _, ..), escape, negated) => {
             claim_text(slot);
             Term::ExprLikeParam(Box::new(Expr::Col(idx)), slot, escape, negated)
         }
@@ -99234,7 +100702,7 @@ fn numeric_term(
         RawKind::Starting(Rhs::Str(p), negated) => {
             Term::ExprStarting(Box::new(Expr::Col(idx)), p, negated)
         }
-        RawKind::Starting(Rhs::Param(slot, _), negated) => {
+        RawKind::Starting(Rhs::Param(slot, _, ..), negated) => {
             claim_text(slot);
             Term::ExprStartingParam(Box::new(Expr::Col(idx)), slot, negated)
         }
@@ -99257,6 +100725,7 @@ fn decfloat_term(
     raw: RawKind,
     d: &Descriptor,
     params: &mut Vec<Option<Descriptor>>,
+    mirrored: bool,
 ) -> Option<Term> {
     // a LIKE/STARTING pattern `?` is plain VARYING text whatever the column
     // (the engine renders the DECFLOAT value and matches against text) -
@@ -99282,7 +100751,7 @@ fn decfloat_term(
         // a `?` against a DECFLOAT column: the input slot describes as the
         // column itself (probed: DECFLOAT(34) len 16), and the driver's
         // value promotes to decimal128 at bind ([ColKind::DecFloat])
-        RawKind::Cmp(op, Rhs::Param(slot, _)) => {
+        RawKind::Cmp(op, Rhs::Param(slot, _, ..)) => {
             if params.len() <= slot {
                 params.resize(slot + 1, None);
             }
@@ -99290,7 +100759,7 @@ fn decfloat_term(
             Term::NumCmp(
                 idx,
                 op,
-                Rhs::Param(slot, ColKind::DecFloat { wide: d.dtype == dtype::DEC128 }),
+                Rhs::Param(slot, ColKind::DecFloat { wide: d.dtype == dtype::DEC128 }, mirrored),
             )
         }
         // a TEXT literal converts to decimal128 by the engine's decNumber
@@ -99324,7 +100793,7 @@ fn decfloat_term(
         RawKind::Like(Rhs::Str(p), escape, negated) => {
             Term::ExprLike(Box::new(Expr::Col(idx)), p, escape, negated)
         }
-        RawKind::Like(Rhs::Param(slot, _), escape, negated) => {
+        RawKind::Like(Rhs::Param(slot, _, ..), escape, negated) => {
             claim_text(slot);
             Term::ExprLikeParam(Box::new(Expr::Col(idx)), slot, escape, negated)
         }
@@ -99333,7 +100802,7 @@ fn decfloat_term(
         RawKind::Starting(Rhs::Str(p), negated) => {
             Term::ExprStarting(Box::new(Expr::Col(idx)), p, negated)
         }
-        RawKind::Starting(Rhs::Param(slot, _), negated) => {
+        RawKind::Starting(Rhs::Param(slot, _, ..), negated) => {
             claim_text(slot);
             Term::ExprStartingParam(Box::new(Expr::Col(idx)), slot, negated)
         }
@@ -99431,6 +100900,7 @@ fn param_or_typed_term(
     raw: RawKind,
     d: &Descriptor,
     params: &mut Vec<Option<Descriptor>>,
+    mirrored: bool,
 ) -> Option<Term> {
     let raw = adopt_carrier_literal(raw, d);
     // ...and the ONE extra rule LIKE carries over the other reinterpreted
@@ -99696,7 +101166,7 @@ fn param_or_typed_term(
         Some(())
     };
     match raw {
-        RawKind::Cmp(op, Rhs::Param(slot, _)) => {
+        RawKind::Cmp(op, Rhs::Param(slot, _, ..)) => {
             claim(slot)?;
             // a `?` against a COLLATED column compares by the
             // collation like a literal does: the ExprParam's lhs is
@@ -99711,14 +101181,28 @@ fn param_or_typed_term(
                     slot,
                     ColKind::Text,
                     fire_crab_ods::intl::CS_UTF8,
+                    mirrored,
                 ));
             }
-            Some(Term::Cmp(idx, op, Rhs::Param(slot, kind)))
+            // a BIGINT column is marked for the same reason the scaled
+            // INT64/INT128 ones are in [numeric_term]: an index on it
+            // rounds a bound double ([ColKind::WideExact]). Every column
+            // caller reaches this one line, so the marker's default is the
+            // refusing one rather than a per-caller opt-in.
+            let kind = if matches!(kind, ColKind::Int) && d.dtype == dtype::INT64 {
+                ColKind::WideExact { numeric: false, scale: 0, short: false }
+            } else if matches!(kind, ColKind::Int) && d.dtype == dtype::SHORT {
+                // the IN-list conversion law ([ColKind::WideExact])
+                ColKind::WideExact { numeric: false, scale: 0, short: true }
+            } else {
+                kind
+            };
+            Some(Term::Cmp(idx, op, Rhs::Param(slot, kind, mirrored)))
         }
-        RawKind::Like(Rhs::Param(slot, _), escape, negated) => match kind {
+        RawKind::Like(Rhs::Param(slot, _, ..), escape, negated) => match kind {
             ColKind::Text => {
                 claim(slot)?;
-                Some(Term::Like(idx, Rhs::Param(slot, ColKind::Text), escape, negated))
+                Some(Term::Like(idx, Rhs::Param(slot, ColKind::Text, false), escape, negated))
             }
             // an INTEGER column: the engine renders the column to its
             // decimal text and describes the SLOT as TEXT, same as
@@ -99755,7 +101239,7 @@ fn param_or_typed_term(
         // An INTEGER column keeps refusing: the engine renders it to
         // decimal text for LIKE and STARTING, but CONTAINING over one
         // was never probed, and a rendered fold is not a thing to guess.
-        RawKind::Containing(Rhs::Param(slot, _), negated) => match kind {
+        RawKind::Containing(Rhs::Param(slot, _, ..), negated) => match kind {
             ColKind::Text => {
                 let tt = if d.sub_type >= 0 { d.sub_type as u16 } else { 0 };
                 let coll = fire_crab_ods::intl::collation_id(d.sub_type);
@@ -99797,17 +101281,17 @@ fn param_or_typed_term(
         // `<text col> SIMILAR TO ?` - the pattern arrives at execute; the
         // slot claims a text describe and the SimRe is compiled at bind.
         // A non-text column is a later slice.
-        RawKind::Similar(Rhs::Param(slot, _), escape, negated) => match kind {
+        RawKind::Similar(Rhs::Param(slot, _, ..), escape, negated) => match kind {
             ColKind::Text => {
                 claim(slot)?;
                 Some(Term::ParamSimilar(idx, slot, escape, negated))
             }
             _ => None,
         },
-        RawKind::Starting(Rhs::Param(slot, _), negated) => match kind {
+        RawKind::Starting(Rhs::Param(slot, _, ..), negated) => match kind {
             ColKind::Text => {
                 claim(slot)?;
-                Some(Term::Starting(idx, Rhs::Param(slot, ColKind::Text), negated))
+                Some(Term::Starting(idx, Rhs::Param(slot, ColKind::Text, false), negated))
             }
             // an INTEGER column: the engine renders the column to its
             // decimal text and describes the SLOT as TEXT (probed:
@@ -99918,10 +101402,12 @@ fn resolve_having(
                 RawLhs::Agg(f, t) if has_rhs_expr => Some(RawTerm {
                     lhs: RawLhs::Expr(RawExpr::Agg(*f, Box::new(t.clone()))),
                     kind: rt.kind.clone(),
+                    mirrored: rt.mirrored,
                 }),
                 RawLhs::Col(c) if has_rhs_expr => Some(RawTerm {
                     lhs: RawLhs::Expr(RawExpr::Col(c.clone())),
                     kind: rt.kind.clone(),
+                    mirrored: rt.mirrored,
                 }),
                 _ => None,
             };
@@ -100040,7 +101526,7 @@ fn resolve_having(
                     }
                     let (synth_cols, synth_descs) =
                         synth_group_view(gitems, slot_descs, columns, synth_base);
-                    let rt2 = RawTerm { lhs: RawLhs::Expr(subbed), kind: kind2 };
+                    let rt2 = RawTerm { lhs: RawLhs::Expr(subbed), kind: kind2, mirrored: rt.mirrored };
                     HAVING_MUL_WIDTHS.with(|h| *h.borrow_mut() = vouched);
                     let term = resolve_expr_term(&rt2, &synth_cols, &synth_descs, params);
                     HAVING_MUL_WIDTHS.with(|h| h.borrow_mut().clear());
@@ -100048,6 +101534,14 @@ fn resolve_having(
                     continue;
                 }
             }
+            // an AGGREGATE's own output is never an index key, so its
+            // INT64 describe carries no rounding law and the
+            // [ColKind::WideExact] marker is taken back off below
+            // (`HAVING SUM(ID) > ?` [11.5] and `HAVING SUM(BI) > ?` answer
+            // 12 on a heap AND on an indexed twin). A GROUP KEY column
+            // keeps the mark - `GROUP BY BI HAVING BI > ?` is the keyed
+            // shape.
+            let is_agg = matches!(&rt.lhs, RawLhs::Agg(..));
             let (idx, kind, pdesc): (usize, ColKind, Option<Descriptor>) = match &rt.lhs {
                 // a function call (no aggregate) in HAVING - a later slice
                 RawLhs::Expr(_) => return None,
@@ -100293,7 +101787,7 @@ fn resolve_having(
                             // past 18): its `?` owes an INT128 input the
                             // message decoder does not read yet, so refuse
                             // rather than mis-decode.
-                            RawKind::Cmp(op, Rhs::Param(slot, _)) => {
+                            RawKind::Cmp(op, Rhs::Param(slot, _, ..)) => {
                                 let d = ad.clone()?;
                                 if d.dtype == dtype::INT128
                                     || d.dtype == dtype::DEC64
@@ -100306,7 +101800,7 @@ fn resolve_having(
                                     params.resize(slot + 1, None);
                                 }
                                 params[slot] = Some(d);
-                                Term::NumCmp(idx, op, Rhs::Param(slot, ColKind::Numeric))
+                                Term::NumCmp(idx, op, Rhs::Param(slot, ColKind::Numeric, rt.mirrored))
                             }
                             _ => return None,
                         };
@@ -100324,13 +101818,35 @@ fn resolve_having(
             // a `?` on the compared side claims its slot with the value's
             // describe; a literal keeps the ordinary typed term
             terms.push(match pdesc {
-                Some(d) => param_or_typed_term(idx, kind, rt.kind, &d, params)?,
+                Some(d) => {
+                    let t = param_or_typed_term(idx, kind, rt.kind, &d, params, rt.mirrored)?;
+                    if is_agg { unwide_term(t) } else { t }
+                }
                 None => typed_term(idx, kind, rt.kind)?,
             });
         }
         groups.push(terms);
     }
-    Some(Predicate::tagged(groups, tags))
+    // AN AGGREGATE IS NEVER AN INDEX KEY, and saying so with an EMPTY key
+    // list is knowledge, not ignorance: `HAVING SUM(ID) > (?)` [2.5] is
+    // 3,3;9,9 on the engine over a heap AND over an indexed twin, so the
+    // whole-side rung must compare as a double there.  Leaving the path
+    // UNKNOWN instead - which is what a ROUTER does - refused it, and the
+    // gate's floor cell caught that on the first run.
+    //
+    // A HAVING term over a GROUP BY **KEY** is a different matter and this
+    // line is too coarse for it: `GROUP BY ID, BI HAVING BI > (?)` [2.5]
+    // IS index-matchable and the engine answers row 9 alone over the
+    // indexed twin where the heap is 3;9 - a RECORDED WRONG ANSWER here
+    // (and on the previous binary), gated in section 14 of
+    // `qa/serve-real-dblparam.sh` with both answers pinned.  A first cut
+    // that split on "every term is an aggregate" was INERT - the grouped
+    // rung never reaches [Predicate::bind]'s ExprCond arm at all, so the
+    // split changed no cell - and unexercised code carrying a claim is the
+    // defect this very round was opened by ([Predicate::keys_known]).
+    // Narrowing it means routing the grouped key's own retrieval, which is
+    // ranked in the roadmap.
+    Some(Predicate::tagged(groups, tags).with_keys(Vec::new()))
 }
 
 /// Serve one connection to completion.
@@ -111095,7 +112611,7 @@ mod tests {
     // (control probed); genuine blr_bool keeps the refusal (unprobed).
     #[test]
     fn bind_numeric_wire_value_against_text_column() {
-        let p = Predicate::dnf(vec![vec![Term::Cmp(0, Cmp::Eq, Rhs::Param(0, ColKind::Text))]]);
+        let p = Predicate::dnf(vec![vec![Term::Cmp(0, Cmp::Eq, Rhs::Param(0, ColKind::Text, false))]]);
         // blr_long 5: the full equivalence class, raising mid-scan
         let b = p.bind(&[WireParam::Int(5, 0)]).unwrap();
         assert!(b.matches(&[Value::Text("05".into())]).unwrap());
@@ -111405,8 +112921,8 @@ mod tests {
     #[test]
     fn predicate_binds_params_at_execute() {
         let p = Predicate::dnf(vec![vec![
-            Term::Cmp(3, Cmp::Eq, Rhs::Param(0, ColKind::Int)),
-            Term::Cmp(5, Cmp::Eq, Rhs::Param(1, ColKind::Text)),
+            Term::Cmp(3, Cmp::Eq, Rhs::Param(0, ColKind::Int, false)),
+            Term::Cmp(5, Cmp::Eq, Rhs::Param(1, ColKind::Text, false)),
         ]]);
         let b = p
             .bind(&[WireParam::Int(42, 0), WireParam::Text("x".into())])
@@ -111543,7 +113059,7 @@ mod tests {
         let (d, np) = dnf("? IS NULL");
         assert_eq!(np, 1);
         assert!(matches!(&d.0[0][0],
-            RawTerm { lhs: RawLhs::Param(0), kind: RawKind::IsNull }));
+            RawTerm { lhs: RawLhs::Param(0), kind: RawKind::IsNull, .. }));
         let (d, _) = dnf("? IS NOT NULL");
         assert!(matches!(&d.0[0][0].kind, RawKind::IsNotNull));
         // ? BETWEEN desugars into the mirrored comparisons, BOTH
@@ -111556,19 +113072,19 @@ mod tests {
         // leaf claims the slot as it resolves.
         let (d, np) = dnf("? BETWEEN 1 AND 3");
         assert_eq!((np, d.0.len(), d.0[0].len()), (1, 1, 2));
-        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Ge, Rhs::Param(0, _))));
-        assert!(matches!(&d.0[0][1].kind, RawKind::Cmp(Cmp::Le, Rhs::Param(0, _))));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Ge, Rhs::Param(0, _, ..))));
+        assert!(matches!(&d.0[0][1].kind, RawKind::Cmp(Cmp::Le, Rhs::Param(0, _, ..))));
         assert!(matches!(&d.0[0][0].lhs, RawLhs::Expr(RawExpr::Int(3))));
         assert!(matches!(&d.0[0][1].lhs, RawLhs::Expr(RawExpr::Int(1))));
         // ? IN is an OR of mirrored equalities over the one slot
         let (d, np) = dnf("? IN (1, 2)");
         assert_eq!((np, d.0.len()), (1, 2));
-        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Param(0, _))));
-        assert!(matches!(&d.0[1][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Param(0, _))));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Param(0, _, ..))));
+        assert!(matches!(&d.0[1][0].kind, RawKind::Cmp(Cmp::Eq, Rhs::Param(0, _, ..))));
         // NOT IN pushes De Morgan through: AND of Ne
         let (d, _) = dnf("? NOT IN (1, 2)");
         assert_eq!((d.0.len(), d.0[0].len()), (1, 2));
-        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Ne, Rhs::Param(0, _))));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Ne, Rhs::Param(0, _, ..))));
         // a param BOUND refuses (the engine refuses too, -804)
         assert!(parse_predicate(&tokenize("? BETWEEN ? AND 3").unwrap(), &mut 0).is_none());
         // mixed text/numeric bounds refuse at prepare
@@ -111578,7 +113094,7 @@ mod tests {
         let (d, np) = dnf("? LIKE ?");
         assert_eq!(np, 2);
         assert!(matches!(&d.0[0][0],
-            RawTerm { lhs: RawLhs::Param(0), kind: RawKind::Like(Rhs::Param(1, _), None, false) }));
+            RawTerm { lhs: RawLhs::Param(0), kind: RawKind::Like(Rhs::Param(1, _, ..), None, false), .. }));
 
         // the bind: ? IS NULL is type-blind and row-independent
         let mut params = Vec::new();
@@ -113543,7 +115059,7 @@ mod tests {
         assert_eq!(t.matches(&[Value::Null]).unwrap(), None);
         // `? LIKE ?` with a bad bound pattern raises as an IN-ORDER
         // invariant: alone it raises typed ...
-        let like = Term::ParamLike(0, Rhs::Param(1, ColKind::Text), Some('!'), false);
+        let like = Term::ParamLike(0, Rhs::Param(1, ColKind::Text, false), Some('!'), false);
         let p = Predicate::dnf(vec![vec![like.clone()]]);
         let bad = [WireParam::Text("x".into()), WireParam::Text("a!bc".into())];
         assert!(matches!(p.bind(&bad), Err(ExecErr::Eval(EvalErr::InvalidEscape))));
@@ -116683,7 +118199,7 @@ mod tests {
         assert!(matches!(subst_params_expr(&rung, &[WireParam::Null]), Some(Expr::Null)));
         // the whole-side rung: stamped, found under its minuses, bound whole
         let d4 = desc(dtype::LONG, 4, 0);
-        let ws = whole_side_rung(0, &d4).unwrap();
+        let ws = whole_side_rung(0, &d4, false).unwrap();
         assert!(matches!(ws, Expr::Cast(_, CastTarget::Int { bytes: 8 }, CS_WHOLE_SIDE)));
         assert_eq!(whole_side_exact(&ws), Some((0, 0)));
         assert_eq!(whole_side_exact(&Expr::Neg(Box::new(Expr::Neg(Box::new(ws.clone()))))), Some((0, 2)));
@@ -116692,7 +118208,7 @@ mod tests {
         assert!(matches!(bind_whole_side(0, 0, 0, &[WireParam::Text("2.5".into())]), Some(Expr::TextNum(..))));
         assert!(matches!(bind_whole_side(0, 1, 0, &[WireParam::Text("2.5".into())]), Some(Expr::Neg(_))));
         assert!(matches!(bind_whole_side(0, 0, 0, &[WireParam::Null]), Some(Expr::Null)));
-        let wt = whole_side_rung(0, &desc(dtype::VARYING, 10, 0)).unwrap();
+        let wt = whole_side_rung(0, &desc(dtype::VARYING, 10, 0), false).unwrap();
         assert!(is_text_param_rung(&wt));
         assert_eq!(whole_side_text(&Expr::CarrierEnc(Box::new(wt.clone()), 4)), Some(0));
         assert_eq!(whole_side_text(&rung), None);
@@ -116796,7 +118312,7 @@ mod tests {
         assert!(!hits("IIF(D = ?, 1, 0) = 1", &t("1 2")));
         assert!(!hits("IIF(D = ?, 1, 0) = 1", &t("1e400")));
         assert_eq!(raises("IIF(D = ?, 1, 0) = 1", &t("0x2")).as_deref(), Some("0x2"));
-        let wd = whole_side_rung(0, &desc(dtype::DOUBLE, 8, 0)).unwrap();
+        let wd = whole_side_rung(0, &desc(dtype::DOUBLE, 8, 0), false).unwrap();
         assert!(matches!(wd, Expr::Cast(_, CastTarget::Approx, CS_WHOLE_SIDE)));
         assert_eq!(whole_side_exact(&wd), Some((0, 0)));
 
@@ -116902,7 +118418,7 @@ mod tests {
         assert!(hits("IIF(TM = ?, 1, 0) = 1", &[WireParam::Timestamp(session_now().0, 450_000_000)]));
         assert!(hits("IIF(TM = ?, 1, 0) = 1", &[WireParam::Time(450_000_000)]));
         assert!(!hits("IIF(DT = ?, 1, 0) = 1", &[WireParam::Null]));
-        let wdt = whole_side_rung(0, &desc(dtype::SQL_DATE, 4, 0)).unwrap();
+        let wdt = whole_side_rung(0, &desc(dtype::SQL_DATE, 4, 0), false).unwrap();
         assert!(matches!(wdt, Expr::Cast(_, CastTarget::Temporal(TKind::Date), CS_WHOLE_SIDE)));
         assert_eq!(whole_side_exact(&wdt), Some((0, 0)));
         assert!(matches!(
@@ -117085,10 +118601,10 @@ mod tests {
 
         // E: a TIME whole side refuses inside a subquery body, not outside
         let tm = desc(dtype::SQL_TIME, 4, 0);
-        assert!(whole_side_rung(0, &tm).is_some());
+        assert!(whole_side_rung(0, &tm, false).is_some());
         CORR_INNER_PLAN.with(|c| c.set(true));
-        assert!(whole_side_rung(0, &tm).is_none());
-        assert!(whole_side_rung(0, &descs[0]).is_some());
+        assert!(whole_side_rung(0, &tm, false).is_none());
+        assert!(whole_side_rung(0, &descs[0], false).is_some());
         CORR_INNER_PLAN.with(|c| c.set(false));
 
         // F(a): a simple CASE's WHEN value is a compare side in a body
@@ -117354,7 +118870,7 @@ mod tests {
 
         // Q3: `? * ?` under a LONG slot multiplies in INT64
         let mut sink = Vec::new();
-        let e = resolve_cmp_param_side(&raw("? * ?"), &descs[0], &columns, &descs, &mut sink, true).unwrap();
+        let e = resolve_cmp_param_side(&raw("? * ?"), &descs[0], &columns, &descs, &mut sink, true, false).unwrap();
         let Expr::Bin(a, ArithOp::Mul, b) = &e else { panic!() };
         assert!(matches!(**a, Expr::Cast(_, _, CS_MUL_I64)) && matches!(**b, Expr::Cast(_, _, CS_MUL_I64)));
         let ints = |x: i64, y: i64| vec![WireParam::Int(x, 0), WireParam::Int(y, 0)];
@@ -117366,7 +118882,7 @@ mod tests {
         assert_eq!(run(&e, &[WireParam::Null, WireParam::Int(2, 0)]).unwrap(), Value::Null);
         // ...and under an INT64 slot the engine's int128 branch: no stamp
         let mut sink = Vec::new();
-        let e = resolve_cmp_param_side(&raw("? * ?"), &descs[1], &columns, &descs, &mut sink, true).unwrap();
+        let e = resolve_cmp_param_side(&raw("? * ?"), &descs[1], &columns, &descs, &mut sink, true, false).unwrap();
         let Expr::Bin(a, ArithOp::Mul, _) = &e else { panic!() };
         assert!(!matches!(**a, Expr::Cast(_, _, CS_MUL_I64)));
 
@@ -117419,7 +118935,7 @@ mod tests {
         let run = |e: &Expr, a: &[WireParam]| subst_params_expr(e, a).unwrap().eval(&row);
         let side = |s: &str, slot: &Descriptor| {
             let mut sink = Vec::new();
-            resolve_cmp_param_side(&raw(s), slot, &columns, &descs, &mut sink, true).unwrap()
+            resolve_cmp_param_side(&raw(s), slot, &columns, &descs, &mut sink, true, false).unwrap()
         };
 
         // P1: ONE rule decides the gate - the stamp, not the router (round
@@ -117437,7 +118953,7 @@ mod tests {
         assert_eq!(int4("4.999999999999", CS_SLOT_OPERAND).unwrap(), Value::Int(5));
         // MERGE: each marker is stamped as the DML router stamps its `?`
         let marks = |v: &str, d: &Descriptor| -> Vec<bool> {
-            merge_marker_descs(v, d, &columns, &descs).unwrap().into_iter().map(|(_, _, m)| m).collect()
+            merge_marker_descs(v, d, &columns, &descs).unwrap().into_iter().map(|(_, _, m, _)| m).collect()
         };
         assert_eq!(marks("FC$P0", &descs[0]), vec![true]);
         assert_eq!(marks("FC$P0 + 1", &descs[0]), vec![false]);
@@ -117803,7 +119319,7 @@ mod tests {
             let mut e = parse_raw_expr_any(s).unwrap_or_else(|| panic!("{s} parses"));
             renumber_raw_params(&mut e, &mut 0);
             let mut sk: Vec<Option<Descriptor>> = Vec::new();
-            resolve_cmp_param_side(&e, slot, &columns, &descs, &mut sk, true).map(|_| sk)
+            resolve_cmp_param_side(&e, slot, &columns, &descs, &mut sk, true, false).map(|_| sk)
         };
         let dslot = desc(dtype::DOUBLE, 8, 0);
         let lslot = desc(dtype::LONG, 4, 0);
@@ -124455,5 +125971,401 @@ mod computed_wide_types {
         let aged = &cols[8];
         assert_eq!((aged.field_type, aged.length, aged.scale, aged.sub_type), (16, 8, -9, 1));
         assert_eq!(aged.computed.as_ref().unwrap().precision, Some(18));
+    }
+
+    /// The wide-key exactness test ([double_exact_at]): a value an
+    /// INT64/INT128 index HOLDS is answered, everything else refuses.
+    #[test]
+    fn a_wide_key_holds_only_the_doubles_that_survive_its_scale() {
+        // a BIGINT key (scale 0) holds only integral doubles
+        assert!(!double_exact_at(2.5, 0));
+        assert!(double_exact_at(2.0, 0));
+        // NUMERIC(18,1) holds 2.5 and 2.4; NUMERIC(38,2) holds 2.49
+        assert!(double_exact_at(2.5, -1));
+        assert!(double_exact_at(2.4, -1));
+        assert!(double_exact_at(2.49, -2));
+        // ...and not a value that needs a THIRD decimal at scale 2
+        assert!(!double_exact_at(2.495, -2));
+        assert!(!double_exact_at(2.49995, -4));
+        // +-Infinity is exact for a key (measured: indexed and scanned
+        // agree); NaN never is
+        assert!(double_exact_at(f64::INFINITY, 0));
+        assert!(double_exact_at(f64::NEG_INFINITY, -2));
+        assert!(!double_exact_at(f64::NAN, 0));
+        // past 2^52 at the key's scale a second double shares the key
+        assert!(!double_exact_at(900_719_925_474_099.2, -1));
+    }
+
+    /// The runtime double -> exact conversion ([approx_to_exact]).
+    #[test]
+    fn a_runtime_double_converts_with_the_cvt_epsilon() {
+        use fire_crab_ods::format::dtype as dt;
+        // half away from zero, WITH the epsilon
+        assert_eq!(approx_to_exact(2.5, 1e-14, dt::LONG, 0), Ok(3));
+        assert_eq!(approx_to_exact(-2.5, 1e-14, dt::LONG, 0), Ok(-3));
+        assert_eq!(approx_to_exact(2.4, 1e-14, dt::LONG, 0), Ok(2));
+        assert_eq!(approx_to_exact(7.245, 1e-14, dt::LONG, -2), Ok(725));
+        // a NaN stores 0; +-Infinity and an overflow are 22003
+        assert_eq!(approx_to_exact(f64::NAN, 1e-14, dt::LONG, 0), Ok(0));
+        assert_eq!(
+            approx_to_exact(f64::INFINITY, 1e-14, dt::LONG, 0),
+            Err(ApproxFit::OutOfRange)
+        );
+        assert_eq!(
+            approx_to_exact(2_147_483_647.6, 1e-14, dt::LONG, 0),
+            Err(ApproxFit::OutOfRange)
+        );
+        // INTEGER takes 2147483647.4 where its NUMERIC(9,2) twin cannot
+        assert_eq!(approx_to_exact(2_147_483_647.4, 1e-14, dt::LONG, 0), Ok(2_147_483_647));
+        assert_eq!(
+            approx_to_exact(2_147_483_647.4, 1e-14, dt::LONG, -2),
+            Err(ApproxFit::OutOfRange)
+        );
+        // an INT128 RUNTIME value below 2^53 takes the same law
+        assert_eq!(approx_to_exact(10.075, 1e-14, dt::INT128, -2), Ok(1007));
+        assert_eq!(approx_to_exact(0.004_999_999_999_999_999_4, 1e-14, dt::INT128, -2), Ok(1));
+        // ...and at or past 2^53 it is the old refusal, not an answer
+        assert_eq!(
+            approx_to_exact(9.007_199_254_740_993e15, 1e-14, dt::INT128, 0),
+            Err(ApproxFit::TooWide)
+        );
+        // a FLOAT source carries the wider epsilon
+        assert_eq!(approx_to_exact(2.674_999_952_316_284, 1e-5, dt::LONG, -2), Ok(268));
+    }
+
+    /// [ColKind::WideExact] is a BINDING MARKER: it unwraps to the kind
+    /// every other reader expects, and carries the key's scale.
+    #[test]
+    fn the_wide_marker_unwraps_to_the_kind_underneath() {
+        assert!(matches!(
+            ColKind::WideExact { numeric: false, scale: 0, short: false }.unwide(),
+            (ColKind::Int, Some(0))
+        ));
+        assert!(matches!(
+            ColKind::WideExact { numeric: true, scale: -2, short: false }.unwide(),
+            (ColKind::Numeric, Some(-2))
+        ));
+        assert!(matches!(ColKind::Int.unwide(), (ColKind::Int, None)));
+        // an aggregate's term gives the marker back ([resolve_having])
+        let t = Term::Cmp(0, Cmp::Gt, Rhs::Param(0, ColKind::WideExact { numeric: false, scale: 0, short: false }, false));
+        assert!(matches!(
+            unwide_term(t),
+            Term::Cmp(0, Cmp::Gt, Rhs::Param(0, ColKind::Int, ..))
+        ));
+    }
+
+    /// ROUND 13: a NUMERIC FUNCTION'S `?` is a DOUBLE slot, not the
+    /// destination's - the engine announces `sqltype 480 DOUBLE` for the
+    /// argument of ABS / SIGN / ROUND / TRUNC / FLOOR / CEIL / CEILING,
+    /// and passing the destination down converted the value BEFORE the
+    /// function read the fraction it exists to inspect (a CHECK
+    /// constraint and a PRIMARY KEY were bypassed by it).  Capped at an
+    /// INT128-backed destination, where the store path refuses an
+    /// approximate source at prepare.
+    #[test]
+    fn a_numeric_function_s_parameter_is_a_double_slot() {
+        let columns: Vec<RelationColumn> = Vec::new();
+        let descs: Vec<Descriptor> = Vec::new();
+        let d = |dt: u8, len: u16, scale: i8, sub: i16| Descriptor {
+            dtype: dt, scale, length: len, sub_type: sub, flags: 0, offset: 4,
+        };
+        let raw = |s: &str| {
+            let mut r = parse_raw_expr_any(s).unwrap();
+            renumber_raw_params(&mut r, &mut 0);
+            r
+        };
+        // the slot the sink CLAIMS is what the describe announces
+        let slot = |s: &str, dest: &Descriptor| -> Descriptor {
+            let mut sink = Vec::new();
+            resolve_dest_param_expr(&raw(s), dest, &columns, &descs, &mut sink).unwrap();
+            sink[0].clone().unwrap()
+        };
+        let long = d(dtype::LONG, 4, 0, 0);
+        let nm = d(dtype::LONG, 4, -2, 1);
+        let i128d = d(dtype::INT128, 16, 0, 0);
+
+        // ...every member of the family, against an INTEGER destination
+        for f in ["ABS(?)", "SIGN(?)", "FLOOR(?)", "CEIL(?)", "CEILING(?)", "TRUNC(?)", "ROUND(?)"] {
+            let got = slot(f, &long);
+            assert_eq!(got.dtype, dtype::DOUBLE, "{f}");
+            assert_eq!(got.length, 8, "{f}");
+            assert_eq!(got.scale, 0, "{f}");
+        }
+        // ...and with a second, NON-parameter argument
+        assert_eq!(slot("ROUND(?, 1)", &long).dtype, dtype::DOUBLE);
+        assert_eq!(slot("TRUNC(?, 1)", &long).dtype, dtype::DOUBLE);
+        // a SCALED destination is the same rule - it was right before only
+        // because rounding into scale 2 leaves the fraction FLOOR reads
+        assert_eq!(slot("FLOOR(?)", &nm).dtype, dtype::DOUBLE);
+
+        // THE CAP: an INT128-backed destination keeps its OWN slot, because
+        // this server's store path refuses an approximate source there and
+        // typing it DOUBLE turned three cells the previous binary answered
+        // exactly like the engine into refusals
+        assert_eq!(slot("FLOOR(?)", &i128d).dtype, dtype::INT128);
+
+        // ...and nothing else moves: a PLAIN `?` and an ARITHMETIC rung
+        // still convert at the destination's own slot first
+        assert_eq!(slot("?", &long).dtype, dtype::LONG);
+        assert_eq!(slot("? * 2", &long).dtype, dtype::LONG);
+        assert_eq!(slot("?", &nm).scale, -2);
+        // a function OUTSIDE the family keeps the destination too
+        assert_eq!(slot("MOD(?, 2)", &long).dtype, dtype::LONG);
+    }
+
+    /// ROUND 2: the SOURCE WIDTH travels in the whole-side STAMP, and
+    /// [wide_whole_side_double] refuses only an INT64-backed rung whose
+    /// partner an index could key.
+    #[test]
+    fn a_whole_side_rung_remembers_its_source_width() {
+        let d = |dt: u8, scale: i8| Descriptor {
+            dtype: dt, scale, length: 8, sub_type: 0, flags: 0, offset: 4,
+        };
+        let stamp = |dt: u8, scale: i8| match whole_side_rung(0, &d(dt, scale), false) {
+            Some(Expr::Cast(_, _, cs)) => cs,
+            _ => panic!("not a whole-side rung"),
+        };
+        assert_eq!(stamp(dtype::LONG, 0), CS_WHOLE_SIDE);
+        assert_eq!(stamp(dtype::SHORT, 0), CS_WHOLE_SIDE);
+        assert_eq!(stamp(dtype::LONG, -2), CS_WHOLE_SIDE);
+        assert_eq!(stamp(dtype::INT64, 0), CS_WHOLE_SIDE_W);
+        assert_eq!(stamp(dtype::INT64, -1), CS_WHOLE_SIDE_W);
+        // an INT128 slot has no encoder here at all
+        assert!(whole_side_rung(0, &d(dtype::INT128, 0), false).is_none());
+
+        let rung = |dt: u8| Expr::Cast(
+            Box::new(Expr::Param(0)),
+            CastTarget::Int { bytes: 8 },
+            if dt == dtype::INT64 { CS_WHOLE_SIDE_W } else { CS_WHOLE_SIDE },
+        );
+        let cmp = |dt: u8, fid: usize| {
+            Cond2::Cmp(Box::new(Expr::Col(fid)), Cmp::Gt, Box::new(rung(dt)))
+        };
+        let args = [WireParam::Double(2.5)];
+        // a LONG-backed rung never refuses - keyed or not, path known or not
+        assert!(!wide_whole_side_double(&cmp(dtype::LONG, 3), &args, &[], true));
+        assert!(!wide_whole_side_double(&cmp(dtype::LONG, 3), &args, &[3], true));
+        assert!(!wide_whole_side_double(&cmp(dtype::LONG, 3), &args, &[], false));
+        // an INT64-backed one refuses where the column is KEYED...
+        assert!(!wide_whole_side_double(&cmp(dtype::INT64, 3), &args, &[], true));
+        assert!(wide_whole_side_double(&cmp(dtype::INT64, 3), &args, &[3], true));
+        // ...and wherever the ACCESS PATH IS UNKNOWN, which is every
+        // router: an empty key list there means "nothing read a catalog",
+        // not "no index leads with this column", and reading it as the
+        // latter answered the scan reading where the engine gives the
+        // index one (six measured wrong answers, 2026-09-20)
+        assert!(wide_whole_side_double(&cmp(dtype::INT64, 3), &args, &[], false));
+        assert!(wide_whole_side_double(&cmp(dtype::INT64, 3), &args, &[3], false));
+        // ...or where the partner is not a plain column at all
+        let expr_side = Cond2::Cmp(
+            Box::new(Expr::Bin(Box::new(Expr::Col(3)), ArithOp::Add, Box::new(Expr::Int(0)))),
+            Cmp::Gt,
+            Box::new(rung(dtype::INT64)),
+        );
+        assert!(wide_whole_side_double(&expr_side, &args, &[], true));
+        assert!(wide_whole_side_double(&expr_side, &args, &[], false));
+        // ...and a double the key HOLDS EXACTLY answers either way, on a
+        // known path AND on an unknown one - the refusal is about the
+        // ROUNDING, so a bound nothing can round is not affected
+        let exact = [WireParam::Double(2.0)];
+        assert!(!wide_whole_side_double(&cmp(dtype::INT64, 3), &exact, &[3], true));
+        assert!(!wide_whole_side_double(&cmp(dtype::INT64, 3), &exact, &[], false));
+    }
+
+    /// ROUND 2: which NaN comparisons keep the previous reading
+    /// ([nan_whole_side_keeps]) - the shapes whose WRITTEN ORDER survives,
+    /// and only the operators whose verdict is the engine's both ways.
+    #[test]
+    fn a_nan_keeps_its_reading_only_where_the_written_order_survives() {
+        let rung = |t: CastTarget| Expr::Cast(Box::new(Expr::Param(0)), t, CS_WHOLE_SIDE);
+        let args = [WireParam::Double(f64::NAN)];
+        let col = Expr::Col(3);
+        let arith = Expr::Bin(Box::new(Expr::Col(3)), ArithOp::Add, Box::new(Expr::Int(0)));
+        // `NaN > X` is FALSE for every side precision - kept
+        for t in [CastTarget::Approx, CastTarget::Float, CastTarget::Int { bytes: 8 }] {
+            assert!(nan_whole_side_keeps(&rung(t), Cmp::Gt, &col, &args));
+        }
+        // ...with the rung written SECOND only a side that is DOUBLE BY
+        // CONSTRUCTION is kept: a bare column may be a FLOAT one, whose
+        // order is the opposite
+        assert!(!nan_whole_side_keeps(&col, Cmp::Gt, &rung(CastTarget::Approx), &args));
+        assert!(nan_whole_side_keeps(&arith, Cmp::Gt, &rung(CastTarget::Approx), &args));
+        assert!(nan_whole_side_keeps(&arith, Cmp::Le, &rung(CastTarget::Approx), &args));
+        // an exact or single slot never keeps the rung-second form
+        assert!(!nan_whole_side_keeps(&arith, Cmp::Lt, &rung(CastTarget::Float), &args));
+        assert!(!nan_whole_side_keeps(&arith, Cmp::Le, &rung(CastTarget::Int { bytes: 8 }), &args));
+        // every other operator refuses
+        for op in [Cmp::Eq, Cmp::Ne, Cmp::Lt, Cmp::Ge] {
+            assert!(!nan_whole_side_keeps(&rung(CastTarget::Approx), op, &col, &args));
+        }
+        // a FINITE bind is not this rung's business
+        let finite = [WireParam::Double(2.5)];
+        assert!(!nan_whole_side_keeps(&rung(CastTarget::Approx), Cmp::Gt, &col, &finite));
+    }
+
+    /// ROUND 2: a SHORT-backed exact target refuses the EQUALITY a
+    /// multi-item `IN` list would have converted ([ColKind::WideExact]'s
+    /// `short`), and nothing else.
+    #[test]
+    fn a_short_backed_equality_refuses_a_double_the_scale_cannot_hold() {
+        let k = ColKind::WideExact { numeric: false, scale: 0, short: true };
+        assert!(matches!(k.unwide(), (ColKind::Int, None)));
+        assert_eq!(k.short_scale(), Some(0));
+        assert_eq!(ColKind::WideExact { numeric: false, scale: 0, short: false }.short_scale(), None);
+        let t = |op: Cmp, v: f64| {
+            double_exact_term(Some(&WireParam::Double(v)), 7, op, &ColKind::Int, None, Some(0))
+        };
+        assert!(matches!(t(Cmp::Eq, 2.5), Err(e) if e == SHORT_IN_REFUSAL));
+        assert!(matches!(t(Cmp::Ne, 2.5), Err(e) if e == SHORT_IN_REFUSAL));
+        assert!(matches!(t(Cmp::Gt, 2.5), Ok(Some(Term::ExprCond(_)))));
+        assert!(matches!(t(Cmp::Le, 2.5), Ok(Some(Term::ExprCond(_)))));
+        // an exact bind is unaffected
+        assert!(matches!(t(Cmp::Eq, 2.0), Ok(Some(Term::ExprCond(_)))));
+    }
+
+    /// The comparison term a bound double builds ([double_exact_term]):
+    /// an ExprCond that compares AS A DOUBLE, never an `Rhs::Dbl`.
+    #[test]
+    fn a_bound_double_compares_as_a_double_or_refuses() {
+        let narrow = |v: f64| double_exact_term(Some(&WireParam::Double(v)), 7, Cmp::Gt, &ColKind::Int, None, None);
+        assert!(matches!(narrow(2.6), Ok(Some(Term::ExprCond(_)))));
+        assert!(matches!(narrow(f64::NAN), Err(e) if e == NAN_CMP_REFUSAL));
+        // a wide key: exact at its scale answers, anything else refuses
+        let wide = |v: f64, sc: i8| {
+            double_exact_term(Some(&WireParam::Double(v)), 7, Cmp::Gt, &ColKind::Numeric, Some(sc), None)
+        };
+        assert!(matches!(wide(2.49, -2), Ok(Some(Term::ExprCond(_)))));
+        assert!(matches!(wide(2.495, -2), Err(e) if e == WIDE_DOUBLE_REFUSAL));
+        assert!(matches!(wide(2.5, 0), Err(e) if e == WIDE_DOUBLE_REFUSAL));
+        // an INTEGER message is not this arm's business at all
+        assert!(matches!(
+            double_exact_term(Some(&WireParam::Int(3, 0)), 7, Cmp::Gt, &ColKind::Int, None, None),
+            Ok(None)
+        ));
+        // nor is an approximate column's own double
+        assert!(matches!(
+            double_exact_term(Some(&WireParam::Double(2.5)), 7, Cmp::Gt, &ColKind::Approx, None, None),
+            Ok(None)
+        ));
+    }
+
+    /// Which casts stop a NaN from reaching a comparison as a double
+    /// ([nan_param_reaches]): the ones the engine CONVERTS at.
+    #[test]
+    fn a_written_cast_absorbs_a_nan_and_a_value_slot_cast_does_not() {
+        let args = vec![WireParam::Double(f64::NAN)];
+        let cast = |cs: u8| {
+            Expr::Cast(Box::new(Expr::Param(0)), CastTarget::Int { bytes: 4 }, cs)
+        };
+        // a cast the STATEMENT wrote, and an operand rung, convert it
+        assert!(!nan_param_reaches(&cast(fire_crab_ods::intl::CS_UTF8), &args));
+        assert!(!nan_param_reaches(&cast(CS_OPERATOR_READ), &args));
+        // a VALUE-position slot cast and a WHOLE-SIDE rung do not
+        assert!(nan_param_reaches(&cast(CS_SLOT_CAST), &args));
+        assert!(nan_param_reaches(&cast(CS_WHOLE_SIDE), &args));
+        // a bare parameter, and one under an arithmetic node
+        assert!(nan_param_reaches(&Expr::Param(0), &args));
+        assert!(nan_param_reaches(
+            &Expr::Bin(Box::new(Expr::Param(0)), ArithOp::Add, Box::new(Expr::Int(1))),
+            &args
+        ));
+        // ...and a FINITE bind reaches nothing
+        let finite = vec![WireParam::Double(2.5)];
+        assert!(!nan_param_reaches(&Expr::Param(0), &finite));
+    }
+
+    /// [nullif_double_flips]: NULLIF compares the CLIENT'S value and
+    /// answers the CONVERTED one, so only a conversion that FLIPS the
+    /// verdict has to refuse.
+    #[test]
+    fn nullif_refuses_only_when_the_slot_flips_its_verdict() {
+        let slot = |i: usize| {
+            Expr::Cast(Box::new(Expr::Param(i)), CastTarget::Int { bytes: 4 }, CS_SLOT_CAST)
+        };
+        // 3.4 against 3: raw differs, converted EQUALS - the verdict flips
+        let a = vec![WireParam::Double(3.4)];
+        assert!(nullif_double_flips(&slot(0), &Expr::Int(3), &a));
+        assert!(nullif_double_flips(&Expr::Int(3), &slot(0), &a));
+        // 1.25 against 0: neither reading is equal - answer as before
+        let b = vec![WireParam::Double(1.25)];
+        assert!(!nullif_double_flips(&slot(0), &Expr::Int(0), &b));
+        // ...and against 1, where the CONVERTED value matches: it flips
+        assert!(nullif_double_flips(&slot(0), &Expr::Int(1), &b));
+        // an integral bind is not converted at all
+        let c = vec![WireParam::Int(3, 0)];
+        assert!(!nullif_double_flips(&slot(0), &Expr::Int(3), &c));
+        // a cast the STATEMENT wrote is not the raw-compare position
+        let written =
+            Expr::Cast(Box::new(Expr::Param(0)), CastTarget::Int { bytes: 4 }, fire_crab_ods::intl::CS_UTF8);
+        assert!(!nullif_double_flips(&written, &Expr::Int(3), &a));
+        // a COLUMN on the other side decides per row - refuse
+        assert!(nullif_double_flips(&Expr::Col(1), &slot(0), &a));
+        // the MERGE twin, from the descriptor
+        let d = Descriptor {
+            dtype: fire_crab_ods::format::dtype::LONG,
+            scale: 0,
+            length: 4,
+            sub_type: 0,
+            flags: 0,
+            offset: 4,
+        };
+        assert!(nullif_double_flips_slot(&d, Some(&WireParam::Double(2.5)), Some(3.0)));
+        assert!(!nullif_double_flips_slot(&d, Some(&WireParam::Double(1.25)), Some(0.0)));
+        assert!(nullif_double_flips_slot(&d, Some(&WireParam::Double(1.25)), None));
+        assert!(!nullif_double_flips_slot(&d, Some(&WireParam::Int(3, 0)), Some(3.0)));
+    }
+
+    /// The text side's NaN order ([text_nan_term]): Eq/Lt/Le false and Ne
+    /// true on every path; `>` / `>=` answered for an EXPRESSION side and
+    /// declined for a bare column, whose answer depends on the index.
+    #[test]
+    fn a_text_side_against_a_nan_orders_by_its_shape() {
+        let cs = fire_crab_ods::intl::CS_UTF8;
+        let col = Expr::Col(3);
+        let expr = Expr::Concat(Box::new(Expr::Col(3)), Box::new(Expr::Str(String::new())));
+        let op_of = |t: Option<Term>| match t {
+            Some(Term::ExprCond(c)) => match *c {
+                Cond2::Cmp(_, op, _) => Some(op),
+                _ => None,
+            },
+            _ => None,
+        };
+        assert!(matches!(op_of(text_nan_term(&col, Cmp::Eq, &ColKind::Text, cs)), Some(Cmp::Lt)));
+        assert!(matches!(op_of(text_nan_term(&col, Cmp::Le, &ColKind::Text, cs)), Some(Cmp::Lt)));
+        assert!(matches!(op_of(text_nan_term(&col, Cmp::Ne, &ColKind::Text, cs)), Some(Cmp::Ge)));
+        assert!(matches!(op_of(text_nan_term(&expr, Cmp::Gt, &ColKind::Text, cs)), Some(Cmp::Ge)));
+        assert!(text_nan_term(&col, Cmp::Gt, &ColKind::Text, cs).is_none());
+        assert!(text_nan_term(&col, Cmp::Ge, &ColKind::Text, cs).is_none());
+        // an exact side is not this function's business
+        assert!(text_nan_term(&col, Cmp::Eq, &ColKind::Int, cs).is_none());
+    }
+
+    /// A bare `?`'s double into an INT128 column takes the eps law, and
+    /// hands back an exact wire value ([bound_double_into_int128]).
+    #[test]
+    fn a_bound_double_into_an_int128_column_converts_at_runtime() {
+        let d = Descriptor {
+            dtype: fire_crab_ods::format::dtype::INT128,
+            scale: -2,
+            length: 16,
+            sub_type: 1,
+            flags: 0,
+            offset: 4,
+        };
+        assert!(matches!(
+            bound_double_into_int128(&d, &WireParam::Double(10.075)),
+            Ok(Some(WireParam::Int(1007, -2)))
+        ));
+        assert!(matches!(
+            bound_double_into_int128(&d, &WireParam::Double(f64::NAN)),
+            Ok(Some(WireParam::Int(0, -2)))
+        ));
+        assert!(matches!(
+            bound_double_into_int128(&d, &WireParam::Double(f64::INFINITY)),
+            Err(EvalErr::NumericOutOfRange)
+        ));
+        // an INTEGER column is not this path
+        let long = Descriptor { dtype: fire_crab_ods::format::dtype::LONG, ..d };
+        assert!(matches!(bound_double_into_int128(&long, &WireParam::Double(2.5)), Ok(None)));
     }
 }

@@ -19,9 +19,10 @@
 # entry point the LEFT side uses, which reaches [expr_concat] and so takes
 # `V || '%'`.
 #
-# SIMILAR TO is deliberately OUT OF SCOPE, exactly as in the predicate
-# world: its pattern is a compiled `SimRe`, so a per-row pattern means
-# `sim_compile` PER ROW - a cost to measure in its own slice.
+# SIMILAR TO was deliberately OUT OF SCOPE here (its pattern is a compiled
+# `SimRe`, so a per-row pattern means `sim_compile` PER ROW). It is NOT any
+# more: measured 2026-09-20, an expression `SIMILAR TO` pattern answers and
+# agrees with the engine, so that cell is a full comparison below.
 #
 # Usage: qa/serve-real-exprvalue.sh [port]   (default 4363)
 set -u
@@ -123,19 +124,25 @@ echo "-- 3. and where a value-world predicate is CONSUMED --"
 agree "WHERE (u LIKE v) = TRUE"    "select count(*) as n from t where (u like v) = true;"
 agree "WHERE (u CONTAINING sub)=TRUE" "select count(*) as n from t where (u containing sub) = true;"
 agree "ORDER BY (u LIKE v)"        "select id from t order by (u like v), id;"
-# A MEASURED GAP, AND NOT THE ONE THE LABEL FIRST SUGGESTED. `HAVING` has
-# its OWN resolver ([resolve_having], which takes `Vec<Vec<RawTerm>>` and
-# resolves against a synthetic group-row view), so it is a THIRD routing
-# site that the expression patterns of chunks 37, 38 and 39 never reach.
-# Measured: `HAVING MAX(U) LIKE 'caf%'` ANSWERS - the literal form is fine -
-# while `HAVING U LIKE V` refuses with NO aggregate anywhere in it. So the
-# boundary is the expression pattern, not the aggregate, and the second
-# cell below states that in its sharpest form.
-gap "HAVING MAX(u) LIKE MAX(v)"    "select count(*) as n from t group by u having max(u) like max(v);"
-gap "HAVING u LIKE v (no aggregate at all - the sharp form)" \
-    "select count(*) as n from t group by u, v having u like v;"
-# the LITERAL pattern in HAVING answers and must keep answering - it is
-# what proves the gap above is the EXPRESSION pattern and nothing wider
+# THE HAVING GAP IS CLOSED. `HAVING` has its OWN resolver
+# ([resolve_having], which takes `Vec<Vec<RawTerm>>` and resolves against a
+# synthetic group-row view), so it was a THIRD routing site that the
+# expression patterns of chunks 37, 38 and 39 never reached: the literal
+# form `HAVING MAX(U) LIKE 'caf%'` answered while `HAVING U LIKE V`, with no
+# aggregate anywhere in it, refused. Re-measured 2026-09-20: both shapes now
+# ANSWER and agree with the engine, so both are full comparisons. The gap
+# was closed by an EARLIER chunk, not by the working tree - the previous
+# committed binary /tmp/fcwire-prev-0e5a8f4 answers them identically - and
+# nobody unrecorded the boundary. The two cells keep their sharp shapes: the
+# second still has NO aggregate anywhere in it, so it is the one that proves
+# the expression pattern itself reaches [resolve_having].
+agree "HAVING MAX(u) LIKE MAX(v) (engine N1N1)" \
+      "select count(*) as n from t group by u having max(u) like max(v);"
+agree "HAVING u LIKE v (no aggregate at all - the sharp form; engine N1N1)" \
+      "select count(*) as n from t group by u, v having u like v;"
+# the LITERAL pattern in HAVING answered even while the expression pattern
+# above refused - it is what proved the old boundary was the EXPRESSION
+# pattern and nothing wider, and it must keep answering
 agree "HAVING MAX(u) LIKE 'caf%' (literal, answers)" \
       "select count(*) as n from t group by u having max(u) like 'caf%';"
 
@@ -174,11 +181,19 @@ agree "WHERE u CONTAINING sub"     "select count(*) as n from t where u containi
 agree "WHERE u STARTING WITH pre"  "select count(*) as n from t where u starting with pre;"
 agree "WHERE u LIKE 'caf%'"        "select count(*) as n from t where u like 'caf%';"
 
-echo "-- 8. still refused, deliberately or pre-existing --"
-gap "SELECT u SIMILAR TO v (sim_compile per row - own slice)" \
-    "select (u similar to v) as n from t order by id;"
-gap "carrier mix: SELECT n LIKE v"      "select (n like v) as n from t order by id;"
-gap "carrier mix: SELECT u CONTAINING subn" "select (u containing subn) as n from t order by id;"
+echo "-- 8. the last three recorded gaps, now closed; IS UNKNOWN still refused --"
+# PROMOTED 2026-09-20. All three answered and agreed with the engine on the
+# working tree AND on the previous committed binary
+# /tmp/fcwire-prev-0e5a8f4, so the gap was closed by an earlier chunk and
+# simply never unrecorded. The engine answers are in the labels; these are
+# now full comparisons, which also pins the per-row `sim_compile` path and
+# the NONE-carrier/UTF8 mix against any later regression.
+agree "SELECT u SIMILAR TO v (expression pattern, sim_compile per row; engine N<true>N<true>N<false>N<null>)" \
+      "select (u similar to v) as n from t order by id;"
+agree "carrier mix: SELECT n LIKE v (NONE u, UTF8 pattern; engine N<true>N<true>N<false>N<null>)" \
+      "select (n like v) as n from t order by id;"
+agree "carrier mix: SELECT u CONTAINING subn (UTF8 u, NONE sub; engine N<true>N<true>N<false>N<null>)" \
+      "select (u containing subn) as n from t order by id;"
 gap "IS UNKNOWN over a predicate (pre-existing)" \
     "select count(*) as n from t where (u like v) is unknown;"
 
