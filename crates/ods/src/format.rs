@@ -294,7 +294,9 @@ impl Value {
             Value::Float(f) => render_float(*f),
             Value::Rounded(raw, scale) if *scale > 0 => format!("{}{}", raw, "0".repeat(*scale as usize)),
             Value::Rounded(raw, scale) => render_scaled(*raw, *scale),
-            Value::Bool(b) => if *b { "true" } else { "false" }.into(),
+            // the engine's own text for a boolean (CVT, and what a CAST to
+            // VARCHAR, LIKE, POSITION and SUBSTRING all see): upper case
+            Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.into(),
             Value::Date(d) => render_date(*d),
             Value::Time(t) => render_time(*t),
             Value::Timestamp(d, t) => format!("{} {}", render_date(*d), render_time(*t)),

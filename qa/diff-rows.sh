@@ -8,7 +8,7 @@
 #
 # Like diff-select.sh, comparison happens on a gbak-restored CLEAN
 # copy. Both sides are canonicalized: engine values via
-# TRIM(CAST(.. AS VARCHAR)) with booleans lowercased and NULLs as
+# TRIM(CAST(.. AS VARCHAR)) and NULLs as
 # <null>; fcstat values via per-field trim, with blob ids collapsed to
 # <blob> on both sides. Columns whose types the Rust decoder does not
 # yet render (DECFLOAT, INT128, TZ types) are excluded per-table and
@@ -75,7 +75,7 @@ EOF
                          *)   skipped="$skipped $fname(cs$cset)"; continue ;;
                      esac ;;
             12|13|35) expr="TRIM(CAST(\"$fname\" AS VARCHAR(64)))" ;;  # date/time/timestamp
-            23)      expr="LOWER(TRIM(CAST(\"$fname\" AS VARCHAR(8))))" ;; # boolean
+            23)      expr="TRIM(CAST(\"$fname\" AS VARCHAR(8)))" ;; # boolean: TRUE/FALSE both sides
             10|27)   # FLOAT/DOUBLE: the Rust side prints these the way
                      # the engine does now (16 significant digits,
                      # trailing zeros kept, scientific outside the fixed

@@ -69818,7 +69818,7 @@ fn resolve_raw_cond(
         // desugar the predicate path takes ([containing_term])
         RawCond::Containing(a, pat, negated) => {
             let e = resolve_expr(a, columns, descs)?;
-            if !matches!(e.type_of(descs)?, ExprType::Text | ExprType::Int) {
+            if !matches!(e.type_of(descs)?, ExprType::Text | ExprType::Int | ExprType::Bool) {
                 return None;
             }
             let (value, tt) = collate_operand_ttype(e, descs)?;
@@ -100303,9 +100303,11 @@ fn resolve_expr_term(
         }
         RawKind::Similar(Rhs::Str(p), escape, negated) => {
             // a TEXT-typed expression against a literal pattern, compiled
-            // once (malformed refuses at prepare). A non-text side, or a
-            // parameter pattern, is a later slice.
-            if !matches!(lhs.type_of(descs), Some(ExprType::Text)) {
+            // once (malformed refuses at prepare). A BOOLEAN side matches
+            // its text, `TRUE`/`FALSE` - measured, `B SIMILAR TO 'T%'` is
+            // the TRUE row, as its LIKE twin is. Another non-text side,
+            // or a parameter pattern, is a later slice.
+            if !matches!(lhs.type_of(descs), Some(ExprType::Text | ExprType::Bool)) {
                 return None;
             }
             // A TEXT PATTERN AGAINST A BYTE-CARRIER SIDE IS BYTE-COPIED
@@ -100371,7 +100373,7 @@ fn resolve_expr_term(
         // form; an explicit COLLATE on it replaces that ttype, as it
         // does everywhere else.
         RawKind::Containing(Rhs::Str(p), negated) => {
-            if !matches!(lhs.type_of(descs)?, ExprType::Text | ExprType::Int) {
+            if !matches!(lhs.type_of(descs)?, ExprType::Text | ExprType::Int | ExprType::Bool) {
                 return None;
             }
             let (value, tt) = match &lhs {
@@ -100456,9 +100458,13 @@ fn resolve_expr_term(
         }
         RawKind::Containing(..) => return None, // a binary pattern
         RawKind::Starting(Rhs::Str(p), negated) => {
-            // bool/numeric rendering under a prefix test is unprobed -
-            // refuse those, answer text, integer, approximate and
-            // temporal sides.
+            // numeric rendering under a prefix test is unprobed - refuse
+            // it, answer text, integer, approximate, temporal and boolean
+            // sides.
+            //
+            // A BOOLEAN SIDE IS PROBED: it matches its own text, upper
+            // case, and does NOT convert the prefix - `B STARTING WITH
+            // 'FA'` is the FALSE row on the engine, `'fa'` is no row.
             //
             // A TEMPORAL SIDE IS PROBED NOW, AND THIS REFUSAL WAS THE
             // WHOLE PREFIX HALF OF THE TEMPORAL LAW: `DT STARTING WITH
@@ -100483,7 +100489,11 @@ fn resolve_expr_term(
             // is the trap the house laws warn about, and this was one.
             if !matches!(
                 lhs.type_of(descs)?,
-                ExprType::Text | ExprType::Int | ExprType::Approx | ExprType::Temporal(_)
+                ExprType::Text
+                    | ExprType::Int
+                    | ExprType::Approx
+                    | ExprType::Temporal(_)
+                    | ExprType::Bool
             ) {
                 return None;
             }
