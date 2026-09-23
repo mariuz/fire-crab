@@ -14232,7 +14232,9 @@ enum SimRe {
     Lit(char),
     Any,                        // `_`
     AnySeq,                     // `%`
-    Class(Vec<SimClass>, bool), // `[...]`, bool = negated (`[^...]`)
+    /// `[<include> ^ <exclude>]`, or `[^...]` when the bool (negated) is
+    /// set - see [sim_class]
+    Class(Vec<SimClass>, Vec<SimClass>, bool),
     Concat(Vec<SimRe>),
     Alt(Vec<SimRe>),
     Repeat(Box<SimRe>, usize, Option<usize>), // {min, max?}
@@ -14347,12 +14349,29 @@ fn sim_primary(p: &[char], i: &mut usize, esc: Option<char>) -> Option<SimRe> {
         '[' => sim_class(p, i, esc),
         '_' => { *i += 1; Some(SimRe::Any) }
         '%' => { *i += 1; Some(SimRe::AnySeq) }
-        // a quantifier or closer with nothing to bind to is malformed
-        '*' | '+' | '?' | '{' | '}' | ')' | ']' | '|' => None,
+        // a quantifier or closer with nothing to bind to is malformed -
+        // and so is a bare `-` or `^` outside a class: measured, `'a-b'
+        // SIMILAR TO 'a-b'`, `'(a|-)'` and `'^a'` all raise "Invalid
+        // SIMILAR TO pattern" on the engine, where this compiled them as
+        // literals and answered (`a\-b` with an escape is the literal)
+        '*' | '+' | '?' | '{' | '}' | ')' | ']' | '|' | '-' | '^' => None,
         _ => { *i += 1; Some(SimRe::Lit(c)) }
     }
 }
 
+/// A bracket class, in the engine's grammar - measured, and it is NOT the
+/// POSIX one:
+///
+/// * `[<include>^<exclude>]` - a `^` AFTER the first position splits the
+///   class into the characters it takes and the ones it then removes:
+///   `[a-z^b]` takes `a` and not `b`, `[x^]` takes `x`, `[[:ALPHA:]^a]`
+///   takes `b` and not `a`. This compiled that `^` as a literal member,
+///   so `'a^b' SIMILAR TO 'a[x^]b'` answered 1 where the engine says 0.
+/// * a LEADING `^` negates the whole class (`[^a-c]` takes `d`, `[^]`
+///   takes anything), and then there is no second list: `[^a^b]` raises,
+///   as does a third list (`[a^b^c]`).
+/// * a `]` in the first position is a member (`[]a]` compiles; `[]` is
+///   unclosed and raises).
 fn sim_class(p: &[char], i: &mut usize, esc: Option<char>) -> Option<SimRe> {
     *i += 1; // past '['
     let neg = p.get(*i) == Some(&'^');
@@ -14360,7 +14379,19 @@ fn sim_class(p: &[char], i: &mut usize, esc: Option<char>) -> Option<SimRe> {
         *i += 1;
     }
     let mut items = Vec::new();
-    while *i < p.len() && p[*i] != ']' {
+    let mut excl: Option<Vec<SimClass>> = None;
+    let mut first = !neg;
+    while *i < p.len() && (p[*i] != ']' || first) {
+        first = false;
+        // the include/exclude split
+        if p[*i] == '^' && Some('^') != esc {
+            if neg || excl.is_some() {
+                return None;
+            }
+            excl = Some(std::mem::take(&mut items));
+            *i += 1;
+            continue;
+        }
         // a POSIX class `[:NAME:]`
         if p[*i] == '[' && p.get(*i + 1) == Some(&':') {
             let start = *i + 2;
@@ -14399,13 +14430,23 @@ fn sim_class(p: &[char], i: &mut usize, esc: Option<char>) -> Option<SimRe> {
             items.push(SimClass::Range(lo, hi));
         } else {
             items.push(SimClass::Ch(lo));
+            // ...and a `-` that CLOSES a class after a member is not a
+            // literal either: `[a-]` raises on the engine, while a
+            // leading one (`[-]`, `[-a]`) is the character
+            if p.get(*i) == Some(&'-') && p.get(*i + 1) == Some(&']') {
+                return None;
+            }
         }
     }
     if p.get(*i) != Some(&']') {
         return None;
     }
     *i += 1;
-    Some(SimRe::Class(items, neg))
+    // `items` collected after a split are the EXCLUDED ones
+    Some(match excl {
+        Some(include) => SimRe::Class(include, items, false),
+        None => SimRe::Class(items, Vec::new(), neg),
+    })
 }
 
 fn sim_posix(name: &str) -> Option<fn(char) -> bool> {
@@ -14442,8 +14483,11 @@ fn sim_reach(re: &SimRe, v: &[char], pos: usize) -> Vec<usize> {
             if pos < v.len() { vec![pos + 1] } else { vec![] }
         }
         SimRe::AnySeq => (pos..=v.len()).collect(),
-        SimRe::Class(items, neg) => {
-            if pos < v.len() && (sim_class_hit(items, v[pos]) != *neg) {
+        SimRe::Class(items, excl, neg) => {
+            if pos < v.len()
+                && (sim_class_hit(items, v[pos]) != *neg)
+                && !sim_class_hit(excl, v[pos])
+            {
                 vec![pos + 1]
             } else {
                 vec![]
@@ -69818,9 +69862,18 @@ fn resolve_raw_cond(
         // desugar the predicate path takes ([containing_term])
         RawCond::Containing(a, pat, negated) => {
             let e = resolve_expr(a, columns, descs)?;
-            if !matches!(e.type_of(descs)?, ExprType::Text | ExprType::Int | ExprType::Bool) {
+            if !matches!(
+                e.type_of(descs)?,
+                ExprType::Text
+                    | ExprType::Int
+                    | ExprType::Bool
+                    | ExprType::Numeric
+                    | ExprType::Approx
+                    | ExprType::Temporal(_)
+            ) {
                 return None;
             }
+            let pat = &converting_expr_pattern(&e, pat, descs)?;
             let (value, tt) = collate_operand_ttype(e, descs)?;
             match containing_term(value, tt, pat, *negated) {
                 Term::ExprLike(x, p, esc, n) => Cond2::Like(x, p, esc, n),
@@ -69902,6 +69955,13 @@ fn resolve_raw_cond(
             if expr_reads_coll(&e, descs) {
                 return None;
             }
+            // the pattern CONVERTS against a numeric, approximate or
+            // temporal operand, as LIKE's does two arms up; a DECFLOAT one
+            // has its own grammar this router does not carry - refuse it
+            if is_decfloat_arith(&e, descs) {
+                return None;
+            }
+            let pat = &converting_expr_pattern(&e, pat, descs)?;
             Cond2::Similar(Box::new(e), sim_compile(pat, *esc)?, *negated)
         }
         // the per-row pattern. The collated-operand refusal above applies
@@ -75800,10 +75860,19 @@ fn converting_expr_pattern(e: &Expr, p: &str, descs: &[Descriptor]) -> Option<St
 ///
 /// FLOAT is deliberately NOT included: `dtype_real` does NOT convert, and
 /// `FL LIKE '1%'` answers rows on the engine where the DOUBLE twin raises.
-/// That one cell is why this asks for the dtype rather than for
+/// That one cell is why this asks for the WIDTH rather than for
 /// "approximate".
+///
+/// And it asks it of the EXPRESSION, not of a bare column: this read
+/// `Expr::Col` with `dtype::DOUBLE` alone, so `DP + 0 LIKE 'x'`, `ABS(DP)
+/// LIKE 'x'`, `CAST(ID AS DOUBLE PRECISION) LIKE 'x'` and `R * 1 LIKE '%'`
+/// - FLOAT arithmetic widens - all answered rows where the engine raises
+/// 22018, and `DP * 1 CONTAINING '1e20'` missed its row. Measured, the
+/// single-width shapes keep the raw pattern exactly as the REAL column
+/// does: `CAST(.. AS REAL)`, `-R`, `ABS(R)`, `COALESCE(R, R)`, `IIF(.., R,
+/// R)` - which is [approx_expr_single]'s descriptor rule, already written.
 fn expr_is_double(e: &Expr, descs: &[Descriptor]) -> bool {
-    matches!(e, Expr::Col(fid) if descs.get(*fid).is_some_and(|d| d.dtype == dtype::DOUBLE))
+    matches!(e.type_of(descs), Some(ExprType::Approx)) && !approx_expr_single(e, descs)
 }
 
 /// The conversion itself, written ONCE so the column entry point and the
@@ -80423,7 +80492,13 @@ impl Expr {
                     }
                 }
                 // a NUMERIC operand renders to its decimal text inside
-                // the matcher, where there is no case to fold
+                // the matcher, where there is no case to fold - EXCEPT a
+                // DOUBLE's exponent: `1.000000000000000e+20` is lower
+                // case and CONTAINING upper-cases the needle, so `DP
+                // CONTAINING '1e20'` found nothing where the engine finds
+                // the row. Upper-case the render when CONTAINING asks.
+                Value::Null => Value::Null,
+                v if *upcase => Value::Text(v.render().to_ascii_uppercase()),
                 v => v,
             },
             Expr::CollKey(e, tt) => match e.eval(values)? {
@@ -99144,6 +99219,18 @@ fn containing_term(value: Expr, ttype: u16, pattern: &str, negated: bool) -> Ter
     )
 }
 
+/// A SIMILAR TO over a value and an already-converted literal pattern,
+/// compiled once. A malformed pattern raises when a ROW reaches it, not
+/// at prepare - the text column's rule ([typed_term]), and the one a
+/// converting operand keeps: `DT SIMILAR TO '15.01.2020'` converts to
+/// "2020-01-15", whose `-` the engine's grammar rejects.
+fn similar_term(value: Expr, pattern: &str, escape: Option<char>, negated: bool) -> Term {
+    match sim_compile(pattern, escape) {
+        Some(re) => Term::ExprSimilar(Box::new(value), re, negated),
+        None => Term::BadSimilar(Box::new(value)),
+    }
+}
+
 /// A single-quoted literal at `pos`, doubled quotes included. `None`
 /// when what is there is not one - which is how the pattern predicates
 /// above decline a `?` or an expression pattern rather than mis-read
@@ -99407,6 +99494,11 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
                 Some(re) => Term::Similar(idx, re, negated),
                 None => Term::BadSimilar(Box::new(Expr::Col(idx))),
             },
+            // an INTEGER column matches its decimal text, the pattern as
+            // written - an integer does not convert it (measured: `SI
+            // SIMILAR TO '%2%'` takes -12, `BI SIMILAR TO '1234567890123'`
+            // its row), exactly as its LIKE arm above
+            (ColKind::Int, Rhs::Str(p)) => similar_term(Expr::Col(idx), &p, escape, negated),
             (_, Rhs::Null) => Term::Unknown,
             _ => return None,
         },
@@ -100305,11 +100397,25 @@ fn resolve_expr_term(
             // a TEXT-typed expression against a literal pattern, compiled
             // once (malformed refuses at prepare). A BOOLEAN side matches
             // its text, `TRUE`/`FALSE` - measured, `B SIMILAR TO 'T%'` is
-            // the TRUE row, as its LIKE twin is. Another non-text side,
-            // or a parameter pattern, is a later slice.
-            if !matches!(lhs.type_of(descs), Some(ExprType::Text | ExprType::Bool)) {
+            // the TRUE row, as its LIKE twin is. A NUMERIC, APPROXIMATE or
+            // TEMPORAL side converts the pattern first, exactly as LIKE
+            // does ([converting_expr_pattern]); a DECFLOAT expression has
+            // no type here and refuses. A parameter pattern is a later
+            // slice.
+            if !matches!(
+                lhs.type_of(descs),
+                Some(
+                    ExprType::Text
+                        | ExprType::Bool
+                        | ExprType::Int
+                        | ExprType::Numeric
+                        | ExprType::Approx
+                        | ExprType::Temporal(_)
+                )
+            ) {
                 return None;
             }
+            let p = &converting_expr_pattern(&lhs, p, descs)?;
             // A TEXT PATTERN AGAINST A BYTE-CARRIER SIDE IS BYTE-COPIED
             // INTO IT - and the copy is by the ATTACHMENT's encoding, for
             // EVERY carrier, not by UTF-8 for OCTETS alone.
@@ -100373,9 +100479,22 @@ fn resolve_expr_term(
         // form; an explicit COLLATE on it replaces that ttype, as it
         // does everywhere else.
         RawKind::Containing(Rhs::Str(p), negated) => {
-            if !matches!(lhs.type_of(descs)?, ExprType::Text | ExprType::Int | ExprType::Bool) {
+            // a NUMERIC, APPROXIMATE or TEMPORAL side converts the needle
+            // first, as LIKE converts its pattern - measured, `DT
+            // CONTAINING '2'` raises 22018 and `DT CONTAINING '2020-1-15'`
+            // is the row; `DP CONTAINING '1e20'` renders the double text
+            if !matches!(
+                lhs.type_of(descs)?,
+                ExprType::Text
+                    | ExprType::Int
+                    | ExprType::Bool
+                    | ExprType::Numeric
+                    | ExprType::Approx
+                    | ExprType::Temporal(_)
+            ) {
                 return None;
             }
+            let p = &converting_expr_pattern(&lhs, p, descs)?;
             let (value, tt) = match &lhs {
                 Expr::Collate(inner, tt) => ((**inner).clone(), *tt),
                 other => (
@@ -101483,6 +101602,14 @@ fn numeric_term(
             claim_text(slot);
             Term::ExprContainingParam(Box::new(Expr::Col(idx)), 0, slot, negated)
         }
+        // ...and a LITERAL one CONVERTS FIRST, exactly as LIKE's does: a
+        // wide operand's `CONTAINING 'x'` raises the one-line 22018 at
+        // prepare, `N382 CONTAINING '1e1'` keeps the raw text and finds
+        // nothing, and a narrow one matches the rendered value as written
+        // ([converting_literal_pattern]; `serve-real-numpattern.sh`)
+        RawKind::Containing(Rhs::Str(p), negated) => {
+            containing_term(Expr::Col(idx), 0, &converting_literal_pattern(&p, d)?, negated)
+        }
         RawKind::Containing(..) => return None,
         // a BINARY pattern against a DECFLOAT column: refused, as
         // every other text-shaped pattern is here
@@ -101564,7 +101691,12 @@ fn numeric_term(
         }
         RawKind::Like(Rhs::Null, ..) => Term::Unknown,
         RawKind::Like(..) => return None,
-        // SIMILAR TO on a numeric column is a later slice (text only)
+        // SIMILAR TO converts its pattern by the same law and then
+        // compiles what came back - `I128 SIMILAR TO '%'` raises 22018,
+        // `N382 SIMILAR TO '10.5'` renders "10.5" and misses the 10.50 row
+        RawKind::Similar(Rhs::Str(p), escape, negated) => {
+            similar_term(Expr::Col(idx), &converting_literal_pattern(&p, d)?, escape, negated)
+        }
         RawKind::Similar(Rhs::Null, ..) => Term::Unknown,
         RawKind::Similar(..) => return None,
         RawKind::Starting(Rhs::Str(p), negated) => {
@@ -101606,8 +101738,12 @@ fn decfloat_term(
         params[slot] = Some(num_pat_desc());
     };
     Some(match raw {
-        // CONTAINING over a DECFLOAT column: the rendered text has no
-        // case to fold, but its rendering is unprobed here - refuse
+        // CONTAINING over a DECFLOAT column converts its pattern as LIKE
+        // does ([dec_literal_pattern]) - `D34 CONTAINING 'e'` raises
+        // 22018 - and then folds case over the rendered text
+        RawKind::Containing(Rhs::Str(p), negated) => {
+            containing_term(Expr::Col(idx), 0, &dec_literal_pattern(&p, d)?, negated)
+        }
         RawKind::Containing(..) => return None,
         // an expression PATTERN over a DECFLOAT column, likewise: the
         // pattern varies per row and this resolver cannot evaluate one
@@ -101722,8 +101858,10 @@ fn decfloat_term(
         }
         RawKind::Starting(Rhs::Null, _) => Term::Unknown,
         RawKind::Starting(..) => return None,
-        // SIMILAR TO on a numeric/DECFLOAT column is a later slice (text
-        // only), as in numeric_term
+        // ...and SIMILAR TO the same, compiled after the conversion
+        RawKind::Similar(Rhs::Str(p), escape, negated) => {
+            similar_term(Expr::Col(idx), &dec_literal_pattern(&p, d)?, escape, negated)
+        }
         RawKind::Similar(Rhs::Null, ..) => Term::Unknown,
         RawKind::Similar(..) => return None,
         RawKind::CmpExpr(..) => return None,
@@ -113939,6 +114077,39 @@ mod tests {
         assert!(
             resolve_predicate(raw, &columns, &[user_blob], &mut Vec::new()).is_none()
         );
+    }
+
+    #[test]
+    fn similar_grammar_is_the_engine_s() {
+        // every cell measured against the engine (serve-real-numpattern §5)
+        let hit = |v: &str, p: &str| sim_match(&sim_compile(p, Some('\\')).unwrap(), v);
+        let bad = |p: &str| sim_compile(p, Some('\\')).is_none();
+        // a bare - or ^ is no literal, nor is a class ending in -
+        for p in ["a-b", "-", "(a|-)", "(-)", "a^b", "^a", "[a-]"] {
+            assert!(bad(p), "{p} must not compile");
+        }
+        assert!(hit("a-b", "a\\-b"));
+        assert!(hit("-", "[-]"));
+        assert!(hit("a-b", "[-a]%"));
+        // [<include>^<exclude>]
+        assert!(hit("x", "[x^]"));
+        assert!(!hit("a^b", "a[x^]b"));
+        assert!(hit("a", "[a-z^b]"));
+        assert!(!hit("b", "[a-z^b]"));
+        assert!(!hit("a", "[[:ALPHA:]^a]"));
+        assert!(hit("b", "[[:ALPHA:]^a]"));
+        assert!(hit("a-b", "a[-^]b"));
+        assert!(!hit("a^b", "a[-^]b"));
+        // a leading ^ negates, and leaves no room for a second list
+        assert!(hit("d", "[^a-c]"));
+        assert!(hit("q", "[^]"));
+        assert!(bad("[^a^b]"));
+        assert!(bad("[a^b^c]"));
+        // an escaped ^ is a member; a leading ] is a member
+        assert!(hit("^", "[a\\^]"));
+        assert!(!hit("^", "[^\\^]"));
+        assert!(hit("]", "[]a]"));
+        assert!(bad("[]"));
     }
 
     #[test]

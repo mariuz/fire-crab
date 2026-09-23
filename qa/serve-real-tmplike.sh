@@ -423,10 +423,10 @@ both      "10 CONTROL N92 LIKE '1.50'  - the narrow numeric's rendered match" "S
 both      "10 CONTROL EXTRACT(YEAR FROM DT) = 2020 - a temporal FUNCTION is not a pattern" "SELECT ID FROM T WHERE EXTRACT(YEAR FROM DT) = 2020 ORDER BY ID"
 
 echo "--- 11. RECORDED, NOT FIXED"
-err_differs "11 DT CONTAINING '2020' - the engine converts and raises; this server refuses the shape" \
-            "SELECT ID FROM T WHERE DT CONTAINING '2020'" "22018" "42000"
-err_differs "11 DT SIMILAR TO '2%'   - likewise" \
-            "SELECT ID FROM T WHERE DT SIMILAR TO '2%'" "22018" "42000"
+# CONTAINING and SIMILAR TO are the same law and answer it now
+# (`serve-real-numpattern.sh`), so these two are promoted
+err_same  "11 DT CONTAINING '2020' - the needle converts, and a bare year is no date" "SELECT ID FROM T WHERE DT CONTAINING '2020'"
+err_same  "11 DT SIMILAR TO '2%'   - likewise, and a wildcard cannot convert"       "SELECT ID FROM T WHERE DT SIMILAR TO '2%'"
 # fire-crab knows the zone NAMES but not the tzdata RULES, so it cannot
 # render a value stored in a named zone other than GMT at all - which is
 # a boundary of its own, older than this law, and it costs these cells.

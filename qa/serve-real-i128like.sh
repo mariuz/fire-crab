@@ -270,9 +270,10 @@ echo "--- 6. RECORDED, NOT FIXED"
 # rendering "10" would predict 2;3 and the engine answers nothing.
 both      "6 N382 STARTING WITH '1e1' - the exponent keeps the raw text, and the engine agrees" "SELECT ID FROM T WHERE N382 STARTING WITH '1e1' ORDER BY ID"
 both      "6 N382 LIKE '99999999999999999999999.50' - an INT128-magnitude pattern converts and misses" "SELECT ID FROM T WHERE N382 LIKE '99999999999999999999999.50' ORDER BY ID"
-eng_only  "6 N382 CONTAINING '1' - this server refuses CONTAINING over a numeric column, on both binaries" "SELECT ID FROM T WHERE N382 CONTAINING '1' ORDER BY ID"
-err_differs "6 N382 SIMILAR TO '1%' - the engine converts and raises; this server refuses the shape" \
-            "SELECT ID FROM T WHERE N382 SIMILAR TO '1%'" "22018" "42000"
+# CONTAINING and SIMILAR TO were refused here; they are the same law and
+# answer now (`serve-real-numpattern.sh`), so the two cells are promoted
+both      "6 N382 CONTAINING '1' - the needle converts to 1 and renders \"1\"" "SELECT ID FROM T WHERE N382 CONTAINING '1' ORDER BY ID"
+err_same  "6 N382 SIMILAR TO '1%' - the pattern converts, and a wildcard cannot" "SELECT ID FROM T WHERE N382 SIMILAR TO '1%'"
 
 echo "--- 7. THE OTHER FIVE ROUTERS, because a WHERE over a plain column is not the only way in"
 # `col_kind` answers None for every INT128 column, so a JOIN, a COMPUTED
@@ -312,8 +313,9 @@ both      "8 CAST(N382 AS NUMERIC(18,2)) LIKE '1%' - a WIDE column NARROWED stop
 err_same  "8 CAST(N92 AS NUMERIC(19,2)) LIKE '1%' - ...and a NARROW one WIDENED starts" "SELECT ID FROM T WHERE CAST(N92 AS NUMERIC(19,2)) LIKE '1%'"
 both      "8 (N92 * 1) LIKE '1%' - a narrow arithmetic result"  "SELECT ID FROM T WHERE (N92 * 1) LIKE '1%' ORDER BY ID"
 both      "8 CAST(N382 AS VARCHAR(20)) LIKE '1%' - rendered FIRST, so it is a real pattern again" "SELECT ID FROM T WHERE CAST(N382 AS VARCHAR(20)) LIKE '1%' ORDER BY ID"
-eng_err_only "8 CAST(N92 AS DOUBLE PRECISION) LIKE '1%' - DOUBLE converts too, and this server still answers rows" \
-             "SELECT ID FROM T WHERE CAST(N92 AS DOUBLE PRECISION) LIKE '1%' ORDER BY ID" '[]' "1;2;3"
+# ...and a DOUBLE is a WIDTH, not a column: the cast converts too, which
+# was a pinned wrong answer until `serve-real-numpattern.sh` §6
+err_same  "8 CAST(N92 AS DOUBLE PRECISION) LIKE '1%' - DOUBLE converts, cast or column" "SELECT ID FROM T WHERE CAST(N92 AS DOUBLE PRECISION) LIKE '1%'"
 # THE TEMPORAL HALF LANDED (`serve-real-tmplike.sh`), so these two are
 # no longer recorded wrong answers - they are the law, and the cells
 # self-expired exactly as they were meant to.
