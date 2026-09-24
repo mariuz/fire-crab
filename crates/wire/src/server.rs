@@ -20187,6 +20187,8 @@ fn text_form_m(
             };
             match f {
                 SysFn::GetContext => Some((true, 255, TfCs::Att)), // VARCHAR(255), probed
+                // VARCHAR(32) CHARACTER SET ASCII, measured
+                SysFn::TzName => Some((true, 32, TfCs::Ttype(fire_crab_ods::intl::CS_ASCII as i32))),
                 SysFn::Upper | SysFn::Lower | SysFn::UpperCs(_) | SysFn::LowerCs(_) | SysFn::UpperColl(_) | SysFn::LowerColl(_) => {
                     ascii_over_temporal(0, arg(0))
                 }
@@ -60926,6 +60928,9 @@ const ISC_ARG_NUMBER: i32 = 4;
 const GDS_INVALID_BLR: i32 = 335544343;
 const GDS_ILLEGAL_PRC_TYPE: i32 = 335544868;
 const GDS_SQLERR: i32 = 335544436;
+/// `isc_extract_input_mismatch` - "Specified EXTRACT part does not exist
+/// in input datatype" (-105, SQLSTATE 42000), raised at PREPARE
+const GDS_EXTRACT_INPUT_MISMATCH: i32 = 335544789;
 const GDS_PRCMISMAT: i32 = 335544512;
 const GDS_DSQL_PROCEDURE_USE_ERR: i32 = 335544668;
 const GDS_DSQL_LINE_COL_ERROR: i32 = 336397208;
@@ -61786,6 +61791,16 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(GDS_CHARSET_NOT_FOUND)
                 .int(2) // isc_arg_string - PRE-QUOTED "SCHEMA"."NAME"
                 .bytes(name.as_bytes());
+        }
+        EvalErr::ExtractInputMismatch => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-105)
+                .int(1) // isc_arg_gds
+                .int(GDS_EXTRACT_INPUT_MISMATCH);
         }
         EvalErr::CollationRequiresText => {
             w.int(1) // isc_arg_gds
@@ -66962,6 +66977,11 @@ enum SysFn {
     /// SECOND answers NUMERIC(9,4) (12.3456), MILLISECOND NUMERIC(9,1)
     /// (345.6) - both probed; the other parts are integers.
     Extract(ExtractPart),
+    /// EXTRACT(TIMEZONE_NAME FROM x): the zone's own text - a region's
+    /// name, `+05:00`, `GMT` - and the SESSION zone's for a zoneless
+    /// operand; VARCHAR(32) CHARACTER SET ASCII (measured). A function of
+    /// its own because every other EXTRACT part is an integer.
+    TzName,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -67075,7 +67095,7 @@ impl SysFn {
             SysFn::Trunc => "TRUNC",
             SysFn::Lpad => "LPAD",
             SysFn::Rpad => "RPAD",
-            SysFn::Extract(_) => "EXTRACT",
+            SysFn::Extract(_) | SysFn::TzName => "EXTRACT",
             SysFn::DateAdd(_) => "DATEADD",
             SysFn::DateDiff(_) => "DATEDIFF",
         }
@@ -69096,8 +69116,14 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
             "MILLISECOND" => ExtractPart::Millisecond,
             "TIMEZONE_HOUR" => ExtractPart::TimezoneHour,
             "TIMEZONE_MINUTE" => ExtractPart::TimezoneMinute,
-            // TIMEZONE_NAME needs the region catalogue fc does not
-            // carry (it renders through ICU): refused
+            // a text part: its own function ([SysFn::TzName])
+            "TIMEZONE_NAME" => {
+                if !take_keyword(b, pos, "FROM") {
+                    return None;
+                }
+                let operand = expr_add(b, pos)?;
+                return Some(RawExpr::Func(SysFn::TzName, vec![operand]));
+            }
             _ => return None,
         };
         if !take_keyword(b, pos, "FROM") {
@@ -69220,6 +69246,7 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::Trim(_)
         | SysFn::Position
         | SysFn::Extract(_)
+        | SysFn::TzName
         | SysFn::DateAdd(_)
         | SysFn::DateDiff(_) => unreachable!(),
     };
@@ -69487,10 +69514,35 @@ fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
         });
     }
     if matches!(ku.as_str(), "DATE" | "TIME" | "TIMESTAMP") {
-        return Some(CastTarget::Temporal(match ku.as_str() {
-            "DATE" => TKind::Date,
-            "TIME" => TKind::Time,
-            _ => TKind::Timestamp,
+        // TIME / TIMESTAMP take `WITH TIME ZONE` or `WITHOUT TIME ZONE`
+        // (the zoneless default, spelled out); a partial phrase is no
+        // target at all
+        let mut zoned = false;
+        if ku != "DATE" {
+            let word = |p: &mut usize| -> String {
+                skip_ws(b, p);
+                let st = *p;
+                while *p < b.len() && b[*p].is_alphabetic() {
+                    *p += 1;
+                }
+                b[st..*p].iter().collect::<String>().to_ascii_uppercase()
+            };
+            let mut p = *pos;
+            let w = word(&mut p);
+            if w == "WITH" || w == "WITHOUT" {
+                if word(&mut p) != "TIME" || word(&mut p) != "ZONE" {
+                    return None;
+                }
+                zoned = w == "WITH";
+                *pos = p;
+            }
+        }
+        return Some(CastTarget::Temporal(match (ku.as_str(), zoned) {
+            ("DATE", _) => TKind::Date,
+            ("TIME", false) => TKind::Time,
+            ("TIME", true) => TKind::TimeTz,
+            (_, false) => TKind::Timestamp,
+            (_, true) => TKind::TimestampTz,
         }));
     }
     if ku == "FLOAT" || ku == "REAL" {
@@ -73892,6 +73944,26 @@ fn resolve_expr_inner(
                 .iter()
                 .map(|a| resolve_expr(a, columns, descs))
                 .collect::<Option<Vec<_>>>()?;
+            // an EXTRACT part the operand's type does not carry is the
+            // engine's typed -105 at prepare - it reached the client as a
+            // "Table unknown" guess at the FROM inside the parentheses
+            // (`EXTRACT(HOUR FROM DATE '...')` named table "DATE")
+            if matches!(f, SysFn::Extract(_) | SysFn::TzName) {
+                // a bare NULL has no type to lack the part: the engine
+                // answers NULL (`EXTRACT(YEAR FROM NULL)`), and type_of
+                // calls it an Int
+                let operand = resolved.first().filter(|a| !matches!(a, Expr::Null));
+                let carries = match (f, operand.map(|a| a.type_of(descs))) {
+                    (_, None) | (_, Some(None)) => true, // untyped: the generic path decides
+                    (SysFn::Extract(part), Some(Some(ExprType::Temporal(k)))) => part.valid_for(k),
+                    (SysFn::TzName, Some(Some(ExprType::Temporal(k)))) => k != TKind::Date,
+                    (_, Some(Some(_))) => false,
+                };
+                if !carries {
+                    PREPARE_REFUSAL.with(|r| *r.borrow_mut() = Some(EvalErr::ExtractInputMismatch));
+                    return None;
+                }
+            }
             // a BYTE-CARRIER literal argument meeting a REAL-charset one
             // reads as that charset's OCTETS - the engine's byte space,
             // the same single step [adopt_carrier_literal] takes for a
@@ -74684,6 +74756,10 @@ enum EvalErr {
     /// [GDS_WLOCK_CONFLICT]), the last carrying the offending keyword as
     /// its `@1`. Posted at PREPARE, through [PREPARE_REFUSAL].
     WithLock { code: i32, what: Option<&'static str> },
+    /// EXTRACT of a part the operand's type does not carry (HOUR of a
+    /// DATE, YEAR of a TIME, anything of a non-temporal): the engine's
+    /// -105, posted at PREPARE through [PREPARE_REFUSAL]
+    ExtractInputMismatch,
     /// `isc_expression_eval_err` on its own - AtNode::make's refusal for
     /// an `AT TIME ZONE` operand that is not a TIME or a TIMESTAMP
     /// (ExprNodes.cpp:3326), posted at PREPARE
@@ -79094,20 +79170,71 @@ fn tz_local_time(utc: u32, zone: u16) -> Option<u32> {
     Some((utc as i64 + disp as i64 * 600_000).rem_euclid(DAY_UNITS) as u32)
 }
 
-/// A TIME WITH TIME ZONE into a ZONELESS TIME: the session's wall time.
-/// Not [tz_local_time] in the session zone - the engine takes the value's
-/// wall time in its OWN zone (on the TIME base date), dates it TODAY
-/// there, places that on the UTC line by today's rules, and reads it in
-/// the session zone. Measured in Bucharest in September (+03:00 today,
-/// +02:00 on the base date): `CAST(TIME '10:00 +02:00' AS TIME)` and
-/// `CAST(TIME '08:00 UTC' AS TIME)` are 11:00, while `CAST(CURRENT_TIME
-/// AS TIME)` is LOCALTIME. For offset zones every route agrees.
-fn tz_time_to_session(ut: u32, zone: u16) -> Option<u32> {
+/// A TIME WITH TIME ZONE DATED TODAY - the UTC halves of an instant.
+/// The engine takes the value's wall time in its OWN zone (on the TIME
+/// base date), puts it on the SESSION's current date, and places that on
+/// the UTC line by the value's zone's rules on that date. Measured with a
+/// Pago_Pago session on Sep 23 while UTC was on Sep 24: `CAST(TIME '20:00
+/// -12:00' AS TIMESTAMP WITH TIME ZONE)` is 2026-09-23 20:00 -12:00 - the
+/// session's date, not UTC's and not the -12:00 zone's own.
+fn time_tz_dated_today(ut: u32, zone: u16) -> Option<(i32, u32)> {
     let wall = tz_local_time(ut, zone)?;
-    let (nd, nt) = now_date_time();
-    let today = tz_local_timestamp(nd, nt, zone)?.0;
-    let (ud, utt) = wall_to_utc_timestamp(today, wall, zone)?;
+    wall_to_utc_timestamp(session_now().0, wall, zone)
+}
+
+/// A TIME WITH TIME ZONE into a ZONELESS TIME: the session's wall time.
+/// Not [tz_local_time] in the session zone - the value is dated today
+/// ([time_tz_dated_today]) and read in the session zone. Measured in
+/// Bucharest in September (+03:00 today, +02:00 on the base date):
+/// `CAST(TIME '10:00 +02:00' AS TIME)` and `CAST(TIME '08:00 UTC' AS
+/// TIME)` are 11:00, while `CAST(CURRENT_TIME AS TIME)` is LOCALTIME. For
+/// offset zones every route agrees.
+fn tz_time_to_session(ut: u32, zone: u16) -> Option<u32> {
+    let (ud, utt) = time_tz_dated_today(ut, zone)?;
     Some(tz_local_timestamp(ud, utt, session_zone_id())?.1)
+}
+
+/// Text into TIME / TIMESTAMP WITH TIME ZONE (measured, all of it): a
+/// zone tail names the zone; no tail is a wall time in the SESSION zone
+/// (`'2026-09-08'` is its midnight). The specials are the engine's own
+/// quirk: into a TIMESTAMP WITH TIME ZONE they read the UTC clock - `'NOW'`
+/// is the instant, and `'TODAY'` / `'TOMORROW'` / `'YESTERDAY'` are MIDNIGHT
+/// UTC of the UTC date, rendered in the session zone (a Pago_Pago session
+/// on Sep 23 answers `2026-09-23 13:00:00 Pacific/Pago_Pago` for 'TODAY',
+/// which is Sep 24 00:00 UTC). Into a TIME WITH TIME ZONE `'NOW'` is the
+/// session's wall time and a date special is 22018.
+fn cvt_text_tz(t: &str, k: TKind) -> Option<Value> {
+    let zone = session_zone_id();
+    let special = matches!(
+        t.trim().to_ascii_uppercase().as_str(),
+        "NOW" | "TODAY" | "TOMORROW" | "YESTERDAY"
+    );
+    match k {
+        TKind::TimestampTz => {
+            if special {
+                let (d, u) = string_to_datetime(t, ExpectTemporal::Timestamp, now_date_time(), true)?;
+                return Some(Value::TimestampTz(d, u, zone));
+            }
+            if let Some((d, u)) = string_to_datetime(t, ExpectTemporal::Timestamp, session_now(), false) {
+                let (ud, ut) = wall_to_utc_timestamp(d, u, zone)?;
+                return Some(Value::TimestampTz(ud, ut, zone));
+            }
+            let (ud, ut, z) = parse_ts_tz_lit(t)?;
+            Some(Value::TimestampTz(ud, ut, z))
+        }
+        TKind::TimeTz => {
+            let wall = if special {
+                string_to_datetime(t, ExpectTemporal::Time, session_now(), true)?.1
+            } else if let Some((_, u)) = string_to_datetime(t, ExpectTemporal::Time, session_now(), false) {
+                u
+            } else {
+                let (ut, z) = parse_time_tz_lit(t)?;
+                return Some(Value::TimeTz(ut, z));
+            };
+            Some(Value::TimeTz(wall_to_utc_time(wall, zone)?, zone))
+        }
+        _ => None,
+    }
 }
 
 /// The TIMESTAMP twin, with the day carry. The instant is known here, so
@@ -79745,7 +79872,15 @@ impl Expr {
                     },
                     // the part must exist in the operand's kind - this
                     // is where the engine's prepare-time -105 lands
+                    // a bare NULL operand has no type to lack the part:
+                    // the engine answers NULL (`EXTRACT(YEAR FROM NULL)`),
+                    // where this refused and the fallback guessed a table
+                    // named "NULL"
                     SysFn::Extract(part) => match ts[0] {
+                        _ if matches!(args[0], Expr::Null) => Some(match part {
+                            ExtractPart::Second | ExtractPart::Millisecond => ExprType::Numeric,
+                            _ => ExprType::Int,
+                        }),
                         ExprType::Temporal(k) if part.valid_for(k) => {
                             Some(match part {
                                 ExtractPart::Second | ExtractPart::Millisecond => {
@@ -79757,6 +79892,15 @@ impl Expr {
                         _ => None,
                     },
                     SysFn::GetContext => Some(ExprType::Text),
+                    // every clock-bearing kind has a zone (a zoneless one
+                    // the session's); a DATE is the -105 at prepare
+                    SysFn::TzName => match ts[0] {
+                        _ if matches!(args[0], Expr::Null) => Some(ExprType::Text),
+                        ExprType::Temporal(
+                            TKind::Time | TKind::Timestamp | TKind::TimeTz | TKind::TimestampTz,
+                        ) => Some(ExprType::Text),
+                        _ => None,
+                    },
                     SysFn::SetContext => Some(ExprType::Int),
                     SysFn::Upper
                     | SysFn::Lower
@@ -82122,10 +82266,10 @@ impl Expr {
                     },
                     // to a temporal type. A DATE reads as MIDNIGHT
                     // against a TIMESTAMP and a TIMESTAMP splits into
-                    // either half (probed); a TIME does NOT become a
-                    // DATE or a TIMESTAMP here, for the same reason it
-                    // does not compare with one - the engine would use
-                    // the CURRENT DATE, which this server does not do.
+                    // either half (probed); a TIME into a TIMESTAMP is
+                    // dated on the SESSION's current date; a DATE never
+                    // becomes a TIME, nor a TIME a DATE (22018 on the
+                    // value's text, measured).
                     CastTarget::Temporal(k) => {
                         let bad = |v: &Value| conv_err(*cs, v.render());
                         match (k, &v) {
@@ -82171,6 +82315,54 @@ impl Expr {
                                     _ => Value::Timestamp(d, t),
                                 }
                             }
+                            // a zoned TIME into a TIMESTAMP: dated today,
+                            // read in the session zone (measured: TIME
+                            // '10:00 +05:00' is 2026-09-22 18:00 in a
+                            // Pago_Pago session on Sep 23)
+                            (TKind::Timestamp, Value::TimeTz(ut, z)) => {
+                                let (ud, u) = time_tz_dated_today(*ut, *z).ok_or(EvalErr::Unsupported)?;
+                                let (d, t) = tz_local_timestamp(ud, u, session_zone_id())
+                                    .ok_or(EvalErr::Unsupported)?;
+                                Value::Timestamp(d, t)
+                            }
+                            // INTO a WITH TIME ZONE type (measured, each
+                            // one): a zoned source keeps its zone, a
+                            // zoneless one is a wall time in the SESSION
+                            // zone; a TIME is dated today; a TIMESTAMP
+                            // gives a TIME its wall time of day, placed on
+                            // the TIME base date. A DATE has no TIME WITH
+                            // TIME ZONE and a zoned TIME no DATE - 22018 on
+                            // the value's text, as the engine raises.
+                            (TKind::TimestampTz, Value::TimestampTz(..)) => v.clone(),
+                            (TKind::TimestampTz, Value::Timestamp(d, t)) => {
+                                let z = session_zone_id();
+                                let (ud, ut) = wall_to_utc_timestamp(*d, *t, z).ok_or(EvalErr::Unsupported)?;
+                                Value::TimestampTz(ud, ut, z)
+                            }
+                            (TKind::TimestampTz, Value::Date(d)) => {
+                                let z = session_zone_id();
+                                let (ud, ut) = wall_to_utc_timestamp(*d, 0, z).ok_or(EvalErr::Unsupported)?;
+                                Value::TimestampTz(ud, ut, z)
+                            }
+                            (TKind::TimestampTz, Value::Time(t)) => {
+                                let z = session_zone_id();
+                                let (ud, ut) = wall_to_utc_timestamp(session_now().0, *t, z)
+                                    .ok_or(EvalErr::Unsupported)?;
+                                Value::TimestampTz(ud, ut, z)
+                            }
+                            (TKind::TimestampTz, Value::TimeTz(ut, z)) => {
+                                let (ud, u) = time_tz_dated_today(*ut, *z).ok_or(EvalErr::Unsupported)?;
+                                Value::TimestampTz(ud, u, *z)
+                            }
+                            (TKind::TimeTz, Value::TimeTz(..)) => v.clone(),
+                            (TKind::TimeTz, Value::Time(t) | Value::Timestamp(_, t)) => {
+                                let z = session_zone_id();
+                                Value::TimeTz(wall_to_utc_time(*t, z).ok_or(EvalErr::Unsupported)?, z)
+                            }
+                            (TKind::TimeTz, Value::TimestampTz(ud, ut, z)) => {
+                                let wall = tz_local_timestamp(*ud, *ut, *z).ok_or(EvalErr::Unsupported)?.1;
+                                Value::TimeTz(wall_to_utc_time(wall, *z).ok_or(EvalErr::Unsupported)?, *z)
+                            }
                             (_, Value::Text(t)) => {
                                 // the engine's string coercion: the full
                                 // CVT grammar, specials included (probed:
@@ -82196,7 +82388,7 @@ impl Expr {
                                                 Value::Time(tz_time_to_session(ut, z)?)
                                             }
                                         },
-                                        TKind::TimeTz | TKind::TimestampTz => return None,
+                                        TKind::TimeTz | TKind::TimestampTz => cvt_text_tz(t, *k)?,
                                         TKind::Timestamp => match cvt_text_temporal(t, ExpectTemporal::Timestamp) {
                                             Some((d, tm)) => Value::Timestamp(d, tm),
                                             None => {
@@ -82464,6 +82656,16 @@ impl Expr {
                                 | "EXT_CONN_POOL_IDLE_COUNT"
                                 | "EXT_CONN_POOL_ACTIVE_COUNT" => Value::Text("0".into()),
                                 "EXT_CONN_POOL_LIFETIME" => Value::Text("7200".into()),
+                                // the session zone's own text - a region's
+                                // name, an offset `+05:00`, `UTC` (measured;
+                                // this key RAISED not-found here, a wrong
+                                // error where the engine answers)
+                                "SESSION_TIMEZONE" => {
+                                    Value::Text(fire_crab_ods::tz::zone_text(session_zone_id()))
+                                }
+                                // the engine's configured default; fire-crab
+                                // runs no parallel workers, so 1 is its truth
+                                "PARALLEL_WORKERS" => Value::Text("1".into()),
                                 // VALID keys fire-crab cannot yet answer
                                 // truthfully: a NULL (not a raise, not a
                                 // fabricated value). Recorded for the
@@ -82476,6 +82678,7 @@ impl Expr {
                                 | "CLIENT_HOST"
                                 | "CLIENT_PID"
                                 | "CLIENT_PROCESS"
+                                | "CLIENT_OS_USER"
                                 | "WIRE_ENCRYPTED"
                                 | "WIRE_CRYPT_PLUGIN"
                                 | "DB_FILE_ID"
@@ -82510,6 +82713,14 @@ impl Expr {
                         });
                         Value::Int(existed as i64)
                     }
+                    // the zone's text; a zoneless value's is the
+                    // session zone's (measured: LOCALTIMESTAMP answers
+                    // the session region)
+                    SysFn::TzName => Value::Text(fire_crab_ods::tz::zone_text(match vs[0] {
+                        Value::TimeTz(_, z) | Value::TimestampTz(_, _, z) => z,
+                        Value::Time(_) | Value::Timestamp(..) => session_zone_id(),
+                        _ => return Err(EvalErr::Unsupported), // type-checked away
+                    })),
                     SysFn::Upper => Value::Text(simple_case(&fn_text(&vs[0]), true)),
                     SysFn::Lower => Value::Text(simple_case(&fn_text(&vs[0]), false)),
                     // the CHARSET's own case law, tables generated from
@@ -86515,6 +86726,13 @@ fn build_correlated_lookup(
 fn lookup_key_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Text(x), Value::Text(y)) => x.trim_end_matches(' ') == y.trim_end_matches(' '),
+        // a WITH TIME ZONE key is equal by INSTANT, as `=` is: the zone
+        // is a label. `==` compared the zone id too, so `ci.x = co.x`
+        // over '10:00 Europe/Paris' and '08:00 UTC' - one instant -
+        // found no partner and the correlated scalar answered NULL
+        // where the engine answers the row (measured)
+        (Value::TimestampTz(d1, t1, _), Value::TimestampTz(d2, t2, _)) => d1 == d2 && t1 == t2,
+        (Value::TimeTz(t1, _), Value::TimeTz(t2, _)) => t1 == t2,
         _ => a == b,
     }
 }
@@ -101544,7 +101762,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 return false;
             }
             match f {
-                SysFn::GetContext | SysFn::SetContext => false,
+                SysFn::GetContext | SysFn::SetContext | SysFn::TzName => false,
                 SysFn::Upper
                 | SysFn::Lower
                 | SysFn::UpperCs(_)
@@ -118204,16 +118422,20 @@ mod tests {
         assert_eq!(pc("EXTRACT(YEAR FROM D)").sql_type, 501); // SMALLINT nullable
         assert_eq!(pc("DATE '2000-01-01'").sql_type, 571);
 
-        // a part that does not exist in the operand's kind fails the
-        // TYPE CHECK - the refusal lands at prepare like the engine's
-        // -105 - and so does EXTRACT over a non-temporal
-        let ty = |s: &str| {
+        // a part that does not exist in the operand's kind is refused at
+        // RESOLVE with the engine's own -105 posted - and so is EXTRACT
+        // over a non-temporal; a bare NULL types and answers NULL
+        let refused_105 = |s: &str| {
+            PREPARE_REFUSAL.with(|r| *r.borrow_mut() = None);
             let raw = parse_raw_expr(s).unwrap();
-            resolve_expr(&raw, &columns, &descs).unwrap().type_of(&descs)
+            resolve_expr(&raw, &columns, &descs).is_none()
+                && PREPARE_REFUSAL.with(|r| matches!(*r.borrow(), Some(EvalErr::ExtractInputMismatch)))
         };
-        assert_eq!(ty("EXTRACT(HOUR FROM D)"), None);
-        assert_eq!(ty("EXTRACT(YEAR FROM TM)"), None);
-        assert_eq!(ty("EXTRACT(YEAR FROM S)"), None);
+        assert!(refused_105("EXTRACT(HOUR FROM D)"));
+        assert!(refused_105("EXTRACT(YEAR FROM TM)"));
+        assert!(refused_105("EXTRACT(YEAR FROM S)"));
+        assert!(refused_105("EXTRACT(TIMEZONE_NAME FROM D)"));
+        assert!(!refused_105("EXTRACT(YEAR FROM NULL)"));
         // mixed temporal kinds (or temporal beside a number) cannot
         // share a describe - the conditional refuses
         assert!(build_expr_col(
@@ -125962,7 +126184,10 @@ mod tests {
     fn corr_stand_in_probe_skips_a_type_the_cast_grammar_cannot_read() {
         // the plan probe stands an outer column in for by `CAST(NULL AS
         // <type>)`; a type this server's CAST cannot read back must skip
-        // the probe (the reading before the probe), never refuse
+        // the probe (the reading before the probe), never refuse. The
+        // WITH TIME ZONE types were the last unreadable ones until CAST
+        // learnt them, so every descriptor spells now (an unknown dtype
+        // falls back to VARCHAR); the guard stays for the next type
         let d = |dt: u8, len: u16, scale: i8, st: i16| Descriptor { dtype: dt, scale, length: len, sub_type: st, flags: 0, offset: 0 };
         for ok in [
             d(dtype::BOOLEAN, 1, 0, 0),
@@ -125974,11 +126199,10 @@ mod tests {
             d(dtype::REAL, 4, 0, 0),
             d(dtype::SQL_DATE, 4, 0, 0),
             d(dtype::VARYING, 7, 0, 1),
+            d(dtype::SQL_TIME_TZ, 8, 0, 0),
+            d(dtype::TIMESTAMP_TZ, 12, 0, 0),
         ] {
             assert!(corr_standin_spellable(&ok), "{}", desc_type_sql_cs(&ok));
-        }
-        for bad in [d(dtype::SQL_TIME_TZ, 8, 0, 0), d(dtype::TIMESTAMP_TZ, 12, 0, 0)] {
-            assert!(!corr_standin_spellable(&bad), "{}", desc_type_sql_cs(&bad));
         }
         let look = corr_look(CORR_TABLES);
         let t = corr_outer("T", &["ID", "A", "S"]);
@@ -125989,9 +126213,13 @@ mod tests {
         sc.refs[0].desc = Some(d(dtype::LONG, 4, 0, 0));
         assert_eq!(corr_standin_text(&sc).unwrap(), "SELECT 1 FROM F WHERE F.TID = CAST(NULL AS INTEGER)");
         assert!(!corr_inner_plans(&sc, &None));
-        // ... where an unspellable one is not probed at all
+        // ... and a TIME WITH TIME ZONE stand-in spells and is probed too
         sc.refs[0].desc = Some(d(dtype::SQL_TIME_TZ, 8, 0, 0));
-        assert!(corr_inner_plans(&sc, &None));
+        assert_eq!(
+            corr_standin_text(&sc).unwrap(),
+            "SELECT 1 FROM F WHERE F.TID = CAST(NULL AS TIME WITH TIME ZONE)"
+        );
+        assert!(!corr_inner_plans(&sc, &None));
         // a BOOLEAN stand-in now spells and is probed like any other
         sc.refs[0].desc = Some(d(dtype::BOOLEAN, 1, 0, 0));
         assert_eq!(corr_standin_text(&sc).unwrap(), "SELECT 1 FROM F WHERE F.TID = CAST(NULL AS BOOLEAN)");
@@ -126282,6 +126510,10 @@ mod tests {
         assert!(!lookup_key_eq(&Value::Text("ab".into()), &Value::Text("abc".into())));
         assert!(lookup_key_eq(&Value::Int(7), &Value::Int(7)));
         assert!(!lookup_key_eq(&Value::Int(7), &Value::Int(8)));
+        // zoned keys: the instant, never the zone id
+        assert!(lookup_key_eq(&Value::TimestampTz(61000, 100, 1439), &Value::TimestampTz(61000, 100, 65535)));
+        assert!(!lookup_key_eq(&Value::TimestampTz(61000, 100, 1439), &Value::TimestampTz(61000, 101, 1439)));
+        assert!(lookup_key_eq(&Value::TimeTz(100, 1439), &Value::TimeTz(100, 1500)));
     }
 
     #[test]

@@ -31,7 +31,7 @@
 #
 # Boundaries (recorded): a RULED named zone (Europe/Paris) refuses -
 # fire-crab carries no tzdata rules, so it cannot place a value in one
-# (the tz-DML slice's boundary, unchanged); TIMEZONE_NAME refuses for
+# (the tz-DML slice's boundary, unchanged); TIMEZONE_NAME refused for
 # the same reason (the engine renders it through ICU).
 #
 #   qa/serve-real-attimezone.sh [port]
@@ -216,12 +216,10 @@ bothd "EXTRACT keeps its declared width under -, COALESCE, CASE and NULLIF" \
 # --- while fc carried the names only; serve-real-sessionclock.sh) ---
 both "a RULED zone converts (was a boundary refusal)" \
     "SELECT TIMESTAMP '2020-06-15 12:00:00' AT TIME ZONE 'Europe/Paris' FROM RDB\$DATABASE;"
-ran=$((ran + 1))
-r=$(q "$PORT" "SELECT EXTRACT(TIMEZONE_NAME FROM TIMESTAMP '2020-06-15 12:00:00 +05:00') FROM RDB\$DATABASE;")
-case "$r" in
-    *"Statement failed"*) echo "OK   boundary: TIMEZONE_NAME refuses (the engine renders it through ICU)" ;;
-    *) echo "DIFF TIMEZONE_NAME must refuse, fc answered [$r]"; fail=1 ;;
-esac
+# TIMEZONE_NAME answers the zone's own text (it refused; see
+# serve-real-tzcast.sh)
+both "TIMEZONE_NAME is the zone's text (was a boundary refusal)" \
+    "SELECT EXTRACT(TIMEZONE_NAME FROM TIMESTAMP '2020-06-15 12:00:00 +05:00'), EXTRACT(TIMEZONE_NAME FROM TIMESTAMP '2020-06-15 12:00:00 Europe/Paris') FROM RDB\$DATABASE;"
 bothz "...and a session can be SET to one (was a boundary refusal)" "Europe/Paris" \
     "SELECT TIMESTAMP '2020-06-15 12:00:00' AT TIME ZONE '+00:00' FROM RDB\$DATABASE;"
 # RECORDED DIVERGENCE, not a check: under isql's autocommit a

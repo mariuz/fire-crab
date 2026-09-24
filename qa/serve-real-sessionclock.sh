@@ -164,7 +164,7 @@ pin  "5 SET TIME ZONE 'Europe/Bucharest'"   "SET TIME ZONE 'Europe/Bucharest'; S
 pin  "5 THE SAME TEXT across a zone change - a cached plan kept the first clock" \
      "$Z SELECT CURRENT_DATE $DUAL; SET TIME ZONE '$OTHER'; SELECT CURRENT_DATE $DUAL;" "CURRENT_DATE|$FARDATE|CURRENT_DATE|$OTHERDATE"
 pin  "5 ...and 'TODAY' across it"           "$Z SELECT ID FROM T WHERE DT = 'TODAY'; SET TIME ZONE '$OTHER'; SELECT ID FROM T WHERE DT = 'TODAY';" \
-     "ID|1|$( [ "$OTHERDATE" = "$UTCDATE" ] && echo 'ID|2' || echo '')"
+     "ID|1$( [ "$OTHERDATE" = "$UTCDATE" ] && echo '|ID|2')"
 same "5 ...and LOCALTIME's hour across it"  "$Z SELECT EXTRACT(HOUR FROM LOCALTIME) $DUAL; SET TIME ZONE '$OTHER'; SELECT EXTRACT(HOUR FROM LOCALTIME) $DUAL;"
 pin  "5 SET TIME ZONE LOCAL - the host's own zone" "$Z SET TIME ZONE LOCAL; SELECT CURRENT_DATE $DUAL;" "CURRENT_DATE|$HOSTDATE"
 pin  "5 CONTROL an OFFSET zone, which always converted" "SET TIME ZONE '+14:00'; SELECT CURRENT_DATE $DUAL;" "CURRENT_DATE|$(TZ=Etc/GMT-14 date +%F)"
@@ -252,10 +252,10 @@ same "8 ...and a region's TIME, under a third zone" \
      "SET TIME ZONE 'America/New_York'; SELECT CAST(TIME '12:00:00 Australia/Sydney' AS TIME), CAST(TIME '10:00:00 +02:00' AS TIME) $DUAL;"
 same "8 ...and the zone-tailed text route" "$B SELECT CAST('10:00:00 +02:00' AS TIME) $DUAL;"
 
-echo "--- 9. RECORDED (the engine answers, this server refuses)"
-eng_refused "9 CAST(<timestamp> AS TIMESTAMP WITH TIME ZONE) - a CAST target this server does not type, in any zone" \
-            "SET TIME ZONE '+03:00'; SELECT CAST(TIMESTAMP '2026-09-08 10:00:00' AS TIMESTAMP WITH TIME ZONE) $DUAL;" "CAST|2026-09-08 10:00:00.0000 +03:00"
-eng_refused "9 RDB\$GET_CONTEXT('SYSTEM', 'SESSION_TIMEZONE')" "SET TIME ZONE '+05:00'; SELECT RDB\$GET_CONTEXT('SYSTEM', 'SESSION_TIMEZONE') $DUAL;" "RDB\$GET_CONTEXT|+05:00"
+echo "--- 9. PROMOTED from the recorded section (serve-real-tzcast.sh measures them)"
+pin  "9 promoted: CAST(<timestamp> AS TIMESTAMP WITH TIME ZONE) (serve-real-tzcast.sh)" \
+     "SET TIME ZONE '+03:00'; SELECT CAST(TIMESTAMP '2026-09-08 10:00:00' AS TIMESTAMP WITH TIME ZONE) $DUAL;" "CAST|2026-09-08 10:00:00.0000 +03:00"
+pin  "9 promoted: RDB\$GET_CONTEXT('SYSTEM', 'SESSION_TIMEZONE')" "SET TIME ZONE '+05:00'; SELECT RDB\$GET_CONTEXT('SYSTEM', 'SESSION_TIMEZONE') $DUAL;" "RDB\$GET_CONTEXT|+05:00"
 
 echo "--- panic check"
 ran=$((ran + 1))
