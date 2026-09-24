@@ -19937,7 +19937,41 @@ fn text_form_m(
     // `Expr::Col` arm below, which answers None for a non-text
     // descriptor; as a trailing catch-all this fixed the literals and
     // left every column still announcing 32765 (measured, mid-fix).
-    if let Some(ExprType::Temporal(k)) = e.type_of(descs) {
+    //
+    // A CONCATENATION IS TEXT, never one of the typed forms below, so it
+    // goes straight to its own arm - and so does a TEXT FUNCTION (UPPER,
+    // TRIM, SUBSTRING, LPAD ...). The probes are not free: `type_of`
+    // walks the whole subtree, and running it at EVERY node of a `||`
+    // chain made this quadratic - and [recode_concat] calls this at every
+    // level of the chain, so a 2000-deep `||` took 90 s to PREPARE
+    // (cubic; serve-real-deepexpr timed out); [expr_is_octets] and
+    // [carrier_fn_args] do the same at every level of nested UPPERs. The
+    // early answers are unchanged: these types are Text or None, neither
+    // of which any probe matches, and none has a DECFLOAT width.
+    let concat = matches!(
+        e,
+        Expr::Concat(..)
+            | Expr::Func(
+                SysFn::Upper
+                    | SysFn::Lower
+                    | SysFn::UpperCs(_)
+                    | SysFn::LowerCs(_)
+                    | SysFn::UpperColl(_)
+                    | SysFn::LowerColl(_)
+                    | SysFn::Substring
+                    | SysFn::Trim(_)
+                    | SysFn::Left
+                    | SysFn::Right
+                    | SysFn::Replace
+                    | SysFn::Reverse
+                    | SysFn::Lpad
+                    | SysFn::Rpad
+                    | SysFn::GetContext
+                    | SysFn::TzName,
+                _
+            )
+    );
+    if let Some(ExprType::Temporal(k)) = (!concat).then(|| e.type_of(descs)).flatten() {
         return Some((
             true,
             match k {
@@ -19961,10 +19995,11 @@ fn text_form_m(
     // AN APPROXIMATE OPERAND CONVERTED TO TEXT: DOUBLE renders into 24
     // characters, FLOAT into 15, no charset (measured: `DP || ''` is
     // VARYING(24), `ROUND(FL, 2) || ''` VARYING(15)); it announced 32765
-    if matches!(e.type_of(descs), Some(ExprType::Approx)) {
+    let ty = if concat { None } else { e.type_of(descs) };
+    if matches!(ty, Some(ExprType::Approx)) {
         return Some((true, if approx_expr_single(e, descs) { 15 } else { 24 }, TfCs::Ttype(0)));
     }
-    if matches!(e.type_of(descs), Some(ExprType::Numeric | ExprType::Int)) {
+    if matches!(ty, Some(ExprType::Numeric | ExprType::Int)) {
         let base = match result_width_bytes(e, descs) {
             0..=2 => 6,
             3..=4 => 11,
@@ -19981,7 +20016,7 @@ fn text_form_m(
     // charset (NONE; the text operand decides the result's). This carries
     // a decfloat branch through the number-beside-text conditional and a
     // `<decfloat> || <text>` concatenation.
-    if let Some(wide) = decfloat_width(e, descs) {
+    if let Some(wide) = (!concat).then(|| decfloat_width(e, descs)).flatten() {
         return Some((true, if wide { 42 } else { 23 }, TfCs::Ttype(0)));
     }
     match e {
@@ -70211,7 +70246,9 @@ fn resolve_expr(
 /// those keep today's path.
 fn recode_concat(e: Expr, descs: &[Descriptor]) -> Expr {
     use fire_crab_ods::intl::{byte_carrier, bytes_per_char, charset_id};
-    let Expr::Concat(a, b) = e else { return e };
+    if !matches!(e, Expr::Concat(..)) {
+        return e;
+    }
     // A BLOB CONCATENATION IS LEFT ALONE. Its result type is found by
     // walking the expression for a `BlobText` node ([blob_result]), and
     // that walk does not descend through a CAST - so wrapping an
@@ -70219,9 +70256,12 @@ fn recode_concat(e: Expr, descs: &[Descriptor]) -> Expr {
     // a text blob, sub_type 1 charset UTF8 where the engine says 0
     // (caught by serve-real-blobexpr before this shipped). Blob
     // operands carry their own charset rules anyway.
-    if blob_result(&Expr::Concat(a.clone(), b.clone()), descs).is_some() {
-        return Expr::Concat(a, b);
+    // (asked of the node itself: cloning both operands to ask it copied
+    // the whole subtree at every level of a `||` chain)
+    if blob_result(&e, descs).is_some() {
+        return e;
     }
+    let Expr::Concat(a, b) = e else { unreachable!() };
     let (Some((_, wa, ca)), Some((_, wb, cb))) =
         (text_form(&a, descs), text_form(&b, descs))
     else {
