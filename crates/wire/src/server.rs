@@ -5526,7 +5526,7 @@ fn server_info() -> fire_crab_svc::ServerInfo {
     fire_crab_svc::ServerInfo {
         // the driver splits the first space-token on 'V'/'T', so this must
         // look like a Firebird version banner
-        server_version: "LI-V6.0.0.2076 Firebird 6.0 fire-crab".to_string(),
+        server_version: "LI-V6.0.0.2182 Firebird 6.0 fire-crab".to_string(),
         implementation: "Firebird/Linux/ARM64".to_string(),
         security_db: "/opt/firebird/security6.fdb".to_string(),
         root: "/opt/firebird/".to_string(),
@@ -19296,8 +19296,32 @@ fn text_line_col(hay: &str, part: &str) -> Option<(i64, i64)> {
     if p < h || p + part.len() > h + hay.len() {
         return None;
     }
+    // A PART INSIDE THE STATEMENT AS THE CLIENT SENT IT is placed in THAT
+    // text, whatever slice of it `hay` is: a derived table's inner query
+    // is planned over a borrowed slice, and measured from the slice's
+    // start its unknown table sat at column 21 where the engine says 36
+    // (`SELECT X FROM (SELECT ID AS X FROM NOSUCHTAB) D`, measured on
+    // 2182). Rewritten text is never inside that buffer and keeps the
+    // slice-relative answer the callers already treat as theirs.
+    if let Some(r) = STMT_TEXT.with(|t| {
+        let t = t.borrow();
+        let (o, full) = t.as_ref()?;
+        if p >= *o && p + part.len() <= *o + full.len() {
+            Some(line_col_of(full.get(..p - *o)?))
+        } else {
+            None
+        }
+    }) {
+        return Some(r);
+    }
     let at = p - h;
     let before = hay.get(..at)?;
+    Some(line_col_of(before))
+}
+
+/// The 1-based (line, column) just past `before`, counted as the
+/// engine's lexer counts ([text_line_col]).
+fn line_col_of(before: &str) -> (i64, i64) {
     // A LINE ENDS ON CR, ON LF, OR ON CRLF - AND CRLF COUNTS ONCE. The
     // engine's lexer bumps its line counter on either character and
     // swallows the LF that follows a CR, so counting only LF puts every
@@ -19316,7 +19340,7 @@ fn text_line_col(hay: &str, part: &str) -> Option<(i64, i64)> {
         }
         after_cr = c == '\r';
     }
-    Some((line, col))
+    (line, col)
 }
 
 /// The engine's `print_key` (btr.cpp ~7128): `("COL" = v[, ...])`,
@@ -21870,7 +21894,8 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         let mut nums = inner.split(',').map(|n| n.trim().parse::<u16>().ok());
         let seg = nums.next().flatten()?;
         let sub = nums.next().unwrap_or(Some(0))?;
-        if nums.next().is_some() || sub > 1 {
+        // any sub_type since #9135 ([parse_blob_type])
+        if nums.next().is_some() {
             return None;
         }
         format!("BLOB SUB_TYPE {} SEGMENT SIZE {}", sub, seg)
@@ -21906,7 +21931,14 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             // a CHARACTER SET makes the blob a TEXT (sub_type 1) blob even
             // when it was declared SUB_TYPE 0 (probed: the engine promotes
             // `BLOB SUB_TYPE 0 CHARACTER SET UTF8` to subtype 1, charset 4)
-            let sub_type = if cs.is_some() { 1 } else { sub_type };
+            // - and ONLY an untyped one: beside any other sub_type it is the
+            // engine's -204 "Invalid use of CHARACTER SET" (measured: SUB_TYPE
+            // 5 CHARACTER SET UTF8 fails), where this made it a text blob
+            let sub_type = match (cs.is_some(), sub_type) {
+                (false, st) => st,
+                (true, 0 | 1) => 1,
+                (true, _) => return None,
+            };
             Some(fire_crab_ods::ddl::ColumnDef {
                 name: name.to_string(),
                 field_type: 261,
@@ -21997,9 +22029,14 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
 /// Parse the optional `(START WITH <n> [INCREMENT [BY] <n>])` of an IDENTITY
 /// clause. Returns `(start, increment)`, defaulting to `(1, 1)` when absent.
 /// The clauses after `BLOB`: (sub_type, SEGMENT SIZE, CHARACTER SET id).
-/// TEXT is 1, BINARY 0; a sub_type above 1 is refused (the engine: "Blob
-/// sub_types bigger than 1 (text) are for internal use only"); a
-/// CHARACTER SET belongs to a text blob only.
+/// TEXT is 1, BINARY 0, and the system names are theirs (BLR 2, ACL 3,
+/// RANGES 4, SUMMARY 5, FORMAT 6, TRANSACTION_DESCRIPTION 7,
+/// EXTERNAL_FILE_DESCRIPTION 8, DEBUG_INFORMATION 9); ANY signed 16-bit
+/// number is legal - the engine refused a sub_type above 1 ("for internal
+/// use only") until #9135 (f8e6148) removed the check, and engine 2182 has
+/// it removed (measured: 2, 7, 99, 32767 and -32768 all store). A
+/// CHARACTER SET makes an untyped (0) blob TEXT, and belongs to no other
+/// sub_type (the engine's -204 "Invalid use of CHARACTER SET").
 fn parse_blob_type(ty: &str) -> Option<(i16, Option<u16>, Option<u8>)> {
     let toks: Vec<&str> = ty.split_whitespace().collect();
     let (mut sub_type, mut seg, mut cs): (i16, Option<u16>, Option<u8>) = (0, None, None);
@@ -22010,6 +22047,14 @@ fn parse_blob_type(ty: &str) -> Option<(i16, Option<u16>, Option<u8>)> {
                 sub_type = match *toks.get(i + 1)? {
                     "TEXT" => 1,
                     "BINARY" => 0,
+                    "BLR" => 2,
+                    "ACL" => 3,
+                    "RANGES" => 4,
+                    "SUMMARY" => 5,
+                    "FORMAT" => 6,
+                    "TRANSACTION_DESCRIPTION" => 7,
+                    "EXTERNAL_FILE_DESCRIPTION" => 8,
+                    "DEBUG_INFORMATION" => 9,
                     n => n.parse::<i16>().ok()?,
                 };
                 i += 2;
@@ -22031,8 +22076,12 @@ fn parse_blob_type(ty: &str) -> Option<(i16, Option<u16>, Option<u8>)> {
             _ => return None,
         }
     }
-    if sub_type > 1 || (sub_type != 1 && cs.is_some()) {
-        return None;
+    if cs.is_some() {
+        match sub_type {
+            0 => sub_type = 1,
+            1 => {}
+            _ => return None,
+        }
     }
     Some((sub_type, seg, cs))
 }
@@ -25747,27 +25796,9 @@ fn plan_create_table(sql: &str, db: Option<&Database>) -> Option<(Plan, Vec<Desc
         }
     }
     let close = close?;
-    // `BLOB SUB_TYPE n` with n > 1: "Blob sub_types bigger than 1 (text)
-    // are for internal use only" - a -204 inside the CREATE TABLE failed
-    // wrapper (probed), answered at prepare
-    {
-        let body = &masked[open..=close];
-        let mut from = 0;
-        while let Some(at) = find_word(body, "SUB_TYPE", from) {
-            let before = body[..at].trim_end();
-            let after = body[at + "SUB_TYPE".len()..].trim_start();
-            let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if before.ends_with("BLOB") && num.parse::<i64>().map_or(false, |n| n > 1) {
-                let raw = s[table_kw + "TABLE".len()..open].trim();
-                let name = unquote_ident(raw).unwrap_or_else(|| raw.to_ascii_uppercase());
-                return Some((
-                    Plan::RefusedEval(EvalErr::BlobSubTypeInternal(format!("\"PUBLIC\".\"{}\"", name))),
-                    Vec::new(),
-                ));
-            }
-            from = at + "SUB_TYPE".len();
-        }
-    }
+    // (a `BLOB SUB_TYPE n` above 1 was refused here with the engine's
+    // "for internal use only" -204; #9135 removed that check from the
+    // engine, and 2182 stores any sub_type - see [parse_blob_type])
     // whatever follows the column list: an ON COMMIT clause (GTT) or nothing
     let tail = s[close + 1..].trim();
     let relation_type: i64 = if is_gtt {
@@ -43694,6 +43725,25 @@ thread_local! {
 }
 
 fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
+    // the OUTERMOST call records the statement; a nested one (a view, a
+    // derived table re-planned from its own text) leaves it as it is
+    let outermost = STMT_TEXT.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.is_none() {
+            *t = Some((sql.as_ptr() as usize, sql.to_string()));
+            true
+        } else {
+            false
+        }
+    });
+    let out = plan_query_outer(sql, db);
+    if outermost {
+        STMT_TEXT.with(|t| *t.borrow_mut() = None);
+    }
+    out
+}
+
+fn plan_query_outer(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     USER_FNS.with(|m| *m.borrow_mut() = db.as_ref().map(user_function_sigs).unwrap_or_default());
     PLAN_IMAGE.with(|c| {
         *c.borrow_mut() = db.as_ref().map(|d| (d.bytes(), d.page_size));
@@ -53646,13 +53696,16 @@ fn derived_view(inner_cols: &[ProjCol]) -> (Vec<RelationColumn>, Vec<Descriptor>
 
 /// Split `( <select> ) [AS] <alias>` - a DERIVED TABLE in the FROM.
 /// Returns the inner query text and the alias, which SQL requires.
-fn parse_derived_table(from_s: &str) -> Option<(String, String, Vec<String>)> {
+fn parse_derived_table(from_s: &str) -> Option<(&str, String, Vec<String>)> {
     let t = from_s.trim();
     if !t.starts_with('(') {
         return None;
     }
     let close = matching_paren(t.as_bytes(), 0)?;
-    let inner = t[1..close].trim().to_string();
+    // BORROWED, not copied: a position measured inside the inner query
+    // (its unknown table's `At line, column`) is then a slice of the
+    // statement the client sent, and [text_line_col] places it there
+    let inner = t[1..close].trim();
     let up = mask_literals(&inner.to_ascii_uppercase());
     if find_word(&up, "SELECT", 0) != Some(0) {
         return None;
@@ -65157,6 +65210,10 @@ thread_local! {
     /// a call with the wrong argument count): [plan_query] answers it
     /// in place of the generic refusal when the text does not plan
     static PREPARE_REFUSAL: std::cell::RefCell<Option<EvalErr>> = std::cell::RefCell::new(None);
+    /// the statement text of the prepare in progress and the ADDRESS of
+    /// the buffer it came from, so a position measured on a borrowed
+    /// slice of it can be placed in the whole ([text_line_col])
+    static STMT_TEXT: std::cell::RefCell<Option<(usize, String)>> = std::cell::RefCell::new(None);
 }
 
 thread_local! {
@@ -84324,8 +84381,10 @@ fn scope_rel_of(tr: &TableRef<'_>, db: &Database, db_opt: &Option<Database>) -> 
         // ever consulted, which is why widening the parser alone would
         // have built clean and changed nothing
         let alias = tr.alias.as_deref().unwrap_or("");
+        let joined = format!("{} {}", tr.table, alias);
         let (inner_sql, dalias, declared) = parse_derived_table(&tr.table)
-            .or_else(|| parse_derived_table(&format!("{} {}", tr.table, alias)))?;
+            .or_else(|| parse_derived_table(&joined))
+            .map(|(i, a, d)| (i.to_string(), a, d))?;
         let mut ip: Vec<Option<Descriptor>> = Vec::new();
         let plan = plan_query_inner(&inner_sql, db_opt, &mut ip)?;
         if matches!(plan, Plan::Refused | Plan::RefusedEval(_)) {
@@ -105034,6 +105093,24 @@ fn after_auth(
                         // Rc, whether it came from a planner or a cache
                         .map(|(p, ps)| (std::rc::Rc::new(p), std::rc::Rc::new(ps)));
                     match planned {
+                        // A DDL PLAN REFUSED WITH A VECTOR fails the prepare
+                        // with it, as the DML and SELECT arms do. It was
+                        // answered as a successful prepare - of statement
+                        // type SELECT, no columns - and then "executed" to
+                        // success doing nothing: isql reported "request
+                        // synchronization error" and a client that read
+                        // only the status went on as if the DDL had run
+                        // (measured on CREATE TABLE ... BLOB SUB_TYPE 2)
+                        Some((p, _)) if matches!(&*p, Plan::RefusedEval(_)) => {
+                            let Plan::RefusedEval(e) = &*p else { unreachable!() };
+                            let e = e.clone();
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] ddl prepare refused ({:?}): {:?}", e, stmt_sql);
+                            }
+                            plan = std::rc::Rc::new(Plan::Refused);
+                            stmt_params = std::rc::Rc::new(Vec::new());
+                            respond_eval_error(&mut s, &mut enc, &e)?;
+                        }
                         Some((p, ps)) => {
                             // DDL is not cached, so this pair is owned
                             let describe = answer_prepare(

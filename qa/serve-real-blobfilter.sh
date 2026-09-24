@@ -16,8 +16,10 @@
 # with the engine's vectors (a duplicate name, a duplicate (input,
 # output) pair = the unique violation on RDB$INDEX_17, a missing name);
 # a declared filter whose module is not there still converts nothing;
-# `BLOB SUB_TYPE 2` refused at CREATE TABLE with the engine's nested
-# -204; `IS NULL` over a blob column. Client qa/c/blobcol.c prints status
+# `BLOB SUB_TYPE 2` (and 99) ACCEPTED at CREATE TABLE - engine 2076
+# refused it with a nested -204 "for internal use only", and #9135
+# (f8e6148) removed that check: 2182 stores any sub_type; `IS NULL` over
+# a blob column. Client qa/c/blobcol.c prints status
 # vectors raw, so the codes and their arguments are compared.
 #
 # Recorded boundaries: CAST(<blob> AS VARCHAR) is outside fc's expression
