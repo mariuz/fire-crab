@@ -959,7 +959,7 @@ both "? * 2 > SUM(ID) + 1"                           "SELECT N FROM T GROUP BY N
 eng_only "R12 cap: K3: MAX(D) * ? > 10"                               "SELECT N FROM T GROUP BY N HAVING MAX(D) * ? > 10" '[3]'
 eng_only "R12 cap: K1: SUM(ID) > ? + 1 AND COUNT(*) > ? - two slots, two nullabilities"  "SELECT N FROM T GROUP BY N HAVING SUM(ID) > ? + 1 AND COUNT(*) > ?" '[0,1]'
 both "SUM(ID) BETWEEN ? + 1 AND 10"                  "SELECT N FROM T GROUP BY N HAVING SUM(ID) BETWEEN ? + 1 AND 10" '[3]'
-eng_only "SUM(ID) > COALESCE(?, 0) + ? - a sibling-typed and a comparison-typed slot (round 10: refuses - a comparison `?` the previous binary refused MIXED with an implicit integer cast over a `?` (plan_unmixed); the previous binary refuses it too)" \
+eng_only "SUM(ID) > COALESCE(?, 0) + ? - a sibling-typed and a comparison-typed slot (round 10: refuses - a comparison '?' the previous binary refused MIXED with an implicit integer cast over a '?' (plan_unmixed); the previous binary refuses it too)" \
      "SELECT N FROM T GROUP BY N HAVING SUM(ID) > COALESCE(?, 0) + ?" '[null,4]'
 eng_only "R12 cap: K1: NUMBERING: HAVING's slot before ORDER BY's"     "SELECT N, SUM(ID) AS SM FROM T GROUP BY N HAVING SUM(ID) > ? + 1 ORDER BY SUM(ID * CAST(? AS INTEGER))" '[0,-1]'
 both "WHERE ID * ? > 1 GROUP BY N"                   "SELECT N, COUNT(*) AS C FROM T WHERE ID * ? > 1 GROUP BY N" '[2]'
@@ -1012,7 +1012,7 @@ both "SELECT IIF(ID = ?, 1, 0) ['2.4'] -> 0;0;0"     "SELECT IIF(ID = ?, 1, 0) A
 desc_differs "SELECT CASE ID WHEN ? THEN 1 ELSE 0 END ['2.4'] -> 0;0;0" "SELECT CASE ID WHEN ? THEN 1 ELSE 0 END AS X FROM T" '["2.4"]'
 both "ORDER BY IIF(ID = ?, 0, 1) ['2.4'] -> 1;2;3"   "SELECT ID FROM T ORDER BY IIF(ID = ?, 0, 1), ID" '["2.4"]'
 both "SUM(IIF(ID = ?, 1, 0)) ['2.4'] -> 0"           "SELECT SUM(IIF(ID = ?, 1, 0)) AS X FROM T" '["2.4"]'
-eng_only "IIF(ID = ?, ?, 0) = 7 ['1.4', '6.5'] -> none (round 10: refuses - a comparison `?` the previous binary refused MIXED with an implicit integer cast over a `?` (plan_unmixed); the previous binary refuses it too)" "SELECT ID FROM T WHERE IIF(ID = ?, ?, 0) = 7" '["1.4","6.5"]'
+eng_only "IIF(ID = ?, ?, 0) = 7 ['1.4', '6.5'] -> none (round 10: refuses - a comparison '?' the previous binary refused MIXED with an implicit integer cast over a '?' (plan_unmixed); the previous binary refuses it too)" "SELECT ID FROM T WHERE IIF(ID = ?, ?, 0) = 7" '["1.4","6.5"]'
 eng_only "R11 refuses (a negated whole side / a mixed IN list; the previous binary refused): IIF(-? = ID, 1, 0) ['-2.5'] -> 0;0;0"          "SELECT IIF(-? = ID, 1, 0) AS X FROM T" '["-2.5"]'
 boundary_err "R12 boundary: conversion error by design (K2): IIF(ID = ?, 1, 0) = 1 ['1 2'] -> none (the compare grammar reads 12, no raise)" "SELECT ID FROM T WHERE IIF(ID = ?, 1, 0) = 1" '["1 2"]'
 both_err "IIF(ID = ?, 1, 0) = 1 ['0x2'] - conversion error from string on both (prepared on both)" "SELECT ID FROM T WHERE IIF(ID = ?, 1, 0) = 1" '["0x2"]'
@@ -1032,9 +1032,9 @@ both "ORDER BY IIF(ID = CAST(? AS INTEGER), 0, 1)"   "SELECT ID FROM T ORDER BY 
 # the branch's implicit cast would read a text the previous binary's way
 # - `IIF(ID = ?, ?, N)` ['2', '4.999999999999'] answered 3;5;4 where the
 # engine raises - in a statement the previous binary never planned)
-eng_only "IIF(ID = ?, ?, 0) - a condition slot and a branch slot (round 10: refuses - a comparison `?` the previous binary refused MIXED with an implicit integer cast over a `?` (plan_unmixed); the previous binary refuses it too)" \
+eng_only "IIF(ID = ?, ?, 0) - a condition slot and a branch slot (round 10: refuses - a comparison '?' the previous binary refused MIXED with an implicit integer cast over a '?' (plan_unmixed); the previous binary refuses it too)" \
      "SELECT IIF(ID = ?, ?, 0) AS X FROM T" '[2,77]'
-eng_only "IIF(NN = ?, ?, 0) - the same (round 10: refuses - a comparison `?` the previous binary refused MIXED with an implicit integer cast over a `?` (plan_unmixed); the previous binary refuses it too)"  "SELECT IIF(NN = ?, ?, 0) AS X FROM T" '[6,77]'
+eng_only "IIF(NN = ?, ?, 0) - the same (round 10: refuses - a comparison '?' the previous binary refused MIXED with an implicit integer cast over a '?' (plan_unmixed); the previous binary refuses it too)"  "SELECT IIF(NN = ?, ?, 0) AS X FROM T" '[6,77]'
 # PRE-EXISTING (identical on c34c1c8): a text-branch IIF's OUTPUT width
 # is announced 32765 where the engine says the sibling column's 10
 eng_only "R12 cap: K1: IIF(ID = ?, S, ?) - the text output width"        "SELECT IIF(ID = ?, S, ?) AS X FROM T" '[2,"zz"]'

@@ -128,17 +128,19 @@ SQL
 case "$eng" in *"R 11"*) echo "OK   the engine runs the procedure and view fc stored from commented DDL";;
     *) echo "DIFF engine-runs-fc: [$eng]"; fail=1;; esac
 
-# --- fc's stored source: comments BLANKED, length kept (the recorded
-# --- divergence - the engine stores them verbatim)
-ran=$((ran + 1))
-src=$("$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 <<'SQL'
+# --- fc's stored source keeps the comments VERBATIM, as the engine's does
+# --- (this was a recorded divergence - fc blanked them, length kept - and
+# --- it converged in an earlier round without this cell being promoted:
+# --- it went red on every sweep as "fc stored the comment text")
+src_of() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<'SQL' | tr -d '\r'
 SET LIST ON; SET BLOB ALL;
 SELECT RDB$PROCEDURE_SOURCE FROM RDB$PROCEDURES WHERE RDB$PROCEDURE_NAME = 'PC';
 SQL
-)
-case "$src" in *"body comment"*) echo "DIFF fc stored the comment text (expected blanked): [$src]"; fail=1;;
-    *"R = A + 1;"*) echo "OK   fc's stored source keeps positions with comments blanked (recorded divergence)";;
-    *) echo "DIFF stored source unreadable: [$src]"; fail=1;; esac
+}
+case "$(src_of "127.0.0.1/$REAL:$B")" in *"body comment"*) ;; *) echo "DIFF the engine's source lost its comment - the cell below measures nothing"; fail=1;; esac
+check "the stored procedure source keeps its comments, as the engine's" \
+    "$(src_of "127.0.0.1/$PORT:$A" | grep -v '^RDB\$PROCEDURE_SOURCE')" \
+    "$(src_of "127.0.0.1/$REAL:$B" | grep -v '^RDB\$PROCEDURE_SOURCE')"
 
 # --- the nested-comment refusal (engine -104 at the leftover token) ---
 ran=$((ran + 1))

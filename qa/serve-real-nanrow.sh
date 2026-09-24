@@ -304,7 +304,7 @@ echo "-- 2. THE PRIMARY IS THE LESSER, and rank beats the writing order --"
 # why BOTH spellings of `<` are TRUE on the same row.
 both             "2 D < D2 - row 6 holds a finite D and a NaN D2 (engine 1;6;8)" "SELECT ID FROM M WHERE D < D2 ORDER BY ID" '[]'
 both             "2 D2 < D - the SAME question written the other way, also TRUE (engine 1;6;8)" "SELECT ID FROM M WHERE D2 < D ORDER BY ID" '[]'
-both             "2 D > D2 - and both `>` spellings are FALSE (engine (none))" "SELECT ID FROM M WHERE D > D2 ORDER BY ID" '[]'
+both             "2 D > D2 - and both '>' spellings are FALSE (engine (none))" "SELECT ID FROM M WHERE D > D2 ORDER BY ID" '[]'
 both             "2 D2 > D (engine (none))" "SELECT ID FROM M WHERE D2 > D ORDER BY ID" '[]'
 both             "2 D < D - a column against itself (engine 1;8)" "SELECT ID FROM M WHERE D < D ORDER BY ID" '[]'
 both             "2 D > D (engine (none))" "SELECT ID FROM M WHERE D > D ORDER BY ID" '[]'

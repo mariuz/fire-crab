@@ -33903,18 +33903,55 @@ fn double_exact_at(x: f64, scale: i8) -> bool {
     exact_to_f64(scaled.round() as i128, scale as i32) == x
 }
 
+/// A NaN double converted to an exact type: the C++ cast of the platform
+/// the ENGINE runs on, reproduced for the platform this server is built
+/// for. CVT's `(SLONG)` / `(SINT64)` of a NaN is undefined in C++ and the
+/// hardware decides. On x86-64 `cvttsd2si` answers the "integer
+/// indefinite" (measured against the engine on this host): INT32_MIN for
+/// an INTEGER-backed target (INTEGER, NUMERIC(p<=9) - `-21474836.48` at
+/// scale 2), INT64_MIN for a BIGINT-backed one, and 22003 for a
+/// SMALLINT-backed one, whose range check refuses the INT32_MIN; an
+/// INT128-backed one is `-0x7fffffff7fffffff7fffffff80000000` at every
+/// scale (the same indefinite, one per 32-bit word). ARM's `fcvtzs`
+/// saturates NaN to 0 - which is what the gates recorded on the host they
+/// were written on, and what every other architecture keeps here.
+fn nan_exact(dt: u8) -> Result<i128, ApproxFit> {
+    if cfg!(target_arch = "x86_64") {
+        match dt {
+            dtype::SHORT => Err(ApproxFit::OutOfRange),
+            dtype::LONG => Ok(i32::MIN as i128),
+            dtype::INT64 => Ok(i64::MIN as i128),
+            dtype::INT128 => Ok(-0x7fff_ffff_7fff_ffff_7fff_ffff_8000_0000_i128),
+            _ => Ok(0),
+        }
+    } else {
+        Ok(0)
+    }
+}
+
+/// The storage dtype behind an exact type of `bytes` width.
+fn exact_backing(bytes: u8) -> u8 {
+    match bytes {
+        2 => dtype::SHORT,
+        4 => dtype::LONG,
+        8 => dtype::INT64,
+        _ => dtype::INT128,
+    }
+}
+
 /// THE ENGINE'S RUNTIME double -> exact conversion (cvt.cpp CVT_get_int64):
 /// scale to the target, add (0.5 + eps) AS ONE CONSTANT away from zero,
 /// truncate, then fit the storage width. `eps` is 1e-14 for a DOUBLE
-/// source and 1e-5 for a FLOAT one. NaN converts to 0 (measured four ways:
-/// INSERT, UPDATE, CAST and a procedure argument all store 0); +-Infinity
+/// source and 1e-5 for a FLOAT one. NaN converts by the platform's cast
+/// ([nan_exact]: 0 where it was measured first, INT32_MIN / INT64_MIN on
+/// x86-64 - INSERT, UPDATE, CAST and a procedure argument alike); +-Infinity
 /// and an overflow are 22003. INT128 takes the same law BELOW 2^53 (a
 /// runtime 10.075 stores 10.07 where the double LITERAL 10.075e0 stores
 /// 10.08 by its decimal text); at or past 2^53 it answers `TooWide`.
 /// Callers pass ONLY RUNTIME values.
 fn approx_to_exact(x: f64, eps: f64, dt: u8, scale: i8) -> Result<i128, ApproxFit> {
     if x.is_nan() {
-        return Ok(0);
+        return nan_exact(dt);
     }
     let scaled = x * 10f64.powi(-(scale as i32));
     if !scaled.is_finite() {
@@ -78495,6 +78532,12 @@ fn exp_text_to_scaled_at(s: &str, bytes: u8, scale: i8, int128: bool) -> Option<
 /// half away from zero and raises past the INT64 range) - the
 /// non-finite values raise the same *numeric value is out of range*.
 fn approx_to_int64(x: f64) -> Result<i128, EvalErr> {
+    // MOV_get_int64 of a NaN is the platform's cast of it ([nan_exact]):
+    // `MOD(D, 3)` over a stored NaN is -2 on x86-64 (INT64_MIN mod 3,
+    // measured) - where this raised 22003
+    if x.is_nan() {
+        return nan_exact(dtype::INT64).map_err(|_| EvalErr::NumericOutOfRange);
+    }
     if !x.is_finite() {
         return Err(EvalErr::NumericOutOfRange);
     }
@@ -79558,12 +79601,15 @@ fn round_places(nv: Option<&Value>) -> Result<i32, EvalErr> {
 /// the fudge that recovers 1.005 -> 1.01 from its 1.00499.. binary form);
 /// the DOUBLE-typed result is that scaled integer converted back.
 fn round_double(mut d: f64, s: i32, eps: f64) -> Result<Value, EvalErr> {
-    // a NaN ROUNDS TO 0, as every other exact conversion of one does
-    // ([approx_to_exact]) - measured over a STORED NaN: `ROUND(D, 0)` and
-    // `CAST(ROUND(D, 0) AS VARCHAR)` are 0 on the engine where the
-    // non-finite gate below raised 22003
+    // a NaN ROUNDS as every other exact conversion of one does - through
+    // CVT_get_int64, so it is the platform's cast of it ([nan_exact]): 0
+    // where it was measured first, INT64_MIN on x86-64 (`ROUND(D, 0)` is
+    // -9223372036854775808 and `ROUND(D, 2)` -92233720368547758.08 there,
+    // measured over a STORED NaN) - never the 22003 of the gate below
     if d.is_nan() {
-        d = 0.0;
+        let sc = i8::try_from(s).map_err(|_| EvalErr::NumericOutOfRange)?;
+        let r = nan_exact(dtype::INT64).map_err(|_| EvalErr::NumericOutOfRange)?;
+        return Ok(Value::Rounded(r as i64, sc));
     }
     if s > 0 {
         d /= 10f64.powi(s);
@@ -81267,7 +81313,11 @@ impl Expr {
                         ArithOp::Mul => x * y,
                         ArithOp::Div => x / y,
                     };
-                    if !out.is_finite() {
+                    // an INFINITE result is the overflow; a NaN one - only
+                    // a NaN operand makes one - propagates, as the engine's
+                    // isinf() test lets it (measured: `D + 1` over a stored
+                    // NaN is NaN, where this raised 22003)
+                    if out.is_infinite() {
                         return Err(EvalErr::FloatOverflow);
                     }
                     Value::Double(out)
@@ -81868,7 +81918,12 @@ impl Expr {
                                 if x.is_nan() && (matches!(*cs, CS_SLOT_CAST) || is_whole_side(*cs)) {
                                     return Err(EvalErr::ConversionError(None));
                                 }
-                                let x = if x.is_nan() { 0.0 } else { x };
+                                // a NaN is the platform's cast ([nan_exact])
+                                if x.is_nan() {
+                                    let r = nan_exact(exact_backing(*bytes))
+                                        .map_err(|_| EvalErr::NumericOutOfRange)?;
+                                    fit(r)?
+                                } else {
                                 let eps = if matches!(v, Value::Float(_)) && approx_source_is_single(e) {
                                     1e-5
                                 } else {
@@ -81891,6 +81946,7 @@ impl Expr {
                                     return Err(EvalErr::NumericOutOfRange);
                                 }
                                 fit(r as i128)?
+                                }
                             }
                             // a DECFLOAT source rounds half AWAY FROM ZERO
                             // to an integer (2.5 -> 3). The engine converts
@@ -82230,7 +82286,13 @@ impl Expr {
                                 if d.is_nan() && (matches!(*cs, CS_SLOT_CAST) || is_whole_side(*cs)) {
                                     return Err(EvalErr::ConversionError(None));
                                 }
-                                let d = if d.is_nan() { 0.0 } else { d };
+                                // a NaN is the platform's cast, unscaled at
+                                // the target's scale ([nan_exact])
+                                if d.is_nan() {
+                                    let r = nan_exact(exact_backing(*bytes))
+                                        .map_err(|_| EvalErr::NumericOutOfRange)?;
+                                    (r, *scale)
+                                } else {
                                 let scaled = d * 10f64.powi(-(*scale) as i32);
                                 if !scaled.is_finite() {
                                     return Err(EvalErr::ConversionError(None));
@@ -82304,6 +82366,7 @@ impl Expr {
                                         scaled - (0.5 + eps)
                                     };
                                     (adjusted.trunc() as i128, *scale)
+                                }
                                 }
                             }
                             // a DECFLOAT source rounds HALF AWAY FROM ZERO
@@ -82391,7 +82454,10 @@ impl Expr {
                     CastTarget::Float => {
                         let narrow = |d: f64| -> Result<Value, EvalErr> {
                             let f = d as f32;
-                            if !f.is_finite() {
+                            // a double past the single range is 22003; a NaN
+                            // narrows to a NaN (measured: CAST(D AS FLOAT)
+                            // over a stored NaN answers it - this raised)
+                            if f.is_infinite() {
                                 return Err(EvalErr::NumericOutOfRange);
                             }
                             Ok(Value::Float(f))
@@ -120483,6 +120549,19 @@ mod tests {
         assert!(matches!(cast_int("2.5", 4), Ok(Value::Int(3))));
         // and a double at exactly -2^63 is out of range for BIGINT
         assert!(matches!(approx_to_int64(-9223372036854775808.0), Err(EvalErr::NumericOutOfRange)));
+        // a NaN is the build platform's C++ cast (serve-real-nancast)
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(approx_to_int64(f64::NAN).unwrap(), i64::MIN as i128);
+            assert!(matches!(nan_exact(dtype::SHORT), Err(ApproxFit::OutOfRange)));
+            assert_eq!(nan_exact(dtype::LONG).ok(), Some(i32::MIN as i128));
+            assert_eq!(
+                nan_exact(dtype::INT128).ok().map(|v| v.to_string()),
+                Some("-170141183420855150465331762880109871104".to_string())
+            );
+            assert_eq!(approx_to_exact(f64::NAN, 1e-14, dtype::LONG, -2).ok(), Some(i32::MIN as i128));
+        } else {
+            assert_eq!(approx_to_int64(f64::NAN).unwrap(), 0);
+        }
     }
 
     #[test]
@@ -127730,8 +127809,9 @@ mod computed_wide_types {
         assert_eq!(approx_to_exact(-2.5, 1e-14, dt::LONG, 0), Ok(-3));
         assert_eq!(approx_to_exact(2.4, 1e-14, dt::LONG, 0), Ok(2));
         assert_eq!(approx_to_exact(7.245, 1e-14, dt::LONG, -2), Ok(725));
-        // a NaN stores 0; +-Infinity and an overflow are 22003
-        assert_eq!(approx_to_exact(f64::NAN, 1e-14, dt::LONG, 0), Ok(0));
+        // a NaN stores the platform's cast ([nan_exact]); +-Infinity and
+        // an overflow are 22003
+        assert_eq!(approx_to_exact(f64::NAN, 1e-14, dt::LONG, 0), nan_exact(dt::LONG));
         assert_eq!(
             approx_to_exact(f64::INFINITY, 1e-14, dt::LONG, 0),
             Err(ApproxFit::OutOfRange)
@@ -128413,10 +128493,17 @@ mod computed_wide_types {
             bound_double_into_int128(&d, &WireParam::Double(10.075)),
             Ok(Some(WireParam::Int(1007, -2)))
         ));
-        assert!(matches!(
-            bound_double_into_int128(&d, &WireParam::Double(f64::NAN)),
-            Ok(Some(WireParam::Int(0, -2)))
-        ));
+        // a NaN is the platform's cast: 0 on ARM, and on x86-64 the INT128
+        // indefinite - which no i64 wire value carries, so it keeps the
+        // caller's refusal (recorded in serve-real-nancast)
+        if cfg!(target_arch = "x86_64") {
+            assert!(matches!(bound_double_into_int128(&d, &WireParam::Double(f64::NAN)), Ok(None)));
+        } else {
+            assert!(matches!(
+                bound_double_into_int128(&d, &WireParam::Double(f64::NAN)),
+                Ok(Some(WireParam::Int(0, -2)))
+            ));
+        }
         assert!(matches!(
             bound_double_into_int128(&d, &WireParam::Double(f64::INFINITY)),
             Err(EvalErr::NumericOutOfRange)
