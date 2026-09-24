@@ -13,8 +13,13 @@
 #   op_crypt -> Arc4 armed both directions with the session key
 #   op_attach (encrypted)
 #   op_transaction / allocate / prepare / execute / fetch
-# and must decode the fixed answer (4242) that this milestone's server
-# returns for every query. A value mismatch, or a decode of null, is a
+# and must decode the answer of a real query over a real database. The
+# milestone this gate was written for answered a FIXED 4242 to every query
+# and attached to any name at all ("probe"); the server has long since
+# opened real files, and the gate attached to a database that was not
+# there - red on every host without a stray `probe` file in its working
+# directory. It now builds its database through the engine and expects
+# the query's own answer. A value mismatch, or a decode of null, is a
 # protocol bug (it was, once: a missing FB_PROTOCOL_FLAG made the client
 # parse rows in the legacy null-indicator layout - see server.rs).
 #
@@ -27,6 +32,12 @@ FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
 PORT="${1:-4534}"
 EXPECT="${EXPECT:-4242}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
+ISQL="${ISQL:-isql}"
+REAL="${FC_REAL_PORT:-3050}"
+DB=/tmp/fbhandson/fc-client-probe.fdb
+mkdir -p /tmp/fbhandson; rm -f "$DB"
+echo "CREATE DATABASE '127.0.0.1/$REAL:$DB' USER '$U' PASSWORD '$P';" | "$ISQL" -q >/dev/null 2>&1 \
+    || { echo "FAIL the engine could not create $DB"; exit 1; }
 
 if ! command -v node >/dev/null 2>&1; then
     echo "SKIP node not found"; exit 0
@@ -35,7 +46,7 @@ fi
 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-real.log 2>&1 &
 srv=$!
 # give the listener a moment; kill the server on exit no matter what
-trap 'kill $srv 2>/dev/null' EXIT
+trap 'kill $srv 2>/dev/null; rm -f "$DB"' EXIT
 i=0; while [ $i -lt 20 ]; do
     if command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null; then break; fi
     i=$((i + 1)); sleep 0.1
@@ -51,9 +62,9 @@ kill -0 $srv 2>/dev/null || {
 
 got=$(node -e '
 const Firebird = require("node-firebird");
-Firebird.attach({host:"127.0.0.1",port:'"$PORT"',database:"probe",user:"'"$U"'",password:"'"$P"'"}, (err, db) => {
+Firebird.attach({host:"127.0.0.1",port:'"$PORT"',database:"'"$DB"'",user:"'"$U"'",password:"'"$P"'"}, (err, db) => {
   if (err) { console.log("ERR "+err.message); process.exit(0); }
-  db.query("SELECT CAST(42 AS BIGINT) FROM RDB$DATABASE", (e2, r) => {
+  db.query("SELECT CAST(4242 AS BIGINT) FROM RDB$DATABASE", (e2, r) => {
     if (e2) { console.log("ERR "+e2.message); }
     else {
       const row = r && r[0];

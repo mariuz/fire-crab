@@ -1430,6 +1430,26 @@ fn send_request_batch(
     w.send(s, enc)
 }
 
+/// Write a whole database image (or a shadow) to `path`. An EXISTING file
+/// is opened for writing WITHOUT O_CREAT and truncated: `std::fs::write`
+/// always passes O_CREAT, and Linux's `fs.protected_regular` (2 on this
+/// QA host) refuses an O_CREAT open of a file another user owns in a
+/// sticky world- or group-writable directory - even a file the process
+/// may write. A database the ENGINE created (owner firebird, 0660) in
+/// such a directory could be opened O_RDWR and paged, and then failed
+/// every whole-image rewrite (a DDL that grows the file) with EACCES:
+/// "I/O error during write ... Permission denied" (serve-real-fkaction,
+/// ddlsequence, empbuild, empbackup). Only a MISSING file is created.
+fn write_db_file(path: impl AsRef<std::path::Path>, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let p = path.as_ref();
+    match std::fs::OpenOptions::new().write(true).truncate(true).open(p) {
+        Ok(mut f) => f.write_all(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::write(p, bytes),
+        Err(e) => Err(e),
+    }
+}
+
 /// One op_response whose status vector carries a gds error - how the
 /// server refuses a statement (isc_arg_gds + code + isc_arg_end); the
 /// client raises it as an SQL error instead of silently proceeding.
@@ -6963,13 +6983,13 @@ fn run_gbak_restore_core(
             }
         }
         let final_bytes = file.to_bytes();
-        std::fs::write(&db, &final_bytes).map_err(|e| e.to_string())?;
+        write_db_file(&db, &final_bytes).map_err(|e| e.to_string())?;
         // the physical shadows: the finished image itself, header
         // marked ACTIVE_SHADOW + the root file's name (measured - a
         // live shadow is otherwise page-identical to its database)
         for (path, _) in &restored.shadows {
             let sh = fire_crab_ods::ddl::shadow_image_of(&final_bytes, page_size, &db);
-            std::fs::write(path, &sh).map_err(|e| e.to_string())?;
+            write_db_file(path, &sh).map_err(|e| e.to_string())?;
         }
         Ok(())
     })();
@@ -7374,7 +7394,7 @@ fn run_nbak(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
     }
     // the MAIN database takes the chain bookkeeping - written the way
     // the restore path writes files, with the pool told to reload
-    std::fs::write(&db, &main.to_bytes()).map_err(|_| GDS_IO_ERROR)?;
+    write_db_file(&db, &main.to_bytes()).map_err(|_| GDS_IO_ERROR)?;
     fire_crab_cch::pool::forget(&db);
     let pages = copy.byte_len() / page_size;
     // nbackup's own stat lines, streamed back the way the engine's
@@ -7492,7 +7512,7 @@ fn run_nbak_incremental(db: &str, file: &str, level: i64) -> Result<String, i32>
     if let Some(p) = main.page_mut(0) {
         p[8..12].copy_from_slice(&(era + 1).to_le_bytes());
     }
-    std::fs::write(db, &main.to_bytes()).map_err(|_| GDS_IO_ERROR)?;
+    write_db_file(db, &main.to_bytes()).map_err(|_| GDS_IO_ERROR)?;
     fire_crab_cch::pool::forget(db);
     Ok(format!(
         "time elapsed	0 sec 
@@ -36745,7 +36765,7 @@ fn execute_dml_collecting_inner(
                 if let Some(p) = work.page_mut(0) {
                     p[24] = 0;
                 }
-                std::fs::write(&db.path, work.to_bytes()).map_err(|e| e.to_string())?;
+                write_db_file(&db.path, &work.to_bytes()).map_err(|e| e.to_string())?;
                 let _ = std::fs::remove_file(&delta_path);
             }
             (0, 0, 0)
@@ -38579,10 +38599,10 @@ fn flush_careful(path: &str, before: &fire_crab_ods::Image, after: &fire_crab_od
         );
     }
     if std::env::var("FC_NO_CAREFUL").is_ok() {
-        return std::fs::write(path, &after.to_bytes()).map_err(|e| e.to_string());
+        return write_db_file(path, &after.to_bytes()).map_err(|e| e.to_string());
     }
     if before.byte_len() != after.byte_len() || before.num_pages() == 0 || page_size == 0 {
-        return std::fs::write(path, &after.to_bytes()).map_err(|e| e.to_string());
+        return write_db_file(path, &after.to_bytes()).map_err(|e| e.to_string());
     }
     // the changed set by ARC IDENTITY - O(pages), the point of per-page
     // fetch: a written page has a new Arc, so this never materialises
