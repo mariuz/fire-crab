@@ -30271,6 +30271,32 @@ fn wrap_returning(
         }
         _ => None,
     };
+    // A BARE NAME BOTH CONTEXTS CARRY is the engine's 42702, naming the
+    // SOURCE first and the target second (measured: `MERGE INTO O USING
+    // T` says "between table T and table O"; a derived source is
+    // `derived table "S"`). It is POSTED, and the statement refuses with
+    // it at prepare ([PREPARE_REFUSAL]).
+    let post_ambiguous = |name: &str| {
+        if let Plan::Merge { source_sql, src_alias, .. } = &plan {
+            let from = source_sql.trim();
+            let from = from.get(14..).filter(|_| from.to_ascii_uppercase().starts_with("SELECT * FROM "));
+            let first = match from.map(str::trim_start) {
+                Some(f) if f.starts_with('(') => format!("derived table \"{}\"", src_alias),
+                Some(f) => {
+                    let t = f.split_whitespace().next().unwrap_or("");
+                    let n = canon_relation_name(dbr, t).unwrap_or_else(|| t.to_ascii_uppercase());
+                    format!("table \"PUBLIC\".\"{}\"", n)
+                }
+                None => return,
+            };
+            let e = EvalErr::AmbiguousField {
+                first,
+                second: format!("table \"PUBLIC\".\"{}\"", canon),
+                name: name.to_string(),
+            };
+            PREPARE_REFUSAL.with(|r| *r.borrow_mut() = Some(e));
+        }
+    };
     // CAN ANY BRANCH OF THIS MERGE PRODUCE AN AFTER-IMAGE? If none can -
     // every WHEN is a DELETE and there is no INSERT branch - then
     // `NEW.<col>` is STATICALLY NULL, and the engine describes it as the
@@ -30315,7 +30341,15 @@ fn wrap_returning(
     // ...and a MERGE has both images as well: its matched branch is an
     // UPDATE, and on the INSERT branch the engine answers OLD as NULL
     // (probed) rather than refusing the statement.
-    let two_rows = matches!(&plan, Plan::Update { .. } | Plan::Merge { .. } | Plan::ViewTrig { action: 2, .. })
+    // ...and UPDATE OR INSERT has both as well (measured): its update
+    // half is an UPDATE, and its insert half answers OLD as NULL, as a
+    // MERGE's insert branch does - the before-image slot the insert half
+    // leaves EMPTY ([Affected::old_images]) already reads that way. It
+    // refused `OLD.`/`NEW.` outright, where the engine answers.
+    let upsert = matches!(&plan, Plan::UpdateOrInsert { .. })
+        || matches!(&plan, Plan::Returning { inner, .. } if matches!(inner.as_ref(), Plan::UpdateOrInsert { .. }));
+    let two_rows = upsert
+        || matches!(&plan, Plan::Update { .. } | Plan::Merge { .. } | Plan::ViewTrig { action: 2, .. })
         || matches!(&plan, Plan::Returning { inner, .. }
             if matches!(inner.as_ref(), Plan::Update { .. } | Plan::Merge { .. } | Plan::ViewTrig { action: 2, .. }));
     // the OLD row is appended to each returned row at `width`
@@ -30334,6 +30368,48 @@ fn wrap_returning(
         let items = split_top_level_commas(list);
         if items.len() > 1 && items.iter().any(|i| i.trim() == "*") {
             return None;
+        }
+    }
+    // IN A MERGE, `NEW.*` IS ITS COLUMNS SPELLED - `NEW.ID, NEW.N, ...` -
+    // so each one takes the spelled route's after-image law: NULL, named
+    // CONSTANT, where a DELETE branch produced the row. As a star it read
+    // the target's image, and answered the DELETED row's values where
+    // the engine answers NULLs (measured; a wrong answer 796cd58 closed
+    // for `NEW.<col>` and left open for `NEW.*`).
+    let spelled_new: String;
+    let list = if merge.is_some() {
+        let items: Vec<String> = split_top_level_commas(list)
+            .into_iter()
+            .map(|i| {
+                let t = i.trim();
+                let up = t.to_ascii_uppercase();
+                let bare_new = up.strip_prefix("NEW").map(|r| r.trim_start().strip_prefix('.').map(str::trim));
+                if bare_new == Some(Some("*")) {
+                    columns
+                        .iter()
+                        .map(|c| format!("NEW.\"{}\"", c.name.replace('"', "\"\"")))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    t.to_string()
+                }
+            })
+            .collect();
+        spelled_new = items.join(", ");
+        spelled_new.as_str()
+    } else {
+        list
+    };
+    // ...and a BARE `*` in a MERGE is the TARGET's row, each column taken
+    // as a bare name - so one the SOURCE also carries is the engine's
+    // 42702 (measured: over T(ID, N) and O(ID, K) `RETURNING *` names
+    // ID; over O2(OID, K) it answers T's row, never O2's columns)
+    if let Some((_, src, _, _)) = &merge {
+        if split_top_level_commas(list).iter().any(|i| i.trim() == "*") {
+            if let Some(c) = columns.iter().find(|c| src.iter().any(|n| *n == c.name)) {
+                post_ambiguous(&c.name);
+                return None;
+            }
         }
     }
     for item in split_top_level_commas(list) {
@@ -30365,10 +30441,13 @@ fn wrap_returning(
                 }
                 let d = descs.get(fid)?;
                 let (wire, sql_type, length, scale, sub_type) = wire_for(d);
+                // an UPSERT's OLD.* is CONSTANT per column, as its
+                // spelled `OLD.<col>` is (measured)
+                let konst = old_star && upsert;
                 cols.push(ProjCol {
-                    name: c.name.clone(),
-                    fname: None,
-                    relation: Some(table.to_string()),
+                    name: if konst { "CONSTANT".to_string() } else { c.name.clone() },
+                    fname: konst.then(|| "CONSTANT".to_string()),
+                    relation: (!konst).then(|| table.to_string()),
                     rel_alias: None,
                     field_id: fid,
                     wire,
@@ -30462,6 +30541,32 @@ fn wrap_returning(
             } else {
                 body
             };
+            // AN UPSERT's `OLD.<col>` INSIDE AN EXPRESSION is typed by the
+            // engine as the untyped NULL LITERAL while it still evaluates
+            // to the old value (measured: `OLD.S || ''` describes
+            // VARYING(0), `COALESCE(OLD.S, 'xyz')` CHAR(3), and `OLD.S ||
+            // '!'` raises 22001 on the row it updated - where a plain
+            // UPDATE types the same text VARYING(21) and answers). An
+            // engine defect this server does not model: refused, a
+            // recorded boundary. The spelled `OLD.<col>` and `OLD.*`
+            // answer.
+            if upsert && body.contains(OLD_REF_PREFIX) {
+                return None;
+            }
+            // A MERGE's SOURCE ROW is a context too (measured: `RETURNING
+            // K + 1` over O(ID, K) answers 101): `<source alias>.<col>`
+            // becomes a synthetic `SRC$<col>`, and a bare name only the
+            // source carries resolves there as itself - both read the
+            // source row appended at `2 * width`
+            let src_body;
+            let body = match &merge {
+                Some((_, _, src_alias, _)) => {
+                    src_body = rewrite_qual_refs(body, src_alias, SRC_REF_PREFIX);
+                    src_body.as_str()
+                }
+                None => body,
+            };
+            let merge_descs: Vec<Descriptor>;
             let (columns, descs): (Vec<RelationColumn>, &[Descriptor]) = if two_rows {
                 let mut ext: Vec<RelationColumn> = columns.as_ref().clone();
                 for c in columns.iter() {
@@ -30470,7 +30575,23 @@ fn wrap_returning(
                     o.field_id = (width + c.field_id as usize) as u16;
                     ext.push(o);
                 }
-                (ext, ext_descs.as_slice())
+                match &merge {
+                    Some((_, _, _, scols)) => {
+                        let mut d = ext_descs.clone();
+                        for (pos, sc) in scols.iter().enumerate() {
+                            let fid = u16::try_from(width * 2 + pos).ok()?;
+                            let mk = |name: String| RelationColumn { name, field_id: fid, position: fid };
+                            ext.push(mk(format!("{SRC_REF_PREFIX}{}", sc.name)));
+                            if !columns.iter().any(|c| c.name == sc.name) {
+                                ext.push(mk(sc.name.clone()));
+                            }
+                            d.push(desc_of_projcol(sc));
+                        }
+                        merge_descs = d;
+                        (ext, merge_descs.as_slice())
+                    }
+                    None => (ext, ext_descs.as_slice()),
+                }
             } else {
                 (columns.as_ref().clone(), descs)
             };
@@ -30537,7 +30658,13 @@ fn wrap_returning(
                             if qualified.iter().any(|q| q == bare) {
                                 continue;
                             }
-                            if src.iter().any(|s| s == bare) {
+                            // the target carries it too -> the engine's
+                            // 42702; the source alone -> its own column
+                            // (resolved through the scope built above)
+                            if src.iter().any(|s| s == bare)
+                                && columns.iter().any(|c| c.name == bare && (c.field_id as usize) < width)
+                            {
+                                post_ambiguous(bare);
                                 return None;
                             }
                         }
@@ -30702,9 +30829,24 @@ fn wrap_returning(
                 // same -206 on the engine as `OLD.` above - generic here
                 return None;
             }
-        } else if let Some((_, src, _, _)) = &merge {
-            if src.iter().any(|n| if bare_q { *n == bare } else { *n == bare.to_ascii_uppercase() }) {
-                return None; // ambiguous between the source and the target
+        } else if let Some((_, src, _, scols)) = &merge {
+            let canon_bare = if bare_q { bare.clone() } else { bare.to_ascii_uppercase() };
+            if let Some(pos) = src.iter().position(|n| *n == canon_bare) {
+                if columns.iter().any(|c| c.name == canon_bare) {
+                    // both contexts carry it: the engine's 42702
+                    post_ambiguous(&canon_bare);
+                    return None;
+                }
+                // the SOURCE alone carries it: its column, as `<src>.<col>`
+                // reads it (measured: `RETURNING K` over O(ID, K) is 100)
+                let mut pc = scols[pos].clone();
+                pc.field_id = 0;
+                pc.rel_alias = None;
+                pc.sql_type = nullable(pc.sql_type);
+                pc.expr = Some(Expr::Col(width * 2 + pos));
+                cols.push(pc);
+                fields.push(0);
+                continue;
             }
         }
         if !bare_q && !ident_ok(&bare) {
@@ -30732,7 +30874,10 @@ fn wrap_returning(
         // not that column: the engine names it CONSTANT and gives it no
         // table origin, because on a deleted row it answers NULL rather
         // than the column's value (see [merge_any_delete]).
-        let new_expr = new_qual && merge_any_delete;
+        // ...and an UPSERT's `OLD.<col>` likewise: NULL wherever the insert
+        // half produced the row, so the engine names it CONSTANT with the
+        // column's own type and no table (measured)
+        let new_expr = (new_qual && merge_any_delete) || (old_ctx && upsert);
         cols.push(ProjCol {
             name: if new_expr { "CONSTANT".to_string() } else { c.name.clone() },
             fname: if new_expr { Some("CONSTANT".to_string()) } else { None },
@@ -30808,7 +30953,9 @@ fn returning_star(
         // This server has only the target's columns to expand it with,
         // and no 42702 vector to answer with - so it refuses rather
         // than answer half the row.
-        return merge.is_none().then_some(StarCtx::New);
+        // (the ambiguity is settled before this is asked)
+        let _ = merge;
+        return Some(StarCtx::New);
     }
     let (q, rest) = t.split_once('.')?;
     if rest.trim() != "*" {
@@ -30864,6 +31011,18 @@ const OLD_REF_PREFIX: &str = "OLD$";
 /// paren depth or not - the reference means the same thing anywhere -
 /// but never inside a string literal.
 fn rewrite_old_refs(text: &str) -> String {
+    rewrite_qual_refs(text, "OLD", OLD_REF_PREFIX)
+}
+
+/// The synthetic prefix a MERGE's `<source alias>.<col>` takes inside a
+/// RETURNING expression - the source row is appended after the
+/// before-image, at `2 * width`.
+const SRC_REF_PREFIX: &str = "SRC$";
+
+/// [rewrite_old_refs] for any qualifier: every `<qual>.<ident>` (the
+/// qualifier canonical, compared on the upper-cased text) becomes
+/// `<prefix><ident>`, never inside a string literal.
+fn rewrite_qual_refs(text: &str, qual: &str, prefix: &str) -> String {
     let up = text.to_ascii_uppercase();
     let masked = mask_literals(&up);
     let b = text.as_bytes();
@@ -30873,8 +31032,8 @@ fn rewrite_old_refs(text: &str) -> String {
         let is_word_start = i == 0
             || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$'
                 || b[i - 1] == b'.' || b[i - 1] == b'"');
-        if is_word_start && masked[i..].starts_with("OLD") {
-            let after = i + 3;
+        if is_word_start && masked[i..].starts_with(qual) {
+            let after = i + qual.len();
             // `OLD` then optional blanks then `.` then an identifier
             let mut j = after;
             while j < b.len() && (b[j] as char).is_whitespace() {
@@ -30892,7 +31051,7 @@ fn rewrite_old_refs(text: &str) -> String {
                     k += 1;
                 }
                 if k > start {
-                    out.push_str(OLD_REF_PREFIX);
+                    out.push_str(prefix);
                     out.push_str(&text[start..k]);
                     i = k;
                     continue;
@@ -60966,6 +61125,9 @@ const GDS_SQLERR: i32 = 335544436;
 /// `isc_extract_input_mismatch` - "Specified EXTRACT part does not exist
 /// in input datatype" (-105, SQLSTATE 42000), raised at PREPARE
 const GDS_EXTRACT_INPUT_MISMATCH: i32 = 335544789;
+/// `isc_dsql_ambiguous_field_name` - "Ambiguous field name between @1
+/// and @2" (-204, SQLSTATE 42702)
+const GDS_DSQL_AMBIGUOUS_FIELD: i32 = 336003085;
 const GDS_PRCMISMAT: i32 = 335544512;
 const GDS_DSQL_PROCEDURE_USE_ERR: i32 = 335544668;
 const GDS_DSQL_LINE_COL_ERROR: i32 = 336397208;
@@ -61825,6 +61987,24 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(1) // isc_arg_gds
                 .int(GDS_CHARSET_NOT_FOUND)
                 .int(2) // isc_arg_string - PRE-QUOTED "SCHEMA"."NAME"
+                .bytes(name.as_bytes());
+        }
+        EvalErr::AmbiguousField { first, second, name } => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-204)
+                .int(1) // isc_arg_gds
+                .int(GDS_DSQL_AMBIGUOUS_FIELD)
+                .int(2) // isc_arg_string
+                .bytes(first.as_bytes())
+                .int(2) // isc_arg_string
+                .bytes(second.as_bytes())
+                .int(1) // isc_arg_gds
+                .int(GDS_RANDOM)
+                .int(2) // isc_arg_string
                 .bytes(name.as_bytes());
         }
         EvalErr::ExtractInputMismatch => {
@@ -74796,6 +74976,12 @@ enum EvalErr {
     /// [GDS_WLOCK_CONFLICT]), the last carrying the offending keyword as
     /// its `@1`. Posted at PREPARE, through [PREPARE_REFUSAL].
     WithLock { code: i32, what: Option<&'static str> },
+    /// `isc_dsql_ambiguous_field_name` (-204, 42702): a bare name that
+    /// two contexts carry - `Ambiguous field name between <first> and
+    /// <second>` then the name itself as `isc_random`. The engine names
+    /// a MERGE's SOURCE first (`table "PUBLIC"."O"` or `derived table
+    /// "S"`), then its target (measured)
+    AmbiguousField { first: String, second: String, name: String },
     /// EXTRACT of a part the operand's type does not carry (HOUR of a
     /// DATE, YEAR of a TIME, anything of a non-temporal): the engine's
     /// -105, posted at PREPARE through [PREPARE_REFUSAL]
@@ -104916,6 +105102,10 @@ fn after_auth(
                         // needs it owned - out of the Rc, and only here
                         (Some((p, ps)), Some(list)) => match dml_table_name(&dml_sql)
                             .and_then(|t| {
+                                // a refusal the RETURNING list posts (a
+                                // MERGE's 42702) is its own; nothing the
+                                // DML's planning left behind may pose as it
+                                PREPARE_REFUSAL.with(|r| *r.borrow_mut() = None);
                                 wrap_returning(
                                     (*p).clone(),
                                     (*ps).clone(),
@@ -104932,8 +105122,11 @@ fn after_auth(
                             // a RETURNING list this slice does not convert
                             // refuses the STATEMENT: answering the DML
                             // without its rows would run the write and
-                            // then hand the client an empty cursor
-                            None => None,
+                            // then hand the client an empty cursor - with
+                            // the vector the list posted, when it posted one
+                            None => PREPARE_REFUSAL.with(|r| r.borrow_mut().take()).map(|e| {
+                                (std::rc::Rc::new(Plan::RefusedEval(e)), std::rc::Rc::new(Vec::new()))
+                            }),
                         },
                         (planned, _) => planned,
                     };

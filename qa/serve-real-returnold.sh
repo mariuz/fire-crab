@@ -31,8 +31,10 @@ CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192 DEFAULT CHARACTER SE
 COMMIT;
 CREATE TABLE T (ID INTEGER NOT NULL, N INTEGER, S VARCHAR(20), D DATE);
 CREATE TABLE O (ID INTEGER, K INTEGER);
+CREATE TABLE O2 (OID INTEGER, K INTEGER);
 COMMIT;
 INSERT INTO O VALUES (1, 100);
+INSERT INTO O2 VALUES (1, 100);
 INSERT INTO T VALUES (1, 10, 'a', DATE '2020-01-01');
 INSERT INTO T VALUES (2, 20, 'b', DATE '2021-06-30');
 INSERT INTO T VALUES (3, NULL, NULL, NULL);
@@ -55,6 +57,17 @@ norm() { grep -a -v '^$' | sed 's/  */ /g; s/ *$//' | tr '\n' '|'; }
 both() {
     e=$(printf 'SET LIST ON;\n%s\n' "$2" | "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)
     c=$(printf 'SET LIST ON;\n%s\n' "$2" | "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
+    check "$1" "$c" "$e"
+}
+# the same DESCRIBE (SQLDA_DISPLAY: type, length, charset, nullability,
+# name, table origin). The cells that call this landed in 796cd58 with
+# no definition, so until it existed they never ran - `bothd: command
+# not found` scrolled past in every sweep
+bothd() {
+    local e c
+    e=$(printf 'SET SQLDA_DISPLAY ON;\n%s\n' "$2" | "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | grep -a -E 'sqltype|name:|table:' | norm)
+    c=$(printf 'SET SQLDA_DISPLAY ON;\n%s\n' "$2" | "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | grep -a -E 'sqltype|name:|table:' | norm)
+    if [ -z "$e" ]; then ran=$((ran + 1)); echo "DIFF $1 - the ENGINE printed no describe"; fail=1; return; fi
     check "$1" "$c" "$e"
 }
 # BOTH sides must refuse - the engine with a -206 this server has no
@@ -212,10 +225,11 @@ both "the DESCRIBE names the source's own table" \
 both "...and the target's names the target's" \
   "SET SQLDA_DISPLAY ON; $MG WHEN MATCHED THEN UPDATE SET t.N = o.K
    RETURNING t.N; ROLLBACK;"
-# a BARE star in a MERGE names BOTH contexts, and the engine proves it
-# by raising 42702 on the column they share - this server has only the
-# target's columns to expand it with, and no 42702 to answer with
-refuses "a BARE star in a MERGE (the engine's 42702 is not reproduced)" \
+# a BARE star in a MERGE is the TARGET's row, each column taken as a bare
+# name - so the column the source shares (ID) is the engine's 42702,
+# vector and all (this cell expected a refusal where the engine answers,
+# which it never does here: it could not pass)
+both "a BARE star in a MERGE whose source shares a name: the engine's 42702" \
   "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING *; ROLLBACK;"
 
 # ---- the engine still reads fire-crab's file ----------------------------
@@ -258,6 +272,87 @@ both "control: the insert branch is untouched" \
     "MERGE INTO T USING (SELECT 77 AS K FROM RDB\$DATABASE) S ON T.ID=S.K WHEN NOT MATCHED THEN INSERT (ID,N) VALUES (77,7) RETURNING T.ID, NEW.N; ROLLBACK;"
 both "control: a plain DELETE still answers the deleted row" \
     "DELETE FROM T WHERE ID=2 RETURNING ID, N; ROLLBACK;"
+
+# ---- A MERGE's BARE NAMES RESOLVE ACROSS BOTH CONTEXTS -------------------
+# Measured: a name only the target carries is the target's, one only the
+# source carries is the SOURCE's (it refused), and one both carry is the
+# engine's 42702 `Ambiguous field name between <source> and <target>` -
+# the source named first, a derived one as `derived table "S"` - where
+# this server answered a bare 42000.
+M2="MERGE INTO T t USING O2 o ON t.ID = o.OID"
+both "a bare name both contexts carry: 42702, vector and all" \
+    "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING ID; ROLLBACK;"
+both "...the tables named source first (MERGE INTO O USING T)" \
+    "MERGE INTO O x USING T y ON x.ID = y.ID WHEN MATCHED THEN UPDATE SET x.K = y.N RETURNING ID; ROLLBACK;"
+both "...a derived source is 'derived table'" \
+    "MERGE INTO T t USING (SELECT ID, 5 AS Q FROM O) s ON t.ID = s.ID WHEN MATCHED THEN UPDATE SET t.N = s.Q RETURNING ID; ROLLBACK;"
+both "...an unaliased merge" \
+    "MERGE INTO T USING O ON T.ID = O.ID WHEN MATCHED THEN UPDATE SET T.N = O.K RETURNING ID; ROLLBACK;"
+both "...inside an expression" \
+    "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING ID + 1; ROLLBACK;"
+both "a bare name only the SOURCE carries is the source's (it refused)" \
+    "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING K, N; ROLLBACK;"
+both "...qualified both ways, beside the target's" \
+    "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING o.ID, t.ID, K; ROLLBACK;"
+both "...a derived source's column, bare and qualified" \
+    "MERGE INTO T t USING (SELECT ID AS SID, 7 AS Q FROM O) s ON t.ID = s.SID WHEN MATCHED THEN UPDATE SET t.N = s.Q RETURNING Q, s.Q + SID, N; ROLLBACK;"
+both "SOURCE names inside expressions (they refused)" \
+    "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING K + 1, UPPER(S), o.K * 2, o.ID + t.ID, OLD.N + K; ROLLBACK;"
+both "...in a DELETE branch" \
+    "$MG WHEN MATCHED THEN DELETE RETURNING K - 1, o.K, N; ROLLBACK;"
+both "...in an INSERT branch" \
+    "MERGE INTO T t USING O2 o ON t.ID = o.OID + 5 WHEN NOT MATCHED THEN INSERT (ID, N) VALUES (o.OID + 10, o.K) RETURNING OID, K, ID, N, OID * 100 + K; ROLLBACK;"
+both "...a concatenation over both" \
+    "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING COALESCE(K, 0) || S; ROLLBACK;"
+bothd "the describe of a source name, bare and in an expression" \
+    "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING K, K + 1, N; ROLLBACK;"
+
+# ---- STARS IN A MERGE ------------------------------------------------------
+# `NEW.*` in a DELETE branch answered the DELETED row's values - a WRONG
+# ANSWER 796cd58 closed for `NEW.<col>` and left open for the star: the
+# engine answers a NULL CONSTANT per column.  A bare `*` (no shared name)
+# is the target's row - never the source's columns - and it refused.
+both "NEW.* in a DELETE branch is NULL per column (it answered the row)" \
+    "$M2 WHEN MATCHED THEN DELETE RETURNING NEW.*; ROLLBACK;"
+bothd "...described as the null constant per column" \
+    "$M2 WHEN MATCHED THEN DELETE RETURNING NEW.*; ROLLBACK;"
+both "NEW.* in a MIXED merge: per row" \
+    "MERGE INTO T t USING (SELECT 1 AS K, 111 AS W FROM RDB\$DATABASE UNION ALL SELECT 2, 222 FROM RDB\$DATABASE) S ON t.ID=S.K WHEN MATCHED AND S.K=2 THEN DELETE WHEN MATCHED THEN UPDATE SET N=S.W RETURNING t.ID, NEW.*; ROLLBACK;"
+both "NEW.* in an UPDATE branch is the new row" \
+    "$M2 WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING NEW.*; ROLLBACK;"
+bothd "...described as the columns" \
+    "$M2 WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING NEW.*; ROLLBACK;"
+both "a bare * with no shared name is the target's row (it refused)" \
+    "$M2 WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING *; ROLLBACK;"
+both "...in a DELETE branch, the deleted row" \
+    "$M2 WHEN MATCHED THEN DELETE RETURNING *; ROLLBACK;"
+bothd "...described as the target's columns" \
+    "$M2 WHEN MATCHED THEN DELETE RETURNING *; ROLLBACK;"
+both "control: t.* and OLD.*, o.*" \
+    "$M2 WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING t.*, OLD.*, o.*; ROLLBACK;"
+
+# ---- UPDATE OR INSERT HAS BOTH ROWS TOO ------------------------------------
+# It refused OLD. and NEW. outright (the roadmap's open gap).  Measured:
+# the update half answers the before-image, the insert half NULL for OLD
+# (as a MERGE's insert branch); OLD.<col> and OLD.* are named CONSTANT with
+# the column's type, NEW.<col> the column.
+UI1="UPDATE OR INSERT INTO T (ID, N) VALUES (1, 55) MATCHING (ID)"
+UI9="UPDATE OR INSERT INTO T (ID, N) VALUES (9, 55) MATCHING (ID)"
+both "upsert, update half: OLD, NEW and a bare name" "$UI1 RETURNING OLD.N, NEW.N, N; ROLLBACK;"
+both "upsert, insert half: OLD is NULL" "$UI9 RETURNING OLD.N, NEW.N, N, OLD.ID; ROLLBACK;"
+both "upsert OLD.* and NEW.*, update half" "$UI1 RETURNING OLD.*, NEW.*; ROLLBACK;"
+both "upsert OLD.*, insert half" "$UI9 RETURNING OLD.*; ROLLBACK;"
+both "upsert NEW. inside an expression" "$UI1 RETURNING NEW.N * 2, UPPER(NEW.S); ROLLBACK;"
+bothd "upsert describe: OLD named CONSTANT with the column's type, NEW the column" \
+    "$UI1 RETURNING OLD.N, OLD.S, OLD.ID, NEW.N, NEW.S, N; ROLLBACK;"
+bothd "upsert OLD.* describe" "$UI1 RETURNING OLD.*; ROLLBACK;"
+both "control: a bare upsert RETURNING *" "$UI1 RETURNING *; ROLLBACK;"
+# RECORDED: inside an EXPRESSION the engine types an upsert's OLD.<col> as
+# the untyped NULL literal while evaluating the old value - `OLD.S || '!'`
+# describes VARYING(1) and raises 22001 on the row it updated, and
+# `NEW.N - OLD.N` is typed off NULL.  An engine defect; refused here.
+refuses "upsert: OLD.<col> inside an expression (the engine types it as NULL)" \
+    "$UI9 RETURNING NEW.N - OLD.N, COALESCE(OLD.S, 'none'); ROLLBACK;"
 
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
