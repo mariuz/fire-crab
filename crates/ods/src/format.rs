@@ -429,7 +429,8 @@ const DAY_UNITS: i64 = 24 * 60 * 60 * 10_000;
 /// are exact; a named zone without tzdata rules is rendered VISIBLY
 /// unconverted - never a silently wrong local time.
 fn render_time_tz(utc: u32, zone: u16) -> String {
-    match crate::tz::displacement(zone) {
+    // a region's TIME sits on the engine's base date (2020-01-01)
+    match crate::tz::time_displacement(zone, utc) {
         Some(disp) => {
             let local = (utc as i64 + disp as i64 * 600_000).rem_euclid(DAY_UNITS);
             format!("{} {}", render_time(local as u32), crate::tz::zone_text(zone))
@@ -441,7 +442,8 @@ fn render_time_tz(utc: u32, zone: u16) -> String {
 /// TIMESTAMP WITH TIME ZONE: local date and time (day carry applied),
 /// then the zone text - same conversion policy as [render_time_tz].
 fn render_timestamp_tz(date: i32, utc: u32, zone: u16) -> String {
-    match crate::tz::displacement(zone) {
+    // the instant is known, so a named zone converts through its rules
+    match crate::tz::displacement_at(zone, date, utc) {
         Some(disp) => {
             let t = utc as i64 + disp as i64 * 600_000;
             let local_date = date as i64 + t.div_euclid(DAY_UNITS);

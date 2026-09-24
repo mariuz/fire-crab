@@ -15184,7 +15184,21 @@ fn session_now() -> (i32, u32) {
     tz_local_timestamp(d, t, session_zone_id()).unwrap_or((d, t))
 }
 
+/// The UTC instant. Only the WITH TIME ZONE clocks read this directly -
+/// they store UTC halves beside the session zone; every ZONELESS reader
+/// (CURRENT_DATE, LOCALTIME, 'TODAY', 'NOW', a DEFAULT, a TIME dated
+/// today) takes [session_now]. `'TODAY'` read this and was the UTC date:
+/// yesterday, for the hours between local and UTC midnight.
 fn now_date_time() -> (i32, u32) {
+    // A PLAN THAT READ THE CLOCK IS NOT A FUNCTION OF (schema, text):
+    // CURRENT_DATE / LOCALTIME / 'TODAY' fold to literals at prepare, so
+    // a cached plan answered the FIRST prepare's clock for ever - the same
+    // text re-prepared after `SET TIME ZONE` kept the old zone's date and
+    // hour (measured; FC_NO_STMTCACHE=1 answered the new ones). The same
+    // trap [PLAN_READ_ROWS] closes for a folded subquery, closed the same
+    // way; a read at EXECUTE sets it too, harmlessly - it is cleared
+    // before every top-level plan.
+    note_plan_read_rows();
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -16459,9 +16473,9 @@ fn fk_action_leaves_old_key(
 ///
 /// EVERY ARM HERE MIRRORS [default_wire_param], value for value,
 /// because that function is what the action actually BINDS - the same
-/// `session_now()` for the date and time forms (not `now_date_time()`,
-/// which [eval_ctx_default] uses for procedure arguments and which is
-/// not time-zone adjusted), the same upper-cased login, the same
+/// `session_now()` for the date and time forms (which every zoneless
+/// reader of the clock takes now - [eval_ctx_default], the INSERT
+/// defaults, the 'TODAY'/'NOW' grammar), the same upper-cased login, the same
 /// `'NONE'` role, the same attachment id. A test asserts the pair
 /// answer `Some`/`None` on the same variants so they cannot drift.
 /// `CURRENT_TRANSACTION` is the one `None`: its value is the id the
@@ -29980,10 +29994,13 @@ fn plan_set_time_zone(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             ));
         }
     };
-    if fire_crab_ods::tz::displacement(zone).is_none() {
-        // a ruled region: fc has no rules to read it by, so it cannot
-        // sit in that session at all - a clean refusal, never a session
-        // whose zoneless values convert wrongly
+    // a ruled region converts through the host's TZif rules now - the
+    // session clock reads the region's wall time, exactly as the HOST's
+    // own ruled zone (the default session's) already does. A region the
+    // host has no rules for still cannot sit in a session at all: a
+    // clean refusal, never a session whose clock reads GMT.
+    let (d, t) = now_date_time();
+    if fire_crab_ods::tz::displacement_at(zone, d, t).is_none() {
         return Some((Plan::SetTimeZoneRefused(EvalErr::Unsupported), Vec::new()));
     }
     Some((Plan::SetTimeZone { zone: Some(zone) }, Vec::new()))
@@ -34046,7 +34063,7 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
             // time -> timestamp takes the CURRENT date (probed: a TIME
             // literal lands in a TIMESTAMP column dated today)
             dtype::TIMESTAMP => {
-                let mut out = now_date_time().0.to_le_bytes().to_vec();
+                let mut out = session_now().0.to_le_bytes().to_vec();
                 out.extend_from_slice(&tt.to_le_bytes());
                 out
             }
@@ -34076,7 +34093,7 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
         }),
         WireParam::TimeTz(ut, zone) => Some(match d.dtype {
             dtype::SQL_TIME_TZ => tz_time_bytes(*ut, *zone, flen),
-            dtype::SQL_TIME => tz_local_time(*ut, session_zone_id())?.to_le_bytes().to_vec(),
+            dtype::SQL_TIME => tz_time_to_session(*ut, *zone)?.to_le_bytes().to_vec(),
             _ => return None,
         }),
         WireParam::Bool(v) => Some(match d.dtype {
@@ -36968,10 +36985,10 @@ fn execute_dml_collecting_inner(
                     DefaultVal::Int(v, s) => WireParam::Int(*v, *s),
                     DefaultVal::Text(t) => WireParam::Text(t.clone()),
                     DefaultVal::Null => continue,
-                    DefaultVal::CurrentDate => WireParam::Date(now_date_time().0),
-                    DefaultVal::CurrentTime => WireParam::Time(now_date_time().1),
+                    DefaultVal::CurrentDate => WireParam::Date(session_now().0),
+                    DefaultVal::CurrentTime => WireParam::Time(session_now().1),
                     DefaultVal::CurrentTimestamp => {
-                        let (dd, tt) = now_date_time();
+                        let (dd, tt) = session_now();
                         WireParam::Timestamp(dd, tt)
                     }
                     DefaultVal::User => WireParam::Text(ctx.user.to_ascii_uppercase()),
@@ -74103,9 +74120,18 @@ fn resolve_expr_inner(
         // zone, so `SET TIME ZONE` moved the tz clocks and left these
         // behind (review-caught).
         RawExpr::CurrentDate => Expr::DateLit(session_now().0),
+        // CURRENT_TIME is the session's WALL time placed through the TIME
+        // base date, not the instant's UTC time: in a region whose offset
+        // today is not its 2020-01-01 one they differ (measured: Bucharest
+        // in September renders CURRENT_TIME as the wall clock, 10:43 at
+        // LOCALTIME 10:43 - the UTC time rendered 09:43). An offset zone
+        // lands on the same UTC time either way.
         RawExpr::CurrentTime(p) => {
+            let zone = session_zone_id();
+            let (_, lt) = session_now();
             let (_, t) = now_date_time();
-            Expr::TimeTzLit(trunc_time_units(t, *p), session_zone_id())
+            let lt = trunc_time_units(lt, *p);
+            Expr::TimeTzLit(wall_to_utc_time(lt, zone).unwrap_or(trunc_time_units(t, *p)), zone)
         }
         RawExpr::CurrentTimestamp(p) => {
             let (d, t) = now_date_time();
@@ -75987,7 +76013,7 @@ fn temporal_pattern_text(p: &str, k: TKind) -> Option<String> {
         TKind::Time | TKind::TimeTz => ExpectTemporal::Time,
         TKind::Timestamp | TKind::TimestampTz => ExpectTemporal::Timestamp,
     };
-    let now = now_date_time();
+    let now = session_now();
     let render = |(d, u): (i32, u32), zone: Option<u16>| -> String {
         use fire_crab_ods::format::Value;
         let core = match expect {
@@ -78774,19 +78800,19 @@ fn string_to_datetime(
 /// (probed: `DATE 'TODAY'` is the engine's 22018, `DATE '15-JAN-2020'`
 /// and `DATE '7-8'` are dates).
 fn parse_date_lit(s: &str) -> Option<i32> {
-    string_to_datetime(s, ExpectTemporal::Date, now_date_time(), false).map(|(d, _)| d)
+    string_to_datetime(s, ExpectTemporal::Date, session_now(), false).map(|(d, _)| d)
 }
 
 /// A TIME literal's text - `hh:mm[:ss[.ffff]]`, no specials.
 fn parse_time_lit(s: &str) -> Option<u32> {
-    string_to_datetime(s, ExpectTemporal::Time, now_date_time(), false).map(|(_, t)| t)
+    string_to_datetime(s, ExpectTemporal::Time, session_now(), false).map(|(_, t)| t)
 }
 
 /// A TIMESTAMP literal's text - the WHOLE string through the grammar
 /// (an English month name carries spaces inside the date), a date-only
 /// string at midnight, no specials.
 fn parse_ts_lit(s: &str) -> Option<(i32, u32)> {
-    string_to_datetime(s, ExpectTemporal::Timestamp, now_date_time(), false)
+    string_to_datetime(s, ExpectTemporal::Timestamp, session_now(), false)
 }
 
 /// The engine's string COERCION into a temporal - CAST from text, a text
@@ -78794,7 +78820,7 @@ fn parse_ts_lit(s: &str) -> Option<(i32, u32)> {
 /// temporal column: the full grammar WITH the specials (probed:
 /// `WHERE D = 'TODAY'` matches, `INSERT ... VALUES ('now')` stores).
 fn cvt_text_temporal(s: &str, expect: ExpectTemporal) -> Option<(i32, u32)> {
-    string_to_datetime(s, expect, now_date_time(), true)
+    string_to_datetime(s, expect, session_now(), true)
 }
 
 /// Split a temporal string's trailing TIME ZONE - the engine's
@@ -78898,7 +78924,7 @@ fn resolve_zone_tail(tail: &str) -> Option<u16> {
 /// a refusal; the offset zones and the UTC family convert exactly.
 fn parse_ts_tz_lit(s: &str) -> Option<(i32, u32, u16)> {
     let (head, tail) = split_zone_tail(s)?;
-    let (d, t) = string_to_datetime(head, ExpectTemporal::Timestamp, now_date_time(), false)?;
+    let (d, t) = string_to_datetime(head, ExpectTemporal::Timestamp, session_now(), false)?;
     let zone = resolve_zone_tail(tail)?;
     let (ud, ut) = wall_to_utc_timestamp(d, t, zone)?;
     Some((ud, ut, zone))
@@ -78907,7 +78933,7 @@ fn parse_ts_tz_lit(s: &str) -> Option<(i32, u32, u16)> {
 /// The TIME twin - the wall time converts on its own day circle.
 fn parse_time_tz_lit(s: &str) -> Option<(u32, u16)> {
     let (head, tail) = split_zone_tail(s)?;
-    let t = string_to_datetime(head, ExpectTemporal::Time, now_date_time(), false)?.1;
+    let t = string_to_datetime(head, ExpectTemporal::Time, session_now(), false)?.1;
     let zone = resolve_zone_tail(tail)?;
     Some((wall_to_utc_time(t, zone)?, zone))
 }
@@ -78944,16 +78970,22 @@ fn tz_time_bytes(ut: u32, zone: u16, flen: usize) -> Vec<u8> {
 
 /// Local wall time in `zone` -> the UTC halves a WITH TIME ZONE value
 /// stores. Only zones with a known displacement convert.
+/// A WALL time in `zone` onto the UTC line. A named zone resolves
+/// through the host's rules, a gap and an overlap as the engine does
+/// ([wall_displacement]) - before it, every region refused here, and a
+/// plain side against a zoned one in a region session had no instant.
+///
+/// [wall_displacement]: fire_crab_ods::tz::wall_displacement
 fn wall_to_utc_timestamp(d: i32, t: u32, zone: u16) -> Option<(i32, u32)> {
     const DAY_UNITS: i64 = 24 * 60 * 60 * 10_000;
-    let disp = fire_crab_ods::tz::displacement(zone)?;
+    let disp = fire_crab_ods::tz::wall_displacement(zone, d, t)?;
     let ut = t as i64 - disp as i64 * 600_000;
     Some(((d as i64 + ut.div_euclid(DAY_UNITS)) as i32, ut.rem_euclid(DAY_UNITS) as u32))
 }
 
 fn wall_to_utc_time(t: u32, zone: u16) -> Option<u32> {
     const DAY_UNITS: i64 = 24 * 60 * 60 * 10_000;
-    let disp = fire_crab_ods::tz::displacement(zone)?;
+    let disp = fire_crab_ods::tz::time_wall_displacement(zone, t)?;
     Some((t as i64 - disp as i64 * 600_000).rem_euclid(DAY_UNITS) as u32)
 }
 
@@ -79057,14 +79089,37 @@ fn value_to_wireparam(v: &Value) -> Option<WireParam> {
 /// conversion exactly). None for a zone without displacement rules.
 fn tz_local_time(utc: u32, zone: u16) -> Option<u32> {
     const DAY_UNITS: i64 = 24 * 60 * 60 * 10_000;
-    let disp = fire_crab_ods::tz::displacement(zone)?;
+    // a region's TIME is placed on the engine's base date, 2020-01-01
+    let disp = fire_crab_ods::tz::time_displacement(zone, utc)?;
     Some((utc as i64 + disp as i64 * 600_000).rem_euclid(DAY_UNITS) as u32)
 }
 
-/// The TIMESTAMP twin, with the day carry.
+/// A TIME WITH TIME ZONE into a ZONELESS TIME: the session's wall time.
+/// Not [tz_local_time] in the session zone - the engine takes the value's
+/// wall time in its OWN zone (on the TIME base date), dates it TODAY
+/// there, places that on the UTC line by today's rules, and reads it in
+/// the session zone. Measured in Bucharest in September (+03:00 today,
+/// +02:00 on the base date): `CAST(TIME '10:00 +02:00' AS TIME)` and
+/// `CAST(TIME '08:00 UTC' AS TIME)` are 11:00, while `CAST(CURRENT_TIME
+/// AS TIME)` is LOCALTIME. For offset zones every route agrees.
+fn tz_time_to_session(ut: u32, zone: u16) -> Option<u32> {
+    let wall = tz_local_time(ut, zone)?;
+    let (nd, nt) = now_date_time();
+    let today = tz_local_timestamp(nd, nt, zone)?.0;
+    let (ud, utt) = wall_to_utc_timestamp(today, wall, zone)?;
+    Some(tz_local_timestamp(ud, utt, session_zone_id())?.1)
+}
+
+/// The TIMESTAMP twin, with the day carry. The instant is known here, so
+/// a NAMED zone converts through its rules ([displacement_at]) - the
+/// session clock goes through this, and read GMT for every session in a
+/// named zone: `CURRENT_DATE` was yesterday's date for three hours of
+/// every day in Europe/Bucharest, `LOCALTIME` three hours behind all day.
+///
+/// [displacement_at]: fire_crab_ods::tz::displacement_at
 fn tz_local_timestamp(date: i32, utc: u32, zone: u16) -> Option<(i32, u32)> {
     const DAY_UNITS: i64 = 24 * 60 * 60 * 10_000;
-    let disp = fire_crab_ods::tz::displacement(zone)?;
+    let disp = fire_crab_ods::tz::displacement_at(zone, date, utc)?;
     let t = utc as i64 + disp as i64 * 600_000;
     Some(((date as i64 + t.div_euclid(DAY_UNITS)) as i32, t.rem_euclid(DAY_UNITS) as u32))
 }
@@ -80244,8 +80299,23 @@ impl Expr {
                     },
                 };
                 // fc can only place a value in a zone whose offset it
-                // knows: a ruled region refuses rather than guessing
-                if fire_crab_ods::tz::displacement(zone).is_none() {
+                // knows: a ruled region refuses rather than guessing -
+                // EXCEPT an instant, whose offset in the region is one
+                // lookup in the host's rules ([displacement_at]) - and a
+                // zoneless TIMESTAMP is one once the session zone places
+                // it (below); a TIME sits on the engine's base date
+                //
+                // [displacement_at]: fire_crab_ods::tz::displacement_at
+                let instant_in_rules = match v {
+                    Value::TimestampTz(d, t, _) | Value::Timestamp(d, t) => {
+                        fire_crab_ods::tz::displacement_at(zone, d, t).is_some()
+                    }
+                    Value::TimeTz(t, _) | Value::Time(t) => {
+                        fire_crab_ods::tz::time_displacement(zone, t).is_some()
+                    }
+                    _ => false,
+                };
+                if !instant_in_rules && fire_crab_ods::tz::displacement(zone).is_none() {
                     return Err(EvalErr::Unsupported);
                 }
                 match v {
@@ -80907,6 +80977,23 @@ impl Expr {
                         (Value::TimeTz(..) | Value::TimestampTz(..), _)
                             | (_, Value::TimeTz(..) | Value::TimestampTz(..))
                     );
+                    // a PLAIN side that cannot be placed on the UTC
+                    // line (a session region this host has no rules
+                    // for) is a refusal - never the `None` below, which reads as
+                    // "not temporal" and fell through to a NULL or a
+                    // shift (a region session answered `TS - TSTZ` 0)
+                    if tz_involved {
+                        for v in [&va, &vb] {
+                            let placed = match v {
+                                Value::Time(t) => wall_to_utc_time(*t, session_zone_id()).is_some(),
+                                Value::Timestamp(d, t) => wall_utc_cmp_ok(*d, *t).is_some(),
+                                _ => true,
+                            };
+                            if !placed {
+                                return Err(EvalErr::Unsupported);
+                            }
+                        }
+                    }
                     let dt = |v: &Value| match v {
                         Value::Date(d) => Some((*d as i64, 0i64, TKind::Date)),
                         Value::Time(t) if tz_involved => {
@@ -81004,11 +81091,14 @@ impl Expr {
                 // a NAMED zone without displacement rules has no engine
                 // text here (fc's own render is the visibly-unconverted
                 // `<tz ...>`) - refuse, as the CAST arm does
-                (Value::TimeTz(_, z), _)
-                | (Value::TimestampTz(_, _, z), _)
-                | (_, Value::TimeTz(_, z))
-                | (_, Value::TimestampTz(_, _, z))
-                    if fire_crab_ods::tz::displacement(z).is_none() =>
+                (Value::TimeTz(t, z), _) | (_, Value::TimeTz(t, z))
+                    if fire_crab_ods::tz::time_displacement(z, t).is_none() =>
+                {
+                    return Err(EvalErr::Unsupported)
+                }
+                // an INSTANT in a region renders through its rules now
+                (Value::TimestampTz(d, t, z), _) | (_, Value::TimestampTz(d, t, z))
+                    if fire_crab_ods::tz::displacement_at(z, d, t).is_none() =>
                 {
                     return Err(EvalErr::Unsupported)
                 }
@@ -81496,8 +81586,15 @@ impl Expr {
                             // REFUSE the cast instead (the engine
                             // converts via tzdata; review-caught live:
                             // fc answered `<tz ... Europe/Paris>`)
-                            Value::TimeTz(_, z) | Value::TimestampTz(_, _, z)
-                                if fire_crab_ods::tz::displacement(z).is_none() =>
+                            Value::TimeTz(t, z)
+                                if fire_crab_ods::tz::time_displacement(z, t).is_none() =>
+                            {
+                                return Err(EvalErr::Unsupported)
+                            }
+                            // an instant in a region renders through
+                            // its rules; one without rules still refuses
+                            Value::TimestampTz(d, t, z)
+                                if fire_crab_ods::tz::displacement_at(z, d, t).is_none() =>
                             {
                                 return Err(EvalErr::Unsupported)
                             }
@@ -82040,6 +82137,40 @@ impl Expr {
                                 Value::Timestamp(*d, *t)
                             }
                             (TKind::Timestamp, Value::Date(d)) => Value::Timestamp(*d, 0),
+                            // a TIME is dated TODAY, in the session's
+                            // zone (measured: CAST(CAST('12:30:00' AS
+                            // TIME) AS TIMESTAMP) - this raised 22018 on
+                            // the rendered time) - the insert path's law
+                            (TKind::Timestamp, Value::Time(t)) => {
+                                Value::Timestamp(session_now().0, *t)
+                            }
+                            // a zoned TIME into a TIME is its wall clock in
+                            // the SESSION zone ([tz_time_to_session]); a
+                            // zone without rules is a clean refusal, where
+                            // the text route below raised 22018 on a
+                            // `<tz ...>` render
+                            (TKind::Time, Value::TimeTz(ut, z)) => {
+                                Value::Time(
+                                    tz_time_to_session(*ut, *z).ok_or(EvalErr::Unsupported)?,
+                                )
+                            }
+                            // a zoned instant into a ZONELESS temporal is
+                            // its wall clock in the SESSION zone
+                            // (measured: CAST(CURRENT_TIMESTAMP AS DATE)
+                            // is the local date) - it raised 22018 on its
+                            // own render here
+                            (
+                                TKind::Date | TKind::Time | TKind::Timestamp,
+                                Value::TimestampTz(ud, ut, _),
+                            ) => {
+                                let (d, t) = tz_local_timestamp(*ud, *ut, session_zone_id())
+                                    .ok_or(EvalErr::Unsupported)?;
+                                match k {
+                                    TKind::Date => Value::Date(d),
+                                    TKind::Time => Value::Time(t),
+                                    _ => Value::Timestamp(d, t),
+                                }
+                            }
                             (_, Value::Text(t)) => {
                                 // the engine's string coercion: the full
                                 // CVT grammar, specials included (probed:
@@ -82061,11 +82192,8 @@ impl Expr {
                                         TKind::Time => match cvt_text_temporal(t, ExpectTemporal::Time) {
                                             Some((_, tm)) => Value::Time(tm),
                                             None => {
-                                                let (ut, _) = parse_time_tz_lit(t)?;
-                                                Value::Time(tz_local_time(
-                                                    ut,
-                                                    session_zone_id(),
-                                                )?)
+                                                let (ut, z) = parse_time_tz_lit(t)?;
+                                                Value::Time(tz_time_to_session(ut, z)?)
                                             }
                                         },
                                         TKind::TimeTz | TKind::TimestampTz => return None,
@@ -82180,13 +82308,25 @@ impl Expr {
                         // zone's (ExprNodes.cpp:5806 moves it to the tz
                         // type with the session zone first)
                         if matches!(part, TimezoneHour | TimezoneMinute) {
-                            let zone = match vs[0] {
-                                Value::TimeTz(_, z) | Value::TimestampTz(_, _, z) => z,
-                                Value::Time(_) | Value::Timestamp(..) => session_zone_id(),
+                            // an INSTANT's offset in a ruled zone is one
+                            // lookup in the host's rules, a zoneless WALL
+                            // time's is the session zone's at that wall
+                            // time (gap and overlap as the engine places
+                            // them); a TIME's is on the base date
+                            let mins = match vs[0] {
+                                Value::TimestampTz(d, t, z) => {
+                                    fire_crab_ods::tz::displacement_at(z, d, t)
+                                }
+                                Value::TimeTz(t, z) => fire_crab_ods::tz::time_displacement(z, t),
+                                Value::Timestamp(d, t) => {
+                                    fire_crab_ods::tz::wall_displacement(session_zone_id(), d, t)
+                                }
+                                Value::Time(t) => {
+                                    fire_crab_ods::tz::time_wall_displacement(session_zone_id(), t)
+                                }
                                 _ => return Ok(Value::Null), // type-checked away
                             };
-                            // a ruled zone has no offset fc can compute
-                            let Some(mins) = fire_crab_ods::tz::displacement(zone) else {
+                            let Some(mins) = mins else {
                                 return Err(EvalErr::Unsupported);
                             };
                             let sign = if mins < 0 { -1 } else { 1 };
@@ -95374,7 +95514,12 @@ fn psql_literal(v: &Value) -> Option<String> {
         // its zoned literal (the same grammar the tzdml parse reads
         // back); a ruleless named zone has no faithful text - refuse
         Value::TimeTz(_, z) | Value::TimestampTz(_, _, z) => {
-            if fire_crab_ods::tz::displacement(*z).is_none() {
+            let ruled = match v {
+                Value::TimestampTz(d, t, z) => fire_crab_ods::tz::displacement_at(*z, *d, *t),
+                Value::TimeTz(t, z) => fire_crab_ods::tz::time_displacement(*z, *t),
+                _ => fire_crab_ods::tz::displacement(*z),
+            };
+            if ruled.is_none() {
                 return None;
             }
             let kw = if matches!(v, Value::TimeTz(..)) { "TIME" } else { "TIMESTAMP" };
@@ -97202,10 +97347,10 @@ fn eval_ctx_default(dv: &DefaultVal, ctx: &SessionCtx) -> Option<Value> {
         DefaultVal::User => Value::Text(ctx.user.to_ascii_uppercase()),
         DefaultVal::Role => Value::Text("NONE".into()),
         DefaultVal::Connection => Value::Int(ctx.attach_id as i64),
-        DefaultVal::CurrentDate => Value::Date(now_date_time().0),
-        DefaultVal::CurrentTime => Value::Time(now_date_time().1),
+        DefaultVal::CurrentDate => Value::Date(session_now().0),
+        DefaultVal::CurrentTime => Value::Time(session_now().1),
         DefaultVal::CurrentTimestamp => {
-            let (d, t) = now_date_time();
+            let (d, t) = session_now();
             Value::Timestamp(d, t)
         }
         _ => return None,

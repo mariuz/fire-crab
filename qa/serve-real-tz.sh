@@ -78,16 +78,13 @@ check "render: offset zones and GMT == isql (incl. UTC day wrap)" \
     "$(printf '%s\n' "$rows" | grep -v 'Europe/Bucharest' | sort)" \
     "$(isql_q "SELECT COALESCE(CAST(TT AS VARCHAR(30)),'<null>') || '|' || ID || '|' || COALESCE(CAST(TS AS VARCHAR(40)),'<null>') FROM T WHERE ID <> 5;" | sort)"
 
-# the named-zone row: right name from the generated table, and marked
-# unconverted - the zone rules need tzdata the conversion does not have
+# the named-zone row: right name from the generated table, and CONVERTED
+# through the host's TZif rules (it was marked `<tz ...>`, unconverted,
+# while fc carried the names only) - isql renders the same row
 named=$(printf '%s\n' "$rows" | grep 'Europe/Bucharest' || true)
-if [ -n "$named" ] && printf '%s' "$named" | grep -q '<tz '; then
-    echo "OK   named zone: correct region name, visibly unconverted"
-else
-    echo "DIFF named zone: correct region name, visibly unconverted"
-    echo "     got: $named"
-    fail=1
-fi
+check "named zone: correct region name, converted as isql renders it" \
+    "$named" \
+    "$(isql_q "SELECT COALESCE(CAST(TT AS VARCHAR(60)),'<null>') || '|' || ID || '|' || COALESCE(CAST(TS AS VARCHAR(60)),'<null>') FROM T WHERE ID = 5;")"
 
 # --- differential 2: the wire, through node-firebird -------------------
 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-tz.log 2>&1 &
@@ -109,7 +106,9 @@ kill -0 $srv 2>/dev/null || {
 # node's TimeTz decode discards the zone and yields the UTC instant as
 # a compensated Date - print it as HH:MM:SS.mmm of the raw value
 node_once() {
-    FC_DB="$CLEAN" FC_PORT="$PORT" FC_U="$U" FC_P="$P" FC_Q="$1" timeout 15 node -e '
+    # TZ=UTC: node-firebird formats a TIME in the HOST zone, and the
+    # expected side is UTC - a host outside UTC read every time shifted
+    TZ=UTC FC_DB="$CLEAN" FC_PORT="$PORT" FC_U="$U" FC_P="$P" FC_Q="$1" timeout 15 node -e '
       process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(1); });
       const F=require("node-firebird");
       const pad=(n,w)=>String(n).padStart(w,"0");

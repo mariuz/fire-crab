@@ -190,11 +190,14 @@ refuses "SETTIME ZONE is not either" "SETTIME ZONE '+07:00';"
 refuses "nor SETTIMEZONE" "SETTIMEZONE '+07:00';"
 # ...and the refused spelling left the session alone: the SELECT that
 # follows it in the SAME session still converts from the default zone
-# (no -b here, so the script continues past the refusal)
+# (no -b here, so the script continues past the refusal). The default
+# zone is the HOST's, so the expected wall time is the engine's own
+# answer in a default session - 14:00:00 only on a UTC host
 ran=$((ran + 1))
+want=$(q "$REAL" "SELECT TIMESTAMP '2020-06-15 12:00:00' AT TIME ZONE '+02:00' FROM RDB\$DATABASE;" | cut -d'|' -f1)
 r=$(printf "SET HEADING OFF;\nSET TIMEZONE '+07:00';\nSELECT TIMESTAMP '2020-06-15 12:00:00' AT TIME ZONE '+02:00' FROM RDB\$DATABASE;\n" \
-    | "$ISQL" -q -ch NONE -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | grep -c '14:00:00')
-if [ "$r" = "1" ]; then echo "OK   ...and a refused spelling left the session zone alone"; else
+    | "$ISQL" -q -ch NONE -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | grep -cF "$want")
+if [ -n "$want" ] && [ "$r" = "1" ]; then echo "OK   ...and a refused spelling left the session zone alone"; else
     echo "DIFF a refused SET TIMEZONE moved the session zone"; fail=1; fi
 
 # --- a WITH TIME ZONE value through a derived table and a CTE ---
@@ -209,26 +212,18 @@ both "...a TIME WITH TIME ZONE too" \
 bothd "EXTRACT keeps its declared width under -, COALESCE, CASE and NULLIF" \
     "SELECT -EXTRACT(YEAR FROM DATE '2020-06-15'), COALESCE(EXTRACT(HOUR FROM TIME '12:00:00'), 0), CASE WHEN 1=1 THEN EXTRACT(TIMEZONE_HOUR FROM TIMESTAMP '2020-06-15 12:00:00 +05:00') ELSE 0 END, NULLIF(EXTRACT(SECOND FROM TIME '12:00:00'), 0) FROM RDB\$DATABASE;"
 
-# --- BOUNDARY: a ruled zone has no rules here, and must refuse ---
-ran=$((ran + 1))
-r=$(q "$PORT" "SELECT TIMESTAMP '2020-06-15 12:00:00' AT TIME ZONE 'Europe/Paris' FROM RDB\$DATABASE;")
-e=$(q "$REAL" "SELECT TIMESTAMP '2020-06-15 12:00:00' AT TIME ZONE 'Europe/Paris' FROM RDB\$DATABASE;")
-case "$r" in
-    *"Statement failed"*) echo "OK   boundary: a RULED zone refuses (fc carries no tzdata rules; engine: ${e%%|*})" ;;
-    *) echo "DIFF a ruled zone must refuse, fc answered [$r]"; fail=1 ;;
-esac
+# --- a RULED zone converts through the host's TZif rules (it refused
+# --- while fc carried the names only; serve-real-sessionclock.sh) ---
+both "a RULED zone converts (was a boundary refusal)" \
+    "SELECT TIMESTAMP '2020-06-15 12:00:00' AT TIME ZONE 'Europe/Paris' FROM RDB\$DATABASE;"
 ran=$((ran + 1))
 r=$(q "$PORT" "SELECT EXTRACT(TIMEZONE_NAME FROM TIMESTAMP '2020-06-15 12:00:00 +05:00') FROM RDB\$DATABASE;")
 case "$r" in
     *"Statement failed"*) echo "OK   boundary: TIMEZONE_NAME refuses (the engine renders it through ICU)" ;;
     *) echo "DIFF TIMEZONE_NAME must refuse, fc answered [$r]"; fail=1 ;;
 esac
-ran=$((ran + 1))
-r=$(q "$PORT" "SET TIME ZONE 'Europe/Paris';")
-case "$r" in
-    *"Statement failed"*) echo "OK   boundary: a session cannot be SET to a ruled zone either" ;;
-    *) echo "DIFF SET TIME ZONE to a ruled zone must refuse, fc answered [$r]"; fail=1 ;;
-esac
+bothz "...and a session can be SET to one (was a boundary refusal)" "Europe/Paris" \
+    "SELECT TIMESTAMP '2020-06-15 12:00:00' AT TIME ZONE '+00:00' FROM RDB\$DATABASE;"
 # RECORDED DIVERGENCE, not a check: under isql's autocommit a
 # statement typed isc_info_sql_stmt_ddl runs on isql's OWN transaction
 # and is committed there (isql.epp:8575) - and fire-crab hands every

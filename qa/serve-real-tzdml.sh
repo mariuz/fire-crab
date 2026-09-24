@@ -152,18 +152,25 @@ case "$er" in *"2024-11-05 23:30:00.0000 +02:00"*"07:07:07.0000 Etc/GMT+5"*"ID 7
     echo "OK   the ENGINE reads fc's stored tz values and matches instants over them";;
     *) echo "DIFF engine-reads-fc: [$er]"; fail=1;; esac
 
-# --- boundary: a NAMED zone with tzdata rules refuses (never a wrong
-# --- instant) - fc-only pin; the engine stores it ---
+# --- a NAMED zone with tzdata rules STORES now (it refused while fc
+# --- carried the names only): fc writes it, and the ENGINE reading fc's
+# --- file sees the same instant in the same zone ---
 ran=$((ran + 1))
 br=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 <<'SQL' | norm
 INSERT INTO TZT (ID, TS) VALUES (9, TIMESTAMP '2024-05-05 10:00:00 Europe/Paris');
 SET LIST ON;
-SELECT COUNT(*) N9 FROM TZT WHERE ID = 9;
+SELECT TS AT TIME ZONE 'UTC' U9, TS T9 FROM TZT WHERE ID = 9;
 SQL
 )
-case "$br" in *"Dynamic SQL Error"*"N9 0"*)
-    echo "OK   a ruled NAMED zone refuses in DML (no tzdata - never a guessed instant)";;
-    *) echo "DIFF named-zone boundary: [$br]"; fail=1;; esac
+er9=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$A" 2>&1 <<'SQL' | norm
+SET LIST ON;
+SELECT TS AT TIME ZONE 'UTC' U9, TS T9 FROM TZT WHERE ID = 9;
+SQL
+)
+case "$br" in "U9 2024-05-05 08:00:00.0000 UTC|T9 2024-05-05 10:00:00.0000 Europe/Paris|")
+    if [ "$er9" = "$br" ]; then echo "OK   a ruled NAMED zone stores in DML, and the engine reads the same instant"
+    else echo "DIFF named zone: the engine reads fc's row as [$er9]"; fail=1; fi;;
+    *) echo "DIFF named-zone DML: [$br]"; fail=1;; esac
 
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))

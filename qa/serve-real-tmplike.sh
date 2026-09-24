@@ -431,10 +431,12 @@ err_same  "11 DT SIMILAR TO '2%'   - likewise, and a wildcard cannot convert"   
 # render a value stored in a named zone other than GMT at all - which is
 # a boundary of its own, older than this law, and it costs these cells.
 # The PATTERN's half of the rule is proved by the GMT cells in §4.
-differs   "11 TSZ LIKE '2020-01-15 10:20:30 Europe/Bucharest' - row 4 is stored in a named zone this server cannot convert" \
-          "SELECT ID FROM T WHERE TSZ LIKE '2020-01-15 10:20:30 Europe/Bucharest' ORDER BY ID" "4" "(none)"
-differs   "11 TSZ LIKE '2020-01-15 10:20:30.0000 europe/bucharest' - and the canonicalised spelling of it" \
-          "SELECT ID FROM T WHERE TSZ LIKE '2020-01-15 10:20:30.0000 europe/bucharest' ORDER BY ID" "4" "(none)"
+# ...and row 4's REGION converts now, through the host's zone rules
+# (`serve-real-sessionclock.sh`), so these two are promoted
+both_is   "11 TSZ LIKE '2020-01-15 10:20:30 Europe/Bucharest' - row 4 stored in a named zone" \
+          "SELECT ID FROM T WHERE TSZ LIKE '2020-01-15 10:20:30 Europe/Bucharest' ORDER BY ID" "4"
+both_is   "11 TSZ LIKE '2020-01-15 10:20:30.0000 europe/bucharest' - and the canonicalised spelling of it" \
+          "SELECT ID FROM T WHERE TSZ LIKE '2020-01-15 10:20:30.0000 europe/bucharest' ORDER BY ID" "4"
 
 echo "--- 12. THE LAW IS A LITERAL'S, AND A BOUND ? IS NOT ONE"
 # Measured against the engine with node-firebird: a `?` pattern is NOT
