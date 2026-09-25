@@ -61137,6 +61137,67 @@ fn cast_source_charset(e: &Expr, t: &CastTarget, descs: &[Descriptor]) -> u8 {
     err_spell_charset(e, descs)
 }
 
+/// A non-numeric source cast to a number: the engine's CVT raises 22018
+/// on the SOURCE's text - a BOOLEAN names its type (`conversion error from
+/// string "BOOLEAN"`, measured) and a temporal its rendered value
+/// (`"2020-01-01"`). These answered a bare error before.
+fn nonnumeric_conv(v: &Value) -> EvalErr {
+    match v {
+        Value::Bool(_) => EvalErr::ConversionError(Some("BOOLEAN".to_string())),
+        // a TIMESTAMP is spelled the way CVT's own date-to-string spells it
+        // here, `DD-MON-YYYY hh:mm:ss.ffff` (measured: `01-JAN-2020
+        // 10:00:00.0000`, and `... UTC` for a zoned one), where a DATE or a
+        // TIME keeps its ordinary rendering
+        Value::Timestamp(..) | Value::TimestampTz(..) => {
+            let r = v.render();
+            let (date, rest) = r.split_once(' ').unwrap_or((r.as_str(), ""));
+            let mut it = date.splitn(3, '-');
+            let text = match (it.next(), it.next().and_then(|m| m.parse::<usize>().ok()), it.next()) {
+                (Some(y), Some(m @ 1..=12), Some(d)) => {
+                    const MON: [&str; 12] =
+                        ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+                    format!("{}-{}-{} {}", d, MON[m - 1], y, rest)
+                }
+                _ => r.clone(),
+            };
+            EvalErr::ConversionError(Some(text.trim_end().to_string()))
+        }
+        Value::Date(_) | Value::Time(_) | Value::TimeTz(..) => EvalErr::ConversionError(Some(v.render())),
+        _ => EvalErr::ConversionError(None),
+    }
+}
+
+/// A text that IS a plain decimal number - optional sign, digits, at most
+/// one point - whatever its magnitude. Too wide for the target it is the
+/// engine's 22003, not a conversion error (measured: 2^127 as text into
+/// NUMERIC(38,0) or INT128 is *numeric value is out of range*).
+fn plain_decimal_syntax(t: &str) -> bool {
+    // BLANKS only, as CVT trims: a tab, LF, VT, FF or CR is part of the
+    // text and makes it no number (serve-real-textcolcmp: "\t92" is a
+    // conversion error, where Rust's trim() made it 22003)
+    let t = t.trim_matches(' ');
+    // an exponent spelling is a number too (measured: '1.5e40' into
+    // NUMERIC(38,0) is 22003)
+    let (mant, exp) = match t.find(['e', 'E']) {
+        Some(i) => (&t[..i], Some(&t[i + 1..])),
+        None => (t, None),
+    };
+    let mant = mant.strip_prefix(['+', '-']).unwrap_or(mant);
+    let (mut digits, mut dots) = (0usize, 0usize);
+    for c in mant.chars() {
+        match c {
+            '0'..='9' => digits += 1,
+            '.' => dots += 1,
+            _ => return false,
+        }
+    }
+    let exp_ok = exp.map_or(true, |e| {
+        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        !e.is_empty() && e.chars().all(|c| c.is_ascii_digit())
+    });
+    digits > 0 && dots <= 1 && exp_ok
+}
+
 fn conv_err(cs: u8, s: String) -> EvalErr {
     use fire_crab_ods::intl;
     let cs = if matches!(cs, CS_SLOT_CAST | CS_SLOT_OPERAND | CS_MUL_I64 | CS_TEXT_FIT | CS_TEXT_FIT_CHAR | CS_OPERATOR_READ | CS_COMPUTED_UTF8) {
@@ -69828,11 +69889,25 @@ fn parse_uint(b: &[char], pos: &mut usize) -> Option<i64> {
 fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
     skip_ws(b, pos);
     let start = *pos;
-    while *pos < b.len() && (b[*pos].is_alphabetic() || b[*pos] == '_') {
+    // a digit continues a name once it has started - `INT128` was read as
+    // INT followed by a stray `128`, and every CAST(... AS INT128) refused
+    while *pos < b.len()
+        && (b[*pos].is_alphabetic() || b[*pos] == '_' || (*pos > start && b[*pos].is_ascii_digit()))
+    {
         *pos += 1;
     }
     let kw: String = b[start..*pos].iter().collect();
     let ku = kw.to_ascii_uppercase();
+    // INT128 is the INT128-backed exact at scale 0 with sub_type 0 - the
+    // very descriptor `NUMERIC(38,0)` has with sub_type 1 - so it takes the
+    // NUMERIC arm, which already carries the i128 range, the text and
+    // double conversions and the INT128 arithmetic ranks (measured against
+    // 2182: 2^127-1 and -2^127 convert, 2^127 is 22003, 1e20 is exact,
+    // `CAST(1 AS INT128) + 1` describes INT128). It refused outright: the
+    // keyword scan stopped at the digits.
+    if ku == "INT128" {
+        return Some(CastTarget::Numeric { scale: 0, bytes: 16, sub_type: 0 });
+    }
     if matches!(ku.as_str(), "SMALLINT" | "INTEGER" | "INT" | "BIGINT") {
         return Some(CastTarget::Int {
             bytes: match ku.as_str() {
@@ -82050,7 +82125,7 @@ impl Expr {
                                 }
                                 fit(x)?
                             }
-                            _ => return Err(EvalErr::ConversionError(None)),
+                            _ => return Err(nonnumeric_conv(&v)),
                         }
                     }
                     // to a text width: render the value, refuse if it does
@@ -82291,6 +82366,11 @@ impl Expr {
                                 match exp_text_to_scaled_at(t, *bytes, *scale, *cs == CS_OPERATOR_READ) {
                                     Some(Some(raw)) => (raw, *scale),
                                     Some(None) => return Err(EvalErr::NumericOutOfRange),
+                                    // digits too many for i128 are a range
+                                    // error, not a spelling one
+                                    None if plain_decimal_syntax(t) => {
+                                        return Err(EvalErr::NumericOutOfRange)
+                                    }
                                     None => return Err(conv_err(*cs, t.clone())),
                                 }
                             }
@@ -82473,8 +82553,7 @@ impl Expr {
                                 }
                                 (raw, *scale)
                             }
-                            other => numeric_parts(other)
-                                .ok_or(EvalErr::ConversionError(None))?,
+                            other => numeric_parts(other).ok_or_else(|| nonnumeric_conv(other))?,
                         };
                         let out = rescale(raw, from, *scale)?;
                         // THE TARGET'S STORAGE WIDTH IS THE LIMIT, and it
@@ -82576,7 +82655,7 @@ impl Expr {
                             }
                             other => match numeric_parts(other) {
                                 Some((raw, sc)) => narrow(exact_to_f64(raw as i128, sc as i32))?,
-                                None => return Err(EvalErr::ConversionError(None)),
+                                None => return Err(nonnumeric_conv(&v)),
                             },
                         }
                     }
@@ -82630,7 +82709,7 @@ impl Expr {
                             Some((raw, sc)) => {
                                 Value::Double(exact_to_f64(raw as i128, sc as i32))
                             }
-                            None => return Err(EvalErr::ConversionError(None)),
+                            None => return Err(nonnumeric_conv(other)),
                         },
                     },
                     // to a temporal type. A DATE reads as MIDNIGHT

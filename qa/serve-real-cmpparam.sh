@@ -1722,7 +1722,7 @@ eng_only "4l boundary HAVING MAX(ID + 0) (wide): ? * MAX(ID + 0) = CAST(2.8 ..) 
 eng_only "4l boundary HAVING MIN(d.L) over a derived column (narrow): ? * MIN(d.L) = CAST(1.5 ..) ['1.4'] -> 1;2;3" "SELECT d.ID FROM (SELECT ID, 1.5 AS L FROM T) d GROUP BY d.ID HAVING ? * MIN(d.L) = CAST(1.5 AS NUMERIC(9,1))" '["1.4"]'
 eng_only "4l boundary HAVING (COUNT(*) + 0) arithmetic over a fold (wide): ? * (COUNT(*) + 0) = CAST(1.4 ..) ['1.4'] -> 1;2;3" "SELECT ID FROM T GROUP BY ID HAVING ? * (COUNT(*) + 0) = CAST(1.4 AS NUMERIC(9,1))" '["1.4"]'
 eng_only "4l boundary CAST(1.5 AS DECFLOAT(16)): ? * (..) = CAST(2.1 AS NUMERIC(9,2)) ['1.4'] -> 1;2;3" "SELECT ID FROM T WHERE ? * CAST(1.5 AS DECFLOAT(16)) = CAST(2.1 AS NUMERIC(9,2))" '["1.4"]'
-eng_only "4l boundary CAST(2 AS INT128): ? * (..) = CAST(2.8 ..) ['1.4'] -> 1;2;3" "SELECT ID FROM T WHERE ? * CAST(2 AS INT128) = CAST(2.8 AS NUMERIC(9,1))" '["1.4"]'
+both "4l promoted (CAST AS INT128 parses now): ? * (..) = CAST(2.8 ..) ['1.4'] -> 1;2;3" "SELECT ID FROM T WHERE ? * CAST(2 AS INT128) = CAST(2.8 AS NUMERIC(9,1))" '["1.4"]'
 eng_only "4l boundary ? * ABS(?) (a function over the other ?): = CAST(2.0 ..) ['1.4', '1.4'] -> none (engine: a DOUBLE slot for the second)" "SELECT ID FROM T WHERE ? * ABS(?) = CAST(2.0 AS NUMERIC(9,1))" '["1.4", "1.4"]'
 eng_only "4l boundary a NEGATED column -ID: ? * -ID = CAST(-2.0 ..) ['1.4'] -> 2" "SELECT ID FROM T WHERE ? * -ID = CAST(-2.0 AS NUMERIC(9,1))" '["1.4"]'
 eng_only "4l boundary -ID * ? = CAST(-2.8 ..) ['1.4'] -> 2" "SELECT ID FROM T WHERE -ID * ? = CAST(-2.8 AS NUMERIC(9,1))" '["1.4"]'
