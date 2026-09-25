@@ -59858,7 +59858,7 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                 // DOUBLE column folded nothing and answered NULL.
                 GItem::Agg(func @ (AggFn::Sum | AggFn::Avg), src, _) => {
                     let (mut sum, mut scale, mut n) = (0i128, None::<i8>, 0i64);
-                    let (mut fsum, mut approx) = (0f64, false);
+                    let (mut fsum, mut approx, mut exact_ovf) = (0f64, false, false);
                     // a DECFLOAT fold accumulates in decimal (the engine's
                     // DecimalContext, HALF-UP to 34 significant digits);
                     // the source width decides the AVG result type - SUM is
@@ -59928,7 +59928,21 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                             (_, Some((raw, sc))) => {
                                 // one source, one scale - the first pins it
                                 scale.get_or_insert(sc);
-                                sum = sum.saturating_add(raw);
+                                // THE EXACT FOLD IS CHECKED, IN SCAN ORDER:
+                                // the engine accumulates SUM/AVG in 128 bits
+                                // and raises 22003 Integer overflow the
+                                // moment the running sum leaves INT128 - an
+                                // INT128 max + 1 raises even when a later -5
+                                // would bring it back (measured), and the
+                                // bound is the full i128, not 10^38 (two
+                                // NUMERIC(38,0) 6E37s sum to 1.2E38). This
+                                // saturated, answering a clamped 2^127-1.
+                                // Raised after the fold, so an approximate
+                                // row (which makes the fold a double) wins.
+                                match sum.checked_add(raw) {
+                                    Some(s) => sum = s,
+                                    None => exact_ovf = true,
+                                }
                                 // divide-not-multiply (exact_to_f64):
                                 // the mixed-approx fold's f64 leg takes
                                 // the engine's CVT conversion
@@ -59942,6 +59956,17 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                             }
                             _ => continue,
                         }
+                        // a double running sum that reaches an infinity
+                        // raises 22003 Floating-point overflow (SUM and AVG,
+                        // grouped and windowed, measured: 1E308 + 1E308, and
+                        // an Infinity INPUT alone - a VAR_POP that
+                        // overflowed - raises too); a NaN passes through
+                        if approx && fsum.is_infinite() {
+                            return Err(EvalErr::FloatOverflow);
+                        }
+                    }
+                    if exact_ovf && !approx {
+                        return Err(EvalErr::IntegerOverflowArith);
                     }
                     if let Some(acc) = dsum {
                         use fire_crab_ods::decfloat::{self as dfl, Dec};
@@ -60010,7 +60035,7 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                     // gate while COALESCE(VAR_SAMP(...), -1) exposed it,
                     // measured live: the engine answers -1). STDDEV is
                     // the square root, clamped at 0 so f64 cancellation
-                    // cannot sqrt a tiny negative.
+                    // cannot sqrt a tiny negative (a NaN is not clamped).
                     let (mut n, mut sx, mut sxx) = (0i64, 0f64, 0f64);
                     for r in rows {
                         let v = src_value(src, r)?;
@@ -60042,6 +60067,11 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         };
                         Value::Double(match func {
                             AggFn::VarPop | AggFn::VarSamp => var,
+                            // a NaN variance (Sxx - Sx*Sx/n as Inf - Inf,
+                            // measured over {1E300, 1, 1E200}) stays NaN:
+                            // f64::max(NaN, 0.0) is 0.0, which answered a
+                            // STDDEV of 0 where the engine answers NaN
+                            _ if var.is_nan() => var,
                             _ => var.max(0.0).sqrt(),
                         })
                     }
@@ -124182,6 +124212,27 @@ mod tests {
         assert!(matches!(compute_group(&one_row, &gi(AggFn::VarPop)).unwrap()[0], Value::Double(v) if v == 0.0));
         assert!(matches!(compute_group(&empty, &gi(AggFn::VarSamp)).unwrap()[0], Value::Null));
         assert!(matches!(compute_group(&empty, &gi(AggFn::VarPop)).unwrap()[0], Value::Null));
+    }
+
+    #[test]
+    fn sum_avg_stddev_folds_raise_or_propagate() {
+        use fire_crab_ods::format::Value;
+        let gi = |f: AggFn| vec![GItem::Agg(f, AggSrc::Field(0), false)];
+        // INT128 max + 1 raises in scan order, though -5 would fit it back
+        let ovf = vec![vec![Value::Int128(i128::MAX, 0)], vec![Value::Int(1)], vec![Value::Int(-5)]];
+        for f in [AggFn::Sum, AggFn::Avg] {
+            assert!(matches!(compute_group(&ovf, &gi(f)), Err(EvalErr::IntegerOverflowArith)));
+        }
+        let fits = vec![vec![Value::Int(-5)], vec![Value::Int128(i128::MAX, 0)], vec![Value::Int(1)]];
+        assert!(matches!(compute_group(&fits, &gi(AggFn::Sum)).unwrap()[0], Value::Int128(v, 0) if v == i128::MAX - 4));
+        // a double sum reaching an infinity raises
+        let big = vec![vec![Value::Double(1e308)], vec![Value::Double(1e308)]];
+        assert!(matches!(compute_group(&big, &gi(AggFn::Sum)), Err(EvalErr::FloatOverflow)));
+        // a NaN variance keeps its NaN through STDDEV (max(NaN, 0) is 0)
+        let nan = vec![vec![Value::Double(1e300)], vec![Value::Double(1.0)], vec![Value::Double(1e200)]];
+        for f in [AggFn::StddevPop, AggFn::StddevSamp] {
+            assert!(matches!(compute_group(&nan, &gi(f)).unwrap()[0], Value::Double(v) if v.is_nan()));
+        }
     }
 
     /// Engine-DUMPED golden bytes: a DOMAIN CHECK compiles to the bare
