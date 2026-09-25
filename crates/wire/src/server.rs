@@ -91922,9 +91922,10 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                 // evaluation, refusal) sees shapes it already knows.
                 //
                 //   A IS NOT DISTINCT FROM NULL  ==  A IS NULL
-                //   A IS NOT DISTINCT FROM v     ==  A = v          (v not null)
+                //   A IS NOT DISTINCT FROM v     ==  A IS NOT NULL AND A = v   (v not null)
                 //   A IS DISTINCT FROM v         ==  A IS NULL OR A <> v
-                //   A IS NOT DISTINCT FROM B     ==  A = B OR (A IS NULL AND B IS NULL)
+                //   A IS NOT DISTINCT FROM B     ==  (A IS NULL AND B IS NULL)
+                //                                    OR (A, B NOT NULL AND A = B)
                 //
                 // The third line is the one worth stating: `NOT (A = v)`
                 // is NOT the same predicate, because a NULL A makes the
@@ -91939,10 +91940,6 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         leaf(RawKind::IsNotNull)
                     });
                 }
-                let rhs_lhs: Option<RawLhs> = match t.get(*pos) {
-                    Some(Tok::Ident(name)) => Some(RawLhs::Col(name.clone())),
-                    _ => None,
-                };
                 let side = parse_side(t, pos, np)?;
                 // ...AND A PARENTHESISED OR CAST NULL IS STILL NULL. Only a
                 // BARE `Tok::Null` was recognised above, so `A IS DISTINCT
@@ -91983,31 +91980,56 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         }),
                     }
                 };
-                return Some(match (not, rhs_lhs) {
-                    // both sides are columns: the NULL-NULL case is real
+                // THE RIGHT SIDE'S OWN NULL TEST. A null-safe comparison is
+                // TWO-valued - it never answers UNKNOWN - and the leaves it
+                // desugars into are three-valued, so every UNKNOWN they can
+                // produce must be fenced off by an explicit IS [NOT] NULL on
+                // BOTH sides. Two ways this went wrong before, both measured
+                // (m: (1,i=1,bo=TRUE), (2,NULL,NULL)):
+                //  - only a BARE COLUMN on the right was tested for NULL, so a
+                //    right side that is NULL at run time - `NULLIF(1, 1)`, a
+                //    scalar subquery with no row, `NULLIF(Y.ID, Y.ID)` in a
+                //    JOIN ON, `UPPER(S)` over a NULL S - was assumed never
+                //    NULL: `I IS DISTINCT FROM NULLIF(1, 1)` returned {2}
+                //    where the engine returns {1}, and `I IS NOT DISTINCT
+                //    FROM NULLIF(1, 1)` nothing where the engine returns {2}.
+                //  - `A = v` alone is UNKNOWN on a NULL A, so an outer NOT
+                //    kept it UNKNOWN: `NOT (I IS NOT DISTINCT FROM 1)`
+                //    returned nothing where the engine returns {2}; the
+                //    column forms `NOT (I IS [NOT] DISTINCT FROM J)` lost the
+                //    same rows.
+                // So `A = B` stands only beside `A IS NOT NULL AND B IS NOT
+                // NULL`, which also keeps it a usable equality for the index
+                // matcher in the literal case. A literal is never NULL (the
+                // NULL spellings were answered above); a `?` is bound per
+                // execute and keeps the old never-NULL reading (RECORDED -
+                // a `?` is not a tested side here, [RawLhs::Param]).
+                let rhs_nullable: Option<RawLhs> = match &side {
+                    Side::Val(_) => None,
+                    Side::Expr(e) if raw_has_param(e) => None,
+                    Side::Expr(RawExpr::Col(c)) => Some(RawLhs::Col(c.clone())),
+                    Side::Expr(e) => Some(RawLhs::Expr(e.clone())),
+                };
+                let rleaf = |rl: &RawLhs, kind: RawKind| {
+                    Ast::Leaf(RawTerm { lhs: rl.clone(), kind, mirrored: false, in_list: None })
+                };
+                return Some(match (not, rhs_nullable) {
+                    // A IS NOT DISTINCT FROM B ==
+                    //   (A IS NULL AND B IS NULL) OR (A IS NOT NULL AND B IS NOT NULL AND A = B)
                     (true, Some(rl)) => Ast::Or(vec![
-                        cmp_leaf(Cmp::Eq),
-                        Ast::And(vec![
-                            leaf(RawKind::IsNull),
-                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull, mirrored: false, in_list: None }),
-                        ]),
+                        Ast::And(vec![leaf(RawKind::IsNull), rleaf(&rl, RawKind::IsNull)]),
+                        Ast::And(vec![leaf(RawKind::IsNotNull), rleaf(&rl, RawKind::IsNotNull), cmp_leaf(Cmp::Eq)]),
                     ]),
+                    // A IS DISTINCT FROM B == exactly one is NULL, or neither and A <> B
                     (false, Some(rl)) => Ast::Or(vec![
-                        cmp_leaf(Cmp::Ne),
-                        Ast::And(vec![
-                            leaf(RawKind::IsNull),
-                            Ast::Leaf(RawTerm { lhs: rl.clone(), kind: RawKind::IsNotNull, mirrored: false, in_list: None }),
-                        ]),
-                        Ast::And(vec![
-                            leaf(RawKind::IsNotNull),
-                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull, mirrored: false, in_list: None }),
-                        ]),
+                        Ast::And(vec![leaf(RawKind::IsNull), rleaf(&rl, RawKind::IsNotNull)]),
+                        Ast::And(vec![leaf(RawKind::IsNotNull), rleaf(&rl, RawKind::IsNull)]),
+                        Ast::And(vec![leaf(RawKind::IsNotNull), rleaf(&rl, RawKind::IsNotNull), cmp_leaf(Cmp::Ne)]),
                     ]),
                     // the right side is a value that is not NULL
-                    (true, None) => cmp_leaf(Cmp::Eq),
-                    (false, None) => {
-                        Ast::Or(vec![leaf(RawKind::IsNull), cmp_leaf(Cmp::Ne)])
-                    }
+                    (true, None) => Ast::And(vec![leaf(RawKind::IsNotNull), cmp_leaf(Cmp::Eq)]),
+                    // already two-valued: a NULL A is TRUE, else `A <> v` is
+                    (false, None) => Ast::Or(vec![leaf(RawKind::IsNull), cmp_leaf(Cmp::Ne)]),
                 });
             }
             match (t.get(*pos), t.get(*pos + 1)) {
@@ -92021,15 +92043,22 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     Some(leaf(RawKind::IsNotNull))
                 }
                 // `IS TRUE` / `IS FALSE` are TWO-valued: a NULL is
-                // simply not true, so they desugar to `=`. Their
-                // negations are NOT the negated comparison - `B IS NOT
-                // TRUE` RETURNS the NULL rows (probed) where `NOT (B =
-                // TRUE)` drops them, so it desugars to the explicit OR,
-                // exactly as IS DISTINCT FROM does.
+                // simply not true. Their negations are NOT the negated
+                // comparison - `B IS NOT TRUE` RETURNS the NULL rows
+                // (probed) where `NOT (B = TRUE)` drops them, so it
+                // desugars to the explicit OR, exactly as IS DISTINCT
+                // FROM does. And the positive form is not a bare `B =
+                // TRUE` either: NOT is pushed into the leaves, so `NOT (B
+                // IS TRUE)` became `B <> TRUE` and dropped the NULL rows
+                // (measured: the engine returns them). The `B IS NOT NULL`
+                // conjunct keeps it two-valued under any NOT.
                 (Some(Tok::FnExpr(RawExpr::Bool(b))), _) => {
                     let b = *b;
                     *pos += 1;
-                    Some(leaf(RawKind::CmpExpr(Cmp::Eq, RawExpr::Bool(b))))
+                    Some(Ast::And(vec![
+                        leaf(RawKind::IsNotNull),
+                        leaf(RawKind::CmpExpr(Cmp::Eq, RawExpr::Bool(b))),
+                    ]))
                 }
                 (Some(Tok::Not), Some(Tok::FnExpr(RawExpr::Bool(b)))) => {
                     let b = *b;
