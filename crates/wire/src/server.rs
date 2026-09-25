@@ -20246,6 +20246,13 @@ fn text_form_m(
                 // a wrapped cast announced `len: -2147483648` for FOR
                 // 2147483648 and the client dumped core on the describe
                 Some(Expr::Int(n)) if *n >= 0 => i32::try_from(*n).ok(),
+                // ...and a scaled or string literal is a constant as well,
+                // read by CVT_get_long - rounded (measured: `LPAD('ab',
+                // 5.0)`, `LPAD('ab', 4.6)` and `LPAD('abc', '5')` all
+                // describe 5 characters, where this announced 65533)
+                Some(e @ (Expr::Dec(..) | Expr::Str(_))) => {
+                    e.eval(&[]).ok().and_then(|v| arg_long(&v).ok()).filter(|n| *n >= 0)
+                }
                 _ => None,
             };
             // A TEMPORAL operand keeps its natural WIDTH through these
@@ -52544,6 +52551,13 @@ fn plan_query_inner_at(
         for it in items {
             if let SelItem::Expr(raw, ..) = it {
                 if let Some(n) = raw_bad_substring_len(raw) {
+                    // the describe reads it through CVT_get_long first, so
+                    // one past INTEGER is 22003, never a length error
+                    // (measured: `FOR -2147483649` - this named the
+                    // length 2147483647, wrapped)
+                    if i32::try_from(n).is_err() {
+                        return Some(Plan::RefusedEval(EvalErr::NumericOutOfRange));
+                    }
                     return Some(Plan::RefusedEval(EvalErr::InvalidLength(n)));
                 }
             }
@@ -60969,6 +60983,8 @@ const GDS_DECFLOAT_OVERFLOW: i32 = 335545142;
 const GDS_FLOAT_DIVIDE: i32 = 335544772;
 /// `isc_exception_float_overflow` - SQLSTATE 22003
 const GDS_FLOAT_OVERFLOW: i32 = 335544775;
+/// `isc_exception_float_invalid_operand` - SQLSTATE 22000, emitted alone
+const GDS_FLOAT_INVALID_OPERAND: i32 = 335544774;
 /// `isc_sysf_fp_overflow` - "Floating point overflow in built-in function
 /// @1" (SQLSTATE 42000). The std-math family (SINH / COSH) raises THIS on
 /// an infinite result, naming the function - distinct from EXP / POWER,
@@ -61605,6 +61621,10 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
             // string conversion). Its TRUNCATION keeps the wrapper.
             w.int(1) // isc_arg_gds
                 .int(GDS_TRANSLITERATION_FAILED);
+        }
+        EvalErr::FloatInvalidOperand => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_FLOAT_INVALID_OPERAND);
         }
         EvalErr::DecfloatInvalidOperation => {
             // emitted ALONE - the engine's isql shows only "Decimal float
@@ -74519,7 +74539,9 @@ fn resolve_expr_inner(
             // to the three functions whose contract was measured - an
             // unmeasured function would be shipping a guess.
             if matches!(f, SysFn::Position | SysFn::Replace | SysFn::Trim(_)) {
-                carrier_fn_operands(&mut resolved, descs);
+                // POSITION's third argument is a start, not an operand
+                let n = if matches!(f, SysFn::Position) { resolved.len().min(2) } else { resolved.len() };
+                carrier_fn_operands(&mut resolved[..n], descs);
             }
             let resolved = resolved;
             // OCTET_LENGTH over a COLUMN of a tabled single-byte set
@@ -74531,6 +74553,45 @@ fn resolve_expr_inner(
             // which charset that is: the blank everywhere, a single
             // 0x00 for OCTETS (intl_builtin.cpp:1516 sets the binary
             // charset's space character to a NUL)
+            // a CONSTANT length is read at PREPARE by the describe
+            // (makeSubstr / makePad's CVT_get_long), so one past the
+            // INTEGER range refuses the statement with 22003 before any
+            // row (measured: `SUBSTRING('abc' FROM 1 FOR 2147483648)`
+            // fails its prepare - where this described `len:
+            // -2147483648` and the client dumped core on it - and so does
+            // `LPAD('abc', 2147483648)`, even under WHERE 1=0). A STRING
+            // literal is a constant too (`LPAD('abc', '2147483648')` is
+            // the same 22003), and the check comes BEFORE the multi-byte
+            // source's extra argument below, which returned first and
+            // let `LPAD(<UTF8 column>, 2147483648)` prepare.
+            let const_arg = match f {
+                SysFn::Substring => resolved.get(2),
+                SysFn::Lpad | SysFn::Rpad => resolved.get(1),
+                _ => None,
+            };
+            // AN APPROXIMATE LITERAL there is a constant the describe
+            // reads as 0 (the literal's text under a DOUBLE descriptor),
+            // so the engine announces VARYING(0) and a non-empty result
+            // fails its move into that slot - `LPAD('ab', 5e0)` is 22001
+            // *expected length 0, actual 5* - while an expression over
+            // it still sees the whole string (`CHAR_LENGTH(LPAD('ab',
+            // 5e0))` is 5, `LPAD(..) || 'x'` is *expected length 1*).
+            // This server has no zero-width text slot to carry that, so
+            // it refuses the prepare rather than answer the padded string
+            // (measured, 2026-09-25; a computed DOUBLE length answers on
+            // both)
+            if const_arg.is_some_and(|c| matches!(strip_neg(c), Expr::Double(_))) {
+                PREPARE_REFUSAL.with(|r| *r.borrow_mut() = Some(EvalErr::Unsupported));
+                return None;
+            }
+            if let Some(c) = const_arg.filter(|c| is_const_len_literal(c)) {
+                if let Ok(v) = c.eval(&[]) {
+                    if let Err(e) = arg_long(&v) {
+                        PREPARE_REFUSAL.with(|r| *r.borrow_mut() = Some(e));
+                        return None;
+                    }
+                }
+            }
             // FIREBIRD'S IMPLEMENTATION LIMIT: an LPAD/RPAD result past
             // 65535 bytes - the pad length N times the SOURCE charset's
             // bytes-per-character - raises 54000 "Implementation limit
@@ -74557,26 +74618,6 @@ fn resolve_expr_inner(
                     return Some(Expr::Func(*f, args));
                 }
             }
-            // a CONSTANT length is read at PREPARE by the describe
-            // (makeSubstr / makePad's CVT_get_long), so one past the
-            // INTEGER range refuses the statement with 22003 before any
-            // row (measured: `SUBSTRING('abc' FROM 1 FOR 2147483648)`
-            // fails its prepare - where this described `len:
-            // -2147483648` and the client dumped core on it - and so does
-            // `LPAD('abc', 2147483648)`, even under WHERE 1=0)
-            let const_arg = match f {
-                SysFn::Substring => resolved.get(2),
-                SysFn::Lpad | SysFn::Rpad => resolved.get(1),
-                _ => None,
-            };
-            if let Some(c) = const_arg.filter(|c| is_numeric_literal(c)) {
-                if let Ok(v) = c.eval(&[]) {
-                    if let Err(e) = arg_long(&v) {
-                        PREPARE_REFUSAL.with(|r| *r.borrow_mut() = Some(e));
-                        return None;
-                    }
-                }
-            }
             // the BIN_* family takes integral operands only: a scaled,
             // approximate or string one is the engine's typed refusal at
             // PREPARE (measured for all six, `BIN_SHL(1, 2.7)`,
@@ -74586,8 +74627,12 @@ fn resolve_expr_inner(
                 f,
                 SysFn::BinAnd | SysFn::BinOr | SysFn::BinXor | SysFn::BinNot | SysFn::BinShl | SysFn::BinShr
             ) {
+                // ...and any operand that is not an exact number at all:
+                // a DECFLOAT, a DATE, a BOOLEAN (makeBin's one test,
+                // measured for all three)
                 let inexact = resolved.iter().any(|a| match a.type_of(descs) {
-                    Some(ExprType::Approx | ExprType::Text) => true,
+                    Some(ExprType::Approx | ExprType::Text | ExprType::Temporal(_) | ExprType::Bool) => true,
+                    None => is_decfloat_arith(a, descs),
                     Some(ExprType::Numeric) => a.result_scale(descs).is_some_and(|sc| sc != 0),
                     _ => false,
                 });
@@ -75438,6 +75483,11 @@ enum EvalErr {
     /// rows before it, then raises (probed) - so it is an eval error, not
     /// an UNKNOWN.
     DecfloatInvalidOperation,
+    /// the same trap raised through a DOUBLE-flavoured decimal context
+    /// (Decimal128::toInt64, the MOV_get_int64 of a DECFLOAT):
+    /// `isc_exception_float_invalid_operand` (SQLSTATE 22000), emitted
+    /// alone (measured: `DATEADD(DAY, CAST('1e20' AS DECFLOAT), d)`)
+    FloatInvalidOperand,
     /// a TEXT bound against a DECFLOAT(34) slot that decNumber cannot
     /// read: the engine raises *Decimal float invalid operation* FOLLOWED
     /// by *Conversion error from string "<text>"* (both, in that order,
@@ -79038,7 +79088,7 @@ fn temporal_shift(
     let units = |per: i128| -> Result<i128, EvalErr> {
         let exact = |raw: i128, sc: i8| -> i128 {
             let den = 10i128.pow((-sc).max(0) as u32);
-            let num = raw * per;
+            let num = raw.saturating_mul(per);
             let (s, a) = (num.signum(), num.unsigned_abs());
             let den_u = den.unsigned_abs();
             let mut q = a / den_u;
@@ -79048,7 +79098,7 @@ fn temporal_shift(
             s * q as i128
         };
         Ok(match amount {
-            Value::Int(n) => *n as i128 * per,
+            Value::Int(n) => (*n as i128).saturating_mul(per),
             Value::Scaled(r, sc) => exact(*r as i128, *sc),
             Value::Int128(r, sc) => exact(*r, *sc),
             Value::Double(_) | Value::Float(_) | Value::Rounded(..) => {
@@ -79078,15 +79128,31 @@ fn temporal_shift(
             Ok(Value::Time((u as i128 + delta).rem_euclid(UPD) as u32))
         }
         TKind::Timestamp => {
+            // getDayFraction: an amount of more days than the calendar
+            // spans is *valid dates* before any arithmetic (measured:
+            // `TIMESTAMP '2024-01-01 00:00' + 99999999999999999999999`),
+            // the result's own range *valid timestamps* after it
+            let days = numeric_parts(amount)
+                .map(|(r, sc)| exact_to_f64(r, sc as i32))
+                .or_else(|| approx_of(amount));
+            // (compared as a whole count: + 3652058.5 passes this one)
+            if days.is_some_and(|x| x.abs().trunc() > 3_652_058.0) {
+                return Err(EvalErr::DateRange);
+            }
             let mut delta = units(UPD)?;
             if neg {
                 delta = -delta;
             }
-            let total = d as i128 * UPD + u as i128 + delta;
-            Ok(Value::Timestamp(
-                total.div_euclid(UPD) as i32,
-                total.rem_euclid(UPD) as u32,
-            ))
+            let total = (d as i128 * UPD + u as i128).saturating_add(delta);
+            // the result must lie in 0001-01-01 .. 9999-12-31, as a DATE's
+            // does (measured: `TIMESTAMP '9999-12-31 23:00' + 1`, `+ 0.05`
+            // and `TIMESTAMP '0001-01-01 01:00' - 1` are 22008 *valid
+            // timestamps*, where this answered a year 10000 / year 0 value)
+            let day = total.div_euclid(UPD);
+            if !(-678_575..=2_973_483).contains(&day) {
+                return Err(EvalErr::DatetimeRange);
+            }
+            Ok(Value::Timestamp(day as i32, total.rem_euclid(UPD) as u32))
         }
         _ => Err(EvalErr::Unsupported),
     }
@@ -80155,16 +80221,17 @@ fn fn_int(v: &Value) -> Result<i64, EvalErr> {
 /// result past INT64 is *numeric value is out of range* (measured:
 /// `DATEADD(MILLISECOND, 9223372036854775807, ts)` is 22003 - the
 /// millisecond amount is taken at scale -1, in 100us units - and
-/// `DATEADD(DAY, 1e300, d)` too). Text and the other forms keep
-/// [fn_int]'s conversion.
+/// `DATEADD(DAY, 1e300, d)` too). The overflow's wording follows the
+/// SOURCE's type ([arg_overflow]). A text is CVT's decompose, exponent
+/// included (measured: `DATEADD(DAY, '1e1', d)` adds ten days and
+/// `LEFT('abc', '1.5e0')` is 'ab', where this raised 22018).
 fn arg_int64(v: &Value, digits: u32) -> Result<i64, EvalErr> {
     let pow = |k: u32| 10i128.checked_pow(k);
+    let over = arg_overflow(v);
     let r: i128 = if let Some((raw, scale)) = numeric_parts(v) {
         let shift = scale as i32 + digits as i32;
         if shift >= 0 {
-            pow(shift as u32)
-                .and_then(|p| raw.checked_mul(p))
-                .ok_or(EvalErr::NumericOutOfRange)?
+            pow(shift as u32).and_then(|p| raw.checked_mul(p)).ok_or(over.clone())?
         } else {
             // past 10^38 every i128 rounds to zero
             match pow((-shift) as u32) {
@@ -80175,45 +80242,117 @@ fn arg_int64(v: &Value, digits: u32) -> Result<i64, EvalErr> {
                 None => 0,
             }
         }
+    } else if let Some(d) = dec_of(v) {
+        // Decimal128::toInt64: quantized half-up at the scale, and past
+        // INT64 the invalid operation - raised through a DOUBLE context,
+        // so it is *Floating-point invalid operand* (measured: DATEADD
+        // over CAST('1e20' AS DECFLOAT), where LEFT's toInteger names
+        // the decimal one)
+        // (a NaN or an Infinity fails the quantize first, in the
+        // decimal context: *Decimal float invalid operation*)
+        if !matches!(d, fire_crab_ods::decfloat::Dec::Finite { .. }) {
+            return Err(EvalErr::DecfloatInvalidOperation);
+        }
+        fire_crab_ods::decfloat::round_to_exp(&d, -(digits as i32))
+            .filter(|r| i64::try_from(*r).is_ok())
+            .ok_or(EvalErr::FloatInvalidOperand)?
     } else if let Some(x) = approx_of(v) {
         approx_to_int64(x * 10f64.powi(digits as i32))?
     } else if let Value::Text(t) = v {
-        let (raw, scale) =
-            decimal_parts(t).ok_or_else(|| EvalErr::ConversionError(Some(t.clone())))?;
-        return arg_int64(&Value::Int128(raw, scale), digits);
+        match exp_text_to_scaled_at(t, 8, -(digits as i8), false) {
+            Some(Some(raw)) => raw,
+            Some(None) => return Err(EvalErr::NumericOutOfRange),
+            None => {
+                let (raw, scale) =
+                    decimal_parts(t).ok_or_else(|| EvalErr::ConversionError(Some(t.clone())))?;
+                // a text reads as INT64, whatever its digit count
+                return arg_int64(&Value::Int128(raw, scale), digits).map_err(|e| match e {
+                    EvalErr::IntegerOverflowArith => EvalErr::NumericOutOfRange,
+                    e => e,
+                });
+            }
+        }
     } else {
-        (fn_int(v)? as i128)
-            .checked_mul(pow(digits).unwrap_or(1))
-            .ok_or(EvalErr::NumericOutOfRange)?
+        (fn_int(v)? as i128).checked_mul(pow(digits).unwrap_or(1)).ok_or(EvalErr::NumericOutOfRange)?
     };
-    i64::try_from(r).map_err(|_| EvalErr::NumericOutOfRange)
+    i64::try_from(r).map_err(|_| over)
 }
 
-/// A numeric LITERAL - what the engine's describe sees as a constant
-/// (`dsc_address` set), a negated one included (the parser folds it).
-fn is_numeric_literal(e: &Expr) -> bool {
+/// The DECFLOAT a value holds, decoded - `None` for any other value
+fn dec_of(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
+    match v {
+        Value::DecFloat34(b) => Some(fire_crab_ods::decfloat::decode_dec128(*b)),
+        Value::DecFloat16(b) => Some(fire_crab_ods::decfloat::decode_dec64(*b)),
+        _ => None,
+    }
+}
+
+/// The error MOV_get_int64 / MOV_get_long raise when `v` does not fit,
+/// which is the SOURCE type's: an INT128 (a column, a CAST, an integer
+/// literal past BIGINT, a NUMERIC(38, s)) goes through Int128's own
+/// narrowing - *Integer overflow* under the arithmetic exception - a
+/// DECFLOAT through decQuadToInt32 - *Decimal float invalid operation*
+/// ([arg_long]; toInt64's is the FLOAT one, [arg_int64]) - and everything
+/// narrower through CVT - *numeric value is
+/// out of range* (measured: `LEFT(S, <INT128 max>)`, `LEFT('abc',
+/// CAST(4294967296 AS INT128))`, `DATEADD(DAY, 9223372036854775808, d)`
+/// are the first, `LEFT(S, CAST(1e10 AS DECFLOAT))` the second,
+/// `LEFT(S, 4294967296)` and a BIGINT column the third)
+fn arg_overflow(v: &Value) -> EvalErr {
+    match v {
+        Value::Int128(..) => EvalErr::IntegerOverflowArith,
+        Value::DecFloat34(_) | Value::DecFloat16(_) => EvalErr::DecfloatInvalidOperation,
+        _ => EvalErr::NumericOutOfRange,
+    }
+}
+
+/// A LITERAL - what the engine's describe sees as a constant
+/// (`dsc_address` set), a negated one included (the parser folds it): a
+/// number or a string, which CVT_get_long reads the same way at prepare
+fn is_const_len_literal(e: &Expr) -> bool {
     match e {
-        Expr::Int(_) | Expr::Int128(_) | Expr::Dec(..) | Expr::Double(_) | Expr::DecFloat34(_) => true,
-        Expr::Neg(inner) => is_numeric_literal(inner),
+        Expr::Int(_) | Expr::Int128(_) | Expr::Dec(..) | Expr::DecFloat34(_) | Expr::Str(_) => true,
+        Expr::Neg(inner) => is_const_len_literal(inner),
         _ => false,
+    }
+}
+
+/// `e` under any unary minuses
+fn strip_neg(e: &Expr) -> &Expr {
+    match e {
+        Expr::Neg(inner) => strip_neg(inner),
+        e => e,
     }
 }
 
 /// SUBSTRING's FROM less one, EXACTLY - the engine builds `start - 1` as
 /// an expression before rounding it, so a fractional FROM rounds after
-/// the subtraction (FROM 0.5 is -0.5 -> -1, where rounding first gave 0)
+/// the subtraction (FROM 0.5 is -0.5 -> -1, where rounding first gave 0).
+/// The subtraction keeps the operand's TYPE, and with it the error its
+/// narrowing names: a BIGINT FROM of INT64 min overflows the subtraction
+/// itself (bare *Integer overflow*), an INT128 one stays INT128 (measured:
+/// `FROM -BI-1` is the bare overflow, `FROM CAST(2147483649 AS INT128)`
+/// the arithmetic-exception one, `FROM 2147483649` out of range).
 fn value_minus_one(v: &Value) -> Result<Value, EvalErr> {
     if let Some((raw, scale)) = numeric_parts(v) {
-        let one = 10i128.checked_pow((-scale).max(0) as u32).ok_or(EvalErr::NumericOutOfRange)?;
-        let one = if scale > 0 { 1 } else { one };
+        let one = if scale > 0 { 1 } else { 10i128.checked_pow((-scale) as u32).ok_or(EvalErr::NumericOutOfRange)? };
         let raw = if scale > 0 { round_scaled_to_int(raw, scale) } else { raw };
         let scale = scale.min(0);
-        return Ok(Value::Int128(raw.checked_sub(one).ok_or(EvalErr::NumericOutOfRange)?, scale));
+        let r = raw.checked_sub(one).ok_or(EvalErr::IntegerOverflow)?;
+        return Ok(match v {
+            Value::Int128(..) => Value::Int128(r, scale),
+            _ => Value::Scaled(i64::try_from(r).map_err(|_| EvalErr::IntegerOverflow)?, scale),
+        });
+    }
+    if let Some(d) = dec_of(v) {
+        use fire_crab_ods::decfloat as df;
+        let one = df::Dec::Finite { neg: false, coeff: 1, exp: 0 };
+        return Ok(Value::DecFloat34(df::dec_to_bits(&df::sub(&d, &one))));
     }
     if let Some(x) = approx_of(v) {
         return Ok(Value::Double(x - 1.0));
     }
-    Ok(Value::Int128(fn_int(v)? as i128 - 1, 0))
+    Ok(Value::Int(fn_int(v)?.checked_sub(1).ok_or(EvalErr::IntegerOverflow)?))
 }
 
 /// ... and `MOV_get_long(v, 0)`: an INTEGER-typed argument (a length, a
@@ -80222,7 +80361,16 @@ fn value_minus_one(v: &Value) -> Result<Value, EvalErr> {
 /// `POSITION('a', 'abc', 4294967297)`, `ROUND(1.5, 4294967296)` all
 /// raise 22003 on the engine, where this answered `abc` / 0 / 1.5)
 fn arg_long(v: &Value) -> Result<i32, EvalErr> {
-    i32::try_from(arg_int64(v, 0)?).map_err(|_| EvalErr::NumericOutOfRange)
+    if let Some(d) = dec_of(v) {
+        return fire_crab_ods::decfloat::round_to_exp(&d, 0)
+            .and_then(|r| i32::try_from(r).ok())
+            .ok_or(EvalErr::DecfloatInvalidOperation);
+    }
+    let n = arg_int64(v, 0)?;
+    i32::try_from(n).map_err(|_| match v {
+        Value::Text(_) => EvalErr::NumericOutOfRange,
+        v => arg_overflow(v),
+    })
 }
 
 /// Strip repetitions of `what` (a whole string, possibly multi-character)
@@ -80602,9 +80750,31 @@ impl Expr {
                 // engine converts (a number under UPPER renders to its
                 // text, a text length parses to its integer) convert in
                 // eval with the engine's own CVT errors on failure
+                //
+                // A DECFLOAT has no ExprType of its own, but where the
+                // engine reads an argument as an INTEGER (MOV_get_long /
+                // MOV_get_int64: a length, a start, an amount, a places
+                // count) it converts like any number - rounded half up,
+                // and past the range the decimal invalid operation
+                // (measured: `LEFT(S, DF)` with DF 2.5 is 3 characters,
+                // `DATEADD(DAY, DF, d)` three days, `LEFT(S, CAST(1e10 AS
+                // DECFLOAT))` 22000; all were refused here)
+                let int_arg = |i: usize| match f {
+                    SysFn::Left | SysFn::Right | SysFn::Lpad | SysFn::Rpad => i == 1,
+                    SysFn::Substring => i >= 1,
+                    SysFn::Position => i == 2,
+                    SysFn::DateAdd(_) => i == 0,
+                    SysFn::Round | SysFn::Trunc => i == 1,
+                    _ => false,
+                };
                 let ts = args
                     .iter()
-                    .map(|a| a.type_of(descs))
+                    .enumerate()
+                    .map(|(i, a)| {
+                        a.type_of(descs).or_else(|| {
+                            (int_arg(i) && is_decfloat_arith(a, descs)).then_some(ExprType::Numeric)
+                        })
+                    })
                     .collect::<Option<Vec<_>>>()?;
                 match f {
                     SysFn::BlobOctetLength => Some(ExprType::Int), // answered above
@@ -84109,7 +84279,16 @@ impl Expr {
                                     // TRUNC(123, -100) and ROUND(123,
                                     // -100) are 0, where this raised 22003)
                                     match pow10_i128(drop as u32) {
-                                        Some(div) => (rounded_q(raw, div, mode) * div, scale),
+                                        // a round-up past the i128
+                                        // itself is 22003 (measured:
+                                        // ROUND(<INT128 max>, -1), where
+                                        // this wrapped to a negative)
+                                        Some(div) => (
+                                            rounded_q(raw, div, mode)
+                                                .checked_mul(div)
+                                                .ok_or(EvalErr::NumericOutOfRange)?,
+                                            scale,
+                                        ),
                                         None => (0, scale),
                                     }
                                 }
@@ -119100,6 +119279,46 @@ mod tests {
         let m1 = normalize_raw(&parse_raw_expr_any("MOD(A, 2)").unwrap());
         let m2 = normalize_raw(&parse_raw_expr_any("MOD(a,2)").unwrap());
         assert!(m1 == m2);
+    }
+
+    #[test]
+    fn function_integer_arguments_name_the_source_overflow() {
+        use fire_crab_ods::decfloat::{dec_to_bits, Dec};
+        let df = |neg, coeff, exp| Value::DecFloat34(dec_to_bits(&Dec::Finite { neg, coeff, exp }));
+        // MOV_get_long of an INT128 past INTEGER is the ARITHMETIC integer
+        // overflow; of a BIGINT CVT's out of range (both measured)
+        assert_eq!(arg_long(&Value::Int128(4_294_967_296, 0)), Err(EvalErr::IntegerOverflowArith));
+        assert_eq!(arg_long(&Value::Int(4_294_967_296)), Err(EvalErr::NumericOutOfRange));
+        assert_eq!(arg_int64(&Value::Int128(i128::MAX, 0), 0), Err(EvalErr::IntegerOverflowArith));
+        // a DECFLOAT rounds half up; past INTEGER through toInteger it is
+        // the decimal invalid operation, past INT64 through toInt64 the
+        // FLOAT one
+        assert_eq!(arg_long(&df(false, 25, -1)), Ok(3));
+        assert_eq!(arg_long(&df(true, 25, -1)), Ok(-3));
+        assert_eq!(arg_long(&df(false, 1, 10)), Err(EvalErr::DecfloatInvalidOperation));
+        assert_eq!(arg_int64(&df(false, 1, 20), 0), Err(EvalErr::FloatInvalidOperand));
+        // a text reads through CVT's decompose, exponent included
+        assert_eq!(arg_int64(&Value::Text("1e1".into()), 0), Ok(10));
+        assert_eq!(arg_long(&Value::Text("1.5e0".into())), Ok(2));
+        assert_eq!(arg_long(&Value::Text("1e10".into())), Err(EvalErr::NumericOutOfRange));
+        assert_eq!(arg_long(&Value::Text("99999999999999999999999".into())), Err(EvalErr::NumericOutOfRange));
+        // SUBSTRING's start - 1 keeps the operand's type
+        assert_eq!(value_minus_one(&Value::Int(i64::MIN)), Err(EvalErr::IntegerOverflow));
+        assert_eq!(
+            arg_long(&value_minus_one(&Value::Int128(2_147_483_649, 0)).unwrap()),
+            Err(EvalErr::IntegerOverflowArith)
+        );
+        assert_eq!(arg_long(&value_minus_one(&Value::Int(2_147_483_649)).unwrap()), Err(EvalErr::NumericOutOfRange));
+        // TIMESTAMP + n: the calendar's span first (valid dates), then
+        // the result's range (valid timestamps)
+        let ts = days_of_civil(9999, 12, 31);
+        let h23 = 23 * 3_600 * 10_000;
+        assert_eq!(temporal_shift(ts as i64, h23, TKind::Timestamp, &Value::Int(1), false), Err(EvalErr::DatetimeRange));
+        assert_eq!(
+            temporal_shift(0, 0, TKind::Timestamp, &Value::Int(3_652_059), false),
+            Err(EvalErr::DateRange)
+        );
+        assert!(temporal_shift(ts as i64, h23, TKind::Timestamp, &Value::Scaled(1, -2), false).is_ok());
     }
 
     #[test]

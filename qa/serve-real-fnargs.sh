@@ -31,6 +31,28 @@
 #     error, accepts a scale-0 NUMERIC / INT128 (refused before) and
 #     shifts an INT128 in 128 bits; ATAN2(0, 0) raises.
 #
+# Round 2 (a refuter's findings, each measured first):
+#
+#   * the overflow of an INTEGER-read argument names the SOURCE's type:
+#     an INT128 (a column, a CAST, a literal past BIGINT, a NUMERIC(38,s))
+#     is the ARITHMETIC integer overflow, a DECFLOAT the decimal invalid
+#     operation (DATEADD's toInt64: the FLOAT invalid operand), anything
+#     narrower *numeric value is out of range* - round 1 said the last for
+#     all, and SUBSTRING's start - 1 now keeps its operand's type;
+#   * a constant length is read at prepare for a UTF8 source too (its
+#     extra argument returned first), for a STRING literal, and for a
+#     negative FOR past INTEGER (it named a wrapped 2147483647); a scaled
+#     or string literal length describes its value (it was 65533);
+#   * a text amount reads its exponent ('1e1' was 22018); ROUND past the
+#     i128 is 22003 (it wrapped negative); POSITION's start over a UTF8
+#     string counts characters (it counted bytes); TIMESTAMP +/- a number
+#     keeps 0001..9999 (it answered year 10000); a DECFLOAT length / start
+#     / amount / places count converts (it was refused); BIN_* over a
+#     DECFLOAT, DATE or BOOLEAN is the typed refusal.
+#   * RECORDED (section 15): an approximate LITERAL length (engine
+#     VARYING(0) + 22001; refused here), ROUND/TRUNC of a DECFLOAT operand,
+#     and LPAD in PSQL / under HAVING / in an IN (subquery).
+#
 # Usage: qa/serve-real-fnargs.sh [port]   (default 5360)
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
@@ -48,6 +70,15 @@ CREATE TABLE T (ID INTEGER, N INTEGER, BIG BIGINT, I128 INT128, NM NUMERIC(18,0)
   TS TIMESTAMP, TM TIME, S VARCHAR(10), U VARCHAR(10) CHARACTER SET UTF8, DB DOUBLE PRECISION);
 INSERT INTO T VALUES (1, -32768, 4294967297, 1, 5, '2024-02-29', '2024-01-01 00:00:00', '10:00:00', 'abc', 'abc', 0.5);
 INSERT INTO T VALUES (2, 0, -1, -8, -3, '0001-01-01', '9999-12-31 23:59:00', '00:30:00', 'xyz', 'xyz', 0);
+COMMIT;
+CREATE TABLE T2 (I128X INT128, BI BIGINT, N380 NUMERIC(38,0), DF DECFLOAT, U2 VARCHAR(20) CHARACTER SET UTF8,
+  N2 INTEGER, S VARCHAR(10), D DATE);
+INSERT INTO T2 VALUES (170141183460469231731687303715884105727, 9223372036854775807,
+  -170141183460469231731687303715884105728, 2.5, 'äbcdef', 2, 'abc', '2024-01-01');
+SET TERM ^;
+CREATE PROCEDURE PP (X VARCHAR(10) CHARACTER SET UTF8, L INTEGER) RETURNS (R VARCHAR(100) CHARACTER SET UTF8)
+AS BEGIN R = LPAD(X, L, 'é'); SUSPEND; END^
+SET TERM ;^
 COMMIT;
 SQL
 } | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/fnargs-build.log 2>&1
@@ -101,7 +132,21 @@ dsame() { # <label> <select>
     elif [ "$ed" != "$fd" ]; then echo "FAIL $1"; echo "     eng=[$ed]"; echo "     fc =[$fd]"; fail=1
     else echo "OK   $1 [$ed]"; fi
 }
+# a RECORDED difference: the engine's answer is pinned, and this server
+# must still give its known clean refusal - a cell that starts to agree
+# FAILS, so it is promoted rather than left behind
+rec() { # <label> <script> <engine-output> <this-server-output>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(sess "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2")
+    if [ "$ev" != "$3" ]; then echo "FAIL $1 - THE ENGINE ANSWERS [$ev], not the pinned [$3]"; fail=1
+    elif [ "$ev" = "$fv" ]; then echo "FAIL $1 - now agrees; promote the cell"; fail=1
+    elif [ "$fv" != "$4" ]; then echo "FAIL $1 - this server answers [$fv], not the recorded [$4]"; fail=1
+    else echo "OK   $1 (recorded: engine [$ev], this server [$fv])"; fi
+}
 DUAL='FROM RDB$DATABASE'
+# ...and INT128's narrowing: the ARITHMETIC integer overflow
+IOVF='Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Integer overflow. The result of an integer operation caused the most significant bit of the result to carry.'
 E22003='Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range'
 
 DATES='Statement failed, SQLSTATE = 22008|value exceeds the range for valid dates'
@@ -288,6 +333,194 @@ pin  "6 ...either zero signed, a column" "SELECT ATAN2(-0e0, N) FROM T WHERE ID 
      "ATAN2|$EVAL|-Arguments for ATAN2 cannot both be zero"
 pin  "6 CONTROL ATAN2 off the origin" "SELECT ATAN2(0, 1), ATAN2(1, 0) $DUAL;" \
      "ATAN2 ATAN2|0.000000000000000 1.570796326794897"
+echo "--- 8. the overflow names the SOURCE's type (round 2)"
+# MOV_get_long / MOV_get_int64 of an INT128 is Int128's own narrowing -
+# the ARITHMETIC integer overflow - of a DECFLOAT the decimal (or, through
+# toInt64, the float) invalid operation, and of anything narrower CVT's
+# *numeric value is out of range*; round 1 named the last for all of them
+pin  "8 an INT128 column as a DATEADD amount" "SELECT DATEADD(DAY, I128X, D) FROM T2;" \
+     "DATEADD|$IOVF"
+pin  "8 ...as a LEFT length" "SELECT LEFT(S, I128X) FROM T2;" \
+     "LEFT|$IOVF"
+pin  "8 ...as a POSITION start" "SELECT POSITION('a', S, I128X) FROM T2;" \
+     "POSITION|$IOVF"
+pin  "8 ...as an LPAD length" "SELECT LPAD(S, I128X) FROM T2;" \
+     "LPAD|$IOVF"
+pin  "8 ...as ROUND places" "SELECT ROUND(1.25, I128X) FROM T2;" \
+     "ROUND|$IOVF"
+pin  "8 ...as a BIN_SHL count" "SELECT BIN_SHL(1, I128X) FROM T2;" \
+     "BIN_SHL|$IOVF"
+pin  "8 ...as a SUBSTRING FOR" "SELECT SUBSTRING(S FROM 1 FOR I128X) FROM T2;" \
+     "SUBSTRING|$IOVF"
+pin  "8 an INT128 cast past INTEGER (master answered 'abc')" "SELECT LEFT('abc', CAST(4294967296 AS INT128)) $DUAL;" \
+     "LEFT|$IOVF"
+pin  "8 ...as ROUND places (master answered 1.5)" "SELECT ROUND(1.5, CAST(4294967296 AS INT128)) $DUAL;" \
+     "ROUND|$IOVF"
+pin  "8 an integer literal past BIGINT is INT128" "SELECT DATEADD(DAY, 9223372036854775808, $DD) $DUAL;" \
+     "DATEADD|$IOVF"
+pin  "8 ...as a LEFT length" "SELECT LEFT(S, 9223372036854775808) FROM T2;" \
+     "LEFT|$IOVF"
+pin  "8 a NUMERIC(38,2) is INT128-backed" "SELECT LEFT(S, CAST(4294967296 AS NUMERIC(38,2))) FROM T2;" \
+     "LEFT|$IOVF"
+pin  "8 MILLISECOND's scale -1 over an INT128" "SELECT DATEADD(MILLISECOND, CAST(922337203685477581 AS INT128), $TS0) $DUAL;" \
+     "DATEADD|$IOVF"
+pin  "8 a constant INT128 pad length fails the prepare" "SELECT LPAD('abc', 9223372036854775808) $DUAL WHERE 1 = 0;" \
+     "$IOVF"
+pin  "8 SUBSTRING's start - 1 overflows a BIGINT FROM itself" "SELECT SUBSTRING(S FROM -BI-1) FROM T2;" \
+     "SUBSTRING|Statement failed, SQLSTATE = 22003|Integer overflow. The result of an integer operation caused the most significant bit of the result to carry."
+pin  "8 ...an INT128 FROM stays INT128" "SELECT SUBSTRING(S FROM CAST(2147483649 AS INT128)) FROM T2;" \
+     "SUBSTRING|$IOVF"
+pin  "8 CONTROL ...and one that fits is empty" "SELECT '[' || SUBSTRING(S FROM CAST(2147483648 AS INT128)) || ']' FROM T2;" \
+     "CONCATENATION|[]"
+pin  "8 CONTROL a BIGINT literal / column is out of range" "SELECT LEFT(S, 4294967296) FROM T2;" \
+     "LEFT|$E22003"
+pin  "8 CONTROL ...a BIGINT column" "SELECT LEFT(S, BI) FROM T2;" \
+     "LEFT|$E22003"
+pin  "8 CONTROL ...a BIGINT FROM" "SELECT SUBSTRING(S FROM 2147483649) FROM T2;" \
+     "SUBSTRING|$E22003"
+echo "--- 9. constant lengths (round 2)"
+pin  "9 a UTF8 source's constant pad length fails the prepare too" "SELECT LPAD(U, 2147483648) FROM T WHERE 1 = 0;" \
+     "$E22003"
+pin  "9 ...RPAD, with rows" "SELECT RPAD(U, 3000000000) FROM T;" \
+     "$E22003"
+pin  "9 a negative FOR past INTEGER is 22003 (it named 2147483647)" "SELECT SUBSTRING('abcdef' FROM 1 FOR -2147483649) $DUAL WHERE 1 = 0;" \
+     "$E22003"
+pin  "9 ...over a column" "SELECT SUBSTRING(S FROM 1 FOR -2147483649) FROM T;" \
+     "$E22003"
+pin  "9 CONTROL FOR -2147483648 is the length error" "SELECT SUBSTRING(S FROM 1 FOR -2147483648) FROM T;" \
+     "Statement failed, SQLSTATE = 22011|Invalid length parameter -2147483648 to SUBSTRING. Negative integers are not allowed."
+pin  "9 a STRING constant pad length is read at prepare" "SELECT LPAD('abc', '2147483648') $DUAL WHERE 1 = 0;" \
+     "$E22003"
+pin  "9 ...a string FOR" "SELECT SUBSTRING('abc' FROM 1 FOR '2147483648') $DUAL WHERE 1 = 0;" \
+     "$E22003"
+pin  "9 ...a non-numeric one is 22018 at prepare" "SELECT LPAD('abc', 'x') $DUAL WHERE 1 = 0;" \
+     "Statement failed, SQLSTATE = 22018|conversion error from string \"x\""
+dsame "9 LPAD('ab', 5.0) describes 5 (it announced 65533)" "SELECT LPAD('ab', 5.0) $DUAL;"
+dsame "9 LPAD('ab', 4.6) rounds to 5" "SELECT LPAD('ab', 4.6) $DUAL;"
+dsame "9 LPAD('abc', '5') describes 5" "SELECT LPAD('abc', '5') $DUAL;"
+pin  "9 ...and they answer" "SELECT LPAD('ab', 5.0), LPAD('ab', 4.6), LPAD('abc', '5') $DUAL;" \
+     "LPAD LPAD LPAD|ab ab abc"
+pin  "9 CONTROL a computed DOUBLE length answers" "SELECT LPAD('ab', CAST(5 AS DOUBLE PRECISION)), LEFT('abcdef', 2e0) $DUAL;" \
+     "LPAD LEFT|ab ab"
+echo "--- 10. a text amount is CVT's, exponent included (round 2)"
+pin  "10 DATEADD(DAY, '1e1') (it was 22018)" "SELECT DATEADD(DAY, '1e1', DATE '2024-02-29') $DUAL;" \
+     "DATEADD|2024-03-10"
+pin  "10 LEFT '1e0', '1.5e0', ' 2 '" "SELECT LEFT('abc', '1e0'), LEFT('abc', '1.5e0'), LEFT('abc', ' 2 '), '[' || LEFT('abc', '1e-400') || ']' $DUAL;" \
+     "LEFT LEFT LEFT CONCATENATION|a ab ab []"
+pin  "10 ...'-1e0' is the length error" "SELECT LEFT('abc', '-1e0') $DUAL;" \
+     "LEFT|Statement failed, SQLSTATE = 22011|Invalid length parameter -1 to SUBSTRING. Negative integers are not allowed."
+pin  "10 ...'1e10' is 22003" "SELECT LEFT('abc', '1e10') $DUAL;" \
+     "LEFT|$E22003"
+pin  "10 ...'1e400' is 22003" "SELECT LEFT('abc', '1e400') $DUAL;" \
+     "LEFT|$E22003"
+pin  "10 ...a digit string past INT64 is 22003" "SELECT LEFT('abc', '99999999999999999999999') $DUAL;" \
+     "LEFT|$E22003"
+pin  "10 MILLISECOND '1.5e0'" "SELECT DATEADD(MILLISECOND, '1.5e0', $TS0) $DUAL;" \
+     "DATEADD|2024-01-01 00:00:00.0015"
+pin  "10 CONTROL '2e' is 22018" "SELECT LEFT('abc', '2e') $DUAL;" \
+     "LEFT|Statement failed, SQLSTATE = 22018|conversion error from string \"2e\""
+echo "--- 11. ROUND past the i128 (round 2)"
+pin  "11 ROUND(INT128 max, -1) is 22003 (it wrapped negative)" "SELECT ROUND(I128X, -1) FROM T2;" \
+     "ROUND|$E22003"
+pin  "11 ...-38" "SELECT ROUND(I128X, -38) FROM T2;" \
+     "ROUND|$E22003"
+pin  "11 NUMERIC(38,0) min, -38" "SELECT ROUND(N380, -38) FROM T2;" \
+     "ROUND|$E22003"
+pin  "11 ...-1" "SELECT ROUND(N380, -1) FROM T2;" \
+     "ROUND|$E22003"
+pin  "11 CONTROL TRUNC cannot overflow; -37 and -39 fit" "SELECT TRUNC(I128X, -1), ROUND(I128X, -37), ROUND(I128X, -39) FROM T2;" \
+     "TRUNC ROUND ROUND|170141183460469231731687303715884105720 170000000000000000000000000000000000000 0"
+pin  "11 CONTROL a BIGINT round-up is 22003" "SELECT ROUND(BI, -1) FROM T2;" \
+     "ROUND|$E22003"
+echo "--- 12. POSITION's start over a UTF8 string (round 2)"
+pin  "12 POSITION('c', U2, 2) counts characters (it said 4)" "SELECT POSITION('c', U2, 2), POSITION('c', U2, N2), POSITION('c', U2, 4) FROM T2;" \
+     "POSITION POSITION POSITION|3 3 0"
+pin  "12 ...'ä' from 1, 'b' from 2 and 3" "SELECT POSITION('ä', U2, 1), POSITION('b', U2, 2), POSITION('b', U2, 3) FROM T2;" \
+     "POSITION POSITION POSITION|1 2 0"
+pin  "12 ...an empty needle up to one past the end" "SELECT POSITION('', U2, 3), POSITION('', U2, 7), POSITION('', U2, 8) FROM T2;" \
+     "POSITION POSITION POSITION|3 7 0"
+pin  "12 CONTROL the two-argument form" "SELECT POSITION('c' IN U2), POSITION('ä', U2) FROM T2;" \
+     "POSITION POSITION|3 1"
+echo "--- 13. TIMESTAMP +/- a number keeps the calendar's range (round 2)"
+pin  "13 + 1 past 9999-12-31 (it answered year 10000)" "SELECT TIMESTAMP '9999-12-31 23:00:00' + 1 $DUAL;" \
+     "ADD|$STAMPS"
+pin  "13 ...+ 0.05" "SELECT TIMESTAMP '9999-12-31 23:00:00' + 0.05 $DUAL;" \
+     "ADD|$STAMPS"
+pin  "13 ...- 1 before 0001-01-01" "SELECT TIMESTAMP '0001-01-01 01:00:00' - 1 $DUAL;" \
+     "SUBTRACT|$STAMPS"
+pin  "13 ...1 + TIMESTAMP" "SELECT 1 + TIMESTAMP '9999-12-31 23:00:00' $DUAL;" \
+     "ADD|$STAMPS"
+pin  "13 ...- (-1)" "SELECT TIMESTAMP '9999-12-31 23:00:00' - (-1) $DUAL;" \
+     "SUBTRACT|$STAMPS"
+pin  "13 more days than the calendar spans is valid DATES" "SELECT TIMESTAMP '2024-01-01 00:00:00' + 3652059 $DUAL;" \
+     "ADD|$DATES"
+pin  "13 ...a literal past INT64" "SELECT TIMESTAMP '2024-01-01 00:00:00' + 99999999999999999999999 $DUAL;" \
+     "ADD|$DATES"
+pin  "13 ...the span itself (and a half) is valid timestamps" "SELECT TIMESTAMP '2024-01-01 00:00:00' + 3652058.5 $DUAL;" \
+     "ADD|$STAMPS"
+pin  "13 ...- the span" "SELECT TIMESTAMP '2024-01-01 00:00:00' - 3652058 $DUAL;" \
+     "SUBTRACT|$STAMPS"
+pin  "13 CONTROL in-range fractions" "SELECT TIMESTAMP '9999-12-31 23:00:00' + 0.01, TIMESTAMP '9999-12-31 00:00:00' + 0.99999, $TS0 + 1.5 $DUAL;" \
+     "ADD ADD ADD|9999-12-31 23:14:24.0000 9999-12-31 23:59:59.1360 2024-01-02 12:00:00.0000"
+echo "--- 14. a DECFLOAT integer argument (round 2; all refused before)"
+pin  "14 LEFT(S, DF 2.5) rounds half up" "SELECT LEFT(S, DF), RIGHT(S, DF), RPAD(S, DF, '*') FROM T2;" \
+     "LEFT RIGHT RPAD|abc abc abc"
+pin  "14 DATEADD(DAY, DF)" "SELECT DATEADD(DAY, DF, D), DATEADD(MILLISECOND, DF, $TS0), DATEADD(MILLISECOND, CAST('0.25' AS DECFLOAT), $TS0) FROM T2;" \
+     "DATEADD DATEADD DATEADD|2024-01-04 2024-01-01 00:00:00.0025 2024-01-01 00:00:00.0003"
+pin  "14 SUBSTRING FROM / FOR" "SELECT SUBSTRING(S FROM CAST('0.5' AS DECFLOAT) FOR 2), SUBSTRING(S FROM CAST('1.5' AS DECFLOAT) FOR DF), POSITION('b', S, DF) FROM T2;" \
+     "SUBSTRING SUBSTRING POSITION|a bc 0"
+pin  "14 ROUND/TRUNC places" "SELECT ROUND(1.25, DF), TRUNC(1.25, DF) FROM T2;" \
+     "ROUND TRUNC|1.25 1.25"
+pin  "14 ...places 200 is the scale error" "SELECT ROUND(1.25, CAST('200' AS DECFLOAT)) FROM T2;" \
+     "ROUND|$EVAL|-The numeric scale must be between -128 and 127 in ROUND"
+pin  "14 -2.5 is -3, the length error" "SELECT LEFT(S, CAST(-2.5 AS DECFLOAT)) FROM T2;" \
+     "LEFT|Statement failed, SQLSTATE = 22011|Invalid length parameter -3 to SUBSTRING. Negative integers are not allowed."
+pin  "14 past INTEGER is the decimal invalid operation" "SELECT LEFT(S, CAST('1e10' AS DECFLOAT)) FROM T2;" \
+     "LEFT|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation."
+pin  "14 ...a NaN" "SELECT LEFT(S, CAST('NaN' AS DECFLOAT)) FROM T2;" \
+     "LEFT|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation."
+pin  "14 past INT64 through toInt64 is the FLOAT invalid operand" "SELECT DATEADD(DAY, CAST('1e20' AS DECFLOAT), D) FROM T2;" \
+     "DATEADD|Statement failed, SQLSTATE = 22000|Floating-point invalid operand. An indeterminant error occurred during a floating-point operation."
+pin  "14 ...but a NaN is the decimal one" "SELECT DATEADD(DAY, CAST('NaN' AS DECFLOAT), D) FROM T2;" \
+     "DATEADD|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation."
+pin  "14 ...in INT64, the day bound" "SELECT DATEADD(DAY, CAST('1e10' AS DECFLOAT), D) FROM T2;" \
+     "DATEADD|$DATES"
+pin  "14 BIN_SHL of a DECFLOAT count is the typed refusal" "SELECT BIN_SHL(1, DF) FROM T2;" \
+     "$EVAL|-Arguments for BIN_SHL must be integral types or NUMERIC/DECIMAL without scale"
+pin  "14 BIN_AND of a DECFLOAT (it was a bare Dynamic SQL Error)" "SELECT BIN_AND(CAST(1 AS DECFLOAT), 1) $DUAL;" \
+     "$EVAL|-Arguments for BIN_AND must be integral types or NUMERIC/DECIMAL without scale"
+pin  "14 ...of a DATE" "SELECT BIN_AND(DATE '2024-01-01', 1) $DUAL;" \
+     "$EVAL|-Arguments for BIN_AND must be integral types or NUMERIC/DECIMAL without scale"
+pin  "14 ...of a BOOLEAN" "SELECT BIN_AND(TRUE, 1) $DUAL;" \
+     "$EVAL|-Arguments for BIN_AND must be integral types or NUMERIC/DECIMAL without scale"
+echo "--- 15. RECORDED in round 2, not fixed"
+# an APPROXIMATE LITERAL length is read by the describe as 0: the engine
+# announces VARYING(0) and fails the move of a non-empty result (22001),
+# while an expression over it still sees the whole string (CHAR_LENGTH is
+# 5). This server has no zero-width text slot; it refuses the prepare, as
+# master did, rather than answer the padded string as round 1 did
+rec  "15 LPAD('ab', 5e0)" "SELECT LPAD('ab', 5e0) $DUAL;" \
+     "LPAD|Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 0, actual 5" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
+rec  "15 SUBSTRING FOR 2e0" "SELECT SUBSTRING('abcdef' FROM 1 FOR 2e0) $DUAL;" \
+     "SUBSTRING|Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 0, actual 2" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
+rec  "15 CHAR_LENGTH(LPAD('ab', 5e0))" "SELECT CHAR_LENGTH(LPAD('ab', 5e0)) $DUAL;" \
+     "CHAR_LENGTH|5" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
+# ROUND/TRUNC of a DECFLOAT OPERAND answers a DECFLOAT on the engine (with
+# its own cohort rules - ROUND(DF, -128) is 0E-128, TRUNC's power of ten
+# wraps); not implemented, still the clean refusal
+rec  "15 ROUND/TRUNC of a DECFLOAT" "SELECT ROUND(DF, 1), TRUNC(DF, 1) FROM T2;" \
+     "ROUND TRUNC|2.5 2.5" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
+rec  "15 TRUNC(DF, 128)" "SELECT TRUNC(DF, 128) FROM T2;" \
+     "TRUNC|$EVAL|-The numeric scale must be between -128 and 127 in TRUNC" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
+# LPAD/LEFT/REPLACE inside PSQL, and a function under HAVING or in an
+# IN (subquery), are refused by this server whatever the arguments - a
+# wider gap than the argument checks (the same on master)
+rec  "15 LPAD in a procedure" "SELECT * FROM PP('ab', 5);" \
+     "R|éééab" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
+rec  "15 RPAD under GROUP BY ... HAVING" "SELECT RPAD(S, 5, '*') AS X FROM T GROUP BY 1 HAVING RPAD(S, 5, '*') > '';" \
+     "X|abc**|xyz**" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
+rec  "15 LPAD in an IN (subquery)" "SELECT 1 FROM T WHERE '**abc' IN (SELECT LPAD(S, 5, '*') FROM T);" \
+     "CONSTANT|1|1" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
 echo "--- 7. RECORDED, not fixed"
 # the describe of a NEGATIVE constant pad length: the engine's makePad
 # computes 2 + fixLength(-1 * bpc) into a USHORT and announces VARYING(1);
@@ -305,5 +538,5 @@ if grep -aq 'panicked at' "/tmp/fc-serve-fnargs-$PORT.log"; then echo "FAIL the 
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 89 ]; then echo "FAIL only $ran checks ran (floor 89)"; fail=1; fi
+if [ "$ran" -lt 173 ]; then echo "FAIL only $ran checks ran (floor 173)"; fail=1; fi
 exit $fail
