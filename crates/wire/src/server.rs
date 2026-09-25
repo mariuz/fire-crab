@@ -41183,6 +41183,12 @@ fn resolve_join_predicate(
                 terms.push(resolve_expr_term(&rt, &comb_cols, &comb_descs, params)?);
                 continue;
             }
+            // a `?`'s own null test (the null-safe desugar's, [null_safe_ast])
+            // reads no column
+            if let (RawLhs::Param(slot), RawKind::IsNull | RawKind::IsNotNull, true) = (&rt.lhs, &rt.kind, rt.mirrored) {
+                terms.push(resolve_param_lhs(*slot, &rt.kind, rt.mirrored, params)?);
+                continue;
+            }
             let RawLhs::Col(col) = &rt.lhs else {
                 return None;
             };
@@ -61436,6 +61442,10 @@ const GDS_DSQL_DERIVED_FIELD_UNNAMED: i32 = 336397220;
 /// When no member is reachable from the main query the engine names
 /// the LAST-DECLARED member of the cycle (`P,Q` -> Q; `Q,P` -> P).
 const GDS_DSQL_CTE_CYCLE: i32 = 336397226;
+/// `isc_invalid_boolean_usage` - "Invalid usage of boolean expression"
+/// (22000): a non-BOOLEAN value where a predicate is required - `WHERE
+/// S`, `S IS TRUE` over a VARCHAR ([RawExpr::BareTrue])
+const GDS_INVALID_BOOLEAN_USAGE: i32 = 335545023;
 /// `isc_dsql_cte_not_a_union` - "Recursive CTE (@1) must be an UNION".
 /// `WITH RECURSIVE X AS (<body naming X>)` whose body is NOT a union:
 /// @1 is BARE, the template supplies the parentheses (sqlerr.h:180).
@@ -62089,6 +62099,19 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(GDS_DSQL_CTE_NOT_A_UNION)
                 .int(2) // isc_arg_string - @1 BARE: the template parenthesises it
                 .bytes(name.as_bytes());
+        }
+        // three lines, as the CTE vectors: "Dynamic SQL Error", "SQL
+        // error code = -104", "Invalid usage of boolean expression"
+        // (measured on `WHERE S` and `S IS TRUE` over a VARCHAR)
+        EvalErr::InvalidBooleanUsage => {
+            w.int(1)
+                .int(GDS_DSQL_ERROR)
+                .int(1)
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1)
+                .int(GDS_INVALID_BOOLEAN_USAGE);
         }
         EvalErr::CteMissNonRecursive(name) => {
             w.int(1)
@@ -70361,6 +70384,15 @@ fn resolve_null_test_operand(a: &RawExpr, columns: &[RelationColumn], descs: &[D
     resolve_expr(a, columns, descs)
 }
 
+/// A [RawExpr::BareTrue] side that is not BOOLEAN: the engine's prepare-time
+/// 22000 ([EvalErr::InvalidBooleanUsage]), posted only when the side's type
+/// is KNOWN - an untyped side (a NULL) keeps the generic refusal.
+fn bare_true_refusal(side: &Expr, descs: &[Descriptor]) {
+    if side.type_of(descs).is_some() {
+        PREPARE_REFUSAL.with(|r| *r.borrow_mut() = Some(EvalErr::InvalidBooleanUsage));
+    }
+}
+
 fn resolve_raw_cond(
     c: &RawCond,
     columns: &[RelationColumn],
@@ -70380,7 +70412,10 @@ fn resolve_raw_cond(
             // side takes it - the engine refuses `CASE WHEN NAME` at
             // prepare, where the explicit `NAME = TRUE` coerces per row
             let rb = if matches!(**b, RawExpr::BareTrue) {
-                if !matches!(l.type_of(descs), Some(ExprType::Bool)) {
+                // a NULL side is UNKNOWN whatever it is compared with: the
+                // engine answers `NULL IS TRUE` (no row), it does not raise
+                if !matches!(l, Expr::Null) && !matches!(l.type_of(descs), Some(ExprType::Bool)) {
+                    bare_true_refusal(&l, descs);
                     return None;
                 }
                 Expr::Bool(true)
@@ -72069,6 +72104,36 @@ fn coalesce_arg_raises(a: &RawExpr) -> bool {
 /// 2` with -804 exactly as it refuses the uncompared `SELECT ID * ?`.
 /// NOT [untyped_param], which counts a Func/Iif/Case with a `?` as
 /// untyped.
+/// The one `?` whose NULL-ness an expression side has exactly: a bare
+/// `?` under unary minus, parentheses, `+ - *` or `||` with a non-NULL
+/// LITERAL as the only other operand (`(?)`, `-?`, `? + 1`, `? || 'x'`).
+/// Division is left out - a zero divisor raises rather than answering
+/// NULL, and the proxy would skip that raise.
+fn raw_param_null_proxy(e: &RawExpr) -> Option<usize> {
+    let lit = |x: &RawExpr| {
+        matches!(
+            x,
+            RawExpr::Int(_) | RawExpr::Int128(_) | RawExpr::DecFloat34(_) | RawExpr::Dec(..)
+                | RawExpr::Double(_) | RawExpr::Str(_)
+        )
+    };
+    match e {
+        RawExpr::Param(s) => Some(*s),
+        RawExpr::Neg(a) => raw_param_null_proxy(a),
+        RawExpr::Bin(_, ArithOp::Div, _) => None,
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) => {
+            if lit(b) {
+                raw_param_null_proxy(a)
+            } else if lit(a) {
+                raw_param_null_proxy(b)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn raw_bare_cmp_param(e: &RawExpr) -> bool {
     match e {
         RawExpr::Param(_) => true,
@@ -75724,6 +75789,10 @@ enum EvalErr {
     /// a recursive body that IS a union but whose FIRST member already
     /// names the CTE - no anchor ([GDS_DSQL_CTE_MISS_NONRECURSIVE]).
     CteMissNonRecursive(String),
+    /// a non-BOOLEAN value used as a predicate - `WHERE S`, `S IS TRUE`,
+    /// `I IS NOT FALSE` - which the engine refuses AT PREPARE
+    /// ([GDS_INVALID_BOOLEAN_USAGE] under the -104 wrapper, measured)
+    InvalidBooleanUsage,
 }
 
 /// What an expression's result is typed as - which drives its wire form
@@ -90921,7 +90990,10 @@ struct RawTerm {
     /// is none, one `Cmp::Le` term either way.  True means the `?` was
     /// written FIRST; only [parse_leaf]'s mirror sets it, and
     /// [negate_term] and the LHS rewrites carry it along.  Read by
-    /// [nan_cmp_verdict] and nothing else.
+    /// [nan_cmp_verdict] and nothing else - except on a [RawLhs::Param]
+    /// null test, which has no comparison to mirror: there it is set by
+    /// [null_safe_ast] and means the slot is typed by the comparison
+    /// beside it ([resolve_param_lhs]).
     mirrored: bool,
     /// `Some(width)` when this leaf came from a MULTI-ELEMENT IN-LIST,
     /// carrying the width the engine pads that list's elements to.
@@ -91467,6 +91539,40 @@ fn mirror_cmp(op: Cmp) -> Cmp {
     }
 }
 
+/// The null-safe comparison built from three-valued leaves, with every
+/// `=` / `<>` fenced by IS NOT NULL on both sides so the whole can never
+/// be UNKNOWN - under NOT (pushed into the leaves by De Morgan) it then
+/// stays exact. `b` is the right side's own null test, `None` when it is
+/// a value that cannot be NULL; `cmp` builds the `a op b` leaf.
+///
+///   A IS NOT DISTINCT FROM B == (A IS NULL AND B IS NULL)
+///                               OR (A, B NOT NULL AND A = B)
+///   A IS DISTINCT FROM B     == exactly one is NULL, or neither and A <> B
+fn null_safe_ast(not: bool, a: &RawLhs, b: Option<&RawLhs>, cmp: &dyn Fn(Cmp) -> Ast) -> Ast {
+    // a `?`'s own null test is marked `mirrored` - on a [RawLhs::Param]
+    // leaf the flag says "this slot is typed by the comparison beside me"
+    // ([resolve_param_lhs])
+    let l = |lhs: &RawLhs, kind: RawKind| {
+        let mirrored = matches!(lhs, RawLhs::Param(_));
+        Ast::Leaf(RawTerm { lhs: lhs.clone(), kind, mirrored, in_list: None })
+    };
+    match (not, b) {
+        (true, Some(b)) => Ast::Or(vec![
+            Ast::And(vec![l(a, RawKind::IsNull), l(b, RawKind::IsNull)]),
+            Ast::And(vec![l(a, RawKind::IsNotNull), l(b, RawKind::IsNotNull), cmp(Cmp::Eq)]),
+        ]),
+        (false, Some(b)) => Ast::Or(vec![
+            Ast::And(vec![l(a, RawKind::IsNull), l(b, RawKind::IsNotNull)]),
+            Ast::And(vec![l(a, RawKind::IsNotNull), l(b, RawKind::IsNull)]),
+            Ast::And(vec![l(a, RawKind::IsNotNull), l(b, RawKind::IsNotNull), cmp(Cmp::Ne)]),
+        ]),
+        // the right side is a value that is not NULL
+        (true, None) => Ast::And(vec![l(a, RawKind::IsNotNull), cmp(Cmp::Eq)]),
+        // already two-valued: a NULL A is TRUE, else `A <> v` is
+        (false, None) => Ast::Or(vec![l(a, RawKind::IsNull), cmp(Cmp::Ne)]),
+    }
+}
+
 fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
     // A `?` ON THE LEFT - `WHERE ? < SALARY`. The engine describes the
     // parameter from the OTHER side whichever way round it is written,
@@ -91529,8 +91635,45 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         in_list: None,
                     }));
                 }
-                // `? IS TRUE/FALSE/DISTINCT FROM` with a param left
-                // side: unprobed - refuse
+                // `? IS [NOT] DISTINCT FROM X` - the parameter-first
+                // spelling of `X IS [NOT] DISTINCT FROM ?`, which the
+                // engine answers (measured: ['1'] counts 1 and its NOT 4
+                // over 5 rows; this refused both). Read from X's side as
+                // `? = X` is, so the slot describes as X; the `?`'s own
+                // null test sits beside it ([null_safe_ast]). A `?` in X,
+                // or a NULL X, stays refused - unprobed.
+                let is_word = |i: usize, w: &str| {
+                    matches!(t.get(i), Some(Tok::Ident(x)) if x.eq_ignore_ascii_case(w))
+                };
+                if is_word(p3, "DISTINCT") && is_word(p3 + 1, "FROM") {
+                    let mut p4 = p3 + 2;
+                    let other = texpr(t, &mut p4, &mut np2)?;
+                    if raw_has_param(&other)
+                        || matches!(&other, RawExpr::Null)
+                        || matches!(&other, RawExpr::Cast(inner, _) if matches!(**inner, RawExpr::Null))
+                    {
+                        return None;
+                    }
+                    let a = match other {
+                        RawExpr::Col(c) => RawLhs::Col(c),
+                        e => RawLhs::Expr(e),
+                    };
+                    let cmp = |op: Cmp| {
+                        Ast::Leaf(RawTerm {
+                            lhs: a.clone(),
+                            kind: RawKind::Cmp(op, param.clone()),
+                            // the `?` was written first ([RawTerm::mirrored]);
+                            // `=` and `<>` mirror to themselves
+                            mirrored: true,
+                            in_list: None,
+                        })
+                    };
+                    *pos = p4;
+                    *np = np2;
+                    return Some(null_safe_ast(not, &a, Some(&RawLhs::Param(slot)), &cmp));
+                }
+                // `? IS TRUE/FALSE` with a param left side: unprobed -
+                // refuse
                 return None;
             }
             // an optional NOT before LIKE/BETWEEN/IN/STARTING, the
@@ -91922,9 +92065,10 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                 // evaluation, refusal) sees shapes it already knows.
                 //
                 //   A IS NOT DISTINCT FROM NULL  ==  A IS NULL
-                //   A IS NOT DISTINCT FROM v     ==  A = v          (v not null)
+                //   A IS NOT DISTINCT FROM v     ==  A IS NOT NULL AND A = v   (v not null)
                 //   A IS DISTINCT FROM v         ==  A IS NULL OR A <> v
-                //   A IS NOT DISTINCT FROM B     ==  A = B OR (A IS NULL AND B IS NULL)
+                //   A IS NOT DISTINCT FROM B     ==  (A IS NULL AND B IS NULL)
+                //                                    OR (A, B NOT NULL AND A = B)
                 //
                 // The third line is the one worth stating: `NOT (A = v)`
                 // is NOT the same predicate, because a NULL A makes the
@@ -91939,10 +92083,6 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         leaf(RawKind::IsNotNull)
                     });
                 }
-                let rhs_lhs: Option<RawLhs> = match t.get(*pos) {
-                    Some(Tok::Ident(name)) => Some(RawLhs::Col(name.clone())),
-                    _ => None,
-                };
                 let side = parse_side(t, pos, np)?;
                 // ...AND A PARENTHESISED OR CAST NULL IS STILL NULL. Only a
                 // BARE `Tok::Null` was recognised above, so `A IS DISTINCT
@@ -91983,32 +92123,56 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         }),
                     }
                 };
-                return Some(match (not, rhs_lhs) {
-                    // both sides are columns: the NULL-NULL case is real
-                    (true, Some(rl)) => Ast::Or(vec![
-                        cmp_leaf(Cmp::Eq),
-                        Ast::And(vec![
-                            leaf(RawKind::IsNull),
-                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull, mirrored: false, in_list: None }),
-                        ]),
-                    ]),
-                    (false, Some(rl)) => Ast::Or(vec![
-                        cmp_leaf(Cmp::Ne),
-                        Ast::And(vec![
-                            leaf(RawKind::IsNull),
-                            Ast::Leaf(RawTerm { lhs: rl.clone(), kind: RawKind::IsNotNull, mirrored: false, in_list: None }),
-                        ]),
-                        Ast::And(vec![
-                            leaf(RawKind::IsNotNull),
-                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull, mirrored: false, in_list: None }),
-                        ]),
-                    ]),
-                    // the right side is a value that is not NULL
-                    (true, None) => cmp_leaf(Cmp::Eq),
-                    (false, None) => {
-                        Ast::Or(vec![leaf(RawKind::IsNull), cmp_leaf(Cmp::Ne)])
+                // THE RIGHT SIDE'S OWN NULL TEST. A null-safe comparison is
+                // TWO-valued - it never answers UNKNOWN - and the leaves it
+                // desugars into are three-valued, so every UNKNOWN they can
+                // produce must be fenced off by an explicit IS [NOT] NULL on
+                // BOTH sides. Two ways this went wrong before, both measured
+                // (m: (1,i=1,bo=TRUE), (2,NULL,NULL)):
+                //  - only a BARE COLUMN on the right was tested for NULL, so a
+                //    right side that is NULL at run time - `NULLIF(1, 1)`, a
+                //    scalar subquery with no row, `NULLIF(Y.ID, Y.ID)` in a
+                //    JOIN ON, `UPPER(S)` over a NULL S - was assumed never
+                //    NULL: `I IS DISTINCT FROM NULLIF(1, 1)` returned {2}
+                //    where the engine returns {1}, and `I IS NOT DISTINCT
+                //    FROM NULLIF(1, 1)` nothing where the engine returns {2}.
+                //  - `A = v` alone is UNKNOWN on a NULL A, so an outer NOT
+                //    kept it UNKNOWN: `NOT (I IS NOT DISTINCT FROM 1)`
+                //    returned nothing where the engine returns {2}; the
+                //    column forms `NOT (I IS [NOT] DISTINCT FROM J)` lost the
+                //    same rows.
+                // So `A = B` stands only beside `A IS NOT NULL AND B IS NOT
+                // NULL`, which also keeps it a usable equality for the index
+                // matcher in the literal case. A literal is never NULL (the
+                // NULL spellings were answered above).
+                //
+                // A `?` IS A NULLABLE SIDE TOO - the commonest use of the
+                // predicate is an application binding NULL to `C IS NOT
+                // DISTINCT FROM ?`. Read as never NULL it answered wrong
+                // (measured, 5 rows, I NULL on two: `I IS NOT DISTINCT FROM
+                // ?` [NULL] counted 0 where the engine counts 2, `I IS
+                // DISTINCT FROM ?` [NULL] 2 where it counts 3), and so did
+                // an expression holding one - `CAST(? AS INTEGER) + SI`
+                // ['0'] is NULL on a NULL-SI row. A bare `?` takes the
+                // row-independent `? IS NULL` test ([Term::ParamIsNull],
+                // decided at bind; its slot is typed by the comparison
+                // beside it, see [resolve_param_lhs]); an expression with a
+                // `?` takes the ordinary expression null test, which types
+                // its slot exactly as the comparison does, or refuses.
+                let rhs_nullable: Option<RawLhs> = match &side {
+                    Side::Val(Rhs::Param(slot, ..)) => Some(RawLhs::Param(*slot)),
+                    Side::Val(_) => None,
+                    // `(?)`, `-?`, `? + 1`, `? || 'x'`: NULL exactly when the
+                    // `?` is, and the expression null test cannot type a bare
+                    // `?` on its own (it refused, where the previous binary
+                    // answered a non-NULL bind right)
+                    Side::Expr(e) if raw_param_null_proxy(e).is_some() => {
+                        raw_param_null_proxy(e).map(RawLhs::Param)
                     }
-                });
+                    Side::Expr(RawExpr::Col(c)) => Some(RawLhs::Col(c.clone())),
+                    Side::Expr(e) => Some(RawLhs::Expr(e.clone())),
+                };
+                return Some(null_safe_ast(not, &lhs, rhs_nullable.as_ref(), &cmp_leaf));
             }
             match (t.get(*pos), t.get(*pos + 1)) {
                 // IS UNKNOWN lexes as IS NULL - the same predicate
@@ -92021,22 +92185,40 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     Some(leaf(RawKind::IsNotNull))
                 }
                 // `IS TRUE` / `IS FALSE` are TWO-valued: a NULL is
-                // simply not true, so they desugar to `=`. Their
-                // negations are NOT the negated comparison - `B IS NOT
-                // TRUE` RETURNS the NULL rows (probed) where `NOT (B =
-                // TRUE)` drops them, so it desugars to the explicit OR,
-                // exactly as IS DISTINCT FROM does.
+                // simply not true. Their negations are NOT the negated
+                // comparison - `B IS NOT TRUE` RETURNS the NULL rows
+                // (probed) where `NOT (B = TRUE)` drops them, so it
+                // desugars to the explicit OR, exactly as IS DISTINCT
+                // FROM does. And the positive form is not a bare `B =
+                // TRUE` either: NOT is pushed into the leaves, so `NOT (B
+                // IS TRUE)` became `B <> TRUE` and dropped the NULL rows
+                // (measured: the engine returns them). The `B IS NOT NULL`
+                // conjunct keeps it two-valued under any NOT.
+                //
+                // ONLY A BOOLEAN IS TESTED. The engine raises 22000 "Invalid
+                // usage of boolean expression" AT PREPARE for `S IS TRUE`
+                // over a VARCHAR and `I IS FALSE` over an INTEGER (measured,
+                // every polarity, under NOT too), where the explicit `S =
+                // TRUE` this desugared into coerces the text per row - it
+                // printed the header and raised 22018 from the 'a' row. So
+                // the comparison is against the BARE marker
+                // ([RawExpr::BareTrue]), whose resolution admits a BOOLEAN
+                // side only: a non-null B is FALSE exactly when `B <>
+                // TRUE`, so the four forms need no second marker.
                 (Some(Tok::FnExpr(RawExpr::Bool(b))), _) => {
-                    let b = *b;
+                    let op = if *b { Cmp::Eq } else { Cmp::Ne };
                     *pos += 1;
-                    Some(leaf(RawKind::CmpExpr(Cmp::Eq, RawExpr::Bool(b))))
+                    Some(Ast::And(vec![
+                        leaf(RawKind::IsNotNull),
+                        leaf(RawKind::CmpExpr(op, RawExpr::BareTrue)),
+                    ]))
                 }
                 (Some(Tok::Not), Some(Tok::FnExpr(RawExpr::Bool(b)))) => {
-                    let b = *b;
+                    let op = if *b { Cmp::Ne } else { Cmp::Eq };
                     *pos += 2;
                     Some(Ast::Or(vec![
                         leaf(RawKind::IsNull),
-                        leaf(RawKind::CmpExpr(Cmp::Ne, RawExpr::Bool(b))),
+                        leaf(RawKind::CmpExpr(op, RawExpr::BareTrue)),
                     ]))
                 }
                 _ => None,
@@ -100458,7 +100640,7 @@ fn resolve_predicate(
             // a `?` as the TESTED side - `? IS NULL`, `? LIKE ...`,
             // `? STARTING WITH ...` - resolves without any column
             if let RawLhs::Param(slot) = &rt.lhs {
-                terms.push(resolve_param_lhs(*slot, &rt.kind, params)?);
+                terms.push(resolve_param_lhs(*slot, &rt.kind, rt.mirrored, params)?);
                 continue;
             }
             // an EXPRESSION on either side takes the expression-predicate
@@ -100581,14 +100763,9 @@ fn resolve_predicate(
 fn resolve_param_lhs(
     slot: usize,
     kind: &RawKind,
+    sibling_typed: bool,
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
-    let mut claim = |slot: usize, d: Descriptor| {
-        if params.len() <= slot {
-            params.resize(slot + 1, None);
-        }
-        params[slot] = Some(d);
-    };
     // the tested `?` of a `? LIKE/STARTING <pattern>` describes as the
     // PATTERN's own width (probed): a literal pattern its char length
     // (`'abc%'` is 4, `'x'` is 1), a NULL pattern a bare 1, a parameter
@@ -100635,15 +100812,33 @@ fn resolve_param_lhs(
         flags: 0,
         offset: 0,
     };
+    // ...but not a slot a COMPARISON TYPES. The null-safe desugar
+    // ([null_safe_ast]) sets a `? IS [NOT] NULL` beside the comparison the
+    // same `?` is an operand of (`I IS NOT DISTINCT FROM ?`), and there the
+    // engine describes the slot from the comparison's other side - I's
+    // LONG, not SQL_NULL. That test claims nothing: a SQL_NULL claim made
+    // first would conflict with the comparison's ([claim_param_slot]
+    // refuses a second, different claim - `I IS NOT DISTINCT FROM (?)`
+    // refused that way).
+    let null_claim = |params: &mut Vec<Option<Descriptor>>| {
+        if !sibling_typed {
+            if params.len() <= slot {
+                params.resize(slot + 1, None);
+            }
+            params[slot] = Some(null_desc());
+        }
+    };
+    if matches!(kind, RawKind::IsNull | RawKind::IsNotNull) {
+        null_claim(params);
+        return Some(Term::ParamIsNull(slot, matches!(kind, RawKind::IsNotNull)));
+    }
+    let mut claim = |slot: usize, d: Descriptor| {
+        if params.len() <= slot {
+            params.resize(slot + 1, None);
+        }
+        params[slot] = Some(d);
+    };
     Some(match kind {
-        RawKind::IsNull => {
-            claim(slot, null_desc());
-            Term::ParamIsNull(slot, false)
-        }
-        RawKind::IsNotNull => {
-            claim(slot, null_desc());
-            Term::ParamIsNull(slot, true)
-        }
         RawKind::Like(pattern, escape, negated) => {
             match pattern {
                 Rhs::Str(p) => {
@@ -101057,7 +101252,10 @@ fn resolve_expr_term(
             // built (round 11: a failed attempt leaves no flag behind)
             let mut cmp_new = false;
             let rhs = if matches!(e, RawExpr::BareTrue) {
-                if !matches!(lhs.type_of(descs), Some(ExprType::Bool)) {
+                // a NULL side is UNKNOWN whatever it is compared with: the
+                // engine answers `NULL IS TRUE` (no row), it does not raise
+                if !matches!(lhs, Expr::Null) && !matches!(lhs.type_of(descs), Some(ExprType::Bool)) {
+                    bare_true_refusal(&lhs, descs);
                     return None;
                 }
                 Expr::Bool(true)
@@ -103330,6 +103528,15 @@ fn resolve_having(
                 terms.push(Term::Const(b));
                 continue;
             }
+            // a `?`'s own null test - the null-safe desugar's sibling of
+            // `MAX(V) IS NOT DISTINCT FROM ?` ([null_safe_ast]) - is
+            // row-independent, decided at bind, so the group row has
+            // nothing to add to it. (A written `HAVING ? IS NULL` is not
+            // this and still refuses - unprobed here.)
+            if let (RawLhs::Param(slot), RawKind::IsNull | RawKind::IsNotNull, true) = (&rt.lhs, &rt.kind, rt.mirrored) {
+                terms.push(resolve_param_lhs(*slot, &rt.kind, rt.mirrored, params)?);
+                continue;
+            }
             // DOES THIS KIND CARRY A RIGHT-SIDE EXPRESSION? Exactly four
             // variants do, and every one of them refused in HAVING until
             // this slice: the right side had to be a LITERAL. Measured on
@@ -103379,6 +103586,26 @@ fn resolve_having(
                     mirrored: rt.mirrored,
                     in_list: rt.in_list,
                 }),
+                // ...and the NULL TEST of a group key the keyed path has no
+                // kind for (a BOOLEAN, a temporal, a scaled NUMERIC): the
+                // null-safe desugars put one beside every comparison, so
+                // `HAVING B1 IS FALSE` (`B1 IS NOT NULL AND B1 <> TRUE`)
+                // refused where the previous binary answered it, and `HAVING
+                // B1 IS NOT TRUE` refused on both (measured; the engine
+                // answers both)
+                RawLhs::Col(c)
+                    if matches!(rt.kind, RawKind::IsNull | RawKind::IsNotNull)
+                        && find_col(columns, c)
+                            .and_then(|rc| descs.get(rc.field_id as usize))
+                            .is_some_and(|d| col_kind(d).is_none()) =>
+                {
+                    Some(RawTerm {
+                        lhs: RawLhs::Expr(RawExpr::Col(c.clone())),
+                        kind: rt.kind.clone(),
+                        mirrored: rt.mirrored,
+                        in_list: rt.in_list,
+                    })
+                }
                 _ => None,
             };
             let rt = lifted.unwrap_or(rt);
@@ -103402,7 +103629,16 @@ fn resolve_having(
                 // ... or a `?` in it: `HAVING COALESCE(?, 0) > 0` has no
                 // aggregate and a literal right side, and the ExprCond
                 // path below is the one that types a parameter
-                if raw_has_agg(raw_e) || rhs_e.is_some() || raw_has_param(raw_e) {
+                // ... or it is a NULL TEST of an expression: the null-safe
+                // desugar ([null_safe_ast]) tests the right side of
+                // `MAX(V) IS DISTINCT FROM K * 2` on its own, and with no
+                // aggregate in `K * 2` nor a right side it fell through to
+                // the refusal below - `1 + 4`, `CAST(5 AS INTEGER)`, `K *
+                // 2` and `COALESCE(K, 0) + 1` all refused (measured; the
+                // engine answers every one). Over the group-row view a
+                // group key resolves and any other column refuses.
+                let null_test = matches!(rt.kind, RawKind::IsNull | RawKind::IsNotNull);
+                if raw_has_agg(raw_e) || rhs_e.is_some() || raw_has_param(raw_e) || null_test {
                     let mut aggs = collect_aggs(raw_e);
                     if let Some(r) = rhs_e {
                         for a in collect_aggs(r) {
@@ -115074,6 +115310,44 @@ mod tests {
         // multi-byte: `_` is one CHARACTER
         assert!(like_match("héllo", "h_llo", None));
         assert!(like_match("héllo", "h%o", None));
+    }
+
+    #[test]
+    fn null_safe_param_side_gets_its_own_null_test() {
+        let dnf = |s: &str| {
+            let mut np = 0;
+            let d = parse_predicate(&tokenize(s).unwrap(), &mut np).unwrap();
+            (d.0, np)
+        };
+        let param_tests = |g: &[RawTerm]| {
+            g.iter()
+                .filter(|t| matches!(t.lhs, RawLhs::Param(0)))
+                .map(|t| (matches!(t.kind, RawKind::IsNull), t.mirrored))
+                .collect::<Vec<_>>()
+        };
+        // `I IS NOT DISTINCT FROM ?`: (I NULL AND ? NULL) OR (both not
+        // NULL AND I = ?) - the `?`'s tests are marked sibling-typed
+        for q in ["I IS NOT DISTINCT FROM ?", "I IS NOT DISTINCT FROM (?)", "I IS NOT DISTINCT FROM ? + 1", "? IS NOT DISTINCT FROM I"] {
+            let (d, np) = dnf(q);
+            assert_eq!(np, 1, "{q}");
+            assert_eq!(d.len(), 2, "{q}");
+            assert_eq!(param_tests(&d[0]), vec![(true, true)], "{q}");
+            assert_eq!(param_tests(&d[1]), vec![(false, true)], "{q}");
+        }
+        // a written `? IS NULL` is not sibling-typed: it claims SQL_NULL
+        let (d, _) = dnf("? IS NULL");
+        assert_eq!(param_tests(&d[0]), vec![(true, false)]);
+        // a `?` divided is not a null proxy: its expression side is tested
+        let (d, _) = dnf("I IS NOT DISTINCT FROM ? / 2");
+        assert!(d.iter().all(|g| param_tests(g).is_empty()));
+        // IS TRUE / FALSE compare against the BOOLEAN-only marker
+        for q in ["S IS TRUE", "S IS FALSE", "S IS NOT TRUE", "S IS NOT FALSE"] {
+            let (d, _) = dnf(q);
+            assert!(
+                d.iter().flatten().any(|t| matches!(t.kind, RawKind::CmpExpr(_, RawExpr::BareTrue))),
+                "{q}"
+            );
+        }
     }
 
     #[test]
