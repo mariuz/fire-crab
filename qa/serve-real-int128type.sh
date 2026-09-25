@@ -129,13 +129,14 @@ pin  "2 a column into INT128" "SELECT ID, CAST(N AS INT128), CAST(V AS INT128) F
 pin  "2 in WHERE" "SELECT ID FROM T WHERE CAST(V AS INT128) > 1000 ORDER BY ID;" "ID|1"
 pin  "2 against the INT128 column" "SELECT ID FROM T WHERE I = CAST('170141183460469231731687303715884105727' AS INT128);" "ID|1"
 pin  "2 INSERT ... CAST, read back" "INSERT INTO T (ID, I) VALUES (9, CAST('-9999999999' AS INT128)); SELECT I FROM T WHERE ID = 9; ROLLBACK;" "I|-9999999999"
-# RECORDED: an INSERT whose value is a CAST to a 16-byte exact PAST the
-# i64 range refuses (NUMERIC(38,0) as well, before this round too) - the
-# DML value path carries no 128-bit wire value; the engine stores it
-ran=$((ran + 1))
-fv=$(sess "127.0.0.1/$PORT:$FC" "INSERT INTO T (ID, I) VALUES (9, CAST('-99999999999999999999' AS INT128)); ROLLBACK;")
-case "$fv" in *"SQLSTATE"*) echo "OK   2 recorded: an over-i64 INT128 CAST as an INSERT value refuses here (the engine stores it)";;
-    *) echo "FAIL 2 the over-i64 INSERT answered [$fv] - promote the cell"; fail=1;; esac
+# ...PAST the i64 range: the DML value path had no 128-bit wire value and
+# refused (NUMERIC(38,0) too); WireParam::Int128 carries it now
+pin  "2 INSERT an over-i64 INT128 value (it refused)" "INSERT INTO T (ID, I) VALUES (9, CAST('-99999999999999999999' AS INT128)); SELECT I FROM T WHERE ID = 9; ROLLBACK;" "I|-99999999999999999999"
+pin  "2 ...and an over-i64 NUMERIC(38,0)" "INSERT INTO T (ID, N) VALUES (9, CAST('99999999999999999999' AS NUMERIC(38,0))); SELECT N FROM T WHERE ID = 9; ROLLBACK;" "N|99999999999999999999"
+pin  "2 UPDATE past i64, arithmetic on the column" "UPDATE T SET I = CAST(N AS INT128) * 100000000000000000000 WHERE ID = 1; SELECT I FROM T WHERE ID = 1; ROLLBACK;" "I|500000000000000000000"
+pin  "2 INSERT ... SELECT, MERGE and UPDATE OR INSERT carry it" \
+     "INSERT INTO T (ID, I) SELECT 10, I - 1 FROM T WHERE ID = 1; MERGE INTO T USING RDB\$DATABASE ON T.ID = 11 WHEN NOT MATCHED THEN INSERT (ID, I) VALUES (11, CAST('-77777777777777777777' AS INT128)); UPDATE OR INSERT INTO T (ID, I) VALUES (12, CAST('88888888888888888888' AS INT128)) MATCHING (ID); SELECT ID, I FROM T WHERE ID > 9 ORDER BY ID; ROLLBACK;" \
+     "ID I|10 170141183460469231731687303715884105726|11 -77777777777777777777|12 88888888888888888888"
 pin  "2 NULL rows" "SELECT CAST(N AS INT128) FROM T WHERE ID = 3;" "CAST|<null>"
 
 echo "--- 3. A NON-NUMERIC SOURCE CAST TO A NUMBER: 22018 on its text (bare errors before)"
@@ -161,11 +162,28 @@ pin  "4 an exponent spelling" "SELECT CAST('1.5e40' AS NUMERIC(38,0)) $DUAL;" "C
 pin  "4 CONTROL BIGINT and INTEGER were right already" "SELECT CAST('9223372036854775808' AS BIGINT) $DUAL;" "CAST|$E22003"
 pin  "4 CONTROL a bad spelling is still 22018" "SELECT CAST('12x' AS NUMERIC(38,0)) $DUAL;" "CAST|$(conv 12x)"
 
+echo "--- 5. AN INT128 THAT DOES NOT FIT: which overflow the engine names"
+# The engine narrows an INT128 through its 32/64-bit conversion, which
+# raises the PREFIXED integer overflow ("arithmetic exception ... /
+# -Integer overflow"); a SMALLINT target takes the 32-bit value and then
+# its own range check.  An INT64 source narrowed is "numeric value is out
+# of range", and an overflow INSIDE INT64 arithmetic the bare message.
+# This server answered a bare refusal or the wrong one of the three.
+IOV='arithmetic exception, numeric overflow, or string truncation|-Integer overflow. The result of an integer operation caused the most significant bit of the result to carry.'
+OOR='arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range'
+same "5 a 20-digit NUMERIC(38,0) into BIGINT (INSERT and UPDATE)" \
+     "CREATE TABLE T2 (S SMALLINT, N INTEGER, B BIGINT); COMMIT; INSERT INTO T2 (B) VALUES (CAST('99999999999999999999' AS NUMERIC(38,0))); UPDATE T2 SET B = CAST('99999999999999999999' AS NUMERIC(38,0)); ROLLBACK; DROP TABLE T2; COMMIT;"
+pin  "5 INT128 arithmetic into INTEGER is integer overflow" "UPDATE T SET ID = CAST(ID AS BIGINT) * 10000000000 WHERE ID = 1; ROLLBACK;" "Statement failed, SQLSTATE = 22003|$IOV"
+pin  "5 ...a BIGINT narrowed into INTEGER is out of range" "UPDATE T SET ID = CAST(5000000000 AS BIGINT) WHERE ID = 1; ROLLBACK;" "Statement failed, SQLSTATE = 22003|$OOR"
+pin  "5 INT128 overflow in arithmetic is prefixed" "SELECT CAST('170141183460469231731687303715884105727' AS INT128) + 1 $DUAL;" "ADD|Statement failed, SQLSTATE = 22003|$IOV"
+pin  "5 ...negating its minimum too (folded: raised at prepare)" "SELECT -CAST('-170141183460469231731687303715884105728' AS INT128) $DUAL;" "Statement failed, SQLSTATE = 22003|$IOV"
+pin  "5 CONTROL an INT64 overflow is bare" "SELECT CAST(9223372036854775807 AS BIGINT) + 1 $DUAL;" "ADD|Statement failed, SQLSTATE = 22003|Integer overflow. The result of an integer operation caused the most significant bit of the result to carry."
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-int128type-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 39 ]; then echo "FAIL only $ran checks ran (floor 39)"; fail=1; fi
+if [ "$ran" -lt 48 ]; then echo "FAIL only $ran checks ran (floor 48)"; fail=1; fi
 exit $fail

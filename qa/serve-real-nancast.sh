@@ -70,7 +70,8 @@ store NUMERIC(9,2)|UPDATE W SET N92 = ? WHERE ID = 1|1|ok
 store NUMERIC(18,4)|UPDATE W SET N184 = ? WHERE ID = 1|1|ok
 store NUMERIC(4,2)|UPDATE W SET N42 = ? WHERE ID = 1|1|ERR 22003
 store DOUBLE|UPDATE W SET DP = ? WHERE ID = 1|1|ok
-read back the stores|SELECT SM, N, BI, N92, N184, N42 FROM W|0|[{"SM":null,"N":-2147483648,"BI":-9223372036854776000,"N92":-21474836.48,"N184":-922337203685477.6,"N42":null}]
+store NUMERIC(38,2) - the INT128 indefinite (it refused: no 128-bit wire value)|UPDATE W SET N382 = ? WHERE ID = 1|1|ok
+read back the stores|SELECT SM, N, BI, N92, N184, N42, N382 FROM W|0|[{"SM":null,"N":-2147483648,"BI":-9223372036854776000,"N92":-21474836.48,"N184":-922337203685477.6,"N42":null,"N382":"-1701411834208551504653317628801098711.04"}]
 CAST(? AS SMALLINT)|SELECT CAST(? AS SMALLINT) AS X FROM RDB$DATABASE|1|ERR 22003
 CAST(? AS INTEGER)|SELECT CAST(? AS INTEGER) AS X FROM RDB$DATABASE|1|[{"X":-2147483648}]
 CAST(? AS BIGINT)|SELECT CAST(? AS BIGINT) AS X FROM RDB$DATABASE|1|[{"X":-9223372036854776000}]
@@ -135,5 +136,5 @@ if grep -aq 'panicked at' "/tmp/fc-serve-nancast-$PORT.log"; then echo "FAIL the
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks ($ARCH)"
-if [ "$ran" -lt 37 ]; then echo "FAIL only $ran checks ran (floor 37)"; fail=1; fi
+if [ "$ran" -lt 38 ]; then echo "FAIL only $ran checks ran (floor 38)"; fail=1; fi
 exit $fail

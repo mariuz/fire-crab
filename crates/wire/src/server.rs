@@ -32151,6 +32151,14 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                         eprintln!("[srv] insert const-expr {:?} -> {}", part_text, v.render());
                     }
                     let wp = expr_value_to_wireparam(&e, &v, &[])?;
+                    // an INT128-TYPED value keeps the 128-bit shape even
+                    // when it fits i64: the shape is what tells the store
+                    // its overflow is the prefixed *Integer overflow*
+                    // ([fit_or]), not *numeric value is out of range*
+                    let wp = match wp {
+                        WireParam::Int(n, sc) if int128_typed(&e, &[]) => WireParam::Int128(n as i128, sc),
+                        wp => wp,
+                    };
                     if matches!(wp, WireParam::Double(_) | WireParam::Single(_))
                         && !approx_runtime_expr(&e)
                     {
@@ -32894,6 +32902,13 @@ enum WireParam {
     /// (relation 0) to materialise at the store, or a permanent one
     BlobId([u8; 8]),
     Int(i64, i8),
+    /// an exact value PAST the i64 range - an INTERNAL shape, never
+    /// decoded off the wire (a driver sends an INT128 as text or as its
+    /// own blr_int128 message field): a DML value computed as an INT128
+    /// (`VALUES (CAST('-99999999999999999999' AS INT128))`) and a NaN
+    /// bound into an INT128 column on x86-64 ([nan_exact]) both need one,
+    /// and both refused while `Int(i64, _)` was the only exact shape
+    Int128(i128, i8),
     Text(String),
     /// A text value that KNOWS the character set it was decoded from -
     /// an INTERNAL shape, never decoded off the wire. `insert_select`
@@ -34037,7 +34052,10 @@ fn bound_double_into_int128(d: &Descriptor, wp: &WireParam) -> Result<Option<Wir
         _ => return Ok(None),
     };
     match approx_to_exact(x, eps, d.dtype, d.scale) {
-        Ok(r) => Ok(i64::try_from(r).ok().map(|v| WireParam::Int(v, d.scale))),
+        Ok(r) => Ok(Some(match i64::try_from(r) {
+            Ok(v) => WireParam::Int(v, d.scale),
+            Err(_) => WireParam::Int128(r, d.scale),
+        })),
         Err(ApproxFit::TooWide) => Ok(None),
         Err(ApproxFit::OutOfRange) => Err(EvalErr::NumericOutOfRange),
     }
@@ -34052,7 +34070,14 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
             dtype::BLOB | dtype::ARRAY => b.to_vec(),
             _ => return None,
         }),
-        WireParam::Int(v, ws) => Some(match d.dtype {
+        WireParam::Int(..) | WireParam::Int128(..) => {
+            let (v, ws): (i128, i8) = match wp {
+                WireParam::Int(v, ws) => (*v as i128, *ws),
+                WireParam::Int128(v, ws) => (*v, *ws),
+                _ => unreachable!(),
+            };
+            let (v, ws) = (&v, &ws);
+            Some(match d.dtype {
             dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 => {
                 // an EXACT value with more fraction digits than the
                 // column ROUNDS on the first dropped digit, half away
@@ -34095,7 +34120,8 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                 text_bytes_for(&s, fire_crab_ods::intl::CS_UTF8, d, flen)?
             }
             _ => return None,
-        }),
+        })
+        }
         WireParam::Text(text) | WireParam::TextCs(text, _) => {
             let src_cs = match wp {
                 WireParam::TextCs(_, cs) => *cs,
@@ -37897,7 +37923,7 @@ fn execute_dml_collecting_inner(
                             },
                         };
                         match encode_wire_value(d, &wp).ok_or_else(|| {
-                            fit_or(d, &wp, "expression result does not fit the column")
+                            fit_or_src(d, &wp, int128_typed(e, descs), "expression result does not fit the column")
                         })?
                         {
                             None => img[fid / 8] |= 1 << (fid % 8),
@@ -38722,12 +38748,22 @@ fn wire_value_fit_error(d: &Descriptor, wp: &WireParam) -> Option<EvalErr> {
     // 8-byte SUM as a bare *Dynamic SQL Error* (round 6, stabilisation:
     // the previous binary carried the engine's text for the first)
     if matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128) {
-        if let WireParam::Int(v, ws) = wp {
-            if rescale_int_round(*v as i128, *ws, d.scale)
+        let exact = match wp {
+            WireParam::Int(v, ws) => Some((*v as i128, *ws)),
+            WireParam::Int128(v, ws) => Some((*v, *ws)),
+            _ => None,
+        };
+        if let Some((v, ws)) = exact.as_ref() {
+            if rescale_int_round(*v, *ws, d.scale)
                 .and_then(|s| exact_int_le(d.dtype, s))
                 .is_none()
             {
-                return Some(EvalErr::NumericOutOfRange);
+                // the 128-bit shape is INT128-typed by construction
+                return Some(if matches!(wp, WireParam::Int128(..)) {
+                    int128_narrow_error(d.dtype, rescale_int_round(*v, *ws, d.scale))
+                } else {
+                    EvalErr::NumericOutOfRange
+                });
             }
         }
         // ...and the APPROXIMATE twin: an out-of-range or infinite double
@@ -38772,6 +38808,45 @@ fn wire_value_fit_error(d: &Descriptor, wp: &WireParam) -> Option<EvalErr> {
 /// else this path's own refusal text. Every DML site asks for it, so
 /// UPDATE, INSERT, INSERT .. SELECT, MERGE, RETURNING and a bound `?`
 /// all answer the same vector - they answered a bare 42000 before.
+/// [fit_or] for a value whose SOURCE EXPRESSION is known: an INT128-typed
+/// source that does not fit an exact column is the engine's prefixed
+/// *Integer overflow*, not *numeric value is out of range*
+/// ([EvalErr::IntegerOverflowArith]).
+fn fit_or_src(d: &Descriptor, wp: &WireParam, int128_src: bool, msg: &str) -> ExecErr {
+    match wire_value_fit_error(d, wp) {
+        Some(EvalErr::NumericOutOfRange) if int128_src => match wp {
+            WireParam::Int(v, ws) => {
+                ExecErr::Eval(int128_narrow_error(d.dtype, rescale_int_round(*v as i128, *ws, d.scale)))
+            }
+            _ => ExecErr::Eval(EvalErr::NumericOutOfRange),
+        },
+        Some(e) => ExecErr::Eval(e),
+        None => ExecErr::Text(msg.to_string()),
+    }
+}
+
+/// The error an INT128-TYPED value raises when it does not fit a narrower
+/// integer column (`scaled` = the value at the column's scale, None when
+/// even that overflowed). The engine narrows an INT128 through its 32-bit
+/// or 64-bit conversion, which raises the PREFIXED *Integer overflow*;
+/// a SMALLINT target first takes the 32-bit value and then its own range
+/// check, so a value that fits 32 bits is *numeric value is out of range*
+/// there (measured: CAST(40000 AS INT128) into SMALLINT is out of range,
+/// B * 10000000000 into INTEGER and a 20-digit NUMERIC(38,0) into BIGINT
+/// are integer overflow).
+fn int128_narrow_error(dtype: u8, scaled: Option<i128>) -> EvalErr {
+    match (dtype, scaled.map(|v| i32::try_from(v).is_ok())) {
+        (dtype::SHORT, Some(true)) => EvalErr::NumericOutOfRange,
+        _ => EvalErr::IntegerOverflowArith,
+    }
+}
+
+/// Is `e` an INT128-TYPED exact expression - an INT128 / NUMERIC(19..38)
+/// column or cast, or arithmetic that widens to 16 bytes?
+fn int128_typed(e: &Expr, descs: &[Descriptor]) -> bool {
+    matches!(e.type_of(descs), Some(ExprType::Int | ExprType::Numeric)) && result_width_bytes(e, descs) == 16
+}
+
 fn fit_or(d: &Descriptor, wp: &WireParam, msg: &str) -> ExecErr {
     match wire_value_fit_error(d, wp) {
         Some(e) => ExecErr::Eval(e),
@@ -61605,6 +61680,12 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
             w.int(1) // isc_arg_gds
                 .int(GDS_INTEGER_OVERFLOW);
         }
+        EvalErr::IntegerOverflowArith => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_ARITH_EXCEPT)
+                .int(1) // isc_arg_gds
+                .int(GDS_INTEGER_OVERFLOW);
+        }
         EvalErr::NumericOutOfRange => {
             w.int(1) // isc_arg_gds - arithmetic exception, numeric overflow, ...
                 .int(GDS_ARITH_EXCEPT)
@@ -62617,6 +62698,10 @@ fn param_to_expr(p: &WireParam) -> Option<Expr> {
         WireParam::Null => Expr::Null,
         WireParam::Int(v, 0) => Expr::Int(*v),
         WireParam::Int(v, s) => Expr::Dec(*v, *s),
+        // an internal shape - never a client's bind; a whole one is the
+        // INT128 literal, a scaled one has no literal form here
+        WireParam::Int128(v, 0) => Expr::Int128(*v),
+        WireParam::Int128(..) => return None,
         WireParam::Text(s) | WireParam::TextCs(s, _) => Expr::Str(s.clone()),
         // a bound DOUBLE is a RUNTIME value, not a compile-time literal:
         // wrapped in an explicit CAST-to-DOUBLE so `CAST(? AS DECFLOAT)`
@@ -65774,6 +65859,8 @@ fn wireparam_text(wp: &WireParam) -> Option<String> {
         WireParam::Text(t) | WireParam::TextCs(t, _) => t.clone(),
         WireParam::Int(n, 0) => n.to_string(),
         WireParam::Int(r, sc) => render_exact(*r as i128, *sc),
+        WireParam::Int128(r, 0) => r.to_string(),
+        WireParam::Int128(r, sc) => render_exact(*r, *sc),
         WireParam::Double(d) => Value::Double(*d).render(),
         WireParam::Single(f) => Value::Float(*f).render(),
         WireParam::Date(d) => Value::Date(*d).render(),
@@ -75205,6 +75292,13 @@ enum EvalErr {
     /// sum past `i64`, or an operation past `i128`:
     /// `isc_exception_integer_overflow` (SQLSTATE 22003)
     IntegerOverflow,
+    /// `isc_arith_except` + `isc_exception_integer_overflow`: an
+    /// INT128-TYPED value narrowed into a smaller integer column (measured:
+    /// `SET B = CAST('9..9' AS NUMERIC(38,0))`, `SET N = B * 10000000000`
+    /// - where an INT64 source narrowed the same way is *numeric value is
+    /// out of range*, and an overflow INSIDE an expression is the bare
+    /// integer overflow)
+    IntegerOverflowArith,
     /// BYTES that do not spell a character of the set they are being
     /// read as: `isc_malformed_string` (SQLSTATE 22000, *Malformed
     /// string*). The engine's byte-level well-formedness test, which is
@@ -77484,10 +77578,14 @@ fn scaled_value(raw: i128, scale: i8) -> Value {
 /// divisor is the arithmetic exception, never a wrong answer.
 fn numeric_bin(r1: i128, s1: i8, op: ArithOp, r2: i128, s2: i8) -> Result<(i128, i8), EvalErr> {
     // every step checked: past-i128 intermediates are the engine's
-    // integer overflow (SQLSTATE 22003), never a wrapped wrong answer
-    let pow = |k: u32| 10i128.checked_pow(k).ok_or(EvalErr::IntegerOverflow);
+    // integer overflow (SQLSTATE 22003), never a wrapped wrong answer - and
+    // an overflow of 128-BIT arithmetic carries the arithmetic-exception
+    // prefix, where an INT64 one does not (measured: `I * I * I` over an
+    // INT128 is `arithmetic exception ... / -Integer overflow`,
+    // `9223372036854775807 + 1` the bare message)
+    let pow = |k: u32| 10i128.checked_pow(k).ok_or(EvalErr::IntegerOverflowArith);
     let align = |r: i128, k: u32| -> Result<i128, EvalErr> {
-        r.checked_mul(pow(k)?).ok_or(EvalErr::IntegerOverflow)
+        r.checked_mul(pow(k)?).ok_or(EvalErr::IntegerOverflowArith)
     };
     Ok(match op {
         ArithOp::Add | ArithOp::Sub => {
@@ -77499,9 +77597,9 @@ fn numeric_bin(r1: i128, s1: i8, op: ArithOp, r2: i128, s2: i8) -> Result<(i128,
             } else {
                 a.checked_sub(b)
             };
-            (r.ok_or(EvalErr::IntegerOverflow)?, sr)
+            (r.ok_or(EvalErr::IntegerOverflowArith)?, sr)
         }
-        ArithOp::Mul => (r1.checked_mul(r2).ok_or(EvalErr::IntegerOverflow)?, s1 + s2),
+        ArithOp::Mul => (r1.checked_mul(r2).ok_or(EvalErr::IntegerOverflowArith)?, s1 + s2),
         ArithOp::Div => {
             if r2 == 0 {
                 return Err(EvalErr::DivideByZero);
@@ -79560,7 +79658,10 @@ fn value_to_wireparam(v: &Value) -> Option<WireParam> {
         // zone-less one
         Value::TimeTz(utc, zone) => WireParam::TimeTz(*utc, *zone),
         Value::TimestampTz(dd, utc, zone) => WireParam::TimestampTz(*dd, *utc, *zone),
-        Value::Int128(r, sc) => WireParam::Int(i64::try_from(*r).ok()?, *sc),
+        Value::Int128(r, sc) => match i64::try_from(*r) {
+            Ok(n) => WireParam::Int(n, *sc),
+            Err(_) => WireParam::Int128(*r, *sc),
+        },
         // A DECFLOAT VALUE TRAVELS AS ITS EXACT DECIMAL TEXT: [WireParam]
         // has no decfloat carrier, and the destination's encoder already
         // reads a text by the decNumber grammar ([encode_wire_value]'s
@@ -81342,7 +81443,9 @@ impl Expr {
                     Value::Scaled(r.checked_neg().ok_or(EvalErr::IntegerOverflow)?, s)
                 }
                 Value::Int128(r, s) => {
-                    Value::Int128(r.checked_neg().ok_or(EvalErr::IntegerOverflow)?, s)
+                    // negating INT128's minimum is 128-bit arithmetic: the
+                    // prefixed vector ([numeric_bin], measured)
+                    Value::Int128(r.checked_neg().ok_or(EvalErr::IntegerOverflowArith)?, s)
                 }
                 Value::Double(d) => Value::Double(-d),
                 Value::Float(f) => Value::Float(-f),
@@ -128670,10 +128773,12 @@ mod computed_wide_types {
             Ok(Some(WireParam::Int(1007, -2)))
         ));
         // a NaN is the platform's cast: 0 on ARM, and on x86-64 the INT128
-        // indefinite - which no i64 wire value carries, so it keeps the
-        // caller's refusal (recorded in serve-real-nancast)
+        // indefinite - past i64, so it travels as the 128-bit wire shape
         if cfg!(target_arch = "x86_64") {
-            assert!(matches!(bound_double_into_int128(&d, &WireParam::Double(f64::NAN)), Ok(None)));
+            assert!(matches!(
+                bound_double_into_int128(&d, &WireParam::Double(f64::NAN)),
+                Ok(Some(WireParam::Int128(v, -2))) if v == -0x7fff_ffff_7fff_ffff_7fff_ffff_8000_0000_i128
+            ));
         } else {
             assert!(matches!(
                 bound_double_into_int128(&d, &WireParam::Double(f64::NAN)),
