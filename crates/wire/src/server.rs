@@ -20241,7 +20241,11 @@ fn text_form_m(
         Expr::Func(f, args) => {
             let arg = |i: usize| args.get(i).and_then(|a| text_form(a, descs));
             let lit = |i: usize| match args.get(i) {
-                Some(Expr::Int(n)) if *n >= 0 => Some(*n as i32),
+                // a literal past the INTEGER range never reaches here -
+                // it is refused at prepare with the engine's 22003 - but
+                // a wrapped cast announced `len: -2147483648` for FOR
+                // 2147483648 and the client dumped core on the describe
+                Some(Expr::Int(n)) if *n >= 0 => i32::try_from(*n).ok(),
                 _ => None,
             };
             // A TEMPORAL operand keeps its natural WIDTH through these
@@ -61339,6 +61343,27 @@ const GDS_SYSF_ZEROPOWNEG: i32 = 335544964;
 /// sysf_invalid_negpowfp - "Base for @1 cannot be negative if exponent is
 /// not an integral value" (POWER)
 const GDS_SYSF_NEGPOWFP: i32 = 335544965;
+/// sysf_argnmustbe_nonneg - "Argument #@1 for @2 must be zero or
+/// positive" (LPAD/RPAD's length, #2)
+const GDS_SYSF_ARGN_NONNEG: i32 = 335544962;
+/// sysf_argnmustbe_positive - "Argument #@1 for @2 must be positive"
+/// (POSITION's start, #3)
+const GDS_SYSF_ARGN_POSITIVE: i32 = 335544963;
+/// sysf_invalid_scale - "The numeric scale must be between -128 and 127
+/// in @1" (ROUND / TRUNC places)
+const GDS_SYSF_INVALID_SCALE: i32 = 335544966;
+/// sysf_argscant_both_be_zero - "Arguments for @1 cannot both be zero"
+/// (ATAN2)
+const GDS_SYSF_BOTH_ZERO: i32 = 335545024;
+/// sysf_argmustbe_exact - "Arguments for @1 must be integral types or
+/// NUMERIC/DECIMAL without scale" (the BIN_* family, at prepare)
+const GDS_SYSF_ARGMUSTBE_EXACT: i32 = 335544945;
+/// isc_imp_exc - "Implementation limit exceeded" (SQLSTATE 54000)
+const GDS_IMP_EXC: i32 = 335544381;
+/// isc_date_range_exceeded - "value exceeds the range for valid dates"
+const GDS_DATE_RANGE_EXCEEDED: i32 = 335544810;
+/// isc_time_range_exceeded - "value exceeds the range for a valid time"
+const GDS_TIME_RANGE_EXCEEDED: i32 = 335544912;
 
 /// isc_bad_substring_length - "Invalid length parameter @1 to SUBSTRING.
 /// Negative integers are not allowed." (SQLSTATE 22011, msg/jrd.h:534);
@@ -61980,6 +62005,28 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
         EvalErr::DatetimeRange => {
             w.int(1) // isc_arg_gds
                 .int(335544913); // isc_datetime_range_exceeded (jrd 593)
+        }
+        EvalErr::DateRange => {
+            w.int(1).int(GDS_DATE_RANGE_EXCEEDED);
+        }
+        EvalErr::TimeRange => {
+            w.int(1).int(GDS_TIME_RANGE_EXCEEDED);
+        }
+        EvalErr::ArgDomain { func, argno, code } => {
+            w.int(1) // isc_arg_gds - expression evaluation not supported
+                .int(GDS_EXPRESSION_EVAL_ERR)
+                .int(1) // isc_arg_gds - "Argument #@1 for @2 must be ..."
+                .int(*code)
+                .int(ISC_ARG_NUMBER)
+                .int(*argno)
+                .int(2) // isc_arg_string - @2 = the function name
+                .bytes(func.as_bytes());
+        }
+        EvalErr::ImplementationLimit => {
+            w.int(1) // isc_arg_gds - arithmetic exception, ...
+                .int(GDS_ARITH_EXCEPT)
+                .int(1) // isc_arg_gds - Implementation limit exceeded
+                .int(GDS_IMP_EXC);
         }
         EvalErr::NotValid { column, value } => {
             w.int(1) // isc_arg_gds
@@ -74484,29 +74531,74 @@ fn resolve_expr_inner(
             // which charset that is: the blank everywhere, a single
             // 0x00 for OCTETS (intl_builtin.cpp:1516 sets the binary
             // charset's space character to a NUL)
-            // FIREBIRD'S IMPLEMENTATION LIMIT: an LPAD/RPAD result is a
-            // VARCHAR whose declared byte width is the pad length N times
-            // the SOURCE charset's bytes-per-character; when that exceeds
-            // 65535 the engine raises 54000 "Implementation limit
-            // exceeded" AT PREPARE - even wrapped in CHAR_LENGTH, which
-            // otherwise consumes the string. fire-crab built the
-            // over-long string and answered a confident wrong value (and
-            // a wrong cardinality where the engine errors). Refuse the
-            // whole statement here so the raise propagates through any
-            // enclosing expression (measured: `LPAD('Hi',16384,'*')`
-            // under UTF8 is 16384x4 = 65536 -> refuse; 16383 is fine; a
-            // NONE/single-byte source caps at 65535 chars). A non-literal
-            // length keeps the current fallback width (the rare dynamic
-            // case).
-            if matches!(f, SysFn::Lpad | SysFn::Rpad) {
-                if let (Some(src), Some(Expr::Int(len))) = (resolved.first(), resolved.get(1)) {
-                    if *len >= 0 {
-                        let bpc = cmp_text_charset(src, descs)
-                            .map_or(1i64, |cs| fire_crab_ods::intl::bytes_per_char(cs) as i64);
-                        if *len * bpc > 65535 {
-                            return None;
-                        }
+            // FIREBIRD'S IMPLEMENTATION LIMIT: an LPAD/RPAD result past
+            // 65535 bytes - the pad length N times the SOURCE charset's
+            // bytes-per-character - raises 54000 "Implementation limit
+            // exceeded", even wrapped in CHAR_LENGTH (measured:
+            // `LPAD('Hi',16384,'*')` under UTF8 is 16384x4 = 65536 ->
+            // raise; 16383 is fine; a NONE/single-byte source caps at
+            // 65535 chars). It is evlPad's EXECUTE-time check: a literal
+            // `LPAD('abc', 100000)` PREPARES, described VARYING(65533),
+            // and a computed length (65536 + 0) raises the same 54000 -
+            // where this refused a literal at prepare with a bare Dynamic
+            // SQL Error and answered the computed one, 65536 characters
+            // long. The source's bytes-per-character travels to the
+            // evaluator as a 4th argument (after the pad, made explicit)
+            // when it is not 1.
+            if let (SysFn::Lpad | SysFn::Rpad, Some(src)) = (f, resolved.first()) {
+                let bpc = cmp_text_charset(src, descs)
+                    .map_or(1i64, |cs| fire_crab_ods::intl::bytes_per_char(cs) as i64);
+                if bpc > 1 {
+                    let mut args = resolved.clone();
+                    if args.len() == 2 {
+                        args.push(Expr::Str(" ".into()));
                     }
+                    args.push(Expr::Int(bpc));
+                    return Some(Expr::Func(*f, args));
+                }
+            }
+            // a CONSTANT length is read at PREPARE by the describe
+            // (makeSubstr / makePad's CVT_get_long), so one past the
+            // INTEGER range refuses the statement with 22003 before any
+            // row (measured: `SUBSTRING('abc' FROM 1 FOR 2147483648)`
+            // fails its prepare - where this described `len:
+            // -2147483648` and the client dumped core on it - and so does
+            // `LPAD('abc', 2147483648)`, even under WHERE 1=0)
+            let const_arg = match f {
+                SysFn::Substring => resolved.get(2),
+                SysFn::Lpad | SysFn::Rpad => resolved.get(1),
+                _ => None,
+            };
+            if let Some(c) = const_arg.filter(|c| is_numeric_literal(c)) {
+                if let Ok(v) = c.eval(&[]) {
+                    if let Err(e) = arg_long(&v) {
+                        PREPARE_REFUSAL.with(|r| *r.borrow_mut() = Some(e));
+                        return None;
+                    }
+                }
+            }
+            // the BIN_* family takes integral operands only: a scaled,
+            // approximate or string one is the engine's typed refusal at
+            // PREPARE (measured for all six, `BIN_SHL(1, 2.7)`,
+            // `BIN_AND(1.5, 1)`, `BIN_OR(1, 2e0)`, `BIN_XOR(1, '2')`),
+            // where this refused with a bare Dynamic SQL Error
+            if matches!(
+                f,
+                SysFn::BinAnd | SysFn::BinOr | SysFn::BinXor | SysFn::BinNot | SysFn::BinShl | SysFn::BinShr
+            ) {
+                let inexact = resolved.iter().any(|a| match a.type_of(descs) {
+                    Some(ExprType::Approx | ExprType::Text) => true,
+                    Some(ExprType::Numeric) => a.result_scale(descs).is_some_and(|sc| sc != 0),
+                    _ => false,
+                });
+                if inexact {
+                    PREPARE_REFUSAL.with(|r| {
+                        *r.borrow_mut() = Some(EvalErr::MathDomain {
+                            func: f.header(),
+                            code: GDS_SYSF_ARGMUSTBE_EXACT,
+                        })
+                    });
+                    return None;
                 }
             }
             // LPAD/RPAD's default fill is the same charset space
@@ -75239,6 +75331,18 @@ enum EvalErr {
     /// the engine STORES such a value (the wall clock was in range)
     /// and raises this READING it back (measured)
     DatetimeRange,
+    /// DATEADD's own range refusals, which name the OPERAND's family:
+    /// `isc_date_range_exceeded` over a DATE, `isc_time_range_exceeded`
+    /// over a TIME (22008 both; a TIMESTAMP's is [EvalErr::DatetimeRange])
+    DateRange,
+    TimeRange,
+    /// a function argument that left its NUMBERED domain:
+    /// `isc_expression_eval_err` + `sysf_argnmustbe_*`, whose `@1` is the
+    /// argument's position and `@2` the function (LPAD's #2, POSITION's #3)
+    ArgDomain { func: &'static str, argno: i32, code: i32 },
+    /// `isc_arith_except` + `isc_imp_exc` (54000): a pad result wider
+    /// than the 65535-byte string limit
+    ImplementationLimit,
     /// a DOUBLE math function whose operand left its domain (SQRT of a
     /// negative, LN of <= 0, ...): `isc_expression_eval_err` +
     /// the specific `sysf_argmustbe_*` message, whose `@1` is the function
@@ -75357,9 +75461,8 @@ enum EvalErr {
     /// a negative length given to SUBSTRING/LEFT/RIGHT (the engine routes
     /// LEFT and RIGHT through SUBSTRING, so all three name it):
     /// `isc_bad_substring_length` (SQLSTATE 22011), the offending value
-    /// carried as the message argument. Also stands in for the engine's
-    /// 42000 "must be zero or positive" on LPAD/RPAD/POSITION bounds -
-    /// an error either way, never a wrong row
+    /// carried as the message argument. (LPAD/RPAD/POSITION raise their
+    /// own numbered 42000 instead: [EvalErr::ArgDomain])
     InvalidLength(i64),
     /// isc_ctx_namespace_invalid: "Invalid namespace name '@1' passed to @2"
     CtxNamespace(String, &'static str),
@@ -78989,6 +79092,27 @@ fn temporal_shift(
     }
 }
 
+/// `amount` is evlDateAdd's quantity: whole units, except MILLISECOND,
+/// whose amount is read at scale -1 - in 100us units, so a fractional
+/// millisecond is kept (measured: `DATEADD(MILLISECOND, 0.5, ts)` adds
+/// .0005 and 1.26 adds .0013, where rounding to whole milliseconds gave
+/// .0010 for both).
+///
+/// The engine's order, each step measured: a quantity past the part's
+/// own bound (9999 years, 9999*12 months, the calendar's span in days /
+/// weeks / hours / ...) raises before any arithmetic - which is what kept
+/// `DATEADD(YEAR, 4294967296, d)` from wrapping to a date as it did here;
+/// then the arithmetic; then the result must lie in 0001-01-01 ..
+/// 9999-12-31. Every raise names the OPERAND's family: *valid dates*
+/// over a DATE, *a valid time* over a TIME, *valid timestamps* over a
+/// TIMESTAMP (all 22008; this raised a bare Dynamic SQL Error).
+///
+/// A TIME rides on the calendar's MIDDLE day, so a clock amount that
+/// carries it past either end is out of range too (measured:
+/// `DATEADD(HOUR, 43825000, TIME '00:00')` raises, 43824000 wraps to
+/// 00:00). A DATE takes a clock amount as whole days, TRUNCATED toward
+/// zero (`DATEADD(HOUR, -25, d)` is one day back, `MINUTE, -1` none),
+/// where flooring the instant moved it one day further.
 fn dateadd_impl(
     unit: ExtractPart,
     amount: i64,
@@ -78998,44 +79122,77 @@ fn dateadd_impl(
     zone: u16,
 ) -> Result<Value, EvalErr> {
     use ExtractPart::*;
-    let (mut d, mut u) = (days as i64, units as i64);
+    const MIN_DATE: i64 = -678_575; // 0001-01-01
+    const MAX_DATE: i64 = 2_973_483; // 9999-12-31
+    const SPAN: i128 = (MAX_DATE - MIN_DATE) as i128;
+    let is_time = matches!(kind, TKind::Time | TKind::TimeTz);
+    let range = match kind {
+        TKind::Date => EvalErr::DateRange,
+        TKind::Time | TKind::TimeTz => EvalErr::TimeRange,
+        TKind::Timestamp | TKind::TimestampTz => EvalErr::DatetimeRange,
+    };
+    // units (of the amount) per day, for the clock parts
+    let per_day: i128 = match unit {
+        Hour => 24,
+        Minute => 24 * 60,
+        Second => 24 * 60 * 60,
+        _ => 24 * 60 * 60 * 10_000,
+    };
+    let bound: i128 = match unit {
+        Year => 9999,
+        Month => 9999 * 12,
+        Day => SPAN,
+        Week => SPAN / 7 + 1,
+        Hour | Minute | Second | Millisecond => (SPAN + 1) * per_day,
+        // DATEADD's own unit parser never yields these
+        Weekday | Yearday | TimezoneHour | TimezoneMinute => {
+            return Err(EvalErr::ConversionError(None))
+        }
+    };
+    if (amount as i128).abs() > bound {
+        return Err(range);
+    }
+    let base = if is_time { (MAX_DATE - MIN_DATE) / 2 + MIN_DATE } else { days as i64 };
+    let (mut d, mut u) = (base, units as i64);
     match unit {
-        Year | Month => {
-            let (y, m, dom) = civil_of(days);
-            let months = amount * if matches!(unit, Year) { 12 } else { 1 };
-            let idx = y as i64 * 12 + (m as i64 - 1) + months;
+        Year => {
+            let (y, m, dom) = civil_of(base as i32);
+            let ny = y + amount as i32;
+            d = days_of_civil(ny, m, dom.min(last_day_of_month(ny, m))) as i64;
+        }
+        Month => {
+            let (y, m, dom) = civil_of(base as i32);
+            let idx = y as i64 * 12 + (m as i64 - 1) + amount;
             let (ny, nm) = (idx.div_euclid(12) as i32, (idx.rem_euclid(12) + 1) as u32);
-            let nd = dom.min(last_day_of_month(ny, nm));
+            // evlDateAdd's one quirk: a FORWARD move from February 29
+            // into a NON-leap year lands on the target month's LAST day
+            // (its `md[lm] - mday` distance of -1 overshoots and then
+            // clamps) - measured: 2024-02-29 + 13 MONTH is 2025-03-31
+            // and + 14 is 2025-04-30, while + 1 is 2024-03-29
+            let leap = |y: i32| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+            let nd = if amount >= 0 && m == 2 && dom == 29 && !leap(ny) {
+                last_day_of_month(ny, nm)
+            } else {
+                dom.min(last_day_of_month(ny, nm))
+            };
             d = days_of_civil(ny, nm, nd) as i64;
         }
         Week | Day => {
             d += amount * if matches!(unit, Week) { 7 } else { 1 };
         }
+        Hour | Minute | Second | Millisecond if matches!(kind, TKind::Date) => {
+            d += (amount as i128 / per_day) as i64;
+        }
         Hour | Minute | Second | Millisecond => {
-            let per: i128 = match unit {
-                Hour => 36_000_000,
-                Minute => 600_000,
-                Second => 10_000,
-                _ => 10,
-            };
+            let per: i128 = UNITS_PER_DAY / per_day;
             let total = d as i128 * UNITS_PER_DAY + u as i128 + amount as i128 * per;
             d = total.div_euclid(UNITS_PER_DAY) as i64;
             u = total.rem_euclid(UNITS_PER_DAY) as i64;
         }
-        // DATEADD's own unit parser never yields these
-        Weekday | Yearday | TimezoneHour | TimezoneMinute => {
-            return Err(EvalErr::ConversionError(None))
-        }
+        Weekday | Yearday | TimezoneHour | TimezoneMinute => unreachable!(),
     }
-    // the engine's valid date range. A TIME-FAMILY value has no date
-    // to range-check - zoned or not - while a zoned TIMESTAMP must
-    // still raise when the result leaves the range, so the exemption is
-    // on the TIME-ness and not on the zone-ness.
-    if !matches!(kind, TKind::Time | TKind::TimeTz) {
-        let (y, _, _) = civil_of(d as i32);
-        if !(1..=9999).contains(&y) || i32::try_from(d).is_err() {
-            return Err(EvalErr::ConversionError(None));
-        }
+    if !(MIN_DATE..=MAX_DATE).contains(&d) {
+        return Err(range);
     }
     Ok(match kind {
         TKind::Date => Value::Date(d as i32),
@@ -79841,10 +79998,21 @@ enum RndMode {
 /// The places argument of ROUND/TRUNC, converted the way the engine's
 /// `MOV_get_long(scaleDsc, 0)` does - a fractional value rounds (2.7 -> 3);
 /// an absent argument means 0 (round/truncate to a whole number).
-fn round_places(nv: Option<&Value>) -> Result<i32, EvalErr> {
+///
+/// MOV_get_long first (22003 past INTEGER: `ROUND(1.5, 4294967296)`),
+/// then evlRound / evlTrunc's own -128..127 bound (measured: `ROUND(1.5,
+/// 200)` and `ROUND(1.5, 127.5)` raise *The numeric scale must be
+/// between -128 and 127 in ROUND*; this answered 1.5).
+fn round_places(nv: Option<&Value>, func: &'static str) -> Result<i32, EvalErr> {
     match nv {
         None => Ok(0),
-        Some(v) => Ok(fn_f64(v)?.round() as i32),
+        Some(v) => {
+            let n = arg_long(v)?;
+            if !(-128..=127).contains(&n) {
+                return Err(EvalErr::MathDomain { func, code: GDS_SYSF_INVALID_SCALE });
+            }
+            Ok(n)
+        }
     }
 }
 
@@ -79879,24 +80047,47 @@ fn round_double(mut d: f64, s: i32, eps: f64) -> Result<Value, EvalErr> {
     }
     // the engine's evlRound result is an EXACT INT64 of scale -places
     // ([Value::Rounded]) - a negative places count keeps the POSITIVE scale
-    // (ROUND(45.7e0, -2) renders '000', measured)
-    let sc = i8::try_from(s).map_err(|_| EvalErr::NumericOutOfRange)?;
-    Ok(Value::Rounded(d as i64, sc))
+    // (ROUND(45.7e0, -2) renders '000', measured). Places -128 is scale
+    // 128, one past i8: its zero is still zero (measured: ROUND(1.5e0,
+    // -128) is 0, where this raised 22003); a non-zero result there - an
+    // operand of 5e127 or more - is refused, not approximated
+    let r = d as i64;
+    let sc = match i8::try_from(s) {
+        Ok(sc) => sc,
+        Err(_) if r == 0 => i8::MAX,
+        Err(_) => return Err(EvalErr::NumericOutOfRange),
+    };
+    Ok(Value::Rounded(r, sc))
 }
 
 /// TRUNC of an APPROXIMATE operand: the engine's evlTrunc stays in the f64
 /// domain via `modf` - toward zero at `places` decimals (a negative
 /// `places` truncates whole tens/hundreds).
+///
+/// The power of ten is evlTrunc's own SINT64 `v *= 10` loop, which WRAPS
+/// past 10^18 and reaches 0 at 10^64 (2^64 divides it) - so a places
+/// count past 63 either way answers NaN (0/0 or inf*0), and 19..63 divide
+/// by the wrapped value (measured: TRUNC(1.5e0, 127) and TRUNC(123e0,
+/// -100) are NaN on the engine; this answered 1.5 and 0).
 fn trunc_double(d: f64, places: i32) -> Value {
+    let wrapped_pow10 = |k: i32| -> f64 {
+        let mut v: i64 = 1;
+        for _ in 0..k {
+            v = v.wrapping_mul(10);
+        }
+        v as f64
+    };
     let rs = -places;
     let out = if rs > 0 {
-        let v = 10f64.powi(rs);
+        let v = wrapped_pow10(rs);
         (d / v).trunc() * v
     } else {
         let ip = d.trunc();
         if rs != 0 {
-            let v = 10f64.powi(-rs);
-            ip + ((d - ip) * v).trunc() / v
+            let v = wrapped_pow10(-rs);
+            // modf's fraction of an infinity is a signed zero
+            let r = if d.is_infinite() { 0.0 } else { d - ip };
+            ip + (r * v).trunc() / v
         } else {
             ip
         }
@@ -79958,6 +80149,82 @@ fn fn_int(v: &Value) -> Result<i64, EvalErr> {
     }
 }
 
+/// A function argument read the way the engine's `MOV_get_int64(v,
+/// -digits)` reads it: the value scaled to `digits` decimal places and
+/// rounded half away from zero (an approximate one by the same rule), a
+/// result past INT64 is *numeric value is out of range* (measured:
+/// `DATEADD(MILLISECOND, 9223372036854775807, ts)` is 22003 - the
+/// millisecond amount is taken at scale -1, in 100us units - and
+/// `DATEADD(DAY, 1e300, d)` too). Text and the other forms keep
+/// [fn_int]'s conversion.
+fn arg_int64(v: &Value, digits: u32) -> Result<i64, EvalErr> {
+    let pow = |k: u32| 10i128.checked_pow(k);
+    let r: i128 = if let Some((raw, scale)) = numeric_parts(v) {
+        let shift = scale as i32 + digits as i32;
+        if shift >= 0 {
+            pow(shift as u32)
+                .and_then(|p| raw.checked_mul(p))
+                .ok_or(EvalErr::NumericOutOfRange)?
+        } else {
+            // past 10^38 every i128 rounds to zero
+            match pow((-shift) as u32) {
+                Some(p) => {
+                    let (q, rem) = (raw / p, raw % p);
+                    q + if rem.unsigned_abs() * 2 >= p.unsigned_abs() { raw.signum() } else { 0 }
+                }
+                None => 0,
+            }
+        }
+    } else if let Some(x) = approx_of(v) {
+        approx_to_int64(x * 10f64.powi(digits as i32))?
+    } else if let Value::Text(t) = v {
+        let (raw, scale) =
+            decimal_parts(t).ok_or_else(|| EvalErr::ConversionError(Some(t.clone())))?;
+        return arg_int64(&Value::Int128(raw, scale), digits);
+    } else {
+        (fn_int(v)? as i128)
+            .checked_mul(pow(digits).unwrap_or(1))
+            .ok_or(EvalErr::NumericOutOfRange)?
+    };
+    i64::try_from(r).map_err(|_| EvalErr::NumericOutOfRange)
+}
+
+/// A numeric LITERAL - what the engine's describe sees as a constant
+/// (`dsc_address` set), a negated one included (the parser folds it).
+fn is_numeric_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_) | Expr::Int128(_) | Expr::Dec(..) | Expr::Double(_) | Expr::DecFloat34(_) => true,
+        Expr::Neg(inner) => is_numeric_literal(inner),
+        _ => false,
+    }
+}
+
+/// SUBSTRING's FROM less one, EXACTLY - the engine builds `start - 1` as
+/// an expression before rounding it, so a fractional FROM rounds after
+/// the subtraction (FROM 0.5 is -0.5 -> -1, where rounding first gave 0)
+fn value_minus_one(v: &Value) -> Result<Value, EvalErr> {
+    if let Some((raw, scale)) = numeric_parts(v) {
+        let one = 10i128.checked_pow((-scale).max(0) as u32).ok_or(EvalErr::NumericOutOfRange)?;
+        let one = if scale > 0 { 1 } else { one };
+        let raw = if scale > 0 { round_scaled_to_int(raw, scale) } else { raw };
+        let scale = scale.min(0);
+        return Ok(Value::Int128(raw.checked_sub(one).ok_or(EvalErr::NumericOutOfRange)?, scale));
+    }
+    if let Some(x) = approx_of(v) {
+        return Ok(Value::Double(x - 1.0));
+    }
+    Ok(Value::Int128(fn_int(v)? as i128 - 1, 0))
+}
+
+/// ... and `MOV_get_long(v, 0)`: an INTEGER-typed argument (a length, a
+/// start, a scale) past the 32-bit range is *numeric value is out of
+/// range*, never a wrapped count (measured: `LEFT('abc', 4294967298)`,
+/// `POSITION('a', 'abc', 4294967297)`, `ROUND(1.5, 4294967296)` all
+/// raise 22003 on the engine, where this answered `abc` / 0 / 1.5)
+fn arg_long(v: &Value) -> Result<i32, EvalErr> {
+    i32::try_from(arg_int64(v, 0)?).map_err(|_| EvalErr::NumericOutOfRange)
+}
+
 /// Strip repetitions of `what` (a whole string, possibly multi-character)
 /// from the chosen side(s) of `s` - blr_trim's rule, probed:
 /// TRIM(BOTH 'ab' FROM 'ababXab') = 'X'. An empty `what` strips nothing.
@@ -80002,8 +80269,14 @@ fn substring_impl(s: &str, start: i64, len: Option<i64>) -> Result<String, EvalE
 /// it is 0, probed); a start below 1 is the engine's "must be positive"
 /// argument error.
 fn position_impl(sub: &str, s: &str, start: i64) -> Result<i64, EvalErr> {
+    // evlPosition's numbered argument error, SQLSTATE 42000 - not
+    // SUBSTRING's 22011, which this raised (measured)
     if start < 1 {
-        return Err(EvalErr::InvalidLength(start));
+        return Err(EvalErr::ArgDomain {
+            func: "POSITION",
+            argno: 3,
+            code: GDS_SYSF_ARGN_POSITIVE,
+        });
     }
     let sc: Vec<char> = s.chars().collect();
     let nc: Vec<char> = sub.chars().collect();
@@ -80335,11 +80608,15 @@ impl Expr {
                     .collect::<Option<Vec<_>>>()?;
                 match f {
                     SysFn::BlobOctetLength => Some(ExprType::Int), // answered above
-                    // amount (Int/Numeric) + temporal operand -> the
-                    // operand's kind; a TIME takes only clock units
+                    // amount + temporal operand -> the operand's kind; a
+                    // TIME takes only clock units. The amount is any
+                    // number or a numeric string - the engine reads it
+                    // through MOV_get_int64 (measured: a DOUBLE 0.25
+                    // MILLISECOND adds 0.0003, '1.5' adds 0.0015; both
+                    // were refused here)
                     SysFn::DateAdd(unit) => match (ts[0], ts[1]) {
                         (
-                            ExprType::Int | ExprType::Numeric,
+                            ExprType::Int | ExprType::Numeric | ExprType::Approx | ExprType::Text,
                             ExprType::Temporal(k),
                         ) => {
                             use ExtractPart::*;
@@ -80536,7 +80813,16 @@ impl Expr {
                     | SysFn::BinNot
                     | SysFn::BinShl
                     | SysFn::BinShr => {
-                        if ts.iter().all(|t| *t == ExprType::Int) {
+                        // ... and an exact scale-0 NUMERIC counts as
+                        // integral (measured: BIN_SHL(CAST(1 AS
+                        // NUMERIC(18,0)), 2) is 4, CAST(1 AS INT128)
+                        // shifts in 128 bits)
+                        let integral = |i: usize| match ts[i] {
+                            ExprType::Int => true,
+                            ExprType::Numeric => args[i].result_scale(descs) == Some(0),
+                            _ => false,
+                        };
+                        if (0..ts.len()).all(integral) {
                             Some(ExprType::Int)
                         } else {
                             None
@@ -82981,7 +83267,10 @@ impl Expr {
                 }
                 match f {
                     SysFn::DateAdd(unit) => {
-                        let amount = fn_int(&vs[0])?;
+                        let amount = arg_int64(
+                            &vs[0],
+                            if matches!(unit, ExtractPart::Millisecond) { 1 } else { 0 },
+                        )?;
                         // The tz variants were NOT "type-checked away":
                         // `type_of` accepts every TKind, the zoned ones
                         // included, so this default answered NULL under a
@@ -83355,9 +83644,19 @@ impl Expr {
                         };
                         Value::Int(n as i64)
                     }
+                    // the engine reads FROM as `start - 1` and both
+                    // through MOV_get_long, so a start whose predecessor
+                    // leaves INTEGER - `FROM -2147483648`, `FROM
+                    // 4294967298` - and a FOR past it are 22003 (measured;
+                    // this answered an empty string)
                     SysFn::Substring => {
-                        let len = vs.get(2).map(fn_int).transpose()?;
-                        Value::Text(substring_impl(&fn_text(&vs[0]), fn_int(&vs[1])?, len)?)
+                        let len = vs.get(2).map(arg_long).transpose()?;
+                        let start0 = arg_long(&value_minus_one(&vs[1])?)?;
+                        Value::Text(substring_impl(
+                            &fn_text(&vs[0]),
+                            start0 as i64 + 1,
+                            len.map(i64::from),
+                        )?)
                     }
                     SysFn::Trim(side) => {
                         // ONE ARGUMENT IS THE SOURCE ALONE and the pad is
@@ -83379,12 +83678,12 @@ impl Expr {
                     // negative-length error NAMES it, probed) - so they
                     // share substring_impl here
                     SysFn::Left => {
-                        let n = fn_int(&vs[1])?;
+                        let n = arg_long(&vs[1])? as i64;
                         Value::Text(substring_impl(&fn_text(&vs[0]), 1, Some(n))?)
                     }
                     SysFn::Right => {
                         let s = fn_text(&vs[0]);
-                        let n = fn_int(&vs[1])?;
+                        let n = arg_long(&vs[1])? as i64;
                         if n < 0 {
                             return Err(EvalErr::InvalidLength(n));
                         }
@@ -83404,8 +83703,8 @@ impl Expr {
                         })
                     }
                     SysFn::Position => {
-                        let start = vs.get(2).map(fn_int).transpose()?.unwrap_or(1);
-                        Value::Int(position_impl(&fn_text(&vs[0]), &fn_text(&vs[1]), start)?)
+                        let start = vs.get(2).map(arg_long).transpose()?.unwrap_or(1);
+                        Value::Int(position_impl(&fn_text(&vs[0]), &fn_text(&vs[1]), start as i64)?)
                     }
                     SysFn::BlobOctetLength => match vs[0] {
                         Value::Blob(rel, num) => {
@@ -83501,23 +83800,41 @@ impl Expr {
                     // taken modulo the result width. A value within i64
                     // shifts in i64 (a BIGINT result, wrap at 64); a wider
                     // value shifts in i128 (an INT128 result, wrap at 128).
+                    // a NEGATIVE count is evlBinShift's domain error
+                    // (measured: BIN_SHL(1, -1) raises where this
+                    // answered -9223372036854775808); the count is
+                    // MOV_get_int64's, so a huge one still shifts
                     SysFn::BinShl | SysFn::BinShr => {
-                        let amt = fn_int(&vs[1])? as u32;
+                        let amt = arg_int64(&vs[1], 0)?;
+                        if amt < 0 {
+                            return Err(EvalErr::MathDomain {
+                                func: if matches!(f, SysFn::BinShl) { "BIN_SHL" } else { "BIN_SHR" },
+                                code: GDS_SYSF_ARG_NONNEG,
+                            });
+                        }
+                        // evlBinShift2 takes the count as a C `int`
+                        // (its low 32 bits) and shifts by the operand's
+                        // TYPE, not its value: an INT64 wraps the count
+                        // at 64, an INT128 (ttmath) pushes every bit out
+                        // for a count past 127 or a negative int - 0, or
+                        // the sign for a right shift (measured: BIN_SHL(
+                        // CAST(1 AS INT128), 64) is 2^64, at 128 it is 0,
+                        // at 4294967295 it is 0; this shifted a small
+                        // INT128 as an INT64)
+                        let amt = amt as u32;
                         let (raw, scale) =
                             numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError(None))?;
                         let val = round_scaled_to_int(raw, scale);
                         let shl = matches!(f, SysFn::BinShl);
-                        let result = match i64::try_from(val) {
-                            Ok(v) => {
-                                (if shl { v.wrapping_shl(amt) } else { v.wrapping_shr(amt) }) as i128
-                            }
-                            Err(_) => {
-                                if shl {
-                                    val.wrapping_shl(amt)
-                                } else {
-                                    val.wrapping_shr(amt)
-                                }
-                            }
+                        let result = if !matches!(vs[0], Value::Int128(..)) {
+                            let v = val as i64;
+                            (if shl { v.wrapping_shl(amt) } else { v.wrapping_shr(amt) }) as i128
+                        } else if amt as i32 >= 0 && amt < 128 {
+                            if shl { val << amt } else { val >> amt }
+                        } else if shl || val >= 0 {
+                            0
+                        } else {
+                            -1
                         };
                         scaled_value(result, 0)
                     }
@@ -83713,8 +84030,17 @@ impl Expr {
                         Value::Double(x.acos())
                     }
                     SysFn::Atan => Value::Double(fn_f64(&vs[0])?.atan()),
+                    // atan2(0, 0) is the engine's own refusal, either
+                    // zero signed (measured: ATAN2(-0e0, 0) raises too)
                     SysFn::Atan2 => {
-                        Value::Double(fn_f64(&vs[0])?.atan2(fn_f64(&vs[1])?))
+                        let (y, x) = (fn_f64(&vs[0])?, fn_f64(&vs[1])?);
+                        if y == 0.0 && x == 0.0 {
+                            return Err(EvalErr::MathDomain {
+                                func: "ATAN2",
+                                code: GDS_SYSF_BOTH_ZERO,
+                            });
+                        }
+                        Value::Double(y.atan2(x))
                     }
                     SysFn::Sinh => fin_dbl_named(fn_f64(&vs[0])?.sinh(), "SINH")?,
                     SysFn::Cosh => fin_dbl_named(fn_f64(&vs[0])?.cosh(), "COSH")?,
@@ -83744,7 +84070,7 @@ impl Expr {
                                 RndMode::Ceil => Value::Double(x.ceil()),
                                 RndMode::Floor => Value::Double(x.floor()),
                                 RndMode::Round => {
-                                    let places = round_places(vs.get(1))?;
+                                    let places = round_places(vs.get(1), "ROUND")?;
                                     let eps = if matches!(v, Value::Float(_)) {
                                         1e-5
                                     } else {
@@ -83761,7 +84087,7 @@ impl Expr {
                                     round_double(x, -places, eps)?
                                 }
                                 RndMode::Trunc => {
-                                    trunc_double(x, round_places(vs.get(1))?)
+                                    trunc_double(x, round_places(vs.get(1), "TRUNC")?)
                                 }
                             }
                         } else {
@@ -83769,14 +84095,23 @@ impl Expr {
                                 numeric_parts(v).ok_or(EvalErr::ConversionError(None))?;
                             let (rraw, rscale) = if vs.len() > 1 {
                                 // 2-arg: keep the operand scale, round n places
-                                let n = round_places(vs.get(1))?;
+                                let n = round_places(
+                                    vs.get(1),
+                                    if matches!(mode, RndMode::Round) { "ROUND" } else { "TRUNC" },
+                                )?;
                                 let drop = (-(scale as i32)) - n;
                                 if drop <= 0 {
                                     (raw, scale)
                                 } else {
-                                    let div = pow10_i128(drop as u32)
-                                        .ok_or(EvalErr::NumericOutOfRange)?;
-                                    (rounded_q(raw, div, mode) * div, scale)
+                                    // dropping more digits than an i128
+                                    // holds leaves nothing: the engine's
+                                    // repeated /10 answers 0 (measured:
+                                    // TRUNC(123, -100) and ROUND(123,
+                                    // -100) are 0, where this raised 22003)
+                                    match pow10_i128(drop as u32) {
+                                        Some(div) => (rounded_q(raw, div, mode) * div, scale),
+                                        None => (0, scale),
+                                    }
                                 }
                             } else {
                                 // 1-arg: to an integer (scale 0)
@@ -83798,14 +84133,33 @@ impl Expr {
                             scaled_value(rraw, rscale)
                         }
                     }
+                    // evlPad: the length through MOV_get_long (22003 past
+                    // INTEGER), a negative one is the numbered argument
+                    // error, and a result past MAX_STR_SIZE (65535 bytes)
+                    // in the SOURCE's bytes-per-character - which
+                    // resolution appends as a 4th argument when it is not
+                    // 1 - is 54000 (measured: LPAD('abc', 65536 + 0) and
+                    // a UTF8 source's 16384; this answered the string, and
+                    // `LPAD('abc', -1)` raised SUBSTRING's 22011)
                     SysFn::Lpad | SysFn::Rpad => {
+                        let lpad = matches!(f, SysFn::Lpad);
+                        let n = arg_long(&vs[1])?;
+                        if n < 0 {
+                            return Err(EvalErr::ArgDomain {
+                                func: if lpad { "LPAD" } else { "RPAD" },
+                                argno: 2,
+                                code: GDS_SYSF_ARGN_NONNEG,
+                            });
+                        }
+                        let bpc = match vs.get(3) {
+                            Some(Value::Int(b)) if *b > 0 => *b,
+                            _ => 1,
+                        };
+                        if n as i64 > 65535 / bpc {
+                            return Err(EvalErr::ImplementationLimit);
+                        }
                         let pad = vs.get(2).map(fn_text).unwrap_or_else(|| " ".into());
-                        Value::Text(pad_impl(
-                            matches!(f, SysFn::Lpad),
-                            &fn_text(&vs[0]),
-                            fn_int(&vs[1])?,
-                            &pad,
-                        )?)
+                        Value::Text(pad_impl(lpad, &fn_text(&vs[0]), n as i64, &pad)?)
                     }
                 }
             }
@@ -118448,7 +118802,13 @@ mod tests {
         assert!(matches!(ev("POSITION('l', NAME, 99)"), Value::Int(0)));
         assert!(matches!(ev("POSITION('', NAME, 3)"), Value::Int(3)));
         assert!(matches!(ev("POSITION('', NAME, 99)"), Value::Int(0)));
-        assert!(matches!(ev_err("POSITION('l', NAME, 0)"), EvalErr::InvalidLength(0)));
+        // POSITION's own numbered 42000, not SUBSTRING's 22011 (measured)
+        assert!(matches!(
+            ev_err("POSITION('l', NAME, 0)"),
+            EvalErr::ArgDomain { func: "POSITION", argno: 3, .. }
+        ));
+        // a start past INTEGER is 22003, never a wrapped count
+        assert!(matches!(ev_err("POSITION('l', NAME, 4294967297)"), EvalErr::NumericOutOfRange));
 
         txt("REVERSE(NAME)", "olleH");
         txt("REVERSE(A)", "7-");
@@ -118492,7 +118852,12 @@ mod tests {
         txt("RPAD(NAME, 9, 'ab')", "Helloabab");
         txt("LPAD('ab', 5, '')", "ab");
         txt("LPAD(A, 6, '0')", "0000-7");
-        assert!(matches!(ev_err("LPAD(NAME, -1)"), EvalErr::InvalidLength(-1)));
+        // LPAD's own numbered 42000 (measured), and 54000 past 65535
+        assert!(matches!(
+            ev_err("LPAD(NAME, -1)"),
+            EvalErr::ArgDomain { func: "LPAD", argno: 2, .. }
+        ));
+        assert!(matches!(ev_err("RPAD(NAME, 65536)"), EvalErr::ImplementationLimit));
 
         // NULL propagates through every one of them
         let null_row = vec![Value::Null; 5];
@@ -118766,6 +119131,31 @@ mod tests {
         ));
         // out of the engine's date range raises
         assert!(dateadd_impl(ExtractPart::Year, 9000, day(2024, 1, 1), 0, TKind::Date, 0).is_err());
+        // a quantity past the part's bound raises - it wrapped to a date
+        // (measured: YEAR 4294967296 is 22008 valid dates on the engine)
+        assert!(matches!(
+            dateadd_impl(ExtractPart::Year, 4_294_967_296, day(2024, 1, 1), 0, TKind::Date, 0),
+            Err(EvalErr::DateRange)
+        ));
+        assert!(matches!(
+            dateadd_impl(ExtractPart::Minute, 2, day(9999, 12, 31), 23 * 36_000_000 + 59 * 600_000, TKind::Timestamp, 0),
+            Err(EvalErr::DatetimeRange)
+        ));
+        // Feb 29 forward into a non-leap year: the month's last day
+        assert!(matches!(
+            dateadd_impl(ExtractPart::Month, 13, day(2024, 2, 29), 0, TKind::Date, 0),
+            Ok(Value::Date(d)) if d == day(2025, 3, 31)
+        ));
+        // MILLISECOND amounts are 100us units: 5 is half a millisecond
+        assert!(matches!(
+            dateadd_impl(ExtractPart::Millisecond, 5, 0, 0, TKind::Time, 0),
+            Ok(Value::Time(5))
+        ));
+        // a DATE truncates a clock amount toward zero
+        assert!(matches!(
+            dateadd_impl(ExtractPart::Hour, -25, day(2024, 1, 1), 0, TKind::Date, 0),
+            Ok(Value::Date(d)) if d == day(2023, 12, 31)
+        ));
 
         // DATEDIFF: calendar components for YEAR/MONTH, truncating
         // day-diff/7 for WEEK, boundary crossings for the clock units,
