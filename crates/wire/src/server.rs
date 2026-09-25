@@ -31962,6 +31962,14 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     if let Some(sel) = find_word(&masked, "SELECT", into + "INTO".len()) {
         let vals = find_word(&masked, "VALUES", into + "INTO".len());
         if vals.is_none_or(|v| sel < v) {
+            // the source query's FIRST/SKIP beside ROWS is the engine's
+            // -104 here too (measured: `insert into t3 select first 1 id,
+            // 'q' from t1 rows 1` refuses and inserts nothing - this
+            // inserted the one row ROWS let through). Only that verdict
+            // is taken: a Token unknown's position would be the slice's
+            if let Some(EvalErr::FirstSkipRows) = limit_clause_lint(&s[sel..]) {
+                return Some((Plan::RefusedEval(EvalErr::FirstSkipRows), Vec::new()));
+            }
             return plan_insert_select(s, &masked, into, sel, db);
         }
     }
@@ -43831,7 +43839,21 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
             false
         }
     });
-    let out = plan_query_outer(sql, db);
+    // the limit-clause grammar around UNION is the PARSER's, so it is
+    // judged on the text as sent, before any rewrite ([limit_clause_lint])
+    let lint = if outermost { limit_clause_lint(sql) } else { None };
+    let out = match lint {
+        // a relation the FROM cannot resolve outranks the FIRST/SKIP
+        // check (measured: `select first 1 id from nosuch rows 2` is the
+        // -204), so that statement plans on and meets its own refusal
+        Some(EvalErr::FirstSkipRows)
+            if db.as_ref().is_some_and(|d| first_unknown_relation(sql, d).is_some()) =>
+        {
+            plan_query_outer(sql, db)
+        }
+        Some(e) => (Plan::RefusedEval(e), Vec::new()),
+        None => plan_query_outer(sql, db),
+    };
     if outermost {
         STMT_TEXT.with(|t| *t.borrow_mut() = None);
     }
@@ -47950,6 +47972,224 @@ fn with_first_rows(sql: String) -> String {
     }
 }
 
+/// The limit-clause GRAMMAR the engine's parser enforces around UNION,
+/// checked once on the statement AS THE CLIENT SENT IT, before planning.
+///
+/// Measured on 2182, all -104 at PREPARE:
+/// - a UNION member that is not the last may carry no ORDER BY, ROWS,
+///   OFFSET or FETCH: those belong to the whole query expression, so the
+///   parser stops at the UNION that follows them - `select id from t1
+///   order by v union select id from t2` is *Token unknown - line 1,
+///   column 30* / `union` (the token as written, `UNION` when written so).
+///   This server split the text on UNION and answered all six rows.
+/// - ROWS and OFFSET/FETCH are two spellings of ONE slot: after `ROWS n
+///   [TO m]` an OFFSET or FETCH is the unknown token, after OFFSET/FETCH
+///   a ROWS is, FETCH may not precede OFFSET, and none may repeat or
+///   follow `WITH LOCK` (each measured at the offending keyword).
+/// - FIRST/SKIP in a query spec together with ROWS/OFFSET/FETCH on the
+///   SAME query is *FIRST/SKIP cannot be used with OFFSET/FETCH or ROWS*
+///   (at any depth: a derived table, a scalar or EXISTS subquery, a CTE's
+///   main query), where this server let the ROWS clause win. It is NOT
+///   an error across a UNION: `select first 2 a from t1 union all select
+///   x from t2 rows 3` answers 10,20,5 - the FIRST is its member's, the
+///   ROWS the union's. The check is semantic, after the FROM is resolved
+///   (an unknown table's -204 wins, an unknown column does not), so the
+///   caller lets a statement naming an unknown relation plan on.
+///
+/// The column is counted in BYTES, as the engine's lexer counts it
+/// (measured: three two-byte letters in a literal ahead of the UNION move
+/// it to 38 where characters would say 35). A syntax error the parser
+/// would meet EARLIER in the text is outside this check; the earliest of
+/// the ones it finds is the one reported.
+fn limit_clause_lint(sql: &str) -> Option<EvalErr> {
+    // tokens: (byte start, byte end, depth); strings, delimited names and
+    // comments are single opaque tokens or skipped, never searched
+    let b = sql.as_bytes();
+    let mut toks: Vec<(usize, usize, i32)> = Vec::new();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
+                i += 1;
+            }
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+        } else if c == b'\'' || c == b'"' {
+            let st = i;
+            i += 1;
+            while i < b.len() {
+                if b[i] == c {
+                    if b.get(i + 1) == Some(&c) {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i = (i + 1).min(b.len());
+            toks.push((st, i, depth));
+        } else if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80 {
+            let st = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] >= 0x80) {
+                i += 1;
+            }
+            toks.push((st, i, depth));
+        } else {
+            if c == b')' {
+                depth -= 1;
+            }
+            toks.push((i, i + 1, depth));
+            if c == b'(' {
+                depth += 1;
+            }
+            i += 1;
+        }
+    }
+    let word = |t: &(usize, usize, i32)| sql[t.0..t.1].to_ascii_uppercase();
+    // A line ends on CR, LF or CRLF (once), as [line_col_of] counts it.
+    // The column is the lexer's BYTE offset in the text as the CLIENT
+    // encoded it, which this decoded string is not: under a single-byte
+    // (or NONE) attachment every character was one byte, under UTF8 /
+    // UNICODE_FSS it is its UTF-8 length. Any other multi-byte set with a
+    // non-ASCII character ahead of the token has no width known here,
+    // and that position is not invented (`col` 0 marks it).
+    let att = AttCs::by_id(CURRENT_ATT_CS.with(|c| c.get()));
+    let tok_err = |t: &(usize, usize, i32)| {
+        let (mut line, mut col, mut after_cr) = (1i64, 1i64, false);
+        let mut unknown_width = false;
+        for ch in sql[..t.0].chars() {
+            match ch {
+                '\r' => (line, col) = (line + 1, 1),
+                '\n' if after_cr => {}
+                '\n' => (line, col) = (line + 1, 1),
+                c if c.is_ascii() || !att.multibyte => col += 1,
+                c if att.id == 3 || att.id == 4 => col += c.len_utf8() as i64,
+                _ => unknown_width = true,
+            }
+            after_cr = ch == '\r';
+        }
+        (t.0, line, if unknown_width { 0 } else { col }, sql[t.0..t.1].to_string())
+    };
+    let mut first_err: Option<(usize, i64, i64, String)> = None;
+    let mut note = |e: (usize, i64, i64, String)| {
+        if first_err.as_ref().map_or(true, |f| e.0 < f.0) {
+            first_err = Some(e);
+        }
+    };
+    let mut firstskip = false;
+    // every LEVEL: the top one and each parenthesised group, as the
+    // indices of the tokens directly inside it
+    let mut levels: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut stack: Vec<usize> = vec![0];
+    for (k, t) in toks.iter().enumerate() {
+        let s = &sql[t.0..t.1];
+        if s == ")" {
+            if stack.len() == 1 {
+                return None; // unbalanced: not this check's to report
+            }
+            stack.pop();
+        }
+        // a bracket belongs to the level OUTSIDE the group it delimits
+        levels[*stack.last()?].push(k);
+        if s == "(" {
+            levels.push(Vec::new());
+            stack.push(levels.len() - 1);
+        }
+    }
+    for lv in &levels {
+        // a query level starts with SELECT or WITH; anything else (an
+        // argument list, an IN list, the statement of a DML) is skipped
+        let Some(&f) = lv.first() else { continue };
+        let fw = word(&toks[f]);
+        if fw != "SELECT" && fw != "WITH" {
+            continue;
+        }
+        let words: Vec<(usize, String)> = lv.iter().map(|&k| (k, word(&toks[k]))).collect();
+        let Some(q0) = words.iter().position(|(_, w)| w == "SELECT") else { continue };
+        // members, split on this level's UNIONs
+        let mut members: Vec<(usize, usize)> = Vec::new(); // [start, end) into words
+        let mut st = q0;
+        for (j, (_, w)) in words.iter().enumerate().skip(q0) {
+            if w == "UNION" {
+                members.push((st, j));
+                st = j + 1;
+            }
+        }
+        members.push((st, words.len()));
+        let union = members.len() > 1;
+        for (mi, &(ms, me)) in members.iter().enumerate() {
+            let (mut rows, mut offset, mut fetch, mut locked) = (false, false, false, false);
+            let mut unit = false;
+            let mut limited = false;
+            for j in ms..me {
+                let (k, w) = (&words[j].0, words[j].1.as_str());
+                match w {
+                    "ORDER" => limited = true,
+                    "LOCK" if j > ms && words[j - 1].1 == "WITH" => locked = true,
+                    "OFFSET" => {
+                        if rows || offset || fetch || locked {
+                            note(tok_err(&toks[*k]));
+                        }
+                        offset = true;
+                        unit = true;
+                        limited = true;
+                    }
+                    "FETCH" => {
+                        if rows || fetch || locked {
+                            note(tok_err(&toks[*k]));
+                        }
+                        fetch = true;
+                        unit = true;
+                        limited = true;
+                    }
+                    "ROW" | "ROWS" if unit => unit = false,
+                    "ROWS" => {
+                        if rows || offset || fetch || locked {
+                            note(tok_err(&toks[*k]));
+                        }
+                        rows = true;
+                        limited = true;
+                    }
+                    _ => {}
+                }
+            }
+            if limited && mi + 1 < members.len() {
+                note(tok_err(&toks[words[me].0]));
+            }
+            if !union && (rows || offset || fetch) {
+                // FIRST / SKIP in THIS query spec's head, followed by a
+                // value (not a column that happens to be named so)
+                let head = |j: usize| words.get(j).map(|(_, w)| w.as_str());
+                let val = |j: usize| {
+                    words.get(j).is_some_and(|(k, w)| {
+                        w == "(" || w == "?" || w == ":" || sql[toks[*k].0..toks[*k].1].bytes().all(|c| c.is_ascii_digit())
+                    })
+                };
+                let (h1, h2) = (ms + 1, ms + 2);
+                if matches!(head(h1), Some("FIRST" | "SKIP")) && val(h2) {
+                    firstskip = true;
+                }
+            }
+        }
+    }
+    if let Some((_, line, col, token)) = first_err {
+        if col == 0 {
+            return Some(EvalErr::Unsupported);
+        }
+        return Some(EvalErr::TokenUnknown { line, col, token });
+    }
+    firstskip.then_some(EvalErr::FirstSkipRows)
+}
+
 /// Pull the result modifiers off a SELECT.
 ///
 /// THE ENGINE'S GRAMMAR IS `SELECT [FIRST m] [SKIP n] [DISTINCT|ALL]
@@ -48015,7 +48255,15 @@ fn strip_modifiers(sql: &str) -> Option<(String, bool, usize, Option<usize>, boo
         }
         Some((d.parse().ok()?, lead + consumed))
     };
-    let (mut w, mut lead) = word_at(at);
+    // A UNION'S HEAD IS ITS FIRST MEMBER'S. `SELECT FIRST 2 A FROM T1
+    // UNION ALL SELECT X FROM T2` limits T1's rows to two and keeps all of
+    // T2's (measured: 10,20,5,6,<null>,8,9,10 - and the same eight, sorted,
+    // under a trailing ORDER BY). Read as the statement's own FIRST it cut
+    // the whole union to two rows. Only the TAIL (ROWS / OFFSET / FETCH)
+    // belongs to the union; the member keeps its head and is stripped
+    // when [plan_union] plans it as a query of its own.
+    let union = split_union(s).is_some();
+    let (mut w, mut lead) = if union { (String::new(), at) } else { word_at(at) };
     if w == "FIRST" {
         let (n, end) = num_after(lead + w.len())?;
         take = Some(n);
@@ -48025,9 +48273,11 @@ fn strip_modifiers(sql: &str) -> Option<(String, bool, usize, Option<usize>, boo
         w = nx.0;
         lead = nx.1;
     }
+    let mut head_skip = false;
     if w == "SKIP" {
         let (n, end) = num_after(lead + w.len())?;
         skip = n;
+        head_skip = true;
         found = true;
         at = end;
         let nx = word_at(at);
@@ -48050,6 +48300,7 @@ fn strip_modifiers(sql: &str) -> Option<(String, bool, usize, Option<usize>, boo
     // anything of ours appearing AFTER its slot is out of order
     let out_of_order = matches!(w.as_str(), "FIRST" | "SKIP" | "DISTINCT");
     let head_end = at;
+    let head_limit = take.is_some() || head_skip;
 
     // a trailing ROWS n [TO m] - one word, so find_word not find_kw_by
     let mut tail_end = s.len();
@@ -48060,8 +48311,9 @@ fn strip_modifiers(sql: &str) -> Option<(String, bool, usize, Option<usize>, boo
     // [<n>] ROW|ROWS ONLY`, or both in that order (OFFSET then FETCH ->
     // skip then take). WITH TIES and PERCENT are not this engine's (both
     // -104); a `?` count is not this slice.
-    let off_kw = find_word(&up, "OFFSET", 0);
-    let fetch_kw = find_word(&up, "FETCH", 0);
+    // AT DEPTH 0 ONLY: a subquery's own clause is not this query's
+    let off_kw = find_word_depth0(&up, "OFFSET", 0);
+    let fetch_kw = find_word_depth0(&up, "FETCH", 0);
     if off_kw.is_some() || fetch_kw.is_some() {
         if let (Some(o), Some(f)) = (off_kw, fetch_kw) {
             if o > f {
@@ -48103,7 +48355,7 @@ fn strip_modifiers(sql: &str) -> Option<(String, bool, usize, Option<usize>, boo
         }
         found = true;
         tail_end = off_kw.into_iter().chain(fetch_kw).min().unwrap_or(s.len());
-    } else if let Some(kw) = find_word(&up, "ROWS", 0) {
+    } else if let Some(kw) = find_word_depth0(&up, "ROWS", 0) {
         let spec = s[kw + "ROWS".len()..].trim();
         let mut it = spec.split_whitespace();
         let n: usize = it.next()?.parse().ok()?;
@@ -48128,12 +48380,18 @@ fn strip_modifiers(sql: &str) -> Option<(String, bool, usize, Option<usize>, boo
     if !found && !out_of_order {
         return None;
     }
+    // FIRST/SKIP BESIDE ROWS/OFFSET/FETCH is the engine's -104 (measured:
+    // `select first 1 id from t1 order by id rows 3`), which
+    // [limit_clause_lint] raises for a statement; a query reaching here
+    // some other way refuses rather than letting the tail win, as this
+    // did (1,2,3 where the engine has no rows to give)
+    let tail = tail_end < s.len();
     Some((
         format!("SELECT {}", s[head_end..tail_end].trim()),
         distinct,
         skip,
         take,
-        out_of_order,
+        out_of_order || (head_limit && tail),
     ))
 }
 
@@ -50833,7 +51091,12 @@ fn plan_query_inner_at(
                     take,
                 });
             }
-            let (mut cur, modifiers) = match strip_modifiers(&main) {
+            // a UNION main keeps its tail (ROWS/OFFSET/FETCH) in place:
+            // the modifiers are put back below as a HEAD, which on a
+            // union is its first member's and would limit only that
+            // member ([strip_modifiers])
+            let stripped = if split_union(&main).is_some() { None } else { strip_modifiers(&main) };
+            let (mut cur, modifiers) = match stripped {
                 Some((inner, distinct, skip, take, bad)) if !bad => {
                     (inner, Some((distinct, skip, take)))
                 }
@@ -61303,6 +61566,13 @@ const GDS_EDS_OUTPUT_PRM_MISMATCH: i32 = 335544928;
 /// `isc_command_end_err2` (JRD 531) - "Unexpected end of command - line
 /// @1, column @2", which an empty statement text reaches at once
 const GDS_COMMAND_END_ERR2: i32 = 335544851;
+/// `isc_dsql_token_unk_err` (JRD 634) - "Token unknown - line @1, column
+/// @2", the parser's yyerror, always followed by the token as an
+/// `isc_random` string item
+const GDS_DSQL_TOKEN_UNK_ERR: i32 = 335544634;
+/// `isc_dsql_firstskip_rows` (DSQL 271) - "FIRST/SKIP cannot be used
+/// with OFFSET/FETCH or ROWS"
+const GDS_DSQL_FIRSTSKIP_ROWS: i32 = 336397327;
 
 /// isc_exception_integer_overflow - "Integer overflow. The result of an
 /// integer operation caused the most significant bit of the result to
@@ -62202,6 +62472,34 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(GDS_ILLEGAL_PRC_TYPE)
                 .int(2) // isc_arg_string - PRE-QUOTED "SCHEMA"."NAME"
                 .bytes(procedure.as_bytes());
+        }
+        EvalErr::TokenUnknown { line, col, token } => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1) // isc_arg_gds
+                .int(GDS_DSQL_TOKEN_UNK_ERR)
+                .int(ISC_ARG_NUMBER)
+                .int(*line as i32)
+                .int(ISC_ARG_NUMBER)
+                .int(*col as i32)
+                .int(1) // isc_arg_gds
+                .int(GDS_RANDOM)
+                .int(2) // isc_arg_string
+                .bytes(token.as_bytes());
+        }
+        EvalErr::FirstSkipRows => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1) // isc_arg_gds
+                .int(GDS_DSQL_FIRSTSKIP_ROWS);
         }
         EvalErr::ProcNoOutputs { procedure, line, col } => {
             w.int(1) // isc_arg_gds
@@ -75628,6 +75926,15 @@ enum EvalErr {
     /// 1-based position of the FROM ITEM in the ORIGINAL statement text,
     /// so this variant is only ever built from un-rewritten SQL
     ProcNoOutputs { procedure: String, line: i64, col: i64 },
+    /// The PARSER's `-104 Token unknown - line @1, column @2` + the token
+    /// as written (`isc_dsql_error` + `isc_sqlerr`(-104) +
+    /// `isc_dsql_token_unk_err` + `isc_random`). Built only by
+    /// [limit_clause_lint] from the statement text as the client sent
+    /// it; `col` counts BYTES, as the engine's lexer does.
+    TokenUnknown { line: i64, col: i64, token: String },
+    /// `-104 FIRST/SKIP cannot be used with OFFSET/FETCH or ROWS`
+    /// (`isc_dsql_error` + `isc_sqlerr`(-104) + `isc_dsql_firstskip_rows`)
+    FirstSkipRows,
     /// A QUALIFIED relation reference that names no relation reachable
     /// under that schema: the engine's -204 "Table unknown"
     /// (`isc_dsql_error` + `isc_sqlerr`(-204) + `isc_dsql_relation_err`
@@ -127679,6 +127986,44 @@ mod tests {
         // not this slice
         assert!(strip_modifiers("SELECT FIRST (?) X FROM T").is_none());
         assert!(strip_modifiers("SELECT FIRST (1+1) X FROM T").is_none());
+    }
+
+    /// A union's head is its first member's: only the tail is stripped,
+    /// and FIRST beside ROWS on one query refuses instead of the tail
+    /// winning.
+    #[test]
+    fn strip_modifiers_leaves_a_members_first_and_refuses_first_with_rows() {
+        assert!(strip_modifiers("SELECT FIRST 2 A FROM T1 UNION ALL SELECT X FROM T2").is_none());
+        let (inner, _, skip, take, bad) =
+            strip_modifiers("SELECT FIRST 2 A FROM T1 UNION ALL SELECT X FROM T2 ROWS 3").unwrap();
+        assert_eq!(inner, "SELECT FIRST 2 A FROM T1 UNION ALL SELECT X FROM T2");
+        assert_eq!((skip, take, bad), (0, Some(3), false));
+        assert!(strip_modifiers("SELECT FIRST 1 ID FROM T ROWS 3").unwrap().4);
+        assert!(strip_modifiers("SELECT SKIP 1 ID FROM T OFFSET 1 ROWS").unwrap().4);
+        // a subquery's ROWS is not this query's
+        assert!(strip_modifiers("SELECT FIRST 1 ID FROM T WHERE ID IN (SELECT ID FROM U ROWS 2)").is_some_and(|m| !m.4));
+    }
+
+    /// The parser's limit-clause grammar, positions as measured on 2182.
+    #[test]
+    fn limit_clause_lint_matches_the_engines_parser() {
+        let tok = |sql: &str| match limit_clause_lint(sql) {
+            Some(EvalErr::TokenUnknown { line, col, token }) => Some((line, col, token)),
+            _ => None,
+        };
+        assert_eq!(tok("select id from t1 order by v union select id from t2"), Some((1, 30, "union".into())));
+        assert_eq!(tok("select id from t1\norder by v\nUNION select id from t2"), Some((3, 1, "UNION".into())));
+        assert_eq!(tok("select id from t1 order by id rows 3 offset 1 rows"), Some((1, 38, "offset".into())));
+        assert_eq!(tok("select id from t1 order by id offset 1 rows rows 2"), Some((1, 45, "rows".into())));
+        assert_eq!(tok("select id, 'union' from t1 order by v union select id, 'x' from t2"), Some((1, 39, "union".into())));
+        assert_eq!(limit_clause_lint("select first 1 id from t1 rows 3"), Some(EvalErr::FirstSkipRows));
+        assert_eq!(limit_clause_lint("select (select first 1 id from t2 rows 1) from t1"), Some(EvalErr::FirstSkipRows));
+        // a member's FIRST beside the union's ROWS, OFFSET then FETCH, a
+        // window's ORDER BY, and a column named FIRST are all fine
+        assert_eq!(limit_clause_lint("select first 2 a from t1 union all select x from t2 rows 3"), None);
+        assert_eq!(limit_clause_lint("select id from t1 order by id offset 1 row fetch next 2 rows only"), None);
+        assert_eq!(limit_clause_lint("select row_number() over (order by id) from t1 union select 1 from t2"), None);
+        assert_eq!(limit_clause_lint("select first from t1 rows 2"), None);
     }
 
     /// A generator may be named with its schema; the two this server
