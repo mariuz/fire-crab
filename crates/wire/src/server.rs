@@ -31965,9 +31965,12 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             // the source query's FIRST/SKIP beside ROWS is the engine's
             // -104 here too (measured: `insert into t3 select first 1 id,
             // 'q' from t1 rows 1` refuses and inserts nothing - this
-            // inserted the one row ROWS let through). Only that verdict
-            // is taken: a Token unknown's position would be the slice's
-            if let Some(EvalErr::FirstSkipRows) = limit_clause_lint(&s[sel..]) {
+            // inserted the one row ROWS let through). A client's prepare
+            // has linted the whole statement already; this is for the
+            // paths that come here without one (a PSQL body), and takes
+            // only the position-free verdict - still after an unknown
+            // FROM item the engine resolves first ([LimitLint::unknown])
+            if let Some(EvalErr::FirstSkipRows) = limit_lint_scan_db(&s[sel..], db).err {
                 return Some((Plan::RefusedEval(EvalErr::FirstSkipRows), Vec::new()));
             }
             return plan_insert_select(s, &masked, into, sel, db);
@@ -43587,6 +43590,14 @@ fn with_lock_verdict(sql: &str, db: &Option<Database>) -> WithLockVerdict {
 fn with_lock_one_bad(sql: &str, db: &Option<Database>) -> Option<EvalErr> {
     let simple = || Some(EvalErr::WithLock { code: GDS_WLOCK_SIMPLE, what: None });
     let aggregates = || Some(EvalErr::WithLock { code: GDS_WLOCK_AGGREGATES, what: None });
+    // A ROWS / OFFSET / FETCH TAIL says nothing about what is locked.
+    // Measured: `select id from t1 rows 2 with lock` answers 1,2 (and
+    // `count(*) .. rows 1 with lock` is the aggregates message, `distinct
+    // .. rows 1` the DISTINCT one), where this read `T1 ROWS 2` as the
+    // FROM and refused every one as not a single physical table
+    let upm = mask_literals(&sql.to_ascii_uppercase());
+    let tail = ["ROWS", "OFFSET", "FETCH"].iter().filter_map(|w| find_word_depth0(&upm, w, 0)).min();
+    let sql = tail.map_or(sql, |t| sql[..t].trim_end());
     // not a plain SELECT at all (a CTE arrives here as its whole `WITH`
     // text) - the engine calls that the single-physical-table rule
     let Some((proj, table_s, _w, group, _h, _o)) = split_query(sql) else {
@@ -43841,17 +43852,19 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     });
     // the limit-clause grammar around UNION is the PARSER's, so it is
     // judged on the text as sent, before any rewrite ([limit_clause_lint])
-    let lint = if outermost { limit_clause_lint(sql) } else { None };
+    let lint = if outermost { Some(limit_lint_scan_db(sql, db)) } else { None };
     let out = match lint {
-        // a relation the FROM cannot resolve outranks the FIRST/SKIP
-        // check (measured: `select first 1 id from nosuch rows 2` is the
-        // -204), so that statement plans on and meets its own refusal
-        Some(EvalErr::FirstSkipRows)
-            if db.as_ref().is_some_and(|d| first_unknown_relation(sql, d).is_some()) =>
-        {
-            plan_query_outer(sql, db)
-        }
-        Some(e) => (Plan::RefusedEval(e), Vec::new()),
+        // a -104, or the -204 of a FROM item the engine resolves before
+        // its FIRST/SKIP check ([LimitLint::unknown])
+        Some(LimitLint { err: Some(e), .. }) => (Plan::RefusedEval(e), Vec::new()),
+        Some(LimitLint { unknown, .. }) => match (plan_query_outer(sql, db), unknown) {
+            // a statement refused BARE that names an unknown relation the
+            // keyword scan of the fallback misses - a comma-joined one:
+            // `select id from t1, nosuch` is the engine's -204 at NOSUCH,
+            // where this refused with a bare Dynamic SQL Error
+            ((Plan::Refused, _), Some(u)) if db.is_some() => (Plan::RefusedEval(u), Vec::new()),
+            (out, _) => out,
+        },
         None => plan_query_outer(sql, db),
     };
     if outermost {
@@ -47965,6 +47978,11 @@ fn with_first_rows(sql: String) -> String {
         return sql;
     }
     let t = sql.trim_start();
+    // a query carrying its own ROWS / OFFSET / FETCH keeps its text: a
+    // FIRST beside them is the -104 [strip_modifiers] refuses
+    if has_limit_tail(t) {
+        return sql;
+    }
     if t.len() >= 7 && t[..7].eq_ignore_ascii_case("SELECT ") {
         format!("SELECT FIRST 1 {}", &t[7..])
     } else {
@@ -47972,29 +47990,47 @@ fn with_first_rows(sql: String) -> String {
     }
 }
 
+/// Does this query carry a depth-0 ROWS / OFFSET / FETCH clause of its
+/// own - the tail a FIRST/SKIP may not be added beside?
+fn has_limit_tail(sql: &str) -> bool {
+    let m = mask_literals(&sql.to_ascii_uppercase());
+    ["ROWS", "OFFSET", "FETCH"].iter().any(|w| find_word_depth0(&m, w, 0).is_some())
+}
+
 /// The limit-clause GRAMMAR the engine's parser enforces around UNION,
 /// checked once on the statement AS THE CLIENT SENT IT, before planning.
 ///
 /// Measured on 2182, all -104 at PREPARE:
 /// - a UNION member that is not the last may carry no ORDER BY, ROWS,
-///   OFFSET or FETCH: those belong to the whole query expression, so the
-///   parser stops at the UNION that follows them - `select id from t1
-///   order by v union select id from t2` is *Token unknown - line 1,
-///   column 30* / `union` (the token as written, `UNION` when written so).
-///   This server split the text on UNION and answered all six rows.
-/// - ROWS and OFFSET/FETCH are two spellings of ONE slot: after `ROWS n
-///   [TO m]` an OFFSET or FETCH is the unknown token, after OFFSET/FETCH
-///   a ROWS is, FETCH may not precede OFFSET, and none may repeat or
-///   follow `WITH LOCK` (each measured at the offending keyword).
+///   OFFSET, FETCH, FOR UPDATE, WITH LOCK or OPTIMIZE FOR: those belong
+///   to the whole query expression, so the parser stops at the UNION that
+///   follows them - `select id from t1 order by v union select id from
+///   t2` is *Token unknown - line 1, column 30* / `union` (the token as
+///   written, `UNION` when written so). This server split the text on
+///   UNION and answered all six rows.
+/// - the tail is ONE sequence, `[ORDER BY] [ROWS | OFFSET/FETCH] [FOR
+///   UPDATE [OF ..]] [WITH LOCK [SKIP LOCKED]] [OPTIMIZE FOR ..]`, each
+///   at most once and in that order: ROWS and OFFSET/FETCH are two
+///   spellings of one slot (after `ROWS n [TO m]` an OFFSET or FETCH is
+///   the unknown token, after OFFSET/FETCH a ROWS is, FETCH may not
+///   precede OFFSET), and a clause after a later one is the unknown
+///   token at its keyword (`for update rows 1` at `rows`, `with lock for
+///   update` at `for`, `rows 1 order by id` at `order`) - where this
+///   answered, ignoring the ROWS.
+/// - FOR UPDATE, WITH LOCK and OPTIMIZE belong to a SELECT STATEMENT
+///   only: in a derived table, a subquery, a CTE body or an INSERT's
+///   source they are the unknown `for` / `with` (OPTIMIZE is no reserved
+///   word there, it reads as an alias and the FOR after it is the error).
 /// - FIRST/SKIP in a query spec together with ROWS/OFFSET/FETCH on the
 ///   SAME query is *FIRST/SKIP cannot be used with OFFSET/FETCH or ROWS*
 ///   (at any depth: a derived table, a scalar or EXISTS subquery, a CTE's
-///   main query), where this server let the ROWS clause win. It is NOT
-///   an error across a UNION: `select first 2 a from t1 union all select
-///   x from t2 rows 3` answers 10,20,5 - the FIRST is its member's, the
-///   ROWS the union's. The check is semantic, after the FROM is resolved
-///   (an unknown table's -204 wins, an unknown column does not), so the
-///   caller lets a statement naming an unknown relation plan on.
+///   main query, an INSERT's source), where this server let the ROWS
+///   clause win. It is NOT an error across a UNION: `select first 2 a
+///   from t1 union all select x from t2 rows 3` answers 10,20,5 - the
+///   FIRST is its member's, the ROWS the union's. The check is semantic
+///   (pass1_rse_impl, right after that spec's FROM is resolved), so a
+///   relation the engine resolves EARLIER outranks it with its -204 -
+///   see [LimitLint::unknown] for which ones those are.
 ///
 /// The column is counted in BYTES, as the engine's lexer counts it
 /// (measured: three two-byte letters in a literal ahead of the UNION move
@@ -48002,11 +48038,58 @@ fn with_first_rows(sql: String) -> String {
 /// would meet EARLIER in the text is outside this check; the earliest of
 /// the ones it finds is the one reported.
 fn limit_clause_lint(sql: &str) -> Option<EvalErr> {
-    // tokens: (byte start, byte end, depth); strings, delimited names and
+    limit_lint_scan(sql, &|_, _| true).err
+}
+
+/// [limit_lint_scan] against the catalogue: a FROM item is known when
+/// it is a table, view, procedure or CTE ([first_unknown_relation]'s
+/// test); with no database every name is taken as known.
+fn limit_lint_scan_db(sql: &str, db: &Option<Database>) -> LimitLint {
+    match db {
+        Some(d) => {
+            let masked = mask_literals(&sql.to_ascii_uppercase());
+            limit_lint_scan(sql, &|name, quoted| {
+                let n = if quoted { name.to_string() } else { name.to_ascii_uppercase() };
+                is_cte_name(&masked, &n) || relation_schema(d, &n).is_some() || procedure_defined(d, &n)
+            })
+        }
+        None => limit_lint_scan(sql, &|_, _| true),
+    }
+}
+
+/// What [limit_lint_scan] found in a statement.
+struct LimitLint {
+    /// the verdict at PREPARE: the parser's Token unknown, else the
+    /// FIRST/SKIP check - or, when a FROM item the engine resolves BEFORE
+    /// that check names no relation, that relation's -204
+    err: Option<EvalErr>,
+    /// the -204 for the unknown FROM item the engine resolves FIRST, for
+    /// a statement this server otherwise refuses bare. Its FROM items are
+    /// read at every query level, comma-joined ones too (`from t1,
+    /// nosuch` is -204 at the NOSUCH on the engine; the keyword scan in
+    /// [first_unknown_relation] sees only the item after FROM / JOIN).
+    ///
+    /// ORDER, measured: pass1_rse_impl resolves a query spec's FROM
+    /// (joins, their ON, derived tables - in text order) FIRST, then
+    /// checks its FIRST/SKIP against ROWS, then the WHERE and the rest.
+    /// So `select first 1 id from t1, nosuch rows 1` is the -204, while
+    /// an unknown table in the WHERE's or the select list's subquery
+    /// loses to the -104 (`select first 1 id from t1 where id in (select
+    /// id from nosuch) rows 1`); a derived table's own FIRST/SKIP with
+    /// ROWS outranks an unknown table later in the same FROM, not one
+    /// before it.
+    unknown: Option<EvalErr>,
+}
+
+/// The scan behind [limit_clause_lint]; `known(name, quoted)` answers
+/// whether a FROM item names a relation.
+fn limit_lint_scan(sql: &str, known: &dyn Fn(&str, bool) -> bool) -> LimitLint {
+    let nothing = || LimitLint { err: None, unknown: None };
+    // tokens: (byte start, byte end); strings, delimited names and
     // comments are single opaque tokens or skipped, never searched
     let b = sql.as_bytes();
-    let mut toks: Vec<(usize, usize, i32)> = Vec::new();
-    let mut depth = 0i32;
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    let mut toks: Vec<(usize, usize)> = Vec::new();
     let mut i = 0usize;
     while i < b.len() {
         let c = b[i];
@@ -48022,6 +48105,30 @@ fn limit_clause_lint(sql: &str) -> Option<EvalErr> {
                 i += 1;
             }
             i = (i + 2).min(b.len());
+        } else if (c == b'q' || c == b'Q')
+            && b.get(i + 1) == Some(&b'\'')
+            && (i == 0 || !is_word(b[i - 1]))
+            && b.get(i + 2).is_some_and(|d| d.is_ascii() && !d.is_ascii_whitespace())
+        {
+            // q'<d>...<d>' - its quotes are not a string's: a `'` inside
+            // one ended a plain string early here and every later word
+            // of a literal read as a keyword (`select q'{'}', ' union '
+            // ...` raised a made-up Token unknown at the `union` inside
+            // a literal)
+            let st = i;
+            let close = match b[i + 2] {
+                b'(' => b')',
+                b'[' => b']',
+                b'{' => b'}',
+                b'<' => b'>',
+                d => d,
+            };
+            i += 3;
+            while i < b.len() && !(b[i] == close && b.get(i + 1) == Some(&b'\'')) {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+            toks.push((st, i));
         } else if c == b'\'' || c == b'"' {
             let st = i;
             i += 1;
@@ -48036,25 +48143,19 @@ fn limit_clause_lint(sql: &str) -> Option<EvalErr> {
                 i += 1;
             }
             i = (i + 1).min(b.len());
-            toks.push((st, i, depth));
-        } else if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80 {
+            toks.push((st, i));
+        } else if is_word(c) {
             let st = i;
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] >= 0x80) {
+            while i < b.len() && is_word(b[i]) {
                 i += 1;
             }
-            toks.push((st, i, depth));
+            toks.push((st, i));
         } else {
-            if c == b')' {
-                depth -= 1;
-            }
-            toks.push((i, i + 1, depth));
-            if c == b'(' {
-                depth += 1;
-            }
+            toks.push((i, i + 1));
             i += 1;
         }
     }
-    let word = |t: &(usize, usize, i32)| sql[t.0..t.1].to_ascii_uppercase();
+    let upw = |k: usize| sql[toks[k].0..toks[k].1].to_ascii_uppercase();
     // A line ends on CR, LF or CRLF (once), as [line_col_of] counts it.
     // The column is the lexer's BYTE offset in the text as the CLIENT
     // encoded it, which this decoded string is not: under a single-byte
@@ -48063,7 +48164,8 @@ fn limit_clause_lint(sql: &str) -> Option<EvalErr> {
     // non-ASCII character ahead of the token has no width known here,
     // and that position is not invented (`col` 0 marks it).
     let att = AttCs::by_id(CURRENT_ATT_CS.with(|c| c.get()));
-    let tok_err = |t: &(usize, usize, i32)| {
+    let tok_err = |k: usize| {
+        let t = toks[k];
         let (mut line, mut col, mut after_cr) = (1i64, 1i64, false);
         let mut unknown_width = false;
         for ch in sql[..t.0].chars() {
@@ -48081,113 +48183,336 @@ fn limit_clause_lint(sql: &str) -> Option<EvalErr> {
     };
     let mut first_err: Option<(usize, i64, i64, String)> = None;
     let mut note = |e: (usize, i64, i64, String)| {
-        if first_err.as_ref().map_or(true, |f| e.0 < f.0) {
+        if first_err.as_ref().is_none_or(|f| e.0 < f.0) {
             first_err = Some(e);
         }
     };
-    let mut firstskip = false;
     // every LEVEL: the top one and each parenthesised group, as the
-    // indices of the tokens directly inside it
+    // indices of the tokens directly inside it, and where it ends (its
+    // closing bracket's byte, or the text's end)
     let mut levels: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut level_end: Vec<usize> = vec![sql.len()];
+    // the token that opens each level (its `(`), none for the top one
+    let mut level_open: Vec<Option<usize>> = vec![None];
     let mut stack: Vec<usize> = vec![0];
-    for (k, t) in toks.iter().enumerate() {
-        let s = &sql[t.0..t.1];
+    for k in 0..toks.len() {
+        let s = &sql[toks[k].0..toks[k].1];
         if s == ")" {
             if stack.len() == 1 {
-                return None; // unbalanced: not this check's to report
+                return nothing(); // unbalanced: not this check's to report
             }
-            stack.pop();
+            let lv = stack.pop().unwrap_or(0);
+            level_end[lv] = toks[k].0;
         }
         // a bracket belongs to the level OUTSIDE the group it delimits
-        levels[*stack.last()?].push(k);
+        let Some(&cur) = stack.last() else { return nothing() };
+        levels[cur].push(k);
         if s == "(" {
             levels.push(Vec::new());
+            level_end.push(sql.len());
+            level_open.push(Some(k));
             stack.push(levels.len() - 1);
         }
     }
-    for lv in &levels {
-        // a query level starts with SELECT or WITH; anything else (an
-        // argument list, an IN list, the statement of a DML) is skipped
+    if stack.len() != 1 {
+        return nothing();
+    }
+    // every query spec seen: its start and end byte, its FROM clause's
+    // span, its WHERE's span and where the WHERE's AND / OR operands
+    // split (see the order key below)
+    struct Spec {
+        start: usize,
+        end: usize,
+        from: (usize, usize),
+        wher: (usize, usize),
+        ops: Vec<usize>,
+    }
+    let mut specs: Vec<Spec> = Vec::new();
+    // bracketed groups that are no query: (open byte, end byte, the byte
+    // of each AND / OR at their own level)
+    let mut groups: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    // the specs with FIRST/SKIP beside ROWS, by index into `specs`
+    let mut firstskip: Vec<usize> = Vec::new();
+    // unknown FROM items: (byte start, byte end, quoted)
+    let mut unknown: Vec<(usize, usize, bool)> = Vec::new();
+    for (li, lv) in levels.iter().enumerate() {
         let Some(&f) = lv.first() else { continue };
-        let fw = word(&toks[f]);
-        if fw != "SELECT" && fw != "WITH" {
-            continue;
+        let words: Vec<String> = lv.iter().map(|&k| upw(k)).collect();
+        // WHICH GRAMMAR: the SELECT statement itself (top level), an
+        // INSERT's source (top level, from its SELECT to any RETURNING)
+        // or a query in brackets. Anything else - an argument list, an
+        // IN list, an UPDATE / DELETE / MERGE with its own ORDER BY and
+        // ROWS - is not a query level
+        let fw = upw(f);
+        #[derive(PartialEq)]
+        enum Kind {
+            Statement,
+            Source,
+            Sub,
         }
-        let words: Vec<(usize, String)> = lv.iter().map(|&k| (k, word(&toks[k]))).collect();
-        let Some(q0) = words.iter().position(|(_, w)| w == "SELECT") else { continue };
+        // a PSQL cursor's query, `DECLARE C CURSOR FOR (SELECT ..)`, is a
+        // SELECT statement of its own: FOR UPDATE is its to carry
+        // (measured: such a cursor over `.. from t1 for update` answers)
+        let cursor = level_open[li].is_some_and(|o| o >= 2 && upw(o - 1) == "FOR" && upw(o - 2) == "CURSOR");
+        let kind = match (li == 0 || cursor, fw.as_str()) {
+            (true, "SELECT" | "WITH") => Kind::Statement,
+            (true, "INSERT") if li == 0 => Kind::Source,
+            (false, "SELECT" | "WITH") => Kind::Sub,
+            _ => {
+                // a bracketed group that is no query: its own AND / OR
+                // operands, for the order key below
+                if let Some(o) = level_open[li] {
+                    let mut ops = Vec::new();
+                    let mut between = false;
+                    for (j, w) in words.iter().enumerate() {
+                        match w.as_str() {
+                            "BETWEEN" => between = true,
+                            "AND" if between => between = false,
+                            "AND" | "OR" => ops.push(toks[lv[j]].0),
+                            _ => {}
+                        }
+                    }
+                    groups.push((toks[o].0, level_end[li], ops));
+                }
+                continue;
+            }
+        };
+        let Some(q0) = words.iter().position(|w| w == "SELECT") else { continue };
+        let q_end = if kind == Kind::Source {
+            words.iter().skip(q0).position(|w| w == "RETURNING").map_or(words.len(), |p| q0 + p)
+        } else {
+            words.len()
+        };
         // members, split on this level's UNIONs
         let mut members: Vec<(usize, usize)> = Vec::new(); // [start, end) into words
         let mut st = q0;
-        for (j, (_, w)) in words.iter().enumerate().skip(q0) {
-            if w == "UNION" {
+        for j in q0..q_end {
+            if words[j] == "UNION" {
                 members.push((st, j));
                 st = j + 1;
             }
         }
-        members.push((st, words.len()));
+        members.push((st, q_end));
         let union = members.len() > 1;
+        let byte_at = |j: usize| if j < lv.len() { toks[lv[j]].0 } else { level_end[li] };
         for (mi, &(ms, me)) in members.iter().enumerate() {
-            let (mut rows, mut offset, mut fetch, mut locked) = (false, false, false, false);
+            let word = |j: usize| if j < me { words[j].as_str() } else { "" };
+            // the TAIL, one clause kind per rank: 1 ORDER BY, 2 ROWS or
+            // OFFSET/FETCH, 3 FOR UPDATE, 4 WITH LOCK, 5 OPTIMIZE FOR
+            let (mut rank, mut rows, mut offset, mut fetch) = (0u8, false, false, false);
+            // words a clause owns (OFFSET n ROW(S), FETCH .. ROW(S) ONLY,
+            // OPTIMIZE FOR FIRST|ALL ROWS) are not clauses themselves
             let mut unit = false;
-            let mut limited = false;
+            let mut skip_to = ms;
+            let mut from_at: Option<usize> = None;
+            let mut from_end: Option<usize> = None;
+            let (mut where_at, mut where_end): (Option<usize>, Option<usize>) = (None, None);
+            let (mut ops, mut between) = (Vec::new(), false);
             for j in ms..me {
-                let (k, w) = (&words[j].0, words[j].1.as_str());
+                if j < skip_to {
+                    continue;
+                }
+                let k = lv[j];
+                let w = words[j].as_str();
+                let clause = match w {
+                    "ORDER" if word(j + 1) == "BY" => Some(1u8),
+                    "ROW" | "ROWS" if unit => {
+                        unit = false;
+                        None
+                    }
+                    "ROWS" | "OFFSET" | "FETCH" => Some(2),
+                    "FOR" if word(j + 1) == "UPDATE" || (j > ms && words[j - 1] == "OPTIMIZE") => {
+                        Some(if word(j + 1) == "UPDATE" { 3 } else { 5 })
+                    }
+                    "WITH" if word(j + 1) == "LOCK" => Some(4),
+                    "OPTIMIZE" if word(j + 1) == "FOR" && kind == Kind::Statement => Some(5),
+                    _ => None,
+                };
+                if from_at.is_none() && w == "FROM" && j > ms && words[j - 1] != "DISTINCT" {
+                    from_at = Some(j);
+                }
+                if from_at.is_some()
+                    && from_end.is_none()
+                    && (clause.is_some()
+                        || matches!(w, "WHERE" | "GROUP" | "HAVING" | "WINDOW" | "PLAN" | "OPTIMIZE"))
+                {
+                    from_end = Some(j);
+                }
+                if where_at.is_some()
+                    && where_end.is_none()
+                    && (clause.is_some() || matches!(w, "GROUP" | "HAVING" | "WINDOW" | "PLAN" | "OPTIMIZE"))
+                {
+                    where_end = Some(j);
+                }
+                if where_at.is_none() && w == "WHERE" {
+                    where_at = Some(j);
+                } else if where_at.is_some() && where_end.is_none() {
+                    // the WHERE's boolean operands at this level - the AND
+                    // of a BETWEEN is not one
+                    match w {
+                        "BETWEEN" => between = true,
+                        "AND" if between => between = false,
+                        "AND" | "OR" => ops.push(toks[k].0),
+                        _ => {}
+                    }
+                }
+                let Some(c) = clause else { continue };
+                // FOR UPDATE / WITH LOCK / OPTIMIZE are the statement's:
+                // in brackets or an INSERT's source the keyword is unknown
+                if c >= 3 && kind != Kind::Statement {
+                    note(tok_err(k));
+                    continue;
+                }
+                let bad = match (c, w) {
+                    (2, "ROWS" | "OFFSET") => rows || offset || fetch || rank > 2,
+                    (2, _) => rows || fetch || rank > 2,
+                    _ => rank >= c,
+                };
+                if bad {
+                    note(tok_err(k));
+                }
+                rank = rank.max(c);
                 match w {
-                    "ORDER" => limited = true,
-                    "LOCK" if j > ms && words[j - 1].1 == "WITH" => locked = true,
-                    "OFFSET" => {
-                        if rows || offset || fetch || locked {
-                            note(tok_err(&toks[*k]));
-                        }
-                        offset = true;
-                        unit = true;
-                        limited = true;
-                    }
-                    "FETCH" => {
-                        if rows || fetch || locked {
-                            note(tok_err(&toks[*k]));
-                        }
-                        fetch = true;
-                        unit = true;
-                        limited = true;
-                    }
-                    "ROW" | "ROWS" if unit => unit = false,
-                    "ROWS" => {
-                        if rows || offset || fetch || locked {
-                            note(tok_err(&toks[*k]));
-                        }
-                        rows = true;
-                        limited = true;
-                    }
+                    "ROWS" => rows = true,
+                    "OFFSET" => (offset, unit) = (true, true),
+                    "FETCH" => (fetch, unit) = (true, true),
+                    // OPTIMIZE FOR FIRST|ALL ROWS owns its three words
+                    "OPTIMIZE" => skip_to = j + 4,
                     _ => {}
                 }
             }
-            if limited && mi + 1 < members.len() {
-                note(tok_err(&toks[words[me].0]));
+            if rank > 0 && mi + 1 < members.len() {
+                note(tok_err(lv[me]));
             }
+            // this member as a query spec, and the items its FROM names
+            let (s0, s1) = (byte_at(ms), byte_at(me));
+            let from_span = match from_at {
+                Some(fa) => (byte_at(fa), byte_at(from_end.unwrap_or(me))),
+                None => (s1, s1),
+            };
+            if let Some(fa) = from_at {
+                let fe = from_end.unwrap_or(me);
+                let mut j = fa + 1;
+                while j < fe {
+                    // an item starts after FROM, a comma or JOIN
+                    let starts = j == fa + 1 || matches!(words[j - 1].as_str(), "," | "JOIN");
+                    let t = toks[lv[j]];
+                    let raw = &sql[t.0..t.1];
+                    let quoted = raw.starts_with('"');
+                    let name_like = quoted || raw.as_bytes().first().is_some_and(|c| is_word(*c) && !c.is_ascii_digit());
+                    // a qualified name (S.T) and a procedure CALL (P(..))
+                    // keep their own paths, as in [first_unknown_relation]
+                    let plain = !matches!(word(j + 1), "." | "(");
+                    if starts && name_like && plain && !(!quoted && words[j] == "LATERAL") {
+                        let (ns, ne) = if quoted { (t.0 + 1, t.1.saturating_sub(1).max(t.0 + 1)) } else { t };
+                        let name = sql[ns..ne].replace("\"\"", "\"");
+                        if !known(&name, quoted) {
+                            unknown.push((ns, ne, quoted));
+                        }
+                    }
+                    j += 1;
+                }
+            }
+            let wher = match where_at {
+                Some(wa) => (byte_at(wa), byte_at(where_end.unwrap_or(me))),
+                None => (s1, s1),
+            };
+            specs.push(Spec { start: s0, end: s1, from: from_span, wher, ops });
             if !union && (rows || offset || fetch) {
                 // FIRST / SKIP in THIS query spec's head, followed by a
                 // value (not a column that happens to be named so)
-                let head = |j: usize| words.get(j).map(|(_, w)| w.as_str());
                 let val = |j: usize| {
-                    words.get(j).is_some_and(|(k, w)| {
-                        w == "(" || w == "?" || w == ":" || sql[toks[*k].0..toks[*k].1].bytes().all(|c| c.is_ascii_digit())
-                    })
+                    j < me && {
+                        let w = words[j].as_str();
+                        w == "(" || w == "?" || w == ":" || w.bytes().all(|c| c.is_ascii_digit())
+                    }
                 };
-                let (h1, h2) = (ms + 1, ms + 2);
-                if matches!(head(h1), Some("FIRST" | "SKIP")) && val(h2) {
-                    firstskip = true;
+                if matches!(word(ms + 1), "FIRST" | "SKIP") && val(ms + 2) {
+                    firstskip.push(specs.len() - 1);
                 }
             }
         }
     }
     if let Some((_, line, col, token)) = first_err {
-        if col == 0 {
-            return Some(EvalErr::Unsupported);
-        }
-        return Some(EvalErr::TokenUnknown { line, col, token });
+        let err = if col == 0 { EvalErr::Unsupported } else { EvalErr::TokenUnknown { line, col, token } };
+        return LimitLint { err: Some(err), unknown: None };
     }
-    firstskip.then_some(EvalErr::FirstSkipRows)
+    // THE ENGINE'S ORDER as a sort key: each enclosing spec, outermost
+    // first, contributes its start and where in it the position is - its
+    // FROM (0, resolved first), its WHERE (2) or the rest (3: the select
+    // list and what follows); the FIRST/SKIP check of a spec sits after
+    // its FROM (1). Inside the WHERE an AND / OR resolves its RIGHT
+    // operand first on this engine build (BinaryBoolNode::dsqlPass hands
+    // both passes to one constructor call, whose arguments GCC evaluates
+    // right to left - measured: `where id in (select first 1 .. rows 1)
+    // and exists (select 1 from nosuch)` is the -204, the same two
+    // operands the other way round the -104), so the operands rank in
+    // reverse - and so do those of a bracketed group inside them (each
+    // group placed by its bracket, then its own reversed operand rank).
+    let rank = |ops: &[usize], p: usize| ops.len() - ops.iter().filter(|&&o| o <= p).count();
+    let enclosing = |p: usize, skip: Option<usize>| {
+        let mut e: Vec<usize> = (0..specs.len())
+            .filter(|&s| Some(s) != skip && specs[s].start <= p && p < specs[s].end)
+            .collect();
+        e.sort_by_key(|&s| specs[s].start);
+        let mut key = Vec::new();
+        for (n, &s) in e.iter().enumerate() {
+            let sp = &specs[s];
+            key.push(sp.start);
+            if sp.from.0 <= p && p < sp.from.1 {
+                key.push(0);
+            } else if sp.wher.0 <= p && p < sp.wher.1 {
+                key.push(2);
+                key.push(rank(&sp.ops, p));
+                // the groups between this spec and the next one in
+                // - a group inside that one is that one's
+                let next = e.get(n + 1).map_or(usize::MAX, |&t| specs[t].start);
+                let mut gs: Vec<&(usize, usize, Vec<usize>)> = groups
+                    .iter()
+                    .filter(|g| sp.wher.0 <= g.0 && g.0 < p && p < g.1 && g.0 < next)
+                    .collect();
+                gs.sort_by_key(|g| g.0);
+                for g in gs {
+                    key.push(g.0);
+                    key.push(rank(&g.2, p));
+                }
+            } else {
+                key.push(3);
+            }
+        }
+        key
+    };
+    let unknown_first = unknown
+        .iter()
+        .map(|&(s, e, q)| {
+            let mut key = enclosing(s, None);
+            key.push(s);
+            (key, (s, e, q))
+        })
+        .min_by(|a, b| a.0.cmp(&b.0));
+    let fs_first = firstskip
+        .iter()
+        .map(|&s| {
+            let mut key = enclosing(specs[s].start, Some(s));
+            key.push(specs[s].start);
+            key.push(1);
+            key
+        })
+        .min();
+    let table_unknown = |(s, e, quoted): (usize, usize, bool)| {
+        // a delimited name is placed at its opening quote (measured:
+        // `from t1 a, "nosuch" b` is column 30, the `"`)
+        let (line, col) = line_col_of(&sql[..if quoted { s - 1 } else { s }]);
+        let part = &sql[s..e];
+        let name = if quoted { format!("\"{}\"", part.replace("\"\"", "\"")) } else { format!("\"{}\"", part.to_ascii_uppercase()) };
+        EvalErr::TableUnknown { name, line, col }
+    };
+    let err = match (fs_first, &unknown_first) {
+        (Some(fk), Some((uk, u))) if *uk < fk => Some(table_unknown(*u)),
+        (Some(_), _) => Some(EvalErr::FirstSkipRows),
+        (None, _) => None,
+    };
+    LimitLint { err, unknown: unknown_first.map(|(_, u)| table_unknown(u)) }
 }
 
 /// Pull the result modifiers off a SELECT.
@@ -49278,20 +49603,14 @@ fn branch_rows_res(
             // ...each value under the column the UNION announces, not
             // the one its own branch would have announced
             for r in got.iter_mut() {
-                for (i, v) in r.iter_mut().enumerate() {
-                    // every column, not just the scaled ones: an
-                    // APPROXIMATE union announces scale 0 and still has
-                    // to turn each exact branch's scaled integer into a
-                    // double (a `NUMERIC(9,2) UNION ALL <DOUBLE>` whose
-                    // exact branch skipped this answered 0.0, because
-                    // the encoder's approx_of does not know the exact
-                    // forms and writes 0.0 for what it cannot read)
-                    if let Some(c) = cols.get(i) {
-                        *v = union_coerce_value(std::mem::replace(v, Value::Null), c.sql_type & !1, c.scale);
-                    }
-                }
+                union_coerce_row(r, cols);
             }
             rows.append(&mut got);
+        }
+        // a DISTINCT or sorted union BLOCKS: a value that does not fit
+        // the union's column raises before any row is delivered
+        if (*distinct || order_by.is_some()) && rows.iter().flatten().any(|v| matches!(v, Value::OutOfRange)) {
+            return Err(EvalErr::NumericOutOfRange);
         }
         if *distinct {
             let oc = output_cols_of(plan);
@@ -50101,8 +50420,15 @@ fn plan_union(
         branches.push(plan);
     }
     // the first branch names and types the result; every branch must be
-    // the same width
-    let first_cols = output_cols_of(branches.first()?);
+    // the same width. A branch under its OWN FIRST / SKIP / DISTINCT is a
+    // Plan::Modified, whose columns read the inner rows positionally
+    // (`expr: None`, like a plain field), so what it projects - and so
+    // what names the column ([union_naming]) - is the INNER plan's.
+    // Measured: `select first 1 a + 1 from t1 union all select x * 2 from
+    // t2` is a nameless column on the engine, where this named it ADD
+    // (UPPER, COALESCE, CASE, DIVIDE likewise) once a member's FIRST
+    // stayed its member's
+    let first_cols = union_branch_cols(branches.first()?);
     if first_cols.is_empty() {
         return None;
     }
@@ -50181,7 +50507,7 @@ fn plan_union(
         let mut widths = Vec::with_capacity(branches.len());
         let mut first_typed: Option<ProjCol> = None;
         for b in &branches {
-            match output_cols_of(b).get(i) {
+            match union_branch_cols(b).get(i) {
                 // A BARE NULL BRANCH HAS NO SAY IN THE TYPE: the engine's
                 // DataTypeUtil::makeFromList skips a null descriptor, so
                 // `X UNION ALL NULL` describes as X / X / T (measured) and
@@ -50447,6 +50773,18 @@ fn plan_union(
     Some(Plan::Union { cols, branches, distinct: !all, order_by: order_ordinal })
 }
 
+/// A union branch's columns as its select list PROJECTS them: under the
+/// branch's own FIRST / SKIP / DISTINCT (a [Plan::Modified], whose
+/// columns only read the inner rows by position) they are the inner
+/// plan's, so a NULL or an expression is still seen as one.
+fn union_branch_cols(b: &Plan) -> Vec<ProjCol> {
+    let mut p = b;
+    while let Plan::Modified { inner, .. } = p {
+        p = inner;
+    }
+    output_cols_of(p)
+}
+
 /// WHERE AN EXACT-NUMERIC DESCRIBE TYPE SITS ON THE WIDTH LADDER, or
 /// `None` for anything off it.
 ///
@@ -50497,6 +50835,19 @@ fn is_exact_numeric_sqltype(t: i32) -> bool {
 /// A value already at that scale is untouched; an integer becomes a
 /// scaled one; a value at a NARROWER scale is widened. Nothing else is
 /// converted - the planner refuses those before a row is read.
+/// One row of a branch under the union's announced columns
+/// ([union_coerce_value] per column). Every column, not just the scaled
+/// ones: an APPROXIMATE union announces scale 0 and still has to turn
+/// each exact branch's scaled integer into a double (a `NUMERIC(9,2)
+/// UNION ALL <DOUBLE>` whose exact branch skipped this answered 0.0,
+/// because the encoder's approx_of does not know the exact forms and
+/// writes 0.0 for what it cannot read).
+fn union_coerce_row(row: &mut [Value], cols: &[ProjCol]) {
+    for (v, c) in row.iter_mut().zip(cols) {
+        *v = union_coerce_value(std::mem::replace(v, Value::Null), c.sql_type & !1, c.scale);
+    }
+}
+
 fn union_coerce_value(v: Value, sql_type: i32, scale: i32) -> Value {
     // a DECFLOAT union column: every branch converts to the result width -
     // the same vehicle CAST(.. AS DECFLOAT) uses. Exact numerics promote
@@ -50579,7 +50930,14 @@ fn union_coerce_value(v: Value, sql_type: i32, scale: i32) -> Value {
             .and_then(|m| raw.checked_mul(m))
         {
             Some(n) => Value::Int128(n, -(want as i8)),
-            None => Value::Int128(raw, -(from as i8)),
+            // PAST 38 DIGITS AT THE UNION'S SCALE is the engine's 22003
+            // for that row (measured: INT128 max beside a NUMERIC(38,2)
+            // raises; NUMERIC(38,2)'s 123456789012345678901234567890123456.78
+            // beside a NUMERIC(18,4) raises). The value used to stay at its
+            // own scale and the encoder wrote its digits under the union's
+            // - 1701411834604692317316873037158841057.27 for the INT128
+            // max. The poison raises where the row is presented
+            None => Value::OutOfRange,
         };
     }
     union_scale_value(v, scale)
@@ -50595,9 +50953,10 @@ fn union_scale_value(v: Value, scale: i32) -> Value {
     let shift = |raw: i64, from: u32| -> Value {
         match want.checked_sub(from).and_then(|d| 10i64.checked_pow(d)).and_then(|m| raw.checked_mul(m)) {
             Some(n) => Value::Scaled(n, -(want as i8)),
-            // it does not fit: leave the value alone rather than answer
-            // a wrong number - the describe still says what it is
-            None => Value::Scaled(raw, -(from as i8)),
+            // it does not fit the 64-bit column at the union's scale: the
+            // engine's 22003, as in the 128-bit arm above. Left alone at
+            // its own scale, its digits were written under the union's
+            None => Value::OutOfRange,
         }
     };
     match v {
@@ -51236,6 +51595,8 @@ fn plan_query_inner_at(
                 | Plan::ProcSelect { .. }
                 | Plan::Join { .. }
                 | Plan::JoinGroup { .. }
+                | Plan::Group { .. }
+                | Plan::Scalar(..)
                 | Plan::Derived { .. }
                 // a LATERAL may carry a modifier now that
                 // [materialise_laterals] turns one into rows at fetch.
@@ -51255,12 +51616,21 @@ fn plan_query_inner_at(
         if matches!(&plan, Plan::Project { gen_cols, .. } if !gen_cols.is_empty()) {
             return Some(Plan::Refused);
         }
-        // a WINDOW under FIRST/SKIP/DISTINCT materialises through
-        // branch_rows too, which refuses windows - refuse it here at
-        // prepare rather than erroring mid-fetch (its own later slice)
+        // a WINDOW under FIRST/SKIP/DISTINCT still refuses: the engine
+        // delivers a windowed query in its window's sort order, which the
+        // fold here does not keep (measured: `select first 3 row_number()
+        // over (order by id desc) from t1` is 1,2,3 on the engine, and
+        // lifting this refusal answered 6,5,4)
         if matches!(&plan, Plan::Project { windows, .. } if !windows.is_empty()) {
             return Some(Plan::Refused);
         }
+        // A GROUP BY and a lone aggregate (a Scalar) under FIRST / SKIP /
+        // DISTINCT materialise through [branch_rows_res], which reads both
+        // as rows - the row source a union branch or a derived table
+        // already uses. They were refused here, so once a member's FIRST
+        // stayed its member's, `select first 1 count(*) from t1 union all
+        // select first 1 sum(x) from t2` refused where the engine answers
+        // 6, 38 (and `select first 2 a, count(*) .. group by a` alone)
         let cols: Vec<ProjCol> = output_cols_of(&plan)
             .iter()
             .enumerate()
@@ -64500,7 +64870,8 @@ fn emit_rows_inner(
                 // at all before the raise.
                 if !*distinct && order_by.is_none() {
                     for b in branches {
-                        branch_rows_each(b, db, args, &mut |row| {
+                        branch_rows_each(b, db, args, &mut |mut row| {
+                            union_coerce_row(&mut row, cols);
                             encode_row(w, cols, &row, out)
                         })
                         .map_err(EmitErr::Eval)?;
@@ -64516,6 +64887,12 @@ fn emit_rows_inner(
                         Ok(mut r) => rows.append(&mut r),
                         Err(e) => return Err(EmitErr::Eval(e)),
                     }
+                }
+                for r in rows.iter_mut() {
+                    union_coerce_row(r, cols);
+                }
+                if rows.iter().flatten().any(|v| matches!(v, Value::OutOfRange)) {
+                    return Err(EmitErr::Eval(EvalErr::NumericOutOfRange));
                 }
                 // UNION removes duplicates; UNION ALL is the whole
                 // difference and keeps them. Comparison is on the whole
@@ -86562,6 +86939,13 @@ fn corr_inject_first(text: &str, n: usize) -> String {
     if find_word_depth0(&masked, "UNION", 0).is_some() || find_word(&masked, "OVER", 0).is_some() {
         return text.to_string();
     }
+    // ...and so is a subquery with its own ROWS / OFFSET / FETCH: FIRST
+    // beside them is refused as the engine's -104 ([strip_modifiers]), so
+    // `exists (select 1 from t2 where t2.id = t1.id rows 1)` planned and
+    // then failed its first row (measured: the engine answers 1..6)
+    if has_limit_tail(t) {
+        return text.to_string();
+    }
     if let Some((proj_s, _, _, g, h, _)) = split_query(t) {
         if g.is_some() || h.is_some() {
             return text.to_string();
@@ -105696,7 +106080,19 @@ fn after_auth(
                             database.as_ref().map(user_function_sigs).unwrap_or_default()
                     });
                     PREPARE_REFUSAL.with(|r| *r.borrow_mut() = None);
-                    let planned = timed("plan(dml)", || {
+                    // THE LIMIT-CLAUSE GRAMMAR HOLDS INSIDE DML TOO, judged
+                    // on the text as the client sent it: an INSERT's source
+                    // and every bracketed query of an UPDATE / DELETE /
+                    // MERGE ([limit_lint_scan]). Measured: `insert into t3
+                    // select id, 'q' from t1 order by id union all select
+                    // id, 'r' from t2` is Token unknown at the `union` and
+                    // inserts nothing - this inserted twelve rows - and a
+                    // DELETE / UPDATE whose IN-subquery carries `order by
+                    // .. union` or `rows 1 union` deleted / updated.
+                    let dml_lint = limit_lint_scan_db(&stmt_sql, &database).err;
+                    let planned = if let Some(e) = dml_lint {
+                        Some((std::rc::Rc::new(Plan::RefusedEval(e)), std::rc::Rc::new(Vec::new())))
+                    } else { timed("plan(dml)", || {
                         let build = || {
                             plan_unmixed(|| match kw {
                                 "INSERT" => plan_insert(&dml_sql, &database),
@@ -105736,7 +106132,7 @@ fn after_auth(
                                 (std::rc::Rc::new(p), std::rc::Rc::new(d))
                             }),
                         }
-                    });
+                    }) };
                     let planned = match (planned, &returning) {
                         // VECTOR-AT-PREPARE: wrap_returning over a
                         // refused plan would produce Returning{inner:
@@ -128024,6 +128420,79 @@ mod tests {
         assert_eq!(limit_clause_lint("select id from t1 order by id offset 1 row fetch next 2 rows only"), None);
         assert_eq!(limit_clause_lint("select row_number() over (order by id) from t1 union select 1 from t2"), None);
         assert_eq!(limit_clause_lint("select first from t1 rows 2"), None);
+        // the tail is one ordered sequence, and FOR UPDATE / WITH LOCK /
+        // OPTIMIZE belong to the SELECT statement alone
+        assert_eq!(tok("select id from t1 for update rows 1"), Some((1, 30, "rows".into())));
+        assert_eq!(tok("select id from t1 rows 1 order by id"), Some((1, 26, "order".into())));
+        assert_eq!(tok("select id from t1 with lock union select id from t2"), Some((1, 29, "union".into())));
+        assert_eq!(tok("select id from t1 with lock for update"), Some((1, 29, "for".into())));
+        assert_eq!(tok("select id from t1 optimize for first rows rows 1"), Some((1, 43, "rows".into())));
+        assert_eq!(tok("select * from (select id from t1 for update) d"), Some((1, 34, "for".into())));
+        assert_eq!(tok("select * from (select id from t1 optimize for first rows) d"), Some((1, 43, "for".into())));
+        assert_eq!(limit_clause_lint("select id from t1 rows 1 for update of id with lock skip locked"), None);
+        assert_eq!(limit_clause_lint("select id from t1 union select id from t2 rows 1 optimize for first rows"), None);
+        assert_eq!(limit_clause_lint("select next value for g from rdb$database rows 1"), None);
+        // an INSERT's source is linted from its SELECT; an UPDATE's own
+        // ORDER BY / ROWS is not a query's
+        assert_eq!(
+            tok("insert into t3 select id, 'q' from t1 order by id union all select id, 'r' from t2"),
+            Some((1, 51, "union".into()))
+        );
+        assert_eq!(tok("insert into t3 select id, 'q' from t1 for update"), Some((1, 39, "for".into())));
+        assert_eq!(limit_clause_lint("insert into t3 select id, 'q' from t1 rows 1 returning k"), None);
+        assert_eq!(limit_clause_lint("update t3 set k = 0 order by k rows 1"), None);
+        assert_eq!(
+            tok("delete from t3 where k in (select id from t1 order by id union all select id from t2)"),
+            Some((1, 58, "union".into()))
+        );
+        // a q-string's quotes are its own
+        assert_eq!(limit_clause_lint("select q'{'}', ' order ', ' union ' from t1 rows 1"), None);
+        assert_eq!(tok("select q'{x}' from t1 order by 1 union select 'a' from t2"), Some((1, 34, "union".into())));
+    }
+
+    /// Which of FIRST/SKIP-with-ROWS and an unknown FROM item the engine
+    /// reports: a spec's FROM is resolved before its check, its WHERE and
+    /// select list after (measured on 2182).
+    #[test]
+    fn limit_lint_unknown_relation_precedence() {
+        let known = |n: &str, _: bool| !n.eq_ignore_ascii_case("nosuch");
+        let err = |sql: &str| limit_lint_scan(sql, &known).err;
+        let at = |sql: &str| match limit_lint_scan(sql, &known).err {
+            Some(EvalErr::TableUnknown { line, col, .. }) => Some((line, col)),
+            _ => None,
+        };
+        assert_eq!(at("select first 1 id from t1, nosuch rows 1"), Some((1, 28)));
+        assert_eq!(at("select first 1 id from nosuch rows 2"), Some((1, 24)));
+        assert_eq!(at("select * from nosuch, (select first 1 id from t1 rows 1) d"), Some((1, 15)));
+        assert_eq!(at("select first 1 id from t1 a, \"nosuch\" b rows 1"), Some((1, 30)));
+        assert_eq!(err("select first 1 id from t1 where id in (select id from nosuch) rows 1"), Some(EvalErr::FirstSkipRows));
+        assert_eq!(err("select first 1 (select id from nosuch) from t1 rows 1"), Some(EvalErr::FirstSkipRows));
+        assert_eq!(err("select * from (select first 1 id from t1 rows 1) d, nosuch"), Some(EvalErr::FirstSkipRows));
+        // an AND / OR resolves its right operand first; BETWEEN's AND is
+        // not one; the WHERE precedes the select list
+        assert_eq!(
+            at("select * from t1 where id in (select first 1 id from t2 rows 1) and exists (select 1 from nosuch)"),
+            Some((1, 91))
+        );
+        assert_eq!(
+            err("select * from t1 where exists (select 1 from nosuch) and id in (select first 1 id from t2 rows 1)"),
+            Some(EvalErr::FirstSkipRows)
+        );
+        assert_eq!(
+            at("select * from t1 where id in (select first 1 id from t2 rows 1) and id between 1 and 3 and exists (select 1 from nosuch)"),
+            Some((1, 114))
+        );
+        assert_eq!(at("select (select first 1 id from t2 rows 1) from t1 where exists (select 1 from nosuch)"), Some((1, 79)));
+        assert_eq!(
+            at("select * from t1 where (id in (select first 1 id from t2 rows 1) and exists (select 1 from nosuch))"),
+            Some((1, 92))
+        );
+        // no FIRST/SKIP: no verdict, only the -204 for a bare refusal
+        assert_eq!(err("select id from t1, nosuch"), None);
+        assert!(matches!(
+            limit_lint_scan("select id from t1, nosuch", &known).unknown,
+            Some(EvalErr::TableUnknown { col: 20, .. })
+        ));
     }
 
     /// A generator may be named with its schema; the two this server
