@@ -14010,28 +14010,8 @@ fn concat_operands(l: Expr, r: Expr, descs: &[Descriptor]) -> Expr {
 }
 
 fn carrier_fn_args(resolved: &mut [Expr], descs: &[Descriptor]) {
-    use fire_crab_ods::intl;
     let att = CURRENT_ATT_CS.with(|c| c.get());
-    if !intl::byte_carrier(att) {
-        return;
-    }
-    // the charset a NON-literal text argument contributes; two different
-    // real sets in one call are left alone rather than guessed between
-    let mut real: Option<u8> = None;
-    for e in resolved.iter() {
-        if matches!(e, Expr::Str(_)) {
-            continue;
-        }
-        if let Some(cs) = cmp_text_charset(e, descs) {
-            if !intl::byte_carrier(cs) {
-                match real {
-                    Some(prev) if prev != cs => return,
-                    _ => real = Some(cs),
-                }
-            }
-        }
-    }
-    let Some(cs) = real else { return };
+    let Some(cs) = carrier_fn_args_real(resolved, descs) else { return };
     for e in resolved.iter_mut() {
         if let Expr::Str(s) = e {
             // bytes that do not spell the set stay a carrier string,
@@ -14041,6 +14021,35 @@ fn carrier_fn_args(resolved: &mut [Expr], descs: &[Descriptor]) {
             }
         }
     }
+}
+
+/// The ONE real set [carrier_fn_args] re-spells a call's literals into,
+/// when there is one: under a byte-carrier attachment, the charset the
+/// NON-literal text arguments contribute, all of one real set. None
+/// under a real attachment, with no real operand, or with two different
+/// real sets in one call - those are left alone rather than guessed
+/// between. Asked again by [recode_strfn], for which the re-spelled
+/// literal has made that set the one the call runs in.
+fn carrier_fn_args_real(resolved: &[Expr], descs: &[Descriptor]) -> Option<u8> {
+    use fire_crab_ods::intl;
+    if !intl::byte_carrier(CURRENT_ATT_CS.with(|c| c.get())) {
+        return None;
+    }
+    let mut real: Option<u8> = None;
+    for e in resolved.iter() {
+        if matches!(e, Expr::Str(_)) {
+            continue;
+        }
+        if let Some(cs) = cmp_text_charset(e, descs) {
+            if !intl::byte_carrier(cs) {
+                match real {
+                    Some(prev) if prev != cs => return None,
+                    _ => real = Some(cs),
+                }
+            }
+        }
+    }
+    real
 }
 
 /// The OPERAND-keyed twin of [carrier_fn_args], for the two shapes that
@@ -20081,7 +20090,21 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
         }),
         SysFn::Sign => Some(short),
         SysFn::AsciiVal | SysFn::AsciiValCs(_) => Some(short), // SMALLINT (probed)
-        SysFn::Hash => Some(int64), // BIGINT (probed)
+        // BIGINT (probed); `USING CRC32` is an INTEGER (makeHash: makeLong
+        // for the 4-byte algorithm, measured `496 LONG len 4`)
+        SysFn::Hash(HashKind::Weak) | SysFn::HashCs(HashKind::Weak, _) => Some(int64),
+        SysFn::Hash(HashKind::Crc32) | SysFn::HashCs(HashKind::Crc32, _) => Some(long),
+        // BIT_LENGTH describes as its OCTET_LENGTH does - INTEGER, BIGINT
+        // over a blob (measured: `bit_length(<text blob>)` is INT64 len 8)
+        SysFn::BitLength => match args.first() {
+            Some(Expr::Func(SysFn::BlobOctetLength, _)) => Some(int64),
+            Some(Expr::Func(_, inner))
+                if inner.first().is_some_and(|a| blob_result(a, descs).is_some()) =>
+            {
+                Some(int64)
+            }
+            _ => Some(long),
+        },
         // ... but over a BLOB argument both lengths are BIGINT
         // (probed: CHAR_LENGTH(<blob>) describes INT64 where
         // CHAR_LENGTH(<varchar>) describes INTEGER)
@@ -20305,10 +20328,23 @@ fn text_form_oct(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
         // under a BYTE-CARRIER attachment the literal already holds one
         // char per byte ([stmt_text_decode]), so its octet count is that
         // char count - `s.len()`, the UTF-8 length, counts every high
-        // byte twice. Under a real attachment the literal holds real
-        // characters and the UTF-8 length is the octet count.
-        if fire_crab_ods::intl::byte_carrier(CURRENT_ATT_CS.with(|c| c.get())) {
+        // byte twice. Under a TABLED single-byte attachment the literal
+        // holds the chars its table decoded, and its octets are what the
+        // table encodes back to - one per char - where the UTF-8 length
+        // counted the SPELLING of those chars: 'Ä' (C3 84) under WIN1252
+        // decodes to 'Ã' + '„' (U+201E, three UTF-8 bytes) and announced
+        // TEXT(5) for the engine's TEXT(2), 'ÄÖÜ' TEXT(14) for TEXT(6),
+        // and under ISO8859_1 TEXT(4) and TEXT(12) (measured; the value
+        // came back padded to the wrong width). Under UTF8 the literal
+        // holds real characters and the UTF-8 length is the octet count.
+        let att = CURRENT_ATT_CS.with(|c| c.get());
+        if fire_crab_ods::intl::byte_carrier(att) {
             fire_crab_ods::intl::carrier_encode(s).map_or(s.len() as i32, |b| b.len() as i32)
+        } else if fire_crab_ods::intl::tabled(att) {
+            match fire_crab_ods::intl::encode_text(att, s) {
+                Ok(Some(b)) => b.len() as i32,
+                _ => s.len() as i32,
+            }
         } else {
             s.len() as i32
         }
@@ -20863,7 +20899,9 @@ fn fn_answers_text(f: &SysFn) -> bool {
             | SysFn::OctetLengthCs(_)
             | SysFn::BlobOctetLength
             | SysFn::Position
-            | SysFn::Hash
+            | SysFn::Hash(_)
+            | SysFn::HashCs(..)
+            | SysFn::BitLength
             | SysFn::AsciiVal
             | SysFn::AsciiValCs(_)
     )
@@ -63271,6 +63309,9 @@ const GDS_NUMERIC_OUT_OF_RANGE: i32 = 335544916;
 /// isc_expression_eval_err - "expression evaluation not supported"
 /// (SQLSTATE 42000), the wrapper a system-function domain error carries.
 const GDS_EXPRESSION_EVAL_ERR: i32 = 335544606;
+/// sysf_invalid_hash_algorithm - "Invalid HASH algorithm @1" (SQLSTATE
+/// 42000, no Dynamic SQL Error wrapper: measured `HASH('abc' USING MD5)`)
+const GDS_SYSF_INVALID_HASH_ALGORITHM: i32 = 335545152;
 /// sysf_argmustbe_nonneg - "Argument for @1 must be zero or positive" (SQRT)
 const GDS_SYSF_ARG_NONNEG: i32 = 335544967;
 /// sysf_argmustbe_positive - "Argument for @1 must be positive" (LN / LOG)
@@ -63693,6 +63734,12 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
         // the percentile fraction range error is posted by the engine as a
         // DSQL error (ERRD_post), so the primary is "Dynamic SQL Error", not
         // the JRD expression_eval_err the math domains use
+        EvalErr::InvalidHashAlgorithm(name) => {
+            w.int(1) // isc_arg_gds - "Invalid HASH algorithm @1"
+                .int(GDS_SYSF_INVALID_HASH_ALGORITHM)
+                .int(2) // isc_arg_string - @1 = the algorithm as written
+                .bytes(name.as_bytes());
+        }
         EvalErr::DsqlDomain { func, code } => {
             w.int(1) // isc_arg_gds - Dynamic SQL Error
                 .int(GDS_DSQL_ERROR)
@@ -69487,9 +69534,34 @@ enum SysFn {
     /// `ORDER BY` the rows before the offending one are delivered first,
     /// and a row the WHERE excludes never raises at all).
     AsciiValCs(u8),
-    /// HASH(s) - the engine's default WEAK 64-bit hash of the value's
-    /// bytes (an ELF-style rolling hash), a BIGINT.
-    Hash,
+    /// HASH(v [USING CRC32]) over an operand whose character set is not
+    /// carried by this server (UTF8, the attachment's set under a UTF8
+    /// attachment, a rendered number): the algorithm runs over the
+    /// value's UTF-8 bytes, which ARE its stored bytes for those. Kept
+    /// where [SysFn::HashCs] cannot be stamped. A non-text operand is
+    /// wrapped in a synthetic CAST to text at resolution, because the
+    /// engine hashes `MOV_make_string2` of the value in its own text
+    /// type (SysFunction.cpp evlHash): `HASH(10)` is the hash of "10",
+    /// `HASH(1.50)` of "1.50", `HASH(1.5e0)` of "1.500000000000000",
+    /// `HASH(TRUE)` of "TRUE", a DATE of "2020-01-02" (all measured on
+    /// engine 2182, and each equal to `HASH(CAST(x AS VARCHAR(30)))`).
+    Hash(HashKind),
+    /// HASH over an operand whose value is carried in ITS OWN set's
+    /// bytes - a byte carrier or a tabled single-byte page - stamped at
+    /// resolution from [expr_value_charset], the [SysFn::OctetLengthCs]
+    /// seam. The engine hashes the STORED BYTES in the value's own text
+    /// type, never the attachment's: a WIN1252 `C0 C9 CE` is 52574 under
+    /// a NONE, a UTF8 and a WIN1252 attachment alike, and the same three
+    /// letters stored as UTF8 (`C3 80 C3 89 C3 8E`) are 213697982
+    /// (measured). Hashing the decoded text's UTF-8 answered
+    /// 919206616215896077 for a WIN1252 column that held UTF-8 octets.
+    HashCs(HashKind, u8),
+    /// BIT_LENGTH(s) - eight times OCTET_LENGTH, an INTEGER (BIGINT over
+    /// a blob, like OCTET_LENGTH): the resolved OCTET_LENGTH rides as
+    /// the one argument, so every charset rule it has is inherited.
+    /// Measured: 24 over a WIN1252 `C0 C9 CE`, 48 over the UTF8
+    /// spelling, 48 for a 6-octet literal under NONE, UTF8 and WIN1252.
+    BitLength,
     /// the DOUBLE-valued math functions - the operand(s) fold to f64 and
     /// the result is DOUBLE PRECISION.
     Sqrt,
@@ -69595,6 +69667,17 @@ impl ExtractPart {
     }
 }
 
+/// Which HASH the call asked for: the bare form is the engine's
+/// WeakHashContext (a BIGINT), `USING CRC32` the libtomcrypt CRC-32 (an
+/// INTEGER). CRC32 is the ONLY algorithm HASH accepts on engine 2182 -
+/// `USING MD5` / `SHA1` / `SHA256` / `SHA512` all raise *Invalid HASH
+/// algorithm MD5* at prepare (measured; those belong to CRYPT_HASH).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum HashKind {
+    Weak,
+    Crc32,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum TrimSide {
     Both,
@@ -69631,7 +69714,8 @@ impl SysFn {
             SysFn::BinShl => "BIN_SHL",
             SysFn::BinShr => "BIN_SHR",
             SysFn::AsciiVal | SysFn::AsciiValCs(_) => "ASCII_VAL",
-            SysFn::Hash => "HASH",
+            SysFn::Hash(_) | SysFn::HashCs(..) => "HASH",
+            SysFn::BitLength => "BIT_LENGTH",
             SysFn::Sqrt => "SQRT",
             SysFn::Power => "POWER",
             SysFn::Ln => "LN",
@@ -71497,7 +71581,7 @@ fn names_expr_call(s: &str) -> bool {
     let up = s.to_ascii_uppercase();
     [
         "COALESCE(", "NULLIF(", "IIF(", "UPPER(", "LOWER(", "CHAR_LENGTH(",
-        "CHARACTER_LENGTH(", "OCTET_LENGTH(", "SUBSTRING(", "TRIM(", "LEFT(",
+        "CHARACTER_LENGTH(", "OCTET_LENGTH(", "BIT_LENGTH(", "SUBSTRING(", "TRIM(", "LEFT(",
         "RIGHT(", "REPLACE(", "POSITION(", "REVERSE(", "ABS(", "MOD(",
         "SIGN(", "LPAD(", "RPAD(", "EXTRACT(", "DATEADD(", "DATEDIFF(",
     ]
@@ -71515,6 +71599,7 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
         "LOWER" => SysFn::Lower,
         "CHAR_LENGTH" | "CHARACTER_LENGTH" => SysFn::CharLength,
         "OCTET_LENGTH" => SysFn::OctetLength,
+        "BIT_LENGTH" => SysFn::BitLength,
         "SUBSTRING" => SysFn::Substring,
         "TRIM" => SysFn::Trim(TrimSide::Both),
         "LEFT" => SysFn::Left,
@@ -71532,7 +71617,7 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
         "BIN_SHL" => SysFn::BinShl,
         "BIN_SHR" => SysFn::BinShr,
         "ASCII_VAL" => SysFn::AsciiVal,
-        "HASH" => SysFn::Hash,
+        "HASH" => SysFn::Hash(HashKind::Weak),
         "SQRT" => SysFn::Sqrt,
         "POWER" => SysFn::Power,
         "LN" => SysFn::Ln,
@@ -71762,6 +71847,30 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         }
         return Some(RawExpr::Func(SysFn::Position, args));
     }
+    // HASH(<value> [USING <algorithm>]) - the one algorithm the engine
+    // takes is CRC32; any other name is its typed prepare refusal
+    // (measured: MD5, SHA1, SHA256, SHA512 and FOO all *Invalid HASH
+    // algorithm X*). A second comma argument is the engine's syntax
+    // error, which the caller's `)` check turns into a refusal.
+    if matches!(f, SysFn::Hash(_)) {
+        let value = expr_add(b, pos)?;
+        if !take_keyword(b, pos, "USING") {
+            return Some(RawExpr::Func(SysFn::Hash(HashKind::Weak), vec![value]));
+        }
+        skip_ws(b, pos);
+        let start = *pos;
+        while *pos < b.len() && (b[*pos].is_alphanumeric() || b[*pos] == '_') {
+            *pos += 1;
+        }
+        let algo: String = b[start..*pos].iter().collect::<String>().to_ascii_uppercase();
+        if algo != "CRC32" {
+            PREPARE_REFUSAL.with(|r| {
+                r.borrow_mut().get_or_insert(EvalErr::InvalidHashAlgorithm(algo));
+            });
+            return None;
+        }
+        return Some(RawExpr::Func(SysFn::Hash(HashKind::Crc32), vec![value]));
+    }
     // the comma-argument functions, arity checked. A niladic call - PI() -
     // has an EMPTY argument list, so the first argument is only parsed when
     // the parens are not immediately closed.
@@ -71794,7 +71903,7 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::Abs
         | SysFn::Sign => (1, 1),
         SysFn::Left | SysFn::Right | SysFn::Mod | SysFn::BinShl | SysFn::BinShr => (2, 2),
-        SysFn::BinNot | SysFn::AsciiVal | SysFn::AsciiValCs(_) | SysFn::Hash | SysFn::Sqrt | SysFn::Ln | SysFn::Log10 | SysFn::Exp
+        SysFn::BinNot | SysFn::AsciiVal | SysFn::AsciiValCs(_) | SysFn::Hash(_) | SysFn::HashCs(..) | SysFn::BitLength | SysFn::Sqrt | SysFn::Ln | SysFn::Log10 | SysFn::Exp
         | SysFn::Sin | SysFn::Cos | SysFn::Tan | SysFn::Cot | SysFn::Asin | SysFn::Acos | SysFn::Atan
         | SysFn::Sinh | SysFn::Cosh | SysFn::Tanh => (1, 1),
         SysFn::Ceil | SysFn::Ceiling | SysFn::Floor => (1, 1),
@@ -72757,6 +72866,7 @@ fn resolve_expr(
     // source or the select list
     let e = align_conditional(resolve_expr_inner(raw, columns, descs)?, descs);
     let e = pad_conditional(recode_conditional(recode_concat(e, descs), descs), descs);
+    let e = recode_strfn(e, descs);
     // a FLOAT branch beside a DOUBLE one widens to the common DOUBLE
     let e = float_conditional(e, descs);
     // a DECFLOAT conditional (COALESCE/CASE/IIF/NULLIF with a decfloat
@@ -72798,7 +72908,7 @@ fn resolve_expr(
 /// emission, and guessing it here would convert against the wrong set -
 /// those keep today's path.
 fn recode_concat(e: Expr, descs: &[Descriptor]) -> Expr {
-    use fire_crab_ods::intl::{byte_carrier, bytes_per_char, charset_id};
+    use fire_crab_ods::intl::{byte_carrier, charset_id};
     if !matches!(e, Expr::Concat(..)) {
         return e;
     }
@@ -72854,32 +72964,151 @@ fn recode_concat(e: Expr, descs: &[Descriptor]) -> Expr {
     // engine (UTF8 attachment) answers 4 - C3 A9 61 62. Under a NONE
     // attachment the literal is NONE, which yields its tag and keeps
     // its bytes, as it always did here.
+    Expr::Concat(recode_operand(a, ca, wa, dst), recode_operand(b, cb, wb, dst))
+}
+
+/// One operand converted INTO the set `dst` its expression's result is
+/// in, through the synthetic text CAST that invokes [transcode_text] -
+/// the step [recode_concat] takes for `||` and [recode_strfn] for the
+/// string functions. `c` and `w` are the operand's own set and character
+/// width ([text_form]). Untouched: an operand already in `dst`, and a
+/// literal under a NONE attachment (its chars ARE its bytes, and
+/// [carrier_fn_args] has already re-spelled it wherever a real operand
+/// asked for that).
+fn recode_operand(x: Box<Expr>, c: TfCs, w: i32, dst: u8) -> Box<Expr> {
+    use fire_crab_ods::intl::{byte_carrier, bytes_per_char, charset_id};
     let att = CURRENT_ATT_CS.with(|c| c.get());
-    let wrap = |x: Box<Expr>, c: TfCs, w: i32| -> Box<Expr> {
-        let src = match c {
-            TfCs::Ttype(t) => charset_id(t as i16),
-            TfCs::Att if att != 0 => att,
-            TfCs::Att => return x,
-        };
-        if src == dst {
-            return x;
-        }
-        // the target width is in the DESTINATION's characters, and a
-        // byte carrier's are octets - so a wider source has to be given
-        // room for its bytes or the cast would truncate it
-        let len = if byte_carrier(dst) { w * bytes_per_char(src) as i32 } else { w };
-        Box::new(Expr::Cast(
-            x,
-            CastTarget::Text {
-                len: len.max(0) as usize,
-                pad: false,
-                synthetic: true,
-                cs: Some(dst),
-            },
-            src,
-        ))
+    let src = match c {
+        TfCs::Ttype(t) => charset_id(t as i16),
+        TfCs::Att if att != 0 => att,
+        TfCs::Att => return x,
     };
-    Expr::Concat(wrap(a, ca, wa), wrap(b, cb, wb))
+    if src == dst {
+        return x;
+    }
+    // the target width is in the DESTINATION's characters, and a
+    // byte carrier's are octets - so a wider source has to be given
+    // room for its bytes or the cast would truncate it
+    let len = if byte_carrier(dst) { w * bytes_per_char(src) as i32 } else { w };
+    Box::new(Expr::Cast(
+        x,
+        CastTarget::Text {
+            len: len.max(0) as usize,
+            pad: false,
+            synthetic: true,
+            cs: Some(dst),
+        },
+        src,
+    ))
+}
+
+/// The set a [TfCs] names: a ttype's charset, or the attachment's for
+/// the literal sentinel (known at prepare - [CURRENT_ATT_CS] is set
+/// before planning).
+fn tf_charset(c: TfCs) -> u8 {
+    match c {
+        TfCs::Ttype(t) => fire_crab_ods::intl::charset_id(t as i16),
+        TfCs::Att => CURRENT_ATT_CS.with(|c| c.get()),
+    }
+}
+
+/// The character set a string function's RESULT is in - which is the
+/// set the engine converts EVERY text operand into before it runs
+/// (each evl* calls MOV_make_string2 into the result's text type):
+///   * LPAD / RPAD keep the VALUE's set (makePad: `setTextType(
+///     value1->getTextType())`), the pad converts into it;
+///   * TRIM keeps the VALUE's set (TrimNode::make copies desc1), the
+///     trim characters convert;
+///   * POSITION runs in the SEARCHED string's set;
+///   * REPLACE negotiates all three (makeReplace: getResultTextType
+///     twice, which is [cs_join]).
+/// None for a function this law was not measured for, or an operand
+/// with no text form.
+fn strfn_result_cs(f: SysFn, args: &[Expr], descs: &[Descriptor]) -> Option<TfCs> {
+    let form = |i: usize| text_form(args.get(i)?, descs).map(|(_, _, c)| c);
+    match f {
+        SysFn::Lpad | SysFn::Rpad => form(0),
+        SysFn::Trim(_) if args.len() >= 2 => form(1),
+        SysFn::Position => form(1),
+        SysFn::Replace => Some(cs_join(cs_join(form(0)?, form(1)?), form(2)?)),
+        _ => None,
+    }
+}
+
+/// EACH STRING-FUNCTION TEXT OPERAND IS CONVERTED INTO THE RESULT'S
+/// CHARACTER SET before the function runs - [recode_concat]'s law,
+/// carried to LPAD / RPAD / REPLACE / TRIM / POSITION, whose result set
+/// [strfn_result_cs] names.
+///
+/// Measured on engine 2182, NONE column N = `C3 80 C3 89 C3 8E` / `E9`,
+/// UTF8 column U = 'ÀÉÎ':
+///   * `LPAD(N, 8, 'Ä')` is NONE under every attachment, and the pad is
+///     the literal's OCTETS in it - `C3 84` + N under UTF8 (the UTF8
+///     'Ä' byte-copied into NONE), `C3 84 C3 84 C3 84 C3 E9` for the
+///     one-byte row. This server padded with the carrier char U+00C4:
+///     `C4 C4` + N. Under a WIN1252 attachment the literal's second
+///     char ('„', U+201E) has no carrier image, and the mis-spelled
+///     result DROPPED THE CONNECTION (08006) mid-row.
+///   * `REPLACE(N, 'É', 'e')` under UTF8 is a UTF8 result (NONE
+///     yields), so N is READ AS UTF8: `C3 80 65 C3 8E` for the first
+///     row and *Malformed string* (22000) for the `E9` row. This server
+///     ran the replace in byte space and re-encoded the carrier chars
+///     as UTF-8: `C3 83 C2 80 65 C3 83 C2 8E`, and `C3 A9` for the row
+///     the engine refuses.
+///   * `POSITION(<NONE C3 89> IN U)` is 2 - the octets read as the
+///     UTF8 'É' - where byte space answers 3; `TRIM(TRAILING <NONE C3
+///     8E> FROM U)` is 'ÀÉ' and `REPLACE(U, <NONE C3 89>, 'x')` 'ÀxÎ',
+///     where this server answered the carrier chars re-encoded.
+///
+/// A blob operand is left alone (its own rules, as in [recode_concat]),
+/// and so is any function whose result set is one [transcode_text] does
+/// not implement.
+fn recode_strfn(e: Expr, descs: &[Descriptor]) -> Expr {
+    use fire_crab_ods::intl::{byte_carrier, tabled, CS_UTF8};
+    let Expr::Func(f, args) = e else { return e };
+    let Some(dst_tf) = strfn_result_cs(f, &args, descs) else {
+        return Expr::Func(f, args);
+    };
+    let mut dst = tf_charset(dst_tf);
+    // A LITERAL NAMES THE RESULT'S SET under a byte-carrier attachment
+    // (`POSITION(U IN 'xcafé')` is NONE), but [carrier_fn_args] has
+    // already re-spelled that literal into the call's one real set, and
+    // the call now runs THERE - the same comparison in the other
+    // direction, which is equivalent while the octets spell the set.
+    // Converting the real operand into the carrier on top of it turned
+    // that POSITION from 2 into 0 (serve-real-nonecmp caught it).
+    if matches!(dst_tf, TfCs::Att) && args.iter().any(|a| matches!(a, Expr::Str(_))) {
+        if let Some(real) = carrier_fn_args_real(&args, descs) {
+            dst = real;
+        }
+    }
+    if !(byte_carrier(dst) || tabled(dst) || dst == CS_UTF8) {
+        return Expr::Func(f, args);
+    }
+    let operands: &[usize] = match f {
+        SysFn::Lpad | SysFn::Rpad => &[2],
+        SysFn::Trim(_) | SysFn::Position => &[0],
+        SysFn::Replace => &[0, 1, 2],
+        _ => &[],
+    };
+    let mut args = args;
+    for &i in operands {
+        // an operand [carrier_fn_operands] already re-spelled into byte
+        // space is there for a CARRIER result, and is left as it is - a
+        // second conversion would encode the carrier chars as text again
+        // (measured while writing this: `POSITION('É' IN N)` under UTF8
+        // answered 0 for 3, and under WIN1252 raised a 22001)
+        if i >= args.len()
+            || matches!(args[i], Expr::Null | Expr::CarrierEnc(..))
+            || blob_result(&args[i], descs).is_some()
+        {
+            continue;
+        }
+        let Some((_, w, c)) = text_form(&args[i], descs) else { continue };
+        let a = std::mem::replace(&mut args[i], Expr::Null);
+        args[i] = *recode_operand(Box::new(a), c, w, dst);
+    }
+    Expr::Func(f, args)
 }
 
 /// A NUMERIC-formed conditional must ANSWER AT THE SCALE IT ANNOUNCES.
@@ -76562,6 +76791,13 @@ fn resolve_expr_inner(
             Box::new(resolve_expr(b, columns, descs)?),
         ),
         RawExpr::Func(f, args) => {
+            // BIT_LENGTH is eight times OCTET_LENGTH, so it resolves AS
+            // the OCTET_LENGTH of its argument (every charset and blob
+            // rule below included) and multiplies at eval
+            if matches!(f, SysFn::BitLength) {
+                let octets = resolve_expr(&RawExpr::Func(SysFn::OctetLength, args.clone()), columns, descs)?;
+                return Some(Expr::Func(SysFn::BitLength, vec![octets]));
+            }
             // OCTET_LENGTH over a BLOB column: the column itself never
             // resolves (a blob has no expression type here), so the
             // length is recognised on the RAW shape and reads the
@@ -76612,7 +76848,20 @@ fn resolve_expr_inner(
             // column-vs-column, where no literal exists to rewrite. Gated
             // to the three functions whose contract was measured - an
             // unmeasured function would be shipping a guess.
-            if matches!(f, SysFn::Position | SysFn::Replace | SysFn::Trim(_)) {
+            // ...and ONLY when the function's result set is itself a
+            // carrier (or unknown): the engine converts every operand
+            // INTO the result's set (evlPad / evlReplace / TrimNode /
+            // evlPosition all MOV_make_string2 into it), so a carrier
+            // operand meeting a REAL result is read AS that set - a
+            // NONE `C3 89` searched in a UTF8 column is the character
+            // 'É' at position 2, not the bytes at 3 - which
+            // [recode_strfn] does with the transcoding CAST; the byte
+            // space this wrapper builds is the engine's only when the
+            // result is bytes (measured, `serve-real-csfn` section 5)
+            if matches!(f, SysFn::Position | SysFn::Replace | SysFn::Trim(_))
+                && strfn_result_cs(*f, &resolved, descs)
+                    .is_none_or(|c| fire_crab_ods::intl::byte_carrier(tf_charset(c)))
+            {
                 // POSITION's third argument is a start, not an operand
                 let n = if matches!(f, SysFn::Position) { resolved.len().min(2) } else { resolved.len() };
                 carrier_fn_operands(&mut resolved[..n], descs);
@@ -76780,6 +77029,30 @@ fn resolve_expr_inner(
                     Some(cs) => SysFn::OctetLengthCs(cs),
                     None => *f,
                 },
+                // HASH hashes the value's STORED bytes, in ITS set - the
+                // OCTET_LENGTH seam again ([SysFn::HashCs]); a non-text
+                // operand hashes its engine text form, so it is wrapped
+                // in the text CAST that renders it (the DOUBLE's 16-digit
+                // form needs a wide target: `approx_fit_text`)
+                (SysFn::Hash(kind), [a]) => {
+                    let text = matches!(a, Expr::Null)
+                        || matches!(a.type_of(descs), Some(ExprType::Text));
+                    if !text {
+                        let a = a.clone();
+                        return Some(Expr::Func(
+                            *f,
+                            vec![Expr::Cast(
+                                Box::new(a),
+                                CastTarget::Text { len: 32765, pad: false, synthetic: true, cs: None },
+                                fire_crab_ods::intl::CS_UTF8,
+                            )],
+                        ));
+                    }
+                    match expr_value_charset(a, descs) {
+                        Some(cs) => SysFn::HashCs(*kind, cs),
+                        None => *f,
+                    }
+                }
                 // UPPER/LOWER over such a column takes the CHARSET's
                 // case law (intl::case_char, engine-generated tables;
                 // a carrier cases ASCII only) - same seam, same reason.
@@ -76788,11 +77061,30 @@ fn resolve_expr_inner(
                 // - accent-stripping - and does NOT raise on 'ƒ'), so
                 // a collated column keeps the untabled arm until the
                 // collation driver is converted.
-                (SysFn::Upper | SysFn::Lower, [Expr::Col(fid)]) => {
-                    let d0 = descs.get(*fid);
-                    let cs = d0.map_or(0, |d| fire_crab_ods::intl::charset_id(d.sub_type));
-                    let coll = d0.map_or(0, |d| fire_crab_ods::intl::collation_id(d.sub_type));
-                    let tt = d0.map_or(0, |d| d.sub_type as u16);
+                //
+                // ...and over ANY expression whose set [text_form] knows:
+                // a LITERAL is in the ATTACHMENT's set, and that set's
+                // law is what cases it. Measured on 2182 with `LOWER('ÄÖÜ')`
+                // (source octets C3 84 C3 96 C3 9C): under NONE the octets
+                // come back UNCHANGED (a carrier cases ASCII only), under
+                // WIN1252 they are E3 84 E3 96 E3 9C (its table lowers
+                // 0xC3 'Ã' to 0xE3 'ã'; 0x84 has no case), under UTF8 the
+                // three letters lower. This server cased the carrier
+                // chars by Unicode and answered E3 84 E3 96 E3 9C under
+                // NONE - the WIN1252 answer for a NONE value. A concat, a
+                // CAST to a named set and an OCTETS operand ride the
+                // same arm (`LOWER('ÄÖÜ' || 'x')` under NONE is
+                // unchanged plus x, measured).
+                (SysFn::Upper | SysFn::Lower, [a]) if !matches!(a, Expr::Null) => {
+                    let (cs, coll, tt) = match text_form(a, descs) {
+                        Some((_, _, TfCs::Ttype(t))) => (
+                            fire_crab_ods::intl::charset_id(t as i16),
+                            fire_crab_ods::intl::collation_id(t as i16),
+                            t as u16,
+                        ),
+                        Some((_, _, TfCs::Att)) => (CURRENT_ATT_CS.with(|c| c.get()), 0, 0),
+                        None => (0xFF, 0xFF, 0),
+                    };
                     if tt == fire_crab_ods::coll::TTYPE_PXW_INTL {
                         // a REAL collation cases by its OWN tables
                         if matches!(f, SysFn::Upper) {
@@ -77473,6 +77765,10 @@ enum EvalErr {
     /// a domain error posted as a DSQL error (primary "Dynamic SQL Error"),
     /// as PERCENTILE_CONT/DISC's out-of-range fraction is
     DsqlDomain { func: &'static str, code: i32 },
+    /// `HASH(x USING <algorithm>)` naming anything but CRC32: the
+    /// engine's isc_sysf_invalid_hash_algorithm at prepare, the name as
+    /// written (upper-cased by the parser: `using md5` reports MD5)
+    InvalidHashAlgorithm(String),
     /// a `WITH LOCK` over a target the engine will not lock: one of its
     /// three -104 messages ([GDS_WLOCK_SIMPLE], [GDS_WLOCK_AGGREGATES],
     /// [GDS_WLOCK_CONFLICT]), the last carrying the offending keyword as
@@ -82304,6 +82600,41 @@ fn rounded_q(raw: i128, div: i128, mode: RndMode) -> i128 {
     }
 }
 
+/// A text value's bytes IN THE SET IT IS CARRIED IN: a byte carrier's
+/// chars are its octets, a tabled single-byte page encodes back through
+/// its table, and anything else (UTF8, an unstamped value) is the UTF-8
+/// spelling. The same three-way rule [SysFn::OctetLengthCs] counts by;
+/// the UTF-8 spelling stands in wherever an encode somehow fails.
+fn text_bytes_in(cs: Option<u8>, t: &str) -> Vec<u8> {
+    use fire_crab_ods::intl::{byte_carrier, carrier_encode, encode_text};
+    match cs {
+        Some(cs) if byte_carrier(cs) => carrier_encode(t).unwrap_or_else(|| t.as_bytes().to_vec()),
+        Some(cs) => match encode_text(cs, t) {
+            Ok(Some(b)) => b,
+            _ => t.as_bytes().to_vec(),
+        },
+        None => t.as_bytes().to_vec(),
+    }
+}
+
+/// `HASH(x USING CRC32)`: libtomcrypt's CRC-32 (IEEE 802.3, reflected,
+/// 0xEDB88320) over the bytes, whose `crc32_finish` STORES THE RESULT
+/// BIG-ENDIAN and the engine then reads it back as a native SLONG
+/// (TomCryptHash.cpp Crc32HashContext::finish) - so on the x86_64 engine
+/// the answer is the byte-swapped CRC: 'abc' is CRC 0x352441C2 and the
+/// engine answers -1035918283 = 0xC2412435 (measured; `C3 80 C3 89 C3
+/// 8E` 1714852855, `C0 C9 CE` -489944568, an empty string 0).
+fn crc32_engine(data: &[u8]) -> i32 {
+    let mut crc: u32 = !0;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    (!crc).swap_bytes() as i32
+}
+
 fn weak_hash(data: &[u8]) -> i64 {
     let mut h: i64 = 0;
     for &b in data {
@@ -82315,6 +82646,42 @@ fn weak_hash(data: &[u8]) -> i64 {
         h &= !n;
     }
     h
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+
+    // every value below is the live engine's (2182), measured for
+    // qa/serve-real-csfn.sh
+    #[test]
+    fn the_weak_hash_over_stored_bytes() {
+        assert_eq!(weak_hash(b"abc"), 26499);
+        assert_eq!(weak_hash(&[0xC0, 0xC9, 0xCE]), 52574);
+        assert_eq!(weak_hash(&[0xC3, 0x80, 0xC3, 0x89, 0xC3, 0x8E]), 213697982);
+        assert_eq!(weak_hash(b"1.500000000000000"), 590872271110997792);
+        assert_eq!(weak_hash(b""), 0);
+    }
+
+    #[test]
+    fn the_crc32_is_stored_big_endian_and_read_native() {
+        assert_eq!(crc32_engine(b"abc"), -1035918283);
+        assert_eq!(crc32_engine(&[0xC3, 0x80, 0xC3, 0x89, 0xC3, 0x8E]), 1714852855);
+        assert_eq!(crc32_engine(&[0xC0, 0xC9, 0xCE]), -489944568);
+        assert_eq!(crc32_engine(b"10"), -517644895);
+        assert_eq!(crc32_engine(b""), 0);
+    }
+
+    #[test]
+    fn a_value_s_bytes_are_its_own_set_s() {
+        use fire_crab_ods::intl::{CS_NONE, CS_WIN1252};
+        // a carrier's chars are its octets
+        assert_eq!(text_bytes_in(Some(CS_NONE), "\u{c3}\u{80}"), vec![0xC3, 0x80]);
+        // a tabled page encodes back through its table
+        assert_eq!(text_bytes_in(Some(CS_WIN1252), "\u{c0}\u{c9}\u{ce}"), vec![0xC0, 0xC9, 0xCE]);
+        // unstamped: the UTF-8 spelling
+        assert_eq!(text_bytes_in(None, "\u{c0}"), vec![0xC3, 0x80]);
+    }
 }
 
 /// A function argument as an integer - CVT the other way: a scaled
@@ -83045,16 +83412,19 @@ impl Expr {
                             None
                         }
                     }
-                    // HASH(text) -> BIGINT. A non-text operand would hash the
-                    // engine's string CONVERSION of it, which this server
-                    // does not pin - refuse it (text only for now).
-                    SysFn::Hash => {
-                        if ts[0] == ExprType::Text {
+                    // HASH(text) -> BIGINT (INTEGER for CRC32). A non-text
+                    // operand arrives here already wrapped in its text CAST
+                    // (resolution, the engine's MOV_make_string2), and a
+                    // bare NULL answers NULL
+                    SysFn::Hash(_) | SysFn::HashCs(..) => {
+                        if ts[0] == ExprType::Text || matches!(args[0], Expr::Null) {
                             Some(ExprType::Int)
                         } else {
                             None
                         }
                     }
+                    // eight times its resolved OCTET_LENGTH
+                    SysFn::BitLength => Some(ExprType::Int),
                     // the DOUBLE math functions: PI takes no operand; the
                     // rest fold NUMERIC/INTEGER/DOUBLE operands to f64 and
                     // answer DOUBLE. A text operand refuses.
@@ -83475,7 +83845,12 @@ impl Expr {
                 | SysFn::AsciiVal
                 | SysFn::AsciiValCs(_)
                 | SysFn::Extract(_) => Some(NumRank::Long),
-                SysFn::BlobOctetLength | SysFn::Hash => Some(NumRank::I64),
+                SysFn::BlobOctetLength
+                | SysFn::Hash(HashKind::Weak)
+                | SysFn::HashCs(HashKind::Weak, _) => Some(NumRank::I64),
+                SysFn::Hash(HashKind::Crc32) | SysFn::HashCs(HashKind::Crc32, _) | SysFn::BitLength => {
+                    Some(NumRank::Long)
+                }
                 // the exact-rounding family ranks by its RESULT width (which
                 // matches the describe): CEIL/FLOOR promote, ROUND/TRUNC keep
                 SysFn::Ceil | SysFn::Ceiling | SysFn::Floor | SysFn::Round | SysFn::Trunc => {
@@ -86207,9 +86582,26 @@ impl Expr {
                             }
                         }
                     }
-                    // HASH(s): the engine's WeakHashContext over the string
-                    // bytes (Hash.cpp) - a 64-bit ELF-style rolling hash.
-                    SysFn::Hash => Value::Int(weak_hash(fn_text(&vs[0]).as_bytes())),
+                    // HASH(s): the engine's WeakHashContext over the value's
+                    // STORED bytes (Hash.cpp) - a 64-bit ELF-style rolling
+                    // hash - or the CRC-32 of them. The bytes are the
+                    // value's own set's when it is stamped, exactly as
+                    // OctetLengthCs counts them
+                    SysFn::Hash(kind) | SysFn::HashCs(kind, _) => {
+                        let cs = match f {
+                            SysFn::HashCs(_, cs) => Some(*cs),
+                            _ => None,
+                        };
+                        let bytes = text_bytes_in(cs, &fn_text(&vs[0]));
+                        Value::Int(match kind {
+                            HashKind::Weak => weak_hash(&bytes),
+                            HashKind::Crc32 => i64::from(crc32_engine(&bytes)),
+                        })
+                    }
+                    SysFn::BitLength => match vs[0] {
+                        Value::Int(n) => Value::Int(n.checked_mul(8).ok_or(EvalErr::IntegerOverflow)?),
+                        _ => return Err(EvalErr::Unsupported), // typed away
+                    },
                     // the DOUBLE math functions: each operand folds to f64
                     // (fn_f64) and the libm result is announced DOUBLE. Rust
                     // f64 shares the platform libm with the engine, so the
@@ -106475,7 +106867,9 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 // - so a STAMPED operand is judged by its set, while an
                 // unstamped one keeps the old answer rather than newly
                 // refusing statements that work today.
-                SysFn::Hash | SysFn::AsciiVal => true,
+                SysFn::Hash(_) | SysFn::HashCs(..) | SysFn::AsciiVal => true,
+                // ...as its OCTET_LENGTH: a blob's is read per row
+                SysFn::BitLength => !matches!(args.first(), Some(Expr::Func(SysFn::BlobOctetLength, _))),
                 SysFn::AsciiValCs(cs) => fire_crab_ods::intl::bytes_per_char(*cs) == 1,
                 // PI never raises; the other DOUBLE math functions can leave
                 // their domain (SQRT of a negative, LN of <= 0, ...) - defer
