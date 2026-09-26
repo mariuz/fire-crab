@@ -124,6 +124,29 @@
 # default set) under a NONE caller, made the join TRANSLITERATE the NONE
 # value where the engine copies its bytes: 'é' came out 'Ã©' (10e).
 #
+# SECTION 11 came out of the review of 10d/10e. A literal under COLLATE
+# resolves since 10d, but the collation was DROPPED on the way through
+# UPPER, LOWER, TRIM, SUBSTRING, COALESCE, IIF, CASE and NULLIF - the
+# engine's result type for each is its argument's, collation included -
+# so `UPPER('é' COLLATE UNICODE_CI) = U` counted 0 for 1 (11a). An
+# EXECUTE STATEMENT argument of a BYTE-CARRIER set (a NONE or OCTETS
+# local, an untyped local in a database with no default set) is read in
+# the ATTACHMENT's set - its octets are the argument - where 10d spelled
+# it typed NONE and it compared by its bytes, the opposite cell under a
+# WIN1252 caller and 4 for 2 under UTF8 (11b). A NONE value beside a
+# body's ASCII literal of a REAL set moves its octets INTO that set: a
+# WIN1252-created `V || 'x'` over a NONE V holding C3 A9 reaches a UTF8
+# output as 'Ã©x', where the carrier kept its label and the output read
+# 'éx' (11c); the same law glues an EXECUTE STATEMENT's text. A body
+# with a non-ASCII literal that calls a user function OUTSIDE a select
+# list - in a WHERE, an aggregate, an EXISTS, a FOR SELECT's WHERE -
+# refused since section 9 routed it to the source path, where the BLR
+# executor had answered; it answers again (11d), except where the
+# refused statement returns non-ASCII text, which the executor's guard
+# keeps refusing (recorded). And a NONE value that reaches a typed
+# operand through COALESCE, IIF or CASE, or through a bare CAST, is
+# byte-moved into the real set, not transliterated (11e).
+#
 # Usage: qa/serve-real-psqlassign.sh [port]   (default 5400)
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
@@ -314,6 +337,35 @@ CREATE PROCEDURE SZ1 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET 
 CREATE PROCEDURE SZ7 RETURNS (O INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT OCTET_LENGTH(CAST(U AS VARCHAR(5)) || 'x') FROM SRT WHERE ID = 1 INTO O; SUSPEND; END^
 CREATE PROCEDURE SC58 RETURNS (R VARCHAR(40) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT CAST(W AS VARCHAR(5)) || 'x' FROM SRT WHERE ID = 1 INTO R; SUSPEND; END^
 SET TERM ;^
+CREATE TABLE SRN (ID INTEGER, U VARCHAR(10) CHARACTER SET UTF8, W VARCHAR(10) CHARACTER SET WIN1252, N VARCHAR(10) CHARACTER SET NONE, O VARCHAR(10) CHARACTER SET OCTETS, I INTEGER);
+INSERT INTO SRN VALUES (1, 'é', 'é', 'é', x'C3A9', 10);
+INSERT INTO SRN VALUES (2, 'ab', 'ö', 'ab', x'4142', 20);
+INSERT INTO SRN VALUES (3, NULL, NULL, NULL, NULL, NULL);
+SET TERM ^;
+CREATE FUNCTION SFI (X INTEGER) RETURNS INTEGER AS BEGIN RETURN X * 2; END^
+CREATE PROCEDURE XE1 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COUNT(*) FROM SRN WHERE UPPER('é' COLLATE UNICODE_CI) = U INTO C; SUSPEND; SELECT COUNT(*) FROM SRN WHERE LOWER('É' COLLATE UNICODE_CI) = U INTO C; SUSPEND; SELECT COUNT(*) FROM SRN WHERE U = UPPER('é' COLLATE UNICODE_CI) INTO C; SUSPEND; SELECT COUNT(*) FROM SRN WHERE UPPER('é' COLLATE UNICODE_CI) = 'É' INTO C; SUSPEND; SELECT COUNT(*) FROM SRN WHERE CAST(U AS VARCHAR(5)) = 'É' COLLATE UNICODE_CI INTO C; SUSPEND; SELECT COUNT(*) FROM SRN WHERE COALESCE(U COLLATE UNICODE_CI, 'z') = 'É' INTO C; SUSPEND; END^
+CREATE PROCEDURE XF1 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE N VARCHAR(10) CHARACTER SET NONE = 'é'; BEGIN EXECUTE STATEMENT ('select count(*) from srn where u = ?') (N) INTO C; SUSPEND; EXECUTE STATEMENT ('select count(*) from srn where w = ?') (N) INTO C; SUSPEND; EXECUTE STATEMENT ('select count(*) from srn where n = ?') (N) INTO C; SUSPEND; EXECUTE STATEMENT ('select octet_length(cast(? as varchar(10))) from rdb$database') (N) INTO C; SUSPEND; EXECUTE STATEMENT ('select count(*) from srn where u = :x') (x := N) INTO C; SUSPEND; END^
+CREATE PROCEDURE XF2 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE N VARCHAR(10); BEGIN N = 'é'; EXECUTE STATEMENT ('select count(*) from srn where u = ?') (N) INTO C; SUSPEND; EXECUTE STATEMENT ('select count(*) from srn where w = ?') (N) INTO C; SUSPEND; SELECT U FROM SRN WHERE ID = 1 INTO N; EXECUTE STATEMENT ('select count(*) from srn where w = ?') (N) INTO C; SUSPEND; END^
+CREATE PROCEDURE XF3 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE O VARCHAR(10) CHARACTER SET OCTETS = x'C3A9'; DECLARE A VARCHAR(10) CHARACTER SET ISO8859_1 = 'é'; BEGIN EXECUTE STATEMENT ('select count(*) from srn where u = ?') (O) INTO C; SUSPEND; EXECUTE STATEMENT ('select count(*) from srn where u = ?') (A) INTO C; SUSPEND; EXECUTE STATEMENT ('select count(*) from srn where w = ?') (A) INTO C; SUSPEND; EXECUTE STATEMENT ('select count(*) from srn where n = ?') (A) INTO C; SUSPEND; END^
+CREATE PROCEDURE XG5 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE O VARCHAR(10) CHARACTER SET OCTETS = x'C3A9'; BEGIN EXECUTE STATEMENT ('select octet_length(cast(? as varchar(10))) from rdb$database') (O) INTO C; SUSPEND; EXECUTE STATEMENT ('select count(*) from srn where w = ?') (O) INTO C; SUSPEND; EXECUTE STATEMENT ('select count(*) from srn where n = ?') (O) INTO C; SUSPEND; EXECUTE STATEMENT ('select count(*) from srn where u = :x and n = :y') (x := O, y := O) INTO C; SUSPEND; END^
+CREATE PROCEDURE XK1 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE N VARCHAR(10) CHARACTER SET NONE; BEGIN SELECT W FROM SRN WHERE ID = 1 INTO N; EXECUTE STATEMENT ('select count(*) from srn where w = ?') (N) INTO C; SUSPEND; EXECUTE STATEMENT ('select count(*) from srn where u = ?') (N) INTO C; SUSPEND; EXECUTE STATEMENT ('select octet_length(cast(? as varchar(10))) from rdb$database') (N) INTO C; SUSPEND; END^
+CREATE PROCEDURE XK2 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE N VARCHAR(10) CHARACTER SET NONE; BEGIN SELECT W FROM SRN WHERE ID = 1 INTO N; EXECUTE STATEMENT 'select count(*) from srn where w = ''' || N || '''' INTO C; SUSPEND; END^
+CREATE PROCEDURE XG1 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE N VARCHAR(10) CHARACTER SET NONE = 'é'; DECLARE S VARCHAR(100) CHARACTER SET NONE; BEGIN S = 'select count(*) from srn where w = ''' || N || ''''; EXECUTE STATEMENT S INTO C; SUSPEND; S = 'select count(*) from srn where u = ''' || N || ''''; EXECUTE STATEMENT S INTO C; SUSPEND; EXECUTE STATEMENT 'select count(*) from srn where w = ''' || N || '''' INTO C; SUSPEND; EXECUTE STATEMENT 'select octet_length(''' || N || ''') from rdb$database' INTO C; SUSPEND; C = OCTET_LENGTH(N || 'x'); SUSPEND; C = OCTET_LENGTH('x' || N); SUSPEND; C = CHAR_LENGTH('x' || N); SUSPEND; END^
+CREATE PROCEDURE XK3 RETURNS (R VARCHAR(40) CHARACTER SET UTF8, O INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE N VARCHAR(10) CHARACTER SET NONE; DECLARE V VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN N = 'ab'; R = N || V; O = OCTET_LENGTH(N || V); SUSPEND; SELECT N FROM SRN WHERE ID = 1 INTO N; R = N || V; O = OCTET_LENGTH(N || V); SUSPEND; R = V || N; O = OCTET_LENGTH(V || N); SUSPEND; R = N || 'x'; O = OCTET_LENGTH(N || 'x'); SUSPEND; R = N || N; O = OCTET_LENGTH(N || N); SUSPEND; END^
+CREATE PROCEDURE XK4 RETURNS (R VARCHAR(40) CHARACTER SET UTF8, O INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE N VARCHAR(10) CHARACTER SET NONE; DECLARE E VARCHAR(10) CHARACTER SET WIN1252 = 'é'; BEGIN SELECT N FROM SRN WHERE ID = 1 INTO N; R = N || E; O = OCTET_LENGTH(N || E); SUSPEND; R = E || N; O = OCTET_LENGTH(E || N); SUSPEND; SELECT W FROM SRN WHERE ID = 1 INTO N; R = N || E; O = OCTET_LENGTH(N || E); SUSPEND; R = N || 'x'; O = OCTET_LENGTH(N || 'x'); SUSPEND; END^
+CREATE PROCEDURE XB1 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COUNT(*) FROM SRN WHERE SFN(U) = 'fab' INTO C; SUSPEND; END^
+CREATE PROCEDURE XB2 RETURNS (S INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT SUM(SFI(I)) FROM SRN INTO S; SUSPEND; END^
+CREATE PROCEDURE XB3 RETURNS (R VARCHAR(40) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT MAX(SFN(U)) FROM SRN INTO R; SUSPEND; END^
+CREATE PROCEDURE XB4 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COUNT(*) FROM SRN WHERE SFI(ID) = 4 INTO C; SUSPEND; END^
+CREATE PROCEDURE XB5 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COUNT(*) FROM SRN WHERE SFN(U) = SFN('ab') INTO C; SUSPEND; END^
+CREATE PROCEDURE XB6 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN IF (EXISTS (SELECT 1 FROM SRN WHERE SFN(U) = 'fab')) THEN C = 1; ELSE C = 0; SUSPEND; END^
+CREATE PROCEDURE XB7 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COUNT(*) FROM SRN WHERE SFN(U) = 'fab' OR SFI(I) = 40 INTO C; SUSPEND; END^
+CREATE PROCEDURE XB8 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN C = 0; FOR SELECT ID FROM SRN WHERE SFN(U) = 'fab' INTO C DO SUSPEND; END^
+CREATE PROCEDURE XB9 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COUNT(*) FROM SRN WHERE SFI(I) > 15 INTO C; SUSPEND; END^
+CREATE PROCEDURE XBA1 RETURNS (C INTEGER) AS BEGIN SELECT COUNT(*) FROM SRN WHERE SFN(U) = 'fab' INTO C; SUSPEND; END^
+CREATE PROCEDURE XBA2 RETURNS (S INTEGER) AS BEGIN SELECT SUM(SFI(I)) FROM SRN INTO S; SUSPEND; END^
+CREATE PROCEDURE XP5 RETURNS (R VARCHAR(40) CHARACTER SET UTF8, O INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COALESCE(CAST(U AS VARCHAR(5)), 'q') || 'x', OCTET_LENGTH(SUBSTRING(CAST(U AS VARCHAR(5)) FROM 1) || 'x') FROM SRN WHERE ID = 1 INTO R, O; SUSPEND; SELECT COALESCE(N, 'q') || 'x', OCTET_LENGTH(COALESCE(N, 'q')) FROM SRN WHERE ID = 1 INTO R, O; SUSPEND; SELECT IIF(TRUE, N, 'q') || 'x', OCTET_LENGTH(CASE WHEN TRUE THEN N ELSE 'q' END) FROM SRN WHERE ID = 1 INTO R, O; SUSPEND; END^
+SET TERM ;^
 COMMIT;
 SQL
 grep -qiE 'Statement failed|error' /tmp/psqlassign-build.log && { echo "FAIL fixture build (UTF8)"; sed 's/^/   /' /tmp/psqlassign-build.log; exit 1; }
@@ -325,6 +377,13 @@ CREATE PROCEDURE WL1 (X VARCHAR(10) CHARACTER SET UTF8 = 'é') RETURNS (R VARCHA
 CREATE PROCEDURE WL7 RETURNS (C INTEGER) AS BEGIN SELECT COUNT(*) FROM XTU WHERE W = 'é' INTO :C; SUSPEND; END^
 CREATE PROCEDURE WL3 RETURNS (R VARCHAR(20) CHARACTER SET UTF8, O INTEGER) AS BEGIN R = 'é' || 'a'; O = OCTET_LENGTH('é'); SUSPEND; END^
 CREATE FUNCTION SH2 RETURNS INTEGER AS BEGIN RETURN OCTET_LENGTH(CAST('ab' || 'é' AS VARCHAR(10) CHARACTER SET OCTETS)); END^
+SET TERM ;^
+CREATE TABLE SRW (ID INTEGER, U VARCHAR(10) CHARACTER SET UTF8, W VARCHAR(10) CHARACTER SET WIN1252, N VARCHAR(10));
+INSERT INTO SRW VALUES (1, 'é', 'é', 'é');
+SET TERM ^;
+CREATE PROCEDURE XPA1 RETURNS (R VARCHAR(40) CHARACTER SET UTF8, O INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE V VARCHAR(10); BEGIN SELECT U FROM SRW WHERE ID = 1 INTO V; R = V || 'x'; O = OCTET_LENGTH(V || 'x'); SUSPEND; END^
+CREATE PROCEDURE XPA2 RETURNS (R VARCHAR(40) CHARACTER SET UTF8, O INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE V VARCHAR(10); BEGIN V = 'é'; R = V || 'x'; O = OCTET_LENGTH(V || 'x'); SUSPEND; END^
+CREATE PROCEDURE XPA3 RETURNS (R VARCHAR(40) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE V VARCHAR(10); BEGIN SELECT W FROM SRW WHERE ID = 1 INTO V; R = V || 'x'; SUSPEND; END^
 SET TERM ;^
 COMMIT;
 SQL
@@ -391,6 +450,18 @@ refused() { # <label> <script> <engine-output>
     elif [ "${fv#*Statement failed}" = "$fv" ]; then
         echo "FAIL $1 - this server neither answers nor refuses"; echo "     fc =[$fv]"; fail=1
     else echo "OK   $1 (recorded: the engine answers [$ev], this server refuses)"; fi
+}
+# RECORDED: the engine answers, this server answers SOMETHING ELSE - a
+# divergence too narrow to fix yet, pinned on both sides so it cannot
+# drift. Fails the day the two agree, so the cell gets promoted.
+known() { # <label> <script> <engine-output> <fc-output>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(sess "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2")
+    if [ "$ev" != "$3" ]; then echo "FAIL $1 - THE ENGINE ANSWERS [$ev], not the pinned [$3]"; fail=1
+    elif [ "$ev" = "$fv" ]; then echo "FAIL $1 - THIS SERVER NOW AGREES; promote the cell"; fail=1
+    elif [ "$fv" != "$4" ]; then echo "FAIL $1 - this server answers [$fv], not the recorded [$4]"; fail=1
+    else echo "OK   $1 (recorded: the engine answers [$ev], this server [$fv])"; fi
 }
 # one EXECUTE BLOCK (or any ^-terminated PSQL statement) as a script
 eb() { printf 'SET TERM ^;\n%s^\nSET TERM ;^\n' "$1"; }
@@ -772,11 +843,104 @@ CH=WIN1252
 same $'10e [WIN1252] CAST(U AS VARCHAR(5)) || \'x\' (the é arrives as E9)' $'SELECT R FROM SC13;'
 same $'10e [WIN1252] WHERE CAST(U AS VARCHAR(5)) || \'x\' = \'éx\'' $'SELECT C FROM SZ1;'
 CH=""
+
+echo "--- 11a. A COLLATION UNDER UPPER / LOWER / CAST / COALESCE IN A BODY (the collation was dropped on the way through the function: every cell counted 0)"
+# UTF8-created bodies over SRN; the body's literal is UTF8, so the
+# collation resolves under every caller
+for CH in "" UTF8 WIN1252; do
+  pin  "11a [${CH:-NONE}] UPPER('é' COLLATE UNICODE_CI) = U, LOWER(..) = U, U = UPPER(..), UPPER(..) = 'É', CAST(U AS VARCHAR(5)) = 'É' COLLATE UNICODE_CI, COALESCE(U COLLATE UNICODE_CI, 'z') = 'É'" $'SELECT * FROM XE1;' $'C|1|1|1|3|1|1'
+done
+CH=""
+
+echo "--- 11b. AN EXECUTE STATEMENT ARGUMENT OF A BYTE-CARRIER SET IS READ IN THE ATTACHMENT'S SET (it was spelled typed NONE and compared by its bytes)"
+# XF1: a NONE local holding the UTF8 literal's octets C3 A9 against U, W,
+# N, its octet length once cast, and the named form; XF2: an untyped
+# local (NONE in this database) assigned the literal, then filled from
+# U; XF3: an OCTETS local, then an ISO8859_1 one; XG5: the OCTETS local
+# cast, against W, N, and named twice
+CH=UTF8
+pin  "11b [UTF8] a NONE local C3 A9: u = ?, w = ?, n = ?, octet_length(cast(? as varchar(10))), :x" $'SELECT * FROM XF1;' $'C|1|1|1|2|1'
+pin  "11b [UTF8] an untyped local: from the literal against u, w; from U against w" $'SELECT * FROM XF2;' $'C|1|1|1'
+pin  "11b [UTF8] an OCTETS x'C3A9' against u; an ISO8859_1 'é' against u, w, n" $'SELECT * FROM XF3;' $'C|1|1|1|0'
+pin  "11b [UTF8] the OCTETS local cast, against w, n, and named twice" $'SELECT * FROM XG5;' $'C|2|1|1|1'
+same "11b [UTF8] a NONE local holding the WIN1252 E9: no UTF8 spells it, 22000 (it counted 1)" $'SELECT * FROM XK1;'
+CH=WIN1252
+pin  "11b [WIN1252] a NONE local C3 A9 reads 'Ã©' here: 0, 0, 1 (the NONE column's octets), 2, 0 (it was 1, 0, 1, 2, 1)" $'SELECT * FROM XF1;' $'C|0|0|1|2|0'
+pin  "11b [WIN1252] an untyped local" $'SELECT * FROM XF2;' $'C|0|0|0'
+pin  "11b [WIN1252] an OCTETS x'C3A9' against u is 0 here (it was 1); the ISO8859_1 cells" $'SELECT * FROM XF3;' $'C|0|1|1|0'
+pin  "11b [WIN1252] the OCTETS local cast, against w, n, named" $'SELECT * FROM XG5;' $'C|2|0|1|0'
+pin  "11b [WIN1252] a NONE local holding E9 reads 'é' here" $'SELECT * FROM XK1;' $'C|1|1|1'
+CH=""
+pin  "11b [NONE] a NONE local C3 A9" $'SELECT * FROM XF1;' $'C|1|0|1|2|1'
+pin  "11b [NONE] an untyped local" $'SELECT * FROM XF2;' $'C|1|0|0'
+pin  "11b [NONE] an OCTETS x'C3A9'; the ISO8859_1 cells" $'SELECT * FROM XF3;' $'C|1|1|1|0'
+pin  "11b [NONE] the OCTETS local cast, against w, n, named" $'SELECT * FROM XG5;' $'C|2|0|1|1'
+known "11b [NONE] a NONE local holding E9: w = ? is 1; u = ? is the engine's 22000 (the parameter moves into the column's set), this server compares octets" $'SELECT * FROM XK1;' $'C|1|Statement failed, SQLSTATE = 22000|Malformed string|-At procedure "PUBLIC"."XK1" line: 1, col: 261' $'C|1|1|1'
+
+echo "--- 11c. A NONE VALUE BESIDE A BODY'S ASCII LITERAL OF A REAL SET MOVES ITS OCTETS INTO THAT SET (the carrier kept its label; a WIN1252-created body's output read 'éx' for 'Ã©x')"
+# XG1 glues a NONE local into an EXECUTE STATEMENT's text: via a NONE
+# local S (the text is NONE and its literal reads in the attachment's
+# set), inline (the text is UTF8 and moves into the attachment's), and
+# the octet/char lengths of the pair; XK3/XK4 concatenate NONE locals
+# with UTF8 and WIN1252 locals and literals
+CH=UTF8
+pin  "11c [UTF8] the dynamic text: via S against w, u; inline against w; its octet length; N || 'x', 'x' || N, CHAR_LENGTH" $'SELECT * FROM XG1;' $'C|1|1|1|2|3|3|2'
+pin  "11c [UTF8] 'ab' || V, N || V, V || N, N || 'x', N || N over a NONE N holding C3 A9 and a UTF8 V (it refused)" $'SELECT * FROM XK3;' $'R O|abé 4|éé 4|éé 4|éx 3|éé 4'
+same "11c [UTF8] N || E over a WIN1252 E: the octets read as WIN1252; then N holding E9 || the UTF8 'x' is 22000" $'SELECT * FROM XK4;'
+same "11c [UTF8] the inline text over a NONE N holding E9: no UTF8 spells it, 22000 (it counted 1)" $'SELECT * FROM XK2;'
+CH=WIN1252
+pin  "11c [WIN1252] the dynamic text: inline the UTF8 text moves into WIN1252 as E9, 1 and 1 (they were 0 and 2)" $'SELECT * FROM XG1;' $'C|0|0|1|1|3|3|2'
+same "11c [WIN1252] 'ab' || V, N || V, V || N, N || 'x', N || N" $'SELECT * FROM XK3;'
+same "11c [WIN1252] N || E, E || N, then E9" $'SELECT * FROM XK4;'
+same "11c [WIN1252] the inline text over E9: 22000" $'SELECT * FROM XK2;'
+CH=""
+pin  "11c [NONE] the dynamic text" $'SELECT * FROM XG1;' $'C|0|1|0|2|3|3|2'
+pin  "11c [NONE] 'ab' || V, N || V, V || N, N || 'x', N || N" $'SELECT * FROM XK3;' $'R O|abé 4|éé 4|éé 4|éx 3|éé 4'
+same "11c [NONE] N || E, E || N, then E9" $'SELECT * FROM XK4;'
+same "11c [NONE] the inline text over E9: 22000" $'SELECT * FROM XK2;'
+# the WIN1252-created bodies over SRW, whose rows were inserted under
+# WIN1252 too: U holds 'Ã©' (C3 83 C2 A9), W and N the octets C3 A9
+for CH in "" UTF8; do
+  pin  "11c [${CH:-NONE}] WIN1252-created: V from U, V || 'x' - the UTF8 octets read as WIN1252 'ÃƒÂ©' (it read 'Ã©x')" $'SELECT * FROM XPA1;' $'R O|ÃƒÂ©x 5'
+  pin  "11c [${CH:-NONE}] WIN1252-created: V = 'é' (the WIN1252 'Ã©'), V || 'x' (it read 'éx')" $'SELECT * FROM XPA2;' $'R O|Ã©x 3'
+  pin  "11c [${CH:-NONE}] WIN1252-created: V from W, V || 'x' (it read 'éx' - a regression from the executor's 'Ã©x')" $'SELECT * FROM XPA3;' $'R|Ã©x'
+done
+CH=WIN1252
+same "11c [WIN1252] WIN1252-created: V from U" $'SELECT * FROM XPA1;'
+same "11c [WIN1252] WIN1252-created: V = 'é'" $'SELECT * FROM XPA2;'
+same "11c [WIN1252] WIN1252-created: V from W" $'SELECT * FROM XPA3;'
+CH=""
+
+echo "--- 11d. A USER-FUNCTION CALL OUTSIDE THE SELECT LIST IN A BODY THE SOURCE PATH RUNS (refused since section 9; the BLR executor answers it after the refusal)"
+for CH in "" UTF8 WIN1252; do
+  pin  "11d [${CH:-NONE}] WHERE SFN(U) = 'fab'" $'SELECT * FROM XB1;' $'C|1'
+  pin  "11d [${CH:-NONE}] SUM(SFI(I))" $'SELECT * FROM XB2;' $'S|60'
+  pin  "11d [${CH:-NONE}] WHERE SFI(ID) = 4" $'SELECT * FROM XB4;' $'C|1'
+  pin  "11d [${CH:-NONE}] WHERE SFN(U) = SFN('ab')" $'SELECT * FROM XB5;' $'C|1'
+  pin  "11d [${CH:-NONE}] IF (EXISTS (SELECT 1 FROM SRN WHERE SFN(U) = 'fab'))" $'SELECT * FROM XB6;' $'C|1'
+  pin  "11d [${CH:-NONE}] WHERE SFN(U) = 'fab' OR SFI(I) = 40" $'SELECT * FROM XB7;' $'C|1'
+  pin  "11d [${CH:-NONE}] FOR SELECT ID ... WHERE SFN(U) = 'fab'" $'SELECT * FROM XB8;' $'C|2'
+  pin  "11d [${CH:-NONE}] WHERE SFI(I) > 15" $'SELECT * FROM XB9;' $'C|2'
+  pin  "11d [${CH:-NONE}] the ASCII-only controls" $'SELECT * FROM XBA1; SELECT * FROM XBA2;' $'C|1|S|60'
+done
+for CH in "" UTF8; do
+  refused "11d [${CH:-NONE}] MAX(SFN(U)) INTO R: the refused statement returns non-ASCII text, which the executor's guard keeps refusing" $'SELECT * FROM XB3;' $'R|fé'
+done
+CH=""
+
+echo "--- 11e. A NONE VALUE THROUGH COALESCE / IIF / CASE / A BARE CAST BESIDE A TYPED OPERAND IS BYTE-MOVED, NOT TRANSLITERATED (it read 'Ã©x', 'Ã©x', 'Ã©x')"
+CH=UTF8
+pin  "11e [UTF8] COALESCE(CAST(U AS VARCHAR(5)), 'q') || 'x', SUBSTRING(CAST(..)) || 'x'; COALESCE(N, 'q') || 'x'; IIF(TRUE, N, 'q') || 'x', CASE" $'SELECT * FROM XP5;' $'R O|éx 3|éx 2|éx 2'
+CH=""
+same "11e [NONE] the same three rows" $'SELECT * FROM XP5;'
+CH=WIN1252
+same "11e [WIN1252] the same three rows" $'SELECT * FROM XP5;'
+CH=""
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-psqlassign-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 358 ]; then echo "FAIL only $ran checks ran (floor 358)"; fail=1; fi
+if [ "$ran" -lt 429 ]; then echo "FAIL only $ran checks ran (floor 429)"; fail=1; fi
 exit $fail
