@@ -184,6 +184,24 @@ CREATE TABLE DC (ID INTEGER, P CHAR(5) CHARACTER SET UTF8);
 INSERT INTO DC VALUES (1,'abc'); INSERT INTO DC VALUES (2,'abc '); INSERT INTO DC VALUES (3,'xyz');
 CREATE TABLE D3 (ID INTEGER, P VARCHAR(10) CHARACTER SET UTF8);
 INSERT INTO D3 VALUES (1,'abc'); INSERT INTO D3 VALUES (2,'abc '); INSERT INTO D3 VALUES (3,'abc  ');
+CREATE TABLE WE (ID INTEGER, DEPT INTEGER, SAL INTEGER, NAME VARCHAR(10) CHARACTER SET NONE);
+INSERT INTO WE VALUES (1,2,100,'ann'); INSERT INTO WE VALUES (2,1,100,'bob'); INSERT INTO WE VALUES (3,2,100,'cid'); INSERT INTO WE VALUES (4,1,200,'dan'); INSERT INTO WE VALUES (5,3,100,'eve');
+CREATE TABLE WO (ID INTEGER, G INTEGER, X INTEGER, Y INTEGER);
+INSERT INTO WO VALUES (1,1,3,9); INSERT INTO WO VALUES (2,1,2,8); INSERT INTO WO VALUES (3,1,1,7); INSERT INTO WO VALUES (4,2,4,3);
+INSERT INTO WO VALUES (5,2,4,1); INSERT INTO WO VALUES (6,NULL,4,2); INSERT INTO WO VALUES (7,NULL,7,5); INSERT INTO WO VALUES (8,2,4,6);
+CREATE TABLE W7 (ID INTEGER, G INTEGER, X INTEGER, Y INTEGER, Z INTEGER, N VARCHAR(10) CHARACTER SET NONE, K INTEGER, S SMALLINT, C4 CHAR(5) CHARACTER SET NONE);
+INSERT INTO W7 VALUES (1,1,4,5,1,'abcd',3,1,'abcd'); INSERT INTO W7 VALUES (2,-1,4,3,2,'dcba',1,2,'dcba'); INSERT INTO W7 VALUES (3,1,4,4,3,'badc',2,-1,'badc');
+INSERT INTO W7 VALUES (4,-1,4,1,9,'cdab',3,3,'cdab'); INSERT INTO W7 VALUES (5,7,4,2,5,'acbd',1,-2,'acbd'); INSERT INTO W7 VALUES (6,7,4,6,6,'dbca',2,5,'dbca');
+CREATE TABLE WE2 (ID INTEGER, DEPT INTEGER, NAME VARCHAR(10) CHARACTER SET NONE);
+INSERT INTO WE2 VALUES (1,1,'bob'); INSERT INTO WE2 VALUES (2,1,'dan'); INSERT INTO WE2 VALUES (3,1,'ann'); INSERT INTO WE2 VALUES (4,2,'abcd');
+INSERT INTO WE2 VALUES (5,2,'abdc'); INSERT INTO WE2 VALUES (6,2,'aaab'); INSERT INTO WE2 VALUES (7,2,'aaaa');
+CREATE TABLE WE4 (ID INTEGER, DEPT INTEGER, NAME CHAR(4) CHARACTER SET NONE);
+INSERT INTO WE4 VALUES (1,1,'bob'); INSERT INTO WE4 VALUES (2,1,'dan'); INSERT INTO WE4 VALUES (3,1,'ann'); INSERT INTO WE4 VALUES (4,2,'abcd');
+INSERT INTO WE4 VALUES (5,2,'abdc'); INSERT INTO WE4 VALUES (6,2,'aaab'); INSERT INTO WE4 VALUES (7,2,'aaaa');
+CREATE TABLE XK (ID INTEGER, S VARCHAR(10) CHARACTER SET UTF8);
+INSERT INTO XK VALUES (1,'a'); INSERT INTO XK VALUES (2,'B'); INSERT INTO XK VALUES (3,'c'); INSERT INTO XK VALUES (4,'b'); INSERT INTO XK VALUES (5,'A');
+CREATE TABLE XK2 (ID INTEGER, S VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE_CI);
+INSERT INTO XK2 VALUES (1,'a'); INSERT INTO XK2 VALUES (2,'B'); INSERT INTO XK2 VALUES (3,'c'); INSERT INTO XK2 VALUES (4,'b'); INSERT INTO XK2 VALUES (5,'A');
 COMMIT;
 SQL
 } | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/collkey-build.log 2>&1
@@ -496,11 +514,75 @@ pin  "12 DISTINCT ci || 'x' when nothing collides" "SELECT DISTINCT S || 'x' FRO
 pin  "12 DISTINCT over a plain UTF8 expression" "SELECT DISTINCT S || 'x' FROM U8;" "CONCATENATION|ABCx|Abcx|abc x|abcx|bx"
 refused "12 DISTINCT ci || 'x' merges three spellings: the survivor is not the projection's to name" "SELECT DISTINCT S || 'x' FROM CS;"
 refused "12 DISTINCT SUBSTRING(ci ...) the same" "SELECT DISTINCT SUBSTRING(S FROM 1 FOR 2) FROM CS;"
+echo "--- 13. THE OUTER SORT OVER A WINDOWED SELECT: its ties fall to the window map's record"
+pin  "13 ID, ROW_NUMBER() ... ORDER BY SAL ties by ID" "SELECT ID, ROW_NUMBER() OVER (ORDER BY DEPT) FROM WE ORDER BY SAL;" "ID ROW_NUMBER|1 3|2 1|3 4|5 5|4 2"
+pin  "13 ...with a text column between" "SELECT ID, NAME, ROW_NUMBER() OVER (ORDER BY DEPT) RN FROM WE ORDER BY SAL;" "ID NAME RN|1 ann 3|2 bob 1|3 cid 4|5 eve 5|4 dan 2"
+pin  "13 ...a partition count" "SELECT ID, DEPT, COUNT(*) OVER (PARTITION BY DEPT) C FROM WE ORDER BY SAL;" "ID DEPT C|1 2 2|2 1 2|3 2 2|5 3 1|4 1 2"
+pin  "13 ...FIRST_VALUE" "SELECT ID, FIRST_VALUE(NAME) OVER (PARTITION BY DEPT ORDER BY ID) FROM WE ORDER BY SAL;" "ID FIRST_VALUE|1 ann|2 bob|3 ann|5 eve|4 bob"
+pin  "13 ...ORDER BY SAL DESC" "SELECT ID, ROW_NUMBER() OVER (ORDER BY DEPT) RN FROM WE ORDER BY SAL DESC;" "ID RN|4 2|1 3|2 1|3 4|5 5"
+pin  "13 the window value written first ties first" "SELECT ROW_NUMBER() OVER (ORDER BY DEPT), ID FROM WE ORDER BY SAL;" "ROW_NUMBER ID|1 2|3 1|4 3|5 5|2 4"
+pin  "13 FIRST 3" "SELECT FIRST 3 ID, ROW_NUMBER() OVER (ORDER BY DEPT) FROM WE ORDER BY SAL;" "ID ROW_NUMBER|1 3|2 1|3 4"
+pin  "13 ROWS 2" "SELECT ID, ROW_NUMBER() OVER (ORDER BY DEPT) FROM WE ORDER BY SAL ROWS 2;" "ID ROW_NUMBER|1 3|2 1"
+pin  "13 the review's TO1: ties on X by ID" "SELECT ID, Y, ROW_NUMBER() OVER (ORDER BY G) FROM WO ORDER BY X;" "ID Y ROW_NUMBER|3 7 5|2 8 4|1 9 3|4 3 6|5 1 7|6 2 1|8 6 8|7 5 2"
+pin  "13 ...by Y when ID is not selected" "SELECT Y, ROW_NUMBER() OVER (ORDER BY G) FROM WO ORDER BY X;" "Y ROW_NUMBER|7 3|8 4|9 5|1 6|2 1|3 7|6 8|5 2"
+pin  "13 ...by the window value written first" "SELECT ROW_NUMBER() OVER (ORDER BY G) R, Y FROM WO ORDER BY X;" "R Y|3 7|4 8|5 9|1 2|6 1|7 3|8 6|2 5"
+pin  "13 the posting order: Z before Y" "SELECT DENSE_RANK() OVER (ORDER BY K) R, Z, Y FROM W7 ORDER BY X;" "R Z Y|1 2 3|1 5 2|2 3 4|2 6 6|3 1 5|3 9 1"
+pin  "13 ...an expression posts the fields it reads" "SELECT DENSE_RANK() OVER (ORDER BY K) R, Z + Y S FROM W7 ORDER BY X;" "R S|1 5|1 7|2 7|2 12|3 6|3 10"
+pin  "13 a VARCHAR ties by the words its bytes fall in (data on a word)" "SELECT N, COUNT(*) OVER () C FROM W7 ORDER BY X;" "N C|dcba 6|dbca 6|cdab 6|badc 6|acbd 6|abcd 6"
+pin  "13 ...behind a BIGINT (two bytes in)" "SELECT COUNT(*) OVER () C, N FROM W7 ORDER BY X;" "C N|6 badc|6 abcd|6 dbca|6 acbd|6 dcba|6 cdab"
+pin  "13 ...a partition key rides the record" "SELECT N, COUNT(*) OVER (PARTITION BY G) C FROM W7 ORDER BY X;" "N C|badc 2|abcd 2|dbca 2|acbd 2|dcba 2|cdab 2"
+pin  "13 ...a SMALLINT shares the length's word" "SELECT S, N, COUNT(*) OVER () C FROM W7 ORDER BY X;" "S N C|1 abcd 6|2 dcba 6|3 cdab 6|5 dbca 6|-2 acbd 6|-1 badc 6"
+pin  "13 ...a CHAR(5)" "SELECT C4, COUNT(*) OVER () C FROM W7 ORDER BY X;" "C4 C|badc 6|abcd 6|dbca 6|acbd 6|dcba 6|cdab 6"
+pin  "13 ...under two keys" "SELECT N, COUNT(*) OVER () C FROM W7 ORDER BY X, K;" "N C|dcba 6|acbd 6|dbca 6|badc 6|cdab 6|abcd 6"
+pin  "13 a derived table over a window: the inner map's order" "SELECT C, N FROM (SELECT N, X, COUNT(*) OVER () C FROM W7) ORDER BY X;" "C N|6 dcba|6 dbca|6 cdab|6 badc|6 acbd|6 abcd"
+pin  "13 ...an inner column the outer does not read counts" "SELECT N, C FROM (SELECT N, X, Y, COUNT(*) OVER () C FROM W7) ORDER BY X;" "N C|badc 6|abcd 6|dbca 6|acbd 6|dcba 6|cdab 6"
+pin  "13 ...and leads when written first" "SELECT N, C FROM (SELECT Y, N, X, COUNT(*) OVER () C FROM W7) ORDER BY X;" "N C|cdab 6|acbd 6|dcba 6|badc 6|abcd 6|dbca 6"
+pin  "13 FIRST over the lifted window keeps the statement's order" "SELECT FIRST 3 COUNT(*) OVER () C, N FROM W7 ORDER BY X;" "C N|6 badc|6 abcd|6 dbca"
+pin  "13 the window's own tie: NAME's bytes on a word" "SELECT NAME, ROW_NUMBER() OVER (ORDER BY DEPT) FROM WE2;" "NAME ROW_NUMBER|bob 1|dan 2|ann 3|aaaa 4|aaab 5|abdc 6|abcd 7"
+pin  "13 ...two bytes in under ORDER BY DEPT" "SELECT NAME, ROW_NUMBER() OVER (ORDER BY DEPT) FROM WE2 ORDER BY DEPT;" "NAME ROW_NUMBER|bob 3|dan 1|ann 2|aaaa 4|aaab 5|abdc 6|abcd 7"
+pin  "13 ...ORDER BY DEPT, NAME" "SELECT NAME, ROW_NUMBER() OVER (ORDER BY DEPT) FROM WE2 ORDER BY DEPT, NAME;" "NAME ROW_NUMBER|ann 2|bob 3|dan 1|aaaa 4|aaab 5|abcd 7|abdc 6"
+pin  "13 ...a CHAR(4) by its first byte" "SELECT NAME, ROW_NUMBER() OVER (ORDER BY DEPT) FROM WE4 ORDER BY DEPT, NAME;" "NAME ROW_NUMBER|ann 1|bob 2|dan 3|aaaa 4|aaab 5|abcd 7|abdc 6"
+
+echo "--- 14. AN ORDER BY OVER AN EXPLICIT COLLATE's alias or ordinal, and a UNION ALL's"
+pin  "14 GROUP BY K ORDER BY K over s COLLATE UNICODE" "SELECT S COLLATE UNICODE AS K, COUNT(*) FROM XK GROUP BY K ORDER BY K;" "K COUNT|a 1|A 1|b 1|B 1|c 1"
+pin  "14 ...over a UNICODE_CI column" "SELECT S COLLATE UNICODE AS K, COUNT(*) FROM XK2 GROUP BY K ORDER BY K;" "K COUNT|a 1|A 1|b 1|B 1|c 1"
+pin  "14 ...GROUP BY 1 ORDER BY 1" "SELECT S COLLATE UNICODE AS K, COUNT(*) FROM XK GROUP BY 1 ORDER BY 1;" "K COUNT|a 1|A 1|b 1|B 1|c 1"
+pin  "14 the bare alias" "SELECT S COLLATE UNICODE_CI AS K FROM XK ORDER BY K;" "K|a|A|b|B|c"
+pin  "14 ...the ordinal" "SELECT S COLLATE UNICODE_CI AS K FROM XK ORDER BY 1;" "K|a|A|b|B|c"
+pin  "14 ...DESC" "SELECT S COLLATE UNICODE_CI AS K FROM XK ORDER BY K DESC;" "K|c|B|b|A|a"
+pin  "14 ...FIRST 2" "SELECT FIRST 2 S COLLATE UNICODE AS K FROM XK ORDER BY K;" "K|a|A"
+pin  "14 ...beside a window" "SELECT S COLLATE UNICODE_CI AS K, ROW_NUMBER() OVER (ORDER BY S COLLATE UNICODE_CI) FROM XK ORDER BY K;" "K ROW_NUMBER|a 1|A 2|b 3|B 4|c 5"
+pin  "14 ORDER BY the column itself stays its own (bytes, control)" "SELECT S COLLATE UNICODE K FROM XK ORDER BY S;" "K|A|B|a|b|c"
+pin  "14 UNION ALL ... ORDER BY 1 over a CI column" "SELECT S FROM CS UNION ALL SELECT S FROM CS WHERE ID < 3 ORDER BY 1;" "S|abc|abc|Abc|ABC|ABC|b"
+pin  "14 ...over COLLATE legs" "SELECT S COLLATE UNICODE_CI FROM XK UNION ALL SELECT S COLLATE UNICODE_CI FROM XK WHERE ID < 3 ORDER BY 1;" "a|a|A|b|B|B|c"
+
+echo "--- 15. A SUBQUERY's value compares under ITS collation against a plain column"
+pin  "15 IN (SELECT ci ...)" "SELECT ID FROM U8 WHERE S IN (SELECT S FROM CS WHERE ID = 1) ORDER BY ID;" "ID|1|2|3|5"
+pin  "15 ...DISTINCT over it" "SELECT DISTINCT S FROM U8 WHERE S IN (SELECT S FROM CS WHERE ID = 1);" "S|ABC|Abc|abc"
+pin  "15 ...GROUP BY over it" "SELECT S, COUNT(*) FROM U8 WHERE S IN (SELECT S FROM CS WHERE ID = 1) GROUP BY S;" "S COUNT|ABC 1|Abc 1|abc 2"
+pin  "15 ...COUNT(DISTINCT)" "SELECT COUNT(DISTINCT S) FROM U8 WHERE S IN (SELECT S FROM CS WHERE ID = 1);" "COUNT|4"
+pin  "15 = (SELECT ci ...)" "SELECT ID FROM U8 WHERE S = (SELECT S FROM CS WHERE ID = 1) ORDER BY ID;" "ID|1|2|3|5"
+pin  "15 > (SELECT ci ...)" "SELECT ID FROM U8 WHERE S > (SELECT S FROM CS WHERE ID = 2) ORDER BY ID;" "ID|4"
+pin  "15 = ANY" "SELECT ID FROM U8 WHERE S = ANY (SELECT S FROM CS WHERE ID = 1) ORDER BY ID;" "ID|1|2|3|5"
+pin  "15 NOT IN" "SELECT ID FROM U8 WHERE S NOT IN (SELECT S FROM CS WHERE ID = 1) ORDER BY ID;" "ID|4"
+pin  "15 <> ALL" "SELECT ID FROM U8 WHERE S <> ALL (SELECT S FROM CS WHERE ID = 1) ORDER BY ID;" "ID|4"
+pin  "15 IN (SELECT s COLLATE UNICODE_CI ...)" "SELECT ID FROM U8 WHERE S IN (SELECT S COLLATE UNICODE_CI FROM U8 WHERE ID = 2) ORDER BY ID;" "ID|1|2|3|5"
+pin  "15 IN (SELECT UPPER(ci) ...)" "SELECT ID FROM U8 WHERE S IN (SELECT UPPER(S) FROM CS WHERE ID = 1) ORDER BY ID;" "ID|1|2|3|5"
+pin  "15 a correlated EXISTS" "SELECT ID FROM U8 WHERE EXISTS (SELECT 1 FROM CS WHERE CS.S = U8.S AND CS.ID = 1) ORDER BY ID;" "ID|1|2|3|5"
+pin  "15 a per-row scalar" "SELECT ID FROM U8 WHERE S = (SELECT S FROM CS WHERE CS.ID = U8.ID - 1) ORDER BY ID;" "ID|2|3"
+pin  "15 ...written first" "SELECT ID FROM U8 WHERE (SELECT S FROM CS WHERE ID = 1) = S ORDER BY ID;" "ID|1|2|3|5"
+pin  "15 ...against a literal" "SELECT ID FROM U8 WHERE (SELECT S FROM CS WHERE ID = 1) = 'ABC' ORDER BY ID;" "ID|1|2|3|4|5"
+pin  "15 a select-list count over the correlation" "SELECT ID, (SELECT COUNT(*) FROM CS WHERE CS.S = U8.S) FROM U8 ORDER BY ID;" "ID COUNT|1 3|2 3|3 3|4 1|5 3"
+pin  "15 ...MIN" "SELECT ID, (SELECT MIN(ID) FROM CS WHERE CS.S = U8.S) FROM U8 ORDER BY ID;" "ID MIN|1 1|2 1|3 1|4 4|5 1"
+pin  "15 ...the CI value on the OUTER side" "SELECT ID, (SELECT COUNT(*) FROM U8 WHERE U8.S = CS.S) FROM CS ORDER BY ID;" "ID COUNT|1 4|2 4|3 4|4 1"
+pin  "15 the CI column on the left adopts nothing new (control)" "SELECT ID FROM CS WHERE S IN (SELECT S FROM U8 WHERE ID = 1) ORDER BY ID;" "ID|1|2|3"
+pin  "15 a plain subquery against a plain column stays bytes (control)" "SELECT ID FROM U8 WHERE S IN (SELECT S FROM U8 WHERE ID = 1) ORDER BY ID;" "ID|1|5"
+refused "15 a per-row membership over a CI set compares values: refused" "SELECT ID FROM U8 WHERE S IN (SELECT S FROM CS WHERE CS.ID > U8.ID) ORDER BY ID;"
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-collkey-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 211 ]; then echo "FAIL only $ran checks ran (floor 211)"; fail=1; fi
+if [ "$ran" -lt 269 ]; then echo "FAIL only $ran checks ran (floor 269)"; fail=1; fi
 exit $fail
