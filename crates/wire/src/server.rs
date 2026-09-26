@@ -13672,14 +13672,36 @@ impl Term {
                     Some(v) if approx_of(v).is_some() => {
                         Some(ord_ok(value_cmp(v, &rhs), *op))
                     }
+                    // a DECFLOAT value - a decimal128 fold's answer in a
+                    // HAVING (`HAVING PERCENTILE_CONT(0.5) WITHIN GROUP
+                    // (ORDER BY <INT128>) > 1`, `HAVING VAR_POP(I) >= 0`,
+                    // `HAVING COVAR_POP(I, ID) = 0`) - has no exact
+                    // decomposition either; the engine promotes the exact
+                    // literal to decimal128 and compares in decimal
+                    // (measured: the first answers groups 2 and 3, the
+                    // others every group, where `num_cmp`'s decline read
+                    // as UNKNOWN and dropped EVERY group without an error)
+                    Some(v) if dec_of(v).is_some() => {
+                        match value_as_dec(&rhs) {
+                            Some(lit) => Term::NumCmp(*fid, *op, Rhs::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&lit))).matches(values)?,
+                            None => None,
+                        }
+                    }
                     Some(v) => num_cmp(v, &rhs).map(|o| ord_ok(o, *op)),
                     None => None,
                 }
             }
             // a wide integer literal (INT128): the compare aligns it
             // against the column's value in i128 exactly as the i64 arm
-            // does, `num_cmp` doing the width-safe part.
+            // does, `num_cmp` doing the width-safe part (and a DECFLOAT
+            // value promotes the literal, as above).
             Term::NumCmp(fid, op, Rhs::Int128(r)) => match values.get(*fid) {
+                Some(v) if dec_of(v).is_some() => {
+                    match value_as_dec(&Value::Int128(*r, 0)) {
+                        Some(lit) => Term::NumCmp(*fid, *op, Rhs::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&lit))).matches(values)?,
+                        None => None,
+                    }
+                }
                 Some(v) => num_cmp(v, &Value::Int128(*r, 0)).map(|o| ord_ok(o, *op)),
                 None => None,
             },
@@ -44829,6 +44851,7 @@ fn plan_query_outer(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>)
     clear_corr_registry();
     PREPARE_REFUSAL.with(|r| *r.borrow_mut() = None);
     EXPLICIT_COLL_SEEN.with(|c| c.set(false));
+    DOUBLE_LITERAL_TEXT.with(|t| t.borrow_mut().clear());
     // the two system-SQL pieces libfbclient's array helpers lean on,
     // folded into plain SQL before planning - see [rewrite_system_sql]
     let sys = rewrite_system_sql(sql);
@@ -61585,9 +61608,10 @@ fn stat2_result(func: AggFn, n: i64, sx: f64, sx2: f64, sy: f64, sy2: f64, sxy: 
 /// accumulated by add and one-rounding fma), every step a decimal128
 /// operation HALF-UP at 34 digits in the engine's own order. The
 /// trapped steps raise (Overflow 22003, an Invalid NaN 22000); the two
-/// `safeDivide` steps - slope and corr - divide by a zero variance
-/// silently, and their consumers test the variance first. X is the
-/// SECOND SQL argument, Y the FIRST.
+/// `safeDivide` steps - slope and corr - divide a NON-ZERO covariance by
+/// a zero variance silently (only the divide-by-zero trap is cleared),
+/// while 0 / 0 there is the trapped invalid operation, 22000 for every
+/// REGR type. X is the SECOND SQL argument, Y the FIRST.
 fn stat2_dec_result(
     func: AggFn,
     n: i64,
@@ -61653,11 +61677,28 @@ fn stat2_dec_result(
             let covar_pop = dv(&sxy_, &cnt)?;
             let avg_x = dv(sx, &cnt)?;
             let avg_y = dv(sy, &cnt)?;
-            // the safeDivide steps: a zero variance gives an untrapped
-            // Infinity / NaN that no consumer reads
-            let slope = dfl::div(&covar_pop, &var_pop_x);
+            // the safeDivide steps, taken for EVERY REGR type before the
+            // switch: `safeDivide` clears ONLY DEC_Division_by_zero, so a
+            // non-zero covariance over a zero variance is a silent
+            // Infinity no consumer reads, while 0 / 0 - a single row, a
+            // constant X (`GROUP BY` the row key), a constant Y for the
+            // corr step - is decNumber's Division undefined, an INVALID
+            // OPERATION that stays trapped: 22000 for REGR_AVGX / AVGY /
+            // SXX / SXY / SYY / SLOPE / INTERCEPT / R2 alike (measured:
+            // `REGR_AVGX(M, CAST(1 AS INT128))`, `REGR_SLOPE(I, I) WHERE
+            // ID = 1`, `REGR_R2(CAST(1 AS INT128), I)` all 22000, where
+            // this answered a value or NULL). CORR is CorrAggNode's own
+            // execute, which tests the divisor first (above).
+            let safe_dv = |a: &Dec, b: &Dec| -> Result<Dec, EvalErr> {
+                let q = dfl::div(a, b);
+                if matches!(q, Dec::Nan) && !matches!(a, Dec::Nan) && !matches!(b, Dec::Nan) {
+                    return Err(EvalErr::DecfloatInvalidOperation);
+                }
+                Ok(q)
+            };
+            let slope = safe_dv(&covar_pop, &var_pop_x)?;
             let sq = m(&trap(&[&var_pop_x], dfl::sqrt(&var_pop_x))?, &trap(&[&var_pop_y], dfl::sqrt(&var_pop_y))?)?;
-            let corr = dfl::div(&covar_pop, &sq);
+            let corr = safe_dv(&covar_pop, &sq)?;
             match func {
                 AggFn::RegrAvgx => out(avg_x),
                 AggFn::RegrAvgy => out(avg_y),
@@ -76646,6 +76687,9 @@ fn resolve_proj_expr(
                     )
                 } else {
                     let e = resolve_proj_expr(inner, columns, descs, sink)?;
+                    if !dec_literal_cast_spelled(&e, t) {
+                        return None;
+                    }
                     let cs = cast_source_charset(&e, t, descs);
                     Expr::Cast(Box::new(runtime_double_cast(e, t, cs)), *t, cs)
                 }
@@ -76963,6 +77007,9 @@ fn resolve_expr_inner(
                 ));
             }
             let inner = resolve_expr(e, columns, descs)?;
+            if !dec_literal_cast_spelled(&inner, t) {
+                return None;
+            }
             let cs = cast_source_charset(&inner, t, descs);
             Expr::Cast(Box::new(runtime_double_cast(inner, t, cs)), *t, cs)
         }
@@ -79805,6 +79852,29 @@ fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
             // it is transparent here (ABS(<decfloat>) is that decfloat)
             Expr::Func(f, args) if is_dbldec_fn(f) => dbldec_decimal(args, descs),
             Expr::Func(SysFn::Abs, args) if args.len() == 1 => walk(&args[0], descs)?,
+            // FLOOR / CEILING over a decfloat answer DECFLOAT(34)
+            // (makeCeilFloor's dec arm is makeDecimal128), ROUND / TRUNC
+            // keep the operand's own width (makeRound / makeTrunc `*result
+            // = *value`) - decfloat leaves when their operand is one, and
+            // over any other operand exactly what that operand is. A
+            // places argument the exact arm would refuse (a text) refuses
+            // here too.
+            Expr::Func(SysFn::Ceil | SysFn::Ceiling | SysFn::Floor, args) if args.len() == 1 => {
+                walk(&args[0], descs)?
+            }
+            Expr::Func(SysFn::Round | SysFn::Trunc, args) if !args.is_empty() => {
+                let w = walk(&args[0], descs)?;
+                if let Some(n) = args.get(1) {
+                    let numeric = matches!(
+                        n.type_of(descs),
+                        Some(ExprType::Int | ExprType::Numeric | ExprType::Approx)
+                    ) || walk(n, descs).is_some();
+                    if !numeric {
+                        return None;
+                    }
+                }
+                w
+            }
             _ => return None,
         })
     }
@@ -79831,6 +79901,26 @@ fn runtime_double_cast(inner: Expr, t: &CastTarget, cs: u8) -> Expr {
     } else {
         inner
     }
+}
+
+/// A double LITERAL under a CAST to DECFLOAT folds from its spelling
+/// ([double_literal_text]); when two spellings of the same double in one
+/// statement read to different decimals the fold cannot pick, and the
+/// statement refuses HERE, at prepare, rather than at fetch. Every other
+/// shape passes.
+fn dec_literal_cast_spelled(inner: &Expr, t: &CastTarget) -> bool {
+    if !matches!(t, CastTarget::DecFloat { .. }) || RUNTIME_DOUBLE_CASTS.with(|c| c.get()) {
+        return true;
+    }
+    let lit = match inner {
+        Expr::Double(d) => Some(*d),
+        Expr::Neg(x) => match &**x {
+            Expr::Double(d) => Some(*d),
+            _ => None,
+        },
+        _ => None,
+    };
+    lit.is_none_or(|d| double_literal_text(d).is_some())
 }
 
 /// Run `f` with [RUNTIME_DOUBLE_CASTS] set, restoring the previous state.
@@ -79920,6 +80010,14 @@ fn df_agg_engine_width(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
         // ABS keeps the operand's own width (makeAbs `*result = *value`)
         Expr::Func(f, args) if is_dbldec_fn(f) && dbldec_decimal(args, descs) => Some(true),
         Expr::Func(SysFn::Abs, args) if args.len() == 1 => df_agg_engine_width(&args[0], descs),
+        // FLOOR / CEILING widen a DECFLOAT(16) to (34) (`FLOOR(<DECFLOAT(16)>)`
+        // describes DECFLOAT(34), measured); ROUND / TRUNC keep the width
+        Expr::Func(SysFn::Ceil | SysFn::Ceiling | SysFn::Floor, args) if args.len() == 1 => {
+            df_agg_engine_width(&args[0], descs).map(|_| true)
+        }
+        Expr::Func(SysFn::Round | SysFn::Trunc, args) if !args.is_empty() => {
+            df_agg_engine_width(&args[0], descs)
+        }
         _ => None,
     }
 }
@@ -80179,14 +80277,12 @@ fn classify_exp_literal(text: &str) -> Option<ExpLit> {
             return text_to_dec128_clamped(text).ok().map(ExpLit::DecFloat34);
         }
         let d = cvt_text_to_double(text)?;
-        if text.parse::<f64>().ok() != Some(d) {
-            DOUBLE_LITERAL_TEXT.with(|t| {
-                let mut t = t.borrow_mut();
-                if !t.iter().any(|(b, _)| *b == d.to_bits()) {
-                    t.push((d.to_bits(), text.to_string()));
-                }
-            });
-        }
+        DOUBLE_LITERAL_TEXT.with(|t| {
+            let mut t = t.borrow_mut();
+            if !t.iter().any(|(b, s)| *b == d.to_bits() && s == text) {
+                t.push((d.to_bits(), text.to_string()));
+            }
+        });
         Some(ExpLit::Double(d))
     } else if m == TWO63 {
         // the 2^63 INT128 quirk: representable only as a scale-0 i128
@@ -80217,13 +80313,32 @@ fn classify_exp_literal(text: &str) -> Option<ExpLit> {
 /// nearest double). Rust's `parse::<f64>` gave the correctly rounded one.
 /// A significand past 2^53 loses digits in the accumulation the same way.
 /// The decimal text a double LITERAL was spelled with, for the fold that
-/// re-reads it: the recorded spelling of an engine-rounded double
-/// ([DOUBLE_LITERAL_TEXT]), else the shortest round-trip form, which for
-/// a correctly rounded double reads back to the same value.
-fn double_literal_text(d: f64) -> String {
-    DOUBLE_LITERAL_TEXT
-        .with(|t| t.borrow().iter().find(|(b, _)| *b == d.to_bits()).map(|(_, s)| s.clone()))
-        .unwrap_or_else(|| format!("{:e}", d))
+/// re-reads it: the spelling the prepare in progress recorded for the
+/// double's bits ([DOUBLE_LITERAL_TEXT]) - ALWAYS the spelling, since the
+/// engine re-reads the text and a 16- or 17-digit spelling that is not
+/// the double's shortest decimal folds to ITS digits (measured:
+/// `CAST(9007199254740993e0 AS NUMERIC(38,0))` is 9007199254740993 and
+/// `CAST(1.0000000000000001e0 AS NUMERIC(38,17))` 1.00000000000000010,
+/// where the shortest form gave ...992 and 1.00000000000000000). Two
+/// spellings of one double in the same statement that read to DIFFERENT
+/// decimals (`1.5e0` beside `1.50e0` for a DECFLOAT target) cannot be
+/// told apart by the bits, and decline; a literal no lexer recorded (a
+/// double built in code) takes the shortest round-trip form.
+fn double_literal_text(d: f64) -> Option<String> {
+    DOUBLE_LITERAL_TEXT.with(|t| {
+        let t = t.borrow();
+        let mut spellings = t.iter().filter(|(b, _)| *b == d.to_bits()).map(|(_, s)| s);
+        let first = match spellings.next() {
+            Some(s) => s.clone(),
+            None => return Some(format!("{:e}", d)),
+        };
+        let bits_of = |s: &str| text_to_dec128_clamped(s).ok();
+        if spellings.all(|s| bits_of(s) == bits_of(&first)) {
+            Some(first)
+        } else {
+            None
+        }
+    })
 }
 
 fn cvt_text_to_double(text: &str) -> Option<f64> {
@@ -82756,6 +82871,18 @@ fn fn_f64(v: &Value) -> Result<f64, EvalErr> {
     if let Some(d) = approx_of(v) {
         return Ok(d);
     }
+    // a DECFLOAT operand: MOV_get_double's decimal-to-double, the value's
+    // digits read as a double (the CAST to DOUBLE's own conversion)
+    if let Some(dec) = dec_of(v) {
+        use fire_crab_ods::decfloat::Dec;
+        return match dec {
+            Dec::Infinity { .. } => Err(EvalErr::FloatOverflowBare),
+            Dec::Nan => Err(EvalErr::DecfloatInvalidOperation),
+            Dec::Finite { .. } => fire_crab_ods::decfloat::to_string(&dec)
+                .parse()
+                .map_err(|_| EvalErr::ConversionError(None)),
+        };
+    }
     // a TEXT operand: the engine converts it to double by its numeric
     // grammar (SQRT('4') answers 2.0), and raises 22018 with the raw
     // string when the text is not a number (SQRT('abc'))
@@ -82800,6 +82927,237 @@ enum RndMode {
     Floor,
     Round,
     Trunc,
+}
+
+/// A decfloat brought to an integer the way decQuadToIntegralValue does
+/// under `mode`'s rounding: a negative exponent rounds away to exponent
+/// 0 (a zero result keeps the value's sign - `CEILING(-0.5)` is -0,
+/// measured), a non-negative exponent and a special value pass through
+/// unchanged (`FLOOR(1.5E+2)` is 1.5E+2, `FLOOR(NaN)` NaN, measured).
+fn dec_to_integral(d: &fire_crab_ods::decfloat::Dec, mode: RndMode) -> fire_crab_ods::decfloat::Dec {
+    use fire_crab_ods::decfloat::Dec;
+    let Dec::Finite { neg, coeff, exp } = d else { return d.clone() };
+    if *exp >= 0 {
+        return d.clone();
+    }
+    let (q, rem) = match 10u128.checked_pow((-exp) as u32) {
+        Some(p) => (coeff / p, coeff % p),
+        None => (0, *coeff),
+    };
+    let up = match mode {
+        RndMode::Trunc => false,
+        RndMode::Floor => *neg && rem != 0,
+        RndMode::Ceil => !*neg && rem != 0,
+        RndMode::Round => 10u128.checked_pow((-exp - 1) as u32).is_some_and(|h| rem >= 5 * h),
+    };
+    Dec::Finite { neg: *neg, coeff: q + up as u128, exp: 0 }
+}
+
+/// FLOOR / CEILING / ROUND / TRUNC over a DECFLOAT operand - the engine's
+/// evlCeil / evlFloor / evlRound / evlTrunc decimal arms (SysFunction.cpp),
+/// each measured on 2182:
+///
+/// * FLOOR / CEILING are `Decimal128::floor` / `ceil` -
+///   decQuadToIntegralValue under ROUND_FLOOR / ROUND_CEILING
+///   ([dec_to_integral]) - and answer DECFLOAT(34) whatever the operand's
+///   width;
+/// * ROUND(x, n) is the INT128 route: `MOV_get_int128(value, -n)` - the
+///   same [cvt_dec_to_int128] a CAST takes, so x * 10^n is range-checked
+///   (22003: `ROUND(1.5, 127)`) and then quantized, past 34 digits the
+///   invalid operation (22000: `ROUND(SQRT(2), 34)`) - and the Int128
+///   comes back at scale -n as a decimal of the operand's width, HALF-UP
+///   (`ROUND(2.5)` 3, `ROUND(-2.5)` -3, `ROUND(123.456, -1)` 1.2E+2,
+///   `ROUND(2, 2)` 2.00). The scale lives in a SCHAR: n = -128 wraps
+///   to -128, so `ROUND(1.5, -128)` is 0E-128;
+/// * TRUNC(x, n) works in decimal with a power of ten built in an
+///   INT64 by repeated `v *= 10` - which WRAPS past 10^18: n >= 0 splits
+///   x into its integral part and fraction (`modf`, ROUND_DOWN), scales
+///   the fraction by v, takes ITS integral part and divides it back, so
+///   `TRUNC(1.23456, 3)` is 1.234 and `TRUNC(16, 2)` stays 16, while
+///   `TRUNC(SQRT(2), 19)` runs through v = -8446744073709551616 and lands
+///   on 1.414213562373095048720917202727053, and n >= 64 (v = 0) is the
+///   0 / 0 invalid operation; n < 0 divides x by v first and multiplies
+///   the integral part back (`TRUNC(123.456, -1)` 120, `TRUNC(123, -64)`
+///   the divide by zero, 22012). A places count outside -128..127 is the
+///   named scale error for both.
+fn dec_round_family(
+    mode: RndMode,
+    d: &fire_crab_ods::decfloat::Dec,
+    narrow: bool,
+    places: Option<&Value>,
+) -> Result<Value, EvalErr> {
+    use fire_crab_ods::decfloat::{self as dfl, Dec};
+    let out = |r: Dec| {
+        if narrow && matches!(mode, RndMode::Round | RndMode::Trunc) {
+            Value::DecFloat16(dfl::dec_to_dec64_bits(&r))
+        } else {
+            Value::DecFloat34(dfl::dec_to_bits(&r))
+        }
+    };
+    // the context traps: a division by a zero divisor (22012), an
+    // Invalid (22000) and an Overflow (22003) made from finite operands
+    let fin = |x: &Dec| matches!(x, Dec::Finite { .. });
+    let trap = |before: &[&Dec], after: Dec| -> Result<Dec, EvalErr> {
+        if matches!(after, Dec::Nan) && !before.iter().any(|x| matches!(x, Dec::Nan)) {
+            return Err(EvalErr::DecfloatInvalidOperation);
+        }
+        if matches!(after, Dec::Infinity { .. }) && before.iter().all(|x| fin(x)) {
+            return Err(EvalErr::DecfloatOverflow);
+        }
+        Ok(after)
+    };
+    let div = |a: &Dec, b: &Dec| -> Result<Dec, EvalErr> {
+        if dfl::is_zero(b) && fin(a) && !dfl::is_zero(a) {
+            return Err(EvalErr::DecfloatDivideByZero);
+        }
+        trap(&[a, b], dfl::div(a, b))
+    };
+    let mul = |a: &Dec, b: &Dec| trap(&[a, b], dfl::mul(a, b));
+    // `v *= 10` k times in an SINT64
+    let pow_i64 = |k: i32| -> Dec {
+        let mut v: i64 = 1;
+        for _ in 0..k {
+            v = v.wrapping_mul(10);
+        }
+        Dec::Finite { neg: v < 0, coeff: v.unsigned_abs() as u128, exp: 0 }
+    };
+    let modf = |x: &Dec| -> (Dec, Dec) {
+        let ip = dec_to_integral(x, RndMode::Trunc);
+        let r = dfl::sub(x, &ip);
+        (ip, r)
+    };
+    match mode {
+        RndMode::Ceil | RndMode::Floor => Ok(out(dec_to_integral(d, mode))),
+        RndMode::Round => {
+            let n = round_places(places, "ROUND")?;
+            // a DECFLOAT(16) operand is not `is128()`: MOV_get_int64
+            // (`ROUND(<DECFLOAT(16)> 1.5, 100)` is the 34-digit invalid,
+            // `ROUND(CAST('1e19' AS DECFLOAT(16)))` the INT64 range's
+            // *Floating-point invalid operand*, measured)
+            let raw = if narrow {
+                cvt_dec_to_int64(d, -n)? as i128
+            } else {
+                cvt_dec_to_int128(d, -n)?
+            };
+            let exp = (-n) as i8 as i32;
+            Ok(out(Dec::Finite { neg: raw < 0, coeff: raw.unsigned_abs(), exp }))
+        }
+        RndMode::Trunc => {
+            let result_scale = -round_places(places, "TRUNC")?;
+            if result_scale > 0 {
+                let vv = pow_i64(result_scale);
+                let (ip, _) = modf(&div(d, &vv)?);
+                Ok(out(mul(&ip, &vv)?))
+            } else {
+                let (ip, r) = modf(d);
+                if result_scale == 0 {
+                    return Ok(out(ip));
+                }
+                let vv = pow_i64(-result_scale);
+                let (ri, _) = modf(&mul(&r, &vv)?);
+                Ok(out(trap(&[&ip], dfl::add(&ip, &div(&ri, &vv)?))?))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod decfloat_cvt_tests {
+    use super::*;
+    use fire_crab_ods::decfloat::{decode_dec128, to_string};
+
+    fn d(s: &str) -> fire_crab_ods::decfloat::Dec {
+        decode_dec128(text_to_dec128(s).unwrap())
+    }
+
+    // every value here is engine 2182's own answer (measured 2026-09-26)
+    #[test]
+    fn decfloat_to_int128_is_range_then_quantize() {
+        assert!(matches!(
+            cvt_dec_to_int128(&d("1.701411834604692317316873037158842E+38"), 0),
+            Err(EvalErr::NumericOutOfRange)
+        ));
+        assert!(matches!(
+            cvt_dec_to_int128(&d("1.701411834604692317316873037158841E+38"), 0),
+            Err(EvalErr::DecfloatInvalidOperation)
+        ));
+        assert!(matches!(cvt_dec_to_int128(&d("1e34"), 0), Err(EvalErr::DecfloatInvalidOperation)));
+        assert_eq!(cvt_dec_to_int128(&d("1e33"), 0).unwrap(), 10i128.pow(33));
+        assert_eq!(cvt_dec_to_int128(&d("2.5"), 0).unwrap(), 3);
+        assert_eq!(cvt_dec_to_int128(&d("-2.5"), 0).unwrap(), -3);
+        assert_eq!(cvt_dec_to_int128(&d("1e-40"), -4).unwrap(), 0);
+        assert_eq!(cvt_dec_to_int128(&d("1e37"), -2).unwrap_err(), EvalErr::NumericOutOfRange);
+        let root2 = "1.414213562373095048801688724209698";
+        assert!(matches!(cvt_dec_to_int128(&d(root2), -34), Err(EvalErr::DecfloatInvalidOperation)));
+        assert_eq!(cvt_dec_to_int128(&d(root2), -33).unwrap(), 1414213562373095048801688724209698);
+        assert!(matches!(cvt_dec_to_int128(&d("inf"), 0), Err(EvalErr::NumericOutOfRange)));
+        assert!(matches!(cvt_dec_to_int128(&d("nan"), 0), Err(EvalErr::DecfloatInvalidOperation)));
+        // toInt64: the quantize first, then the range through the DOUBLE context
+        assert!(matches!(cvt_dec_to_int64(&d("1e30"), 0), Err(EvalErr::FloatInvalidOperand)));
+        assert!(matches!(cvt_dec_to_int64(&d("1e35"), -2), Err(EvalErr::DecfloatInvalidOperation)));
+        assert!(matches!(
+            cvt_dec_to_int64(&d("9223372036854775807.5"), 0),
+            Err(EvalErr::FloatInvalidOperand)
+        ));
+        assert_eq!(cvt_dec_to_int64(&d("9223372036854775807.4"), 0).unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn decfloat_round_family_follows_evl() {
+        let r = |mode: RndMode, s: &str, n: Option<i64>| -> String {
+            match dec_round_family(mode, &d(s), false, n.map(Value::Int).as_ref()).unwrap() {
+                Value::DecFloat34(b) => to_string(&decode_dec128(b)),
+                other => panic!("not a DECFLOAT(34): {:?}", other.render()),
+            }
+        };
+        assert_eq!(r(RndMode::Round, "123.456", Some(-1)), "1.2E+2");
+        assert_eq!(r(RndMode::Round, "2", Some(2)), "2.00");
+        assert_eq!(r(RndMode::Round, "2.5", None), "3");
+        assert_eq!(r(RndMode::Round, "-2.5", None), "-3");
+        assert_eq!(r(RndMode::Round, "1.5", Some(-128)), "0E-128");
+        assert_eq!(r(RndMode::Round, "0", Some(127)), "0E-127");
+        let root2 = "1.414213562373095048801688724209698";
+        assert_eq!(r(RndMode::Trunc, root2, Some(18)), "1.414213562373095048");
+        assert_eq!(r(RndMode::Trunc, root2, Some(19)), "1.414213562373095048720917202727053");
+        assert_eq!(r(RndMode::Trunc, root2, Some(40)), "1.414213562373095048705607286608139");
+        assert_eq!(r(RndMode::Trunc, "123.456", Some(-1)), "120");
+        assert_eq!(r(RndMode::Trunc, "123.456", Some(-3)), "0");
+        assert_eq!(r(RndMode::Trunc, "1.23456", Some(3)), "1.234");
+        assert_eq!(r(RndMode::Trunc, "16", Some(2)), "16");
+        assert_eq!(r(RndMode::Trunc, "-2.5", None), "-2");
+        assert_eq!(r(RndMode::Trunc, "1.5E+2", None), "1.5E+2");
+        assert_eq!(r(RndMode::Floor, "1E+36", None), "1E+36");
+        assert_eq!(r(RndMode::Floor, "1.5E+2", None), "1.5E+2");
+        assert_eq!(r(RndMode::Floor, "-1.5", None), "-2");
+        assert_eq!(r(RndMode::Ceil, "-1.5", None), "-1");
+        assert_eq!(r(RndMode::Ceil, "-0.5", None), "-0");
+        assert_eq!(r(RndMode::Floor, "NaN", None), "NaN");
+        assert!(matches!(
+            dec_round_family(RndMode::Trunc, &d("2"), false, Some(&Value::Int(64))),
+            Err(EvalErr::DecfloatInvalidOperation)
+        ));
+        assert!(matches!(
+            dec_round_family(RndMode::Trunc, &d("123"), false, Some(&Value::Int(-64))),
+            Err(EvalErr::DecfloatDivideByZero)
+        ));
+        assert!(matches!(
+            dec_round_family(RndMode::Round, &d("1.5"), false, Some(&Value::Int(127))),
+            Err(EvalErr::NumericOutOfRange)
+        ));
+        assert!(matches!(
+            dec_round_family(RndMode::Round, &d(root2), false, Some(&Value::Int(34))),
+            Err(EvalErr::DecfloatInvalidOperation)
+        ));
+        // a DECFLOAT(16) operand rounds through INT64
+        assert!(matches!(
+            dec_round_family(RndMode::Round, &d("1e19"), true, None),
+            Err(EvalErr::FloatInvalidOperand)
+        ));
+        assert!(matches!(
+            dec_round_family(RndMode::Round, &d("1.5"), true, Some(&Value::Int(100))),
+            Err(EvalErr::DecfloatInvalidOperation)
+        ));
+    }
 }
 
 /// The places argument of ROUND/TRUNC, converted the way the engine's
@@ -83017,6 +83375,82 @@ fn arg_int64(v: &Value, digits: u32) -> Result<i64, EvalErr> {
         (fn_int(v)? as i128).checked_mul(pow(digits).unwrap_or(1)).ok_or(EvalErr::NumericOutOfRange)?
     };
     i64::try_from(r).map_err(|_| over)
+}
+
+/// A DECFLOAT into an INT128-backed exact at `scale` (the target's
+/// dsc_scale, `-2` for NUMERIC(38,2)): the engine's `CVT_get_int128`
+/// dec128 arm (cvt.cpp) and `Int128::set(DecimalStatus, Decimal128)`
+/// (Int128.cpp). The value's exponent shifts by the scale (exact), the
+/// scaled value is RANGE-CHECKED against +-1.701411834604692317316873037158841E+38
+/// - *numeric value is out of range*, 22003 - and only then quantized
+/// to exponent 0 HALF-UP, which decNumber refuses as an INVALID
+/// OPERATION (22000) whenever the integer needs more than 34 digits. So
+/// no DECFLOAT of 1E+34 or more converts to INT128 at all, a 34-digit
+/// fraction does not convert to NUMERIC(38,34), and the two errors are
+/// ordered by magnitude (measured on 2182: `CAST(POWER(CAST(2 AS INT128),
+/// 128) AS INT128)` 22003, `.. 127)` 22000, `CAST(SQRT(CAST(2 AS INT128))
+/// AS NUMERIC(38,34))` 22000, `CAST(CAST('1e37' AS DECFLOAT(34)) AS
+/// NUMERIC(38,2))` 22003, `'1e34'` to INT128 22000; the previous binary
+/// quantized before the range check and never raised the digit limit).
+/// A NaN fails the range compare itself (22000); an Infinity is out of
+/// range (22003) - both measured. ROUND over a DECFLOAT takes this same
+/// conversion ([SysFn::Round]'s decimal arm).
+fn cvt_dec_to_int128(d: &fire_crab_ods::decfloat::Dec, scale: i32) -> Result<i128, EvalErr> {
+    use fire_crab_ods::decfloat::{self as dfl, Dec};
+    let scaled = match d {
+        Dec::Finite { neg, coeff, exp } => Dec::Finite { neg: *neg, coeff: *coeff, exp: exp - scale },
+        Dec::Infinity { .. } => return Err(EvalErr::NumericOutOfRange),
+        Dec::Nan => return Err(EvalErr::DecfloatInvalidOperation),
+    };
+    let lim = |neg: bool| Dec::Finite { neg, coeff: 1_701_411_834_604_692_317_316_873_037_158_841, exp: 5 };
+    if dfl::cmp(&scaled, &lim(true)) == std::cmp::Ordering::Less
+        || dfl::cmp(&scaled, &lim(false)) == std::cmp::Ordering::Greater
+    {
+        return Err(EvalErr::NumericOutOfRange);
+    }
+    let raw = dec_quantize_int(&scaled)?;
+    if raw.unsigned_abs() >= 10u128.pow(34) {
+        return Err(EvalErr::DecfloatInvalidOperation);
+    }
+    Ok(raw)
+}
+
+/// `Decimal128::quantize(1)` of a finite value as an integer: HALF-UP to
+/// exponent 0. A value below 10^-39 in magnitude has no digit left
+/// (`CAST(CAST('1e-40' AS DECFLOAT(34)) AS INT128)` is 0, `ROUND(1.5,
+/// -128)` 0E-128 - measured), where the i128 arithmetic would have
+/// overflowed the power of ten; past i128 the caller's digit limit is
+/// what raises.
+fn dec_quantize_int(d: &fire_crab_ods::decfloat::Dec) -> Result<i128, EvalErr> {
+    use fire_crab_ods::decfloat::{self as dfl, Dec};
+    match d {
+        // ...and a zero is 0 at every exponent (`ROUND(0, 127)` is 0E-127)
+        Dec::Finite { coeff: 0, .. } => Ok(0),
+        Dec::Finite { exp, .. } if *exp < -39 => Ok(0),
+        _ => dfl::round_to_exp(d, 0).ok_or(EvalErr::DecfloatInvalidOperation),
+    }
+}
+
+/// A DECFLOAT into an INT64-backed exact at `scale`: `Decimal128::toInt64`
+/// (DecFloat.cpp), which shifts the exponent, QUANTIZES FIRST - past 34
+/// digits decNumber's invalid operation, *Decimal float invalid
+/// operation* (`CAST(CAST('1e35' AS DECFLOAT(34)) AS NUMERIC(18,2))`,
+/// measured) - and only then range-checks against INT64, raising through
+/// the DOUBLE context: *Floating-point invalid operand* (`'1e30' AS
+/// BIGINT`, `'9223372036854775807.5' AS BIGINT` where `.4` fits; `'1e20'
+/// AS NUMERIC(18,2)`). ROUND over a DECFLOAT(16) takes this route too
+/// (evlRound's `is128()` is false for dec64).
+fn cvt_dec_to_int64(d: &fire_crab_ods::decfloat::Dec, scale: i32) -> Result<i64, EvalErr> {
+    use fire_crab_ods::decfloat::Dec;
+    let scaled = match d {
+        Dec::Finite { neg, coeff, exp } => Dec::Finite { neg: *neg, coeff: *coeff, exp: exp - scale },
+        _ => return Err(EvalErr::DecfloatInvalidOperation),
+    };
+    let raw = dec_quantize_int(&scaled)?;
+    if raw.unsigned_abs() >= 10u128.pow(34) {
+        return Err(EvalErr::DecfloatInvalidOperation);
+    }
+    i64::try_from(raw).map_err(|_| EvalErr::FloatInvalidOperand)
 }
 
 /// The DECFLOAT a value holds, decoded - `None` for any other value
@@ -83497,6 +83931,20 @@ impl Expr {
                 if matches!(f, SysFn::Abs) && args.len() == 1 && is_decfloat_arith(&args[0], descs) {
                     return None;
                 }
+                // ... and FLOOR / CEILING / ROUND / TRUNC over one: a
+                // decfloat leaf too (their width in [df_agg_engine_width]);
+                // SIGN over one is the SHORT every SIGN is (evlSign reads a
+                // decfloat through Decimal128::sign) - measured:
+                // `SIGN(SQRT(I))` SHORT 1, `ROUND(SQRT(I), 2)` DECFLOAT(34)
+                // 2.24, where every one of these refused
+                if matches!(f, SysFn::Ceil | SysFn::Ceiling | SysFn::Floor | SysFn::Round | SysFn::Trunc)
+                    && args.first().is_some_and(|a| is_decfloat_arith(a, descs))
+                {
+                    return None;
+                }
+                if matches!(f, SysFn::Sign) && args.len() == 1 && is_decfloat_arith(&args[0], descs) {
+                    return Some(ExprType::Int);
+                }
                 // every argument must be typeable; the arguments the
                 // engine converts (a number under UPPER renders to its
                 // text, a text length parses to its integer) convert in
@@ -83518,12 +83966,18 @@ impl Expr {
                     SysFn::Round | SysFn::Trunc => i == 1,
                     _ => false,
                 };
+                // ... and a DblDec call on its DOUBLE path (an approximate
+                // argument beside a decfloat one) reads the decfloat through
+                // MOV_get_double (measured: `POWER(<DECFLOAT(34)> 2, 0.5e0)`
+                // is DOUBLE 1.414213562373095; refused here)
+                let dbl_path = is_dbldec_fn(f) && !dbldec_decimal(args, descs);
                 let ts = args
                     .iter()
                     .enumerate()
                     .map(|(i, a)| {
                         a.type_of(descs).or_else(|| {
-                            (int_arg(i) && is_decfloat_arith(a, descs)).then_some(ExprType::Numeric)
+                            ((int_arg(i) || dbl_path) && is_decfloat_arith(a, descs))
+                                .then_some(if dbl_path { ExprType::Approx } else { ExprType::Numeric })
                         })
                     })
                     .collect::<Option<Vec<_>>>()?;
@@ -85218,13 +85672,41 @@ impl Expr {
                             }
                         } else if approx_const_fold(e) {
                             // a pure-constant approximate literal cast to
-                            // DECFLOAT is a PREPARE-TIME decimal fold on the
-                            // literal text (0.1e0 -> 0.1), NOT the runtime
-                            // 17-sig expansion. fire-crab cannot yet
-                            // reproduce the fold, so REFUSE rather than ship
-                            // the wrong value (deferred follow-on) - the same
-                            // refusal a Double source earned before.
-                            return Err(EvalErr::ConversionError(None));
+                            // DECFLOAT is the engine's LiteralNode::pass2
+                            // fold: under an assignment to the DECFLOAT
+                            // target the literal is re-read from its TEXT
+                            // by CVT_get_dec128 (`CAST(1e30 AS DECFLOAT(34))`
+                            // is 1E+30, `CAST(1.50e0 ..)` 1.50, `CAST(0.1e0
+                            // ..)` 0.1, `SQRT(CAST(1e-30 AS DECFLOAT(34)))`
+                            // 1E-15 - all measured), never the runtime
+                            // 17-digit expansion of the double, which the
+                            // resolver wraps for the contexts that are no
+                            // assignment ([runtime_double_cast]). A bare
+                            // literal, negated or not, spells itself
+                            // ([double_literal_text]); a constant TREE
+                            // (`CAST(1.5e0 * 2 AS DECFLOAT(34))`) would need
+                            // its literals re-read as decimals before the
+                            // arithmetic, and keeps its refusal.
+                            let (neg, lit) = match &**e {
+                                Expr::Double(d) => (false, Some(*d)),
+                                Expr::Neg(inner) => match &**inner {
+                                    Expr::Double(d) => (true, Some(*d)),
+                                    _ => (false, None),
+                                },
+                                _ => (false, None),
+                            };
+                            let bits = lit
+                                .and_then(double_literal_text)
+                                .and_then(|t| text_to_dec128_clamped(&t).ok())
+                                .ok_or(EvalErr::ConversionError(None))?;
+                            // the minus is part of the re-read TEXT, so
+                            // `CAST(-0e0 AS DECFLOAT(34))` is -0 (measured)
+                            match fire_crab_ods::decfloat::decode_dec128(bits) {
+                                fire_crab_ods::decfloat::Dec::Finite { neg: n, coeff, exp } => {
+                                    fire_crab_ods::decfloat::Dec::Finite { neg: n != neg, coeff, exp }
+                                }
+                                other => other,
+                            }
                         } else if let Some(x) = approx_of(&v) {
                             // a RUNTIME approximate value (FLOAT/DOUBLE
                             // column, CAST(.. AS DOUBLE) result, param): the
@@ -85442,17 +85924,20 @@ impl Expr {
                             v @ (Value::DecFloat16(_) | Value::DecFloat34(_)) => {
                                 let dec =
                                     value_as_dec(&v).ok_or(EvalErr::DecfloatInvalidOperation)?;
-                                let x = fire_crab_ods::decfloat::round_to_exp(&dec, 0)
-                                    .ok_or(EvalErr::DecfloatInvalidOperation)?;
-                                let (clo, chi) = if *bytes >= 8 {
-                                    (i64::MIN as i128, i64::MAX as i128)
+                                if *bytes >= 8 {
+                                    // BIGINT is Decimal128::toInt64
+                                    // ([cvt_dec_to_int64]): the range
+                                    // failure is *Floating-point invalid
+                                    // operand* (measured: `'1e30' AS BIGINT`)
+                                    fit(cvt_dec_to_int64(&dec, 0)? as i128)?
                                 } else {
-                                    (i32::MIN as i128, i32::MAX as i128)
-                                };
-                                if x < clo || x > chi {
-                                    return Err(EvalErr::DecfloatInvalidOperation);
+                                    let x = fire_crab_ods::decfloat::round_to_exp(&dec, 0)
+                                        .ok_or(EvalErr::DecfloatInvalidOperation)?;
+                                    if x < i32::MIN as i128 || x > i32::MAX as i128 {
+                                        return Err(EvalErr::DecfloatInvalidOperation);
+                                    }
+                                    fit(x)?
                                 }
-                                fit(x)?
                             }
                             _ => return Err(nonnumeric_conv(&v)),
                         }
@@ -85824,7 +86309,7 @@ impl Expr {
                                     {
                                         return Err(EvalErr::NumericOutOfRange);
                                     }
-                                    match text_number(&double_literal_text(d)) {
+                                    match double_literal_text(d).and_then(|t| text_number(&t)) {
                                         Some(TextNum::Dec { mantissa, exp })
                                             if i8::try_from(exp).is_ok() =>
                                         {
@@ -85876,23 +86361,48 @@ impl Expr {
                             v @ (Value::DecFloat16(_) | Value::DecFloat34(_)) => {
                                 let dec =
                                     value_as_dec(v).ok_or(EvalErr::DecfloatInvalidOperation)?;
-                                let raw = fire_crab_ods::decfloat::round_to_exp(&dec, *scale as i32)
-                                    .ok_or(EvalErr::DecfloatInvalidOperation)?;
-                                // a DECFLOAT source overflows the NUMERIC
-                                // BACKING as 22000 (probed: 1e18 ->
-                                // NUMERIC(9,0) i32, 1e30 -> NUMERIC(18,0)
-                                // i64), not the 22003 the shared gate below
-                                // raises for an exact/approx source
-                                let (lo, hi) = match *bytes {
-                                    2 => (i16::MIN as i128, i16::MAX as i128),
-                                    4 => (i32::MIN as i128, i32::MAX as i128),
-                                    8 => (i64::MIN as i128, i64::MAX as i128),
-                                    _ => (i128::MIN, i128::MAX),
-                                };
-                                if raw < lo || raw > hi {
-                                    return Err(EvalErr::DecfloatInvalidOperation);
+                                if *bytes == 16 {
+                                    // an INT128-backed target is the
+                                    // engine's CVT_get_int128 dec arm:
+                                    // range first (22003), then the
+                                    // 34-digit quantize (22000)
+                                    (cvt_dec_to_int128(&dec, *scale as i32)?, *scale)
+                                } else if *bytes == 8 {
+                                    (cvt_dec_to_int64(&dec, *scale as i32)? as i128, *scale)
+                                } else {
+                                    let raw = fire_crab_ods::decfloat::round_to_exp(&dec, *scale as i32)
+                                        .ok_or(EvalErr::DecfloatInvalidOperation)?;
+                                    // a DECFLOAT source overflows the NUMERIC
+                                    // BACKING as 22000 (probed: 1e18 ->
+                                    // NUMERIC(9,0) i32, 1e30 -> NUMERIC(18,0)
+                                    // i64), not the 22003 the shared gate below
+                                    // raises for an exact/approx source. The
+                                    // wording is the converter's: an INT64
+                                    // target is Decimal128::toInt64, whose
+                                    // overflow is *Floating-point invalid
+                                    // operand* (measured: `CAST(CAST('1e30' AS
+                                    // DECFLOAT(34)) AS BIGINT)`, and
+                                    // `'9223372036854775807.5'` rounds past the
+                                    // edge the same way while `.4` fits); a
+                                    // SHORT / LONG target goes through the
+                                    // LONG conversion - *Decimal float invalid
+                                    // operation* past INTEGER (`'1e18' AS
+                                    // SMALLINT`), and only then the SHORT
+                                    // width gate below (`'32767.5' AS
+                                    // SMALLINT` is 22003)
+                                    let (lo, hi) = match *bytes {
+                                        8 => (i64::MIN as i128, i64::MAX as i128),
+                                        _ => (i32::MIN as i128, i32::MAX as i128),
+                                    };
+                                    if raw < lo || raw > hi {
+                                        return Err(if *bytes == 8 {
+                                            EvalErr::FloatInvalidOperand
+                                        } else {
+                                            EvalErr::DecfloatInvalidOperation
+                                        });
+                                    }
+                                    (raw, *scale)
                                 }
-                                (raw, *scale)
                             }
                             other => numeric_parts(other).ok_or_else(|| nonnumeric_conv(other))?,
                         };
@@ -86819,7 +87329,24 @@ impl Expr {
                     // -1;-1;-1, SIGN(D - 2.5) -> -1;0;1, SIGN(0.0e0) -> 0;
                     // before this it prepared as SHORT and failed at execute)
                     SysFn::Sign => {
-                        if let Some(x) = approx_of(&vs[0]) {
+                        if let Some(d) = dec_of(&vs[0]) {
+                            // Decimal128::sign(): a zero of either sign is
+                            // 0, then the SIGN BIT decides - so -Infinity
+                            // and -NaN are -1, NaN and sNaN 1 (measured:
+                            // `SIGN(CAST('-0' AS DECFLOAT(34)))` 0, `'NaN'`
+                            // 1, `'-NaN'` -1, `'-inf'` -1)
+                            use fire_crab_ods::decfloat::Dec;
+                            let sign_bit = match &vs[0] {
+                                Value::DecFloat34(b) => (b >> 127) & 1 == 1,
+                                Value::DecFloat16(b) => (b >> 63) & 1 == 1,
+                                _ => false,
+                            };
+                            Value::Int(match d {
+                                Dec::Finite { coeff: 0, .. } => 0,
+                                _ if sign_bit => -1,
+                                _ => 1,
+                            })
+                        } else if let Some(x) = approx_of(&vs[0]) {
                             Value::Int(if x > 0.0 {
                                 1
                             } else if x < 0.0 {
@@ -87106,7 +87633,10 @@ impl Expr {
                             _ => RndMode::Trunc,
                         };
                         let v = &vs[0];
-                        if matches!(v, Value::Double(_) | Value::Float(_) | Value::Rounded(..) | Value::Text(_)) {
+                        if let Some(d) = dec_of(v) {
+                            // a DECFLOAT operand: the decimal family
+                            dec_round_family(mode, &d, matches!(v, Value::DecFloat16(_)), vs.get(1))?
+                        } else if matches!(v, Value::Double(_) | Value::Float(_) | Value::Rounded(..) | Value::Text(_)) {
                             // an approximate (or text-converted) operand: CEIL
                             // / FLOOR are exact on the double, ROUND / TRUNC
                             // follow the engine's evlRound / evlTrunc
@@ -108511,9 +109041,13 @@ fn resolve_having(
                                 HKind::Int
                             } else if matches!(col_kind(d), Some(ColKind::Int)) {
                                 HKind::Int
-                            } else if is_numeric_col(d) || is_approx_col(d) {
+                            } else if is_numeric_col(d) || is_approx_col(d) || is_decfloat_col(d) {
                                 // approximate folds land here too - the
-                                // comparison promotes the literal
+                                // comparison promotes the literal; and a
+                                // DECFLOAT column's fold, which the numeric
+                                // compare meets in decimal (`HAVING SUM(DF)
+                                // > 1` answers groups 2 and 3, measured;
+                                // refused here before)
                                 HKind::Numeric
                             } else if matches!(col_kind(d), Some(ColKind::Text))
                                 && matches!(func, AggFn::Min | AggFn::Max)
@@ -108536,6 +109070,15 @@ fn resolve_having(
                             let e = resolve_expr_sink(raw, columns, descs, params)?;
                             let hk = if matches!(func, AggFn::Count) {
                                 HKind::Int
+                            } else if is_decfloat_arith(&e, descs) {
+                                // a DECFLOAT expression (`SUM(SQRT(I))`,
+                                // `MAX(D34 + 1)`) has no ExprType; its fold
+                                // is a decimal the numeric compare promotes
+                                // the literal to (measured: `HAVING
+                                // SUM(SQRT(I)) > 1` answers groups 2 and 3,
+                                // where this refused at prepare)
+                                agg_result_desc(*func, target, columns, descs)?;
+                                HKind::Numeric
                             } else {
                                 match e.type_of(descs)? {
                                     ExprType::Int => HKind::Int,
@@ -108563,8 +109106,15 @@ fn resolve_having(
                     if distinct && !matches!(func, AggFn::Count) {
                         return None;
                     }
+                    // a fold the describe says is DECFLOAT(34) reads its
+                    // source through MOV_get_dec128 ([stat_dec_src]), as
+                    // the select-list path does - so a HAVING over a
+                    // PERCENTILE_CONT / REGR over INT128 folds in decimal
+                    // exactly as the projected one
+                    let decimal = agg_result_desc(*func, target, columns, descs)
+                        .is_some_and(|d| d.dtype == dtype::DEC128);
                     let idx = if let Some(src) = pre_src {
-                        gitems.push(GItem::Agg(*func, src, false));
+                        gitems.push(GItem::Agg(*func, stat_dec_src(*func, src, decimal), false));
                         slot_descs.push(agg_result_desc(*func, target, columns, descs));
                         gitems.len() - 1
                     } else {
@@ -108596,7 +109146,7 @@ fn resolve_having(
                         (Some(_), _) => {
                             gitems.push(GItem::Agg(
                                 *func,
-                                AggSrc::Expr(src_expr.clone()?),
+                                stat_dec_src(*func, AggSrc::Expr(src_expr.clone()?), decimal),
                                 distinct,
                             ));
                             slot_descs.push(agg_result_desc(*func, target, columns, descs));
@@ -108615,6 +109165,10 @@ fn resolve_having(
                             RawKind::Cmp(op, Rhs::Num(r, sc)) => {
                                 Term::NumCmp(idx, op, Rhs::Num(r, sc))
                             }
+                            // a wide literal aligns in i128 like a WHERE's
+                            // (`HAVING PERCENTILE_CONT(..) >= <INT128 max>`
+                            // answers no group, measured; refused here)
+                            RawKind::Cmp(op, Rhs::Int128(n)) => Term::NumCmp(idx, op, Rhs::Int128(n)),
                             // a text literal against a numeric aggregate
                             // converts as in WHERE (probed: `HAVING
                             // SUM(N92) = '0.5'` answers the 0.50 group;

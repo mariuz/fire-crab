@@ -50,8 +50,8 @@
 #     / amount / places count converts (it was refused); BIN_* over a
 #     DECFLOAT, DATE or BOOLEAN is the typed refusal.
 #   * RECORDED (section 15): an approximate LITERAL length (engine
-#     VARYING(0) + 22001; refused here), ROUND/TRUNC of a DECFLOAT operand,
-#     and LPAD in PSQL / under HAVING / in an IN (subquery).
+#     VARYING(0) + 22001; refused here) and LPAD in PSQL / under HAVING /
+#     in an IN (subquery); ROUND/TRUNC of a DECFLOAT operand answer now.
 #
 # Usage: qa/serve-real-fnargs.sh [port]   (default 5360)
 set -u
@@ -507,11 +507,12 @@ rec  "15 CHAR_LENGTH(LPAD('ab', 5e0))" "SELECT CHAR_LENGTH(LPAD('ab', 5e0)) $DUA
      "CHAR_LENGTH|5" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
 # ROUND/TRUNC of a DECFLOAT OPERAND answers a DECFLOAT on the engine (with
 # its own cohort rules - ROUND(DF, -128) is 0E-128, TRUNC's power of ten
-# wraps); not implemented, still the clean refusal
-rec  "15 ROUND/TRUNC of a DECFLOAT" "SELECT ROUND(DF, 1), TRUNC(DF, 1) FROM T2;" \
-     "ROUND TRUNC|2.5 2.5" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
-rec  "15 TRUNC(DF, 128)" "SELECT TRUNC(DF, 128) FROM T2;" \
-     "TRUNC|$EVAL|-The numeric scale must be between -128 and 127 in TRUNC" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
+# wraps); implemented in the widenum review round (serve-real-widenum.sh
+# section 9 pins the laws) - promoted from recorded
+pin  "15 ROUND/TRUNC of a DECFLOAT" "SELECT ROUND(DF, 1), TRUNC(DF, 1) FROM T2;" \
+     "ROUND TRUNC|2.5 2.5"
+pin  "15 TRUNC(DF, 128)" "SELECT TRUNC(DF, 128) FROM T2;" \
+     "TRUNC|$EVAL|-The numeric scale must be between -128 and 127 in TRUNC"
 # LPAD/LEFT/REPLACE inside PSQL, and a function under HAVING or in an
 # IN (subquery), are refused by this server whatever the arguments - a
 # wider gap than the argument checks (the same on master)
