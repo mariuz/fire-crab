@@ -11450,6 +11450,8 @@ enum AggSrc {
         /// the argument's collation ttype (0 = none): DISTINCT sorts the
         /// values at full strength and dedups at its own ([list_fold])
         coll: u16,
+        /// the WITHIN GROUP sort keys (DESC, NULLS FIRST flags beside them)
+        order: Vec<(Expr, bool, bool)>,
     },
 }
 
@@ -11736,6 +11738,10 @@ enum AggTarget {
         arg: RawExpr,
         sep: Option<RawExpr>,
         distinct: bool,
+        /// LISTAGG's `WITHIN GROUP (ORDER BY ...)` keys, each with its
+        /// DESC flag and whether its NULLs come first - the order the
+        /// values join in (empty: the rows' own)
+        order: Vec<(RawExpr, bool, bool)>,
     },
 }
 
@@ -20542,12 +20548,22 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
         }
         SysFn::CharLength | SysFn::OctetLength | SysFn::OctetLengthCs(_) | SysFn::Position => Some(long),
         SysFn::BlobOctetLength => Some(int64), // a blob's length is a BIGINT (probed)
-        SysFn::Mod => match src_dtype(0)? {
-            dtype::SHORT => Some(short),
-            dtype::LONG => Some(long),
-            dtype::INT64 => Some(int64),
+        SysFn::Mod => match src_dtype(0) {
+            Some(dtype::SHORT) => Some(short),
+            Some(dtype::LONG) => Some(long),
+            Some(dtype::INT64) => Some(int64),
+            // makeMod's default arm: a text, DECFLOAT or approximate
+            // first operand answers INT64 (measured `MOD(<DECFLOAT> ,2)`
+            // and `MOD('7', 2)` INT64)
+            _ if args.first().is_some_and(|a| {
+                is_decfloat_arith(a, descs) || matches!(a.type_of(descs), Some(ExprType::Text | ExprType::Approx))
+            }) =>
+            {
+                Some(int64)
+            }
             _ => None,
         },
+        SysFn::UnicodeVal(_) => Some(long), // INTEGER (measured)
         // ABS WIDENS ONE STEP AT THE NARROW END (makeAbs): a SMALLINT
         // operand answers INTEGER, an INTEGER one BIGINT, and BIGINT /
         // INT128 keep their width - for a COLUMN, a LITERAL and a CAST
@@ -21146,6 +21162,49 @@ fn text_form_m(
             };
             match f {
                 SysFn::GetContext => Some((true, 255, TfCs::Att)), // VARCHAR(255), probed
+                // a NULL operand is the NULL string CHAR(1) NONE of every
+                // make function below (measured for each)
+                SysFn::AsciiChar
+                | SysFn::UnicodeChar
+                | SysFn::UuidToChar(_)
+                | SysFn::CharToUuid(_)
+                | SysFn::Overlay
+                | SysFn::DateAdd(_)
+                    if args.iter().any(|a| matches!(a, Expr::Null))
+                        && (!matches!(f, SysFn::DateAdd(_)) || matches!(args.get(1), Some(Expr::Null))) =>
+                {
+                    Some(all_null_form())
+                }
+                // a DATEADD over a text operand is that operand's type
+                SysFn::DateAdd(_) => arg(1),
+                // CHAR(1) NONE / CHAR(1) UTF8 (4 bytes), measured
+                SysFn::AsciiChar => Some((false, 1, TfCs::Ttype(fire_crab_ods::intl::CS_NONE as i32))),
+                SysFn::UnicodeChar => Some((false, 1, TfCs::Ttype(fire_crab_ods::intl::CS_UTF8 as i32))),
+                // VARYING ASCII / OCTETS at the codec's width ([codec_width])
+                SysFn::HexEncode(_) | SysFn::Base64Encode(_) => args
+                    .first()
+                    .and_then(|a| codec_width(*f, a, descs))
+                    .map(|w| (true, w, TfCs::Ttype(fire_crab_ods::intl::CS_ASCII as i32))),
+                SysFn::HexDecode(_) | SysFn::Base64Decode(_) => args
+                    .first()
+                    .and_then(|a| codec_width(*f, a, descs))
+                    .map(|w| (true, w, TfCs::Ttype(fire_crab_ods::intl::CS_OCTETS as i32))),
+                // CHAR(36) ASCII / CHAR(16) OCTETS / VARYING(digest) OCTETS
+                SysFn::UuidToChar(_) => Some((false, 36, TfCs::Ttype(fire_crab_ods::intl::CS_ASCII as i32))),
+                SysFn::CharToUuid(_) => Some((false, 16, TfCs::Ttype(fire_crab_ods::intl::CS_OCTETS as i32))),
+                SysFn::CryptHash(algo, _) => {
+                    Some((true, algo.len(), TfCs::Ttype(fire_crab_ods::intl::CS_OCTETS as i32)))
+                }
+                // makeOverlay: VARYING at the source's width plus the
+                // placing's, in the set the two negotiate (measured:
+                // 'Hello World' / 'XX' 13, a NONE VARCHAR(20) / 'Q' 21,
+                // a UTF8 VARCHAR(10) / 'xy' 12 characters of UTF8, a
+                // number its rendered width - `OVERLAY(123 PLACING 'Z'
+                // FROM 2)` VARYING(12))
+                SysFn::Overlay => match (arg(0), arg(1)) {
+                    (Some((_, w0, c0)), Some((_, w1, c1))) => Some((true, w0 + w1, cs_join(c0, c1))),
+                    _ => None,
+                },
                 // VARCHAR(32) CHARACTER SET ASCII, measured
                 SysFn::TzName => Some((true, 32, TfCs::Ttype(fire_crab_ods::intl::CS_ASCII as i32))),
                 SysFn::Upper | SysFn::Lower | SysFn::UpperCs(_) | SysFn::LowerCs(_) | SysFn::UpperColl(_) | SysFn::LowerColl(_) => {
@@ -24834,7 +24893,68 @@ fn rewrite_entry_literals(text: String, att: u8) -> String {
     ) {
         return text;
     }
+    let text = rewrite_listagg(text);
     rewrite_alt_literals(&text, Some(att)).unwrap_or(text)
+}
+
+/// LISTAGG IS LIST: the engine's parser builds the same ListAggNode for
+/// `LISTAGG(<value> [, <sep>]) [WITHIN GROUP (ORDER BY ...)]` and
+/// describes it as LIST (measured: the column header is LIST, the blob
+/// the same TEXT one, `LISTAGG(V)` joins in row order like `LIST(V)`).
+/// So the call is respelled `LIST   (` - padded to its own length, so the
+/// positions an error reports stay put - and the WITHIN GROUP clause
+/// after it is read by the LIST fold ([parse_agg_item]). Strings and
+/// quoted names pass through.
+fn rewrite_listagg(text: String) -> String {
+    if !text.to_ascii_uppercase().contains("LISTAGG") {
+        return text;
+    }
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' || c == b'"' {
+            let start = i;
+            i += 1;
+            while i < b.len() {
+                if b[i] == c {
+                    if b.get(i + 1) == Some(&c) {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&text[start..i]);
+            continue;
+        }
+        let word_start = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$');
+        // compared as BYTES: a character boundary need not fall 7 bytes
+        // on (a string slice there panicked on `LIST(V, 'é')`)
+        if word_start
+            && b.len() >= i + 7
+            && b[i..i + 7].eq_ignore_ascii_case(b"LISTAGG")
+            && !b.get(i + 7).is_some_and(|x| x.is_ascii_alphanumeric() || *x == b'_' || *x == b'$')
+        {
+            let mut j = i + 7;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if b.get(j) == Some(&b'(') {
+                out.push_str("LIST   ");
+                i += 7;
+                continue;
+            }
+        }
+        // one whole UTF-8 character
+        let len = text[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&text[i..i + len]);
+        i += len;
+    }
+    out
 }
 
 fn parse_trig_stmt(
@@ -60802,7 +60922,7 @@ fn resolve_agg_src(
             },
             false,
         ),
-        AggTarget::List { arg, sep, distinct } => {
+        AggTarget::List { arg, sep, distinct, order } => {
             // a plain BLOB column argument joins by CONTENT
             // (the engine's MOV_make_string2 reads the blob) -
             // it resolves to the content reader the blob CAST
@@ -60866,7 +60986,18 @@ fn resolve_agg_src(
             // argument reading an ICU column through a form that names none
             // refuses ([expr_key_coll])
             let coll = if *distinct { expr_key_coll(&a, descs)? } else { 0 };
-            (AggSrc::List { arg: a, sep: s, distinct: *distinct, pad, coll }, false)
+            // the WITHIN GROUP keys sort by value; a key under a real
+            // collation (or reading an ICU column through a form that
+            // names none) would need its collation's sort key, and refuses
+            let mut keys = Vec::with_capacity(order.len());
+            for (k, desc, nulls_first) in order {
+                let e = resolve_expr_sink(k, columns, descs, sink)?;
+                if e.type_of(descs).is_none() || expr_key_coll(&e, descs)? != 0 {
+                    return None;
+                }
+                keys.push((e, *desc, *nulls_first));
+            }
+            (AggSrc::List { arg: a, sep: s, distinct: *distinct, pad, coll, order: keys }, false)
         }
     };
     Some(out)
@@ -67251,10 +67382,13 @@ fn window_record(
                     expr_reads(frac, &base);
                     expr_reads(order, &base);
                 }
-                AggSrc::List { arg, sep, .. } => {
+                AggSrc::List { arg, sep, order, .. } => {
                     expr_reads(arg, &base);
                     if let Some(s) = sep {
                         expr_reads(s, &base);
+                    }
+                    for (k, ..) in order {
+                        expr_reads(k, &base);
                     }
                 }
             },
@@ -67985,10 +68119,13 @@ fn group_rows(
                             expr_reads(frac, &mark);
                             expr_reads(order, &mark);
                         }
-                        AggSrc::List { arg, sep, .. } => {
+                        AggSrc::List { arg, sep, order, .. } => {
                             expr_reads(arg, &mark);
                             if let Some(s) = sep {
                                 expr_reads(s, &mark);
+                            }
+                            for (k, ..) in order {
+                                expr_reads(k, &mark);
                             }
                         }
                     },
@@ -68507,6 +68644,39 @@ fn list_text_tie_cmp(x: &str, y: &str) -> std::cmp::Ordering {
 /// the values ([value_cmp]) and dedupes them first - the engine's
 /// distinct machinery delivers them at aggExecute, where the separator
 /// evaluates with the group's LAST row current (measured).
+/// A group's rows in its LISTAGG `WITHIN GROUP` order: each key by value,
+/// its NULLs where the key places them, ties in the rows' own order (a
+/// stable sort - measured: `ORDER BY G, K DESC` over two tied groups).
+fn list_sorted(rows: &[Vec<Value>], order: &[(Expr, bool, bool)]) -> Result<Vec<Vec<Value>>, EvalErr> {
+    let mut keyed: Vec<(Vec<Value>, &Vec<Value>)> = Vec::with_capacity(rows.len());
+    for r in rows {
+        let mut ks = Vec::with_capacity(order.len());
+        for (k, ..) in order {
+            ks.push(k.eval(r)?);
+        }
+        keyed.push((ks, r));
+    }
+    keyed.sort_by(|(a, _), (b, _)| {
+        for (i, (_, desc, nulls_first)) in order.iter().enumerate() {
+            let null_side = if *nulls_first { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+            let o = match (&a[i], &b[i]) {
+                (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+                (Value::Null, _) => null_side,
+                (_, Value::Null) => null_side.reverse(),
+                (x, y) => {
+                    let o = num_cmp(x, y).unwrap_or_else(|| value_cmp(x, y));
+                    if *desc { o.reverse() } else { o }
+                }
+            };
+            if o != std::cmp::Ordering::Equal {
+                return o;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    Ok(keyed.into_iter().map(|(_, r)| r.clone()).collect())
+}
+
 fn list_fold(
     rows: &[Vec<Value>],
     arg: &Expr,
@@ -69281,8 +69451,12 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                     }
                 }
                 GItem::Const(v) => v.clone(), // a per-group constant slot
-                GItem::Agg(AggFn::List, AggSrc::List { arg, sep, distinct, pad, coll }, _) => {
-                    list_fold(rows, arg, sep.as_ref(), *distinct, *pad, *coll)?
+                GItem::Agg(AggFn::List, AggSrc::List { arg, sep, distinct, pad, coll, order }, _) => {
+                    if order.is_empty() {
+                        list_fold(rows, arg, sep.as_ref(), *distinct, *pad, *coll)?
+                    } else {
+                        list_fold(&list_sorted(rows, order)?, arg, sep.as_ref(), *distinct, *pad, *coll)?
+                    }
                 }
                 GItem::Agg(..) => Value::Null, // MIN/MAX/SUM(*): rejected at plan
             })
@@ -70821,6 +70995,56 @@ const GDS_EXCEPT: i32 = 335544517;
 /// but carrying the matching status vector, so the client raises the same
 /// SQL error the real server would (server.cpp:4302 sends the same
 /// op_response on a mid-cursor access-method error).
+/// An argument of an [EvalErr::Bare] / [EvalErr::EvalArgs] vector.
+#[derive(Debug, Clone, PartialEq)]
+enum ErrArg {
+    Num(i64),
+    Str(String),
+    /// a further status code in the same vector
+    Gds(i32),
+}
+
+fn write_err_args(w: &mut W, args: &[ErrArg]) {
+    for a in args {
+        match a {
+            ErrArg::Num(n) => {
+                w.int(ISC_ARG_NUMBER).int(*n as i32);
+            }
+            ErrArg::Str(t) => {
+                w.int(2).bytes(t.as_bytes()); // isc_arg_string
+            }
+            ErrArg::Gds(c) => {
+                w.int(1).int(*c); // isc_arg_gds
+            }
+        }
+    }
+}
+
+/// `isc_funmismat` - JRD message 119
+const GDS_FUNMISMAT: i32 = 335544439;
+/// `isc_dsql_datatypes_not_comparable` - DSQL (facility 7) message 16
+const GDS_DSQL_DATATYPES_NOT_COMPARABLE: i32 = 336003088;
+/// the codec / UUID / math vectors of the functions this round added -
+/// JRD message numbers 627..630, 632, 648, 649, 658, 659, 896, 897, 937,
+/// 938 (src/include/firebird/impl/msg/jrd.h) over 335544320
+const GDS_SYSF_UUIDTYPE: i32 = 335544947;
+const GDS_SYSF_UUIDLEN: i32 = 335544948;
+const GDS_SYSF_UUIDFMT: i32 = 335544949;
+const GDS_SYSF_GUIDIGITS: i32 = 335544950;
+const GDS_SYSF_BINUUID_STR: i32 = 335544968;
+const GDS_SYSF_BINUUID_SIZE: i32 = 335544969;
+const GDS_SYSF_GTEQ_ONE: i32 = 335544978;
+const GDS_SYSF_INVALID_ADD_DT: i32 = 335544952;
+const GDS_SYSF_RANGE_EXC11: i32 = 335544979;
+const GDS_TOM_DECODE64LEN: i32 = 335545216;
+const GDS_TOM_STRBLOB: i32 = 335545217;
+const GDS_ODD_HEX_LEN: i32 = 335545257;
+const GDS_INVALID_HEX_DIGIT: i32 = 335545258;
+/// `isc_tom_error` *TomCrypt library error: @1* (910) and `isc_tom_decode`
+/// *Decoding @1* (922)
+const GDS_TOM_ERROR: i32 = 335545230;
+const GDS_TOM_DECODE: i32 = 335545242;
+
 fn write_eval_error(w: &mut W, e: &EvalErr) {
     w.int(OP_RESPONSE)
         .int(0)
@@ -71302,6 +71526,35 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
         }
         EvalErr::TimeRange => {
             w.int(1).int(GDS_TIME_RANGE_EXCEEDED);
+        }
+        EvalErr::FunMismatch(name) => {
+            w.int(1) // isc_arg_gds - "function @1 could not be matched"
+                .int(GDS_FUNMISMAT)
+                .int(2) // isc_arg_string - @1 = the function name
+                .bytes(name.as_bytes());
+        }
+        EvalErr::NotComparable(name) => {
+            w.int(1) // isc_arg_gds - SQL error code = -104
+                .int(335544436)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1) // isc_arg_gds - dsql_datatypes_not_comparable
+                .int(GDS_DSQL_DATATYPES_NOT_COMPARABLE)
+                .int(2) // @1 - empty
+                .bytes(b"")
+                .int(2) // @2 - the expression's name
+                .bytes(name.as_bytes());
+        }
+        EvalErr::Bare(code, args) => {
+            w.int(1).int(*code);
+            write_err_args(w, args);
+        }
+        EvalErr::EvalArgs(code, args) => {
+            w.int(1) // isc_arg_gds - expression evaluation not supported
+                .int(GDS_EXPRESSION_EVAL_ERR)
+                .int(1)
+                .int(*code);
+            write_err_args(w, args);
         }
         EvalErr::ArgDomain { func, argno, code } => {
             w.int(1) // isc_arg_gds - expression evaluation not supported
@@ -73279,8 +73532,10 @@ fn aggsrc_has_param(s: &AggSrc) -> bool {
         AggSrc::Expr(e) => expr_has_param(e),
         AggSrc::Pair(a, b) => expr_has_param(a) || expr_has_param(b),
         AggSrc::Percentile { frac, order, .. } => expr_has_param(frac) || expr_has_param(order),
-        AggSrc::List { arg, sep, .. } => {
-            expr_has_param(arg) || sep.as_ref().is_some_and(expr_has_param)
+        AggSrc::List { arg, sep, order, .. } => {
+            expr_has_param(arg)
+                || sep.as_ref().is_some_and(expr_has_param)
+                || order.iter().any(|(k, ..)| expr_has_param(k))
         }
         AggSrc::Star | AggSrc::Field(_) | AggSrc::CollField(..) => false,
     }
@@ -73298,7 +73553,7 @@ fn subst_params_aggsrc(s: &AggSrc, args: &[WireParam]) -> Option<AggSrc> {
             order: subst_params_expr(order, args)?,
             desc: *desc,
         },
-        AggSrc::List { arg, sep, distinct, pad, coll } => AggSrc::List {
+        AggSrc::List { arg, sep, distinct, pad, coll, order } => AggSrc::List {
             arg: subst_params_expr(arg, args)?,
             sep: match sep {
                 Some(x) => Some(subst_params_expr(x, args)?),
@@ -73307,6 +73562,10 @@ fn subst_params_aggsrc(s: &AggSrc, args: &[WireParam]) -> Option<AggSrc> {
             distinct: *distinct,
             pad: *pad,
             coll: *coll,
+            order: order
+                .iter()
+                .map(|(k, d, n)| Some((subst_params_expr(k, args)?, *d, *n)))
+                .collect::<Option<Vec<_>>>()?,
         },
         other => other.clone(),
     })
@@ -77144,6 +77403,127 @@ enum SysFn {
     /// operand; VARCHAR(32) CHARACTER SET ASCII (measured). A function of
     /// its own because every other EXTRACT part is an integer.
     TzName,
+    /// ACOSH / ASINH / ATANH - evlStdMath's inverse hyperbolics, DOUBLE
+    /// over any number or numeric text, computed by the engine's own
+    /// formulas (`log(v + sqrt(v*v + 1))` for ASINH, not libm's asinh -
+    /// so ASINH(-1e308) overflows as the engine's does). ACOSH below 1
+    /// and ATANH outside ]-1, 1[ raise their numbered domain errors, an
+    /// infinite result the named float overflow (all measured on 2182).
+    Acosh,
+    Asinh,
+    Atanh,
+    /// ASCII_CHAR(n) - CHAR(1) CHARACTER SET NONE (a NULL operand's is
+    /// the NULL string's CHAR(1) NONE too); the code is MOV_get_long's,
+    /// rounded (`ASCII_CHAR(65.7)` and `ASCII_CHAR('66')` are 'B'), and
+    /// outside 0..255 it is 22003 *numeric value is out of range*.
+    AsciiChar,
+    /// UNICODE_CHAR(n) - CHAR(1) CHARACTER SET UTF8 (4 bytes), a NULL
+    /// operand's CHAR(1) NONE; a negative code is its *must be zero or
+    /// positive*, a surrogate or a code past U+10FFFF *Malformed string*.
+    UnicodeChar,
+    /// UNICODE_VAL(s) - INTEGER: the first character's code point of the
+    /// value moved to UTF8, 0 for an empty string; a non-text operand
+    /// reads its text form (`UNICODE_VAL(5)` is 53). The operand's value
+    /// set rides in the variant, stamped at resolution the
+    /// [SysFn::HashCs] way (0xFF: its characters are its code points).
+    UnicodeVal(u8),
+    /// MAXVALUE / MINVALUE / GREATEST / LEAST - a RAW-level name only:
+    /// resolution lowers the call into the searched CASE that answers
+    /// what evlMaxMinValue does ([lower_maxmin]), so no resolved
+    /// expression ever carries it.
+    MaxMin(MaxMinKind),
+    /// HEX_ENCODE / BASE64_ENCODE / HEX_DECODE / BASE64_DECODE over the
+    /// operand's STORED bytes (CVT_get_bytes); the u8 is the operand's
+    /// value set, stamped at resolution ([SysFn::HashCs]'s seam, 0xFF for
+    /// UTF-8 bytes). The encoders answer VARCHAR CHARACTER SET ASCII at
+    /// twice / 4-per-3 the operand's BYTE length, the decoders VARCHAR
+    /// OCTETS at half / 3-per-4 of it - a describe length that is not a
+    /// whole number of pairs / quads is the decoder's PREPARE error.
+    HexEncode(u8),
+    HexDecode(u8),
+    Base64Encode(u8),
+    Base64Decode(u8),
+    /// UUID_TO_CHAR(16 bytes) - CHAR(36) ASCII in the engine's
+    /// `%02X...-...` spelling; CHAR_TO_UUID(36 characters) - CHAR(16)
+    /// OCTETS. The u8 as above.
+    UuidToChar(u8),
+    CharToUuid(u8),
+    /// CRYPT_HASH(x USING algo) - VARCHAR(<digest length>) OCTETS over
+    /// the operand's stored bytes; the u8 as above.
+    CryptHash(CryptAlgo, u8),
+    /// OVERLAY(s PLACING r FROM p [FOR n]) - args [s, r, p] or [s, r, p,
+    /// n]; VARYING at the two operands' widths summed, in their set.
+    Overlay,
+}
+
+/// Which of the evlMaxMinValue pair, and under which name the header
+/// shows it (GREATEST / LEAST are the same functions, spelled the
+/// standard's way).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MaxMinKind {
+    MaxValue,
+    MinValue,
+    Greatest,
+    Least,
+}
+
+impl MaxMinKind {
+    fn is_max(self) -> bool {
+        matches!(self, MaxMinKind::MaxValue | MaxMinKind::Greatest)
+    }
+}
+
+/// CRYPT_HASH's algorithms - the engine's cryptHashAlgorithmDescriptors
+/// (SysFunction.cpp): the name as the USING clause spells it and the
+/// digest length the describe announces.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CryptAlgo {
+    Md5,
+    Sha1,
+    Sha256,
+    Sha512,
+    Sha3_224,
+    Sha3_256,
+    Sha3_384,
+    Sha3_512,
+}
+
+impl CryptAlgo {
+    fn named(name: &str) -> Option<CryptAlgo> {
+        Some(match name {
+            "MD5" => CryptAlgo::Md5,
+            "SHA1" => CryptAlgo::Sha1,
+            "SHA256" => CryptAlgo::Sha256,
+            "SHA512" => CryptAlgo::Sha512,
+            "SHA3_224" => CryptAlgo::Sha3_224,
+            "SHA3_256" => CryptAlgo::Sha3_256,
+            "SHA3_384" => CryptAlgo::Sha3_384,
+            "SHA3_512" => CryptAlgo::Sha3_512,
+            _ => return None,
+        })
+    }
+
+    fn len(self) -> i32 {
+        match self {
+            CryptAlgo::Md5 => 16,
+            CryptAlgo::Sha1 => 20,
+            CryptAlgo::Sha256 | CryptAlgo::Sha3_256 => 32,
+            CryptAlgo::Sha3_224 => 28,
+            CryptAlgo::Sha3_384 => 48,
+            CryptAlgo::Sha512 | CryptAlgo::Sha3_512 => 64,
+        }
+    }
+
+    fn digest(self, data: &[u8]) -> Vec<u8> {
+        use fire_crab_auth::crypto as c;
+        match self {
+            CryptAlgo::Md5 => c::md5(data).to_vec(),
+            CryptAlgo::Sha1 => c::sha1(data).to_vec(),
+            CryptAlgo::Sha256 => c::sha256(data).to_vec(),
+            CryptAlgo::Sha512 => c::sha512(data).to_vec(),
+            a => c::sha3(data, a.len() as usize),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -77272,7 +77652,60 @@ impl SysFn {
             SysFn::Extract(_) | SysFn::TzName => "EXTRACT",
             SysFn::DateAdd(_) => "DATEADD",
             SysFn::DateDiff(_) => "DATEDIFF",
+            SysFn::Acosh => "ACOSH",
+            SysFn::Asinh => "ASINH",
+            SysFn::Atanh => "ATANH",
+            SysFn::AsciiChar => "ASCII_CHAR",
+            SysFn::UnicodeChar => "UNICODE_CHAR",
+            SysFn::UnicodeVal(_) => "UNICODE_VAL",
+            SysFn::MaxMin(MaxMinKind::MaxValue) => "MAXVALUE",
+            SysFn::MaxMin(MaxMinKind::MinValue) => "MINVALUE",
+            SysFn::MaxMin(MaxMinKind::Greatest) => "GREATEST",
+            SysFn::MaxMin(MaxMinKind::Least) => "LEAST",
+            SysFn::HexEncode(_) => "HEX_ENCODE",
+            SysFn::HexDecode(_) => "HEX_DECODE",
+            SysFn::Base64Encode(_) => "BASE64_ENCODE",
+            SysFn::Base64Decode(_) => "BASE64_DECODE",
+            SysFn::UuidToChar(_) => "UUID_TO_CHAR",
+            SysFn::CharToUuid(_) => "CHAR_TO_UUID",
+            SysFn::CryptHash(..) => "CRYPT_HASH",
+            SysFn::Overlay => "OVERLAY",
         }
+    }
+
+    /// Is this one of SysFunction.cpp's table entries, called with the
+    /// plain comma syntax? Only those answer a wrong argument count with
+    /// `isc_funmismat` (39000 *function X could not be matched*, measured
+    /// for ACOSH, ABS, LEFT, MOD, PI, MAXVALUE, ASCII_CHAR, ...): the
+    /// parser's own intrinsics (UPPER, CHAR_LENGTH, SUBSTRING, TRIM,
+    /// EXTRACT, DATEADD, HASH, ...) have grammar rules and a stray
+    /// argument is a -104 syntax error there.
+    fn table_arity(&self) -> bool {
+        !matches!(
+            self,
+            SysFn::Upper
+                | SysFn::Lower
+                | SysFn::UpperCs(_)
+                | SysFn::LowerCs(_)
+                | SysFn::UpperColl(_)
+                | SysFn::LowerColl(_)
+                | SysFn::CharLength
+                | SysFn::OctetLength
+                | SysFn::OctetLengthCs(_)
+                | SysFn::BlobOctetLength
+                | SysFn::BitLength
+                | SysFn::Substring
+                | SysFn::Trim(_)
+                | SysFn::Position
+                | SysFn::Hash(_)
+                | SysFn::HashCs(..)
+                | SysFn::Extract(_)
+                | SysFn::TzName
+                | SysFn::DateAdd(_)
+                | SysFn::DateDiff(_)
+                | SysFn::CryptHash(..)
+                | SysFn::Overlay
+        )
     }
 }
 
@@ -77982,10 +78415,13 @@ fn renumber_agg_target_params(t: &mut AggTarget, next: &mut usize) {
             renumber_raw_params(frac, next);
             renumber_raw_params(order, next);
         }
-        AggTarget::List { arg, sep, .. } => {
+        AggTarget::List { arg, sep, order, .. } => {
             renumber_raw_params(arg, next);
             if let Some(s) = sep {
                 renumber_raw_params(s, next);
+            }
+            for (k, ..) in order {
+                renumber_raw_params(k, next);
             }
         }
         AggTarget::Star | AggTarget::Col(_) | AggTarget::Distinct(_) => {}
@@ -78455,8 +78891,29 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                     .iter()
                     .chain(&b[frac_start..*pos])
                     .collect();
-                let raw: i64 = digits.parse().ok()?;
-                return Some(RawExpr::Dec(raw, scale));
+                // A SCALED LITERAL PAST INT64 is an INT128 NUMERIC(38, s)
+                // literal, and past INT128 a DECFLOAT(34) one rounded to 34
+                // digits (measured on 2182: `123456789012345678901234567890.123`
+                // describes INT128 scale -3 SUBTYPE 0 named CONSTANT,
+                // `99999999999999999999999999999999999999.9` DECFLOAT(34)
+                // 1.000000000000000000000000000000000E+38). The INT128 one
+                // is carried as the exact CAST of its own spelling that
+                // [wide_scaled_literal] recognises - the one Numeric cast
+                // at SUBTYPE 0 with a scale, which no written CAST makes
+                // (NUMERIC is 1, DECIMAL 2, INT128 scale 0).
+                return Some(match digits.parse::<i64>() {
+                    Ok(raw) => RawExpr::Dec(raw, scale),
+                    Err(_) => {
+                        let text: String = b[start..*pos].iter().collect();
+                        match digits.parse::<i128>() {
+                            Ok(_) => RawExpr::Cast(
+                                Box::new(RawExpr::Str(text)),
+                                CastTarget::Numeric { scale, bytes: 16, sub_type: 0 },
+                            ),
+                            Err(_) => RawExpr::DecFloat34(text_to_dec128_clamped(&text).ok()?),
+                        }
+                    }
+                });
             }
             let text: String = b[start..*pos].iter().collect();
             match text.parse::<i64>() {
@@ -79182,6 +79639,115 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
         "EXTRACT" => SysFn::Extract(ExtractPart::Year),
         "DATEADD" => SysFn::DateAdd(ExtractPart::Year),
         "DATEDIFF" => SysFn::DateDiff(ExtractPart::Year),
+        "ACOSH" => SysFn::Acosh,
+        "ASINH" => SysFn::Asinh,
+        "ATANH" => SysFn::Atanh,
+        "ASCII_CHAR" => SysFn::AsciiChar,
+        "UNICODE_CHAR" => SysFn::UnicodeChar,
+        "UNICODE_VAL" => SysFn::UnicodeVal(NO_CS),
+        "MAXVALUE" => SysFn::MaxMin(MaxMinKind::MaxValue),
+        "MINVALUE" => SysFn::MaxMin(MaxMinKind::MinValue),
+        "GREATEST" => SysFn::MaxMin(MaxMinKind::Greatest),
+        "LEAST" => SysFn::MaxMin(MaxMinKind::Least),
+        "HEX_ENCODE" => SysFn::HexEncode(NO_CS),
+        "HEX_DECODE" => SysFn::HexDecode(NO_CS),
+        "BASE64_ENCODE" => SysFn::Base64Encode(NO_CS),
+        "BASE64_DECODE" => SysFn::Base64Decode(NO_CS),
+        "UUID_TO_CHAR" => SysFn::UuidToChar(NO_CS),
+        "CHAR_TO_UUID" => SysFn::CharToUuid(NO_CS),
+        // the algorithm is a placeholder; parse_sysfn_call reads it
+        "CRYPT_HASH" => SysFn::CryptHash(CryptAlgo::Md5, NO_CS),
+        "OVERLAY" => SysFn::Overlay,
+        _ => return None,
+    })
+}
+
+/// The "no stamped value set" marker of the byte-reading functions
+/// ([SysFn::HexEncode] and its siblings): the operand's bytes are the
+/// UTF-8 of its characters.
+const NO_CS: u8 = 0xFF;
+
+/// MAXVALUE / MINVALUE (GREATEST / LEAST) as the searched CASE that
+/// answers what evlMaxMinValue does. The engine evaluates every argument
+/// - any NULL makes the result NULL - keeps the FIRST argument that no
+/// later one beats under MOV_compare (a strict `>` / `<` replaces it),
+/// and moves that ORIGINAL value into makeFromList's result type. So:
+///
+///   CASE WHEN a1 IS NULL THEN a1 ... WHEN an IS NULL THEN an
+///        WHEN a1 >= a2 AND ... AND a1 >= an THEN a1
+///        ...
+///        WHEN a(n-1) >= a1 AND ... THEN a(n-1)
+///        ELSE an END
+///
+/// - the comparisons are made on the arguments as they are (measured:
+/// `MAXVALUE(9, '10')` is '10', a numeric compare, and `MAXVALUE(1,
+/// 'x')` is 22018 *conversion error from string "x"*), and the CASE's
+/// makeFromList describe and its move into the result type are the
+/// function's (`MAXVALUE(1, 2.5)` INT64 scale -1, `MAXVALUE(1, '7')`
+/// VARYING(11), `MAXVALUE('a', 'bc')` CHAR(2), `MAXVALUE(ID, NM, DB)`
+/// DOUBLE; NOT NULL exactly when every argument is - the IS NULL arms'
+/// values ARE the arguments, so they add no nullability of their own).
+/// A NULL literal's arm answers it at once. Every argument is read more
+/// than once, so one whose second read could differ - a generator step,
+/// a subquery, a stored function, a `?` the CASE cannot type - refuses.
+fn lower_maxmin(kind: MaxMinKind, args: &[RawExpr]) -> Option<RawExpr> {
+    if args.is_empty()
+        || args.iter().any(|a| {
+            raw_any(a, &|y| {
+                matches!(y, RawExpr::Gen { .. } | RawExpr::Subq(_) | RawExpr::UserFn(..) | RawExpr::Param(_))
+            })
+        })
+    {
+        return None;
+    }
+    let op = if kind.is_max() { Cmp::Ge } else { Cmp::Le };
+    let n = args.len();
+    let mut arms: Vec<(RawCond, RawExpr)> = Vec::new();
+    for a in args {
+        // a non-NULL literal is never NULL: no arm to test it
+        if !matches!(
+            a,
+            RawExpr::Int(_) | RawExpr::Int128(_) | RawExpr::Dec(..) | RawExpr::Double(_) | RawExpr::Str(_)
+        ) {
+            arms.push((RawCond::IsNull(Box::new(a.clone())), a.clone()));
+        }
+    }
+    for i in 0..n - 1 {
+        let mut conds: Vec<RawCond> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| RawCond::Cmp(Box::new(args[i].clone()), op, Box::new(args[j].clone())))
+            .collect();
+        let c = if conds.len() == 1 { conds.pop()? } else { RawCond::And(conds) };
+        arms.push((c, args[i].clone()));
+    }
+    Some(RawExpr::Case(arms, Some(Box::new(args[n - 1].clone())), false))
+}
+
+/// A codec's described result width: the encoders' twice / 4-per-3 of
+/// the operand's BYTE length (getStringLength - a UTF8 VARCHAR(10) is
+/// 40 bytes, so HEX_ENCODE is VARYING(80), BASE64_ENCODE VARYING(56)),
+/// the decoders' half / 3-per-4 of its CHARACTER length
+/// (characterLen - measured: HEX_DECODE of a NONE VARCHAR(20) is
+/// VARYING(10) OCTETS, BASE64_DECODE 15).
+fn codec_width(f: SysFn, a: &Expr, descs: &[Descriptor]) -> Option<i32> {
+    // a literal counts at its set's MAXIMUM bytes per character, as a
+    // column does (measured under -ch UTF8: `HEX_ENCODE('é')` is
+    // VARYING(8) - the one-character literal's 4-byte descriptor - where
+    // its value is C3A9)
+    let octets = || -> Option<i32> {
+        let (_, w, cs) = text_form(a, descs)?;
+        let set = match cs {
+            TfCs::Ttype(t) => fire_crab_ods::intl::charset_id(t as i16),
+            TfCs::Att => CURRENT_ATT_CS.with(|c| c.get()),
+        };
+        Some(w * i32::from(fire_crab_ods::intl::bytes_per_char(set)))
+    };
+    let chars = || text_form(a, descs).map(|(_, w, _)| w);
+    Some(match f {
+        SysFn::HexEncode(_) => octets()? * 2,
+        SysFn::Base64Encode(_) => (octets()? + 2) / 3 * 4,
+        SysFn::HexDecode(_) => chars()? / 2,
+        SysFn::Base64Decode(_) => chars()? / 4 * 3,
         _ => return None,
     })
 }
@@ -79377,6 +79943,11 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
             args.push(expr_add(b, pos)?);
         }
         if args.len() < 2 || args.len() > 3 {
+            // the comma form is the table entry's (2..3): a miscount is
+            // its 39000 (measured `POSITION('a', 'b', 'c', 'd')`)
+            PREPARE_REFUSAL.with(|r| {
+                r.borrow_mut().get_or_insert(EvalErr::FunMismatch("POSITION"));
+            });
             return None;
         }
         return Some(RawExpr::Func(SysFn::Position, args));
@@ -79410,6 +79981,51 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
             return None;
         }
         return Some(RawExpr::Func(SysFn::Hash(HashKind::Crc32), vec![value]));
+    }
+    // CRYPT_HASH(<value> USING <algorithm>) - the USING clause is its
+    // grammar (a comma form is the engine's syntax error); a name outside
+    // the cryptHashAlgorithmDescriptors table is *Invalid HASH algorithm
+    // X* at prepare, as HASH's is (measured: `USING FOO`, and `USING
+    // CRC32`, which only HASH takes)
+    if matches!(f, SysFn::CryptHash(..)) {
+        let value = expr_add(b, pos)?;
+        if !take_keyword(b, pos, "USING") {
+            return None;
+        }
+        skip_ws(b, pos);
+        let start = *pos;
+        while *pos < b.len() && (b[*pos].is_alphanumeric() || b[*pos] == '_') {
+            *pos += 1;
+        }
+        let algo: String = b[start..*pos].iter().collect::<String>().to_ascii_uppercase();
+        if algo.is_empty() {
+            return None;
+        }
+        let Some(a) = CryptAlgo::named(&algo) else {
+            PREPARE_REFUSAL.with(|r| {
+                r.borrow_mut().get_or_insert(EvalErr::InvalidHashAlgorithm(algo));
+            });
+            return None;
+        };
+        return Some(RawExpr::Func(SysFn::CryptHash(a, NO_CS), vec![value]));
+    }
+    // OVERLAY(<s> PLACING <r> FROM <p> [FOR <n>]) - the standard's
+    // keyword form is the only one (parse.y overlay_function)
+    if matches!(f, SysFn::Overlay) {
+        let src = expr_add(b, pos)?;
+        if !take_keyword(b, pos, "PLACING") {
+            return None;
+        }
+        let placing = expr_add(b, pos)?;
+        if !take_keyword(b, pos, "FROM") {
+            return None;
+        }
+        let from = expr_add(b, pos)?;
+        let mut args = vec![src, placing, from];
+        if take_keyword(b, pos, "FOR") {
+            args.push(expr_add(b, pos)?);
+        }
+        return Some(RawExpr::Func(SysFn::Overlay, args));
     }
     // the comma-argument functions, arity checked. A niladic call - PI() -
     // has an EMPTY argument list, so the first argument is only parsed when
@@ -79446,6 +80062,11 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         SysFn::BinNot | SysFn::AsciiVal | SysFn::AsciiValCs(_) | SysFn::Hash(_) | SysFn::HashCs(..) | SysFn::BitLength | SysFn::Sqrt | SysFn::Ln | SysFn::Log10 | SysFn::Exp
         | SysFn::Sin | SysFn::Cos | SysFn::Tan | SysFn::Cot | SysFn::Asin | SysFn::Acos | SysFn::Atan
         | SysFn::Sinh | SysFn::Cosh | SysFn::Tanh => (1, 1),
+        SysFn::Acosh | SysFn::Asinh | SysFn::Atanh | SysFn::AsciiChar | SysFn::UnicodeChar | SysFn::UnicodeVal(_) => (1, 1),
+        SysFn::HexEncode(_) | SysFn::HexDecode(_) | SysFn::Base64Encode(_) | SysFn::Base64Decode(_) => (1, 1),
+        SysFn::UuidToChar(_) | SysFn::CharToUuid(_) => (1, 1),
+        // evlMaxMinValue takes one argument or more (MAXVALUE(5) is 5)
+        SysFn::MaxMin(_) => (1, usize::MAX),
         SysFn::Ceil | SysFn::Ceiling | SysFn::Floor => (1, 1),
         SysFn::Round | SysFn::Trunc => (1, 2),
         SysFn::Power | SysFn::Log | SysFn::Atan2 => (2, 2),
@@ -79459,9 +80080,19 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::Extract(_)
         | SysFn::TzName
         | SysFn::DateAdd(_)
-        | SysFn::DateDiff(_) => unreachable!(),
+        | SysFn::DateDiff(_)
+        | SysFn::CryptHash(..)
+        | SysFn::Overlay => unreachable!(),
     };
     if args.len() < min || args.len() > max {
+        // a table function's miscount is the engine's 39000 at prepare
+        // (SysFunction::lookup's isc_funmismat, measured: `ACOSH(1, 2)`,
+        // `ABS()`, `LEFT('a')`, `PI(1)`, `MOD(1)`, `MAXVALUE()`)
+        if f.table_arity() {
+            PREPARE_REFUSAL.with(|r| {
+                r.borrow_mut().get_or_insert(EvalErr::FunMismatch(f.header()));
+            });
+        }
         return None;
     }
     Some(RawExpr::Func(f, args))
@@ -82668,6 +83299,9 @@ fn resolve_dest_param_expr(
                     .collect::<Option<Vec<_>>>()?,
             )
         }
+        // lowered only by the plain resolver; a `?` among its arguments
+        // is refused there too ([lower_maxmin])
+        RawExpr::Func(SysFn::MaxMin(_), _) => return None,
         RawExpr::Func(f, args) => Expr::Func(
             *f,
             dec_math_wrap(
@@ -85224,6 +85858,33 @@ fn resolve_expr_inner(
             Box::new(resolve_expr(b, columns, descs)?),
         ),
         RawExpr::Func(f, args) => {
+            // MAXVALUE / MINVALUE / GREATEST / LEAST resolve AS the searched
+            // CASE that answers what evlMaxMinValue does ([lower_maxmin]):
+            // its type, width, charset and nullability are makeFromList's,
+            // which is the CASE's own describe law
+            if let SysFn::MaxMin(kind) = f {
+                // ...and makeFromList refuses two DIFFERENT datetime kinds
+                // at prepare: `MINVALUE(<TIMESTAMP>, <DATE>)` is HY004
+                // *Datatypes are not comparable in expression MINVALUE*
+                // (measured on 2182)
+                let mut kinds: Vec<TKind> = Vec::new();
+                for a in args {
+                    if let Some(ExprType::Temporal(k)) =
+                        resolve_expr(a, columns, descs).and_then(|e| e.type_of(descs))
+                    {
+                        if !kinds.contains(&k) {
+                            kinds.push(k);
+                        }
+                    }
+                }
+                if kinds.len() > 1 {
+                    PREPARE_REFUSAL.with(|r| {
+                        r.borrow_mut().get_or_insert(EvalErr::NotComparable(f.header()));
+                    });
+                    return None;
+                }
+                return resolve_expr_inner(&lower_maxmin(*kind, args)?, columns, descs);
+            }
             // BIT_LENGTH is eight times OCTET_LENGTH, so it resolves AS
             // the OCTET_LENGTH of its argument (every charset and blob
             // rule below included) and multiplies at eval
@@ -85250,6 +85911,93 @@ fn resolve_expr_inner(
                 .iter()
                 .map(|a| resolve_expr(a, columns, descs))
                 .collect::<Option<Vec<_>>>()?;
+            // ASCII_VAL / UNICODE_VAL / CRYPT_HASH over a NON-TEXT operand
+            // read its text form (MOV_make_string2 - measured: ASCII_VAL(1)
+            // 49, ASCII_VAL(12.5) 49, ASCII_VAL(DATE '2024-01-01') 50,
+            // UNICODE_VAL(5) 53, CRYPT_HASH(5 USING MD5) the MD5 of '5'),
+            // wrapped in the text CAST that renders it, as HASH's operand is
+            if matches!(f, SysFn::AsciiVal | SysFn::UnicodeVal(_) | SysFn::CryptHash(..)) {
+                if let [a] = resolved.as_slice() {
+                    let t = a.type_of(descs);
+                    if !matches!(a, Expr::Null) && t.is_some() && t != Some(ExprType::Text) {
+                        let a = a.clone();
+                        resolved = vec![Expr::Cast(
+                            Box::new(a),
+                            CastTarget::Text { len: 32765, pad: false, synthetic: true, cs: None },
+                            fire_crab_ods::intl::CS_UTF8,
+                        )];
+                    }
+                }
+            }
+            // THE CODECS read the operand's descriptor at PREPARE
+            // (makeEncodeHex / makeDecode64 ...): a non-text operand is
+            // 22023 *Invalid first parameter datatype - need string or
+            // blob* (a NULL literal too, measured `HEX_ENCODE(NULL)`), and
+            // a decoder whose described CHARACTER length is not a whole
+            // number of pairs / quads (or is 0) raises its own length
+            // error there - `HEX_DECODE('616')`, `BASE64_DECODE('YWJ')`,
+            // `HEX_DECODE(<CHAR(5)>)`, all before any row (measured)
+            if let (SysFn::HexEncode(_) | SysFn::HexDecode(_) | SysFn::Base64Encode(_) | SysFn::Base64Decode(_), [a]) =
+                (f, resolved.as_slice())
+            {
+                // a bare NULL is the NULL string, CHAR(1) NONE: text to
+                // the decoders (whose length 1 is then their error -
+                // measured `HEX_DECODE(NULL)` *Invalid hex text length 1*,
+                // `BASE64_DECODE(NULL)` *Wrong base64 text length 1*), not
+                // text to the encoders (`HEX_ENCODE(NULL)`,
+                // `BASE64_ENCODE(NULL)` *need string or blob*)
+                if matches!(a, Expr::Null) && matches!(f, SysFn::HexDecode(_) | SysFn::Base64Decode(_)) {
+                    let code = if matches!(f, SysFn::HexDecode(_)) { GDS_ODD_HEX_LEN } else { GDS_TOM_DECODE64LEN };
+                    PREPARE_REFUSAL.with(|r| {
+                        r.borrow_mut().get_or_insert(EvalErr::Bare(code, vec![ErrArg::Num(1)]));
+                    });
+                    return None;
+                }
+                if matches!(a, Expr::Null) || a.type_of(descs) != Some(ExprType::Text) {
+                    if a.type_of(descs).is_some() {
+                        PREPARE_REFUSAL.with(|r| {
+                            r.borrow_mut().get_or_insert(EvalErr::Bare(GDS_TOM_STRBLOB, vec![]));
+                        });
+                    }
+                    return None;
+                }
+                let chars = text_form(a, descs).map(|(_, w, _)| w)?;
+                let bad = match f {
+                    SysFn::HexDecode(_) => (chars % 2 != 0 || chars == 0).then_some(GDS_ODD_HEX_LEN),
+                    SysFn::Base64Decode(_) => (chars % 4 != 0 || chars == 0).then_some(GDS_TOM_DECODE64LEN),
+                    _ => None,
+                };
+                if let Some(code) = bad {
+                    PREPARE_REFUSAL.with(|r| {
+                        r.borrow_mut().get_or_insert(EvalErr::Bare(code, vec![ErrArg::Num(chars as i64)]));
+                    });
+                    return None;
+                }
+                // an encoded text past MAX_VARY_COLUMN_SIZE is a BLOB on the
+                // engine - not a shape this server describes
+                if codec_width(*f, a, descs)? > 32765 {
+                    return None;
+                }
+            }
+            // OVERLAY's two strings must meet in ONE set this server can
+            // splice in: the same one, or a side that is plain ASCII (the
+            // engine converts both into getResultTextType's; a cross-set
+            // splice is not modelled, so it refuses)
+            if matches!(f, SysFn::Overlay) && resolved.iter().any(|a| matches!(a, Expr::Null)) {
+                return Some(Expr::Func(*f, resolved));
+            }
+            if let (SysFn::Overlay, [s0, r0, ..]) = (f, resolved.as_slice()) {
+                let form = |e: &Expr| match e.type_of(descs) {
+                    Some(ExprType::Text | ExprType::Int | ExprType::Numeric) => text_form(e, descs),
+                    _ => None,
+                };
+                let (Some((_, _, c0)), Some((_, _, c1))) = (form(s0), form(r0)) else { return None };
+                let ascii_lit = |e: &Expr| matches!(e, Expr::Str(t) if t.is_ascii())
+                    || !matches!(e.type_of(descs), Some(ExprType::Text));
+                if tf_charset(c0) != tf_charset(c1) && !ascii_lit(s0) && !ascii_lit(r0) {
+                    return None;
+                }
+            }
             // an EXTRACT part the operand's type does not carry is the
             // engine's typed -105 at prepare - it reached the client as a
             // "Table unknown" guess at the FROM inside the parentheses
@@ -85508,6 +86256,24 @@ fn resolve_expr_inner(
                     Some(cs) => SysFn::OctetLengthCs(cs),
                     None => *f,
                 },
+                // the byte readers carry the set their operand's VALUE is
+                // in, so they read its STORED bytes ([text_bytes_in]): a
+                // CHAR(5) NONE 'ab' encodes 6162202020, a UTF8 or WIN1252
+                // 'é' C3A9 through a NONE attachment (measured)
+                (SysFn::UnicodeVal(_), [a]) => SysFn::UnicodeVal(expr_value_charset(a, descs).unwrap_or(NO_CS)),
+                (SysFn::HexEncode(_), [a]) => SysFn::HexEncode(expr_value_charset(a, descs).unwrap_or(NO_CS)),
+                (SysFn::HexDecode(_), [a]) => SysFn::HexDecode(expr_value_charset(a, descs).unwrap_or(NO_CS)),
+                (SysFn::Base64Encode(_), [a]) => {
+                    SysFn::Base64Encode(expr_value_charset(a, descs).unwrap_or(NO_CS))
+                }
+                (SysFn::Base64Decode(_), [a]) => {
+                    SysFn::Base64Decode(expr_value_charset(a, descs).unwrap_or(NO_CS))
+                }
+                (SysFn::UuidToChar(_), [a]) => SysFn::UuidToChar(expr_value_charset(a, descs).unwrap_or(NO_CS)),
+                (SysFn::CharToUuid(_), [a]) => SysFn::CharToUuid(expr_value_charset(a, descs).unwrap_or(NO_CS)),
+                (SysFn::CryptHash(algo, _), [a]) => {
+                    SysFn::CryptHash(*algo, expr_value_charset(a, descs).unwrap_or(NO_CS))
+                }
                 // HASH hashes the value's STORED bytes, in ITS set - the
                 // OCTET_LENGTH seam again ([SysFn::HashCs]); a non-text
                 // operand hashes its engine text form, so it is wrapped
@@ -86410,6 +87176,25 @@ enum EvalErr {
     CtxVarNotFound(String, String),
     /// `NAME(...)` names no function: -804 "Function unknown" (probed)
     FunctionUnknown(String),
+    /// a SysFunction table entry called with an argument count outside
+    /// its range: `isc_funmismat` (39000) *function @1 could not be
+    /// matched*, posted at PREPARE (measured for ACOSH(1, 2), ABS(),
+    /// LEFT('a'), PI(1), MOD(1), MAXVALUE())
+    FunMismatch(&'static str),
+    /// makeFromList's refusal of two different datetime kinds in one list
+    /// (`MINVALUE(<TIMESTAMP>, <DATE>)`): -104 / HY004 *Datatypes are not
+    /// comparable in expression @2* (its @1 empty), at PREPARE (measured)
+    NotComparable(&'static str),
+    /// one status code and its arguments, posted BARE - the codec
+    /// functions' errors (22023: *Invalid hex digit @1 at position @2*,
+    /// *Invalid hex text length @1, should be multiple of 2*, *Wrong
+    /// base64 text length @1, ...*, *Invalid first parameter datatype -
+    /// need string or blob*), measured with no wrapper line
+    Bare(i32, Vec<ErrArg>),
+    /// `isc_expression_eval_err`, then one code and its arguments - the
+    /// UUID functions' argument checks (*Human readable UUID argument for
+    /// @2 must be of exact length @1*, ...)
+    EvalArgs(i32, Vec<ErrArg>),
     /// a user-function call with the wrong argument count: the first
     /// missing argument's name, or none when there are too many
     FnArity { name: String, missing: Option<String> },
@@ -91643,6 +92428,142 @@ fn fn_text(v: &Value) -> String {
     v.render()
 }
 
+/// BASE64_ENCODE's libtomcrypt `base64_encode`: the standard alphabet,
+/// `=`-padded to a multiple of four.
+fn base64_encode(b: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
+    for chunk in b.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for k in 0..4 {
+            if k <= chunk.len() {
+                out.push(A[(n >> (18 - 6 * k) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// BASE64_DECODE: the run-time length check (decodeLen - a value whose
+/// length is no multiple of four, or empty, is 22023 *Wrong base64 text
+/// length @1*), then libtomcrypt's RELAXED `base64_decode`, ported: a
+/// character outside the alphabet is skipped, `=` anywhere only counted,
+/// and a lone trailing sextet is *Invalid input packet* (measured:
+/// 'YW=j' and 'YW!j' both decode to 6168).
+fn base64_decode(b: &[u8]) -> Result<Vec<u8>, EvalErr> {
+    if b.len() % 4 != 0 || b.is_empty() {
+        return Err(EvalErr::Bare(GDS_TOM_DECODE64LEN, vec![ErrArg::Num(b.len() as i64)]));
+    }
+    let map = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => u32::from(c - b'A'),
+            b'a'..=b'z' => u32::from(c - b'a') + 26,
+            b'0'..=b'9' => u32::from(c - b'0') + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    };
+    let (mut t, mut y, mut out) = (0u32, 0usize, Vec::with_capacity(b.len() / 4 * 3));
+    for &c in b {
+        let Some(v) = map(c) else { continue };
+        t = (t << 6) | v;
+        y += 1;
+        if y == 4 {
+            out.extend_from_slice(&[(t >> 16) as u8, (t >> 8) as u8, t as u8]);
+            y = 0;
+            t = 0;
+        }
+    }
+    if y == 1 {
+        return Err(EvalErr::Bare(
+            GDS_TOM_ERROR,
+            vec![ErrArg::Str("Invalid input packet.".into()), ErrArg::Gds(GDS_TOM_DECODE), ErrArg::Str("BASE64".into())],
+        ));
+    }
+    if y >= 2 {
+        let t = t << (6 * (4 - y));
+        out.push((t >> 16) as u8);
+        if y == 3 {
+            out.push((t >> 8) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// HEX_DECODE (evlEncodeDecodeHex): each digit in either case, a
+/// non-digit 22023 *Invalid hex digit @1 at position @2* (1-based), an
+/// odd count *Invalid hex text length @1, should be multiple of 2*.
+fn hex_decode(b: &[u8]) -> Result<Vec<u8>, EvalErr> {
+    let mut out = Vec::with_capacity(b.len() / 2);
+    let mut last = 0u8;
+    for (pos, &c) in b.iter().enumerate() {
+        let v = match c {
+            b'0'..=b'9' => c - b'0',
+            b'A'..=b'F' => c - b'A' + 10,
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => {
+                return Err(EvalErr::Bare(
+                    GDS_INVALID_HEX_DIGIT,
+                    vec![ErrArg::Str((c as char).to_string()), ErrArg::Num(pos as i64 + 1)],
+                ))
+            }
+        };
+        if pos % 2 == 1 {
+            out.push((last << 4) + v);
+        } else {
+            last = v;
+        }
+    }
+    if b.len() % 2 == 1 {
+        return Err(EvalErr::Bare(GDS_ODD_HEX_LEN, vec![ErrArg::Num(b.len() as i64)]));
+    }
+    Ok(out)
+}
+
+/// CHAR_TO_UUID (evlCharToUuid): trailing blanks past 36 characters are
+/// dropped (CORE-5062), then exactly 36 must remain, a `-` at 9, 14, 19
+/// and 24 and a hex digit everywhere else - each miss its own 42000,
+/// the offender shown as `c (ASCII n)`.
+fn char_to_uuid(b: &[u8]) -> Result<Vec<u8>, EvalErr> {
+    let name = || ErrArg::Str("CHAR_TO_UUID".into());
+    let mut len = b.len();
+    while len > 36 && b[len - 1] == b' ' {
+        len -= 1;
+    }
+    if len != 36 {
+        return Err(EvalErr::EvalArgs(GDS_SYSF_UUIDLEN, vec![ErrArg::Num(36), name()]));
+    }
+    let show = |c: u8| ErrArg::Str(format!("{} (ASCII {})", c as char, c));
+    let mut out = Vec::with_capacity(16);
+    let mut hi: Option<u8> = None;
+    for (i, &c) in b[..36].iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if c != b'-' {
+                return Err(EvalErr::EvalArgs(GDS_SYSF_UUIDFMT, vec![show(c), ErrArg::Num(i as i64 + 1), name()]));
+            }
+            continue;
+        }
+        let v = match c {
+            b'0'..=b'9' => c - b'0',
+            b'A'..=b'F' => c - b'A' + 10,
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => {
+                return Err(EvalErr::EvalArgs(GDS_SYSF_GUIDIGITS, vec![show(c), ErrArg::Num(i as i64 + 1), name()]))
+            }
+        };
+        match hi.take() {
+            None => hi = Some(v),
+            Some(h) => out.push((h << 4) | v),
+        }
+    }
+    Ok(out)
+}
+
 /// The engine's default HASH - `WeakHashContext` (Hash.cpp): a 64-bit
 /// ELF-style rolling hash over the bytes. Each byte does
 /// `h = (h << 4) + byte`, then the top nibble `n` (bits 60..63) is folded
@@ -92848,6 +93769,58 @@ impl Expr {
                 if matches!(f, SysFn::Sign) && args.len() == 1 && is_decfloat_arith(&args[0], descs) {
                     return Some(ExprType::Int);
                 }
+                // MOD over a DECFLOAT reads each operand through
+                // MOV_get_int64 (half up) and answers the FIRST operand's
+                // integer type, INT64 for anything else (makeMod -
+                // measured: `MOD(<DECFLOAT(16)> 3.25, 2)` INT64 1,
+                // `MOD(7, <DECFLOAT(16)> 2)` LONG 1, `MOD(<DECFLOAT(34)>
+                // 7.5, <DECFLOAT(16)> 2)` INT64 0)
+                if matches!(f, SysFn::Mod) && args.iter().any(|a| is_decfloat_arith(a, descs)) {
+                    return args
+                        .iter()
+                        .all(|a| {
+                            is_decfloat_arith(a, descs)
+                                || matches!(
+                                    a.type_of(descs),
+                                    Some(ExprType::Int | ExprType::Numeric | ExprType::Approx | ExprType::Text)
+                                )
+                        })
+                        .then_some(ExprType::Int);
+                }
+                // a MAXVALUE-family call never survives resolution
+                // ([lower_maxmin]); a DATEADD over a bare NULL operand is
+                // makeDateAdd's NULL string, CHAR(1) NONE (measured: the
+                // describe of `DATEADD(DAY, 1, NULL)` is TEXT len 1)
+                if matches!(f, SysFn::MaxMin(_)) {
+                    return None;
+                }
+                if matches!(f, SysFn::DateAdd(_)) && matches!(args.get(1), Some(Expr::Null)) {
+                    return Some(ExprType::Text);
+                }
+                // ...and over a TEXT operand makeDateAdd describes the
+                // operand's own text type, and evlDateAdd raises *Invalid
+                // data type in addition of part to DATE/TIME/TIMESTAMP in
+                // DATEADD* per row (measured: `DATEADD(DAY, 1,
+                // '2024-01-01')` describes TEXT(10) NONE, then raises)
+                if matches!(f, SysFn::DateAdd(_))
+                    && args.get(1).is_some_and(|a| a.type_of(descs) == Some(ExprType::Text))
+                    && args.first().is_some_and(|a| {
+                        matches!(a, Expr::Null)
+                            || matches!(
+                                a.type_of(descs),
+                                Some(ExprType::Int | ExprType::Numeric | ExprType::Approx | ExprType::Text)
+                            )
+                    })
+                {
+                    return Some(ExprType::Text);
+                }
+                // an ASCII_CHAR / UNICODE_CHAR / OVERLAY over a bare NULL
+                // is the NULL string CHAR(1) NONE of their make functions
+                if matches!(f, SysFn::AsciiChar | SysFn::UnicodeChar | SysFn::Overlay)
+                    && args.iter().any(|a| matches!(a, Expr::Null))
+                {
+                    return Some(ExprType::Text);
+                }
                 // every argument must be typeable; the arguments the
                 // engine converts (a number under UPPER renders to its
                 // text, a text length parses to its integer) convert in
@@ -92867,13 +93840,35 @@ impl Expr {
                     SysFn::Position => i == 2,
                     SysFn::DateAdd(_) => i == 0,
                     SysFn::Round | SysFn::Trunc => i == 1,
+                    SysFn::Overlay => i >= 2,
+                    SysFn::AsciiChar | SysFn::UnicodeChar => i == 0,
                     _ => false,
                 };
                 // ... and a DblDec call on its DOUBLE path (an approximate
                 // argument beside a decfloat one) reads the decfloat through
                 // MOV_get_double (measured: `POWER(<DECFLOAT(34)> 2, 0.5e0)`
                 // is DOUBLE 1.414213562373095; refused here)
-                let dbl_path = is_dbldec_fn(f) && !dbldec_decimal(args, descs);
+                // ... and so does every std-math function (setParamsDouble:
+                // `ACOSH(CAST(2 AS DECFLOAT(16)))` is DOUBLE 1.316957896924817,
+                // measured)
+                let dbl_path = (is_dbldec_fn(f) && !dbldec_decimal(args, descs))
+                    || matches!(
+                        f,
+                        SysFn::Sin
+                            | SysFn::Cos
+                            | SysFn::Tan
+                            | SysFn::Cot
+                            | SysFn::Asin
+                            | SysFn::Acos
+                            | SysFn::Atan
+                            | SysFn::Atan2
+                            | SysFn::Sinh
+                            | SysFn::Cosh
+                            | SysFn::Tanh
+                            | SysFn::Acosh
+                            | SysFn::Asinh
+                            | SysFn::Atanh
+                    );
                 let ts = args
                     .iter()
                     .enumerate()
@@ -93008,16 +94003,57 @@ impl Expr {
                     | SysFn::Position => {
                         Some(ExprType::Int)
                     }
-                    // MOD and SIGN take numbers; a text operand would go
-                    // through a string-to-number conversion this server
-                    // has not pinned against the engine - refuse it
+                    // MOD and SIGN take numbers - and a TEXT operand, which
+                    // they convert the way their siblings do: SIGN through
+                    // the double (`SIGN('5')` is 1, `SIGN('abc')` 22018
+                    // *conversion error from string "abc"*), MOD through
+                    // MOV_get_int64 (makeMod's INT64); measured on 2182
                     SysFn::Mod | SysFn::Sign => {
-                        if ts.iter().all(|t| *t != ExprType::Text) {
+                        if ts.iter().all(|t| {
+                            matches!(t, ExprType::Int | ExprType::Numeric | ExprType::Approx | ExprType::Text)
+                        }) {
                             Some(ExprType::Int)
                         } else {
                             None
                         }
                     }
+                    // the one-character makers: any number, or a numeric
+                    // text, read by MOV_get_long
+                    SysFn::AsciiChar | SysFn::UnicodeChar => match ts[0] {
+                        ExprType::Int | ExprType::Numeric | ExprType::Approx | ExprType::Text => {
+                            Some(ExprType::Text)
+                        }
+                        _ => None,
+                    },
+                    // UNICODE_VAL(text) -> INTEGER (a non-text operand
+                    // arrives wrapped in its text CAST)
+                    SysFn::UnicodeVal(_) => {
+                        (ts[0] == ExprType::Text || matches!(args[0], Expr::Null)).then_some(ExprType::Int)
+                    }
+                    // the codecs and CRYPT_HASH answer text (ASCII or
+                    // OCTETS); their operand was checked at resolution
+                    SysFn::HexEncode(_)
+                    | SysFn::HexDecode(_)
+                    | SysFn::Base64Encode(_)
+                    | SysFn::Base64Decode(_)
+                    | SysFn::CryptHash(..) => {
+                        (ts[0] == ExprType::Text || matches!(args[0], Expr::Null)).then_some(ExprType::Text)
+                    }
+                    // the UUID pair describe on any operand: a non-text one
+                    // is their run-time *... must be of string type*
+                    SysFn::UuidToChar(_) | SysFn::CharToUuid(_) => Some(ExprType::Text),
+                    // OVERLAY: two strings (a number renders to its text)
+                    // and two integer counts
+                    SysFn::Overlay => {
+                        let strings = ts[..2]
+                            .iter()
+                            .all(|t| matches!(t, ExprType::Text | ExprType::Int | ExprType::Numeric));
+                        let counts = ts[2..].iter().all(|t| {
+                            matches!(t, ExprType::Int | ExprType::Numeric | ExprType::Approx | ExprType::Text)
+                        });
+                        (strings && counts).then_some(ExprType::Text)
+                    }
+                    SysFn::MaxMin(_) => None,
                     // ASCII_VAL(text) -> SMALLINT (an integer); a wrong-typed
                     // operand refuses (an unpinned conversion).
                     // A BARE `NULL` LITERAL IS A LEGAL OPERAND. It types as
@@ -93067,7 +94103,10 @@ impl Expr {
                     | SysFn::Atan2
                     | SysFn::Sinh
                     | SysFn::Cosh
-                    | SysFn::Tanh => {
+                    | SysFn::Tanh
+                    | SysFn::Acosh
+                    | SysFn::Asinh
+                    | SysFn::Atanh => {
                         // the engine describes DOUBLE for a numeric OR a text
                         // operand (a text operand string-converts to double at
                         // run time, or raises 22018) - so Text is admitted
@@ -93455,8 +94494,19 @@ impl Expr {
                     a => a.rank_of(descs),
                 },
                 // a MOD result's magnitude is below its divisor's, but
-                // an INT128 divisor can still put it past i64
+                // an INT128 divisor can still put it past i64 - unless the
+                // first operand is a text / DECFLOAT / approximate one,
+                // whose MOD is makeMod's INT64
+                SysFn::Mod
+                    if args.first().is_some_and(|a| {
+                        is_decfloat_arith(a, descs)
+                            || matches!(a.type_of(descs), Some(ExprType::Text | ExprType::Approx))
+                    }) =>
+                {
+                    Some(NumRank::I64)
+                }
                 SysFn::Mod => args.iter().filter_map(|a| a.rank_of(descs)).max(),
+                SysFn::UnicodeVal(_) => Some(NumRank::Long),
                 // BIN_AND / BIN_OR / BIN_XOR / BIN_NOT rank as the widest
                 // operand, but never below INTEGER; the shifts always rank
                 // BIGINT (the engine types BIN_SHL / BIN_SHR INT64)
@@ -95724,6 +96774,12 @@ impl Expr {
                             Value::Timestamp(d, t) => (d, t, TKind::Timestamp, 0),
                             Value::TimeTz(t, z) => (0, t, TKind::TimeTz, z),
                             Value::TimestampTz(d, t, z) => (d, t, TKind::TimestampTz, z),
+                            Value::Text(_) => {
+                                return Err(EvalErr::EvalArgs(
+                                    GDS_SYSF_INVALID_ADD_DT,
+                                    vec![ErrArg::Str("DATEADD".into())],
+                                ))
+                            }
                             _ => return Ok(Value::Null),
                         };
                         dateadd_impl(*unit, amount, d, u, kind, zone)?
@@ -96211,6 +97267,12 @@ impl Expr {
                             if let Some(x) = approx_of(v) {
                                 return approx_to_int64(x);
                             }
+                            // a DECFLOAT or a TEXT operand is MOV_get_int64's
+                            // (half up; measured `MOD(<DECFLOAT> 7.5, 2)` 0,
+                            // `MOD('7', 2)` 1)
+                            if dec_of(v).is_some() || matches!(v, Value::Text(_)) {
+                                return arg_int64(v, 0).map(i128::from);
+                            }
                             let (raw, scale) =
                                 numeric_parts(v).ok_or(EvalErr::ConversionError(None))?;
                             Ok(round_scaled_to_int(raw, scale))
@@ -96310,7 +97372,11 @@ impl Expr {
                                 _ if sign_bit => -1,
                                 _ => 1,
                             })
-                        } else if let Some(x) = approx_of(&vs[0]) {
+                        } else if let Some(x) = approx_of(&vs[0])
+                            .map(Ok)
+                            .or_else(|| matches!(vs[0], Value::Text(_)).then(|| fn_f64(&vs[0])))
+                            .transpose()?
+                        {
                             Value::Int(if x > 0.0 {
                                 1
                             } else if x < 0.0 {
@@ -96392,6 +97458,151 @@ impl Expr {
                             HashKind::Crc32 => i64::from(crc32_engine(&bytes)),
                         })
                     }
+                    // the inverse hyperbolics, by evlStdMath's own formulas
+                    // (log(v + sqrt(v*v + 1)) and friends - not libm's
+                    // asinh, whose v*v never overflows), domain checks first
+                    SysFn::Acosh | SysFn::Asinh | SysFn::Atanh => {
+                        let v = fn_f64(&vs[0])?;
+                        let rc = match f {
+                            SysFn::Asinh => (v + (v * v + 1.0).sqrt()).ln(),
+                            SysFn::Acosh => {
+                                if v < 1.0 {
+                                    return Err(EvalErr::MathDomain { func: "ACOSH", code: GDS_SYSF_GTEQ_ONE });
+                                }
+                                (v + (v - 1.0).sqrt() * (v + 1.0).sqrt()).ln()
+                            }
+                            _ => {
+                                if v <= -1.0 || v >= 1.0 {
+                                    return Err(EvalErr::MathDomain { func: "ATANH", code: GDS_SYSF_RANGE_EXC11 });
+                                }
+                                ((1.0 + v) / (1.0 - v)).ln() / 2.0
+                            }
+                        };
+                        fin_dbl_named(rc, f.header())?
+                    }
+                    // one byte of CHARACTER SET NONE: the code MOV_get_long
+                    // reads, 0..255 or 22003 (evlAsciiChar)
+                    SysFn::AsciiChar => {
+                        let code = arg_long(&vs[0])?;
+                        if !(0..=255).contains(&code) {
+                            return Err(EvalErr::NumericOutOfRange);
+                        }
+                        Value::Text(char::from(code as u8).to_string())
+                    }
+                    // one UTF8 character: a negative code is the numbered
+                    // domain error, one U8_LENGTH cannot spell (a surrogate,
+                    // past U+10FFFF) *Malformed string* (evlUnicodeChar)
+                    SysFn::UnicodeChar => {
+                        let code = arg_long(&vs[0])?;
+                        if code < 0 {
+                            return Err(EvalErr::MathDomain { func: "UNICODE_CHAR", code: GDS_SYSF_ARG_NONNEG });
+                        }
+                        match char::from_u32(code as u32) {
+                            Some(c) => Value::Text(c.to_string()),
+                            // under the arithmetic exception (measured:
+                            // UNICODE_CHAR(55296) and (1114112) print both
+                            // lines, where a cast's Malformed is bare)
+                            None => {
+                                return Err(EvalErr::Bare(GDS_ARITH_EXCEPT, vec![ErrArg::Gds(GDS_MALFORMED_STRING)]))
+                            }
+                        }
+                    }
+                    // the first code point of the value moved to UTF8: a
+                    // byte carrier's bytes are read AS UTF-8 (the move is a
+                    // copy), a bad lead is 22018; every other set's
+                    // characters are already the code points
+                    SysFn::UnicodeVal(cs) => {
+                        let t = fn_text(&vs[0]);
+                        if *cs != NO_CS && fire_crab_ods::intl::byte_carrier(*cs) {
+                            let b = text_bytes_in(Some(*cs), &t);
+                            let lead = match std::str::from_utf8(&b) {
+                                Ok(x) => x.chars().next(),
+                                Err(e) if e.valid_up_to() > 0 => {
+                                    std::str::from_utf8(&b[..e.valid_up_to()]).ok().and_then(|x| x.chars().next())
+                                }
+                                Err(_) => return Err(EvalErr::TransliterationFailed),
+                            };
+                            Value::Int(lead.map_or(0, |c| c as i64))
+                        } else {
+                            Value::Int(t.chars().next().map_or(0, |c| c as i64))
+                        }
+                    }
+                    // the codecs over the operand's STORED bytes
+                    // (CVT_get_bytes: a CHAR keeps its padding)
+                    SysFn::HexEncode(cs) | SysFn::Base64Encode(cs) | SysFn::HexDecode(cs) | SysFn::Base64Decode(cs) => {
+                        let b = text_bytes_in((*cs != NO_CS).then_some(*cs), &fn_text(&vs[0]));
+                        match f {
+                            SysFn::HexEncode(_) => Value::Text(b.iter().map(|x| format!("{:02X}", x)).collect()),
+                            SysFn::Base64Encode(_) => Value::Text(base64_encode(&b)),
+                            SysFn::HexDecode(_) => Value::Text(fire_crab_ods::intl::carrier_decode(&hex_decode(&b)?)),
+                            _ => Value::Text(fire_crab_ods::intl::carrier_decode(&base64_decode(&b)?)),
+                        }
+                    }
+                    // the 16 bytes spelled `%02X` in the 8-4-4-4-12 groups
+                    SysFn::UuidToChar(cs) => {
+                        let Value::Text(t) = &vs[0] else {
+                            return Err(EvalErr::EvalArgs(GDS_SYSF_BINUUID_STR, vec![ErrArg::Str("UUID_TO_CHAR".into())]));
+                        };
+                        let b = text_bytes_in((*cs != NO_CS).then_some(*cs), t);
+                        if b.len() != 16 {
+                            return Err(EvalErr::EvalArgs(
+                                GDS_SYSF_BINUUID_SIZE,
+                                vec![ErrArg::Num(16), ErrArg::Str("UUID_TO_CHAR".into())],
+                            ));
+                        }
+                        let h: Vec<String> = b.iter().map(|x| format!("{:02X}", x)).collect();
+                        Value::Text(format!(
+                            "{}-{}-{}-{}-{}",
+                            h[0..4].concat(),
+                            h[4..6].concat(),
+                            h[6..8].concat(),
+                            h[8..10].concat(),
+                            h[10..16].concat()
+                        ))
+                    }
+                    SysFn::CharToUuid(cs) => {
+                        let Value::Text(t) = &vs[0] else {
+                            return Err(EvalErr::EvalArgs(GDS_SYSF_UUIDTYPE, vec![ErrArg::Str("CHAR_TO_UUID".into())]));
+                        };
+                        Value::Text(fire_crab_ods::intl::carrier_decode(&char_to_uuid(&text_bytes_in(
+                            (*cs != NO_CS).then_some(*cs),
+                            t,
+                        ))?))
+                    }
+                    SysFn::CryptHash(algo, cs) => {
+                        let b = text_bytes_in((*cs != NO_CS).then_some(*cs), &fn_text(&vs[0]));
+                        Value::Text(fire_crab_ods::intl::carrier_decode(&algo.digest(&b)))
+                    }
+                    // evlOverlay in characters: FROM clamps to one past the
+                    // end, the length (default: the placing's characters)
+                    // to what is left; FROM must be positive, FOR not
+                    // negative (the numbered 42000s, #3 and #4)
+                    SysFn::Overlay => {
+                        let src: Vec<char> = fn_text(&vs[0]).chars().collect();
+                        let placing = fn_text(&vs[1]);
+                        let len = match vs.get(3) {
+                            Some(v) => {
+                                let n = arg_long(v)?;
+                                if n < 0 {
+                                    return Err(EvalErr::ArgDomain { func: "OVERLAY", argno: 4, code: GDS_SYSF_ARGN_NONNEG });
+                                }
+                                Some(n as usize)
+                            }
+                            None => None,
+                        };
+                        let from = arg_long(&vs[2])?;
+                        if from <= 0 {
+                            return Err(EvalErr::ArgDomain { func: "OVERLAY", argno: 3, code: GDS_SYSF_ARGN_POSITIVE });
+                        }
+                        let from = (from as usize).min(src.len() + 1);
+                        let len = len.unwrap_or_else(|| placing.chars().count()).min(src.len() + 1 - from);
+                        let mut out: String = src[..from - 1].iter().collect();
+                        out.push_str(&placing);
+                        out.extend(&src[from - 1 + len..]);
+                        Value::Text(out)
+                    }
+                    // lowered at resolution
+                    SysFn::MaxMin(_) => return Err(EvalErr::Unsupported),
                     SysFn::BitLength => match vs[0] {
                         Value::Int(n) => Value::Int(n.checked_mul(8).ok_or(EvalErr::IntegerOverflow)?),
                         _ => return Err(EvalErr::Unsupported), // typed away
@@ -97797,6 +99008,15 @@ fn corr_scan_span(
         }
     }
     Some(out)
+}
+
+/// The INT128 scaled LITERAL the expression parser carries as a CAST of
+/// its own spelling (a scaled literal past INT64 - see the literal arm of
+/// the primary parser): a Numeric cast of a string at SUBTYPE 0 with a
+/// negative scale, which no written CAST produces.
+fn wide_scaled_literal(e: &RawExpr) -> bool {
+    matches!(e, RawExpr::Cast(inner, CastTarget::Numeric { scale, bytes: 16, sub_type: 0 })
+        if *scale < 0 && matches!(**inner, RawExpr::Str(_)))
 }
 
 /// Is this word an aggregate function's name?
@@ -103004,6 +104224,57 @@ fn split_top_comma2(s: &str) -> Option<(&str, &str)> {
     at.map(|i| (&s[..i], &s[i + 1..]))
 }
 
+/// A LISTAGG's `WITHIN GROUP (ORDER BY k [ASC | DESC] [NULLS FIRST |
+/// LAST], ...)` tail: the keys, their DESC flags and where their NULLs
+/// go - FIRST ascending and LAST descending unless the key says
+/// (measured: `ORDER BY V NULLS LAST` puts the NULL row's value last).
+/// Nothing may follow the clause.
+fn parse_list_within_group(tail: &str) -> Option<Vec<(RawExpr, bool, bool)>> {
+    let word = |s: &str, kw: &str| -> Option<usize> {
+        let t = s.trim_start();
+        let lead = s.len() - t.len();
+        (t.len() >= kw.len()
+            && t[..kw.len()].eq_ignore_ascii_case(kw)
+            && t[kw.len()..].chars().next().is_none_or(|c| c.is_whitespace() || c == '('))
+        .then_some(lead + kw.len())
+    };
+    let rest = &tail[word(tail, "WITHIN")?..];
+    let rest = &rest[word(rest, "GROUP")?..];
+    let rest = rest.trim_start();
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let close = matching_paren(rest.as_bytes(), 0)?;
+    if !rest[close + 1..].trim().is_empty() {
+        return None;
+    }
+    let inner = &rest[1..close];
+    let inner = &inner[word(inner, "ORDER")?..];
+    let inner = &inner[word(inner, "BY")?..];
+    let mut keys = Vec::new();
+    for item in split_top_level_commas(inner) {
+        let mut k = item.trim();
+        let mut nulls: Option<bool> = None;
+        for (sfx, first) in [(" NULLS FIRST", true), (" NULLS LAST", false)] {
+            let up = k.to_ascii_uppercase();
+            if up.ends_with(sfx) {
+                nulls = Some(first);
+                k = k[..k.len() - sfx.len()].trim_end();
+            }
+        }
+        let up = k.to_ascii_uppercase();
+        let mut desc = false;
+        if up.ends_with(" DESC") {
+            desc = true;
+            k = k[..k.len() - 5].trim_end();
+        } else if up.ends_with(" ASC") {
+            k = k[..k.len() - 4].trim_end();
+        }
+        keys.push((parse_raw_expr_any(k)?, desc, nulls.unwrap_or(!desc)));
+    }
+    (!keys.is_empty()).then_some(keys)
+}
+
 /// Parse `PERCENTILE_x(frac) WITHIN GROUP (ORDER BY expr [ASC|DESC])` -
 /// `t` is the whole item, `open` the index of the `(` after the function
 /// name. Only ONE sort item is accepted (the engine rejects more).
@@ -103287,6 +104558,16 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
     // separator after the top-level comma (a third argument is the
     // engine's -104, which the generic refusal answers)
     if matches!(func, AggFn::List) {
+        // LISTAGG's `WITHIN GROUP (ORDER BY k [ASC|DESC], ...)` tail sits
+        // after the call's own parens ([rewrite_listagg] spelled the call
+        // LIST): the argument is what the call's parens hold, the keys
+        // order the join
+        let close = matching_paren(t.as_bytes(), open)?;
+        let (arg, order) = if close + 1 == t.len() {
+            (arg, Vec::new())
+        } else {
+            (t.get(open + 1..close)?.trim(), parse_list_within_group(t.get(close + 1..)?)?)
+        };
         let (distinct, rest) = match arg
             .get(..8)
             .filter(|w| w.eq_ignore_ascii_case("DISTINCT"))
@@ -103315,9 +104596,14 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
             Some((a, s)) => (a.trim().to_string(), Some(parse_raw_expr_any(s.trim())?)),
             None => (rest.to_string(), None),
         };
+        // a DISTINCT fold is already ordered by its own dedupe sort; the
+        // two together are not modelled
+        if distinct && !order.is_empty() {
+            return None;
+        }
         return Some((
             func,
-            AggTarget::List { arg: parse_raw_expr_any(&a)?, sep, distinct },
+            AggTarget::List { arg: parse_raw_expr_any(&a)?, sep, distinct, order },
         ));
     }
     // the two-argument statistical folds take `(Y, X)` - split on the
@@ -103759,6 +105045,9 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Bin(_, ArithOp::Mul, _) => "MULTIPLY",
         RawExpr::Bin(_, ArithOp::Div, _) => "DIVIDE",
         RawExpr::Concat(_, _) => "CONCATENATION",
+        // a scaled literal past INT64 is a CONSTANT, whatever carries it
+        e if wide_scaled_literal(e) => "CONSTANT",
+        RawExpr::Neg(a) if wide_scaled_literal(a) => "CONSTANT",
         RawExpr::Cast(_, _) => "CAST",
         RawExpr::Coalesce(_) => "COALESCE",
         // the engine compiles NULLIF into a CASE and the header says so
@@ -104211,7 +105500,15 @@ fn numeric_tok(s: &str, b: &[u8], start: usize, i: &mut usize) -> Option<Tok> {
     }
     if scale != 0 {
         let digits: String = s[start..*i].chars().filter(|c| *c != '.').collect();
-        return Some(Tok::Dec(digits.parse().ok()?, scale));
+        // past INT64 the expression parser's wide literal (an INT128
+        // NUMERIC, or past INT128 a DECFLOAT(34) - see its literal arm)
+        return Some(match digits.parse::<i64>() {
+            Ok(raw) => Tok::Dec(raw, scale),
+            Err(_) => match parse_raw_expr_any(&s[start..*i])? {
+                RawExpr::DecFloat34(x) => Tok::DecFloat34(x),
+                e => Tok::FnExpr(e),
+            },
+        });
     }
     // an integer literal: i64 for the common case, an i128 magnitude
     // (a NUMERIC(38,0) key) next, and past i128::MAX the engine promotes
@@ -104580,8 +105877,12 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                     out.push(Tok::FnExpr(parse_raw_expr_any(word)?));
                     continue;
                 }
+                // ...DECODE among them: it is the expression parser's
+                // simple CASE, and outside this list a WHERE over it read
+                // `DECODE` as a column and refused (measured: `WHERE
+                // DECODE(1, 1, 'a') = 'a'` answers the row on 2182)
                 if sysfn_named(&upper).is_some()
-                    || matches!(upper.as_str(), "CAST" | "COALESCE" | "NULLIF" | "IIF" | "FC$CORR")
+                    || matches!(upper.as_str(), "CAST" | "COALESCE" | "NULLIF" | "IIF" | "DECODE" | "FC$CORR")
                 {
                     let mut j = i;
                     while j < b.len() && b[j].is_ascii_whitespace() {
@@ -104590,6 +105891,20 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                     if j < b.len() && b[j] == b'(' {
                         let close = matching_paren(b, j)?;
                         let raw = parse_raw_expr_any(&s[start..=close])?;
+                        // ...but not a DECODE whose RESULT is a `?`: the
+                        // DecodeNode types none from its siblings, and the
+                        // comparison over it answers what this server's
+                        // CASE cannot (measured: `WHERE DECODE(ID, 2, ?, 0)
+                        // = 2` bound '2.4' selects NO row on 2182 - it took
+                        // row 2 here, the simple CASE's recorded twin in
+                        // serve-real-cmpparam); a `?` searched FOR answers
+                        if upper == "DECODE" {
+                            if let RawExpr::Case(arms, els, true) = &raw {
+                                if arms.iter().map(|(_, v)| v).chain(els.as_deref()).any(raw_has_param) {
+                                    return None;
+                                }
+                            }
+                        }
                         out.push(Tok::FnExpr(raw));
                         i = close + 1;
                         continue;
@@ -118897,6 +120212,21 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 | SysFn::Cosh
                 | SysFn::Tanh => false,
                 SysFn::Ceil | SysFn::Ceiling | SysFn::Floor | SysFn::Round | SysFn::Trunc => false,
+                // the encoders and the digests read any bytes; everything
+                // else this round added has a domain to leave
+                SysFn::HexEncode(_) | SysFn::Base64Encode(_) | SysFn::CryptHash(..) => true,
+                SysFn::Acosh
+                | SysFn::Asinh
+                | SysFn::Atanh
+                | SysFn::AsciiChar
+                | SysFn::UnicodeChar
+                | SysFn::UnicodeVal(_)
+                | SysFn::HexDecode(_)
+                | SysFn::Base64Decode(_)
+                | SysFn::UuidToChar(_)
+                | SysFn::CharToUuid(_)
+                | SysFn::Overlay
+                | SysFn::MaxMin(_) => false,
             }
         }
     }
@@ -135262,8 +136592,9 @@ mod tests {
         }
 
         // the announced type: text functions type Text, the counting ones
-        // Int; MOD/SIGN/ABS refuse a text operand rather than guess at
-        // the engine's string-to-number path
+        // Int; MOD / SIGN / ABS convert a text operand as the engine does
+        // (MOD through MOV_get_int64, SIGN through the double - measured
+        // `MOD('7', 2)` 1, `SIGN('5')` 1, `SIGN('abc')` 22018)
         let ty = |s: &str| {
             let raw = parse_raw_expr(s).unwrap();
             resolve_expr(&raw, &columns, &descs).unwrap().type_of(&descs)
@@ -135271,10 +136602,10 @@ mod tests {
         assert_eq!(ty("UPPER(NAME)"), Some(ExprType::Text));
         assert_eq!(ty("CHAR_LENGTH(NAME)"), Some(ExprType::Int));
         assert_eq!(ty("POSITION('a' IN NAME)"), Some(ExprType::Int));
-        assert_eq!(ty("MOD(NAME, 2)"), None);
+        assert_eq!(ty("MOD(NAME, 2)"), Some(ExprType::Int));
         // ABS reads a text as a DOUBLE (makeAbs's default arm, measured)
         assert_eq!(ty("ABS(NAME)"), Some(ExprType::Approx));
-        assert_eq!(ty("SIGN(NAME)"), None);
+        assert_eq!(ty("SIGN(NAME)"), Some(ExprType::Int));
 
         // un-aliased headers carry the engine's names - CHARACTER_LENGTH
         // canonicalizes, IIF headers as CASE (both probed)
@@ -138443,8 +139774,15 @@ mod tests {
         assert!(build("MOD(A, ID) = 0").is_none() || true); // ID absent here
         // CAST is admitted now and evaluates
         assert!(build("CAST(A AS VARCHAR(5)) = '-7'").unwrap().matches(&row).unwrap());
-        // the type refusal REMAINS a fence
-        assert!(build("MOD(NAME, 2) = 0").is_none());
+        // a text MOD operand converts per row - a non-number is the
+        // engine's 22018 with the offending string (measured `MOD('x',
+        // 2)`), never a silent answer
+        assert!(matches!(
+            build("MOD(NAME, 2) = 0").unwrap().matches(&row),
+            Err(EvalErr::ConversionError(Some(ref t))) if t == "Hello"
+        ));
+        // ...while a type that does not convert at all stays a fence
+        assert!(build("MOD(DATE '2024-01-01', 2) = 0").is_none());
         // a parameter against an expression side binds now: the slot's
         // descriptor synthesizes from the expression's type, and the
         // arrived value substitutes as a literal at bind()
@@ -142936,7 +144274,7 @@ mod tests {
         // FILTER wraps only the VALUE argument in the CASE
         let (_, t) = parse_agg_item("LIST(S, ';') FILTER (WHERE ID > 2)").expect("filtered");
         match t {
-            AggTarget::List { arg, sep, distinct } => {
+            AggTarget::List { arg, sep, distinct, .. } => {
                 assert!(matches!(arg, RawExpr::Case { .. }), "value arg CASE-wrapped");
                 assert!(sep.is_some(), "separator kept outside the CASE");
                 assert!(!distinct);
@@ -146027,5 +147365,112 @@ mod computed_wide_types {
         // an INTEGER column is not this path
         let long = Descriptor { dtype: fire_crab_ods::format::dtype::LONG, ..d };
         assert!(matches!(bound_double_into_int128(&long, &WireParam::Double(2.5)), Ok(None)));
+    }
+}
+
+#[cfg(test)]
+mod builtins_round {
+    use super::*;
+
+    /// libtomcrypt's RELAXED base64 decoder, as the engine answers it
+    /// (measured on 2182): a stray character is skipped, `=` only
+    /// counted, a lone trailing sextet is the invalid-packet error, and
+    /// the length check comes first.
+    #[test]
+    fn base64_relaxed() {
+        assert_eq!(base64_decode(b"YWJj").unwrap(), b"abc");
+        assert_eq!(base64_decode(b"YW=j").unwrap(), b"ah");
+        assert_eq!(base64_decode(b"YW!j").unwrap(), b"ah");
+        assert_eq!(base64_decode(b"YQ==").unwrap(), b"a");
+        assert!(matches!(base64_decode(b"Y==="), Err(EvalErr::Bare(GDS_TOM_ERROR, _))));
+        assert!(matches!(base64_decode(b"YWJjZA"), Err(EvalErr::Bare(GDS_TOM_DECODE64LEN, _))));
+        assert!(matches!(base64_decode(b""), Err(EvalErr::Bare(GDS_TOM_DECODE64LEN, _))));
+        assert_eq!(base64_encode(b"abc"), "YWJj");
+        assert_eq!(base64_encode(b"\xFF\xFE"), "//4=");
+        assert_eq!(base64_encode("é".as_bytes()), "w6k=");
+        assert_eq!(base64_encode(b""), "");
+    }
+
+    /// HEX_DECODE's digit and length errors, in the engine's order.
+    #[test]
+    fn hex_codec() {
+        assert_eq!(hex_decode(b"0a0B").unwrap(), vec![0x0A, 0x0B]);
+        assert_eq!(
+            hex_decode(b"6G"),
+            Err(EvalErr::Bare(GDS_INVALID_HEX_DIGIT, vec![ErrArg::Str("G".into()), ErrArg::Num(2)]))
+        );
+        assert_eq!(hex_decode(b"616"), Err(EvalErr::Bare(GDS_ODD_HEX_LEN, vec![ErrArg::Num(3)])));
+    }
+
+    /// CHAR_TO_UUID: trailing blanks past 36 dropped, the dash and digit
+    /// checks name the offender the engine's way.
+    #[test]
+    fn char_to_uuid_checks() {
+        let ok = char_to_uuid(b"a0bf4e45-3029-2a44-d493-4998c9b439a3   ").unwrap();
+        assert_eq!(ok[0], 0xA0);
+        assert_eq!(ok[15], 0xA3);
+        assert!(matches!(char_to_uuid(b"xyz"), Err(EvalErr::EvalArgs(GDS_SYSF_UUIDLEN, _))));
+        match char_to_uuid(b"A0BF4E45x3029-2A44-D493-4998C9B439A3") {
+            Err(EvalErr::EvalArgs(GDS_SYSF_UUIDFMT, a)) => {
+                assert_eq!(a[0], ErrArg::Str("x (ASCII 120)".into()));
+                assert_eq!(a[1], ErrArg::Num(9));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// MAXVALUE lowers to a searched CASE: the IS NULL arms (none for a
+    /// non-NULL literal), one comparison arm per argument but the last,
+    /// the last as the ELSE; a `?` or a generator refuses.
+    #[test]
+    fn maxvalue_lowering() {
+        let args = vec![RawExpr::Col("A".into()), RawExpr::Int(5), RawExpr::Col("B".into())];
+        match lower_maxmin(MaxMinKind::MaxValue, &args) {
+            Some(RawExpr::Case(arms, Some(els), false)) => {
+                assert_eq!(arms.len(), 2 + 2);
+                assert!(matches!(&arms[0].0, RawCond::IsNull(_)));
+                assert!(matches!(&arms[2].0, RawCond::And(v) if v.len() == 2));
+                assert!(matches!(*els, RawExpr::Col(ref n) if n == "B"));
+            }
+            _ => panic!("MAXVALUE did not lower to a CASE"),
+        }
+        assert!(lower_maxmin(MaxMinKind::Least, &[RawExpr::Param(0), RawExpr::Int(1)]).is_none());
+        assert!(lower_maxmin(MaxMinKind::MinValue, &[]).is_none());
+    }
+
+    /// LISTAGG is respelled LIST at its own length; strings and quoted
+    /// names are left alone, and so is a name that only starts with it.
+    #[test]
+    fn listagg_respelled() {
+        assert_eq!(rewrite_listagg("SELECT listagg (V) FROM T".into()), "SELECT LIST    (V) FROM T");
+        assert_eq!(
+            rewrite_listagg("SELECT 'listagg(' || \"LISTAGG\" FROM T".into()),
+            "SELECT 'listagg(' || \"LISTAGG\" FROM T"
+        );
+        assert_eq!(rewrite_listagg("SELECT LISTAGGX(V) FROM T".into()), "SELECT LISTAGGX(V) FROM T");
+        // a multi-byte character where the name's seven bytes would end
+        assert_eq!(
+            rewrite_listagg("SELECT LISTAGG(V, 'é') FROM T WHERE X = 'ééé'".into()),
+            "SELECT LIST   (V, 'é') FROM T WHERE X = 'ééé'"
+        );
+        assert_eq!(rewrite_listagg("SELECT Lé, 'LISTAGG' FROM T".into()), "SELECT Lé, 'LISTAGG' FROM T");
+        let keys = parse_list_within_group(" WITHIN GROUP (ORDER BY K DESC NULLS FIRST, V)").unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].1 && keys[0].2);
+        assert!(!keys[1].1 && keys[1].2);
+    }
+
+    /// A scaled literal past INT64 is the INT128 CONSTANT, past INT128 a
+    /// DECFLOAT(34); within INT64 it stays a plain Dec.
+    #[test]
+    fn wide_scaled_literals() {
+        let e = parse_raw_expr_any("123456789012345678901234567890.123").unwrap();
+        assert!(wide_scaled_literal(&e));
+        assert_eq!(default_expr_name(&e), "CONSTANT");
+        assert!(matches!(
+            parse_raw_expr_any("99999999999999999999999999999999999999.9"),
+            Some(RawExpr::DecFloat34(_))
+        ));
+        assert!(matches!(parse_raw_expr_any("12345.678"), Some(RawExpr::Dec(12345678, -3))));
     }
 }
