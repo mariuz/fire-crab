@@ -3612,7 +3612,10 @@ fn column_field_precision(file: &crate::Image, page_size: usize, table: &str, co
 ///
 /// A scale that shallows would round the stored values the engine keeps
 /// exact, so only a scale that deepens or stays is taken; everything
-/// else keeps the refusal it had.
+/// else keeps the refusal it had. The ALTER is taken whatever the rows
+/// hold: a stored value whose rescale no longer fits the new type's
+/// storage word (SMALLINT 32000 to NUMERIC(4,2)) raises 22003 when it is
+/// read, as on 2182 ([crate::format::present_field]).
 fn column_type_change_extended(old: &Descriptor, new: &ColumnDef, (old_sub, old_prec): (i64, i64)) -> bool {
     use crate::format::dtype;
     let (o, n) = (old.dtype, new.dtype);

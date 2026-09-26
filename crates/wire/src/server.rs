@@ -23210,7 +23210,8 @@ fn parse_identity_opts(opts: &str) -> Option<(i64, i64)> {
                 Some(b) if up[after..b].trim().is_empty() => b + "BY".len(),
                 _ => after,
             };
-            num_after(after)?
+            // a signed_long_integer ([sequence_step])
+            sequence_step(up[after..].split_whitespace().next()?)?
         }
         None => 1,
     };
@@ -27458,6 +27459,10 @@ fn if_exists_rewrite(sql: &str, db: &Option<Database>) -> Option<IfExists> {
         ["DROP", "TABLE"] | ["DROP", "VIEW"] if !not => {
             catalog_has(db, "RDB$RELATIONS", &[("RDB$RELATION_NAME", Some(&name))])
         }
+        // (a quoted name that is not its own upper-case fold is refused -
+        // the sequence writers and lookups here fold it, see
+        // [plan_create_or_alter_sequence])
+        [_, "SEQUENCE" | "GENERATOR"] if name != name.to_ascii_uppercase() => return None,
         ["CREATE", "SEQUENCE" | "GENERATOR"] if not => {
             catalog_has(db, "RDB$GENERATORS", &[("RDB$GENERATOR_NAME", Some(&name))])
         }
@@ -27465,12 +27470,20 @@ fn if_exists_rewrite(sql: &str, db: &Option<Database>) -> Option<IfExists> {
             catalog_has(db, "RDB$GENERATORS", &[("RDB$GENERATOR_NAME", Some(&name))])
         }
         ["DROP", "INDEX"] if !not => catalog_has(db, "RDB$INDICES", &[("RDB$INDEX_NAME", Some(&name))]),
-        [_, "DOMAIN"] => catalog_has(db, "RDB$FIELDS", &[("RDB$FIELD_NAME", Some(&name))]),
-        [_, "EXCEPTION"] => catalog_has(db, "RDB$EXCEPTIONS", &[("RDB$EXCEPTION_NAME", Some(&name))]),
-        [_, "ROLE"] => catalog_has(db, "RDB$ROLES", &[("RDB$ROLE_NAME", Some(&name))]),
-        [_, "TRIGGER"] => catalog_has(db, "RDB$TRIGGERS", &[("RDB$TRIGGER_NAME", Some(&name))]),
-        [_, "PROCEDURE"] => routine("RDB$PROCEDURES", "RDB$PROCEDURE_NAME"),
-        [_, "FUNCTION"] => routine("RDB$FUNCTIONS", "RDB$FUNCTION_NAME"),
+        // the grammar has only CREATE ... IF NOT EXISTS and DROP ... IF
+        // EXISTS on these kinds: DROP ... IF NOT EXISTS, CREATE ... IF
+        // EXISTS and any ALTER ... IF [NOT] EXISTS are -104 "Token
+        // unknown" on 2182 (measured on all six), so they fall to the
+        // refusal and never run
+        [verb @ ("CREATE" | "DROP"), kind] if (*verb == "CREATE") == not => match *kind {
+            "DOMAIN" => catalog_has(db, "RDB$FIELDS", &[("RDB$FIELD_NAME", Some(&name))]),
+            "EXCEPTION" => catalog_has(db, "RDB$EXCEPTIONS", &[("RDB$EXCEPTION_NAME", Some(&name))]),
+            "ROLE" => catalog_has(db, "RDB$ROLES", &[("RDB$ROLE_NAME", Some(&name))]),
+            "TRIGGER" => catalog_has(db, "RDB$TRIGGERS", &[("RDB$TRIGGER_NAME", Some(&name))]),
+            "PROCEDURE" => routine("RDB$PROCEDURES", "RDB$PROCEDURE_NAME"),
+            "FUNCTION" => routine("RDB$FUNCTIONS", "RDB$FUNCTION_NAME"),
+            _ => return None,
+        },
         // ALTER TABLE <t> ADD [COLUMN] IF NOT EXISTS <col> ... / DROP
         // [COLUMN] IF EXISTS <col> / ADD|DROP CONSTRAINT IF [NOT] EXISTS
         ["ALTER", "TABLE", .., verb] | ["ALTER", "TABLE", .., verb, "COLUMN" | "CONSTRAINT"]
@@ -27489,6 +27502,13 @@ fn if_exists_rewrite(sql: &str, db: &Option<Database>) -> Option<IfExists> {
             let tail = &masked[guard_end..];
             if find_word_depth0(tail, "ADD", 0).or_else(|| find_word_depth0(tail, "DROP", 0)).is_some() {
                 return None;
+            }
+            // on a name that is no table - missing, or a VIEW - the guard
+            // does not answer: the engine still fails the ALTER with 42S02
+            // "Table ... does not exist" in every direction (measured), which
+            // is what the unguarded statement raises here too
+            if !catalog_has(db, "RDB$RELATIONS", &[("RDB$RELATION_NAME", Some(&table)), ("RDB$VIEW_BLR", None)]) {
+                return Some(IfExists::Run(format!("{} {}", s[..if_at].trim_end(), s[guard_end..].trim_start())));
             }
             if ws.last() == Some(&"CONSTRAINT") {
                 catalog_has(
@@ -28620,7 +28640,7 @@ fn plan_create_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             } else {
                 i + 1
             };
-            increment = Some(toks.get(at)?.parse::<i64>().ok()?);
+            increment = Some(sequence_step(toks.get(at)?)?);
             i = at + 1;
         } else {
             return None; // an option this writer does not implement
@@ -28654,6 +28674,15 @@ fn plan_create_or_alter_sequence(sql: &str, db: &Option<Database>) -> Option<(Pl
         return None;
     }
     let name = generator_ident(toks[4])?;
+    // this server's generator lookups ([generator_info], NEXT VALUE, the
+    // CREATE writer) match a name case-insensitively, so a quoted name
+    // that is not its own upper-case fold would find - and RESTART - the
+    // unquoted namesake: `create or alter sequence "s7" start with 50`
+    // over S7 moved S7 to 50, where 2182 creates "s7" and leaves S7 at
+    // its value. Such a name is refused until the lookups are exact.
+    if name != name.to_ascii_uppercase() {
+        return None;
+    }
     let (mut restart, mut start, mut step) = (false, None::<i64>, None::<i64>);
     let mut i = 5;
     while i < toks.len() {
@@ -28673,7 +28702,7 @@ fn plan_create_or_alter_sequence(sql: &str, db: &Option<Database>) -> Option<(Pl
                 i += 1;
             }
             // a signed_long_integer: 32 bits
-            step = Some(toks.get(i)?.parse::<i32>().ok()? as i64);
+            step = Some(sequence_step(toks.get(i)?)?);
             i += 1;
         } else {
             return None;
@@ -28725,7 +28754,14 @@ fn parse_exception_stmt(sql: &str, lead: &str) -> Option<(String, String)> {
     }
     let after = exc + "EXCEPTION".len();
     let q = s[after..].find('\'')? + after;
-    let name = unquote_ident(s[after..q].trim())?;
+    // ONE identifier: [unquote_ident] takes a bare span whole, and
+    // `create exception e3 x 'y'` / `create exception if exists e2 'y'`
+    // (each -104 "Token unknown" on 2182) created "E3 X" / "IF EXISTS E2"
+    let span = s[after..q].trim();
+    if !span.starts_with('"') && span.contains(char::is_whitespace) {
+        return None;
+    }
+    let name = unquote_ident(span)?;
     let message = parse_string_literal(s[q..].trim())?;
     Some((name, message))
 }
@@ -32245,7 +32281,7 @@ fn plan_alter_column_identity(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
                     i += 1;
                 }
                 // a signed_long_integer
-                step = Some(toks.get(i)?.parse::<i32>().ok()? as i64);
+                step = Some(sequence_step(toks.get(i)?)?);
                 i += 1;
             }
             _ => return None,
@@ -32389,6 +32425,16 @@ fn generator_ident(tok: &str) -> Option<String> {
     }
 }
 
+/// A sequence step as the grammar reads it (parse.y signed_long_integer:
+/// an optional '-' before a 32-bit NUMBER). `-2147483648` is NOT one -
+/// its 2147483648 lexes as a 64-bit number, and 2182 answers -104
+/// "Token unknown - -2147483648" for `increment by -2147483648` on
+/// CREATE / ALTER / CREATE OR ALTER SEQUENCE and on an identity's SET
+/// INCREMENT (measured) - so the range is +-2147483647.
+fn sequence_step(tok: &str) -> Option<i64> {
+    tok.parse::<i32>().ok().filter(|v| *v != i32::MIN).map(i64::from)
+}
+
 fn plan_set_generator(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';');
     let toks: Vec<&str> = s.split_whitespace().collect();
@@ -32474,7 +32520,7 @@ fn plan_alter_sequence_options(toks: &[&str]) -> Option<(Plan, Vec<Descriptor>)>
                 i += 1;
             }
             // a signed_long_integer: 32 bits
-            step = Some(toks.get(i)?.parse::<i32>().ok()? as i64);
+            step = Some(sequence_step(toks.get(i)?)?);
             i += 1;
         } else {
             return None;

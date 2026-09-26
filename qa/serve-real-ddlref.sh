@@ -45,6 +45,15 @@
 #      and no row on UPDATE on the engine (an engine quirk; this server
 #      answers the real row).
 #   9. The ENGINE reads fc's file after all of it, and gfix is clean.
+#  10. The review of c697f49: a rescale that keeps the storage word
+#      raises 22003 when a stored value no longer fits it (it wrapped);
+#      a quoted sequence name that is not its own fold is refused by
+#      CREATE OR ALTER and the guard (it restarted the unquoted
+#      namesake); the guard only in the grammar's directions (DROP ...
+#      IF NOT EXISTS, CREATE ... IF EXISTS, ALTER DOMAIN IF EXISTS are
+#      -104, and one wrote a default); ALTER TABLE ... IF [NOT] EXISTS on
+#      a missing table or a view is 42S02; a step of -2147483648 is -104;
+#      an exception name of two words is -104 (it created "E3 X").
 #
 # Usage: qa/serve-real-ddlref.sh [port]   (default 5950)
 set -u
@@ -361,6 +370,50 @@ refused "8 computed by a function" "CREATE TABLE C13 (X INTEGER, W COMPUTED BY (
 refused "8 generated always as over another generated column" "CREATE TABLE C2 (X INTEGER, Y GENERATED ALWAYS AS (X * 2), Z GENERATED ALWAYS AS (Y + 1)); COMMIT; SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME = 'C2';" "COUNT|1"
 differs "8 RETURNING through a WITH CHECK OPTION view: the engine's 0/0 - recorded" "INSERT INTO VCO VALUES (2, 20) RETURNING ID, N; UPDATE VCO SET N = 12 WHERE ID = 1 RETURNING ID, N; SELECT * FROM VB ORDER BY ID; ROLLBACK;" "ID N|0 0|ID N|1 12|2 20" "ID N|2 20|ID N|1 12|ID N|1 12|2 20"
 
+echo "--- 10. THE REVIEW OF c697f49"
+# a rescale that keeps the storage word: the value is read through the
+# NEW word, and one that no longer fits it raises 22003 at the read (the
+# declared precision bounds nothing) - here it wrapped
+pin "10 rescale in the same word: the ALTERs are taken" "CREATE TABLE OV (ID INTEGER, S SMALLINT, I INTEGER, A NUMERIC(3,1), C INTEGER, OK SMALLINT); COMMIT; INSERT INTO OV VALUES (1, 32000, 2000000000, 3276.7, 30000000, 300); INSERT INTO OV VALUES (2, 3, 4, 1.5, 5, 7); COMMIT; ALTER TABLE OV ALTER S TYPE NUMERIC(4,2); ALTER TABLE OV ALTER I TYPE NUMERIC(9,3); ALTER TABLE OV ALTER A TYPE NUMERIC(4,2); ALTER TABLE OV ALTER C TYPE NUMERIC(9,2); ALTER TABLE OV ALTER OK TYPE NUMERIC(4,2); COMMIT; SELECT COUNT(*) FROM OV;" "COUNT|2"
+pin "10 smallint 32000 -> numeric(4,2): 22003 at the read" "SELECT ID, S FROM OV;" "ID S|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range"
+pin "10 integer 2000000000 -> numeric(9,3): 22003" "SELECT ID, I FROM OV;" "ID I|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range"
+pin "10 numeric(3,1) 3276.7 -> numeric(4,2): 22003" "SELECT ID, A FROM OV;" "ID A|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range"
+pin "10 integer 30000000 -> numeric(9,2): 22003, SUM too" "SELECT ID, C FROM OV; SELECT SUM(C) FROM OV;" "ID C|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range|SUM|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range"
+pin "10 the rows that fit read, and a filter that skips the other" "SELECT ID, S, I, A, C FROM OV WHERE ID = 2; SELECT ID, OK FROM OV ORDER BY ID;" "ID S I A C|2 3.00 4.000 1.50 5.00|ID OK|1 300.00|2 7.00"
+# a quoted name that is not its own fold: this server's generator
+# lookups fold, so CREATE OR ALTER / the guard over one are refused -
+# S7's namesake is never restarted
+pin "10 a quoted sequence name: the setup" "CREATE SEQUENCE QS7; COMMIT; SELECT NEXT VALUE FOR QS7 FROM RDB\$DATABASE;" "NEXT_VALUE|1"
+refused "10 create or alter sequence \"qs7\" over QS7 - recorded" "CREATE OR ALTER SEQUENCE \"qs7\" START WITH 50;" ""
+refused "10 create sequence if not exists \"qs7\" over QS7 - recorded" "CREATE SEQUENCE IF NOT EXISTS \"qs7\" START WITH 7;" ""
+pin "10 ...and QS7 kept its value" "SELECT NEXT VALUE FOR QS7 FROM RDB\$DATABASE;" "NEXT_VALUE|2"
+# the guard only where the grammar has it: CREATE ... IF NOT EXISTS and
+# DROP ... IF EXISTS
+refused "10 drop domain if not exists: the engine's -104 - the vector is recorded" "DROP DOMAIN IF NOT EXISTS IED;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 16|-NOT"
+refused "10 create domain if exists - the vector is recorded" "CREATE DOMAIN IF EXISTS QD2 INTEGER;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 18|-EXISTS"
+refused "10 alter domain if exists - the vector is recorded" "ALTER DOMAIN IF EXISTS IED SET DEFAULT 1;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 17|-EXISTS"
+refused "10 drop exception if not exists - the vector is recorded" "DROP EXCEPTION IF NOT EXISTS IEE;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 19|-NOT"
+refused "10 create exception if exists - the vector is recorded" "CREATE EXCEPTION IF EXISTS QE2 'y';" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 21|-EXISTS"
+refused "10 create role if exists - the vector is recorded" "CREATE ROLE IF EXISTS QR9;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 16|-EXISTS"
+refused "10 drop role if not exists - the vector is recorded" "DROP ROLE IF NOT EXISTS IER;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 14|-NOT"
+refused "10 an exception name of two words - the vector is recorded" "CREATE EXCEPTION QE3 X 'y';" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 22|-X"
+pin "10 ...and none of them wrote the catalog" "COMMIT; SELECT CAST(RDB\$DEFAULT_SOURCE AS VARCHAR(20)) FROM RDB\$FIELDS WHERE RDB\$FIELD_NAME = 'IED'; SELECT COUNT(*) FROM RDB\$EXCEPTIONS WHERE TRIM(RDB\$EXCEPTION_NAME) CONTAINING ' ' OR RDB\$EXCEPTION_NAME STARTING 'QE'; SELECT COUNT(*) FROM RDB\$FIELDS WHERE RDB\$FIELD_NAME = 'QD2'; SELECT COUNT(*) FROM RDB\$ROLES WHERE RDB\$ROLE_NAME IN ('QR9', 'IER');" "CAST|<null>|COUNT|0|COUNT|0|COUNT|1"
+# ALTER TABLE ... IF [NOT] EXISTS on no table: 42S02 whatever the guard
+pin "10 alter table <missing> drop if exists: 42S02" "ALTER TABLE NOSUCH DROP IF EXISTS C;" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-ALTER TABLE \"PUBLIC\".\"NOSUCH\" failed|-SQL error code = -607|-Invalid command|-Table \"PUBLIC\".\"NOSUCH\" does not exist"
+pin "10 alter table <view> drop if exists: 42S02" "ALTER TABLE IEV DROP IF EXISTS ZZ;" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-ALTER TABLE \"PUBLIC\".\"IEV\" failed|-SQL error code = -607|-Invalid command|-Table \"PUBLIC\".\"IEV\" does not exist"
+pin "10 alter table <missing> add if not exists: 42S02" "ALTER TABLE NOSUCH ADD IF NOT EXISTS C INTEGER;" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-ALTER TABLE \"PUBLIC\".\"NOSUCH\" failed|-SQL error code = -607|-Invalid command|-Table \"PUBLIC\".\"NOSUCH\" does not exist"
+refused "10 alter table <missing> drop column if exists - the vector is recorded" "ALTER TABLE NOSUCH DROP COLUMN IF EXISTS C;" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-ALTER TABLE \"PUBLIC\".\"NOSUCH\" failed|-SQL error code = -607|-Invalid command|-Table \"PUBLIC\".\"NOSUCH\" does not exist"
+pin "10 alter table <missing> drop constraint if exists: 42S02" "ALTER TABLE NOSUCH DROP CONSTRAINT IF EXISTS CC;" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-ALTER TABLE \"PUBLIC\".\"NOSUCH\" failed|-SQL error code = -607|-Invalid command|-Table \"PUBLIC\".\"NOSUCH\" does not exist"
+# a step is a signed_long_integer: -2147483648 is -104
+pin "10 identity with a step: the setup" "CREATE TABLE QT4 (ID BIGINT GENERATED BY DEFAULT AS IDENTITY, V INTEGER); COMMIT; SELECT COUNT(*) FROM QT4;" "COUNT|0"
+refused "10 identity set increment by -2147483648 - the vector is recorded" "ALTER TABLE QT4 ALTER ID SET INCREMENT BY -2147483648;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 44|-2147483648"
+refused "10 identity restart + set increment by -2147483648 - the vector is recorded" "ALTER TABLE QT4 ALTER ID RESTART WITH 3 SET INCREMENT BY -2147483648;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 59|-2147483648"
+refused "10 create or alter sequence increment by -2147483648 - the vector is recorded" "CREATE OR ALTER SEQUENCE QS2 INCREMENT BY -2147483648;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 44|-2147483648"
+refused "10 create sequence increment by -2147483648 - the vector is recorded" "CREATE SEQUENCE QS3 INCREMENT BY -2147483648;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 35|-2147483648"
+refused "10 alter sequence increment by -2147483648 - the vector is recorded" "ALTER SEQUENCE QS7 INCREMENT BY -2147483648;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 34|-2147483648"
+refused "10 an identity column declared with -2147483648 - the vector is recorded" "CREATE TABLE QT5 (ID BIGINT GENERATED BY DEFAULT AS IDENTITY (INCREMENT BY -2147483648));" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 77|-2147483648"
+pin "10 ...none took, and -2147483647 is a step" "COMMIT; INSERT INTO QT4 (V) VALUES (1) RETURNING ID; CREATE OR ALTER SEQUENCE QS4 INCREMENT BY -2147483647; COMMIT; SELECT RDB\$GENERATOR_NAME, RDB\$GENERATOR_INCREMENT FROM RDB\$GENERATORS WHERE RDB\$GENERATOR_INCREMENT < -2000000000 OR RDB\$GENERATOR_NAME IN ('QS2', 'QS3') ORDER BY 1; ROLLBACK;" "ID|1|RDB\$GENERATOR_NAME RDB\$GENERATOR_INCREMENT|QS4 -2147483647"
+
 echo "--- 9. THE FILE AFTER ALL OF IT"
 gf=$(gfix -v -full -user "$U" -pas "$P" "$FC" 2>&1)
 ran=$((ran + 1))
@@ -382,5 +435,5 @@ ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-ddlref-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 else echo "OK   no panic"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 157 ]; then echo "FAIL only $ran checks ran (floor 157)"; fail=1; fi
+if [ "$ran" -lt 189 ]; then echo "FAIL only $ran checks ran (floor 189)"; fail=1; fi
 exit $fail

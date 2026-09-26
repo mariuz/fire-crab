@@ -1244,6 +1244,23 @@ mod tests {
         assert_eq!(relay_image(&img, &old, &old).unwrap(), img);
     }
 
+    /// A rescale that keeps the storage word is judged against THAT word:
+    /// SMALLINT 32000 read as NUMERIC(4,2) is 3200000, past i16, and the
+    /// engine raises 22003 at the read (measured on 2182) - it wrapped to
+    /// -112.64 here. A value that fits is re-expressed.
+    #[test]
+    fn a_rescale_is_judged_by_the_new_storage_word() {
+        let d = |dtype: u8, scale: i8, length: u16| Descriptor { dtype, scale, length, sub_type: 0, flags: 0, offset: 4 };
+        let (s, n42) = (d(dtype::SHORT, 0, 2), d(dtype::SHORT, -2, 2));
+        assert_eq!(present_field(&Value::Int(32000), &s, &n42), Some(Value::OutOfRange));
+        assert_eq!(present_field(&Value::Int(327), &s, &n42), Some(Value::Scaled(32700, -2)));
+        let (i, n92) = (d(dtype::LONG, 0, 4), d(dtype::LONG, -2, 4));
+        assert_eq!(present_field(&Value::Int(30000000), &i, &n92), Some(Value::OutOfRange));
+        assert_eq!(present_field(&Value::Int(-21474836), &i, &n92), Some(Value::Scaled(-2147483600, -2)));
+        let n182 = d(dtype::INT64, -2, 8);
+        assert_eq!(present_field(&Value::Int(30000000), &i, &n182), Some(Value::Scaled(3000000000, -2)));
+    }
+
     #[test]
     fn per_page_formulas_match_ods_cpp() {
         // 8K pages: ((8192-32)*8/40) & ~7 = 1632; (8192-28)/17 = 480
@@ -1355,9 +1372,20 @@ pub fn present_field(v: &Value, stored: &Descriptor, newest: &Descriptor) -> Opt
         }
         Some(Value::Int128(n, to))
     } else {
+        // the rescaled mantissa must fit the NEW type's storage word, not
+        // just an i64 - the declared precision does not bound what the
+        // record holds, the word does (measured on 2182: SMALLINT 32000
+        // retyped to NUMERIC(4,2), INTEGER 30000000 to NUMERIC(9,2) and
+        // NUMERIC(3,1) 3276.7 to NUMERIC(4,2) each raise 22003 "numeric
+        // value is out of range" when the row is read, SUM too)
+        let fits = match newest.dtype {
+            dtype::SHORT => i16::try_from(n).is_ok(),
+            dtype::LONG => i32::try_from(n).is_ok(),
+            _ => i64::try_from(n).is_ok(),
+        };
         match i64::try_from(n) {
-            Ok(m) => Some(if to == 0 { Value::Int(m) } else { Value::Scaled(m, to) }),
-            Err(_) => Some(Value::OutOfRange),
+            Ok(m) if fits => Some(if to == 0 { Value::Int(m) } else { Value::Scaled(m, to) }),
+            _ => Some(Value::OutOfRange),
         }
     }
 }
