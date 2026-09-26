@@ -17478,9 +17478,11 @@ struct TrigDef {
     /// the same characters from `BEGIN` on - so this anchor plus the
     /// offset the interpreter tracks gives the engine's own numbers.
     anchor: Option<(u32, u32)>,
-    /// the set the body's non-ASCII literals were compiled in, off its
+    /// the set the body's literals were compiled in, off its
     /// RDB$TRIGGER_BLR ([stored_lit_cs])
     lit_cs: SrcCs,
+    /// the set a CAST to a text type names no set for ([PsqlFrame::cast_cs])
+    cast_cs: SrcCs,
 }
 
 /// The `(line, col)` of the FIRST source entry in a `RDB$DEBUG_INFO`
@@ -17590,6 +17592,7 @@ fn db_triggers(db: &Database, event: i64) -> Option<Vec<TrigDef>> {
         }
         out.push(TrigDef {
             lit_cs: trig_lit_cs(db, values, blr_f, &source),
+            cast_cs: Some(db_default_cs(db)),
             name: name.trim_end().to_string(),
             before: false,
             seq: match values.get(seq_f) {
@@ -17748,6 +17751,7 @@ fn ddl_triggers(db: &Database, event: u32, before: bool) -> Option<Vec<TrigDef>>
         }
         out.push(TrigDef {
             lit_cs: trig_lit_cs(db, values, blr_f, &source),
+            cast_cs: Some(db_default_cs(db)),
             name: name.trim_end().to_string(),
             before,
             seq: match values.get(seq_f) {
@@ -18036,6 +18040,7 @@ fn fire_ddl_triggers(
  stop_after: None,
             types: trig_slot_types(&d.source),
             lit_cs: d.lit_cs,
+            cast_cs: d.cast_cs,
                 vars: vec![Value::Null; names.len()],
                 out_at: names.len(),
                 out_len: 0,
@@ -18138,6 +18143,7 @@ fn fire_db_triggers(
  stop_after: None,
             types: trig_slot_types(&d.source),
             lit_cs: d.lit_cs,
+            cast_cs: d.cast_cs,
             vars: vec![Value::Null; names.len()],
             out_at: names.len(),
             out_len: 0,
@@ -18615,6 +18621,7 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
         }
         out.push(TrigDef {
             lit_cs: trig_lit_cs(db, values, blr_f, &source),
+            cast_cs: Some(db_default_cs(db)),
             name: name.trim_end().to_string(),
             before,
             seq: match values.get(seq_f) {
@@ -20578,13 +20585,23 @@ fn text_form_m(
             let carrier = matches!(joined, TfCs::Ttype(t)
                 if fire_crab_ods::intl::byte_carrier(fire_crab_ods::intl::charset_id(t as i16)));
             if carrier {
+                // ...and the attachment's operand is as wide as ITS set's
+                // characters, known here ([CURRENT_ATT_CS]): a UTF8
+                // literal 'é' beside x'4142' contributes 4, for the
+                // engine's VARCHAR(6) OCTETS. Counted as one byte per
+                // char it announced 3, and the four octets the value
+                // holds raised 22001 (expected length 3, actual 4) on
+                // the way out - measured under -ch UTF8, where the
+                // engine answers C3A94142.
                 let bytes = |w: i32, c: TfCs| match c {
                     TfCs::Ttype(t) => {
                         w * fire_crab_ods::intl::bytes_per_char(
                             fire_crab_ods::intl::charset_id(t as i16),
                         ) as i32
                     }
-                    TfCs::Att => w,
+                    TfCs::Att => {
+                        w * fire_crab_ods::intl::bytes_per_char(CURRENT_ATT_CS.with(|c| c.get())) as i32
+                    }
                 };
                 return Some((true, bytes(wa, ca) + bytes(wb, cb), joined));
             }
@@ -21994,6 +22011,11 @@ fn db_default_charset(image: &fire_crab_ods::Image, page_size: usize) -> u8 {
     fire_crab_ods::ddl::database_charset_name(image, page_size)
         .and_then(|n| engine_charset_id(&n))
         .unwrap_or(0)
+}
+
+/// [db_default_charset], memoised on the database's metadata.
+fn db_default_cs(db: &Database) -> u8 {
+    *db.meta_memo("db-default-cs", "", || db_default_charset(&db.bytes(), db.page_size))
 }
 
 /// A COLLATE name to its RDB$COLLATION_ID for a given charset. The default
@@ -23732,15 +23754,29 @@ fn parse_exec_stmt_param_form(
 /// its bound values as SQL literals (see bind_dyn_params). A `:name`
 /// inside a string literal is left alone; a `:name` with no bound value,
 /// or an unused binding, refuses.
-fn bind_dyn_named(sql: &str, binds: &[(String, Value)]) -> Option<String> {
-    let lit = |v: &Value| -> Option<String> {
-        Some(match v {
-            Value::Int(n) => n.to_string(),
-            Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
-            Value::Null => "NULL".to_string(),
-            _ => return None,
-        })
-    };
+/// An EXECUTE STATEMENT argument written into the statement's text: its
+/// value, and the SET it is in when that is not the attachment's and the
+/// text is not all ASCII - spelled typed then ([typed_text_literal]), so
+/// the value keeps its set through the prepare. Measured on engine 2182:
+/// `EXECUTE STATEMENT ('select count(*) from t where u = ?') ('é')` in a
+/// UTF8-created body counts the UTF8 'é' row under a NONE, a WIN1252 and
+/// an ISO8859_1 caller alike, where the plain spelling would be a NONE
+/// or a WIN1252 'é' (and was refused here).
+type DynArg = (Value, Option<u8>);
+
+/// The literal a dynamic argument is spelled as - see [DynArg].
+fn dyn_arg_literal((v, cs): &DynArg) -> Option<String> {
+    Some(match (v, cs) {
+        (Value::Int(n), _) => n.to_string(),
+        (Value::Text(t), Some(cs)) => typed_text_literal(t, *cs, t.chars().count(), false)?,
+        (Value::Text(t), None) => format!("'{}'", t.replace('\'', "''")),
+        (Value::Null, _) => "NULL".to_string(),
+        _ => return None,
+    })
+}
+
+fn bind_dyn_named(sql: &str, binds: &[(String, DynArg)]) -> Option<String> {
+    let lit = dyn_arg_literal;
     let b = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 16);
     let mut used = vec![false; binds.len()];
@@ -23774,15 +23810,8 @@ fn bind_dyn_named(sql: &str, binds: &[(String, Value)]) -> Option<String> {
     Some(out)
 }
 
-fn bind_dyn_params(sql: &str, vals: &[Value]) -> Option<String> {
-    let lit = |v: &Value| -> Option<String> {
-        Some(match v {
-            Value::Int(n) => n.to_string(),
-            Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
-            Value::Null => "NULL".to_string(),
-            _ => return None,
-        })
-    };
+fn bind_dyn_params(sql: &str, vals: &[DynArg]) -> Option<String> {
+    let lit = dyn_arg_literal;
     let b = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 16);
     let mut in_str = false;
@@ -24052,6 +24081,220 @@ fn entry_strip_comments(text: &str) -> String {
         return text.to_string();
     }
     strip_sql_comments(text)
+}
+
+/// A Q-STRING and an INTRODUCED literal, respelled as what every parser
+/// here reads.
+///
+/// `q'{it's}'` is the plain literal `'it''s'`: the character after the
+/// opening quote is the delimiter, closed by its partner for the four
+/// bracket pairs and by itself for anything else, and the text between
+/// is taken as it stands (probed on engine 2182: `q'{it's}'` compares
+/// and describes exactly as `'it''s'` does, under every attachment).
+///
+/// `_utf8 'é'` says THESE OCTETS ARE OF THAT SET: the literal's
+/// characters as `enc`'s set spells them - the attachment's set at the
+/// top level, the compiled set in a stored body - CAST into the named
+/// set from a binary literal, which the planner reads as exactly those
+/// octets in exactly that set. Measured under -ch UTF8:
+/// `OCTET_LENGTH(_utf8 'é' || 'ab')` is 4 and `OCTET_LENGTH('ab' ||
+/// _win1252 'é')` is 6 - the two octets C3 A9 are two WIN1252 characters,
+/// four octets in the UTF8 result the first operand decides; under -ch
+/// NONE they are 4 and 4. `_utf8 x'C3A9'` types a binary literal the
+/// same way. Both spellings were refused here at the top level and in
+/// every body, where the BLR executor had answered them.
+///
+/// Comments, other literals and quoted names pass through, and a
+/// q-string that came out shorter is padded to its spelling's length so
+/// the positions a body's errors report stay put. `None` where nothing
+/// was respelled. An introducer that names a set this server has no
+/// table for, whose octets are not of that set, or whose text's set is
+/// not known (`enc` None) stands as written, for the parsers to refuse.
+fn rewrite_alt_literals(sql: &str, enc: Option<u8>) -> Option<String> {
+    if !sql.contains('_') && !sql.contains("q'") && !sql.contains("Q'") {
+        return None;
+    }
+    let b = sql.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            let end = sql[i..].find('\n').map_or(b.len(), |n| i + n);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            let end = sql[i + 2..].find("*/").map_or(b.len(), |n| i + 2 + n + 2);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        if c == b'"' || c == b'\'' {
+            let end = quoted_span_end(b, i);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        let word_start = i == 0 || !is_ident(b[i - 1]);
+        if word_start && matches!(c, b'q' | b'Q') && b.get(i + 1) == Some(&b'\'') {
+            if let Some((content, end)) = q_string_at(sql, i) {
+                let mut lit = format!("'{}'", content.replace('\'', "''"));
+                while lit.len() < end - i {
+                    lit.push(' ');
+                }
+                out.push_str(&lit);
+                changed = true;
+                i = end;
+                continue;
+            }
+        }
+        if word_start && c == b'_' {
+            if let Some((spelled, end)) = introduced_literal_at(sql, i, enc) {
+                out.push_str(&spelled);
+                changed = true;
+                i = end;
+                continue;
+            }
+        }
+        let n = sql[i..].chars().next().map_or(1, |ch| ch.len_utf8());
+        out.push_str(&sql[i..i + n]);
+        i += n;
+    }
+    changed.then_some(out)
+}
+
+/// The index just past the quoted span opening at `i` (a doubled quote
+/// inside is part of it), or the text's end when it never closes.
+fn quoted_span_end(b: &[u8], i: usize) -> usize {
+    let q = b[i];
+    let mut k = i + 1;
+    while k < b.len() {
+        if b[k] == q {
+            if b.get(k + 1) == Some(&q) {
+                k += 2;
+                continue;
+            }
+            return k + 1;
+        }
+        k += 1;
+    }
+    b.len()
+}
+
+/// The text of the q-string opening at `i` (`b[i]` is the q, `b[i + 1]`
+/// the quote) and the index just past it; None where it never closes
+/// or its delimiter is not a plain ASCII character.
+fn q_string_at(sql: &str, i: usize) -> Option<(String, usize)> {
+    let b = sql.as_bytes();
+    let open = *b.get(i + 2)?;
+    if !open.is_ascii() || open.is_ascii_whitespace() {
+        return None;
+    }
+    let close = match open {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        b'<' => b'>',
+        c => c,
+    };
+    let start = i + 3;
+    let mut k = start;
+    while k + 1 < b.len() {
+        if b[k] == close && b[k + 1] == b'\'' {
+            return Some((sql[start..k].to_string(), k + 2));
+        }
+        k += 1;
+    }
+    None
+}
+
+/// The typed spelling of the introduced literal opening at `i` (`b[i]`
+/// is the underscore) and the index just past it - see
+/// [rewrite_alt_literals]. The quoted text's characters are the octets
+/// `enc`'s set gives them; a binary literal's are its own.
+fn introduced_literal_at(sql: &str, i: usize, enc: Option<u8>) -> Option<(String, usize)> {
+    let b = sql.as_bytes();
+    let mut j = i + 1;
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+        j += 1;
+    }
+    let cs = charset_name_id(&sql[i + 1..j])?;
+    let mut k = j;
+    while k < b.len() && b[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    let (octets, end) = match b.get(k)? {
+        b'\'' => {
+            let end = quoted_span_end(b, k);
+            if end == k + 1 || b[end - 1] != b'\'' {
+                return None; // never closed
+            }
+            let text = sql[k + 1..end - 1].replace("''", "'");
+            (blob_bytes_in(&text, enc?).ok()?, end)
+        }
+        b'x' | b'X' if b.get(k + 1) == Some(&b'\'') => {
+            let chars: Vec<char> = sql[k..].chars().collect();
+            let mut p = 0usize;
+            let bytes = take_hex_literal(&chars, &mut p)?;
+            (bytes, k + chars[..p].iter().map(|ch| ch.len_utf8()).sum::<usize>())
+        }
+        _ => return None,
+    };
+    Some((typed_octets_literal(&octets, cs)?, end))
+}
+
+/// `octets`, a value of set `cs`, as the typed text expression the
+/// planner reads back as exactly that value in exactly that set - the
+/// spelling [typed_text_literal] gives a value it holds as text, for
+/// one held as its bytes. The width is the value's own character
+/// count, which is what the engine describes an introduced literal
+/// with (a CHAR, like any literal). None for octets that are not of
+/// the set, or a set with no name or table here.
+fn typed_octets_literal(octets: &[u8], cs: u8) -> Option<String> {
+    use fire_crab_ods::intl;
+    let name = charset_id_name(cs)?;
+    let chars = if octets.is_empty() {
+        0
+    } else if cs == intl::CS_UTF8 {
+        std::str::from_utf8(octets).ok()?.chars().count()
+    } else if intl::tabled(cs) {
+        intl::decode_text(cs, octets)?.chars().count()
+    } else if intl::bytes_per_char(cs) == 1 {
+        octets.len()
+    } else {
+        return None;
+    };
+    SLOT_TYPED.with(|c| c.set(true));
+    Some(if octets.is_empty() {
+        format!("CAST('' AS VARCHAR(1) CHARACTER SET {})", name)
+    } else {
+        let hex: String = octets.iter().map(|b| format!("{:02X}", b)).collect();
+        format!("CAST(x'{}' AS CHAR({}) CHARACTER SET {})", hex, chars, name)
+    })
+}
+
+/// [rewrite_alt_literals] for a statement at the ENTRY, in the
+/// attachment's set. A DDL statement keeps its text: its source is
+/// stored as the client spelled it ([raw_source] maps the two by
+/// length), and the compiler reads the whole statement.
+fn rewrite_entry_literals(text: String, att: u8) -> String {
+    let head = text
+        .trim_start()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    if matches!(
+        head.as_str(),
+        "CREATE" | "ALTER" | "RECREATE" | "DROP" | "COMMENT" | "GRANT" | "REVOKE" | "DECLARE"
+    ) {
+        return text;
+    }
+    rewrite_alt_literals(&text, Some(att)).unwrap_or(text)
 }
 
 fn parse_trig_stmt(
@@ -44975,6 +45218,40 @@ fn cast_int_literal_arg(t: &str) -> Option<i64> {
     fits.then_some(n)
 }
 
+/// `CAST(x'<hex>' AS CHAR(n) | VARCHAR(n) CHARACTER SET <set>)` - the
+/// typed spelling of a body literal or variable ([typed_text_literal])
+/// - as a call argument, when its text is ASCII: then the value is the
+/// same in every set and the argument reads as the plain literal would
+/// (measured: `SELECT R FROM PCALL('ab')` inside a UTF8-created body
+/// answers under a NONE caller, where the literal arrives typed). A
+/// non-ASCII one is a value of its own set, which this list of plain
+/// values cannot carry, and refuses as before.
+fn cast_ascii_text_arg(t: &str) -> Option<String> {
+    let up = t.to_ascii_uppercase();
+    let inner = up.strip_prefix("CAST")?.trim_start().strip_prefix('(')?.strip_suffix(')')?.trim();
+    let as_at = find_word(inner, "AS", 0)?;
+    let target = inner[as_at + "AS".len()..].trim();
+    let kind_ok = target.starts_with("CHAR(") || target.starts_with("VARCHAR(");
+    if !kind_ok || find_word(target, "CHARACTER", 0).is_none() || find_word(target, "SET", 0).is_none() {
+        return None;
+    }
+    let src = inner[..as_at].trim();
+    if src == "''" {
+        return Some(String::new());
+    }
+    let hex = src.strip_prefix("X'")?.strip_suffix('\'')?;
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> =
+        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect();
+    let bytes = bytes?;
+    if !bytes.is_ascii() {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 fn parse_call_args(text: &str, allow_placeholder: bool) -> Option<Vec<Option<Value>>> {
     let text = text.trim();
     if text.is_empty() {
@@ -45030,6 +45307,8 @@ fn parse_call_args(text: &str, allow_placeholder: bool) -> Option<Vec<Option<Val
                 Some(Some(Value::Int(n)))
             } else if let Some(n) = cast_int_literal_arg(t) {
                 Some(Some(Value::Int(n)))
+            } else if let Some(txt) = cast_ascii_text_arg(t) {
+                Some(Some(Value::Text(txt)))
             } else if let Some(TextNum::Dec { mantissa, exp }) =
                 (!t.starts_with('\'')).then(|| text_number(t)).flatten()
             {
@@ -52553,7 +52832,7 @@ fn plan_query_inner_at(
     }
     // EXECUTE BLOCK is a body with no DDL around it - prepared like any
     // statement, run at execute because it may write.
-    if let Some(p) = parse_execute_block_select(sql) {
+    if let Some(p) = parse_execute_block_select(sql, db) {
         return Some(p);
     }
     if let Some((source, body_at)) = parse_execute_block(sql) {
@@ -70033,7 +70312,13 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
             // `V || '%'`. It stops at the first character it cannot consume,
             // which is how a trailing ESCAPE still parses below.
             let mut pat_expr: Option<RawExpr> = None;
-            let pattern: String = if b.get(after) == Some(&'\'') {
+            // ...and a literal that a `||` follows is an expression too
+            // ([parse_pattern_alone])
+            let lit_alone = {
+                let mut probe = after;
+                read_quoted_alone(b, &mut probe).is_some()
+            };
+            let pattern: String = if b.get(after) == Some(&'\'') && lit_alone {
                 after += 1;
                 let start = after;
                 while after < b.len() && b[after] != '\'' {
@@ -70087,7 +70372,7 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
             // [read_quoted] answers None for anything that is not a quoted
             // literal, which is exactly the rewind signal.
             let save = after;
-            return Some(match read_quoted(b, &mut after) {
+            return Some(match read_quoted_alone(b, &mut after) {
                 Some(prefix) => {
                     *pos = after;
                     RawCond::Starting(Box::new(left), prefix, negated)
@@ -70103,7 +70388,7 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
         let mut after = p2;
         if take_keyword(b, &mut after, "CONTAINING") {
             let save = after;
-            return Some(match read_quoted(b, &mut after) {
+            return Some(match read_quoted_alone(b, &mut after) {
                 Some(pattern) => {
                     *pos = after;
                     RawCond::Containing(Box::new(left), pattern, negated)
@@ -70123,7 +70408,7 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
             }
             // literal first, else an expression - see the LIKE arm above
             let save = after;
-            let literal = read_quoted(b, &mut after);
+            let literal = read_quoted_alone(b, &mut after);
             let pat_expr = if literal.is_none() {
                 after = save;
                 Some(expr_add(b, &mut after)?)
@@ -72852,14 +73137,26 @@ fn recode_concat(e: Expr, descs: &[Descriptor]) -> Expr {
     // unwrapped, its characters were glued to octets as they stood:
     // `OCTET_LENGTH(<UTF8 'é'> || <OCTETS 'ab'>)` answered 3 where the
     // engine (UTF8 attachment) answers 4 - C3 A9 61 62. Under a NONE
-    // attachment the literal is NONE, which yields its tag and keeps
-    // its bytes, as it always did here.
+    // attachment a literal is its octets read as the other side's set
+    // already ([concat_operands] wrapped it), and stays as it is; but
+    // EVERY OTHER value of the attachment's set - a bare CAST, which is
+    // NONE there - is a carrier and MOVES BY ITS BYTES into the real
+    // set beside it. Left unwrapped, its carrier chars (one per octet)
+    // were re-encoded as UTF-8 on the way out: `CAST(U AS VARCHAR(5))
+    // || CAST(x'78' AS CHAR(1) CHARACTER SET UTF8)` over a UTF8 'é'
+    // shipped C383C2A978 for the engine's C3A978 under -ch NONE, and
+    // the same shape over a WIN1252 'é' (E9) answered where the engine
+    // raises 22000 *Malformed string* - E9 is no UTF8. Both measured on
+    // engine 2182; the byte-copy law is [transcode_text]'s carrier-
+    // source arm, which validates the octets in the destination.
     let att = CURRENT_ATT_CS.with(|c| c.get());
     let wrap = |x: Box<Expr>, c: TfCs, w: i32| -> Box<Expr> {
         let src = match c {
             TfCs::Ttype(t) => charset_id(t as i16),
-            TfCs::Att if att != 0 => att,
-            TfCs::Att => return x,
+            TfCs::Att if byte_carrier(att) && matches!(*x, Expr::Str(_) | Expr::CarrierDec(..)) => {
+                return x;
+            }
+            TfCs::Att => att,
         };
         if src == dst {
             return x;
@@ -76389,8 +76686,15 @@ fn resolve_expr_inner(
             let cs = match text_form(&e, descs) {
                 Some((_, _, TfCs::Ttype(t))) => Some(fire_crab_ods::intl::charset_id(t as i16)),
                 // an ATTACHMENT-charset expression (an untyped literal)
-                // has no ttype of its own to collate against - refuse
-                Some((_, _, TfCs::Att)) => return None,
+                // is of the attachment's set, known here
+                // ([CURRENT_ATT_CS]): `U = 'ab' COLLATE UNICODE_CI` over
+                // a UTF8 U counts 1 under -ch UTF8 (measured, engine
+                // 2182), where this refused every literal. Under a NONE
+                // or a WIN1252 attachment the engine's answer is -204
+                // *COLLATION "SYSTEM"."UNICODE_CI" for CHARACTER SET
+                // "SYSTEM"."NONE" is not defined* (measured, both), which
+                // the resolver raises for a set the collation is not of.
+                Some((_, _, TfCs::Att)) => Some(CURRENT_ATT_CS.with(|c| c.get())),
                 None => None, // not text: the engine's own -204
             };
             let tt = explicit_coll_ttype_cs(cs, name)?;
@@ -86835,19 +87139,33 @@ fn subq_text_literal(v: &Value, sub: &str, db: &Option<Database>) -> Option<Stri
         Plan::Scalar(_, _, _, ty) => ty,
         p => ScalarTy::from_col(output_cols_of(&p).first()?),
     };
-    // a real ttype only: an expression carries its charset as a negative
-    // sentinel, and that resolves against the attachment by design
-    if !(0..=i16::MAX as i32).contains(&ty.sub_type) {
+    // a column's ttype, or an EXPRESSION of a real set ([enc_real_cs]) -
+    // whose VALUE is in that set whatever the describe resolves it to.
+    // Folded plain, `'a' || (SELECT CAST(x'C3A9' AS CHAR(1) CHARACTER
+    // SET UTF8) ...)` under a NONE attachment read the 'é' back as a
+    // NONE literal, one octet E9, and moved it into UTF8: *Malformed
+    // string* where the engine counts 3 (measured; a body's `'a' ||
+    // (SELECT 'é' FROM RDB$DATABASE)` under a NONE caller is that
+    // shape). The ATTACHMENT sentinel alone stays plain: the plain
+    // literal IS the attachment's set.
+    let cs = if (0..=i16::MAX as i32).contains(&ty.sub_type) {
+        fire_crab_ods::intl::charset_id(ty.sub_type as i16)
+    } else if ty.sub_type <= -2 {
+        (-2 - ty.sub_type) as u8
+    } else {
         return None;
-    }
-    let cs = fire_crab_ods::intl::charset_id(ty.sub_type as i16);
+    };
     let name = charset_id_name(cs)?;
     let bytes = blob_bytes_in(t, cs).ok()?;
     // the declared width is the COLUMN's, in its own characters - what
     // the engine announces for the combination too (a WIN1252 VARCHAR(10)
     // concatenated with one character describes len 11, not the width of
     // this particular value)
-    let width = if ty.length > 0 { ty.length } else { 1 };
+    // ...capped at the widest VARCHAR the set admits, which is where an
+    // expression of unknown width is carried ([resolve_text_cs])
+    let bpc = fire_crab_ods::intl::bytes_per_char(cs).max(1) as i32;
+    let width = if ty.length > 0 { ty.length.min(32765 / bpc) } else { 1 };
+    let width = width.max(t.chars().count() as i32);
     let mut hex = String::with_capacity(bytes.len() * 2);
     for b in &bytes {
         hex.push_str(&format!("{:02X}", b));
@@ -93904,6 +94222,24 @@ fn parse_pattern(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
     parse_value(t, pos, np)
 }
 
+/// [parse_pattern], declining (the cursor left where it was) when a
+/// `||` follows the literal: `U LIKE 'ab' || '%'` is the EXPRESSION
+/// pattern `'ab' || '%'`, which the engine answers like any other
+/// (measured: it takes the rows starting with 'ab'), and a literal read
+/// alone here left the `||` unparsed and refused the whole statement.
+/// A PSQL body's `LIKE :A || '%'` arrives exactly so, its variable
+/// written in as a literal.
+fn parse_pattern_alone(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
+    let save = (*pos, *np);
+    let lit = parse_pattern(t, pos, np)?;
+    if matches!(t.get(*pos), Some(Tok::Concat)) {
+        *pos = save.0;
+        *np = save.1;
+        return None;
+    }
+    Some(lit)
+}
+
 fn parse_value(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
     let v = match t.get(*pos)? {
         Tok::Int(n) => Rhs::Int(*n),
@@ -94869,7 +95205,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             // an expression cannot alter an existing parse - the fallback
             // can only ADD shapes that used to refuse the whole statement.
             let save = (*pos, *np);
-            let literal = parse_pattern(t, pos, np);
+            let literal = parse_pattern_alone(t, pos, np);
             if literal.is_none() {
                 *pos = save.0;
                 *np = save.1;
@@ -94996,7 +95332,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             // families take, with BOTH `*pos` and `*np` rewound before the
             // fallback so parameter numbering does not leak
             let save = (*pos, *np);
-            let literal = parse_pattern(t, pos, np);
+            let literal = parse_pattern_alone(t, pos, np);
             if literal.is_none() {
                 *pos = save.0;
                 *np = save.1;
@@ -95035,7 +95371,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             // restored before the fallback: rewinding only the position
             // leaks parameter numbering into the expression parse.
             let save = (*pos, *np);
-            let literal = parse_pattern(t, pos, np);
+            let literal = parse_pattern_alone(t, pos, np);
             if literal.is_none() {
                 *pos = save.0;
                 *np = save.1;
@@ -95056,7 +95392,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                 *pos += 1; // WITH is optional sugar (the PSQL parser agrees)
             }
             let save = (*pos, *np);
-            let prefix = parse_pattern(t, pos, np);
+            let prefix = parse_pattern_alone(t, pos, np);
             if prefix.is_none() {
                 *pos = save.0;
                 *np = save.1;
@@ -96081,6 +96417,18 @@ struct PsqlFrame {
     /// octet it could not transliterate ([source_literals_lost]) - so a
     /// non-ASCII literal there is a value this server does not know.
     lit_cs: SrcCs,
+    /// THE SET A `CAST(... AS CHAR(n))` / `VARCHAR(n)` THAT NAMES NO SET
+    /// TAKES in this body. In a STORED body it is the DATABASE's default
+    /// set, not the caller's: measured on engine 2182 with a WIN1252 `Y
+    /// = 'é'` in a UTF8-created procedure, `OCTET_LENGTH(CAST('ab' AS
+    /// VARCHAR(5)) || Y)` is 3 under UTF8, WIN1252 and NONE callers in a
+    /// database with no default set (NONE, which yields to Y's set), 4
+    /// in one whose default is UTF8, 3 in one whose default is WIN1252;
+    /// and `CAST(Y AS VARCHAR(5)) || 'é'` there raises 22000 *Malformed
+    /// string* (Y's octet E9 read as NONE, then as UTF8). An EXECUTE
+    /// BLOCK's is the attachment's, as at the top level (measured: 4
+    /// under UTF8 in all three databases) - `None` here.
+    cast_cs: SrcCs,
     /// where the output parameters start in `vars` (inputs come first)
     out_at: usize,
     /// how many output parameters there are
@@ -99165,22 +99513,151 @@ fn typed_text_literal(t: &str, cs: u8, len: usize, pad: bool) -> Option<String> 
     })
 }
 
+/// Is the literal that comes next in `out` one the planner reads as a
+/// LITERAL and nothing else? A LIKE / CONTAINING / STARTING [WITH] /
+/// SIMILAR TO pattern and an ESCAPE character are matched, not typed
+/// (ASCII ones spell the same in every set), and the text of a `DATE
+/// '...'`, `TIME '...'` or `TIMESTAMP '...'` literal is grammar. A typed
+/// spelling there would be an expression where the planner wants the
+/// quotes.
+fn plain_literal_position(out: &str) -> bool {
+    let word: String = out
+        .trim_end()
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "LIKE" | "CONTAINING" | "STARTING" | "WITH" | "TO" | "ESCAPE" | "DATE" | "TIME" | "TIMESTAMP"
+    )
+}
+
+/// `sql` with ` CHARACTER SET <name>` written after every `AS CHAR(n)`,
+/// `AS VARCHAR(n)` or `AS CHARACTER [VARYING](n)` that names no set
+/// itself (outside string literals) - the target of a CAST, the one
+/// place `AS` precedes a text type. A target followed by CHARACTER SET
+/// or COLLATE is left as written.
+fn retype_bare_casts(sql: &str, name: &str) -> String {
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut i = 0usize;
+    let word_at = |i: usize| -> Option<usize> {
+        let mut j = i;
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            j += 1;
+        }
+        (j > i).then_some(j)
+    };
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' || c == b'"' {
+            // a string or a quoted identifier, copied whole
+            let mut j = i + 1;
+            while j < b.len() && b[j] != c {
+                j += 1;
+            }
+            let end = (j + 1).min(b.len());
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        let starts_word = (c.is_ascii_alphabetic() || c == b'_')
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$'));
+        if starts_word && sql[i..].len() >= 2 && sql[i..i + 2].eq_ignore_ascii_case("AS") && word_at(i) == Some(i + 2) {
+            // AS <ws> CHAR|VARCHAR|CHARACTER [VARYING] <ws> ( digits ) ...
+            let mut j = i + 2;
+            let ws = |j: &mut usize| {
+                while *j < b.len() && b[*j].is_ascii_whitespace() {
+                    *j += 1;
+                }
+            };
+            ws(&mut j);
+            let mut ok = false;
+            if let Some(e) = word_at(j) {
+                let w = sql[j..e].to_ascii_uppercase();
+                if w == "CHAR" || w == "VARCHAR" || w == "CHARACTER" {
+                    j = e;
+                    if w == "CHARACTER" {
+                        let mut k = j;
+                        ws(&mut k);
+                        if let Some(e2) = word_at(k) {
+                            if sql[k..e2].eq_ignore_ascii_case("VARYING") {
+                                j = e2;
+                            }
+                        }
+                    }
+                    ws(&mut j);
+                    if b.get(j) == Some(&b'(') {
+                        let mut k = j + 1;
+                        ws(&mut k);
+                        let d0 = k;
+                        while k < b.len() && b[k].is_ascii_digit() {
+                            k += 1;
+                        }
+                        ws(&mut k);
+                        if k > d0 && b.get(k) == Some(&b')') {
+                            j = k + 1;
+                            // what follows: a set or collation of its own?
+                            let mut k = j;
+                            ws(&mut k);
+                            let next = word_at(k).map(|e| sql[k..e].to_ascii_uppercase());
+                            ok = !matches!(next.as_deref(), Some("CHARACTER") | Some("COLLATE"));
+                        }
+                    }
+                }
+            }
+            if ok {
+                out.push_str(&sql[i..j]);
+                out.push_str(" CHARACTER SET ");
+                out.push_str(name);
+                i = j;
+                continue;
+            }
+        }
+        i = push_char_at(&mut out, sql, i);
+    }
+    out
+}
+
 /// One spelling of [subst_body_query]'s text.
 fn subst_body_query_pass(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> Option<String> {
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    // a stored body's CAST to a text type that names no set is of the
+    // database default's ([PsqlFrame::cast_cs]); the text is read in
+    // the attachment's, so the set is written in where the two differ
+    let retyped;
+    let sql = match f.cast_cs {
+        Some(cs) if cs != att => {
+            retyped = retype_bare_casts(sql, charset_id_name(cs)?);
+            retyped.as_str()
+        }
+        _ => sql,
+    };
     let b = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 16);
     let mut in_str = false;
     let mut i = 0usize;
-    let att = CURRENT_ATT_CS.with(|c| c.get());
     while i < b.len() {
         let c = b[i];
         // A STORED BODY'S LITERAL IS OF THE SET IT WAS COMPILED IN
         // ([PsqlFrame::lit_cs], read off its BLR), and this text is read
-        // in the CALLER's attachment set. Where the two differ a
-        // non-ASCII literal is written typed, `CAST(x'<octets>' AS
-        // CHAR(n) CHARACTER SET <its set>)`, the form of a literal of
-        // that set. Measured: `FOR SELECT W || 'é' FROM TU` created by a
-        // UTF8 isql answers 'éé' and 'übé' under a NONE attachment too.
+        // in the CALLER's attachment set. Where the two differ a literal
+        // is written typed, `CAST(x'<octets>' AS CHAR(n) CHARACTER SET
+        // <its set>)`, the form of a literal of that set. Measured: `FOR
+        // SELECT W || 'é' FROM TU` created by a UTF8 isql answers 'éé'
+        // and 'übé' under a NONE attachment too. An ASCII literal is
+        // typed as well: it spells the same everywhere, but its set
+        // decides the set of what it starts - `FOR SELECT
+        // OCTET_LENGTH('ab' || N)` over a WIN1252 N holding 'é', in a
+        // UTF8-created body, is 4 under a NONE caller (measured), where
+        // the plain 'ab' was NONE there, yielded to N, and answered 3.
+        // Only where the planner reads a literal and nothing else - a
+        // pattern, the text of a DATE/TIME/TIMESTAMP literal - it stays
+        // plain ([plain_literal_position]).
         if !in_str && c == b'\'' {
             let mut j = i + 1;
             let mut tok = String::new();
@@ -99197,17 +99674,24 @@ fn subst_body_query_pass(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> O
                 }
                 j = push_char_at(&mut tok, sql, j);
             }
-            if closed && !tok.is_ascii() {
+            if closed {
+                let ascii = tok.is_ascii();
                 match f.lit_cs {
                     Some(cs) if cs == att => {}
                     // an introducer or a prefix in front names its own
                     // set, which this spelling would lose
-                    Some(_) if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') => return None,
+                    Some(_) if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') => {
+                        if !ascii {
+                            return None;
+                        }
+                    }
+                    Some(_) if ascii && plain_literal_position(&out) => {}
                     Some(cs) => {
-                        out.push_str(&typed_text_literal(&tok, cs, tok.chars().count(), true)?);
+                        out.push_str(&typed_text_literal(&tok, cs, tok.chars().count(), !tok.is_empty())?);
                         i = j + 1;
                         continue;
                     }
+                    None if ascii => {}
                     None => return None,
                 }
             }
@@ -99417,12 +99901,15 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
         }
         // re-quoted the way the lexer unquoted it - in its own set where
         // that is not the attachment's, as [subst_body_query_pass] does
-        E::TextLiteral(t) if !t.is_ascii() => match f.lit_cs {
-            Some(cs) if cs == CURRENT_ATT_CS.with(|c| c.get()) => format!("'{}'", t.replace('\'', "''")),
-            Some(cs) => typed_text_literal(t, cs, t.chars().count(), true)?,
+        // (ASCII included: the set of a concatenation it starts is its)
+        E::TextLiteral(t) => match f.lit_cs {
+            Some(cs) if cs != CURRENT_ATT_CS.with(|c| c.get()) => {
+                typed_text_literal(t, cs, t.chars().count(), !t.is_empty())?
+            }
+            Some(_) => format!("'{}'", t.replace('\'', "''")),
+            None if t.is_ascii() => format!("'{}'", t.replace('\'', "''")),
             None => return None,
         },
-        E::TextLiteral(t) => format!("'{}'", t.replace('\'', "''")),
         E::Int64Literal(v) => v.to_string(),
         E::NullLiteral => "NULL".to_string(),
         E::Variable(n) => psql_slot_literal(f, *n as usize, psql_literal)?,
@@ -99704,7 +100191,7 @@ fn exec_psql_stmt_inner(
                 // by the planner (COALESCE/CASE/NULLIF/CAST/scalar
                 // subquery, incl. over a system table or after a DML) -
                 // then assigned to the target exactly like the parsed form
-                Some((text, binds)) => eval_raw_scalar(text, binds, f, db)?,
+                Some((text, binds)) => eval_raw_scalar(text, binds, f, db, ctx)?,
                 None => {
                     let v = match expr {
                 fire_crab_ods::expr::Expr::GenId { name, step }
@@ -99755,7 +100242,7 @@ fn exec_psql_stmt_inner(
         }
         TrigStmt::If { cond, then, otherwise, raw, .. } => {
             let yes = match raw {
-                Some((text, binds)) => eval_raw_cond(text, binds, f, db)?,
+                Some((text, binds)) => eval_raw_cond(text, binds, f, db, ctx)?,
                 None => eval_psql_cond(cond, f)? == Some(true),
             };
             if yes {
@@ -99768,7 +100255,7 @@ fn exec_psql_stmt_inner(
         }
         TrigStmt::While { cond, body, label, raw, .. } => {
             while match raw {
-                Some((text, binds)) => eval_raw_cond(text, binds, f, db)?,
+                Some((text, binds)) => eval_raw_cond(text, binds, f, db, ctx)?,
                 None => eval_psql_cond(cond, f)? == Some(true),
             } {
                 // LEAVE ends THIS loop and nothing further: the
@@ -99874,13 +100361,8 @@ fn exec_psql_stmt_inner(
             })
             .ok_or(PsqlStop::Unsupported)?;
             let (rows, cs) = {
-                let mut sink: Vec<Option<Descriptor>> = Vec::new();
-                let plan = plan_query_inner(&q, &*db, &mut sink)
-                    .ok_or(PsqlStop::Unsupported)?;
-                if !sink.is_empty() {
-                    return Err(PsqlStop::Unsupported); // a `?` in a loop query
-                }
-                (psql_plan_rows_then(&plan, db, ctx, *src_off)?, plan_out_cs(&plan))
+                let (plan, calls) = psql_plan(&q, db)?;
+                (psql_plan_rows_then(&plan, &calls, db, ctx, *src_off)?, plan_out_cs(&plan))
             };
             let (rows, then) = rows;
             // ROW_COUNT COUNTS THE LOOP'S FETCHES, measured: 0 once the
@@ -99967,14 +100449,8 @@ fn exec_psql_stmt_inner(
             let query = state.query.clone();
             let query = subst_body_query(&query, &[], f).ok_or(PsqlStop::Unsupported)?;
             let (rows, cs) = {
-                let mut sink: Vec<Option<Descriptor>> = Vec::new();
-                let plan = plan_query_inner(&query, &*db, &mut sink)
-                    .ok_or(PsqlStop::Unsupported)?;
-                if !sink.is_empty() {
-                    return Err(PsqlStop::Unsupported); // a `?` in a cursor query
-                }
-                let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
-                (branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?, plan_out_cs(&plan))
+                let (plan, calls) = psql_plan(&query, db)?;
+                (psql_rows(&plan, &calls, db, ctx)?, plan_out_cs(&plan))
             };
             let state = f.cursors.get_mut(cursor).ok_or(PsqlStop::Unsupported)?;
             state.rows = Some(rows);
@@ -100287,12 +100763,7 @@ fn exec_psql_stmt_inner(
         // -313 the engine raises at prepare).
         TrigStmt::SelectInto { sql, into, binds, src_off, .. } => {
             let sql = subst_body_query(sql, binds, f).ok_or(PsqlStop::Unsupported)?;
-            let mut sink: Vec<Option<Descriptor>> = Vec::new();
-            let plan =
-                plan_query_inner(&sql, &*db, &mut sink).ok_or(PsqlStop::Unsupported)?;
-            if !sink.is_empty() {
-                return Err(PsqlStop::Unsupported); // a `?` this surface cannot bind
-            }
+            let (plan, calls) = psql_plan(&sql, db)?;
             // A PLAN THAT PROJECTS NOTHING IS A MISREAD, not a count: no
             // SELECT has zero columns, and `SELECT R FROM PY((-2) - 1)`
             // (a variable spliced into an argument EXPRESSION) was planned
@@ -100305,7 +100776,7 @@ fn exec_psql_stmt_inner(
             if projected != into.len() {
                 return Err(psql_raise(EvalErr::DsqlCountMismatch));
             }
-            let rows = psql_plan_rows(&plan, db, ctx, *src_off)?;
+            let rows = psql_plan_rows(&plan, &calls, db, ctx, *src_off)?;
             let cs = plan_out_cs(&plan);
             if rows.len() > 1 {
                 // taking the first row would be a wrong answer
@@ -100528,11 +100999,12 @@ fn run_autonomous(
 /// projected by `picks`; every other shape is [branch_rows].
 fn psql_plan_rows(
     plan: &Plan,
+    calls: &[FnCall],
     db: &mut Option<Database>,
     ctx: &SessionCtx,
     src_off: usize,
 ) -> Result<Vec<Vec<Value>>, PsqlStop> {
-    match psql_plan_rows_then(plan, db, ctx, src_off)? {
+    match psql_plan_rows_then(plan, calls, db, ctx, src_off)? {
         (rows, None) => Ok(rows),
         (_, Some(raise)) => Err(raise),
     }
@@ -100550,6 +101022,7 @@ fn psql_plan_rows(
 /// all, answering ' caught', 100 and the error alone.
 fn psql_plan_rows_then(
     plan: &Plan,
+    calls: &[FnCall],
     db: &mut Option<Database>,
     ctx: &SessionCtx,
     src_off: usize,
@@ -100583,8 +101056,7 @@ fn psql_plan_rows_then(
             Err(_) => Err(PsqlStop::Unsupported),
         };
     }
-    let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
-    branch_rows(plan, dbr, &[]).ok_or(PsqlStop::Unsupported).map(|rows| (rows, None))
+    psql_rows(plan, calls, db, ctx).map(|rows| (rows, None))
 }
 
 fn psql_raise(err: EvalErr) -> PsqlStop {
@@ -100846,31 +101318,78 @@ fn source_literals_lost(source: &str, blr: Option<&[u8]>) -> bool {
     false
 }
 
-/// THE SET A STORED BODY'S NON-ASCII LITERALS WERE COMPILED IN, read off
-/// its BLR, or `None` where that cannot be told.
+/// THE SET A STORED BODY'S LITERALS WERE COMPILED IN, read off its BLR,
+/// or `None` where that cannot be told.
 ///
-/// The engine compiles a literal in the attachment's set at CREATE time
-/// and writes that set into the BLR (`blr_literal blr_text2 <ttype>
-/// <len> <octets>`); the source text keeps only the characters. Measured
-/// on engine 2182: a body created by a UTF8 isql with `R = 'é'`, `DECLARE
-/// V ... = 'éa'`, `FOR SELECT W || 'é'` or `RETURN X || 'é'` has ttype 4
-/// and C3 A9 in its BLR, and answers the same under a NONE or a UTF8
-/// attachment - the caller's set plays no part. So every non-ASCII
-/// quoted token in the source must be found among the BLR's text
-/// literals, decoded in THEIR set, and every non-ASCII BLR literal must
-/// be of ONE set (an introducer can type one differently). Only a real
-/// set qualifies: a NONE-compiled body's source lost its octets already
-/// ([source_literals_lost]), and a set this server has no table for
-/// cannot be decoded.
+/// The engine compiles EVERY text literal in the attachment's set at
+/// CREATE time - ASCII ones included - and writes that set into the BLR
+/// (`blr_literal blr_text2 <ttype> <len> <octets>`); the source text
+/// keeps only the characters. Measured on engine 2182: a body created by
+/// a UTF8 isql with `R = 'é'`, `DECLARE V ... = 'éa'`, `FOR SELECT W ||
+/// 'é'` or `RETURN X || 'é'` has ttype 4 and C3 A9 in its BLR, and
+/// answers the same under a NONE or a UTF8 attachment - the caller's set
+/// plays no part. The ASCII literal's set counts too, since it decides
+/// the set of a concatenation it starts: `OCTET_LENGTH('ab' || Y)` over
+/// a WIN1252 `Y = 'é'` in a UTF8-created body is 4 under a NONE caller
+/// (UTF8 wins, 'é' is two octets there), where a NONE literal would
+/// yield to Y's set and answer 3.
+///
+/// So the set is the ONE set every BLR text literal that spells a
+/// quoted token of the source is typed in, and two sets say nothing.
+/// An INTRODUCED token (`_win1252 'é'`) is of its introducer's set, not
+/// the body's: it is no token to find, and a BLR literal of that set
+/// which spells nothing is taken to be it (a UTF8-created `'ab' ||
+/// _win1252 'é'` compiles a UTF8 'ab' and a WIN1252 'Ã©', and answers
+/// 6 under every caller - measured). A q-string is the literal it
+/// spells. Every other non-ASCII source token must be found among the
+/// literals, decoded in THEIR set, and only a real set qualifies for
+/// non-ASCII text: a NONE-compiled body's source lost its octets
+/// already ([source_literals_lost]), and a set this server has no
+/// table for cannot be decoded. A body whose literals are all ASCII
+/// may be of the NONE set (`Some(0)`), which is then written typed
+/// under a real caller, where the plain spelling would have taken the
+/// caller's set.
 fn stored_lit_cs(source: &str, blr: Option<&[u8]>) -> SrcCs {
     use fire_crab_ods::intl;
     let blr = blr?;
-    // the source's non-ASCII string tokens, their doubled quotes undone
+    // the source's string tokens, their doubled quotes undone
     let b = source.as_bytes();
+    let ident_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
     let mut toks: Vec<String> = Vec::new();
+    // an introducer read, and the sets the source's introducers name
+    let mut intro: Option<()> = None;
+    let mut intro_sets: Vec<u8> = Vec::new();
     let mut i = 0usize;
     while i < b.len() {
         match b[i] {
+            b'q' | b'Q' if b.get(i + 1) == Some(&b'\'') && (i == 0 || !ident_byte(b[i - 1])) => {
+                match q_string_at(source, i) {
+                    Some((content, end)) => {
+                        if intro.take().is_none() {
+                            toks.push(content);
+                        }
+                        i = end;
+                    }
+                    None => i += 1,
+                }
+            }
+            b'_' if i == 0 || !ident_byte(b[i - 1]) => {
+                let mut j = i + 1;
+                while j < b.len() && ident_byte(b[j]) {
+                    j += 1;
+                }
+                let mut k = j;
+                while k < b.len() && b[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if j > i + 1 && matches!(b.get(k), Some(b'\'') | Some(b'x') | Some(b'X')) {
+                    intro = Some(());
+                    if let Some(cs) = charset_name_id(&source[i + 1..j]) {
+                        intro_sets.push(cs);
+                    }
+                }
+                i = j;
+            }
             b'-' if b.get(i + 1) == Some(&b'-') => {
                 while i < b.len() && b[i] != b'\n' {
                     i += 1;
@@ -100898,7 +101417,7 @@ fn stored_lit_cs(source: &str, blr: Option<&[u8]>) -> SrcCs {
                     i = push_char_at(&mut tok, source, i);
                 }
                 i += 1;
-                if q == b'\'' && !tok.is_ascii() {
+                if q == b'\'' && intro.take().is_none() {
                     toks.push(tok);
                 }
             }
@@ -100908,36 +101427,78 @@ fn stored_lit_cs(source: &str, blr: Option<&[u8]>) -> SrcCs {
     if toks.is_empty() {
         return None;
     }
-    // the BLR's non-ASCII text literals, decoded in their own sets
+    // the BLR's text literals, decoded in their own sets: `blr_text2`
+    // carries a ttype, `blr_text` none (NONE). The scan is by byte
+    // pattern, so a literal that spells no source token is a false
+    // match (or one the compiler made) and says nothing.
     let mut lits: Vec<(u8, Option<String>)> = Vec::new();
     let mut k = 0usize;
-    while k + 7 <= blr.len() {
-        if blr[k] == 21 && blr[k + 1] == 15 {
-            let tt = i16::from_le_bytes([blr[k + 2], blr[k + 3]]);
-            let n = u16::from_le_bytes([blr[k + 4], blr[k + 5]]) as usize;
-            if let Some(bytes) = blr.get(k + 6..k + 6 + n) {
-                if !bytes.is_ascii() {
-                    let cs = intl::charset_id(tt);
-                    let text = if cs == intl::CS_UTF8 {
-                        String::from_utf8(bytes.to_vec()).ok()
-                    } else if intl::tabled(cs) {
-                        intl::decode_text(cs, bytes)
-                    } else {
-                        None
-                    };
-                    lits.push((cs, text));
+    while k + 5 <= blr.len() {
+        let text2 = blr[k] == 21 && blr[k + 1] == 15;
+        let text1 = blr[k] == 21 && blr[k + 1] == 14;
+        if !(text1 || text2) {
+            k += 1;
+            continue;
+        }
+        let (cs, at) = if text2 {
+            if k + 7 > blr.len() {
+                break;
+            }
+            (intl::charset_id(i16::from_le_bytes([blr[k + 2], blr[k + 3]])), k + 4)
+        } else {
+            (intl::CS_NONE, k + 2)
+        };
+        let n = u16::from_le_bytes([blr[at], blr[at + 1]]) as usize;
+        // a hex literal (`x'E9'`) is OCTETS and quotes no source token
+        if cs == intl::CS_OCTETS {
+            k += 1;
+            continue;
+        }
+        if let Some(bytes) = blr.get(at + 2..at + 2 + n) {
+            let text = if bytes.is_ascii() {
+                String::from_utf8(bytes.to_vec()).ok()
+            } else if cs == intl::CS_UTF8 {
+                String::from_utf8(bytes.to_vec()).ok()
+            } else if intl::tabled(cs) {
+                intl::decode_text(cs, bytes)
+            } else {
+                None
+            };
+            let spells_a_token = text.as_deref().is_some_and(|t| toks.iter().any(|s| s == t));
+            // a non-ASCII literal the source does not spell: the source
+            // is not what was compiled, and nothing here is known -
+            // unless an introducer of its set typed it
+            if !bytes.is_ascii() && !spells_a_token {
+                if intro_sets.contains(&cs) {
+                    k += 1;
+                    continue;
                 }
+                return None;
+            }
+            if spells_a_token {
+                lits.push((cs, text));
             }
         }
         k += 1;
     }
     let first = lits.first()?.0;
-    if lits.iter().any(|(cs, t)| *cs != first || t.is_none()) {
+    if lits.iter().any(|(cs, _)| *cs != first) {
         return None;
     }
-    toks.iter()
+    // an ASCII token need not be found: DSQL folds `DATE '2020-01-01'`
+    // into a typed literal, and there is nothing to decode in one
+    if !toks
+        .iter()
+        .filter(|t| !t.is_ascii())
         .all(|t| lits.iter().any(|(_, l)| l.as_deref() == Some(t.as_str())))
-        .then_some(first)
+    {
+        return None;
+    }
+    // a non-ASCII literal of a byte carrier lost its octets in the source
+    if intl::byte_carrier(first) && toks.iter().any(|t| !t.is_ascii()) {
+        return None;
+    }
+    Some(first)
 }
 
 /// [source_literals_lost] for a trigger's catalogue row, against its
@@ -100965,8 +101526,8 @@ fn trig_lit_cs(
     blr_f: Option<usize>,
     source: &str,
 ) -> SrcCs {
-    if source.is_ascii() {
-        return None;
+    if !source.contains('\'') {
+        return None; // no literal to type
     }
     let blr = match blr_f.and_then(|i| values.get(i)) {
         Some(fire_crab_ods::format::Value::Blob(r, n)) => {
@@ -101063,20 +101624,76 @@ fn eval_raw_cond(
     binds: &[(String, u16)],
     f: &PsqlFrame,
     db: &mut Option<Database>,
+    ctx: &SessionCtx,
 ) -> Result<bool, PsqlStop> {
     let cond = subst_body_query(text, binds, f).ok_or(PsqlStop::Unsupported)?;
     let sql = format!("SELECT COUNT(*) FROM RDB$DATABASE WHERE {}", cond);
-    let mut sink: Vec<Option<Descriptor>> = Vec::new();
-    let plan = plan_query_inner(&sql, &*db, &mut sink).ok_or(PsqlStop::Unsupported)?;
-    if !sink.is_empty() {
-        return Err(PsqlStop::Unsupported);
-    }
-    let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
-    let rows = branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?;
+    let (plan, calls) = psql_plan(&sql, db)?;
+    let rows = psql_rows(&plan, &calls, db, ctx)?;
     match rows.first().and_then(|r| r.first()) {
         Some(Value::Int(n)) => Ok(*n != 0),
         _ => Err(PsqlStop::Unsupported),
     }
+}
+
+/// Plan one of a body's statements, keeping the user-function CALLS the
+/// planner registered for it. The top level takes them off [FN_CALLS]
+/// at prepare and runs each per row ([materialise_user_fn_rows]); a
+/// body's statement planned here left them on the list unread, so its
+/// `UserFn` node found no value ([FN_VALS]) and the statement refused.
+/// Measured on engine 2182, in a body the source interpreter runs (one
+/// with a non-ASCII literal): `R = FN('ab')`, `R = FN('ab') || 'z'`,
+/// `R = FN('it''s')`, `R = FW('é')`, `SELECT FW(W) FROM T INTO R` and
+/// `R = PK.PF('ab')` answer 'fab', 'fabz', 'fit''s', 3, 3 and 'pabé'
+/// under every caller. The list is taken and the caller's put back, so
+/// a body run from inside a prepare never hands its calls to it.
+fn psql_plan(sql: &str, db: &Option<Database>) -> Result<(Plan, Vec<FnCall>), PsqlStop> {
+    let outer = FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    let mut sink: Vec<Option<Descriptor>> = Vec::new();
+    let plan = plan_query_inner(sql, db, &mut sink);
+    let calls = FN_CALLS.with(|l| std::mem::replace(&mut *l.borrow_mut(), outer));
+    if std::env::var("FC_SRV_TRACE").is_ok() && plan.is_none() {
+        eprintln!("[srv] psql body statement refused at plan: {:?}", sql);
+    }
+    let plan = plan.ok_or(PsqlStop::Unsupported)?;
+    if !sink.is_empty() {
+        return Err(PsqlStop::Unsupported); // a `?` parameter - not from a body
+    }
+    Ok((plan, calls))
+}
+
+/// The rows of a body's planned statement: [branch_rows_res], or - where
+/// its select list calls user functions - the top level's per-row
+/// materialisation. The enclosing call's values ([FN_VALS]) are kept
+/// across it: a function called from another function's body clears
+/// the slots as it fills its own, and the caller's projection would
+/// then find its earlier calls' values gone.
+///
+/// A row that RAISES is the body's error, not a refusal: `SELECT
+/// CAST(W AS VARCHAR(5)) || 'x' FROM T INTO R` in a UTF8-created body
+/// over a WIN1252 'é' under a NONE caller is 22000 *Malformed string*
+/// on the engine (the bare CAST is NONE, the UTF8 literal types the
+/// result, and E9 is no UTF8) - read through [branch_rows], which
+/// folds every error into "no rows", it was a 42000 refusal.
+fn psql_rows(
+    plan: &Plan,
+    calls: &[FnCall],
+    db: &mut Option<Database>,
+    ctx: &SessionCtx,
+) -> Result<Vec<Vec<Value>>, PsqlStop> {
+    let rows = if calls.is_empty() {
+        let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
+        branch_rows_res(plan, dbr, &[])
+    } else {
+        let kept = FN_VALS.with(|m| m.borrow().clone());
+        let rows = materialise_user_fn_rows(db, plan, calls, &[], ctx);
+        FN_VALS.with(|m| *m.borrow_mut() = kept);
+        rows
+    };
+    rows.map_err(|e| match e {
+        EvalErr::Unsupported => PsqlStop::Unsupported,
+        e => psql_raise(e),
+    })
 }
 
 /// [eval_raw_cond] for a SCALAR value: the RHS of an assignment or RETURN
@@ -101091,18 +101708,14 @@ fn eval_raw_scalar(
     binds: &[(String, u16)],
     f: &PsqlFrame,
     db: &mut Option<Database>,
+    ctx: &SessionCtx,
 ) -> Result<(Value, SrcCs), PsqlStop> {
     let expr = subst_body_query(text, binds, f).ok_or(PsqlStop::Unsupported)?;
     let sql = format!("SELECT {} FROM RDB$DATABASE", expr);
-    let mut sink: Vec<Option<Descriptor>> = Vec::new();
-    let plan = plan_query_inner(&sql, &*db, &mut sink).ok_or(PsqlStop::Unsupported)?;
-    if !sink.is_empty() {
-        return Err(PsqlStop::Unsupported); // a `?` parameter - not from a body
-    }
+    let (plan, calls) = psql_plan(&sql, db)?;
     // the value comes back in the set the planner typed it in
     let cs = plan_out_cs(&plan).first().copied().flatten();
-    let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
-    let rows = branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?;
+    let rows = psql_rows(&plan, &calls, db, ctx)?;
     rows.into_iter()
         .next()
         .and_then(|mut r| (!r.is_empty()).then(|| r.swap_remove(0)))
@@ -101143,15 +101756,23 @@ fn plan_out_cs(plan: &Plan) -> Vec<SrcCs> {
 
 /// The set a body expression's value is spelled in: `Ok(Some(cs))`;
 /// `Ok(None)` for a value that has no set to speak of (a number, NULL,
-/// an ASCII literal - ASCII in every set alike); `Err` where it is not
-/// known.
+/// an ASCII literal of a set not known - ASCII in every set alike);
+/// `Err` where it is not known.
+///
+/// An ASCII literal of a known REAL set carries it ([PsqlFrame::lit_cs]):
+/// the set decides what a concatenation it starts is in, and the value
+/// then moves from THAT set. Measured: `S = 'select ... = ''' || E ||
+/// ''''` over a WIN1252 `E = 'é'` in a UTF8-created body, S a NONE
+/// local, stores C3 A9 under a NONE caller - the text is UTF8 and moves
+/// into NONE by its octets. With the literal's set unknown the text
+/// was WIN1252 and S held E9.
 fn psql_expr_cs(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Option<u8>, ()> {
     use fire_crab_ods::expr::Expr as E;
     match e {
         E::Variable(n) => var_text_cs(f, *n as usize),
-        E::TextLiteral(t) if t.is_ascii() => Ok(None),
+        E::TextLiteral(t) if t.is_ascii() => Ok(ascii_lit_cs(f)),
         E::TextLiteral(_) => f.lit_cs.map(Some).ok_or(()),
-        E::Concat(a, b) => join_text_cs(psql_expr_cs(a, f)?, psql_expr_cs(b, f)?),
+        E::Concat(..) => psql_expr_cs_lit(e, f).map(|(cs, _)| cs),
         E::IntLiteral(_)
         | E::Int64Literal(_)
         | E::NullLiteral
@@ -101165,11 +101786,60 @@ fn psql_expr_cs(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Option<u
     }
 }
 
+/// The set an ASCII body literal carries: the body's, when that is a
+/// real set. A byte carrier's ASCII literal yields to anything, as the
+/// planner's [cs_join] has it, so it says nothing.
+fn ascii_lit_cs(f: &PsqlFrame) -> Option<u8> {
+    f.lit_cs.filter(|cs| !fire_crab_ods::intl::byte_carrier(*cs))
+}
+
+/// [psql_expr_cs], and whether the value is nothing but ASCII literals.
+/// Such a value beside a BYTE CARRIER takes the carrier's set: the
+/// engine types the pair as the real set and copies the carrier's
+/// octets into it, and this server's glued value holds the same octets
+/// under the carrier's label - the two agree wherever the value is
+/// then measured or moved into a carrier or into the literal's own set,
+/// which is what was answered before the literal carried a set at all.
+fn psql_expr_cs_lit(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<(Option<u8>, bool), ()> {
+    use fire_crab_ods::expr::Expr as E;
+    match e {
+        E::TextLiteral(t) if t.is_ascii() => Ok((ascii_lit_cs(f), true)),
+        E::Concat(a, b) => {
+            let (ca, la) = psql_expr_cs_lit(a, f)?;
+            let (cb, lb) = psql_expr_cs_lit(b, f)?;
+            Ok((join_lit_cs(ca, la, cb, lb)?, la && lb))
+        }
+        _ => Ok((psql_expr_cs(e, f)?, false)),
+    }
+}
+
+/// [join_text_cs], where a side that is only ASCII literals (`a_lit`,
+/// `b_lit`) yields to a byte carrier on the other ([psql_expr_cs_lit]).
+fn join_lit_cs(a: Option<u8>, a_lit: bool, b: Option<u8>, b_lit: bool) -> Result<Option<u8>, ()> {
+    use fire_crab_ods::intl::byte_carrier;
+    match (a, b) {
+        (Some(p), Some(q)) if a_lit && byte_carrier(q) && !byte_carrier(p) => Ok(Some(q)),
+        (Some(p), Some(q)) if b_lit && byte_carrier(p) && !byte_carrier(q) => Ok(Some(p)),
+        _ => join_text_cs(a, b),
+    }
+}
+
 /// [psql_expr_cs] for a slot: its declared set; a slot with none (not
 /// text, or undeclared) says nothing unless it holds non-ASCII text.
+/// A NONE or ASCII slot holding ASCII text says nothing either: those
+/// sets yield to any other in a join ([cs_join]) and the octets are
+/// the same everywhere, so the value is whatever it meets. Measured:
+/// `EXECUTE STATEMENT 'select ... u = ''' || A || ''' or w = ''' || E
+/// || ''''` over a NONE `A = 'ab'` and a WIN1252 `E = 'Ü'` in a
+/// UTF8-created body counts 1 under every caller - the text is UTF8,
+/// A's octets copied in; A's declared NONE, taken as the set of the
+/// text so far, made E's WIN1252 an unknown mix and refused the call.
 fn var_text_cs(f: &PsqlFrame, n: usize) -> Result<Option<u8>, ()> {
+    use fire_crab_ods::intl;
     if let Some(cs) = slot_text_cs(f, n) {
-        return Ok(Some(cs));
+        let ascii_none = (cs == intl::CS_NONE || cs == intl::CS_ASCII)
+            && matches!(f.vars.get(n), Some(Value::Text(t)) if t.is_ascii());
+        return Ok((!ascii_none).then_some(cs));
     }
     match f.vars.get(n) {
         Some(Value::Text(t)) if !t.is_ascii() => Err(()),
@@ -101207,9 +101877,12 @@ fn text_cs_src(r: Result<Option<u8>, ()>) -> SrcCs {
 /// The set a literal-and-variable text ([DynPart]) is spelled in.
 fn dyn_text_src(parts: &[DynPart], f: &PsqlFrame) -> SrcCs {
     let mut acc: Result<Option<u8>, ()> = Ok(None);
+    // so far nothing but ASCII literals ([psql_expr_cs_lit])
+    let mut acc_lit = true;
     for p in parts {
+        let lit = matches!(p, DynPart::Lit(t) if t.is_ascii());
         let one = match p {
-            DynPart::Lit(t) if t.is_ascii() => Ok(None),
+            DynPart::Lit(t) if t.is_ascii() => Ok(ascii_lit_cs(f)),
             DynPart::Lit(_) => f.lit_cs.map(Some).ok_or(()),
             DynPart::Var(n) => var_text_cs(f, *n as usize),
             // a trigger row's column: its set is not carried here
@@ -101219,37 +101892,54 @@ fn dyn_text_src(parts: &[DynPart], f: &PsqlFrame) -> SrcCs {
             },
         };
         acc = match (acc, one) {
-            (Ok(a), Ok(b)) => join_text_cs(a, b),
+            (Ok(a), Ok(b)) => join_lit_cs(a, acc_lit, b, lit),
             _ => Err(()),
         };
+        acc_lit = acc_lit && lit;
     }
     text_cs_src(acc)
 }
 
 /// The text of an EXECUTE STATEMENT, which is prepared in the
-/// ATTACHMENT's set like any statement: a text built from values of
-/// another set (a UTF8 variable under a NONE attachment) is not the
-/// statement those characters would spell there, and refuses when that
-/// can show - when it is not all ASCII.
+/// ATTACHMENT's set like any statement: the value is MOVED from the set
+/// it is in ([dyn_text_src]) into the attachment's, as any other value
+/// would be ([transcode_text]), and the planner then reads it as a
+/// statement of that set. Measured on engine 2182, a UTF8-created body
+/// against a WIN1252 W and a UTF8 U both holding 'é': a NONE local S
+/// built as `'... where w = ''' || E || ''''` over a WIN1252 `E = 'é'`
+/// holds C3 A9 (the text is UTF8), and `EXECUTE STATEMENT S` counts 0
+/// under a NONE caller (the NONE octets C3 A9 against W's E9) and 0
+/// under WIN1252 (they read 'Ã©' there); a UTF8 local holding the same
+/// text counts 1 against W under WIN1252 ('é' moves into E9) and 0
+/// under NONE; and `... u = ''' || E || ''''` over a UTF8 E is 1 under
+/// every caller. A text whose set is not known refuses, as does one the
+/// attachment's set cannot spell.
 fn dyn_statement_text(parts: &[DynPart], f: &PsqlFrame) -> Result<String, PsqlStop> {
     let sql = render_dyn_text(parts, f)?.unwrap_or_default();
-    if !sql.is_ascii() && dyn_text_src(parts, f) != Some(CURRENT_ATT_CS.with(|c| c.get())) {
-        return Err(PsqlStop::Unsupported);
+    if sql.is_ascii() {
+        return Ok(sql);
     }
-    Ok(sql)
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    match dyn_text_src(parts, f) {
+        Some(src) => transcode_text(src, att, sql).map_err(|_| PsqlStop::Unsupported),
+        None => Err(PsqlStop::Unsupported),
+    }
 }
 
-/// An EXECUTE STATEMENT argument's value - written into the statement
-/// as a literal of the attachment's set, so a non-ASCII one of another
-/// set refuses (see [dyn_statement_text]).
-fn dyn_param_value(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value, PsqlStop> {
+/// An EXECUTE STATEMENT argument's value and, for non-ASCII text of a
+/// set other than the attachment's, that set ([DynArg]); one whose set
+/// cannot be told refuses.
+fn dyn_param_value(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<DynArg, PsqlStop> {
     let v = eval_psql_expr(e, f)?;
-    if let Value::Text(t) = &v {
-        if !t.is_ascii() && psql_expr_src(e, f) != Some(CURRENT_ATT_CS.with(|c| c.get())) {
-            return Err(PsqlStop::Unsupported);
-        }
-    }
-    Ok(v)
+    let cs = match &v {
+        Value::Text(t) if !t.is_ascii() => match psql_expr_src(e, f) {
+            Some(cs) if cs != CURRENT_ATT_CS.with(|c| c.get()) => Some(cs),
+            Some(_) => None,
+            None => return Err(PsqlStop::Unsupported),
+        },
+        _ => None,
+    };
+    Ok((v, cs))
 }
 
 fn render_dyn_text(parts: &[DynPart], f: &PsqlFrame) -> Result<Option<String>, PsqlStop> {
@@ -101374,13 +102064,8 @@ fn run_dyn_statement(
     }
     // anything else is a query: the ORDINARY planner, so a dynamic
     // SELECT sees joins, views and expressions exactly as a client's does
-    let mut sink: Vec<Option<Descriptor>> = Vec::new();
-    let plan = plan_query_inner(sql, &*db, &mut sink).ok_or(PsqlStop::Unsupported)?;
-    if !sink.is_empty() {
-        return Err(PsqlStop::Unsupported); // a `?` this surface cannot bind
-    }
-    let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
-    Ok(Some(branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?))
+    let (plan, calls) = psql_plan(sql, db)?;
+    Ok(Some(psql_rows(&plan, &calls, db, ctx)?))
 }
 
 /// Execute `EXECUTE PROCEDURE <name> [(<args>)]` and return the output
@@ -102986,6 +103671,7 @@ fn fire_triggers(
  stop_after: None,
             types: trig_slot_types(&d.source),
             lit_cs: d.lit_cs,
+            cast_cs: d.cast_cs,
             vars: vec![Value::Null; names.len()],
             out_at: names.len(),
             out_len: 0,
@@ -103021,6 +103707,7 @@ fn fire_triggers(
  stop_after: None,
             types: trig_slot_types(&d.source),
             lit_cs: d.lit_cs,
+            cast_cs: d.cast_cs,
                 vars: vec![Value::Null; names.len()],
                 out_at: names.len(),
                 out_len: 0,
@@ -103196,7 +103883,30 @@ fn run_body_source(
     let mut names: Vec<String> = meta.ins.iter().map(|p| p.name.clone()).collect();
     names.extend(meta.outs.iter().map(|p| p.name.clone()));
 
-    let up = meta.source.to_ascii_uppercase();
+    // an EXECUTE BLOCK's literals are the attachment's; a stored body's
+    // are the set its BLR recorded ([stored_lit_cs])
+    let lit_cs: SrcCs = if name == ANONYMOUS_BLOCK {
+        Some(CURRENT_ATT_CS.with(|c| c.get()))
+    } else {
+        database.as_ref().and_then(|dbr| {
+            let kind = if meta.is_function { "srclit-fn" } else { "srclit-proc" };
+            *dbr.meta_memo(kind, name, || {
+                let img = dbr.bytes();
+                let blr = if meta.is_function {
+                    fire_crab_exe::function_blr(&img, dbr.page_size, name)
+                } else {
+                    fire_crab_exe::procedure_blr(&img, dbr.page_size, name)
+                };
+                stored_lit_cs(&meta.source, blr.ok().as_deref())
+            })
+        })
+    };
+    // a q-string or an introduced literal in the source is respelled
+    // for the parsers ([rewrite_alt_literals]), in the set the text is
+    // in; the catalog's text stays what the BLR is read against
+    let respelled = rewrite_alt_literals(&meta.source, lit_cs);
+    let source: &str = respelled.as_deref().unwrap_or(&meta.source);
+    let up = source.to_ascii_uppercase();
     let begin_at = find_word(&up, "BEGIN", 0)
         .ok_or_else(|| "procedure body does not start with BEGIN".to_string())?;
     // A procedure DECLAREs its local variables BEFORE the body's BEGIN
@@ -103205,7 +103915,7 @@ fn run_body_source(
     // position in that list, and the frame is indexed the same way.
     // ...and every slot's DECLARED TYPE, in the same order: what a write
     // into it converts through ([coerce_to_slot])
-    let locals = declared_vars(&meta.source[..begin_at]);
+    let locals = declared_vars(&source[..begin_at]);
     let mut types: Vec<Option<CastTarget>> =
         meta.ins.iter().chain(meta.outs.iter()).map(|p| slot_cast_target(&p.desc)).collect();
     let params_at = types.len();
@@ -103221,9 +103931,8 @@ fn run_body_source(
     // list, and the ordinary name resolution turns `ROW_COUNT` into
     // that slot with nothing else to teach. A body that never mentions
     // it never pays for it.
-    let cursors = declared_cursors(&meta.source[..begin_at]);
+    let cursors = declared_cursors(&source[..begin_at]);
     let row_count_slot = {
-        let up = meta.source.to_ascii_uppercase();
         if find_word(&up, "ROW_COUNT", 0).is_some() {
             names.push("ROW_COUNT".to_string());
             Some((names.len() - 1) as u16)
@@ -103235,10 +103944,10 @@ fn run_body_source(
         .into_iter()
         .map(|(name, query)| (name, CursorState { query, rows: None, at: 0, cs: Vec::new() }))
         .collect();
-    let body = parse_trigger_body(&meta.source, begin_at, meta.source.trim_end().len(), &names)
+    let body = parse_trigger_body(source, begin_at, source.trim_end().len(), &names)
         .ok_or_else(|| format!("procedure {}'s body is outside this server's PSQL surface", name))?;
     // the header's initialisers run first, as the assignments they are
-    let inits = declared_var_inits(&meta.source[..begin_at], &names)
+    let inits = declared_var_inits(&source[..begin_at], &names)
         .map_err(|e| ProcErr::from(format!("procedure {}: {}", name, e)))?;
     let body = if inits.is_empty() {
         body
@@ -103288,27 +103997,17 @@ fn run_body_source(
             }
         }
     }
-    // an EXECUTE BLOCK's literals are the attachment's; a stored body's
-    // are the set its BLR recorded ([stored_lit_cs])
-    let lit_cs: SrcCs = if name == ANONYMOUS_BLOCK {
-        Some(CURRENT_ATT_CS.with(|c| c.get()))
+    // an EXECUTE BLOCK's CAST without a set is the attachment's, a
+    // stored body's the database default's ([PsqlFrame::cast_cs])
+    let cast_cs: SrcCs = if name == ANONYMOUS_BLOCK {
+        None
     } else {
-        database.as_ref().and_then(|dbr| {
-            let kind = if meta.is_function { "srclit-fn" } else { "srclit-proc" };
-            *dbr.meta_memo(kind, name, || {
-                let img = dbr.bytes();
-                let blr = if meta.is_function {
-                    fire_crab_exe::function_blr(&img, dbr.page_size, name)
-                } else {
-                    fire_crab_exe::procedure_blr(&img, dbr.page_size, name)
-                };
-                stored_lit_cs(&meta.source, blr.ok().as_deref())
-            })
-        })
+        database.as_ref().map(db_default_cs)
     };
     let mut frame = PsqlFrame {
  stop_after: None,
             types,
+            cast_cs,
             lit_cs,
         vars: Vec::new(),
         out_at: meta.ins.len(),
@@ -103738,7 +104437,7 @@ fn desc_from_proc_meta(m: &fire_crab_dsql::ProcParamMeta) -> Option<Descriptor> 
 /// block. Input parameters (`EXECUTE BLOCK (p type = ?) ...`) need a
 /// client message and are not taken; a block with no RETURNS is the
 /// plain (non-selectable) form parse_execute_block handles.
-fn parse_execute_block_select(sql: &str) -> Option<Plan> {
+fn parse_execute_block_select(sql: &str, db: &Option<Database>) -> Option<Plan> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
@@ -103767,9 +104466,13 @@ fn parse_execute_block_select(sql: &str) -> Option<Plan> {
     // procedure compiler, then interpret the body as a nameless block
     let synth = format!("CREATE PROCEDURE FC$BLOCK {} AS {}", returns_text, body);
     // the compiler resolves a bare column across streams through the
-    // catalog of the tables and procedures the body names
-    fire_crab_dsql::set_catalog(Vec::new()); // an anonymous block: no database in scope here
-    let c = fire_crab_dsql::compile_procedure_full(&synth);
+    // catalog of the tables and procedures the body names, and a call
+    // through the functions it knows: compiled against an empty
+    // catalog, `R = FN('ab')` was an unknown name and the block refused
+    // where the engine answers 'fab' (measured)
+    let plain_funcs = plain_function_arities(db);
+    fire_crab_dsql::set_catalog(dsql_catalog_for(db, &synth));
+    let c = fire_crab_dsql::compile_procedure_full_with_funcs(&synth, &plain_funcs);
     fire_crab_dsql::set_catalog(Vec::new());
     let c = c?;
     if !c.ins.is_empty() || c.outs.is_empty() {
@@ -104094,10 +104797,24 @@ fn collate_canon_of(
 
 /// The TTYPE an expression's text carries, when it has one - the
 /// character set and collation that decide its case law.
+///
+/// A value of the ATTACHMENT's set ([TfCs::Att]: a literal, and what a
+/// literal starts, under [cs_join]) is of that set's default collation
+/// when the attachment names a real set. Measured under a UTF8
+/// attachment: `'x' || U CONTAINING 'é'` over a UTF8 U holding 'é'
+/// counts 1, `'xé' || W CONTAINING 'é'` counts both rows of a WIN1252
+/// W, and `'xé' CONTAINING 'É'` is true - the fold is UTF8's. Read as
+/// no ttype, the fold was NONE's, which leaves 'é' alone, and every
+/// one of those answered nothing. Under a NONE attachment there is no
+/// set, as before.
 fn expr_text_ttype(e: &Expr, descs: &[Descriptor]) -> Option<u16> {
     match text_form(e, descs) {
         Some((_, _, TfCs::Ttype(t))) if (0..=i32::from(i16::MAX)).contains(&t) => {
             Some(t as u16)
+        }
+        Some((_, _, TfCs::Att)) => {
+            let att = CURRENT_ATT_CS.with(|c| c.get());
+            (att != 0).then_some(att as u16)
         }
         _ => None,
     }
@@ -104210,6 +104927,21 @@ fn read_quoted(b: &[char], pos: &mut usize) -> Option<String> {
     }
     *pos = p;
     Some(out)
+}
+
+/// [read_quoted], declining - the cursor left where it was - when a
+/// `||` follows the literal, which makes it the first operand of an
+/// expression pattern ([parse_pattern_alone]).
+fn read_quoted_alone(b: &[char], pos: &mut usize) -> Option<String> {
+    let save = *pos;
+    let lit = read_quoted(b, pos)?;
+    let mut p = *pos;
+    skip_ws(b, &mut p);
+    if b.get(p) == Some(&'|') && b.get(p + 1) == Some(&'|') {
+        *pos = save;
+        return None;
+    }
+    Some(lit)
 }
 
 /// The operand of a collation-deciding predicate, unwrapped from any
@@ -108977,7 +109709,7 @@ fn after_auth(
                 CURRENT_SQL.with(|c| *c.borrow_mut() = stmt_text_decode(&sql, att_cs.id));
                 let raw_text = stmt_text_decode(&sql, att_cs.id);
                 RAW_STMT.with(|r| *r.borrow_mut() = raw_text.clone());
-                let text = entry_strip_comments(&raw_text);
+                let text = rewrite_entry_literals(entry_strip_comments(&raw_text), att_cs.id);
                 // THE SAME TWO GUARDS THE PREPARE PATH APPLIES. These
                 // are properties of the STATEMENT TEXT, so every entry
                 // point that accepts text owes them: a deep expression
@@ -109158,7 +109890,7 @@ fn after_auth(
                 CURRENT_ATT_CS.with(|c| c.set(att_cs.id));
                 let raw_text = stmt_text_decode(&sql, att_cs.id);
                 RAW_STMT.with(|r| *r.borrow_mut() = raw_text.clone());
-                let text = entry_strip_comments(&raw_text);
+                let text = rewrite_entry_literals(entry_strip_comments(&raw_text), att_cs.id);
                 // THE SAME TWO GUARDS THE PREPARE PATH APPLIES. These
                 // are properties of the STATEMENT TEXT, so every entry
                 // point that accepts text owes them: a deep expression
@@ -109298,7 +110030,7 @@ fn after_auth(
                             eprintln!("[srv] prepare raw = {:?}", raw_sql);
                         }
                         RAW_STMT.with(|r| *r.borrow_mut() = raw_sql.clone());
-                        stmt_sql = entry_strip_comments(&raw_sql);
+                        stmt_sql = rewrite_entry_literals(entry_strip_comments(&raw_sql), att_cs.id);
                     }
                 // ...and the text a DDL trigger reads as SQL_TEXT
                 CURRENT_USER_NAME.with(|u| *u.borrow_mut() = user.to_string());
@@ -126275,8 +127007,47 @@ mod tests {
     /// a statement the body did not write.
     /// A stored body's literal set is read off its BLR: `blr_literal
     /// blr_text2 <ttype> <len> <octets>` decoded in that set must spell
-    /// every non-ASCII token of the source, and every non-ASCII BLR
-    /// literal must be of the one set.
+    /// every non-ASCII token of the source, every BLR literal that
+    /// spells a token must be of the one set, and an ASCII literal
+    /// carries the set too.
+    /// A q-string is the literal it spells, padded to its own length; an
+    /// introduced literal is the typed spelling of its octets in `enc`'s
+    /// set, and stands where that set, the named one or the octets fail.
+    #[test]
+    fn alt_literals_are_respelled() {
+        assert_eq!(rewrite_alt_literals("SELECT 'a' FROM T", Some(4)), None);
+        assert_eq!(
+            rewrite_alt_literals("WHERE U = q'{it's}'", Some(4)).as_deref(),
+            Some("WHERE U = 'it''s'  ")
+        );
+        assert_eq!(rewrite_alt_literals("q'(a)'", None).as_deref(), Some("'a'   "));
+        assert_eq!(rewrite_alt_literals("Q'#x#'", None).as_deref(), Some("'x'   "));
+        // not an identifier's tail, not inside a literal or a comment
+        assert_eq!(rewrite_alt_literals("SELECT freq'x' FROM T", None), None);
+        assert_eq!(rewrite_alt_literals("SELECT 'q''{x}''' FROM T -- q'{y}'", None), None);
+        assert_eq!(
+            rewrite_alt_literals("_utf8 'é'", Some(4)).as_deref(),
+            Some("CAST(x'C3A9' AS CHAR(1) CHARACTER SET UTF8)")
+        );
+        assert_eq!(
+            rewrite_alt_literals("_win1252 'é'", Some(4)).as_deref(),
+            Some("CAST(x'C3A9' AS CHAR(2) CHARACTER SET WIN1252)")
+        );
+        assert_eq!(
+            rewrite_alt_literals("_utf8 x'C3A9'", None).as_deref(),
+            Some("CAST(x'C3A9' AS CHAR(1) CHARACTER SET UTF8)")
+        );
+        assert_eq!(
+            rewrite_alt_literals("_utf8 ''", Some(4)).as_deref(),
+            Some("CAST('' AS VARCHAR(1) CHARACTER SET UTF8)")
+        );
+        assert_eq!(rewrite_alt_literals("_utf8 'é'", None), None);
+        assert_eq!(rewrite_alt_literals("_big5 'a'", Some(4)), None);
+        // 'é' in WIN1252 is E9, which is no UTF8
+        assert_eq!(rewrite_alt_literals("_utf8 'é'", Some(53)), None);
+        assert_eq!(rewrite_alt_literals("A_UTF8 'x'", Some(4)), None);
+    }
+
     #[test]
     fn stored_lit_cs_reads_the_blr_literal_set() {
         let lit = |tt: u16, b: &[u8]| {
@@ -126289,6 +127060,16 @@ mod tests {
         let src = "BEGIN R = LPAD(X, L, 'é'); END";
         // compiled under UTF8: C3 A9, ttype 4
         assert_eq!(stored_lit_cs(src, Some(&lit(4, &[0xC3, 0xA9]))), Some(4));
+        // a q-string spells its literal; an introduced token is of its
+        // introducer's set and says nothing about the body's - and a
+        // non-ASCII literal no introducer accounts for still says nothing
+        assert_eq!(
+            stored_lit_cs("BEGIN R = q'{é's}'; END", Some(&lit(4, &[0xC3, 0xA9, b'\'', b's']))),
+            Some(4)
+        );
+        let intro2 = [lit(4, b"ab"), lit(53, &[0xC3, 0xA9])].concat();
+        assert_eq!(stored_lit_cs("BEGIN R = 'ab' || _win1252 'é'; END", Some(&intro2)), Some(4));
+        assert_eq!(stored_lit_cs("BEGIN R = 'ab' || _utf8 'é'; END", Some(&intro2)), None);
         // compiled under WIN1252 from a UTF-8 file: the source reads 'Ã©'
         assert_eq!(stored_lit_cs("BEGIN R = 'Ã©'; END", Some(&lit(53, &[0xC3, 0xA9]))), Some(53));
         // ...and a WIN1252 E9 spells 'é'
@@ -126300,8 +127081,31 @@ mod tests {
         let mut two = lit(4, &[0xC3, 0xA9]);
         two.extend(lit(53, &[0xE9]));
         assert_eq!(stored_lit_cs(src, Some(&two)), None);
-        // no non-ASCII token, or no BLR: nothing to say
+        // an ASCII literal carries the set it was compiled in - UTF8,
+        // WIN1252, and NONE too (that set is written typed under a real
+        // caller, where a plain 'a' would take the caller's)
+        assert_eq!(stored_lit_cs("BEGIN R = 'a'; END", Some(&lit(4, b"a"))), Some(4));
+        assert_eq!(stored_lit_cs("BEGIN R = 'a'; END", Some(&lit(53, b"a"))), Some(53));
+        assert_eq!(stored_lit_cs("BEGIN R = 'a'; END", Some(&lit(0, b"a"))), Some(0));
+        let mut none1 = vec![21u8, 14];
+        none1.extend_from_slice(&1u16.to_le_bytes());
+        none1.push(b'a');
+        assert_eq!(stored_lit_cs("BEGIN R = 'a'; END", Some(&none1)), Some(0));
+        // ...but a NONE-compiled body with a non-ASCII token lost it
+        let mut both = lit(0, b"a");
+        both.extend(lit(0, &[0xC3, 0xA9]));
+        assert_eq!(stored_lit_cs("BEGIN R = 'a' || 'é'; END", Some(&both)), None);
+        // a BLR literal that spells no source token says nothing (DSQL
+        // folds `DATE '2020-01-01'` away; a byte-pattern match may lie)
         assert_eq!(stored_lit_cs("BEGIN R = 'a'; END", Some(&lit(4, &[0xC3, 0xA9]))), None);
+        assert_eq!(stored_lit_cs("BEGIN D = DATE '2020-01-01'; R = 'a'; END", Some(&lit(4, b"a"))), Some(4));
+        let mut mixed = lit(4, b"a");
+        mixed.extend(lit(53, b"zz"));
+        assert_eq!(stored_lit_cs("BEGIN R = 'a'; END", Some(&mixed)), Some(4));
+        // two sets among the spelled literals: not known
+        mixed = lit(4, b"a");
+        mixed.extend(lit(53, b"b"));
+        assert_eq!(stored_lit_cs("BEGIN R = 'a' || 'b'; END", Some(&mixed)), None);
         assert_eq!(stored_lit_cs(src, None), None);
         assert!(blr_has_non_ascii_literal(&lit(4, &[0xC3, 0xA9])));
         assert!(!blr_has_non_ascii_literal(&lit(4, b"ab")));
@@ -126316,6 +127120,7 @@ mod tests {
  stop_after: None,
             types: Vec::new(),
             lit_cs: None,
+            cast_cs: None,
                 vars: vec![k, s],
                 out_at: 0,
                 out_len: 0,

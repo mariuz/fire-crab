@@ -202,8 +202,11 @@ refuses "a COLLATE other than the set's own refuses" \
 # (a BLOB target is served - see serve-real-blobexpr.sh; a cast to a
 # blob names the blob's OWN character set, not a transliteration of the
 # result the way a CHAR target does)
-refuses "the character-set introducer refuses" \
-  "SELECT _WIN1252 'ab' FROM RDB\$DATABASE;"
+# PROMOTED: an introducer types its literal's octets ([rewrite_alt_literals]).
+# The items are aliased: a bare introduced literal is named CONSTANT by the
+# engine and CAST here (it is respelled as one) - recorded, not answered.
+both "the character-set introducer types its literal (it refused)" \
+  "SELECT _WIN1252 'ab' AS A, OCTET_LENGTH(_WIN1252 'ab') AS B, OCTET_LENGTH(_UTF8 'ab' || _WIN1252 x'E9') AS C FROM RDB\$DATABASE;"
 refuses "a parameter under the cast refuses" \
   "SELECT CAST(? AS VARCHAR(3) CHARACTER SET OCTETS) FROM RDB\$DATABASE;"
 refuses "a zero width refuses (the engine's -842)" \
