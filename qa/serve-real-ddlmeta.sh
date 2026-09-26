@@ -338,9 +338,10 @@ pin  "10 CONTROL a case-sensitive UTF8 column stays case-sensitive" \
      "SELECT IIF(D = 'abc', 1, 0), NULLIF(D, 'abc'), D IN ('abc') FROM TC WHERE ID = 1;" "CASE CASE BOOL|0 AbC <false>"
 pin  "10 COUNT(DISTINCT) over two spellings of one CI value is one" \
      "CREATE TABLE TCD2 (ID INTEGER, A DCI); COMMIT; INSERT INTO TCD2 VALUES (1, 'AbC'); INSERT INTO TCD2 VALUES (2, 'abc'); INSERT INTO TCD2 VALUES (3, 'abd'); SELECT COUNT(DISTINCT A) FROM TCD2; COMMIT;" "COUNT|2"
-# An EXPRESSION over a collated column carries the collation too;
-# there is no key to wrap it in, so it refuses (it compared bytes)
-recorded "10 UPPER(ci) = 'abc': refused here, not a byte compare" \
+# An EXPRESSION over a collated column carries the collation too
+# (refused here until the round-3 collation reader of 2026-09-26; it
+# had compared bytes)
+pin "10 UPPER(ci) = 'abc': the collation compares, not the bytes" \
      "SELECT IIF(UPPER(A) = 'abc', 1, 0) FROM TC WHERE ID = 1;" "CASE|1"
 # GROUP BY / DISTINCT over a case-insensitive column is REFUSED by rule
 # (coll_groupable): the engine merges the spellings and returns one of
