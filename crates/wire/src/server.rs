@@ -1936,6 +1936,136 @@ fn respond_ddl_meta(
         format!("\"PUBLIC\".\"{}\"", n.trim().trim_matches('"').to_ascii_uppercase())
     };
     let lc = err_text.to_ascii_lowercase();
+    // the statement's "<VERB> @1 failed" item for the relation DDL that
+    // writes a foreign key or a view - CREATE TABLE, ALTER TABLE ...,
+    // CREATE / ALTER / RECREATE VIEW (the verb the planner chose)
+    let verb_of = |plan: &Plan| -> Option<(i32, String)> {
+        match plan {
+            Plan::CreateTable { name, .. } => Some((336397286, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
+            Plan::Recreate(inner) => match inner.as_ref() {
+                Plan::CreateTable { name, .. } => Some((336397289, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
+                Plan::CreateView { name, .. } => Some((336397301, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
+                _ => None,
+            },
+            Plan::CreateViewRefused { name, verb, .. } => Some((*verb, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
+            _ => ddl_relation_target(plan).map(|t| (ALTER_TABLE_FAILED, q(t))),
+        }
+    };
+    // A VIEW THE ENGINE REFUSES TO WRITE ([Plan::CreateViewRefused]):
+    // "unsuccessful metadata update / <VERB> @1 failed / SQL error code =
+    // -607 / Invalid command / <reason>" - the reason isc_specify_field_err
+    // (42000) or isc_num_field_err (07002), measured on 2182.
+    if let Plan::CreateViewRefused { .. } = plan {
+        if let Some((verb, qn)) = verb_of(plan) {
+            let reason = if lc.contains("number of columns") { 335544599 } else { 335544598 };
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(verb).int(2).bytes(qn.as_bytes())
+                .int(1).int(335544436).int(4).int(-607) // isc_sqlerr
+                .int(1).int(335544570) // isc_dsql_command_err - "Invalid command"
+                .int(1).int(reason)
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
+    // A FOREIGN KEY ACROSS THE PERSISTENT / TEMPORARY LINE (DYN 232, "@1
+    // cannot reference @2", SQLSTATE HY000): the two operands arrive
+    // spelled and quoted by the writer, and ride as two string arguments
+    // after "<VERB> @1 failed". Measured for CREATE TABLE, CREATE GLOBAL
+    // TEMPORARY TABLE and ALTER TABLE ADD alike.
+    if let Some((a, b)) = err_text.split_once(" cannot reference ") {
+        if let Some((verb, qn)) = verb_of(plan) {
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(verb).int(2).bytes(qn.as_bytes())
+                .int(1).int(336068840).int(2).bytes(a.as_bytes()).int(2).bytes(b.as_bytes())
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
+    // A FOREIGN KEY THAT NAMES A VIEW (DYN 242, measured): "<VERB> @1
+    // failed / attempt to reference a view (@1) in a foreign key"
+    if let Some(rest) = lc.strip_prefix("attempt to reference a view (") {
+        if let Some((verb, qn)) = verb_of(plan) {
+            let view = &err_text["attempt to reference a view (".len()..][..rest.find(')').unwrap_or(0)];
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(verb).int(2).bytes(qn.as_bytes())
+                .int(1).int(336068850).int(2).bytes(format!("\"PUBLIC\".\"{}\"", view.trim()).as_bytes())
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
+    // A RELATION THE CATALOG DOES NOT HOLD, by the verb that asked (DYN
+    // 241 "Table @1 not found" / DYN 54 "View @1 not found", 42000): a
+    // foreign key's referenced table ("<VERB> @1 failed / Table @2 not
+    // found"), and COMMENT ON TABLE / VIEW over the wrong kind or a
+    // missing name ("COMMENT ON @1 failed / Table|View @1 not found").
+    // The writer says how the engine spells the name: `(qualified)` is
+    // "PUBLIC"."X", `(bare)` is "X" - the engine's own quirk, a COMMENT
+    // ON TABLE of a name it cannot find prints it unqualified, while a
+    // view it found under that verb, and every VIEW-verb miss, is
+    // qualified (measured on 2182).
+    if lc.ends_with(" not found (qualified)") || lc.ends_with(" not found (bare)") {
+        let (kind_code, rest) = if let Some(r) = err_text.strip_prefix("Table ") {
+            (336068849, r)
+        } else if let Some(r) = err_text.strip_prefix("View ") {
+            (336068662, r)
+        } else {
+            (0, "")
+        };
+        if kind_code != 0 {
+            let bare = lc.ends_with("(bare)");
+            let raw = rest.rsplit_once(" not found (").map(|(n, _)| n.trim()).unwrap_or("");
+            let spelled = if bare { format!("\"{}\"", raw) } else { format!("\"PUBLIC\".\"{}\"", raw) };
+            let head: Option<(i32, String)> = match plan {
+                Plan::Comment { .. } => Some((336397259, spelled.clone())), // COMMENT ON @1 failed
+                _ => verb_of(plan),
+            };
+            if let Some((verb, qn)) = head {
+                let mut w = W::default();
+                w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                w.int(1).int(GDS_NO_META_UPDATE)
+                    .int(1).int(verb).int(2).bytes(qn.as_bytes())
+                    .int(1).int(kind_code).int(2).bytes(spelled.as_bytes())
+                    .int(0);
+                w.send(s, enc)?;
+                return Ok(true);
+            }
+        }
+    }
+    // DROP TABLE / RECREATE TABLE OVER A VIEW: the missing-table -607
+    // (measured: "DROP TABLE "PUBLIC"."V1" failed / SQL error code = -607
+    // / Invalid command / Table "PUBLIC"."V1" does not exist", 42S02,
+    // RECREATE under its own verb), the view untouched
+    if lc.contains("does not exist: it is a view") {
+        let head = match plan {
+            Plan::DropTable { name } => Some((336397288, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
+            Plan::Recreate(inner) => match inner.as_ref() {
+                Plan::CreateTable { name, .. } => Some((336397289, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((verb, qn)) = head {
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(verb).int(2).bytes(qn.as_bytes())
+                .int(1).int(335544436).int(4).int(-607)
+                .int(1).int(335544570)
+                .int(1).int(336397206).int(2).bytes(qn.as_bytes()) // isc_dsql_table_not_found
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
     // BLOB FILTERS spell their own vectors (probed): a duplicate name is
     // "DECLARE FILTER F1 failed" + "Blob filter "F1" already exists" (the
     // bare name, then the quoted one); a duplicate (input, output) pair is
@@ -2241,20 +2371,37 @@ fn respond_ddl_meta(
             w.send(s, enc)?;
             return Ok(true);
         }
-        // DROP TABLE (or RECREATE TABLE) refused because a VIEW reads the
-        // table: "unsuccessful metadata update / cannot delete / TABLE @1 /
-        // there are N dependencies" (probed). N is carried in the message.
-        if let Plan::DropTable { name } = plan {
+        // DROP TABLE / DROP VIEW (or their RECREATEs) refused because
+        // something reads the relation: "unsuccessful metadata update /
+        // cannot delete / TABLE @1 | VIEW @1 / there are N dependencies"
+        // (measured). The writer spells the kind the engine names - TABLE
+        // whenever a VIEW is among the dependents, else the relation's
+        // own kind (dfw.epp delete_relation) - and carries N.
+        let dropped: Option<&str> = match plan {
+            Plan::DropTable { name } | Plan::DropView { name } => Some(name),
+            Plan::Recreate(inner) => match inner.as_ref() {
+                Plan::CreateTable { name, .. } | Plan::CreateView { name, .. } => Some(name),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(name) = dropped {
             let n: i32 = err_text
                 .split_whitespace()
                 .find_map(|w| w.parse::<i32>().ok())
                 .unwrap_or(1);
-            let qn = q(name);
+            let kind = if lc.starts_with("cannot delete view") {
+                335544991 // isc_view_name - "VIEW @1"
+            } else {
+                335544626 // isc_table_name - "TABLE @1"
+            };
+            // the CANONICAL name, as stored (`"v1"` prints "PUBLIC"."v1")
+            let qn = format!("\"PUBLIC\".\"{}\"", name.trim_end());
             let mut w = W::default();
             w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
             w.int(1).int(GDS_NO_META_UPDATE)
                 .int(1).int(335544673) // isc_no_delete - "cannot delete"
-                .int(1).int(335544626).int(2).bytes(qn.as_bytes()) // isc_table_name - "TABLE @1"
+                .int(1).int(kind).int(2).bytes(qn.as_bytes())
                 .int(1).int(335544630).int(4).int(n) // isc_dependency - "there are @1 dependencies"
                 .int(0);
             w.send(s, enc)?;
@@ -9684,6 +9831,16 @@ enum Plan {
         fields: Vec<fire_crab_ods::ddl::ViewFieldSpec>,
         contexts: Vec<fire_crab_ods::ddl::RestoredViewContext>,
     },
+    /// A `CREATE VIEW` the engine refuses when it RUNS, with a -607 reason
+    /// (measured on 2182 through the two-phase rig: PREPARE succeeds, the
+    /// vector is EXECUTE's, "unsuccessful metadata update / CREATE VIEW
+    /// @1 failed / SQL error code = -607 / Invalid command / <reason>").
+    /// Two reasons: an unaliased select item that is not a plain column
+    /// ("must specify column name for view select expression"), and a
+    /// column list whose length is not the select list's ("number of
+    /// columns does not match select list", SQLSTATE 07002). Planned so
+    /// the refusal fires in the engine's phase; nothing is written.
+    CreateViewRefused { name: String, reason: String, verb: i32 },
     DropView { name: String },
     /// `CREATE`/`ALTER MAPPING` - a local (database) name mapping row.
     CreateMapping(MappingSpec),
@@ -18479,7 +18636,7 @@ fn ddl_event_of(plan: &Plan) -> Option<(u32, String, &'static str)> {
         | P::AlterColumnPosition { table, .. } => {
             (DDL_ALTER_TABLE, table.clone(), "ALTER TABLE")
         }
-        P::CreateView { name, .. } => (DDL_CREATE_VIEW, name.clone(), "CREATE VIEW"),
+        P::CreateView { name, .. } | P::CreateViewRefused { name, .. } => (DDL_CREATE_VIEW, name.clone(), "CREATE VIEW"),
         P::AlterView { name, .. } => (DDL_ALTER_VIEW, name.clone(), "ALTER VIEW"),
         P::DropView { name, .. } => (DDL_DROP_VIEW, name.clone(), "DROP VIEW"),
         P::CreateTrigger { def, .. } => (DDL_CREATE_TRIGGER, def.name.clone(), "CREATE TRIGGER"),
@@ -28333,9 +28490,36 @@ fn plan_create_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descr
         tr("no output columns");
         return None;
     }
-    if let Some(c) = &cols {
-        if c.len() != out_cols.len() {
-            return None;
+    // THE COLUMN NAMES ARE CHECKED WHEN THE VIEW IS WRITTEN, with a -607
+    // (measured on 2182, `qa/serve-real-dmlcheck.sh`): a column list of
+    // the wrong length is "number of columns does not match select list"
+    // (07002), and without a list every select item of the FIRST union
+    // branch must NAME its column - a plain column reference (bare,
+    // qualified, `(id)`), `*`, or any item with an alias; a literal, an
+    // expression, a call, CAST, NULL, an aggregate and CURRENT_DATE are
+    // "must specify column name for view select expression". This
+    // server used to store the describe name (CONSTANT, ADD, CAST ...)
+    // as the column, which the engine never does.
+    let refused = |reason: &str| {
+        Some((
+            Plan::CreateViewRefused { name: name.clone(), reason: reason.to_string(), verb: 336397298 },
+            Vec::new(),
+        ))
+    };
+    match &cols {
+        Some(c) if c.len() != out_cols.len() => {
+            return refused("number of columns does not match select list");
+        }
+        Some(_) => {}
+        None => {
+            let head = split_union(select).and_then(|(b, _)| b.first().cloned()).unwrap_or_else(|| select.to_string());
+            if let Some((proj, ..)) = split_query(&head) {
+                for item in split_top_level_commas(proj) {
+                    if !view_item_names_its_column(item) {
+                        return refused("must specify column name for view select expression");
+                    }
+                }
+            }
         }
     }
     // the FROM items, in order: context 1.. (probed: `FROM T a JOIN T b`
@@ -28416,6 +28600,38 @@ fn plan_create_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descr
         return None;
     };
     Some((Plan::CreateView { name, blr, source: select.to_string(), fields, contexts }, Vec::new()))
+}
+
+/// Does a view's select item name its column without a column list -
+/// the engine's rule for "must specify column name for view select
+/// expression" (measured on 2182): an alias (`AS x` or a bare trailing
+/// one) does, `*` and `T.*` do, a plain column reference does - bare,
+/// qualified, or wrapped in parentheses - and nothing else does: a
+/// literal, NULL, an expression, a call, CAST, an aggregate, a clock
+/// keyword (CURRENT_DATE reads like a name but is an expression).
+fn view_item_names_its_column(item: &str) -> bool {
+    let (body, alias) = split_alias(item.trim());
+    if alias.is_some() {
+        return true;
+    }
+    let mut body = body.trim();
+    while body.starts_with('(') && body.ends_with(')') && body.len() >= 2 {
+        body = body[1..body.len() - 1].trim();
+    }
+    if body == "*" || body.ends_with(".*") {
+        return true;
+    }
+    if body.starts_with('"') {
+        return canon_ident(body).is_some();
+    }
+    let up = body.to_ascii_uppercase();
+    let keyword = matches!(
+        up.as_str(),
+        "TRUE" | "FALSE" | "UNKNOWN" | "NULL" | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP"
+            | "LOCALTIME" | "LOCALTIMESTAMP" | "CURRENT_USER" | "USER" | "CURRENT_ROLE"
+            | "CURRENT_CONNECTION" | "CURRENT_TRANSACTION"
+    );
+    !keyword && (is_qualified_col(body) || (bare_ident_ok(body) && canon_ident(body).is_some()))
 }
 
 /// The auto-domain type of a view's expression column, from its describe:
@@ -28558,10 +28774,15 @@ fn plan_alter_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descri
     let s = sql.trim_start();
     let create_sql = format!("CREATE VIEW {}", s[vk + "VIEW".len()..].trim_start());
     let (create, descs) = plan_create_view(&create_sql, db)?;
-    if let Plan::CreateView { name, blr, source, fields, contexts } = create {
-        Some((Plan::AlterView { name, blr, source, fields, contexts }, descs))
-    } else {
-        None
+    match create {
+        Plan::CreateView { name, blr, source, fields, contexts } => {
+            Some((Plan::AlterView { name, blr, source, fields, contexts }, descs))
+        }
+        // the same execute-phase refusal under the ALTER VIEW verb
+        Plan::CreateViewRefused { name, reason, .. } => {
+            Some((Plan::CreateViewRefused { name, reason, verb: 336397299 }, descs))
+        }
+        _ => None,
     }
 }
 
@@ -29635,7 +29856,7 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // INDEX / SEQUENCE / GENERATOR (the last two synonyms)
     let first = first_word_at(&masked, kind_start)?;
     let kind = [
-        "TABLE", "COLUMN", "INDEX", "SEQUENCE", "GENERATOR", "EXCEPTION", "ROLE", "DOMAIN",
+        "TABLE", "VIEW", "COLUMN", "INDEX", "SEQUENCE", "GENERATOR", "EXCEPTION", "ROLE", "DOMAIN",
         "PROCEDURE", "FUNCTION", "DATABASE",
     ]
     .into_iter()
@@ -29657,6 +29878,10 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         "TABLE" => {
             let name = canon_ident(target_str)?;
             fire_crab_ods::ddl::CommentTarget::Table(name)
+        }
+        "VIEW" => {
+            let name = canon_ident(target_str)?;
+            fire_crab_ods::ddl::CommentTarget::View(name)
         }
         "INDEX" => {
             let name = canon_ident(target_str)?;
@@ -35410,18 +35635,25 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         },
     };
     // every matching column must ride the insert list (its value is
-    // the WHERE comparand), and a NULL there would need blr_equiv
+    // the WHERE comparand). The comparison is the engine's blr_equiv -
+    // IS NOT DISTINCT FROM - not `=` (StmtNodes.cpp UpdateOrInsertNode
+    // builds the match with blr_equiv): a NULL value MATCHES a NULL
+    // column. Measured on 2182 (`qa/serve-real-dmlcheck.sh`): over (5,
+    // NULL, NULL), `VALUES (6, NULL, NULL) MATCHING (NAME, N)` updates
+    // row 5, a spelled NULL, `CAST(NULL AS ...)` and `UPPER(NULL)` all
+    // alike, and every row the key matches is updated (two NULL-N rows
+    // both take the new NAME; two rows given the same ID raise the PK
+    // violation). With `=` this server INSERTED a second row where the
+    // engine updates - a silent wrong answer - and refused a spelled
+    // NULL outright.
     let mut wheres: Vec<String> = Vec::new();
     let mut upd_args: Vec<usize> = val_slots.concat();
     for m in &mcols {
         let pos = cols.iter().position(|c| c == m)?;
-        if vals[pos].trim().eq_ignore_ascii_case("NULL") {
-            return None;
-        }
         // RE-RENDERED through [render_canon_ref]: the names are canonical
         // and the two halves are PARSED AGAIN - a bare `a` there is A
         // (review-caught: `MATCHING ("a")` wrote column A)
-        wheres.push(format!("{} = {}", render_canon_ref(&cols[pos]), vals[pos]));
+        wheres.push(format!("{} IS NOT DISTINCT FROM {}", render_canon_ref(&cols[pos]), vals[pos]));
         upd_args.extend_from_slice(&val_slots[pos]);
     }
     let sets: Vec<String> = cols
@@ -37450,6 +37682,8 @@ fn execute_dml_collecting_inner(
             fire_crab_ods::ddl::drop_view(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
+        // the engine's execute-phase refusal, nothing written
+        Plan::CreateViewRefused { reason, .. } => return Err(ExecErr::Text(reason.clone())),
         Plan::CreateFunction { name, args, deterministic, source, blr } => {
             fire_crab_ods::ddl::restore_carried_function(&mut work, db.page_size, name, args, 0, *deterministic, source, blr, None, None, None, false, None)?;
             (0, 0, 0)
@@ -62108,7 +62342,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::CreateViewRefused { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. } | Plan::AlterFunction { .. } | Plan::CreateOrAlterFunction { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -62233,7 +62467,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::CreateViewRefused { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. } | Plan::AlterFunction { .. } | Plan::CreateOrAlterFunction { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -65927,7 +66161,7 @@ fn emit_rows_inner(
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::CreateViewRefused { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. } | Plan::AlterFunction { .. } | Plan::CreateOrAlterFunction { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -96697,6 +96931,12 @@ fn plan_recreate(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descript
         .or_else(|| plan_create_exception(&create_sql))
         .or_else(|| plan_create_sequence(&create_sql))
         .or_else(|| plan_create_function(&create_sql, db))?;
+    // a CREATE VIEW the engine refuses at execute is served UNWRAPPED, so
+    // nothing is dropped: the statement fails as a whole and the old view
+    // stays (measured), under the RECREATE VIEW verb
+    if let Plan::CreateViewRefused { name, reason, .. } = create {
+        return Some((Plan::CreateViewRefused { name, reason, verb: 336397301 }, descs));
+    }
     recreate_drop_plan(&create)?;
     Some((Plan::Recreate(Box::new(create)), descs))
 }
@@ -109866,7 +110106,7 @@ fn after_auth(
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
-                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
+                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::CreateViewRefused { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. } | Plan::AlterFunction { .. } | Plan::CreateOrAlterFunction { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
                         | Plan::CreateProcedure { .. }

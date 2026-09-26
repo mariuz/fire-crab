@@ -10,10 +10,11 @@
 # validates fire-crab's file.
 # Views (RDB$VIEW_RELATIONS), procedures (RDB$DEPENDENCIES type 5) and the
 # FK/PK back-reference (RDB$RELATION_CONSTRAINTS / RDB$REF_CONSTRAINTS) all
-# block, matching the engine's vector and count. Boundary (recorded): a
-# table referenced ONLY by a TRIGGER on another table is refused by the
-# engine but dropped by fire-crab (the rarer trigger-on-other dependent is
-# not counted).
+# block, matching the engine's vector and count. A table referenced ONLY
+# by a TRIGGER on another table was a recorded boundary (dropped here,
+# refused by the engine) until the dependency count became the engine's
+# own two checks, shared with DROP VIEW (serve-real-dmlcheck): it is a
+# pinned refusal now.
 #
 #   qa/serve-real-dropdeps.sh [port]
 set -u
@@ -85,14 +86,10 @@ check "two dependent procedures block the drop (N=2)" "$(run "$FC" "$q4")" "$(ru
 # a table that is BOTH a FK parent AND has a dependent view: FK/PK wins
 q5="DROP TABLE PBOTH; COMMIT; SELECT COUNT(*) AS C FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='PBOTH';"
 check "FK/PK takes precedence over a dependent view" "$(run "$FC" "$q5")" "$(run "$EN" "$q5")"
-# Boundary: a table referenced only by a TRIGGER on another table - the
-# engine refuses (there are 1 dependencies), fc drops (it counts views and
-# procedures, not triggers-on-other-tables)
-eb=$(run "$EN" "DROP TABLE SOLO; COMMIT; SELECT COUNT(*) AS C FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='SOLO';")
-cb=$(run "$FC" "DROP TABLE SOLO; COMMIT; SELECT COUNT(*) AS C FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='SOLO';")
-ran=$((ran + 1))
-if [ "$eb" != "$cb" ] && [ "${eb#*dependencies}" != "$eb" ]; then
-    echo "OK   boundary: a trigger-on-another-table sole dependent is refused by the engine, dropped by fc"
-else echo "DIFF boundary MOVED: trigger-on-other"; echo "     engine: $eb"; echo "     fc: $cb"; fail=1; fi
+# a table referenced only by a TRIGGER on another table: the engine's
+# RDB$DEPENDENCIES check counts the trigger (there are 1 dependencies),
+# and so does fc's since the shared dependents helper
+q6="DROP TABLE SOLO; COMMIT; SELECT COUNT(*) AS C FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='SOLO';"
+check "a trigger-on-another-table sole dependent blocks the drop" "$(run "$FC" "$q6")" "$(run "$EN" "$q6")"
 echo "ran $ran checks"
 exit $fail
