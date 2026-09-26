@@ -315,15 +315,17 @@ bref "LIST(*) refuses" "SELECT LIST(*) FROM T;"
 # cannot reproduce: a content dedupe would answer WRONG, so fc refuses
 bref "LIST(DISTINCT <blob column>) refuses" "SELECT LIST(DISTINCT B) FROM T;"
 # ... and DISTINCT over a NON-BINARY collation dedupes by the collation key
-# there - fc's binary compare would dedupe wrong, so it refuses too
-ran=$((ran + 1))
-"$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" >/dev/null 2>&1 <<'SQL'
+# there. PROMOTED 2026-09-26 (serve-real-collkey): fc dedupes by the key
+# now and keeps the engine's survivor - the byte-greatest of the spellings
+# the collation calls one ('aa' out of {Aa, aa}), the distinct sort's
+# second key being the value itself
+for dbf in "$A" "$B"; do
+"$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$( [ "$dbf" = "$A" ] && echo "$PORT" || echo "$REAL" ):$dbf" >/dev/null 2>&1 <<'SQL'
 CREATE TABLE TCO (G INTEGER, VC VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE_CI);
 INSERT INTO TCO VALUES (1, 'Aa'); INSERT INTO TCO VALUES (1, 'aa'); COMMIT;
 SQL
-cco=$(echo "SELECT LIST(DISTINCT VC) FROM TCO;" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1)
-case "$cco" in *"Dynamic SQL Error"*) echo "OK   LIST(DISTINCT <collated column>) refuses";;
-    *) echo "DIFF collated DISTINCT answered: [$cco]"; fail=1;; esac
+done
+cq "LIST(DISTINCT <collated column>) dedupes by the collation, the byte-greatest spelling surviving" "SELECT LIST(DISTINCT VC) FROM TCO;"
 
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))

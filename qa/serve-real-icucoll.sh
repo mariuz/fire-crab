@@ -366,11 +366,14 @@ both "CONTAINING under each ICU collation" \
 refuses "CONTAINING under PXW_INTL - its canonical table is not converted" \
   "SELECT ID FROM T WHERE W CONTAINING 'PPL' ORDER BY ID;"
 refuses "SIMILAR TO" "SELECT ID FROM T WHERE CI SIMILAR TO 'A.*' ORDER BY ID;"
-refuses "GROUP BY under CI - the surviving SPELLING is unpinnable" \
+# PROMOTED 2026-09-26 (serve-real-collkey): the surviving spelling IS
+# pinnable - the last row of the engine's sort record order - and these
+# answer the engine's rows now
+both "GROUP BY under CI - the surviving SPELLING follows the record order" \
   "SELECT CI, COUNT(*) FROM T GROUP BY CI;"
-refuses "...and under CI_AI" "SELECT AI, COUNT(*) FROM T GROUP BY AI;"
-refuses "DISTINCT under CI - the same question" "SELECT DISTINCT CI FROM T;"
-refuses "a distinct UNION over one" "SELECT CI FROM T UNION SELECT CI FROM T;"
+both "...and under CI_AI" "SELECT AI, COUNT(*) FROM T GROUP BY AI;"
+both "DISTINCT under CI - the same question" "SELECT DISTINCT CI FROM T;"
+both "a distinct UNION over one" "SELECT CI FROM T UNION SELECT CI FROM T;"
 refuses "MIN over an EXPRESSION reading a collated column" \
   "SELECT MIN(UPPER(CI)) FROM T;"
 both "a JOIN keyed on it" \

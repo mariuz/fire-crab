@@ -148,9 +148,12 @@ both "...and the same in a WHERE" "SELECT ID FROM C WHERE S COLLATE NOSUCHCOLL =
 both "COLLATE on a non-TEXT operand" "SELECT ID FROM C ORDER BY ID COLLATE UNICODE;"
 
 # ---- what still refuses -------------------------------------------------
-refuses "GROUP BY under a written collation" \
+# PROMOTED 2026-09-26 (serve-real-collkey): a written collation on a group
+# key or a projected column is carried as the key's own ttype now, so both
+# bucket by it and answer the engine's rows
+both "GROUP BY under a written collation" \
   "SELECT S COLLATE UNICODE X, COUNT(*) N FROM C GROUP BY S COLLATE UNICODE;"
-refuses "DISTINCT under one" "SELECT DISTINCT S COLLATE UNICODE FROM C;"
+both "DISTINCT under one" "SELECT DISTINCT S COLLATE UNICODE FROM C;"
 
 # ---- the engine still reads fire-crab's file ----------------------------
 eng_q="SET LIST ON; SELECT ID, S, CI, UC FROM C ORDER BY ID;"
