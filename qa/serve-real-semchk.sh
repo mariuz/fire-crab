@@ -44,17 +44,33 @@
 #      and every -206, and never for a UNION ALL chain, which the engine
 #      locks. `SELECT 1 FROM RDB$DATABASE WITH LOCK` answered here.
 #
+# SECOND ROUND (the review of the first): a recursive member's
+# select-list SUBQUERY may aggregate - only the member's own aggregate
+# is the refusal (nine answers had become refusals); the "not used"
+# warning rides the FIRST prepare of a text only, the engine's statement
+# cache serving a repeat silently; the -206 pass order continued - the
+# select list's PLAIN FIELD items first, a CASE / IIF / DECODE / SUBSTRING
+# / window frame with its children passed LAST FIRST, `= ANY / SOME / ALL
+# (SELECT ..)` like IN, GEN_ID's second argument; a PLAN before WITH LOCK
+# and a WITH prefix ahead of the locked table, whose parser refusal
+# carries the unused CTEs' warnings.
+#
 # RECORDED, not fixed (every one a refusal on this server, never a wrong
 # answer): a quoted CTE name; a CTE referenced only inside a subquery or
 # a derived table; a nested WITH; a bare (unqualified) unknown column,
-# whose -206 this server does not spell; the same reference in a CASE
-# (the engine reads the THEN branch first); a UNION's ORDER BY and a
-# plain column beside a HAVING (the engine's -104s); an EXECUTE BLOCK or
-# a CREATE VIEW / PROCEDURE carrying any of the five (the engine's
-# vector, sometimes under "unsuccessful metadata update"); a
-# parenthesised join, `USING`, FIRST / ROWS or a subquery beside a
-# recursive member, two recursive members, two recursive CTEs; a bare
-# unknown column under WITH LOCK.
+# whose -206 this server does not spell; a UNION's ORDER BY and a plain
+# column beside a HAVING (the engine's -104s); a statement whose SYNTAX
+# the engine's parser refuses (a Token unknown) carrying a -206 here; an
+# EXECUTE BLOCK or a CREATE VIEW / PROCEDURE carrying any of the five
+# (the engine's vector, sometimes under "unsuccessful metadata update");
+# a parenthesised join, `USING`, FIRST / ROWS / ORDER BY, a derived table
+# the WHERE reads or a grouped IN-subquery beside a recursive member, a
+# windowed or LIST subquery in one, two recursive members, two recursive
+# CTEs; an aggregate misplaced inside a member's subquery (the engine's
+# own -104s); a bare unknown column under WITH LOCK; a PLAN over a user
+# table under WITH LOCK; a star over a join inside a derived table (a
+# NATURAL JOIN's merged column answers on the engine, a JOIN ON's pair is
+# its duplicate - this server calls both an unnamed column).
 #
 # Usage: qa/serve-real-semchk.sh [port]   (default 5950)
 set -u
@@ -409,7 +425,7 @@ pin  "3b ...ORDER BY in text order" "select t.id from t1 t order by t.id, t1.a d
 pin  "3b ...GROUP BY in text order" "select t.id from t1 t group by t.id, t1.a, t1.b;" "$E206|-\"T1\".\"A\"|-At line 1, column 38"
 pin  "3b ...a select-list subquery AFTER the plain items" "select (select t1.a from rdb\$database), t1.b from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 41"
 pin  "3b ...the first UNION member first" "select t.id from t1 t where t1.a = 1 union all select t.id from t1 t where t1.b = 2;" "$E206|-\"T1\".\"A\"|-At line 1, column 29"
-err_differs "3 RECORDED the THEN branch of a CASE is read before its condition" "select t.id from t1 t where case when t1.a = 1 then t1.b else 0 end > 0;" "column 53"
+pin  "3 the THEN branch of a CASE is read before its condition (promoted: recorded in the first round)" "select t.id from t1 t where case when t1.a = 1 then t1.b else 0 end > 0;" "$E206|-\"T1\".\"B\"|-At line 1, column 53"
 err_differs "3 RECORDED a UNION's ORDER BY is the union's -104" "select t.id from t1 t union all select t.id from t1 t order by t1.id;" "invalid ORDER BY clause"
 err_differs "3 RECORDED a plain column beside a HAVING is the select list's -104" "select t.id from t1 t having t1.id = 1;" "Invalid expression in the select list"
 err_differs "3 RECORDED a bare unknown column" "select t.id from t1 t where nosuch = 1;" "Column unknown|-\"NOSUCH\""
@@ -538,11 +554,193 @@ err_differs "5 RECORDED inside an EXECUTE BLOCK" "$(eb 'execute block returns (n
 err_differs "5 RECORDED ...FOR SELECT" "$(eb 'execute block returns (n integer) as begin for select 1 from rdb$database with lock into :n do suspend; end')" "$SYSDB"
 err_differs "5 RECORDED CREATE PROCEDURE" "$(eb 'create procedure psem2 returns (n integer) as begin select 1 from rdb$database with lock into n; suspend; end')" "$SYSDB"
 
+echo "--- 4c. A SUBQUERY's AGGREGATE IS NOT THE MEMBER's (the review's regression: nine answers refused)"
+RM="with recursive r (n, m) as (select 1, 0 from rdb\$database union all"
+AGG="$R104|-Recursive member of CTE cannot use aggregate or window function"
+ONLYFROM="$R104|-Recursive CTE member (\"R\") can refer itself only in FROM clause"
+pin  "4c a correlated COUNT(*) in the select list" "$RM select r.n + 1, (select count(*) from t3 where t3.k = r.n) from r where r.n < 3) select * from r;" "N M|1 0|2 2|3 1"
+pin  "4c ...(SELECT MAX(K)) + R.N" "$RM select r.n + 1, (select max(k) from t3) + r.n from r where r.n < 3) select * from r;" "N M|1 0|2 3|3 4"
+pin  "4c ...under COALESCE" "$RM select r.n + 1, coalesce((select max(k) from t3), 0) from r where r.n < 3) select * from r;" "N M|1 0|2 2|3 2"
+pin  "4c ...GROUP BY / HAVING inside the subquery" "$RM select r.n + 1, (select max(k) from t3 group by k having max(k) > 1) from r where r.n < 3) select * from r;" "N M|1 0|2 2|3 2"
+pin  "4c ...a bare MAX subquery" "$RM select r.n + 1, (select max(k) from t3) from r where r.n < 3) select * from r;" "N M|1 0|2 2|3 2"
+pin  "4c ...a bare COUNT(*) subquery" "$RM select r.n + 1, (select count(*) from t3) from r where r.n < 3) select * from r;" "N M|1 0|2 4|3 4"
+pin  "4c ...a correlated MAX" "$RM select r.n + 1, (select max(k) from t3 where t3.k = r.n) from r where r.n < 3) select * from r;" "N M|1 0|2 1|3 2"
+pin  "4c ...in a CASE condition" "$RM select r.n + 1, case when (select max(k) from t3) > 1 then 1 else 0 end from r where r.n < 3) select * from r;" "N M|1 0|2 1|3 1"
+pin  "4c ...R.M + the subquery" "$RM select r.n + 1, r.m + (select count(*) from t3 where t3.k = r.n) from r where r.n < 3) select * from r;" "N M|1 0|2 2|3 3"
+pin  "4c ...COUNT(DISTINCT K)" "$RM select r.n + 1, (select count(distinct k) from t3) from r where r.n < 3) select * from r;" "N M|1 0|2 2|3 2"
+pin  "4c ...an EXISTS inside the subquery" "$RM select r.n + 1, (select max(t3.k) from t3 where exists (select 1 from t2 where t2.id = t3.k)) from r where r.n < 3) select * from r;" "N M|1 0|2 2|3 2"
+pin  "4c ...a scalar subquery reading R.N" "$RM select r.n + 1, (select r.n from rdb\$database) from r where r.n < 3) select * from r;" "N M|1 0|2 1|3 2"
+pin  "4c ...an aggregate subquery in the WHERE" "$RM select r.n + 1, r.m from r where r.n < (select count(*) from t3)) select * from r;" "N M|1 0|2 0|3 0|4 0"
+pin  "4c ...MAX in the WHERE" "$RM select r.n + 1, (select count(*) from t3 where t3.k = r.n) from r where r.n < (select max(k) from t3)) select * from r;" "N M|1 0|2 2"
+pin  "4c ...a HAVING inside an EXISTS in the WHERE" "$RM select r.n + 1, r.m from r where exists (select 1 from t3 group by k having count(*) > 1) and r.n < 3) select * from r;" "N M|1 0|2 0|3 0"
+pin  "4c ...an aggregate derived table beside R" "$RM select r.n + 1, r.m from r, (select count(*) c from t3) d where r.n < 3) select * from r;" "N M|1 0|2 0|3 0"
+pin  "4c CONTROL the member's own MAX still refuses" "$RM select r.n + 1, max(r.m) from r where r.n < 3) select * from r;" "$AGG"
+pin  "4c CONTROL ...its own window function" "$RM select r.n + 1, sum(r.m) over () from r where r.n < 3) select * from r;" "$AGG"
+pin  "4c CONTROL ...under COALESCE" "$RM select r.n + 1, coalesce(max(r.m), 0) from r where r.n < 3) select * from r;" "$AGG"
+pin  "4c CONTROL ...in parentheses" "$RM select r.n + 1, (max(r.m)) from r where r.n < 3) select * from r;" "$AGG"
+pin  "4c CONTROL ...in a CASE condition" "$RM select r.n + 1, case when max(r.m) > 1 then 1 else 0 end from r where r.n < 3) select * from r;" "$AGG"
+pin  "4c CONTROL ...beside a subquery" "$RM select r.n + 1, (select count(*) from t3 where t3.k = r.n) + max(r.m) from r where r.n < 3) select * from r;" "$AGG"
+pin  "4c a subquery over R is the FROM-clause rule, not the aggregate one" "$RM select r.n + 1, (select count(*) from r) from r where r.n < 3) select * from r;" "$ONLYFROM"
+pin  "4c ...nested deeper" "$RM select r.n + 1, (select count(*) from t3 where t3.k = r.n and exists (select 1 from r)) from r where r.n < 3) select * from r;" "$ONLYFROM"
+pin  "4c ...GROUP BY still first" "$RM select r.n + 1, (select count(*) from t3 where t3.k = r.n) from r where r.n < 3 group by r.n, r.m) select * from r;" "$R104|-Recursive member of CTE 'R' has GROUP BY clause"
+pin  "4c ...HAVING still first" "$RM select r.n + 1, (select max(k) from t3) from r where r.n < 3 having count(*) > 0) select * from r;" "$R104|-Recursive member of CTE 'R' has HAVING clause"
+pin  "4c ...then the bare UNION's non-recursive member" "$RM select r.n + 1, (select count(*) from t3) from r where r.n < 3 union select 9, 9 from rdb\$database) select * from r;" "$R104|-CTE 'R' defined non-recursive member after recursive"
+pin  "4c ...an outer join beside the subquery" "$RM select r.n + 1, (select count(*) from t3) from r left join t3 on t3.k = r.n where r.n < 3) select * from r;" "$OJ"
+pin  "4c ...a CROSS JOIN beside it" "$RM select r.n + 1, (select count(*) from t3) from r cross join t3 where r.n < 3 and t3.k = r.n) select * from r;" "$ONLYFROM"
+refused "4c RECORDED a windowed subquery (the planner's -204, as before)" "$RM select r.n + 1, (select sum(k) over () from t3 rows 1) from r where r.n < 3) select * from r;"
+refused "4c RECORDED a LIST subquery" "with recursive r (n, m) as (select 1, cast('' as varchar(50)) from rdb\$database union all select r.n + 1, (select list(name) from t3) from r where r.n < 3) select * from r;"
+refused "4c RECORDED an ORDER BY in the member" "$RM select r.n + 1, (select count(*) from t3) from r where r.n < 3 order by r.n) select * from r;"
+refused "4c RECORDED a derived table the WHERE reads" "$RM select r.n + 1, (select max(k) from t3 where t3.k = r.n) from r, (select max(k) mk from t3) d where r.n < d.mk) select * from r;"
+refused "4c RECORDED IN (a grouped subquery)" "$RM select r.n + 1, r.m from r where r.n < 3 and r.n in (select k from t3 group by k)) select * from r;"
+err_differs "4c RECORDED an aggregate in a subquery's WHERE (the engine's aggregate message)" "$RM select r.n + 1, (select 1 from t3 where max(r.m) > 1 rows 1) from r where r.n < 3) select * from r;" "cannot use aggregate or window function"
+err_differs "4c RECORDED ...GROUP BY R.N inside a subquery" "$RM select r.n + 1, (select r.n from t3 group by r.n) from r where r.n < 3) select * from r;" "Cannot use an aggregate or window function in a GROUP BY clause"
+err_differs "4c RECORDED ...COUNT(*) in an EXISTS's WHERE" "$RM select r.n + 1, r.m from r where r.n < 3 and exists (select 1 from t3 left join t2 on t2.id = t3.k where t3.k = r.n and count(*) > 0)) select * from r;" "Cannot use an aggregate or window function in a WHERE clause"
+
+echo "--- 2c. THE WARNING RIDES THE FIRST PREPARE OF A TEXT ONLY (the engine's statement cache serves a repeat silently)"
+W6="with c as (select 1 x from rdb\$database) select 6 from rdb\$database;"
+W6S="with c as (select 1 x from rdb\$database)  select 6 from rdb\$database;"
+W7="with c as (select 1 x from rdb\$database), d as (select 2 y from rdb\$database) select 7 from rdb\$database;"
+WC="$W104|-CTE \"C\" $NOTUSED"
+pin  "2c the same text twice: one warning" "$W6
+$W6" "$WC|CONSTANT|6|CONSTANT|6"
+pin  "2c ...three times" "$W6
+$W6
+$W6" "$WC|CONSTANT|6|CONSTANT|6|CONSTANT|6"
+pin  "2c ...a whitespace variant warns again" "$W6
+$W6
+$W6S" "$WC|CONSTANT|6|CONSTANT|6|$WC|CONSTANT|6"
+pin  "2c ...and its own repeat does not" "$W6
+$W6S
+$W6S
+$W6" "$WC|CONSTANT|6|$WC|CONSTANT|6|CONSTANT|6|CONSTANT|6"
+pin  "2c ...across a COMMIT" "$W6
+commit;
+$W6" "$WC|CONSTANT|6|CONSTANT|6"
+pin  "2c ...with another statement between" "$W6
+select 1 from rdb\$database;
+$W6" "$WC|CONSTANT|6|CONSTANT|1|CONSTANT|6"
+pin  "2c ...two CTEs, one header" "$W7
+$W7" "$W104|-CTE \"C\" $NOTUSED|-CTE \"D\" $NOTUSED|CONSTANT|7|CONSTANT|7"
+pin  "2c ...a locking statement" "with c as (select 1 x from rdb\$database) select t.id from t1 t where t.id = 1 with lock;
+with c as (select 1 x from rdb\$database) select t.id from t1 t where t.id = 1 with lock;" "$WC|ID|1|ID|1"
+pin  "2c ...the conflict error carries them every time" "with c as (select 1 x from rdb\$database) select 1 from t1 c;
+with c as (select 1 x from rdb\$database) select 1 from t1 c;" "$A204 \"C\" $CONF|$WC|$A204 \"C\" $CONF|$WC"
+
+echo "--- 3c. THE PASS ORDER, CONTINUED: plain fields first, a CASE last child first, a quantified subquery first"
+pin  "3c a plain field is named before an expression ahead of it" "select cast(t1.a as integer), t1.b from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 31"
+pin  "3c ...UPPER(T1.V), T1.B" "select upper(t1.v), t1.b from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 21"
+pin  "3c ...T1.A + 1, T1.B" "select t1.a + 1, t1.b from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 18"
+pin  "3c ...COUNT(*), T1.A" "select count(*), t1.a from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 18"
+pin  "3c ...EXTRACT(YEAR FROM T1.D), T1.A" "select extract(year from t1.d), t1.a from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 33"
+pin  "3c ...a window, then T1.A" "select row_number() over (partition by t1.b order by t1.id), t1.a from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 62"
+pin  "3c ...T1.V || 'x', T1.A, T1.B" "select t1.v || 'x', t1.a, t1.b from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 21"
+pin  "3c ...\"T1\".A is plain" "select upper(t1.v), \"T1\".a from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 21"
+pin  "3c ...(T1.A) is plain" "select upper(t1.v), (t1.a) from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 22"
+pin  "3c ...T1.* is plain" "select upper(t1.v), t1.* from t1 t;" "$E206|-\"T1\".*|-At line 1, column 21"
+pin  "3c ...a subquery, then T1.A" "select (select t1.b from rdb\$database), upper(t1.v), t1.a from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 54"
+pin  "3c an aliased T1.A AS X is not plain" "select upper(t1.v), t1.a as x from t1 t;" "$E206|-\"T1\".\"V\"|-At line 1, column 14"
+pin  "3c ...nor T1.A X" "select upper(t1.v), t1.a x from t1 t;" "$E206|-\"T1\".\"V\"|-At line 1, column 14"
+pin  "3c ...nor -T1.A" "select upper(t1.v), -t1.a from t1 t;" "$E206|-\"T1\".\"V\"|-At line 1, column 14"
+pin  "3c ...nor T1.A + 0" "select upper(t1.v), t1.a + 0 from t1 t;" "$E206|-\"T1\".\"V\"|-At line 1, column 14"
+pin  "3c the rest in text order, subqueries inline" "select (select t1.a from rdb\$database), upper(t1.v) from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 16"
+pin  "3c ...T1.A + 1, UPPER(T1.V)" "select t1.a + 1, upper(t1.v) from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 8"
+pin  "3c ORDER BY has no such pass" "select t.id from t1 t order by upper(t1.v), t1.a;" "$E206|-\"T1\".\"V\"|-At line 1, column 38"
+pin  "3c ...nor GROUP BY" "select t.id from t1 t group by upper(t1.v), t1.a;" "$E206|-\"T1\".\"V\"|-At line 1, column 38"
+pin  "3c IIF: the ELSE value first" "select iif(t.a = 1, t1.b, t1.id) from t1 t;" "$E206|-\"T1\".\"ID\"|-At line 1, column 27"
+pin  "3c ...then the THEN value" "select iif(t1.a = 1, t1.b, t.id) from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 22"
+pin  "3c ...then the condition, its AND right first" "select iif(t1.a = 1 and t1.b = 2, t.a, t.a) from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 25"
+pin  "3c a searched CASE: the ELSE" "select case when t.a = 1 then t1.b else t1.id end from t1 t;" "$E206|-\"T1\".\"ID\"|-At line 1, column 41"
+pin  "3c ...the LAST pair's value before the first's" "select case when t.a = 1 then t1.b when t.a = 2 then t1.id else t.id end from t1 t;" "$E206|-\"T1\".\"ID\"|-At line 1, column 54"
+pin  "3c ...the last pair's condition before the first's" "select case when t1.a = 1 then t.b when t1.id = 2 then t.b end from t1 t;" "$E206|-\"T1\".\"ID\"|-At line 1, column 41"
+pin  "3c ...a pair's value before its condition" "select case when t1.a = 1 then t1.b when t.a = 2 then t.b end from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 32"
+pin  "3c ...the ELSE before a THEN subquery" "select case when t.a = 1 then (select t1.b from rdb\$database) else t1.id end from t1 t;" "$E206|-\"T1\".\"ID\"|-At line 1, column 68"
+pin  "3c ...the CASE before the operand after it" "select case when t.a = 1 then t1.b else t1.id end + t1.a from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 53"
+pin  "3c a simple CASE: the THEN values, the ELSE, the WHEN operands, the test" "select case t1.a when 1 then t1.b else t.id end from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 30"
+pin  "3c ...the value before the WHEN operand" "select case t.a when t1.b then t1.id else t.a end from t1 t;" "$E206|-\"T1\".\"ID\"|-At line 1, column 32"
+pin  "3c ...the ELSE before the test" "select case t.a when 1 then t.a else t1.id end from t1 t;" "$E206|-\"T1\".\"ID\"|-At line 1, column 38"
+pin  "3c ...the WHEN operands in order" "select case t1.a when t1.b then t.a when t1.id then t.a end from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 23"
+pin  "3c ...the test last" "select case t1.a when 1 then t.a end from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 13"
+pin  "3c DECODE is the simple CASE: the ELSE before the conditions" "select decode(t1.a, t1.b, t.b, t1.id) from t1 t;" "$E206|-\"T1\".\"ID\"|-At line 1, column 32"
+pin  "3c ...the values before the ELSE" "select decode(t.a, 1, t1.b, t1.id) from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 23"
+pin  "3c ...in order" "select decode(t.a, 1, t1.b, 2, t1.id, t.a) from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 23"
+pin  "3c COALESCE's arguments in order" "select coalesce(t1.a, t1.b) from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 17"
+pin  "3c a boolean select item: OR's right operand first" "select t1.a = t1.b or t1.id = 1 from t1 t;" "$E206|-\"T1\".\"ID\"|-At line 1, column 23"
+pin  "3c ...NOT stripped" "select not t1.a = t1.b from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 12"
+pin  "3c ...a CASE inside a WHERE, then the OR's left" "select 1 from t1 t where case when t.a = 1 then t1.b else 0 end = 1 or t1.id = 2;" "$E206|-\"T1\".\"ID\"|-At line 1, column 72"
+pin  "3c = ANY (SELECT ..): the subquery first" "select t.id from t1 t where t1.a = any (select u.x from t2 u where t1.b = 1);" "$E206|-\"T1\".\"B\"|-At line 1, column 68"
+pin  "3c ...SOME" "select t.id from t1 t where t1.a = some (select u.x from t2 u where t1.b = 1);" "$E206|-\"T1\".\"B\"|-At line 1, column 69"
+pin  "3c ...> ALL" "select t.id from t1 t where t1.a > all (select u.x from t2 u where t1.b = 1);" "$E206|-\"T1\".\"B\"|-At line 1, column 68"
+pin  "3c ...NOT IN" "select t.id from t1 t where t1.a not in (select u.x from t2 u where t1.b = 1);" "$E206|-\"T1\".\"B\"|-At line 1, column 69"
+pin  "3c ...a clean subquery, then the left side" "select t.id from t1 t where t1.a = any (select u.x from t2 u where t.id = 1);" "$E206|-\"T1\".\"A\"|-At line 1, column 29"
+pin  "3c CONTROL = (SELECT ..) is the left side first" "select t.id from t1 t where t1.a = (select u.x from t2 u where t1.b = 1);" "$E206|-\"T1\".\"A\"|-At line 1, column 29"
+pin  "3c CONTROL IN (a list) too" "select t.id from t1 t where t1.a in (t1.b, t1.id);" "$E206|-\"T1\".\"A\"|-At line 1, column 29"
+pin  "3c SUBSTRING: FOR, then FROM, then the value" "select substring(t1.v from t1.a for t1.b) from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 37"
+pin  "3c ...FROM before the value" "select substring(t1.v from t1.a) from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 28"
+pin  "3c ...a clean FOR" "select substring(t1.v from t1.a for t.b) from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 28"
+pin  "3c ...FOR alone" "select substring(t1.v from 1 for t1.a) from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 34"
+pin  "3c OVERLAY in order" "select overlay(t1.v placing t1.a from t1.b for t1.id) from t1 t;" "$E206|-\"T1\".\"V\"|-At line 1, column 16"
+pin  "3c TRIM: the characters before the value" "select trim(leading t1.v from t1.a) from t1 t;" "$E206|-\"T1\".\"V\"|-At line 1, column 21"
+pin  "3c ...the value" "select trim(t.v from t1.a) from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 22"
+pin  "3c GEN_ID's second argument is a value" "select gen_id(g, t1.a) from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 18"
+pin  "3c a window: ORDER BY before PARTITION BY" "select sum(t.a) over (partition by t1.b order by t1.id) from t1 t;" "$E206|-\"T1\".\"ID\"|-At line 1, column 50"
+pin  "3c ...the aggregate's argument before both" "select sum(t1.a) over (partition by t1.b order by t1.id) from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 12"
+pin  "3c ...PARTITION BY items in order" "select sum(t.a) over (partition by t1.b, t1.id) from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 36"
+pin  "3c ...ORDER BY items in order" "select sum(t.a) over (order by t1.b, t1.id) from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 32"
+pin  "3c ...the frame before ORDER BY" "select sum(t.a) over (partition by t1.b order by t1.id rows between t1.a preceding and current row) from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 69"
+pin  "3c ...the frame's end bound before its start" "select sum(t.a) over (partition by t1.b order by t.id rows between t1.a preceding and t1.id following) from t1 t;" "$E206|-\"T1\".\"ID\"|-At line 1, column 87"
+pin  "3c ...RANGE x PRECEDING" "select sum(t.a) over (partition by t1.b order by t.id range t1.a preceding) from t1 t;" "$E206|-\"T1\".\"A\"|-At line 1, column 61"
+pin  "3c ...ROW_NUMBER's window" "select row_number() over (partition by t1.b order by t1.id) from t1 t;" "$E206|-\"T1\".\"ID\"|-At line 1, column 54"
+pin  "3c ...an arithmetic argument" "select sum(t.a + t1.b) over (order by t1.id) from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 18"
+pin  "3c BETWEEN in order" "select t.a between t1.b and t1.id from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 20"
+pin  "3c LIKE .. ESCAPE in order" "select t.v like t1.v escape t1.v from t1 t;" "$E206|-\"T1\".\"V\"|-At line 1, column 17"
+pin  "3c CONTROL a searched CASE answers" "select case when t.a = 10 and t.b > 50 then 1 when t.a = 20 or t.id = 3 then 2 else 0 end from t1 t order by t.id;" "CASE|1|2|2|1|0|2"
+pin  "3c CONTROL a simple CASE" "select case t.a when 10 then 'ten' when 20 then 'twenty' else 'other' end from t1 t order by t.id;" "CASE|ten|twenty|other|ten|other|twenty"
+pin  "3c CONTROL a nested CASE" "select case when t.a = 10 then case when t.id = 1 then 'a' else 'b' end else 'c' end from t1 t order by t.id;" "CASE|a|c|c|b|c|c"
+pin  "3c CONTROL IIF" "select iif(t.a = 10, t.b, t.id) from t1 t order by t.id;" "CASE|100|2|3|400|5|6"
+pin  "3c CONTROL DECODE" "select decode(t.a, 10, 'ten', 20, 'twenty', 'other') from t1 t order by t.id;" "DECODE|ten|twenty|other|ten|other|twenty"
+pin  "3c CONTROL SUBSTRING FROM .. FOR" "select substring(t.v from 2 for 3) from t1 t order by t.id;" "SUBSTRING|ppl|ana|her|<null>|_b%|ppl"
+pin  "3c CONTROL a window with a frame" "select sum(t.a) over (order by t.id rows between 1 preceding and current row) from t1 t order by t.id;" "SUM|10|30|20|10|40|50"
+pin  "3c CONTROL a boolean select item" "select t.a = t.b or t.id = 1 from t1 t order by t.id;" "BOOL|<true>|<null>|<null>|<false>|<false>|<false>"
+pin  "3c CONTROL = ANY answers" "select count(*) from t1 t where t.a = any (select u.t1id * 10 from t2 u);" "COUNT|4"
+pin  "3c CONTROL <> ALL" "select count(*) from t1 t where t.a <> all (select u.x from t2 u where u.x is not null);" "COUNT|3"
+pin  "3c CONTROL a CASE in a WHERE beside an OR" "select count(*) from t1 t where case when t.a = 10 then 1 else 0 end = 1 or t.id = 5;" "COUNT|3"
+pin  "3c CONTROL BETWEEN .. AND beside an AND" "select t.id from t1 t where t.d between date '2020-01-01' and date '2021-12-31' and t.id > 0 order by t.id;" "ID|1|2|6"
+err_differs "3c RECORDED a syntax error the engine's parser reports first" "select first t1.a t.id from t1 t;" "Token unknown - line 1, column 16"
+err_differs "3c RECORDED ...ORDER BY before GROUP BY" "select t.id from t1 t where t.id = 1 order by t1.a group by t1.b;" "Token unknown - line 1, column 52"
+err_differs "3c RECORDED ...SUBSTRING's comma form" "select substring(t1.v, t1.a, t1.b) from t1 t;" "Token unknown - line 1, column 22"
+err_differs "3c RECORDED ...PARTITION BY after ORDER BY" "select sum(t.a) over (order by t1.id partition by t1.b) from t1 t;" "Token unknown"
+
+echo "--- 5c. WITH LOCK: a PLAN says nothing about the target, and the WITH prefix is transparent"
+pin  "5c a PLAN before WITH LOCK over the system table" "select * from rdb\$database plan (rdb\$database natural) with lock;" "$HY|$SYSDB"
+pin  "5c ...WHERE 0 = 1 PLAN" "select 1 from rdb\$database where 0 = 1 plan (rdb\$database natural) with lock;" "$HY|$SYSDB"
+pin  "5c ...COUNT(*) under a PLAN is the aggregates message" "select count(*) from rdb\$database plan (rdb\$database natural) with lock;" "$R104|-WITH LOCK cannot be used with aggregates"
+pin  "5c an unused CTE ahead of a locked user table: the warning and the row" "with c as (select 1 x from rdb\$database) select t.id from t1 t where t.id = 1 with lock;" "$W104|-CTE \"C\" $NOTUSED|ID|1"
+pin  "5c ...ahead of the system table: the refusal carries the warning" "with c as (select 1 x from rdb\$database) select 1 from rdb\$database with lock;" "$HY|$SYSDB|$W104|-CTE \"C\" $NOTUSED"
+pin  "5c ...two of them" "with c as (select 1 x from rdb\$database), d as (select 2 y from rdb\$database) select 1 from rdb\$database with lock;" "$HY|$SYSDB|$W104|-CTE \"C\" $NOTUSED|-CTE \"D\" $NOTUSED"
+pin  "5c ...a temporary table" "with c as (select 1 x from rdb\$database) select id from gtd with lock;" "$HY|Cannot select temporary table \"PUBLIC\".\"GTD\" for update WITH LOCK|$W104|-CTE \"C\" $NOTUSED"
+pin  "5c ...the DSQL aggregates message carries none" "with c as (select 1 x from rdb\$database) select count(*) from t1 with lock;" "$R104|-WITH LOCK cannot be used with aggregates"
+pin  "5c a CTE in a UNION ALL chain is not physical" "with c as (select 1 x from rdb\$database) select id from t1 union all select x from c with lock;" "$R104|-WITH LOCK can be used only with a single physical table"
+pin  "5c ...nor joined" "with c as (select 1 x from rdb\$database) select id from t1 t join c on c.x = t.id with lock;" "$R104|-WITH LOCK can be used only with a single physical table"
+pin  "5c ...nor comma-joined" "with c as (select 1 x from rdb\$database), d as (select 2 y from rdb\$database) select * from c, t1 with lock;" "$R104|-WITH LOCK can be used only with a single physical table"
+pin  "5c ...nor a recursive one" "with recursive r (n) as (select 1 from rdb\$database union all select r.n + 1 from r where r.n < 3) select * from r with lock;" "$R104|-WITH LOCK can be used only with a single physical table"
+pin  "5c ...an unknown table under a WITH is the -204" "with c as (select 1 x from rdb\$database) select * from nosuch with lock;" "Statement failed, SQLSTATE = 42S02|Dynamic SQL Error|-SQL error code = -204|-Table unknown|-\"NOSUCH\"|-At line 1, column 56"
+refused "5c RECORDED a PLAN over a user table (the planner does not take a PLAN)" "select id from t1 plan (t1 natural) with lock;"
+refused "5c RECORDED ...with a WHERE" "select id from t1 where id = 1 plan (t1 natural) with lock;"
+refused "5c RECORDED a CTE read only by a subquery, locked" "with c as (select 1 x from rdb\$database) select id from t1 where id in (select x from c) with lock;"
+err_differs "5c RECORDED a PLAN ahead of the WHERE (the engine's parser refuses it)" "select * from t1 t plan (t natural) where t.id = 1 with lock;" "Token unknown"
+
+echo "--- 1c. RECORDED: a star over a join inside a derived table"
+refused "1c RECORDED a NATURAL JOIN's star (one merged ID: the engine answers)" "select * from (select * from t1 natural join t2) x where x.id = 1;"
+refused "1c RECORDED ...JOIN USING" "select * from (select * from t1 join t2 using (id)) x where x.id = 1;"
+refused "1c RECORDED ...T1.*, T2.X" "select * from (select t1.*, t2.x from t1 join t2 on t1.id = t2.id) x where x.id = 1;"
+err_differs "1c RECORDED a JOIN ON's star: the engine's duplicate ID, this server's unnamed column" "select * from (select * from t1 join t2 on t1.id = t2.id) x where x.id = 1;" "column ID $DUP X"
+pin  "1c CONTROL the top-level NATURAL JOIN star answers" "select count(*) from t1 natural join t2 where id = 1;" "COUNT|1"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-semchk-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 300 ]; then echo "FAIL only $ran checks ran (floor 300)"; fail=1; fi
+if [ "$ran" -lt 430 ]; then echo "FAIL only $ran checks ran (floor 430)"; fail=1; fi
 exit $fail

@@ -2830,6 +2830,42 @@ fn build_records_info(inserted: i32, updated: i32, deleted: i32) -> Vec<u8> {
 /// code = -104` / `-CTE "C" is not used in query`, then the rows).
 fn respond_prepare(s: &mut TcpStream, enc: &mut Option<Rc4>, describe: &[u8]) -> std::io::Result<()> {
     let warnings = PREPARE_WARNINGS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    write_prepare_response(s, enc, describe, &warnings)
+}
+
+/// THE WARNINGS RIDE THE FIRST PREPARE OF A TEXT ONLY. The engine keeps
+/// a prepared statement in its per-attachment DSQL statement cache, and
+/// a repeat of the IDENTICAL text is served from it - no DSQL pass, no
+/// "CTE is not used" warning (measured: `WITH C AS (..) SELECT 6 FROM
+/// RDB$DATABASE` warned on its first prepare in an attachment and on
+/// none of its repeats, across a COMMIT too, while a variant with one
+/// more space warned again; a two-CTE text the same). This server plans
+/// a SELECT on every prepare, so it remembers the texts it warned on
+/// instead, per attachment, and drops the warnings of a repeat. Called
+/// between the plan and the response, with the text as the client sent
+/// it - the cache's own key.
+fn take_repeat_warnings(db: &Option<Database>, text: &str) {
+    let Some(db) = db.as_ref() else { return };
+    if PREPARE_WARNINGS.with(|p| p.borrow().is_empty()) {
+        return;
+    }
+    let mut warned = db.warned_texts.borrow_mut();
+    // bounded the way the engine's cache is: a full one starts over
+    if warned.len() >= 4096 {
+        warned.clear();
+    }
+    if !warned.insert(text.to_string()) {
+        PREPARE_WARNINGS.with(|p| p.borrow_mut().clear());
+    }
+}
+
+/// [respond_prepare]'s body, with the warnings it carries made explicit.
+fn write_prepare_response(
+    s: &mut TcpStream,
+    enc: &mut Option<Rc4>,
+    describe: &[u8],
+    warnings: &[String],
+) -> std::io::Result<()> {
     let mut w = W::default();
     w.int(OP_RESPONSE)
         .int(0)
@@ -2843,7 +2879,7 @@ fn respond_prepare(s: &mut TcpStream, enc: &mut Option<Rc4>, describe: &[u8]) ->
         // error and the connection dies on it (measured: isql printed the
         // warning and then "Error reading data from the connection")
         w.int(1).int(0);
-        write_cte_unused_warnings(&mut w, &warnings);
+        write_cte_unused_warnings(&mut w, warnings);
     }
     w.int(0);
     w.send(s, enc)
@@ -3106,6 +3142,10 @@ struct Database {
     /// generation - another connection's DDL moves it, and every plan
     /// compiled under the old one becomes unreachable by key.
     stmts: crate::stmc::DbStatements<Plan, Descriptor>,
+    /// the statement texts whose prepare WARNINGS this attachment has
+    /// already been given - the engine's statement cache serves a
+    /// repeated text without them ([take_repeat_warnings])
+    warned_texts: std::cell::RefCell<std::collections::HashSet<String>>,
     /// the event names this transaction has posted, so its commit can
     /// say what the counters became - the only thing observable about an
     /// event until the auxiliary connection carries deliveries.
@@ -5176,6 +5216,7 @@ fn load_database(path: &str) -> Option<Database> {
         events,
         meta,
         stmts: Default::default(),
+        warned_texts: Default::default(),
         locks,
         lock_owner,
             did_ddl: false,
@@ -44510,10 +44551,21 @@ fn recursive_member_verdict(name: &str, member: &str) -> Option<EvalErr> {
     if having.is_some() {
         return Some(EvalErr::CteWrongClause { name: name.to_string(), clause: "HAVING" });
     }
-    // an aggregate or a window function in the select list
+    // an aggregate or a window function in the select list - the
+    // MEMBER'S OWN, never a subquery's: `(SELECT COUNT(*) FROM T3 WHERE
+    // T3.K = R.N)` beside `R.N + 1` answers (measured, eleven shapes: a
+    // MAX, a COUNT, a LIST, a windowed SUM, a GROUP BY / HAVING inside
+    // the subquery, a subquery under COALESCE / CASE / an arithmetic),
+    // and this scanned the whole list and refused every one of them
+    // where the integration binary answered
     let b = pu.as_bytes();
     let mut i = 0;
     while i < b.len() {
+        if b[i] == b'(' && pu[i + 1..].trim_start().starts_with("SELECT") {
+            let Some(close) = matching_paren(b, i) else { return None };
+            i = close + 1;
+            continue;
+        }
         if b[i].is_ascii_alphabetic() {
             let st = i;
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
@@ -44588,12 +44640,16 @@ fn recursive_cte_verdict(name: &str, source: &str) -> Option<EvalErr> {
 // this server resolved as if the alias were optional. The engine reports
 // the FIRST such reference IN ITS OWN PASS ORDER, measured over ~90
 // shapes: the FROM's ON conditions and derived bodies first, then WHERE,
-// the select list, ORDER BY, GROUP BY, HAVING; inside a boolean the
-// RIGHT operand of AND / OR is passed first (so a chain reports its last
-// bad term), a comparison's left side first, an arithmetic's right
-// operand first, a subquery inline where it sits - except `IN (SELECT
-// ..)`, whose subquery precedes its left side, and a select-list
-// subquery, passed after the plain items.
+// the select list - its PLAIN FIELD items before everything else in it -
+// ORDER BY, GROUP BY, HAVING; inside a boolean the RIGHT operand of AND
+// / OR is passed first (so a chain reports its last bad term), a
+// comparison's left side first, an arithmetic's right operand first, a
+// subquery inline where it sits - except a quantified one (`IN`, `= ANY
+// / SOME / ALL (SELECT ..)`), which precedes its left side. A node the
+// parser builds with several children (a CASE, a SUBSTRING, a window
+// frame) has them passed LAST FIRST: the engine's dsqlPass builds the
+// new node with the passed children as constructor arguments, and its
+// compiler evaluates those right to left ([QualCtx::operand]).
 // -------------------------------------------------------------------
 
 /// One name a qualified reference may resolve through at one query
@@ -44710,9 +44766,40 @@ fn first_unresolved_qualifier(sql: &str, dbo: &Option<Database>) -> Option<EvalE
 }
 
 /// Words a dotted name may legally follow without naming a column: a
-/// sequence (`NEXT VALUE FOR PUBLIC.G`), a cast target (`AS PUBLIC.D`,
-/// `TYPE OF COLUMN T.C`), a collation, a PLAN's index, a character set.
+/// sequence (`NEXT VALUE FOR PUBLIC.G` - the FOR counts only after
+/// VALUE, since SUBSTRING's `FOR T1.B` is a value), a cast target (`AS
+/// PUBLIC.D`, `TYPE OF COLUMN T.C`), a collation, a PLAN's index, a
+/// character set.
 const QUAL_SKIP_AFTER: [&str; 8] = ["FOR", "AS", "COLLATE", "COLUMN", "INDEX", "ORDER", "OF", "SET"];
+
+/// Does `s` open a parenthesised subquery - `(SELECT ..`, whitespace
+/// aside?
+fn paren_select(s: &str) -> bool {
+    let s = s.trim_start();
+    s.starts_with('(') && s[1..].trim_start().starts_with("SELECT")
+}
+
+/// [find_word_depth0] that also steps over every `CASE .. END`: the AND
+/// / OR of a WHEN condition belong to the CASE, not to the boolean
+/// around it.
+fn find_word_outside_case(masked_up: &str, word: &str, from: usize) -> Option<usize> {
+    let mut cand = find_word_depth0(masked_up, word, from);
+    loop {
+        let p = cand?;
+        let count = |w: &str| {
+            let (mut n, mut at) = (0usize, 0usize);
+            while let Some(c) = find_word(&masked_up[..p], w, at) {
+                n += 1;
+                at = c + w.len();
+            }
+            n
+        };
+        if count("CASE") <= count("END") {
+            return Some(p);
+        }
+        cand = find_word_depth0(masked_up, word, p + word.len());
+    }
+}
 
 impl QualCtx<'_> {
     /// the masked, upper-cased twin of a slice of the statement
@@ -44985,54 +45072,81 @@ impl QualCtx<'_> {
         false
     }
 
-    /// A comma list of values (a select list, an ORDER BY, a GROUP BY)
-    /// in text order. `defer_sub` is the select list's rule: its
-    /// subqueries are passed after its plain items (measured: `SELECT
-    /// (SELECT T1.A ..), T1.B FROM T1 T` reports T1.B).
-    fn list(&self, text: &str, scopes: &[Vec<ScopeQual>], defer_sub: bool) -> QualScan {
-        for item in split_top_level_commas(text) {
-            match self.value(item, scopes, defer_sub) {
+    /// A comma list of values (an ORDER BY, a GROUP BY) in text order -
+    /// except the SELECT LIST, whose PLAIN FIELD items the engine passes
+    /// before everything else, the rest then in text order with their
+    /// subqueries inline. Plain: `T1.B`, `T1.*`, `"T1".A`, `(T1.A)` -
+    /// not an aliased `T1.A X`, a signed `-T1.A`, a computed `T1.A + 0`,
+    /// which the parser wraps in a node of its own (measured: `SELECT
+    /// CAST(T1.A AS INTEGER), T1.B FROM T1 T` names T1.B, `UPPER(T1.V),
+    /// T1.A AS X` names T1.V, `(SELECT T1.A ..), UPPER(T1.V)` names T1.A,
+    /// `(SELECT T1.B ..), UPPER(T1.V), T1.A` names T1.A).
+    fn list(&self, text: &str, scopes: &[Vec<ScopeQual>], select_list: bool) -> QualScan {
+        let items = split_top_level_commas(text);
+        if select_list {
+            for item in items.iter().filter(|i| self.is_plain_field(i)) {
+                match self.refs(item, scopes) {
+                    QualScan::Clean => {}
+                    other => return other,
+                }
+            }
+        }
+        // a boolean item (`T1.A = T1.B OR T1.ID = 1` in a select list)
+        // reads as a boolean: its OR's right operand first (measured)
+        for item in items.iter().filter(|i| !select_list || !self.is_plain_field(i)) {
+            match self.boolean(item, scopes) {
                 QualScan::Clean => {}
                 other => return other,
             }
         }
-        if defer_sub {
-            return self.subqueries_only(text, scopes);
-        }
         QualScan::Clean
     }
 
-    /// The subqueries of `text`, outermost ones in text order, each read
-    /// as a query level.
-    fn subqueries_only(&self, text: &str, scopes: &[Vec<ScopeQual>]) -> QualScan {
-        let up = self.up_of(text);
-        let b = up.as_bytes();
+    /// Is a select-list item a bare field reference - a dotted name,
+    /// quoted or not, `.*` allowed, parentheses around it allowed, and
+    /// nothing else (no alias, no sign, no operator)?
+    fn is_plain_field(&self, item: &str) -> bool {
+        let mut t = item.trim();
+        while t.starts_with('(') && matching_paren(t.as_bytes(), 0) == Some(t.len() - 1) {
+            t = t[1..t.len() - 1].trim();
+        }
+        let b = t.as_bytes();
         let mut i = 0;
-        while i < b.len() {
-            if b[i] == b'(' {
-                let inner = up[i + 1..].trim_start();
-                if inner.starts_with("SELECT") {
-                    let Some(close) = matching_paren(text.as_bytes(), i) else { return QualScan::Aside };
-                    match self.select(&text[i + 1..close], scopes) {
-                        QualScan::Clean => {}
-                        other => return other,
-                    }
-                    i = close + 1;
-                    continue;
+        loop {
+            if b.get(i) == Some(&b'"') {
+                let Some(close) = b[i + 1..].iter().position(|c| *c == b'"') else { return false };
+                i += close + 2;
+            } else {
+                let st = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                    i += 1;
+                }
+                if i == st || b[st].is_ascii_digit() {
+                    return false;
                 }
             }
+            if i >= b.len() {
+                return true;
+            }
+            if b[i] != b'.' {
+                return false;
+            }
             i += 1;
+            if b.get(i) == Some(&b'*') {
+                return i + 1 == b.len();
+            }
         }
-        QualScan::Clean
     }
 
-    /// The depth-0 occurrences of `word` in `text`, as split points.
-    /// With `between_aware`, an AND that closes a BETWEEN is not one.
+    /// The depth-0 occurrences of `word` in `text`, as split points -
+    /// outside every parenthesis and every `CASE .. END`, whose own AND /
+    /// OR belong to it. With `between_aware`, an AND that closes a
+    /// BETWEEN is not one.
     fn split_word<'t>(&self, text: &'t str, word: &str, between_aware: bool) -> Vec<&'t str> {
         let up = self.up_of(text);
         let mut out: Vec<&'t str> = Vec::new();
         let (mut start, mut at, mut counted, mut pending) = (0usize, 0usize, 0usize, 0usize);
-        while let Some(p) = find_word_depth0(up, word, at) {
+        while let Some(p) = find_word_outside_case(up, word, at) {
             if between_aware {
                 let mut c = counted;
                 while let Some(bw) = find_word_depth0(&up[..p], "BETWEEN", c) {
@@ -45093,12 +45207,17 @@ impl QualCtx<'_> {
             }
             return self.boolean(inner, scopes);
         }
-        self.value(text, scopes, false)
+        self.value(text, scopes)
     }
 
     /// A value: a comparison's left side first, then its right - except
-    /// `IN (SELECT ..)`, whose subquery the engine passes first.
-    fn value(&self, text: &str, scopes: &[Vec<ScopeQual>], defer_sub: bool) -> QualScan {
+    /// a QUANTIFIED subquery, which the engine passes first: `IN (SELECT
+    /// ..)`, `NOT IN`, and `= ANY / SOME / ALL (SELECT ..)` (measured:
+    /// `T1.A = ANY (SELECT U.X FROM T2 U WHERE T1.B = 1)` names T1.B,
+    /// `<> ALL` the same, while `T1.A = (SELECT ..)` names T1.A and `IN
+    /// (T1.B, T1.ID)` T1.A). A `CASE .. END` is one operand here: its
+    /// own comparisons split nothing.
+    fn value(&self, text: &str, scopes: &[Vec<ScopeQual>]) -> QualScan {
         let text = text.trim();
         if text.is_empty() {
             return QualScan::Clean;
@@ -45108,7 +45227,7 @@ impl QualCtx<'_> {
         // the first depth-0 comparison: an operator run, or a predicate
         // keyword as a whole word
         let mut depth = 0i32;
-        let mut split: Option<(usize, usize, bool)> = None; // (at, len, in-subquery)
+        let mut split: Option<(usize, usize, bool)> = None; // (at, len, subquery first)
         let mut i = 0;
         while i < b.len() {
             match b[i] {
@@ -45119,22 +45238,33 @@ impl QualCtx<'_> {
                     while i < b.len() && matches!(b[i], b'=' | b'<' | b'>' | b'!' | b'~' | b'^') {
                         i += 1;
                     }
-                    split = Some((st, i - st, false));
+                    let rest = up[i..].trim_start();
+                    let sub = ["ANY", "SOME", "ALL"]
+                        .iter()
+                        .any(|q| rest.starts_with(q) && paren_select(&rest[q.len()..]));
+                    split = Some((st, i - st, sub));
                     break;
                 }
-                c if depth == 0 && c.is_ascii_alphabetic() => {
+                c if c.is_ascii_alphabetic() => {
                     let st = i;
                     while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
                         i += 1;
                     }
-                    let w = &up[st..i];
                     if st > 0 && (b[st - 1].is_ascii_alphanumeric() || b[st - 1] == b'_' || b[st - 1] == b'$' || b[st - 1] == b'.') {
                         continue; // the tail of a longer word
                     }
-                    if matches!(w, "IS" | "IN" | "BETWEEN" | "LIKE" | "CONTAINING" | "STARTING" | "SIMILAR") {
-                        let sub = w == "IN" && up[i..].trim_start().starts_with("(SELECT");
-                        split = Some((st, i - st, sub));
-                        break;
+                    let w = &up[st..i];
+                    match w {
+                        "CASE" => depth += 1,
+                        "END" => depth -= 1,
+                        "IS" | "IN" | "BETWEEN" | "LIKE" | "CONTAINING" | "STARTING" | "SIMILAR"
+                            if depth == 0 =>
+                        {
+                            let sub = w == "IN" && paren_select(&up[i..]);
+                            split = Some((st, i - st, sub));
+                            break;
+                        }
+                        _ => {}
                     }
                     continue;
                 }
@@ -45143,12 +45273,12 @@ impl QualCtx<'_> {
             i += 1;
         }
         let Some((at, len, sub_first)) = split else {
-            return self.arith(text, scopes, defer_sub);
+            return self.arith(text, scopes);
         };
         let (left, right) = (&text[..at], &text[at + len..]);
         let order: [&str; 2] = if sub_first { [right, left] } else { [left, right] };
         for side in order {
-            match self.arith(side, scopes, defer_sub) {
+            match self.arith(side, scopes) {
                 QualScan::Clean => {}
                 other => return other,
             }
@@ -45158,8 +45288,11 @@ impl QualCtx<'_> {
 
     /// An arithmetic: the operands of the depth-0 `||`, `+`, `-`, `*`,
     /// `/` RIGHT first (measured: `T1.A + T1.ID` reports T1.ID, and so
-    /// does `T1.A * 2 + T1.ID`).
-    fn arith(&self, text: &str, scopes: &[Vec<ScopeQual>], defer_sub: bool) -> QualScan {
+    /// does `T1.A * 2 + T1.ID`) - the engine builds the passed node with
+    /// its two passed operands as constructor arguments, which its
+    /// compiler evaluates right to left, and every node built that way
+    /// below (a CASE, a SUBSTRING, a TRIM, a window) reads the same way.
+    fn arith(&self, text: &str, scopes: &[Vec<ScopeQual>]) -> QualScan {
         let text = text.trim();
         let up = self.up_of(text);
         let b = up.as_bytes();
@@ -45170,6 +45303,23 @@ impl QualCtx<'_> {
             match b[i] {
                 b'(' => depth += 1,
                 b')' => depth -= 1,
+                c if c.is_ascii_alphabetic() => {
+                    // a CASE .. END is one operand: its branches' operators
+                    // are its own
+                    let st = i;
+                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                        i += 1;
+                    }
+                    let tail = st > 0 && (b[st - 1].is_ascii_alphanumeric() || b[st - 1] == b'_' || b[st - 1] == b'$' || b[st - 1] == b'.');
+                    if !tail {
+                        match &up[st..i] {
+                            "CASE" => depth += 1,
+                            "END" => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
                 b'|' if depth == 0 && b.get(i + 1) == Some(&b'|') => {
                     cuts.push((i, 2));
                     i += 1;
@@ -45189,7 +45339,7 @@ impl QualCtx<'_> {
             i += 1;
         }
         if cuts.is_empty() {
-            return self.operand(text, scopes, defer_sub);
+            return self.operand(text, scopes);
         }
         let mut operands: Vec<&str> = Vec::new();
         let mut start = 0;
@@ -45199,7 +45349,7 @@ impl QualCtx<'_> {
         }
         operands.push(&text[start..]);
         for o in operands.iter().rev() {
-            match self.operand(o, scopes, defer_sub) {
+            match self.operand(o, scopes) {
                 QualScan::Clean => {}
                 other => return other,
             }
@@ -45208,38 +45358,83 @@ impl QualCtx<'_> {
     }
 
     /// One operand: a sign stripped, a parenthesised group opened (a
-    /// subquery read as a level), a call's arguments in order, anything
-    /// else read for its references in text order.
-    fn operand(&self, text: &str, scopes: &[Vec<ScopeQual>], defer_sub: bool) -> QualScan {
+    /// subquery read as a level), a CASE, a window, a call's arguments -
+    /// in order for a function (`COALESCE(T1.A, T1.B)` names T1.A), but
+    /// not for the shapes the parser builds as nodes of their own, whose
+    /// children the engine passes LAST FIRST (see [QualCtx::arith]):
+    /// `IIF(c, t, f)` is f, t, c; `DECODE` and a simple CASE are the
+    /// THEN values in order, the ELSE, the WHEN operands in order, the
+    /// tested value (measured: `DECODE(T1.A, T1.B, T.B, T1.ID)` names
+    /// T1.ID, `CASE T1.A WHEN 1 THEN T1.B ELSE T.ID END` T1.B); a
+    /// searched CASE is a chain of IIFs (`CASE WHEN T.A = 1 THEN T1.B
+    /// WHEN T.A = 2 THEN T1.ID ELSE T.ID END` names T1.ID); `SUBSTRING(x
+    /// FROM y FOR z)` is z, y, x; `GEN_ID`'s first argument is a sequence
+    /// and its second a value (`GEN_ID(G, T1.A)` names T1.A). Anything
+    /// else is read for its references in text order.
+    fn operand(&self, text: &str, scopes: &[Vec<ScopeQual>]) -> QualScan {
         let text = text.trim();
         if text.is_empty() {
             return QualScan::Clean;
         }
         if text.starts_with('-') || text.starts_with('+') {
-            return self.operand(&text[1..], scopes, defer_sub);
+            return self.operand(&text[1..], scopes);
         }
         let up = self.up_of(text);
         if text.starts_with('(') && matching_paren(text.as_bytes(), 0) == Some(text.len() - 1) {
             let inner = &text[1..text.len() - 1];
             if self.up_of(inner).trim_start().starts_with("SELECT") {
-                return if defer_sub { QualScan::Clean } else { self.select(inner, scopes) };
+                return self.select(inner, scopes);
             }
-            return self.value(inner, scopes, defer_sub);
+            return self.boolean(inner, scopes);
+        }
+        let word_end = |w: &str, at: usize| up[at + w.len()..].chars().next().is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if up.starts_with("CASE") && word_end("CASE", 0) && up.ends_with("END") {
+            let e = up.len() - 3;
+            if up[..e].ends_with(char::is_whitespace) {
+                return self.case_expr(text, scopes);
+            }
+        }
+        // `agg(args) OVER (window)`: the call, then the window
+        if let Some(over) = find_word_depth0(up, "OVER", 0) {
+            let rest = text[over + "OVER".len()..].trim_start();
+            if rest.starts_with('(') && matching_paren(rest.as_bytes(), 0) == Some(rest.len() - 1) {
+                match self.operand(&text[..over], scopes) {
+                    QualScan::Clean => {}
+                    other => return other,
+                }
+                return self.window(&rest[1..rest.len() - 1], scopes);
+            }
         }
         if let Some(open) = up.find('(') {
             let head = up[..open].trim_end();
             let is_name = !head.is_empty()
                 && head.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'.');
             if is_name && matching_paren(text.as_bytes(), open) == Some(text.len() - 1) {
-                if head == "GEN_ID" {
-                    return QualScan::Clean; // its first argument is a sequence name
-                }
                 let inner = &text[open + 1..text.len() - 1];
                 if self.up_of(inner).trim_start().starts_with("SELECT") {
-                    return if defer_sub { QualScan::Clean } else { self.select(inner, scopes) };
+                    return self.select(inner, scopes);
                 }
-                for a in split_top_level_commas(inner) {
-                    match self.value(a, scopes, defer_sub) {
+                let args = split_top_level_commas(inner);
+                let ordered: Vec<&str> = match head {
+                    "GEN_ID" => args.iter().skip(1).copied().collect(),
+                    "IIF" if args.len() == 3 => {
+                        for a in [args[2], args[1]] {
+                            match self.value(a, scopes) {
+                                QualScan::Clean => {}
+                                other => return other,
+                            }
+                        }
+                        return self.boolean(args[0], scopes);
+                    }
+                    "DECODE" if args.len() >= 3 => return self.decode(args[0], &args[1..], scopes),
+                    "SUBSTRING" => match self.substring_parts(inner) {
+                        Some(parts) => parts.into_iter().rev().collect(),
+                        None => args,
+                    },
+                    _ => args,
+                };
+                for a in ordered {
+                    match self.value(a, scopes) {
                         QualScan::Clean => {}
                         other => return other,
                     }
@@ -45247,19 +45442,203 @@ impl QualCtx<'_> {
                 return QualScan::Clean;
             }
         }
-        self.refs(text, scopes, defer_sub)
+        self.refs(text, scopes)
+    }
+
+    /// `SUBSTRING(x FROM y [FOR z])`'s three parts, in text order; None
+    /// for the comma form, which the engine's parser refuses anyway.
+    fn substring_parts<'t>(&self, inner: &'t str) -> Option<Vec<&'t str>> {
+        let up = self.up_of(inner);
+        let from = find_word_depth0(up, "FROM", 0)?;
+        let after = &inner[from + "FROM".len()..];
+        let mut parts = vec![&inner[..from]];
+        match find_word_depth0(self.up_of(after), "FOR", 0) {
+            Some(f) => parts.extend([&after[..f], &after[f + "FOR".len()..]]),
+            None => parts.push(after),
+        }
+        Some(parts)
+    }
+
+    /// `DECODE(test, c1, v1, .., [else])` - and a simple CASE, which the
+    /// parser makes one: the values in order, the ELSE, the conditions
+    /// in order, the tested value (measured, see [QualCtx::operand]).
+    fn decode(&self, test: &str, rest: &[&str], scopes: &[Vec<ScopeQual>]) -> QualScan {
+        let pairs = rest.len() / 2;
+        let values = (0..pairs).map(|k| rest[2 * k + 1]);
+        let else_ = (rest.len() % 2 == 1).then(|| rest[rest.len() - 1]);
+        let conds = (0..pairs).map(|k| rest[2 * k]);
+        for part in values.chain(else_).chain(conds) {
+            match self.value(part, scopes) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        self.value(test, scopes)
+    }
+
+    /// `CASE [test] WHEN c THEN v .. [ELSE e] END`: a simple CASE is a
+    /// DECODE ([QualCtx::decode]); a searched one is a chain of IIFs,
+    /// each passing its ELSE side first - so the ELSE, then the LAST
+    /// pair's value and condition, back to the first pair's (measured:
+    /// `CASE WHEN T1.A = 1 THEN T.B WHEN T1.ID = 2 THEN T.B END` names
+    /// T1.ID, `.. THEN T1.B WHEN T1.ID = 2 THEN T1.B END` the second
+    /// T1.B, `CASE WHEN T.A = 1 THEN (SELECT T1.B ..) ELSE T1.ID END`
+    /// T1.ID).
+    fn case_expr(&self, text: &str, scopes: &[Vec<ScopeQual>]) -> QualScan {
+        let up = self.up_of(text);
+        let b = up.as_bytes();
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+        // this CASE's own clause words: outside every parenthesis, at
+        // CASE depth one (a nested CASE's are its own)
+        let (mut depth, mut cd) = (0i32, 0i32);
+        let mut kws: Vec<(usize, &str)> = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                c if c.is_ascii_alphabetic() => {
+                    let st = i;
+                    while i < b.len() && ident(b[i]) {
+                        i += 1;
+                    }
+                    if st > 0 && (ident(b[st - 1]) || b[st - 1] == b'.') {
+                        continue;
+                    }
+                    if depth == 0 {
+                        let w = &up[st..i];
+                        match w {
+                            "CASE" => {
+                                cd += 1;
+                                if cd == 1 {
+                                    kws.push((st, w));
+                                }
+                            }
+                            "END" => {
+                                if cd == 1 {
+                                    kws.push((st, w));
+                                }
+                                cd -= 1;
+                            }
+                            "WHEN" | "THEN" | "ELSE" if cd == 1 => kws.push((st, w)),
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if kws.len() < 4 || kws[0].1 != "CASE" || kws[kws.len() - 1].1 != "END" {
+            return self.refs(text, scopes);
+        }
+        let seg = |k: usize| &text[kws[k].0 + kws[k].1.len()..kws[k + 1].0];
+        let test = seg(0).trim();
+        let (mut conds, mut values, mut else_) = (Vec::new(), Vec::new(), None);
+        for k in 1..kws.len() - 1 {
+            match kws[k].1 {
+                "WHEN" => conds.push(seg(k)),
+                "THEN" => values.push(seg(k)),
+                "ELSE" => else_ = Some(seg(k)),
+                _ => {}
+            }
+        }
+        if conds.len() != values.len() || conds.is_empty() {
+            return self.refs(text, scopes);
+        }
+        if !test.is_empty() {
+            let rest: Vec<&str> = conds
+                .iter()
+                .zip(values.iter())
+                .flat_map(|(c, v)| [*c, *v])
+                .chain(else_)
+                .collect();
+            return self.decode(test, &rest, scopes);
+        }
+        if let Some(e) = else_ {
+            match self.value(e, scopes) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        for (c, v) in conds.iter().zip(values.iter()).rev() {
+            match self.value(v, scopes) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+            match self.boolean(c, scopes) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        QualScan::Clean
+    }
+
+    /// The inside of an `OVER (..)`: the frame first - its END bound
+    /// before its START - then the ORDER BY items in order, then the
+    /// PARTITION BY items in order (measured: `SUM(T.A) OVER (PARTITION
+    /// BY T1.B ORDER BY T1.ID)` names T1.ID; `.. ORDER BY T.ID ROWS
+    /// BETWEEN T1.A PRECEDING AND T1.ID FOLLOWING` names T1.ID; `..
+    /// PARTITION BY T1.B ORDER BY T.ID RANGE T1.A PRECEDING` names T1.A;
+    /// the aggregate's own argument comes before all of them).
+    fn window(&self, w: &str, scopes: &[Vec<ScopeQual>]) -> QualScan {
+        let up = self.up_of(w);
+        let part = find_word_depth0(up, "PARTITION", 0);
+        let order = find_word_depth0(up, "ORDER", 0);
+        let frame = ["ROWS", "RANGE"].iter().filter_map(|k| find_word_depth0(up, k, 0)).min();
+        let starts = [part, order, frame];
+        let end_of = |at: usize| starts.iter().flatten().copied().filter(|p| *p > at).min().unwrap_or(w.len());
+        // the clause's text after its keyword(s)
+        let clause = |at: usize, kw: &str, by: bool| -> &str {
+            let t = w[at + kw.len()..end_of(at)].trim_start();
+            if by && self.up_of(t).starts_with("BY") {
+                &t[2..]
+            } else {
+                t
+            }
+        };
+        if let Some(f) = frame {
+            let kw = if up[f..].starts_with("ROWS") { "ROWS" } else { "RANGE" };
+            let ft = clause(f, kw, false);
+            let fu = self.up_of(ft);
+            let bounds: Vec<&str> = if fu.starts_with("BETWEEN") {
+                let inner = &ft["BETWEEN".len()..];
+                match find_word_depth0(self.up_of(inner), "AND", 0) {
+                    Some(a) => vec![&inner[a + "AND".len()..], &inner[..a]],
+                    None => vec![inner],
+                }
+            } else {
+                vec![ft]
+            };
+            for bound in bounds {
+                match self.value(bound, scopes) {
+                    QualScan::Clean => {}
+                    other => return other,
+                }
+            }
+        }
+        for (at, kw) in [(order, "ORDER"), (part, "PARTITION")] {
+            if let Some(at) = at {
+                match self.list(clause(at, kw, true), scopes, false) {
+                    QualScan::Clean => {}
+                    other => return other,
+                }
+            }
+        }
+        QualScan::Clean
     }
 
     /// The dotted references of `text` in text order - the lexer under
-    /// every reader above. A subquery met on the way is read as a level
-    /// (or skipped, when the select list defers them).
-    fn refs(&self, text: &str, scopes: &[Vec<ScopeQual>], defer_sub: bool) -> QualScan {
+    /// every reader above. A subquery met on the way is read as a level.
+    fn refs(&self, text: &str, scopes: &[Vec<ScopeQual>]) -> QualScan {
         let base = self.off_of(text);
         let sb = text.as_bytes();
         let up = self.up_of(text);
         let ub = up.as_bytes();
         let ident_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
-        let mut prev_word = String::new();
+        // the two bare words before the current one, for [QUAL_SKIP_AFTER]
+        let (mut prev_word, mut prev2) = (String::new(), String::new());
         let mut i = 0;
         while i < sb.len() {
             let c = sb[i];
@@ -45282,11 +45661,9 @@ impl QualCtx<'_> {
             if c == b'(' {
                 if up[i + 1..].trim_start().starts_with("SELECT") {
                     let Some(close) = matching_paren(sb, i) else { return QualScan::Aside };
-                    if !defer_sub {
-                        match self.select(&text[i + 1..close], scopes) {
-                            QualScan::Clean => {}
-                            other => return other,
-                        }
+                    match self.select(&text[i + 1..close], scopes) {
+                        QualScan::Clean => {}
+                        other => return other,
                     }
                     i = close + 1;
                     continue;
@@ -45352,14 +45729,28 @@ impl QualCtx<'_> {
                 let is_call = sb.get(j) == Some(&b'(');
                 let word = parts.first().map(|p| p.0.clone()).unwrap_or_default();
                 if is_call && parts.len() == 1 && word == "GEN_ID" {
-                    // a sequence name, not a column: step over the call
+                    // a sequence name first, then a value (measured:
+                    // `GEN_ID(G, T1.A)` names T1.A)
                     let Some(close) = matching_paren(sb, j) else { return QualScan::Aside };
+                    let inner = &text[j + 1..close];
+                    if let Some(comma) = inner.find(',') {
+                        match self.value(&inner[comma + 1..], scopes) {
+                            QualScan::Clean => {}
+                            other => return other,
+                        }
+                    }
                     i = close + 1;
                     prev_word.clear();
+                    prev2.clear();
                     continue;
                 }
                 let qualified = parts.len() >= 2 || (star && !parts.is_empty());
-                if qualified && !is_call && !QUAL_SKIP_AFTER.contains(&prev_word.as_str()) {
+                // `NEXT VALUE FOR G` names a sequence; SUBSTRING's `FOR
+                // T1.B` a value (measured: `SUBSTRING(T1.V FROM T1.A FOR
+                // T1.B)` names T1.B)
+                let skipped = QUAL_SKIP_AFTER.contains(&prev_word.as_str())
+                    && (prev_word != "FOR" || prev2 == "VALUE");
+                if qualified && !is_call && !skipped {
                     let quals: Vec<String> = if star {
                         parts.iter().map(|p| p.0.clone()).collect()
                     } else {
@@ -45383,7 +45774,8 @@ impl QualCtx<'_> {
                         return QualScan::Hit { at: base + start, len: end - start, name: name.join(".") };
                     }
                 }
-                prev_word = if parts.len() == 1 && !parts[0].1 { word } else { String::new() };
+                let bare = if parts.len() == 1 && !parts[0].1 { word } else { String::new() };
+                prev2 = std::mem::replace(&mut prev_word, bare);
                 continue;
             }
             if c.is_ascii_digit() {
@@ -45391,6 +45783,7 @@ impl QualCtx<'_> {
                     i += 1;
                 }
                 prev_word.clear();
+                prev2.clear();
                 continue;
             }
             i += 1;
@@ -45530,7 +45923,7 @@ impl QualCtx<'_> {
         }
         let assigns = &body[after..wh.unwrap_or(end)];
         for a in split_top_level_commas(assigns) {
-            match self.value(a, &scopes, false) {
+            match self.value(a, &scopes) {
                 QualScan::Clean => {}
                 other => return other,
             }
@@ -45763,6 +46156,27 @@ enum WithLockVerdict {
 /// to right supplies the message (`COUNT(*) UNION ALL DISTINCT` reports
 /// aggregates, `DISTINCT UNION ALL COUNT(*)` reports DISTINCT).
 fn with_lock_verdict(sql: &str, db: &Option<Database>) -> WithLockVerdict {
+    // THE WITH PREFIX IS TRANSPARENT: the main query is judged on its
+    // own, a CTE it reads being no physical table (measured: `WITH C AS
+    // (..) SELECT * FROM T1 T WHERE T.ID = 1 WITH LOCK` answers the row
+    // with the "not used" warning, `.. SELECT * FROM C WITH LOCK` is the
+    // single-table message, `.. SELECT 1 FROM RDB$DATABASE WITH LOCK`
+    // the system-table refusal). This read the whole WITH text as "not a
+    // single physical table". The parser's refusal, raised after the
+    // DSQL pass, carries the unused CTEs' warnings; the DSQL messages,
+    // raised before checkUnusedCTEs, carry none (measured: `.. SELECT
+    // COUNT(*) FROM T1 WITH LOCK` is the aggregates message alone).
+    let (main, ctes, unused): (String, Vec<String>, Vec<String>) = match parse_with(sql) {
+        Some((defs, main, _)) => {
+            let used = cte_used(&defs, &main);
+            let names: Vec<String> = defs.iter().map(|(n, _)| n.clone()).collect();
+            let unused = names.iter().zip(used.iter()).filter(|(_, u)| !**u).map(|(n, _)| n.clone()).collect();
+            (main, names, unused)
+        }
+        None => (sql.to_string(), Vec::new(), Vec::new()),
+    };
+    let sql = main.as_str();
+    let is_cte = |name: &str| ctes.iter().any(|c| c.eq_ignore_ascii_case(name));
     // a FROM item the catalog does not have is the planner's -204 first
     // (measured: `FROM NOSUCH WITH LOCK` and `FROM RDB$DATABASE, NOSUCH
     // WITH LOCK` are both "Table unknown"): the clause is taken so the
@@ -45773,11 +46187,16 @@ fn with_lock_verdict(sql: &str, db: &Option<Database>) -> WithLockVerdict {
             .is_some_and(|(from, joins)| {
                 std::iter::once(&from).chain(joins.iter().map(|(_, r, _, _)| r)).any(|tr| {
                     !tr.table.starts_with('(')
+                        && !is_cte(&tr.table)
                         && relation_schema(dbr, &tr.table).is_none()
                         && !procedure_defined(dbr, &tr.table)
                 })
             });
-        if unknown_item || first_unknown_relation(sql, dbr).is_some() {
+        // (the main text alone no longer carries its WITH, so a CTE name
+        // is not the unknown relation the fallback looks for)
+        let unknown_deep = first_unknown_relation(sql, dbr)
+            .is_some_and(|(at, len, _)| !is_cte(&sql[at..at + len]));
+        if unknown_item || unknown_deep {
             return WithLockVerdict::Takes;
         }
     }
@@ -45823,7 +46242,7 @@ fn with_lock_verdict(sql: &str, db: &Option<Database>) -> WithLockVerdict {
             });
         };
         for p in &parts {
-            if let Err(e) = with_lock_one_bad(p, db) {
+            if let Err(e) = with_lock_one_bad(p, db, &is_cte) {
                 return WithLockVerdict::Refuses(e);
             }
         }
@@ -45833,13 +46252,15 @@ fn with_lock_verdict(sql: &str, db: &Option<Database>) -> WithLockVerdict {
         // are the single statement's only
         return WithLockVerdict::Takes;
     }
-    match with_lock_one_bad(sql, db) {
+    match with_lock_one_bad(sql, db, &is_cte) {
         Err(e) => WithLockVerdict::Refuses(e),
         // the request PARSER's own refusals - a virtual, system or
         // temporary table - come after every DSQL check
-        // ([with_lock_relation_refusal])
+        // ([with_lock_relation_refusal]), and after the unused CTEs were
+        // counted: their warnings ride the refusal
         Ok(table) => match db.as_ref().and_then(|dbr| with_lock_relation_refusal(dbr, &table)) {
-            Some(e) => WithLockVerdict::Refuses(e),
+            Some(e) if unused.is_empty() => WithLockVerdict::Refuses(e),
+            Some(e) => WithLockVerdict::Refuses(EvalErr::CteUnused { err: Box::new(e), unused }),
             None => WithLockVerdict::Takes,
         },
     }
@@ -45847,16 +46268,23 @@ fn with_lock_verdict(sql: &str, db: &Option<Database>) -> WithLockVerdict {
 
 /// One branch, or a whole un-chained statement: the engine's DSQL defect
 /// for this target, or the one physical table it locks.
-fn with_lock_one_bad(sql: &str, db: &Option<Database>) -> Result<String, EvalErr> {
+fn with_lock_one_bad(
+    sql: &str,
+    db: &Option<Database>,
+    is_cte: &dyn Fn(&str) -> bool,
+) -> Result<String, EvalErr> {
     let simple = || Err(EvalErr::WithLock { code: GDS_WLOCK_SIMPLE, what: None });
     let aggregates = || Err(EvalErr::WithLock { code: GDS_WLOCK_AGGREGATES, what: None });
     // A ROWS / OFFSET / FETCH TAIL says nothing about what is locked.
     // Measured: `select id from t1 rows 2 with lock` answers 1,2 (and
     // `count(*) .. rows 1 with lock` is the aggregates message, `distinct
     // .. rows 1` the DISTINCT one), where this read `T1 ROWS 2` as the
-    // FROM and refused every one as not a single physical table
+    // FROM and refused every one as not a single physical table. Nor
+    // does a PLAN (measured: `.. FROM RDB$DATABASE PLAN (RDB$DATABASE
+    // NATURAL) WITH LOCK` is the system-table refusal, `COUNT(*)` under
+    // a PLAN the aggregates message), which this read as part of the FROM
     let upm = mask_literals(&sql.to_ascii_uppercase());
-    let tail = ["ROWS", "OFFSET", "FETCH"].iter().filter_map(|w| find_word_depth0(&upm, w, 0)).min();
+    let tail = ["ROWS", "OFFSET", "FETCH", "PLAN"].iter().filter_map(|w| find_word_depth0(&upm, w, 0)).min();
     let sql = tail.map_or(sql, |t| sql[..t].trim_end());
     // not a plain SELECT at all (a CTE arrives here as its whole `WITH`
     // text) - the engine calls that the single-physical-table rule
@@ -45874,7 +46302,7 @@ fn with_lock_one_bad(sql: &str, db: &Option<Database>) -> Result<String, EvalErr
     }
     let name = from.table.as_str();
     let base = match db.as_ref() {
-        Some(dbr) => relation_schema(dbr, name).is_some() && view_of(dbr, name).is_none(),
+        Some(dbr) => !is_cte(name) && relation_schema(dbr, name).is_some() && view_of(dbr, name).is_none(),
         None => false,
     };
     if !base {
@@ -69118,8 +69546,9 @@ thread_local! {
     /// the engine answers the rows AND posts one "CTE is not used"
     /// warning per name in the prepare's status vector. Cleared with
     /// [PREPARE_REFUSAL], set by the CTE planner, taken by
-    /// [respond_prepare]; a plan that warns is not cached, so the
-    /// second prepare of the same text warns too, as the engine's does
+    /// [respond_prepare] - and dropped for a text this attachment was
+    /// already warned on ([take_repeat_warnings]), as the engine's
+    /// statement cache drops them for a repeat
     static PREPARE_WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     /// set by the op_prepare / op_exec_immediate handlers right before
     /// the outermost [plan_query] of a CLIENT statement, and taken by
@@ -88621,14 +89050,13 @@ fn took_plan_read_rows() -> bool {
 }
 
 /// May the plan just built be kept in the statement cache? Not when it
-/// read row data ([took_plan_read_rows]), and not when it posted a
-/// prepare WARNING ([PREPARE_WARNINGS]): a cached plan answers the next
-/// prepare of the same text without the planner, and the engine warns
-/// on every prepare.
+/// read row data ([took_plan_read_rows]). A plan that posted a prepare
+/// WARNING ([PREPARE_WARNINGS]) may: a cached plan answers the next
+/// prepare of the same text without the planner and so without the
+/// warning - which is the engine's own law, its statement cache serving
+/// a repeated text silently ([take_repeat_warnings]).
 fn plan_cacheable() -> bool {
-    let read = took_plan_read_rows();
-    let warned = PREPARE_WARNINGS.with(|p| !p.borrow().is_empty());
-    !read && !warned
+    !took_plan_read_rows()
 }
 
 /// Forget whatever the LAST plan read - called immediately before a
@@ -111471,6 +111899,7 @@ fn after_auth(
                             att_cs,
                             stmt_for_update(&stmt_sql),
                         );
+                        take_repeat_warnings(&database, &stmt_sql);
                         respond_prepare(&mut s, &mut enc, &describe)?;
                     }
                 }
@@ -118801,6 +119230,7 @@ mod tests {
             events: events_for(path),
             meta: crate::mdc::for_path(path),
             stmts: Default::default(),
+            warned_texts: Default::default(),
             locks: crate::dblocks::for_path(path),
             lock_owner: 0,
             did_ddl: false,
@@ -118975,6 +119405,7 @@ mod tests {
             events: events_for("/nonexistent/fc-rowsource-test"),
             meta: crate::mdc::for_path("/nonexistent/fc-rowsource-test"),
             stmts: Default::default(),
+            warned_texts: Default::default(),
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
             lock_owner: 0,
             did_ddl: false,
@@ -122227,6 +122658,7 @@ mod tests {
             events: events_for("/nonexistent/fc-rowsource-test"),
             meta: crate::mdc::for_path("/nonexistent/fc-rowsource-test"),
             stmts: Default::default(),
+            warned_texts: Default::default(),
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
             lock_owner: 0,
             did_ddl: false,
@@ -131930,6 +132362,7 @@ mod tests {
             events: events_for(tag),
             meta: crate::mdc::for_path(tag),
             stmts: Default::default(),
+            warned_texts: Default::default(),
             locks: crate::dblocks::for_path(tag),
             lock_owner: 0,
             did_ddl: false,
