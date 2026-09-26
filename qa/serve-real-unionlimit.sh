@@ -127,7 +127,7 @@ refused() { # <label> <script>
     local ev fv
     ev=$(sess "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2")
     if [ "${ev#*SQLSTATE}" != "$ev" ]; then echo "FAIL $1 - the engine raises [$ev]"; fail=1
-    elif [ "$ev" = "$fv" ]; then echo "FAIL $1 - THIS SERVER NOW ANSWERS; promote the cell"; fail=1
+    elif [ "$ev" = "$fv" ]; then echo "FAIL $1 - THIS SERVER NOW ANSWERS [$ev]; promote the cell"; fail=1
     elif [ "${fv#Statement failed}" = "$fv" ]; then echo "FAIL $1 - answers WRONG: eng=[$ev] fc=[$fv]"; fail=1
     else echo "OK   $1 (recorded: engine answers [${ev:0:60}], this server refuses)"; fi
 }
@@ -358,7 +358,7 @@ same    "14 a window under a member's FIRST (answers since 2026-09-26: the fold 
 same    "14 ...under FIRST alone" "select first 3 row_number() over (order by id desc) from t1;"
 refused "14 a union ORDER BY of two keys (with or without FIRST)" "select first 1 id, a from t1 union all select first 1 id, x from t2 order by 1, 2 desc;"
 refused "14 a quantified comparison over a union" "select 1 from rdb\$database where 20 = any (select first 2 a from t1 union all select x from t2);"
-refused "14 a q-string (this server has none)" "select q'{'}', ' order ', ' union ' from t1 rows 1;"
+pin "14 a q-string (answered since the introducer/q-string rewrite of 2026-09-26; its quote is no clause boundary)" "select q'{'}', ' order ', ' union ' from t1 rows 1;" "CONSTANT CONSTANT CONSTANT|' order union"
 refused "14 an UPDATE's own ORDER BY / ROWS" "update t3 set name = 'z' order by k rows 1; select name from t3 order by k; rollback;"
 differs "14 COUNT(*) over a union whose value overflows its column" "select count(*) from (select n382 from tn union all select n184 from tn);" "COUNT|$OOR" "COUNT|8"
 
