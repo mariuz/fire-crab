@@ -202,7 +202,7 @@ pin  "5 ...(-2.5)" "SELECT R FROM PY((-2.5));" "R|-3"
 pin  "5 ...EXECUTE PROCEDURE PY((-2))" "EXECUTE PROCEDURE PY((-2));" "R|-2"
 pin  "5 CONTROL a positive variable" "$(eb 'EXECUTE BLOCK RETURNS (R INTEGER) AS DECLARE I INTEGER = 2; BEGIN SELECT R FROM PY(:I) INTO :R; SUSPEND; END')" "R|2"
 pin  "5 CONTROL 5 - :I" "$(eb 'EXECUTE BLOCK RETURNS (R INTEGER) AS DECLARE I INTEGER = -2; BEGIN SELECT 5 - :I FROM RDB$DATABASE INTO :R; SUSPEND; END')" "R|7"
-refused "5 an argument EXPRESSION over the variable" "$(eb 'EXECUTE BLOCK RETURNS (R INTEGER) AS DECLARE I INTEGER = -2; BEGIN SELECT R FROM PY(:I - 1) INTO :R; SUSPEND; END')" "R|-3"
+pin     "5 an argument EXPRESSION over the variable" "$(eb 'EXECUTE BLOCK RETURNS (R INTEGER) AS DECLARE I INTEGER = -2; BEGIN SELECT R FROM PY(:I - 1) INTO :R; SUSPEND; END')" "R|-3"
 
 echo "--- panic check"
 ran=$((ran + 1))
