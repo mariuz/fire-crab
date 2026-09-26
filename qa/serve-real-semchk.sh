@@ -68,6 +68,12 @@
 # answered here) or -206, a qualified key of its name answers (refused
 # after the merge), and it names a derived table's column.
 #
+# FOURTH ROUND: the same law for a CORRELATED whole-item subquery - the
+# per-row marker was spliced `FC$CORR(<id>) AS <name>`, so a qualified
+# GROUP BY key of its name was refused (master answered) and a bare ORDER
+# BY of it sorted by the subquery where the engine sorts by the outer
+# column; a quoted inner alias keeps its case.
+#
 # RECORDED, not fixed (every one a refusal on this server, never a wrong
 # answer): a quoted CTE name; a CTE referenced only inside a subquery or
 # a derived table; a nested WITH; a bare (unqualified) unknown column,
@@ -854,6 +860,47 @@ refused "1d RECORDED a qualified key under an ALIAS of its name (the alias-first
 refused "1d RECORDED ...a subquery aliased so" "select (select x.id from t2 x where x.id = 1) id from t1 t order by t.id;"
 refused "1d RECORDED a FIRST .. ORDER BY inner in a derived table" "select * from (select (select first 1 x.x from t2 x order by 1) from t1 t where t.id < 3) d;"
 
+echo "--- 1e. A CORRELATED SUBQUERY's NAME IS NO ALIAS EITHER (the fourth review: a regression from master to a refusal, and wrong sorts)"
+pin  "1e the member: GROUP BY a qualified key of a correlated subquery's name" "select (select x.id from t2 x where x.id = t.id) from t1 t group by t.id;" "ID|1|2|3|4|5|6"
+pin  "1e ...ORDER BY 1 DESC" "select (select x.id from t2 x where x.id = t.id) from t1 t group by t.id order by 1 desc;" "ID|6|5|4|3|2|1"
+pin  "1e ...beside the key's field, ORDER BY T.ID DESC" "select t.id, (select x.id from t2 x where x.id = t.id) from t1 t group by t.id order by t.id desc;" "ID ID|6 6|5 5|4 4|3 3|2 2|1 1"
+pin  "1e ...under a WHERE" "select (select x.id from t2 x where x.id = t.id) from t1 t where t.id > 2 group by t.id;" "ID|3|4|5|6"
+pin  "1e ...a HAVING" "select (select x.id from t2 x where x.id = t.id) from t1 t group by t.id having t.id > 3;" "ID|4|5|6"
+pin  "1e ...two of them" "select (select x.id from t2 x where x.id = t.id), (select y.x from t2 y where y.id = t.id) from t1 t group by t.id order by t.id;" "ID X|1 5|2 6|3 <null>|4 8|5 9|6 10"
+pin  "1e ...a bare GROUP BY of its name is the COLUMN" "select (select x.id from t2 x where x.id = t.id) from t1 t group by id;" "ID|1|2|3|4|5|6"
+pin  "1e ...a bare ORDER BY of it after two keys" "select (select x.id from t2 x where x.id = t.id) from t1 t group by t.id, t.a order by id;" "ID|1|2|3|4|5|6"
+pin  "1e a bare ORDER BY of its name sorts by the OUTER column (by the subquery here before)" "select (select x.a from t1 x where x.id = 7 - t.id) from t1 t order by a;" "A|10|20|<null>|30|10|20"
+pin  "1e ...an ID-named one" "select (select x.id from t2 x where x.id = 7 - t.id) from t1 t order by id;" "ID|6|5|4|3|2|1"
+pin  "1e ...NULLS FIRST beside a field" "select (select x.v from t1 x where x.id = 7 - t.id), t.id from t1 t order by v nulls first;" "V ID|cherry 4|apple 6|banana 5|Apple 1|a_b%c 2|<null> 3"
+pin  "1e ...a qualified key of its name (refused here before)" "select (select x.a from t1 x where x.id = 7 - t.id) from t1 t order by t.a, t.id;" "A|10|20|<null>|30|10|20"
+pin  "1e ...beside the field of its name" "select (select x.a from t1 x where x.id = 7 - t.id), t.a from t1 t order by a, 1;" "A A|10 <null>|<null> 10|20 10|10 20|30 20|20 30"
+pin  "1e ...under a WHERE" "select (select x.a from t1 x where x.id = 7 - t.id) from t1 t where t.id > 1 order by a;" "A|10|<null>|30|10|20"
+pin  "1e ...FIRST" "select first 3 (select x.a from t1 x where x.id = 7 - t.id) from t1 t order by a desc;" "A|20|30|10"
+pin  "1e ...ROWS" "select (select x.a from t1 x where x.id = 7 - t.id) from t1 t order by a desc rows 2;" "A|20|30"
+pin  "1e ...over a derived table" "select (select x.a from t1 x where x.id = 7 - d.id) from (select id, a from t1) d order by a;" "A|10|20|<null>|30|10|20"
+pin  "1e ...over a CTE" "with c as (select id, a from t1) select (select x.a from t1 x where x.id = 7 - c.id) from c order by a;" "A|10|20|<null>|30|10|20"
+pin  "1e ...over a join" "select (select x.a from t1 x where x.id = 7 - t.id) from t1 t join t2 u on u.id = t.id order by a;" "A|10|20|<null>|30|10|20"
+err_differs "1e ...a name only the subquery carries is -206 (answered here before)" "select (select x.x from t2 x where x.id = t.id) from t1 t order by x;" "-\"X\"|-At line 1, column 68"
+err_differs "1e ...a text one" "select (select x.s from t2 x where x.id = t.id) from t1 t order by s;" "-\"S\"|-At line 1, column 68"
+err_differs "1e ...an inner alias" "select (select x.x as q from t2 x where x.id = t.id) from t1 t order by q;" "-\"Q\"|-At line 1, column 73"
+err_differs "1e ...DISTINCT" "select distinct (select x.x from t2 x where x.id = t.id) from t1 t order by x;" "-\"X\"|-At line 1, column 77"
+err_differs "1e ...beside an EXISTS" "select (select x.s from t2 x where x.id = t.id) from t1 t where exists (select 1 from t2 z where z.t1id = t.id) order by s;" "-\"S\"|-At line 1, column 122"
+err_differs "1e ...grouped" "select (select x.s from t2 x where x.id = t.id) from t1 t group by t.id order by s;" "-\"S\"|-At line 1, column 82"
+err_differs "1e ...GROUP BY" "select (select x.x from t2 x where x.id = t.id) from t1 t group by x;" "-\"X\"|-At line 1, column 68"
+err_differs "1e ...over a derived table" "select (select x.x from t2 x where x.id = d.id) from (select id, a from t1) d order by x;" "-\"X\"|-At line 1, column 88"
+pin  "1e CONTROL a real alias of its name still sorts by the subquery" "select (select x.x from t2 x where x.id = t.id) as x from t1 t order by x;" "X|<null>|5|6|8|9|10"
+pin  "1e CONTROL ...ORDER BY 1 DESC" "select (select x.x from t2 x where x.id = t.id) from t1 t order by 1 desc;" "X|10|9|8|6|5|<null>"
+pin  "1e CONTROL a per-row one beside a lookup one keeps its name" "select (select x.s from t2 x where x.id = 7 - t.id), (select y.v from t1 y where y.id = t.id) from t1 t order by v;" "S V|three <null>|one Apple|two a_b%c|six apple|five banana|<null> cherry"
+pin  "1e CONTROL ...an inner alias beside an aggregate one" "select (select x.s as q from t2 x where x.id = 7 - t.id), (select count(*) from t2 y where y.t1id = t.id) from t1 t order by t.id;" "Q COUNT|six 2|five 1|<null> 0|three 1|two 0|one 0"
+pin  "1e a quoted lower-case inner alias keeps its case" "select (select x.s as \"q\" from t2 x where x.id = 7 - t.id) from t1 t where t.id = 1;" "q|six"
+pin  "1e ...folded (upper-cased here before)" "select (select x.s as \"q\" from t2 x where x.id = 1) from t1 t where t.id = 1;" "q|one"
+pin  "1e ...a lower-case column folds" "select (select x.s from t2 x where x.id = 7 - t.id) from t1 t where t.id = 1;" "S|six"
+pin  "1e ...a spaced name" "select (select x.s as \"My Q\" from t2 x where x.id = 7 - t.id) from t1 t where t.id = 1;" "My Q|six"
+pin  "1e ...over a derived table" "select (select x.s as \"q\" from t2 x where x.id = 7 - d.id) from (select id from t1) d where d.id = 1;" "q|six"
+pin  "1e CONTROL the describe" "set sqlda_display on; select (select x.s from t2 x where x.id = 7 - t.id) from t1 t where t.id = 1;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 20 charset: 0 SYSTEM.NONE|: name: S alias: S|: table: T2 schema: PUBLIC owner: SYSDBA|S|six"
+refused "1e RECORDED a star beside it" "select t.*, (select x.s from t2 x where x.id = 7 - t.id) from t1 t order by id;"
+refused "1e RECORDED a GROUP BY over a join" "select (select x.x from t2 x where x.id = t.id) from t1 t join t2 u on u.id = t.id group by t.id order by t.id;"
+
 echo "--- 2f. A COMMITTED DDL PURGES THE STATEMENT CACHE: the warning comes back"
 WA='with a as (select 1 x from rdb$database) select 1 from rdb$database;'
 pin  "2f a CREATE TABLE and its COMMIT between two prepares" "$WA $WA create table zz1 (i int); commit; $WA" "$W104|-CTE \"A\" $NOTUSED|CONSTANT|1|CONSTANT|1|$W104|-CTE \"A\" $NOTUSED|CONSTANT|1"
@@ -882,5 +929,5 @@ if grep -aq 'panicked at' "/tmp/fc-serve-semchk-$PORT.log"; then echo "FAIL the 
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 520 ]; then echo "FAIL only $ran checks ran (floor 520)"; fail=1; fi
+if [ "$ran" -lt 560 ]; then echo "FAIL only $ran checks ran (floor 560)"; fail=1; fi
 exit $fail

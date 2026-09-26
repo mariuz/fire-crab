@@ -32209,7 +32209,7 @@ fn wrap_returning(
                     new_rel.qual_only = true;
                     scope.rels.push(new_rel);
                 }
-                lifted = lift_corr_text(body, &scope, dbr, db, false)?;
+                lifted = lift_corr_text(body, &scope, dbr, db, None)?;
                 lifted.as_str()
             } else {
                 body
@@ -36592,7 +36592,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 let rhs = if rhs.contains('(')
                     && find_word(&mask_literals(&rhs.to_ascii_uppercase()), "SELECT", 0).is_some()
                 {
-                    rhs_lifted = lift_corr_text(rhs, &set_scope, db, db_outer, false)?;
+                    rhs_lifted = lift_corr_text(rhs, &set_scope, db, db_outer, None)?;
                     if trace_on() {
                         eprintln!("[srv] update SET per-row sub {:?}", rhs_lifted);
                     }
@@ -49115,29 +49115,39 @@ fn plan_over_source(
     // the source's own columns ([lift_corr_text]); a correlated one names
     // the source by its binding alias
     let corr_scope = CorrScope::single(alias, None, None, &columns, &descs);
-    let lift = |t: &str, sel: bool| -> Option<String> {
+    let lift = |t: &str, names: Option<&mut Vec<(usize, String)>>| -> Option<String> {
         match db.as_ref() {
             Some(dbr)
                 if t.contains('(')
                     && find_word(&mask_literals(&t.to_ascii_uppercase()), "SELECT", 0).is_some() =>
             {
-                lift_corr_text(t, &corr_scope, dbr, db, sel)
+                lift_corr_text(t, &corr_scope, dbr, db, names)
             }
             _ => Some(t.to_string()),
         }
     };
-    let proj_l = lift(proj_s, true)?;
+    // (select-list position, name) of each whole-item subquery: laid on
+    // the planned column once ORDER BY has resolved without it
+    let mut sub_names: Vec<(usize, String)> = Vec::new();
+    let proj_l = lift(proj_s, Some(&mut sub_names))?;
     let where_l = match where_s {
-        Some(w) => Some(lift(w, false)?),
+        Some(w) => Some(lift(w, None)?),
         None => None,
     };
     let having_l = match having_s {
-        Some(h) => Some(lift(h, false)?),
+        Some(h) => Some(lift(h, None)?),
         None => None,
     };
     let order_l = match order_s {
-        Some(o) => Some(lift(o, false)?),
+        Some(o) => Some(lift(o, None)?),
         None => None,
+    };
+    let name_subs = |cols: &mut [ProjCol]| {
+        for (i, n) in &sub_names {
+            if let Some(c) = cols.get_mut(*i) {
+                c.name = n.clone();
+            }
+        }
     };
     let proj_s = proj_l.as_str();
     let where_s = where_l.as_deref();
@@ -49265,6 +49275,7 @@ fn plan_over_source(
             })?,
         };
         stamp_group_order_coll(&mut order_by, &slot_descs);
+        name_subs(&mut gcols);
         // a collation decides which rows are one group, and which value
         // a MIN/MAX or a COUNT(DISTINCT) folds to ([coll_groupable],
         // [agg_needs_unkeyable_coll]) - the fold check was missing here
@@ -49463,6 +49474,8 @@ fn plan_over_source(
         )?,
     };
     drop(params_cell);
+    let mut out_cols = out_cols;
+    name_subs(&mut out_cols);
     Some(Plan::Derived {
         inner: Box::new(src.into_plan(cols)),
         cols: out_cols,
@@ -56967,7 +56980,7 @@ fn plan_query_inner_at(
         let on_sub = parsed.as_ref().is_some_and(|(_, j)| j.iter().any(|(_, _, on_s, _)| has_sub(Some(on_s))));
         if has_sub(order_s) || has_sub(having_s) || (joined && has_sub(where_s)) || on_sub {
             if let Some(scope) = CorrScope::of_from(table_s, dbr, db) {
-                let lift = |t: &str| lift_corr_text(t, &scope, dbr, db, false);
+                let lift = |t: &str| lift_corr_text(t, &scope, dbr, db, None);
                 // ON conditions, spliced back into the FROM text from the
                 // end so earlier offsets stay valid
                 let mut from_out = table_s.to_string();
@@ -57036,8 +57049,12 @@ fn plan_query_inner_at(
                     let (p, _, _, _, _, _) = split_query(sub)?;
                     match parse_projection(p)? {
                         Proj::Items(items) => match items.first()? {
+                            // an alias comes canonical from the parse
+                            // (a quoted `"q"` keeps its case, measured on
+                            // 2182: `q`); a column is folded here
                             SelItem::Col(c, alias) => Some(alias.clone().unwrap_or_else(|| {
-                                c.rsplit('.').next().unwrap_or(c).to_string()
+                                let bare = c.rsplit('.').next().unwrap_or(c);
+                                canon_ident(bare).unwrap_or_else(|| bare.to_string())
                             })),
                             SelItem::Agg(f, _, alias) => Some(alias.clone().unwrap_or_else(|| {
                                 f.name()
@@ -57231,7 +57248,7 @@ fn plan_query_inner_at(
                 #[allow(clippy::type_complexity)]
                 let mut correlated: Vec<(usize, String, Expr, Descriptor)> = Vec::new();
                 // (select-list position, name) of each whole-item folded
-                // subquery - its describe name, never an alias
+                // or per-row subquery - its describe name, never an alias
                 let mut name_patches: Vec<(usize, String)> = Vec::new();
                 for (i, sub) in subs.iter().enumerate() {
                     let mark = format!("{}{}", SUBQ_MARK, i);
@@ -57373,8 +57390,20 @@ fn plan_query_inner_at(
                             }
                             return Some(Plan::Refused);
                         };
-                        let repl = match (alone.get(i), subq_name(sub)) {
-                            (Some(true), Some(n)) => format!("FC$CORR({}) AS \"{}\"", id, n.replace('"', "\"\"")),
+                        // the name is NO ALIAS here either (the law at
+                        // the fold below): spliced as `FC$CORR(<id>) AS
+                        // <name>` it made `.. GROUP BY T.ID` over an
+                        // ID-named subquery an alias-shadowed refusal and
+                        // `ORDER BY A` sort by the subquery, where the
+                        // engine sorts by T.A (measured on 2182)
+                        if let (Some(true), Some(n)) = (alone.get(i), subq_name(sub)) {
+                            let pos = split_top_level_commas(&folded).iter().position(|item| item.trim() == mark);
+                            if let Some(pos) = pos {
+                                name_patches.push((pos, n));
+                            }
+                        }
+                        let repl = match alone.get(i) {
+                            Some(true) => corr_unnamed_item(id),
                             _ => format!("FC$CORR({})", id),
                         };
                         proj_out = proj_out.replace(&mark, &repl);
@@ -57468,9 +57497,19 @@ fn plan_query_inner_at(
                             correlated.len()
                         );
                     }
-                    return plan_correlated_select(
+                    let mut plan = plan_correlated_select(
                         &proj_out, &correlated, table_s, where_s, order_s, dbr, params, trace,
                     );
+                    // a per-row subquery beside the lookup one carries its
+                    // placeholder name until here ([corr_unnamed_item])
+                    if let Some(Plan::Project { cols, .. }) = plan.as_mut() {
+                        for (idx, n) in &name_patches {
+                            if let Some(c) = cols.get_mut(*idx) {
+                                c.name = n.clone();
+                            }
+                        }
+                    }
+                    return plan;
                 }
                 if trace {
                     eprintln!("[srv] plan: select-list subqueries folded to {:?}", out);
@@ -57521,7 +57560,7 @@ fn plan_query_inner_at(
                     | Plan::Rows { cols, .. } = &mut plan
                     {
                         if let Some(c) = cols.get_mut(*idx) {
-                            c.name = canon_ident(n).unwrap_or_else(|| n.clone());
+                            c.name = n.clone();
                         }
                     }
                 }
@@ -95607,8 +95646,13 @@ fn corr_cmp_before(text: &str, at: usize) -> Option<(usize, Cmp)> {
 /// ANY|SOME|ALL (...)` - become `FC$CORR(<id>) = TRUE`, the three-valued
 /// result compared as a BOOLEAN so a NOT around it still works.
 ///
-/// `select_list`: a subquery standing alone as a select item is named by
-/// its own item (`... AS <name>`), the way the constant fold names one.
+/// `names`: the text is a select list, and a subquery standing alone as a
+/// select item is named by its own item - a NAME, never an alias (measured
+/// on 2182: `SELECT (SELECT X.A FROM T1 X WHERE X.ID = 7 - D.ID) FROM
+/// (SELECT ID, A FROM T1) D ORDER BY A` sorts by D.A, and `.. ORDER BY X`
+/// over an X-named one is -206 "X"). Its (item position, name) is pushed
+/// for the caller to lay on the planned column; a list holding a star,
+/// whose positions the expansion shifts, keeps the `AS <name>` splice.
 /// The text comes back unchanged when it holds no subquery; None when one
 /// cannot be lifted (the statement then keeps its refusal).
 fn lift_corr_text(
@@ -95616,12 +95660,18 @@ fn lift_corr_text(
     scope: &CorrScope,
     db: &Database,
     db_opt: &Option<Database>,
-    select_list: bool,
+    mut names: Option<&mut Vec<(usize, String)>>,
 ) -> Option<String> {
+    let select_list = names.is_some();
     let (folded, subs) = extract_subqueries(text)?;
     if subs.is_empty() {
         return Some(text.to_string());
     }
+    let items = split_top_level_commas(&folded);
+    let starred = items.iter().any(|it| {
+        let t = it.trim();
+        t == "*" || t.ends_with(".*")
+    });
     // which markers stand alone (no alias) as a select item
     let alone: Vec<bool> = if select_list {
         (0..subs.len())
@@ -95635,6 +95685,7 @@ fn lift_corr_text(
     } else {
         vec![false; subs.len()]
     };
+    let items: Vec<String> = items.iter().map(|it| it.to_string()).collect();
     let mut out = folded;
     for (i, sub) in subs.iter().enumerate().rev() {
         let mark = format!("{}{}", SUBQ_MARK, i);
@@ -95668,15 +95719,31 @@ fn lift_corr_text(
         let id = corr_register(sub, scan, kind, scope, db_opt, None)?;
         let repl = if wrap {
             format!("FC$CORR({}) = TRUE", id)
-        } else if select_list && alone[i] {
+        } else if select_list && alone[i] && starred {
             let name = corr_template(id)?.desc.name;
             format!("FC$CORR({}) AS \"{}\"", id, name.replace('"', "\"\""))
+        } else if select_list && alone[i] {
+            let name = corr_template(id)?.desc.name;
+            if let Some(pos) = items.iter().position(|it| it.trim() == mark) {
+                names.as_deref_mut()?.push((pos, name));
+            }
+            corr_unnamed_item(id)
         } else {
             format!("FC$CORR({})", id)
         };
         out = format!("{}{}{}", &out[..cut], repl, &out[end..]);
     }
     Some(out)
+}
+
+/// A whole select item standing for per-row subquery `id`, spelled so the
+/// planner gives it NO name a statement can write: bare, `FC$CORR(<id>)`
+/// takes the inner item's name ([default_expr_name]) and an ORDER BY or
+/// GROUP BY key of that name resolved to it - a key the engine resolves
+/// to the FROM's column or refuses -206 (measured on 2182). The caller
+/// lays the real name on the planned column afterwards.
+fn corr_unnamed_item(id: usize) -> String {
+    format!("FC$CORR({}) AS \"FC$ITEM{}\"", id, id)
 }
 
 /// How a per-row subquery is used, operands resolved.
@@ -96390,12 +96457,21 @@ fn plan_correlated_select(
     // build the output columns: the marker becomes the lookup, every
     // other item is an ordinary select item
     let mut cols: Vec<ProjCol> = Vec::new();
+    // the lookup columns that carry only the INNER item's name: that name
+    // describes the column but is no alias an ORDER BY resolves to
+    // (measured on 2182: `SELECT (SELECT X.A FROM T1 X WHERE X.ID = T.ID)
+    // FROM T1 T ORDER BY A` sorts by T.A, `.. ORDER BY X` over an X-named
+    // one is -206 "X")
+    let mut unaliased: Vec<usize> = Vec::new();
     for item in split_top_level_commas(proj_marked) {
         let (body, alias) = split_alias(item);
         if let Some((_, lookup, result_desc, (ifname, iname), (irel, iralias))) = lookups
             .iter()
             .find(|(m, _, _, _, _)| body.trim() == format!("{}{}", SUBQ_MARK, m))
         {
+            if alias.is_none() {
+                unaliased.push(cols.len());
+            }
             let (wire, sql_type, length, scale, sub_type) = wire_for(result_desc);
             cols.push(ProjCol {
                 // the subquery DELEGATES naming to its inner item: the
@@ -96450,18 +96526,24 @@ fn plan_correlated_select(
     }
     let order_by = match order_s {
         None => Vec::new(),
-        Some(os) => parse_order_by_expr(
-            &unq(os),
-            &cols,
-            &descs,
-            |n| {
-                columns
-                    .iter()
-                    .find(|c| col_name_is(&c.name, n))
-                    .map(|c| c.field_id as usize)
-            },
-            |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
-        )?,
+        Some(os) => {
+            let mut order_cols = cols.clone();
+            for i in &unaliased {
+                order_cols[*i].name.clear();
+            }
+            parse_order_by_expr(
+                &unq(os),
+                &order_cols,
+                &descs,
+                |n| {
+                    columns
+                        .iter()
+                        .find(|c| col_name_is(&c.name, n))
+                        .map(|c| c.field_id as usize)
+                },
+                |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+            )?
+        }
     };
     // The OUTER retrieval's access path, chosen the way every other
     // single-relation retrieval chooses one. Gated on a WHERE existing
