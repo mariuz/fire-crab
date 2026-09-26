@@ -20106,9 +20106,22 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
             dtype::INT64 => Some(int64),
             _ => None,
         },
-        SysFn::Abs => match src_dtype(0)? {
-            dtype::SHORT => Some(long),
-            dtype::LONG => Some(int64),
+        // ABS WIDENS ONE STEP AT THE NARROW END (makeAbs): a SMALLINT
+        // operand answers INTEGER, an INTEGER one BIGINT, and BIGINT /
+        // INT128 keep their width - for a COLUMN, a LITERAL and a CAST
+        // alike (ABS(CAST(1.5 AS NUMERIC(4,1))) is LONG scale -1,
+        // ABS(CAST(-32768 AS SMALLINT)) LONG, measured; the dtype-only
+        // read above announced INT64 for every cast). A bare NULL is
+        // makeAbs's `makeLong` (ABS(NULL) describes LONG).
+        SysFn::Abs => match args.first() {
+            Some(Expr::Null) => Some(long),
+            Some(a) if matches!(a.type_of(descs), Some(ExprType::Int | ExprType::Numeric)) => {
+                Some(match result_width_bytes(a, descs) {
+                    2 => long,
+                    4 | 8 => int64,
+                    _ => (Wire::Int128, 32752, 16),
+                })
+            }
             _ => None,
         },
         // the result takes the width of the widest operand, read off the
@@ -34768,6 +34781,98 @@ fn approx_to_exact(x: f64, eps: f64, dt: u8, scale: i8) -> Result<i128, ApproxFi
         return Err(ApproxFit::OutOfRange);
     }
     Ok(r)
+}
+
+/// `CVT_power_of_ten` (cvt.cpp): 10^scale as the engine multiplies a
+/// double by it - the product of two table entries, `1e32^k` times
+/// `1e0..1e31`, so a scale past 22 is the same doubly-rounded double the
+/// engine uses and not Rust's `powi`.
+fn cvt_power_of_ten(scale: i32) -> f64 {
+    const UPPER: [f64; 10] = [1e000, 1e032, 1e064, 1e096, 1e128, 1e160, 1e192, 1e224, 1e256, 1e288];
+    const LOWER: [f64; 32] = [
+        1e00, 1e01, 1e02, 1e03, 1e04, 1e05, 1e06, 1e07, 1e08, 1e09, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
+        1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22, 1e23, 1e24, 1e25, 1e26, 1e27, 1e28, 1e29, 1e30, 1e31,
+    ];
+    let scale = scale.clamp(0, 319) as usize;
+    UPPER[scale >> 5] * LOWER[scale & 0x1f]
+}
+
+/// x86-64's `(unsigned) double`: one `cvttsd2si` into a 64-bit register
+/// and the low 32 bits of it - so a value past +-2^63 (the "integer
+/// indefinite" 0x8000000000000000) reads 0, and a negative one wraps.
+/// The engine's Int128::set(double) leans on exactly this.
+fn c_double_to_unsigned(x: f64) -> u32 {
+    if x.is_nan() || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&x) {
+        0
+    } else {
+        (x.trunc() as i64) as u32
+    }
+}
+
+/// `Int128::set(double)` (common/Int128.cpp) as the engine runs it on
+/// x86-64 - INCLUDING ITS DEFECT, which is the law this server follows:
+/// the value is split into four 2^32 parts (`parts[i] = value / 2^(32i)`),
+/// then each dword is `parts[i] - value` where `value` accumulates
+/// `2^32 * dwords[i]` for EVERY dword so far - the same weight for all,
+/// where the true weight is 2^(32 * (j - i)). Below 2^64 nothing is off
+/// (only dwords[1] and [0] exist, and 2^32 * d1 is the right offset for
+/// d0). From 2^64 the lower dwords see a garbage offset: `parts[0] -
+/// value` is a huge positive, past 2^63, and the C conversion above makes
+/// it 0. So a double column holding 1e21 casts to 999999999996264972288
+/// (dwords 54 / 902409669 / 0 in place of 54 / 902409669 / 3735027712),
+/// 1e30 to 999999999994923055729694736384, 2^64 + 2^12 to exactly 2^64,
+/// while 2^64, 2^63 and everything below stay exact - all measured on
+/// 2182 (a UNION branch, a column, an aggregate argument). This server
+/// answered the double's shortest decimal ("18446744073709552000" for
+/// 2^64, "1000000000000000000000000000000" for 1e30) - neither the
+/// engine's value nor the double's.
+fn int128_set_double(value: f64) -> i128 {
+    let neg = value < 0.0;
+    let mut v = value.abs();
+    const P2_32: f64 = 4_294_967_296.0;
+    let mut parts = [0f64; 4];
+    for p in parts.iter_mut() {
+        *p = v;
+        v /= P2_32;
+    }
+    let mut dwords = [0u32; 4];
+    let mut acc = 0f64;
+    for i in (0..4).rev() {
+        dwords[i] = c_double_to_unsigned(parts[i] - acc);
+        acc += P2_32 * dwords[i] as f64;
+    }
+    let mag = ((dwords[3] as u128) << 96)
+        | ((dwords[2] as u128) << 64)
+        | ((dwords[1] as u128) << 32)
+        | dwords[0] as u128;
+    let r = mag as i128;
+    if neg { r.wrapping_neg() } else { r }
+}
+
+/// `CVT_get_int128` for a DOUBLE / FLOAT source (cvt.cpp): the value is
+/// scaled by the engine's power-of-ten table IN DOUBLE (a NUMERIC(38,6)
+/// target multiplies by 1e6 first, so 1e30 becomes the double 1e36 =
+/// 1000000000000000042420637374017961984), moved half away from zero by
+/// `0.5 + eps` (1e-14 for a double, 1e-5 for a float), range-checked
+/// against the engine's asymmetric I128 bounds (22003 past them), and
+/// handed to [int128_set_double]. A FLOAT source is its exact double.
+fn cvt_double_to_int128(d: f64, single: bool, scale: i8) -> Result<i128, EvalErr> {
+    let eps = if single { 1e-5 } else { 1e-14 };
+    let mut d = d;
+    if scale > 0 {
+        d /= cvt_power_of_ten(scale as i32);
+    } else if scale < 0 {
+        d *= cvt_power_of_ten(-(scale as i32));
+    }
+    if d > 0.0 {
+        d += 0.5 + eps;
+    } else {
+        d -= 0.5 + eps;
+    }
+    if d.is_nan() || d < -1.701_411_834_604_692_3e38 || 1.701_411_834_604_692_1e38 < d {
+        return Err(EvalErr::NumericOutOfRange);
+    }
+    Ok(int128_set_double(d))
 }
 
 /// A bare `?`'s DOUBLE / FLOAT message into an INT128 column - a RUNTIME
@@ -51291,7 +51396,9 @@ fn plan_union(
         // [validate_select_bind], [branch_rows_res], and the fetch arm's
         // `branch_rows_each` / `branch_rows_res`.
         let base = params.len();
-        let plan = plan_query_inner_at(p, db, params, false, base)?;
+        // a branch's literals sit in the union MAP, outside any assignment
+        // to the result's type ([runtime_double_cast])
+        let plan = with_runtime_double_casts(|| plan_query_inner_at(p, db, params, false, base))?;
         // every branch shape [branch_rows_res] materialises - a plain
         // scan, an aggregate or GROUP BY (`SELECT 'T' K, COUNT(*) FROM T
         // UNION ALL ...` is how a catalog is counted table by table), a
@@ -54460,6 +54567,15 @@ fn plan_query_inner_at(
                     let fname = func.name()
                     .to_string();
                     let name = alias.clone().unwrap_or_else(|| fname.clone());
+                    // a fold the engine answers in DECIMAL128 (a
+                    // PERCENTILE_CONT / CORR / REGR over an INT128 or
+                    // DECFLOAT operand) has no scalar form here: the group
+                    // machinery types and computes it
+                    if agg_result_desc(*func, target, &columns, &descs)
+                        .is_some_and(|d| d.dtype == dtype::DEC128)
+                    {
+                        return None;
+                    }
                     // MEASURED: MIN/MAX announce the SOURCE column's
                     // own type; SUM widens to INT64; COUNT is INT64
                     // and NOT nullable - the only aggregate without
@@ -55423,23 +55539,25 @@ fn resolve_agg_src(
                 (agg_field_src(fid, descs), distinct)
             }
         }
+        // an aggregate's argument is folded in the aggregate map, outside
+        // any assignment to the result's type ([runtime_double_cast])
         AggTarget::DistinctExpr(raw) => {
-            (agg_expr_src(resolve_expr_sink(raw, columns, descs, sink)?)?, true)
+            (agg_expr_src(with_runtime_double_casts(|| resolve_expr_sink(raw, columns, descs, sink))?)?, true)
         }
         AggTarget::Expr(raw) => {
-            (agg_expr_src(resolve_expr_sink(raw, columns, descs, sink)?)?, false)
+            (agg_expr_src(with_runtime_double_casts(|| resolve_expr_sink(raw, columns, descs, sink))?)?, false)
         }
         AggTarget::Pair(y, x) => (
             AggSrc::Pair(
-                resolve_expr_sink(y, columns, descs, sink)?,
-                resolve_expr_sink(x, columns, descs, sink)?,
+                with_runtime_double_casts(|| resolve_expr_sink(y, columns, descs, sink))?,
+                with_runtime_double_casts(|| resolve_expr_sink(x, columns, descs, sink))?,
             ),
             false,
         ),
         AggTarget::Percentile { frac, order, desc } => (
             AggSrc::Percentile {
                 frac: resolve_expr_sink(frac, columns, descs, sink)?,
-                order: resolve_expr_sink(order, columns, descs, sink)?,
+                order: with_runtime_double_casts(|| resolve_expr_sink(order, columns, descs, sink))?,
                 desc: *desc,
             },
             false,
@@ -55841,8 +55959,9 @@ fn agg_result_desc(
                 AggTarget::Col(n) => col_desc(n)?.dtype == dtype::INT128,
                 AggTarget::Expr(raw) => {
                     let e = resolve_expr_sink(raw, columns, descs, &mut Vec::new())?;
-                    !matches!(e.type_of(descs)?, ExprType::Approx)
-                        && e.rank_of(descs) == Some(NumRank::I128)
+                    is_decfloat_arith(&e, descs)
+                        || (!matches!(e.type_of(descs)?, ExprType::Approx)
+                            && e.rank_of(descs) == Some(NumRank::I128))
                 }
                 _ => false,
             };
@@ -55872,18 +55991,18 @@ fn agg_result_desc(
                     return None;
                 }
             }
-            // an INT128-backed first argument: the engine's DECFLOAT(34)
-            // fold, not modelled - refused (see the select-item arm)
+            // an INT128-backed or DECFLOAT FIRST argument: the engine's
+            // decimal128 fold, DECFLOAT(34) (see the select-item arm)
+            let mut decimal = false;
             if !matches!(func, AggFn::RegrCount) {
                 let ye = resolve_expr_sink(y, columns, descs, &mut Vec::new())?;
-                if !matches!(ye.type_of(descs), Some(ExprType::Approx))
-                    && ye.rank_of(descs) == Some(NumRank::I128)
-                {
-                    return None;
-                }
+                decimal = !matches!(ye.type_of(descs), Some(ExprType::Approx))
+                    && (ye.rank_of(descs) == Some(NumRank::I128) || is_decfloat_arith(&ye, descs));
             }
             if matches!(func, AggFn::RegrCount) {
                 int64(0)
+            } else if decimal {
+                Descriptor { dtype: dtype::DEC128, scale: 0, length: 16, sub_type: 0, flags: 0, offset: 1 }
             } else {
                 double_d()
             }
@@ -55892,6 +56011,22 @@ fn agg_result_desc(
         // an ordered VALUE and keeps its exact type - a column order
         // keeps the column's own descriptor
         AggFn::PercentileCont => {
+            // an INT128-backed or DECFLOAT order: DECFLOAT(34)
+            let dec_order = match target {
+                AggTarget::Percentile { order: RawExpr::Col(n), .. } => {
+                    matches!(col_desc(n)?.dtype, dtype::INT128 | dtype::DEC64 | dtype::DEC128)
+                }
+                AggTarget::Percentile { order, .. } => {
+                    let e = resolve_expr_sink(order, columns, descs, &mut Vec::new())?;
+                    is_decfloat_arith(&e, descs)
+                        || (!matches!(e.type_of(descs), Some(ExprType::Approx))
+                            && e.rank_of(descs) == Some(NumRank::I128))
+                }
+                _ => false,
+            };
+            if dec_order {
+                return Some(Descriptor { dtype: dtype::DEC128, scale: 0, length: 16, sub_type: 0, flags: 0, offset: 1 });
+            }
             if !operand_numericish(target)? {
                 return None;
             }
@@ -55999,11 +56134,36 @@ fn raw_described_not_null(e: &RawExpr) -> bool {
         RawExpr::Coalesce(v) => v.iter().all(raw_described_not_null),
         RawExpr::Func(_, v) => v.iter().all(raw_described_not_null),
         RawExpr::Iif(_, a, b) => raw_described_not_null(a) && raw_described_not_null(b),
+        // a SIMPLE CASE / DECODE (the engine's DecodeNode) describes
+        // NULLABLE whatever its branches: its make() forces the flag
+        // (DecodeNode::getDesc `setNullable(true)`); only the SEARCHED
+        // CASE (a ValueIfNode) follows its branches
+        RawExpr::Case(_, _, true) => false,
         RawExpr::Case(branches, else_, _) => {
             else_.as_deref().is_some_and(raw_described_not_null)
                 && branches.iter().all(|(_, t)| raw_described_not_null(t))
         }
         _ => false,
+    }
+}
+
+/// A resolved SIMPLE CASE / DECODE (`simple`) with a default is made to
+/// DESCRIBE NULLABLE, as the engine's DecodeNode does whatever its
+/// branches hold (measured: `DECODE(I, 1, 'a', 'bb')` and `CASE NN WHEN 4
+/// THEN 'x' ELSE 'y' END` over a NOT NULL NN both describe Nullable, where
+/// IIF(NN = 4, 'x', 'y') does not; this server announced all three
+/// not-null). The marker is a leading `WHEN 0 IS NULL THEN NULL` arm - a
+/// shape every walker already carries (an explicit NULL branch is
+/// transparent to the type, width, scale and sub_type, and never fires) -
+/// so [expr_nullable] reads the node as nullable through the one arm it
+/// judges by. A default-less simple CASE is nullable already.
+fn simple_case_nullable(simple: bool, e: Expr) -> Expr {
+    match e {
+        Expr::Case(mut arms, els @ Some(_)) if simple => {
+            arms.insert(0, (Cond2::IsNull(Box::new(Expr::Int(0))), Expr::Null));
+            Expr::Case(arms, els)
+        }
+        other => other,
     }
 }
 
@@ -56427,7 +56587,8 @@ fn build_group_items(
                 // and MIN/MAX keep the source width (measured). Computed
                 // here so src_shape can be skipped for a decfloat source.
                 let df_wide = match (&src, field_desc) {
-                    (AggSrc::Field(_) | AggSrc::CollField(..), Some(d)) => match d.dtype {
+                    (AggSrc::Field(_) | AggSrc::CollField(..), Some(d))
+                    | (AggSrc::Percentile { .. }, Some(d)) => match d.dtype {
                         dtype::DEC64 => Some(false),
                         dtype::DEC128 => Some(true),
                         _ => None,
@@ -56439,8 +56600,15 @@ fn build_group_items(
                 // AVG/MIN/MAX preserve the expression's width; the shapes
                 // the shipped arith fold would over-widen (d16-d16, -d16)
                 // refuse via df_expr_agg_wide returning None.
+                // ...a PERCENTILE's ORDER BY expression and a two-argument
+                // fold's FIRST argument (the one the engine types by) take
+                // the same route
                 let df_expr = match &src {
                     AggSrc::Expr(e) => df_expr_agg_wide(func, e, descs),
+                    AggSrc::Percentile { order: e, .. } if !matches!(e, Expr::Col(_)) => {
+                        df_expr_agg_wide(func, e, descs)
+                    }
+                    AggSrc::Pair(y, _) => df_expr_agg_wide(func, y, descs),
                     _ => None,
                 };
                 // (type, scale, rank) of the aggregate's input - not needed
@@ -56451,6 +56619,8 @@ fn build_group_items(
                 // src_shape's `type_of()?` and falls to a clean None.
                 let src_shape: Option<(ExprType, i8, NumRank)> = if df_wide.is_some()
                     || matches!(&src, AggSrc::Expr(e) if is_decfloat_arith(e, descs))
+                    || matches!(&src, AggSrc::Percentile { order: e, .. } if is_decfloat_arith(e, descs))
+                    || matches!(&src, AggSrc::Pair(y, _) if is_decfloat_arith(y, descs))
                 {
                     None
                 } else { match (&src, field_desc) {
@@ -56517,14 +56687,34 @@ fn build_group_items(
                 // decfloat source stays refused. (df_wide computed above.)
                 let df_tuple = df_wide.or(df_expr).and_then(|wide| match func {
                     AggFn::Sum => Some((Wire::Dec34, 32762, 16, 0, 0)),
-                    // VAR / STDDEV over a DECFLOAT column: DECFLOAT(34),
-                    // NOT nullable, either width (measured - this refused)
-                    AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp
-                        if df_wide.is_some() =>
-                    {
-                        Some((Wire::Dec34, 32762, 16, 0, 0))
-                    }
-                    AggFn::Avg | AggFn::Min | AggFn::Max => Some(if wide {
+                    // VAR / STDDEV over a DECFLOAT column or expression:
+                    // DECFLOAT(34), NOT nullable, either width (measured -
+                    // the column refused before, the expression until the
+                    // wide-numeric round); PERCENTILE_CONT and the
+                    // two-argument folds over one likewise (makeDecimal128
+                    // on isDecOrInt128), the percentile nullable
+                    AggFn::VarPop
+                    | AggFn::VarSamp
+                    | AggFn::StddevPop
+                    | AggFn::StddevSamp
+                    | AggFn::PercentileCont
+                    | AggFn::Corr
+                    | AggFn::CovarPop
+                    | AggFn::CovarSamp
+                    | AggFn::RegrSlope
+                    | AggFn::RegrIntercept
+                    | AggFn::RegrR2
+                    | AggFn::RegrAvgx
+                    | AggFn::RegrAvgy
+                    | AggFn::RegrSxx
+                    | AggFn::RegrSyy
+                    | AggFn::RegrSxy => Some((Wire::Dec34, 32762, 16, 0, 0)),
+                    // REGR_COUNT is a BIGINT whatever it counts
+                    AggFn::RegrCount => Some((Wire::Int64, 580, 8, 0, 0)),
+                    // PERCENTILE_DISC picks a VALUE and keeps its width, as
+                    // MIN / MAX do (measured: DECFLOAT(16) over a
+                    // CAST(.. AS DECFLOAT(16)) order)
+                    AggFn::Avg | AggFn::Min | AggFn::Max | AggFn::PercentileDisc => Some(if wide {
                         (Wire::Dec34, 32762, 16, 0, 0)
                     } else {
                         (Wire::Dec16, 32760, 8, 0, 0)
@@ -56695,6 +56885,7 @@ fn build_group_items(
                     | AggFn::RegrSxx
                     | AggFn::RegrSyy
                     | AggFn::RegrSxy => {
+                        let mut decimal = false;
                         if let AggSrc::Pair(y, x) = &src {
                             for e in [y, x] {
                                 if !matches!(
@@ -56702,25 +56893,26 @@ fn build_group_items(
                                     Some(
                                         ExprType::Int | ExprType::Numeric | ExprType::Approx
                                     )
-                                ) {
+                                ) && !is_decfloat_arith(e, descs)
+                                {
                                     return None;
                                 }
                             }
-                            // an INT128-backed FIRST argument makes the
-                            // engine fold in decimal128 and answer
-                            // DECFLOAT(34) (measured: CORR(H, ID) is
-                            // 0.7843266893787232114218613551766932) - not
-                            // modelled here, so refused rather than
-                            // answered as the DOUBLE it is not
-                            if !matches!(func, AggFn::RegrCount)
+                            // THE FIRST ARGUMENT ALONE TYPES THE FOLD
+                            // (CorrAggNode / RegrAggNode::make read `arg`):
+                            // an INT128-backed or DECFLOAT Y folds in
+                            // decimal128 and answers DECFLOAT(34) whatever
+                            // X is - CORR(M, DBL) is DECFLOAT(34) 1 where
+                            // CORR(DBL, M) is DOUBLE 1.000000000000000
+                            // (measured). This refused the shape before.
+                            decimal = !matches!(func, AggFn::RegrCount)
                                 && !matches!(y.type_of(descs), Some(ExprType::Approx))
-                                && y.rank_of(descs) == Some(NumRank::I128)
-                            {
-                                return None;
-                            }
+                                && (y.rank_of(descs) == Some(NumRank::I128) || is_decfloat_arith(y, descs));
                         }
                         if matches!(func, AggFn::RegrCount) {
                             (Wire::Int64, 580, 8, 0, 0)
+                        } else if decimal {
+                            (Wire::Dec34, 32762, 16, 0, 0)
                         } else {
                             (Wire::Double, 480, 8, 0, 0)
                         }
@@ -56729,11 +56921,19 @@ fn build_group_items(
                     // ORDER BY value must be numeric (the engine's
                     // "must be numeric" otherwise)
                     AggFn::PercentileCont => {
-                        let (t, _sc, _rank) = src_shape?;
+                        let (t, _sc, rank) = src_shape?;
                         if !matches!(t, ExprType::Int | ExprType::Numeric | ExprType::Approx) {
                             return None;
                         }
-                        (Wire::Double, 480, 8, 0, 0)
+                        // an INT128-backed order interpolates in decimal128
+                        // and answers DECFLOAT(34) (PercentileAggNode::make's
+                        // isDecOrInt128; measured over NUMERIC(38,0) and
+                        // INT128 - this said DOUBLE)
+                        if rank == NumRank::I128 && !matches!(t, ExprType::Approx) {
+                            (Wire::Dec34, 32762, 16, 0, 0)
+                        } else {
+                            (Wire::Double, 480, 8, 0, 0)
+                        }
                     }
                     // LIST answers a TEXT BLOB (sub_type 1) whose character
                     // set is the ARGUMENT's (ListAggNode::make copies the
@@ -61346,11 +61546,13 @@ fn stat2_result(func: AggFn, n: i64, sx: f64, sx2: f64, sy: f64, sy2: f64, sxy: 
             if var_pop_x == 0.0 {
                 Value::Null
             } else {
-                // the engine's `avgY - slope * avgX` is compiled with
-                // floating-point contraction (a fused multiply-add), a
-                // single rounding - matched here with mul_add so the last
-                // bit agrees (plain multiply-then-subtract is one ULP off)
-                Value::Double(slope.mul_add(-avg_x, avg_y))
+                // `avgY - slope * avgX` with TWO roundings, as the engine's
+                // x86-64 build computes it (no FMA instruction in its
+                // target; the fused form answered 0.5000000000000003 over
+                // X {1, 2, 4} / Y {1, 2, 3} where the engine says
+                // 0.5000000000000002 - measured 2026-09-26; the earlier
+                // "fused" data set gave the same bits either way)
+                Value::Double(avg_y - slope * avg_x)
             }
         }
         AggFn::RegrR2 => {
@@ -61375,6 +61577,121 @@ fn stat2_result(func: AggFn, n: i64, sx: f64, sx2: f64, sy: f64, sy2: f64, sxy: 
         AggFn::RegrSxy => Value::Double(nf * covar_pop),
         AggFn::RegrSyy => Value::Double(nf * var_pop_y),
         _ => Value::Null, // RegrCount / CovarSamp handled above
+    }
+}
+
+/// The DECIMAL128 twin of [stat2_result]: CorrAggNode / RegrAggNode's
+/// FLAG_DECFLOAT execute over n and the five sums (Sx, Sxx, Sy, Syy, Sxy
+/// accumulated by add and one-rounding fma), every step a decimal128
+/// operation HALF-UP at 34 digits in the engine's own order. The
+/// trapped steps raise (Overflow 22003, an Invalid NaN 22000); the two
+/// `safeDivide` steps - slope and corr - divide by a zero variance
+/// silently, and their consumers test the variance first. X is the
+/// SECOND SQL argument, Y the FIRST.
+fn stat2_dec_result(
+    func: AggFn,
+    n: i64,
+    sx: &fire_crab_ods::decfloat::Dec,
+    sx2: &fire_crab_ods::decfloat::Dec,
+    sy: &fire_crab_ods::decfloat::Dec,
+    sy2: &fire_crab_ods::decfloat::Dec,
+    sxy: &fire_crab_ods::decfloat::Dec,
+) -> Result<Value, EvalErr> {
+    use fire_crab_ods::decfloat::{self as dfl, Dec};
+    let fin = |d: &Dec| matches!(d, Dec::Finite { .. });
+    let trap = |before: &[&Dec], after: Dec| -> Result<Dec, EvalErr> {
+        if matches!(after, Dec::Infinity { .. }) && before.iter().all(|d| fin(d)) {
+            return Err(EvalErr::DecfloatOverflow);
+        }
+        if matches!(after, Dec::Nan) && !before.iter().any(|d| matches!(d, Dec::Nan)) {
+            return Err(EvalErr::DecfloatInvalidOperation);
+        }
+        Ok(after)
+    };
+    let dec_of = |v: i64| Dec::Finite { neg: v < 0, coeff: v.unsigned_abs() as u128, exp: 0 };
+    let zero = Dec::Finite { neg: false, coeff: 0, exp: 0 };
+    let is0 = |d: &Dec| dfl::cmp(d, &zero) == std::cmp::Ordering::Equal;
+    let out = |d: Dec| Ok(Value::DecFloat34(dfl::dec_to_bits(&d)));
+    if matches!(func, AggFn::RegrCount) {
+        return Ok(Value::Int(n));
+    }
+    if n == 0 || (matches!(func, AggFn::CovarSamp) && n < 2) {
+        return Ok(Value::Null);
+    }
+    let cnt = dec_of(n);
+    // Sx * Sy / n, Sxx - Sx * Sx / n, ... each rounded as the engine rounds
+    let m = |a: &Dec, b: &Dec| trap(&[a, b], dfl::mul(a, b));
+    let dv = |a: &Dec, b: &Dec| trap(&[a, b], dfl::div(a, b));
+    let sb = |a: &Dec, b: &Dec| trap(&[a, b], dfl::sub(a, b));
+    match func {
+        AggFn::CovarSamp | AggFn::CovarPop | AggFn::Corr => {
+            let t = dv(&m(sx, sy)?, &cnt)?;
+            let t = sb(sxy, &t)?;
+            match func {
+                AggFn::CovarSamp => out(dv(&t, &dec_of(n - 1))?),
+                AggFn::CovarPop => out(dv(&t, &cnt)?),
+                _ => {
+                    let covar_pop = dv(&t, &cnt)?;
+                    let vx = dv(&sb(sx2, &dv(&m(sx, sx)?, &cnt)?)?, &cnt)?;
+                    let vy = dv(&sb(sy2, &dv(&m(sy, sy)?, &cnt)?)?, &cnt)?;
+                    let rx = trap(&[&vx], dfl::sqrt(&vx))?;
+                    let ry = trap(&[&vy], dfl::sqrt(&vy))?;
+                    let divisor = m(&rx, &ry)?;
+                    if is0(&divisor) {
+                        return Ok(Value::Null);
+                    }
+                    out(dv(&covar_pop, &divisor)?)
+                }
+            }
+        }
+        _ => {
+            let sxx = sb(sx2, &dv(&m(sx, sx)?, &cnt)?)?;
+            let syy = sb(sy2, &dv(&m(sy, sy)?, &cnt)?)?;
+            let sxy_ = sb(sxy, &dv(&m(sx, sy)?, &cnt)?)?;
+            let var_pop_x = dv(&sxx, &cnt)?;
+            let var_pop_y = dv(&syy, &cnt)?;
+            let covar_pop = dv(&sxy_, &cnt)?;
+            let avg_x = dv(sx, &cnt)?;
+            let avg_y = dv(sy, &cnt)?;
+            // the safeDivide steps: a zero variance gives an untrapped
+            // Infinity / NaN that no consumer reads
+            let slope = dfl::div(&covar_pop, &var_pop_x);
+            let sq = m(&trap(&[&var_pop_x], dfl::sqrt(&var_pop_x))?, &trap(&[&var_pop_y], dfl::sqrt(&var_pop_y))?)?;
+            let corr = dfl::div(&covar_pop, &sq);
+            match func {
+                AggFn::RegrAvgx => out(avg_x),
+                AggFn::RegrAvgy => out(avg_y),
+                AggFn::RegrIntercept => {
+                    if is0(&var_pop_x) {
+                        Ok(Value::Null)
+                    } else {
+                        out(sb(&avg_y, &m(&slope, &avg_x)?)?)
+                    }
+                }
+                AggFn::RegrR2 => {
+                    if is0(&var_pop_x) {
+                        Ok(Value::Null)
+                    } else if is0(&var_pop_y) {
+                        out(dec_of(1))
+                    } else if is0(&sq) {
+                        Ok(Value::Null)
+                    } else {
+                        out(m(&corr, &corr)?)
+                    }
+                }
+                AggFn::RegrSlope => {
+                    if is0(&var_pop_x) {
+                        Ok(Value::Null)
+                    } else {
+                        out(slope)
+                    }
+                }
+                AggFn::RegrSxx => out(sxx),
+                AggFn::RegrSxy => out(sxy_),
+                AggFn::RegrSyy => out(syy),
+                _ => Ok(Value::Null),
+            }
+        }
     }
 }
 
@@ -61546,9 +61863,46 @@ fn percentile_result(func: AggFn, vals: &[Value], frac: f64) -> Result<Value, Ev
         let idx = (crn - 1).clamp(0, n - 1) as usize;
         return Ok(vals[idx].clone());
     }
+    // PERCENTILE_CONT over an INT128 / DECFLOAT order interpolates in
+    // DECIMAL128 (PercentileAggNode::aggPass's isDecOrInt128 arm): the
+    // rank rn = 1 + frac * (n - 1) is still a DOUBLE, an integral rank
+    // answers that row's value as MOV_get_dec128 reads it, and a
+    // fractional one accumulates 0 + v[frn] * D(crn - rn) + v[crn] *
+    // D(rn - frn) where D is Decimal128::set(double) - the 17-digit
+    // "%.016e" - so PERCENTILE_CONT(0.1) over INT128 {1, 2, 4} is
+    // 1.19999999999999996 and (0.25) 1.50000000000000000 (measured; this
+    // answered a DOUBLE 1.200000000000000)
+    if vals.iter().any(|v| matches!(v, Value::Int128(..) | Value::DecFloat16(_) | Value::DecFloat34(_))) {
+        use fire_crab_ods::decfloat::{self as dfl, Dec};
+        let rn = frac.mul_add((n - 1) as f64, 1.0);
+        let frn = rn.floor() as i64;
+        let crn = rn.ceil() as i64;
+        let at = |pos: i64| -> Result<Dec, EvalErr> {
+            let v = &vals[(pos - 1).clamp(0, n - 1) as usize];
+            match v {
+                Value::Text(s) => text_to_dec128_clamped(s).ok().map(dfl::decode_dec128),
+                v => value_as_dec(v).or_else(|| approx_of(v).and_then(|x| f64_to_dec(x, 17))),
+            }
+            .ok_or(EvalErr::ConversionError(None))
+        };
+        let out = if frn == crn {
+            at(frn)?
+        } else {
+            let w1 = f64_to_dec(crn as f64 - rn, 17).ok_or(EvalErr::ConversionError(None))?;
+            let w2 = f64_to_dec(rn - frn as f64, 17).ok_or(EvalErr::ConversionError(None))?;
+            let acc = Dec::Finite { neg: false, coeff: 0, exp: 0 };
+            let acc = dfl::add(&acc, &dfl::mul(&at(frn)?, &w1));
+            let acc = dfl::add(&acc, &dfl::mul(&at(crn)?, &w2));
+            if matches!(acc, Dec::Infinity { .. }) {
+                return Err(EvalErr::DecfloatOverflow);
+            }
+            acc
+        };
+        return Ok(Value::DecFloat34(dfl::dec_to_bits(&out)));
+    }
     // PERCENTILE_CONT - fold each sorted value to f64 the CVT way
     let to_f64 = |v: &Value| -> f64 {
-        approx_of(v).unwrap_or_else(|| {
+        approx_of(v).or_else(|| decfloat_as_f64(v)).unwrap_or_else(|| {
             numeric_parts(v)
                 .map(|(raw, sc)| exact_to_f64(raw, sc as i32))
                 .unwrap_or(0.0)
@@ -62001,16 +62355,66 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         if let Some((raw, sc)) = numeric_parts(v) {
                             Some(exact_to_f64(raw, sc as i32))
                         } else {
-                            approx_of(v)
+                            approx_of(v).or_else(|| decfloat_as_f64(v))
                         }
                     };
+                    let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(rows.len());
+                    for r in rows {
+                        // the FIRST SQL argument is Y, the second X; a
+                        // NULL on either side skips the pair
+                        let (yv, xv) = (ye.eval(r)?, xe.eval(r)?);
+                        if !matches!(yv, Value::Null) && !matches!(xv, Value::Null) {
+                            pairs.push((yv, xv));
+                        }
+                    }
+                    // AN INT128 / DECFLOAT FIRST ARGUMENT FOLDS IN
+                    // DECIMAL128 (CorrAggNode / RegrAggNode's
+                    // FLAG_DECFLOAT path, keyed on `arg` alone): both
+                    // operands read as MOV_get_dec128 - an exact value at
+                    // its cohort, a DECFLOAT as is, a DOUBLE at 17
+                    // significant digits - and the five sums accumulate by
+                    // add / one-rounding fma. Measured: CORR(M, ID) over
+                    // NUMERIC(38,0) is 0.9819805060619657156974386843702867,
+                    // REGR_SXY(I, DBL) 4.66666666666666666666666666666667.
+                    if pairs.iter().any(|(y, _)| {
+                        matches!(y, Value::Int128(..) | Value::DecFloat16(_) | Value::DecFloat34(_))
+                    }) {
+                        use fire_crab_ods::decfloat::{self as dfl, Dec};
+                        let to_dec = |v: &Value| -> Option<Dec> {
+                            match v {
+                                Value::Double(_) | Value::Float(_) => f64_to_dec(approx_of(v)?, 17),
+                                Value::Text(s) => text_to_dec128_clamped(s).ok().map(dfl::decode_dec128),
+                                v => value_as_dec(v),
+                            }
+                        };
+                        let fin = |d: &Dec| matches!(d, Dec::Finite { .. });
+                        let trap = |before: &[&Dec], after: Dec| -> Result<Dec, EvalErr> {
+                            if matches!(after, Dec::Infinity { .. }) && before.iter().all(|d| fin(d)) {
+                                return Err(EvalErr::DecfloatOverflow);
+                            }
+                            if matches!(after, Dec::Nan) && !before.iter().any(|d| matches!(d, Dec::Nan)) {
+                                return Err(EvalErr::DecfloatInvalidOperation);
+                            }
+                            Ok(after)
+                        };
+                        let zero = Dec::Finite { neg: false, coeff: 0, exp: 0 };
+                        let (mut n, mut sx, mut sx2, mut sy, mut sy2, mut sxy) = (0i64, zero, zero, zero, zero, zero);
+                        for (yv, xv) in &pairs {
+                            let (Some(y), Some(x)) = (to_dec(yv), to_dec(xv)) else { continue };
+                            n += 1;
+                            sx = trap(&[&sx, &x], dfl::add(&sx, &x))?;
+                            sx2 = trap(&[&sx2, &x], dfl::fma(&x, &x, &sx2))?;
+                            sy = trap(&[&sy, &y], dfl::add(&sy, &y))?;
+                            sy2 = trap(&[&sy2, &y], dfl::fma(&y, &y, &sy2))?;
+                            sxy = trap(&[&sxy, &x, &y], dfl::fma(&x, &y, &sxy))?;
+                        }
+                        return stat2_dec_result(*func, n, &sx, &sx2, &sy, &sy2, &sxy);
+                    }
                     let (mut n, mut sx, mut sx2, mut sy, mut sy2, mut sxy) =
                         (0i64, 0f64, 0f64, 0f64, 0f64, 0f64);
-                    for r in rows {
-                        // the FIRST SQL argument is Y, the second X
-                        let (yv, xv) = (ye.eval(r)?, xe.eval(r)?);
-                        let (Some(y), Some(x)) = (to_f64(&yv), to_f64(&xv)) else {
-                            continue; // either operand null / non-numeric: skip
+                    for (yv, xv) in &pairs {
+                        let (Some(y), Some(x)) = (to_f64(yv), to_f64(xv)) else {
+                            continue; // a non-numeric operand: skip
                         };
                         n += 1;
                         sx += x;
@@ -67461,6 +67865,18 @@ thread_local! {
     /// a call with the wrong argument count): [plan_query] answers it
     /// in place of the generic refusal when the text does not plan
     static PREPARE_REFUSAL: std::cell::RefCell<Option<EvalErr>> = std::cell::RefCell::new(None);
+    /// set while a UNION branch or an aggregate argument resolves: a
+    /// numeric literal there is NOT under an assignment to its target, so
+    /// the engine never re-reads its text - `CAST(1e30 AS NUMERIC(38,6))`
+    /// converts the DOUBLE at run time ([runtime_double_cast])
+    static RUNTIME_DOUBLE_CASTS: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    /// the SPELLING of every double literal whose engine double
+    /// ([cvt_text_to_double]) is not the correctly rounded one, by the
+    /// double's bits: the literal-fold arm re-reads the TEXT, as the
+    /// engine's LiteralNode::pass2 does, and the shortest decimal of an
+    /// off-by-one-ULP double is not that text (`1e37` would fold as
+    /// 1.0000000000000001e37)
+    static DOUBLE_LITERAL_TEXT: std::cell::RefCell<Vec<(u64, String)>> = std::cell::RefCell::new(Vec::new());
     /// the statement text of the prepare in progress and the ADDRESS of
     /// the buffer it came from, so a position measured on a borrowed
     /// slice of it can be placed in the whole ([text_line_col])
@@ -74044,9 +74460,13 @@ fn resolve_dest_param_expr(
         }
         RawExpr::Func(f, args) => Expr::Func(
             *f,
-            args.iter()
-                .map(|a| resolve_dest_param_expr(a, dest, columns, descs, sink).map(slot_operand))
-                .collect::<Option<Vec<_>>>()?,
+            dec_math_wrap(
+                f,
+                args.iter()
+                    .map(|a| resolve_dest_param_expr(a, dest, columns, descs, sink).map(slot_operand))
+                    .collect::<Option<Vec<_>>>()?,
+                descs,
+            ),
         ),
         // a CONDITION's `?` is typed from the other side of ITS
         // comparison ([resolve_raw_cond_sink]) - the destination plays
@@ -74058,7 +74478,7 @@ fn resolve_dest_param_expr(
             Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?),
             Box::new(resolve_dest_param_expr(b, dest, columns, descs, sink)?),
         ),
-        RawExpr::Case(branches, else_, _) => Expr::Case(
+        RawExpr::Case(branches, else_, simple) => simple_case_nullable(*simple, Expr::Case(
             branches
                 .iter()
                 .map(|(c, t)| {
@@ -74072,7 +74492,7 @@ fn resolve_dest_param_expr(
                 Some(e) => Some(Box::new(resolve_dest_param_expr(e, dest, columns, descs, sink)?)),
                 None => None,
             },
-        ),
+        )),
         // every other shape carrying a `?` keeps its refusal
         _ => return None,
     })
@@ -76227,7 +76647,7 @@ fn resolve_proj_expr(
                 } else {
                     let e = resolve_proj_expr(inner, columns, descs, sink)?;
                     let cs = cast_source_charset(&e, t, descs);
-                    Expr::Cast(Box::new(e), *t, cs)
+                    Expr::Cast(Box::new(runtime_double_cast(e, t, cs)), *t, cs)
                 }
             }
         }
@@ -76328,7 +76748,7 @@ fn resolve_proj_expr(
         // `?` and round 6's direct-side flag were outside this chunk's
         // scope and regressed the nested shapes. The `simple` flag is the
         // parser's; only [raw_is_simple_case_bare_value] reads it now.
-        RawExpr::Case(branches, else_, _) => {
+        RawExpr::Case(branches, else_, simple) => {
             let sibs: Vec<&RawExpr> = branches
                 .iter()
                 .map(|(_, t)| t)
@@ -76336,7 +76756,7 @@ fn resolve_proj_expr(
                 .collect();
             let sd = coalesce_sibling_desc(&sibs, columns, descs)?;
             float_conditional(
-                Expr::Case(
+                simple_case_nullable(*simple, Expr::Case(
                     branches
                         .iter()
                         .map(|(c, t)| {
@@ -76352,7 +76772,7 @@ fn resolve_proj_expr(
                         }
                         None => None,
                     },
-                ),
+                )),
                 descs,
             )
         }
@@ -76544,7 +76964,7 @@ fn resolve_expr_inner(
             }
             let inner = resolve_expr(e, columns, descs)?;
             let cs = cast_source_charset(&inner, t, descs);
-            Expr::Cast(Box::new(inner), *t, cs)
+            Expr::Cast(Box::new(runtime_double_cast(inner, t, cs)), *t, cs)
         }
         RawExpr::Coalesce(args) => Expr::Coalesce(
             args.iter()
@@ -76815,6 +77235,8 @@ fn resolve_expr_inner(
                 }
                 _ => *f,
             };
+            // a decimal DblDec call reads its arguments as DECFLOAT(34)
+            let resolved = dec_math_wrap(&f, resolved, descs);
             Expr::Func(f, resolved)
         }
         RawExpr::UserFn(name, args) => {
@@ -76845,7 +77267,7 @@ fn resolve_expr_inner(
             });
             Expr::UserFn { name: name.clone(), args: resolved, ret, id }
         }
-        RawExpr::Case(branches, else_, _) => Expr::Case(
+        RawExpr::Case(branches, else_, simple) => simple_case_nullable(*simple, Expr::Case(
             branches
                 .iter()
                 .map(|(c, t)| {
@@ -76859,7 +77281,7 @@ fn resolve_expr_inner(
                 Some(e) => Some(Box::new(resolve_expr(e, columns, descs)?)),
                 None => None,
             },
-        ),
+        )),
         RawExpr::DateLit(d) => Expr::DateLit(*d),
         RawExpr::TimeLit(t) => Expr::TimeLit(*t),
         RawExpr::TsLit(d, t) => Expr::TsLit(*d, *t),
@@ -79377,10 +79799,84 @@ fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
             // (1+0.1e0 is 17-sig but 2*2.5e0 is a text fold) - not derivable
             // from the f64, so it REFUSES rather than risk a wrong value
             Expr::Double(_) => return None,
+            // a DblDec math call is a DECFLOAT(34) leaf when it computes in
+            // decimal ([dbldec_decimal]), else a runtime DOUBLE that promotes
+            // like an approximate column; ABS keeps its operand's type, so
+            // it is transparent here (ABS(<decfloat>) is that decfloat)
+            Expr::Func(f, args) if is_dbldec_fn(f) => dbldec_decimal(args, descs),
+            Expr::Func(SysFn::Abs, args) if args.len() == 1 => walk(&args[0], descs)?,
             _ => return None,
         })
     }
     walk(e, descs) == Some(true)
+}
+
+/// Where a written CAST of a CONSTANT approximate expression to an
+/// INT128-backed or DECFLOAT target sits OUTSIDE an assignment to that
+/// target - a UNION branch (the map), an aggregate's argument
+/// ([RUNTIME_DOUBLE_CASTS]) - the engine's LiteralNode::pass2 never sees
+/// the target and the literal stays a double: the cast runs the runtime
+/// conversion. Modelled by casting the constant to DOUBLE first, which
+/// keeps its value and takes it off [approx_const_fold]'s literal path.
+/// Measured: `SELECT CAST(1e30 AS NUMERIC(38,6)) FROM RDB$DATABASE UNION
+/// ALL SELECT 1 ...` is 1000000000000000042420637374017.961984 (the
+/// double 1e36 through [int128_set_double]) where the plain projection is
+/// exact, and MAX(CAST(1e30 AS NUMERIC(38,6))) likewise.
+fn runtime_double_cast(inner: Expr, t: &CastTarget, cs: u8) -> Expr {
+    if RUNTIME_DOUBLE_CASTS.with(|c| c.get())
+        && matches!(t, CastTarget::Numeric { bytes: 16, .. } | CastTarget::DecFloat { .. })
+        && approx_const_fold(&inner)
+    {
+        Expr::Cast(Box::new(inner), CastTarget::Approx, cs)
+    } else {
+        inner
+    }
+}
+
+/// Run `f` with [RUNTIME_DOUBLE_CASTS] set, restoring the previous state.
+fn with_runtime_double_casts<T>(f: impl FnOnce() -> T) -> T {
+    let prev = RUNTIME_DOUBLE_CASTS.with(|c| c.replace(true));
+    let out = f();
+    RUNTIME_DOUBLE_CASTS.with(|c| c.set(prev));
+    out
+}
+
+/// The DECFLOAT-OR-DOUBLE math family - SQRT, POWER, EXP, LN, LOG, LOG10:
+/// the engine's `makeDblDecResult` functions (SysFunction.cpp), which
+/// answer DECFLOAT(34) when an argument is DECFLOAT or INT128-backed and
+/// no argument is approximate, DOUBLE otherwise.
+fn is_dbldec_fn(f: &SysFn) -> bool {
+    matches!(f, SysFn::Sqrt | SysFn::Power | SysFn::Exp | SysFn::Ln | SysFn::Log | SysFn::Log10)
+}
+
+/// The engine's `areParamsDouble` inverted (SysFunction.cpp): a call of the
+/// DblDec family computes and describes in DECIMAL128 when NO argument is
+/// approximate (FLOAT / DOUBLE - an approximate operand wins outright) and
+/// at least one is DECFLOAT or INT128-backed (an INT128 / NUMERIC(38,s)
+/// column or cast, arithmetic that widened to 16 bytes, a decimal call
+/// nested inside). Measured on 2182: `POWER(CAST(10 AS INT128), 30)` is
+/// DECFLOAT(34) 1000000000000000000000000000000, `POWER(<INT128>, 2.5e0)`
+/// DOUBLE, `POWER(CAST(2 AS BIGINT), CAST(3 AS INT128))` DECFLOAT(34) 8.
+fn dbldec_decimal(args: &[Expr], descs: &[Descriptor]) -> bool {
+    !args.iter().any(|a| a.type_of(descs) == Some(ExprType::Approx))
+        && args.iter().any(|a| is_decfloat_arith(a, descs) || int128_typed(a, descs))
+}
+
+/// A decimal DblDec call's arguments, each wrapped in the CAST TO
+/// DECFLOAT(34) that is the engine's MOV_get_dec128 of the value - so the
+/// fold sees a DecFloat34 even where an INT128-typed expression's value
+/// arrives as a small exact [Value] (the same seam [stat_dec_src] uses for
+/// the statistical folds). A double-path call passes through untouched.
+fn dec_math_wrap(f: &SysFn, args: Vec<Expr>, descs: &[Descriptor]) -> Vec<Expr> {
+    if !is_dbldec_fn(f) || !dbldec_decimal(&args, descs) {
+        return args;
+    }
+    args.into_iter()
+        .map(|a| match a {
+            Expr::Cast(_, CastTarget::DecFloat { wide: true }, _) => a,
+            a => Expr::Cast(Box::new(a), CastTarget::DecFloat { wide: true }, fire_crab_ods::intl::CS_UTF8),
+        })
+        .collect()
 }
 
 /// The DECFLOAT width of a decfloat leaf: `Some(true)` for DECFLOAT(34),
@@ -79420,6 +79916,10 @@ fn df_agg_engine_width(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
                 (None, None) => None,
             }
         }
+        // a decimal DblDec call is always DECFLOAT(34) (makeDecimal128);
+        // ABS keeps the operand's own width (makeAbs `*result = *value`)
+        Expr::Func(f, args) if is_dbldec_fn(f) && dbldec_decimal(args, descs) => Some(true),
+        Expr::Func(SysFn::Abs, args) if args.len() == 1 => df_agg_engine_width(&args[0], descs),
         _ => None,
     }
 }
@@ -79468,10 +79968,28 @@ fn df_expr_agg_wide(func: &AggFn, e: &Expr, descs: &[Descriptor]) -> Option<bool
     }
     match func {
         AggFn::Sum => Some(true),
-        AggFn::Avg | AggFn::Min | AggFn::Max => {
+        AggFn::Avg | AggFn::Min | AggFn::Max | AggFn::PercentileDisc => {
             let eng = df_agg_engine_width(e, descs)?;
             (eng == df_agg_fold_width(e, descs)?).then_some(eng)
         }
+        // the decimal128 folds are DECFLOAT(34) over either width
+        AggFn::VarPop
+        | AggFn::VarSamp
+        | AggFn::StddevPop
+        | AggFn::StddevSamp
+        | AggFn::PercentileCont
+        | AggFn::Corr
+        | AggFn::CovarPop
+        | AggFn::CovarSamp
+        | AggFn::RegrSlope
+        | AggFn::RegrIntercept
+        | AggFn::RegrR2
+        | AggFn::RegrAvgx
+        | AggFn::RegrAvgy
+        | AggFn::RegrSxx
+        | AggFn::RegrSyy
+        | AggFn::RegrSxy
+        | AggFn::RegrCount => Some(true),
         _ => None,
     }
 }
@@ -79660,7 +80178,16 @@ fn classify_exp_literal(text: &str) -> Option<ExpLit> {
         if !in_range {
             return text_to_dec128_clamped(text).ok().map(ExpLit::DecFloat34);
         }
-        text.parse::<f64>().ok().map(ExpLit::Double)
+        let d = cvt_text_to_double(text)?;
+        if text.parse::<f64>().ok() != Some(d) {
+            DOUBLE_LITERAL_TEXT.with(|t| {
+                let mut t = t.borrow_mut();
+                if !t.iter().any(|(b, _)| *b == d.to_bits()) {
+                    t.push((d.to_bits(), text.to_string()));
+                }
+            });
+        }
+        Some(ExpLit::Double(d))
     } else if m == TWO63 {
         // the 2^63 INT128 quirk: representable only as a scale-0 i128
         if frac == 0 && exp >= 0 {
@@ -79675,6 +80202,64 @@ fn classify_exp_literal(text: &str) -> Option<ExpLit> {
     } else {
         text_to_dec128_clamped(text).ok().map(ExpLit::DecFloat34)
     }
+}
+
+/// The engine's own text-to-double (cvt.cpp CVT_get_double, the text arm),
+/// which a double literal takes at parse (LiteralNode::parse's
+/// CVT_get_numeric): the significand's digits accumulate as `value * 10 +
+/// digit` in a double, the fraction and exponent digits net into ONE
+/// scale, and the value is multiplied or divided by [cvt_power_of_ten] of
+/// it ONCE. That is not a correctly rounded conversion: `1e37` is 1e32 *
+/// 1e5 in double, one ULP above the nearest double, and `1.7e38` is 17 *
+/// (1e32 * 1e5), one ULP above too - visible wherever the double's exact
+/// value shows, `CAST(1e37 AS NUMERIC(38,0))` in a UNION branch being
+/// 10000000000000000719354278919532445696 (measured, 2^70 above the
+/// nearest double). Rust's `parse::<f64>` gave the correctly rounded one.
+/// A significand past 2^53 loses digits in the accumulation the same way.
+/// The decimal text a double LITERAL was spelled with, for the fold that
+/// re-reads it: the recorded spelling of an engine-rounded double
+/// ([DOUBLE_LITERAL_TEXT]), else the shortest round-trip form, which for
+/// a correctly rounded double reads back to the same value.
+fn double_literal_text(d: f64) -> String {
+    DOUBLE_LITERAL_TEXT
+        .with(|t| t.borrow().iter().find(|(b, _)| *b == d.to_bits()).map(|(_, s)| s.clone()))
+        .unwrap_or_else(|| format!("{:e}", d))
+}
+
+fn cvt_text_to_double(text: &str) -> Option<f64> {
+    let (sig, exp) = text.split_once(['e', 'E'])?;
+    let exp: i32 = exp.parse().ok()?;
+    let neg = sig.starts_with('-');
+    let body = sig.strip_prefix(['+', '-']).unwrap_or(sig);
+    let (mut value, mut scale, mut fraction) = (0f64, 0i32, false);
+    for c in body.chars() {
+        match c {
+            '0'..='9' => {
+                if fraction {
+                    scale += 1;
+                }
+                value = value * 10.0 + (c as u8 - b'0') as f64;
+            }
+            '.' if !fraction => fraction = true,
+            _ => return None,
+        }
+    }
+    if neg {
+        value = -value;
+    }
+    scale -= exp;
+    // past the table (|scale| > 308) the engine leaves this arm for its
+    // overflow path; the range edge keeps the previous binary's correctly
+    // rounded read, which the dfliteral gate measured cell by cell
+    if scale.abs() > 308 {
+        return text.parse::<f64>().ok();
+    }
+    if scale > 0 {
+        value /= cvt_power_of_ten(scale);
+    } else if scale < 0 {
+        value *= cvt_power_of_ten(-scale);
+    }
+    value.is_finite().then_some(value)
 }
 
 fn text_to_dec128(s: &str) -> Option<u128> {
@@ -82127,6 +82712,43 @@ fn fn_text(v: &Value) -> String {
 /// `h = (h << 4) + byte`, then the top nibble `n` (bits 60..63) is folded
 /// down by `h ^= n >> 56` (arithmetic shift) and cleared (`h &= ~n`). The
 /// shift/add wrap the way the engine's SINT64 arithmetic does.
+/// A DECFLOAT value as MOV_get_double reads it - the decimal's text through
+/// strtod, correctly rounded (Infinity / NaN included) - for a fold the
+/// engine runs in DOUBLE over a decfloat operand (CORR(<INTEGER>,
+/// <DECFLOAT>) is DOUBLE, typed by its first argument, and folds the
+/// second as a double; measured 0.9819805060619656).
+fn decfloat_as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::DecFloat16(_) | Value::DecFloat34(_) => value_as_dec(v)
+            .map(|d| fire_crab_ods::decfloat::to_string(&d))
+            .and_then(|t| t.parse::<f64>().ok()),
+        _ => None,
+    }
+}
+
+/// The DECIMAL operands of a DblDec math call, or None when the call takes
+/// the double path: `areParamsDouble` on the VALUES - an approximate one
+/// (a FLOAT / DOUBLE column, a double-typed sibling) decides for double
+/// outright, else an INT128 / DECFLOAT among them decides for decimal.
+/// Each operand then reads as MOV_get_dec128 does: an exact numeric at its
+/// own cohort ([value_as_dec]), a DECFLOAT as is, a text through the
+/// decNumber grammar (a text that does not read falls to the double path,
+/// whose CVT raises the 22018).
+fn dec_math_operands(vs: &[Value]) -> Option<Vec<fire_crab_ods::decfloat::Dec>> {
+    if vs.iter().any(|v| matches!(v, Value::Double(_) | Value::Float(_))) {
+        return None;
+    }
+    if !vs.iter().any(|v| matches!(v, Value::Int128(..) | Value::DecFloat16(_) | Value::DecFloat34(_))) {
+        return None;
+    }
+    vs.iter()
+        .map(|v| match v {
+            Value::Text(s) => text_to_dec128_clamped(s).ok().map(fire_crab_ods::decfloat::decode_dec128),
+            v => value_as_dec(v),
+        })
+        .collect()
+}
+
 /// Fold a numeric operand to f64 for the DOUBLE math functions: an
 /// approximate value passes straight through, an exact numeric goes through
 /// `exact_to_f64` (raw / 10^scale). A non-numeric refuses.
@@ -82865,6 +83487,16 @@ impl Expr {
                 if matches!(f, SysFn::BlobOctetLength) {
                     return Some(ExprType::Int);
                 }
+                // a DECIMAL DblDec call, and ABS of a decfloat, describe
+                // DECFLOAT - which is no ExprType: they type None and are
+                // recognised as decfloat trees by [is_decfloat_arith],
+                // exactly as a DECFLOAT column or cast is
+                if is_dbldec_fn(f) && dbldec_decimal(args, descs) {
+                    return None;
+                }
+                if matches!(f, SysFn::Abs) && args.len() == 1 && is_decfloat_arith(&args[0], descs) {
+                    return None;
+                }
                 // every argument must be typeable; the arguments the
                 // engine converts (a number under UPPER renders to its
                 // text, a text length parses to its integer) convert in
@@ -83123,7 +83755,12 @@ impl Expr {
                         ExprType::Int => Some(ExprType::Int),
                         ExprType::Numeric => Some(ExprType::Numeric),
                         ExprType::Approx => Some(ExprType::Approx),
-                        ExprType::Text | ExprType::Temporal(_) | ExprType::Bool => None,
+                        // a TEXT operand is makeAbs's default arm: DOUBLE,
+                        // the string converted by CVT (ABS('5') is
+                        // 5.000000000000000, measured); a temporal or
+                        // boolean one is the engine's own refusal
+                        ExprType::Text => Some(ExprType::Approx),
+                        ExprType::Temporal(_) | ExprType::Bool => None,
                     },
                     // the EXACT-rounding family. An exact operand answers an
                     // exact numeric (typed Numeric here; result_scale /
@@ -83440,9 +84077,23 @@ impl Expr {
             },
             Expr::UserFn { .. } => None,
             Expr::Func(f, args) => match f {
-                // ABS ranks (and so widens) as its operand does - ABS
-                // over an INT128 column announces INT128
-                SysFn::Abs => args.first()?.rank_of(descs),
+                // ABS ranks as the width it ANSWERS (makeAbs: a SHORT
+                // operand answers LONG, a LONG one INT64, BIGINT and
+                // INT128 stay), so the folds over it widen from THAT:
+                // SUM(ABS(<INTEGER>)) is INT128 and ABS(<INTEGER>) / 3
+                // INT128, as SUM(<BIGINT>) and <BIGINT> / 3 are (measured;
+                // ranking as the operand made both INT64)
+                SysFn::Abs => match args.first()? {
+                    Expr::Null => Some(NumRank::Long),
+                    a if matches!(a.type_of(descs), Some(ExprType::Int | ExprType::Numeric)) => {
+                        Some(match result_width_bytes(a, descs) {
+                            2 => NumRank::Long,
+                            4 | 8 => NumRank::I64,
+                            _ => NumRank::I128,
+                        })
+                    }
+                    a => a.rank_of(descs),
+                },
                 // a MOD result's magnitude is below its divisor's, but
                 // an INT128 divisor can still put it past i64
                 SysFn::Mod => args.iter().filter_map(|a| a.rank_of(descs)).max(),
@@ -85155,16 +85806,25 @@ impl Expr {
                                 // (measured both ways). [approx_const_fold]
                                 // is the split; at or past 2^53 the
                                 // decimal path keeps every value it had.
-                                if *bytes == 16
-                                    && (approx_const_fold(e)
-                                        || scaled.abs() >= 9_007_199_254_740_992.0)
-                                {
+                                // THE FOLD IS THE ENGINE'S LiteralNode::pass2:
+                                // a numeric literal travels to it as TEXT and,
+                                // under an ASSIGNMENT to an INT128 / DECFLOAT
+                                // target (a projection, an INSERT value, a
+                                // PSQL assignment), is re-read from that text
+                                // exactly - so `CAST(1e30 AS NUMERIC(38,6))`
+                                // projected is 1000000000000000000000000000000.000000.
+                                // Anywhere else (a UNION branch, an aggregate
+                                // argument, a WHERE, a view) the literal is a
+                                // double and converts at run time like a
+                                // column: [cvt_double_to_int128], which is
+                                // the engine's own (measured, 2026-09-26).
+                                if *bytes == 16 && approx_const_fold(e) {
                                     if scaled.round().abs()
                                         >= 1.701_411_834_604_692_3e38
                                     {
                                         return Err(EvalErr::NumericOutOfRange);
                                     }
-                                    match text_number(&format!("{:e}", d)) {
+                                    match text_number(&double_literal_text(d)) {
                                         Some(TextNum::Dec { mantissa, exp })
                                             if i8::try_from(exp).is_ok() =>
                                         {
@@ -85172,6 +85832,9 @@ impl Expr {
                                         }
                                         _ => (scaled.round() as i128, *scale),
                                     }
+                                } else if *bytes == 16 {
+                                    let single = matches!(v, Value::Float(_)) && approx_source_is_single(e);
+                                    (cvt_double_to_int128(d, single, *scale)?, *scale)
                                 } else {
                                     // the engine's CVT rounding (cvt.cpp):
                                     // scale, add 0.5 plus its 1e-14 epsilon
@@ -86027,6 +86690,21 @@ impl Expr {
                         let Value::Rounded(r, sc) = vs[0] else { unreachable!() };
                         Value::Rounded(r.checked_abs().ok_or(EvalErr::NumericOutOfRange)?, sc)
                     }
+                    // a DECFLOAT operand keeps its width and cohort: the
+                    // sign flips, nothing else (decQuadAbs)
+                    SysFn::Abs if matches!(vs[0], Value::DecFloat16(_) | Value::DecFloat34(_)) => {
+                        use fire_crab_ods::decfloat::{decode_dec128, decode_dec64, dec_to_bits, dec_to_dec64_bits, negate, Dec};
+                        let pos = |d: Dec| if matches!(d, Dec::Finite { neg: true, .. } | Dec::Infinity { neg: true }) { negate(&d) } else { d };
+                        match vs[0] {
+                            Value::DecFloat16(b) => Value::DecFloat16(dec_to_dec64_bits(&pos(decode_dec64(b)))),
+                            Value::DecFloat34(b) => Value::DecFloat34(dec_to_bits(&pos(decode_dec128(b)))),
+                            _ => unreachable!(),
+                        }
+                    }
+                    // a TEXT operand is makeAbs's default DOUBLE: the
+                    // string read by CVT's number grammar (22018 when it
+                    // is not a number), then the double's magnitude
+                    SysFn::Abs if matches!(vs[0], Value::Text(_)) => Value::Double(fn_f64(&vs[0])?.abs()),
                     SysFn::Abs => {
                         let (raw, scale) =
                             numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError(None))?;
@@ -86215,6 +86893,75 @@ impl Expr {
                     // f64 shares the platform libm with the engine, so the
                     // bits match.
                     SysFn::Pi => Value::Double(std::f64::consts::PI),
+                    // THE DECIMAL PATH of the DblDec family: an INT128 /
+                    // DECFLOAT operand and no approximate one folds in
+                    // DECIMAL128 through decNumber's own routines
+                    // ([fire_crab_ods::decmath]) and answers DECFLOAT(34) -
+                    // evlSqrt / evlLnLog10 / evlExp test `isDecOrInt128` on
+                    // the value, evlPower / evlLog `areParamsDouble` on
+                    // both. The domain refusals come first, on the decimal
+                    // compare, then decNumber's own traps: 22000 invalid
+                    // (a negative base to a fractional power, 0 ** 0),
+                    // 22012 divide by zero (LOG(1, x)), 22003 overflow
+                    // (POWER(10, 6145)). The double path below answered
+                    // every one of these as a DOUBLE (measured: SQRT(CAST(2
+                    // AS INT128)) is 1.414213562373095048801688724209698).
+                    SysFn::Sqrt | SysFn::Ln | SysFn::Log10 | SysFn::Exp | SysFn::Power | SysFn::Log
+                        if dec_math_operands(&vs).is_some() =>
+                    {
+                        use fire_crab_ods::decfloat::{cmp, Dec};
+                        use fire_crab_ods::decmath as dm;
+                        let ds = dec_math_operands(&vs).unwrap_or_default();
+                        let zero = Dec::Finite { neg: false, coeff: 0, exp: 0 };
+                        let le0 = |d: &Dec| cmp(d, &zero) != std::cmp::Ordering::Greater;
+                        let r = match f {
+                            SysFn::Sqrt => {
+                                if cmp(&ds[0], &zero) == std::cmp::Ordering::Less {
+                                    return Err(EvalErr::MathDomain { func: "SQRT", code: GDS_SYSF_ARG_NONNEG });
+                                }
+                                dm::sqrt(&ds[0])
+                            }
+                            SysFn::Ln | SysFn::Log10 => {
+                                if le0(&ds[0]) {
+                                    return Err(EvalErr::MathDomain {
+                                        func: if matches!(f, SysFn::Ln) { "LN" } else { "LOG10" },
+                                        code: GDS_SYSF_ARG_POSITIVE,
+                                    });
+                                }
+                                if matches!(f, SysFn::Ln) { dm::ln(&ds[0]) } else { dm::log10(&ds[0]) }
+                            }
+                            SysFn::Exp => dm::exp(&ds[0]),
+                            SysFn::Power => dm::pow(&ds[0], &ds[1]),
+                            _ => {
+                                // LOG(base, value) = ln(value) / ln(base): each
+                                // ln at 34 digits, then the decimal128 divide
+                                // (a zero divisor is the 22012, 0 / 0 the 22000)
+                                if le0(&ds[0]) {
+                                    return Err(EvalErr::MathDomain { func: "LOG", code: GDS_SYSF_BASE_POSITIVE });
+                                }
+                                if le0(&ds[1]) {
+                                    return Err(EvalErr::MathDomain { func: "LOG", code: GDS_SYSF_ARG_POSITIVE });
+                                }
+                                match (dm::ln(&ds[1]), dm::ln(&ds[0])) {
+                                    (Ok(a), Ok(b)) => {
+                                        if fire_crab_ods::decfloat::is_zero(&b) {
+                                            Err(if fire_crab_ods::decfloat::is_zero(&a) { dm::MathErr::Invalid } else { dm::MathErr::DivByZero })
+                                        } else {
+                                            let q = fire_crab_ods::decfloat::div(&a, &b);
+                                            if matches!(q, Dec::Infinity { .. }) { Err(dm::MathErr::Overflow) } else { Ok(q) }
+                                        }
+                                    }
+                                    (Err(e), _) | (_, Err(e)) => Err(e),
+                                }
+                            }
+                        };
+                        match r {
+                            Ok(d) => Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&d)),
+                            Err(dm::MathErr::Invalid) => return Err(EvalErr::DecfloatInvalidOperation),
+                            Err(dm::MathErr::DivByZero) => return Err(EvalErr::DecfloatDivideByZero),
+                            Err(dm::MathErr::Overflow) => return Err(EvalErr::DecfloatOverflow),
+                        }
+                    }
                     SysFn::Sqrt => {
                         let x = fn_f64(&vs[0])?;
                         if x < 0.0 {
@@ -103926,12 +104673,16 @@ fn agg_field_src(fid: usize, descs: &[Descriptor]) -> AggSrc {
 /// so the fold ([compute_group]) takes the decimal path its describe
 /// (DECFLOAT(34)) announced. Every other source passes through.
 fn stat_dec_src(func: AggFn, src: AggSrc, decimal: bool) -> AggSrc {
+    let dec = |e: Expr| Expr::Cast(Box::new(e), CastTarget::DecFloat { wide: true }, fire_crab_ods::intl::CS_UTF8);
     match src {
-        AggSrc::Expr(e) if decimal && func.is_statistical() => AggSrc::Expr(Expr::Cast(
-            Box::new(e),
-            CastTarget::DecFloat { wide: true },
-            fire_crab_ods::intl::CS_UTF8,
-        )),
+        AggSrc::Expr(e) if decimal && func.is_statistical() => AggSrc::Expr(dec(e)),
+        // PERCENTILE_CONT's ORDER BY value, read as MOV_get_dec128 does
+        AggSrc::Percentile { frac, order, desc } if decimal && func == AggFn::PercentileCont => {
+            AggSrc::Percentile { frac, order: dec(order), desc }
+        }
+        // the two-argument folds' FIRST argument: it decides the decimal
+        // path (the second converts per its own runtime kind)
+        AggSrc::Pair(y, x) if decimal && func.is_statistical2() => AggSrc::Pair(dec(y), x),
         other => other,
     }
 }
@@ -122749,7 +123500,8 @@ mod tests {
         assert_eq!(ty("CHAR_LENGTH(NAME)"), Some(ExprType::Int));
         assert_eq!(ty("POSITION('a' IN NAME)"), Some(ExprType::Int));
         assert_eq!(ty("MOD(NAME, 2)"), None);
-        assert_eq!(ty("ABS(NAME)"), None);
+        // ABS reads a text as a DOUBLE (makeAbs's default arm, measured)
+        assert_eq!(ty("ABS(NAME)"), Some(ExprType::Approx));
         assert_eq!(ty("SIGN(NAME)"), None);
 
         // un-aliased headers carry the engine's names - CHARACTER_LENGTH

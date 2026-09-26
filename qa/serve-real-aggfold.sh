@@ -276,7 +276,8 @@ pin  "6 an INT128 EXPRESSION source" "SELECT STDDEV_POP(H + 0), STDDEV_POP(CAST(
 pin  "6 an empty fold is the NULL shown as 0E-6176" "SELECT STDDEV_POP(H) FROM S WHERE ID > 100;" "STDDEV_POP|0E-6176"
 pin  "6 ...which is NULL (a lone row's SAMP; its POP is 0)" "SELECT COALESCE(STDDEV_POP(H), -1), COALESCE(VAR_SAMP(H), -1), VAR_SAMP(H) IS NULL FROM S WHERE ID = 1;" "COALESCE COALESCE BOOL|0 -1 <true>"
 pin  "6 CONTROL a BIGINT source stays DOUBLE" "SELECT STDDEV_POP(B), VAR_SAMP(B) FROM S;" "STDDEV_POP VAR_SAMP|3.248931448269655 12.66666666666667"
-recorded "6 CORR over an INT128 first argument is refused here" "SELECT CORR(H, ID) FROM S;" "CORR|0.7843266893787232114218613551766932"
+# ...promoted from the record by the wide-numeric round: the decimal128 fold
+pin  "6 CORR over an INT128 first argument is DECFLOAT(34) (it refused)" "SELECT CORR(H, ID) FROM S;" "CORR|0.7843266893787232114218613551766932"
 
 echo "--- 7. MIN / MAX MEETING A NaN, CAST(Infinity AS FLOAT), (ALL x)"
 NAN1="(SELECT VAR_POP(X) W FROM DX UNION ALL SELECT 1e0 $DUAL)"

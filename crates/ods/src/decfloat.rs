@@ -420,15 +420,15 @@ pub fn round_to_dec16(neg: bool, coeff: u128, exp: i32) -> Dec {
 // DecimalContext rounding (probed). A 34x34 multiply overflows every fixed
 // integer, so the coefficients are carried as digit strings.
 
-fn strip0(mut d: Vec<u8>) -> Vec<u8> {
+pub(crate) fn strip0(mut d: Vec<u8>) -> Vec<u8> {
     let nz = d.iter().position(|&c| c != b'0').unwrap_or(d.len() - 1);
     d.drain(..nz);
     d
 }
-fn ucmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+pub(crate) fn ucmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
-fn uadd(a: &[u8], b: &[u8]) -> Vec<u8> {
+pub(crate) fn uadd(a: &[u8], b: &[u8]) -> Vec<u8> {
     let mut r = Vec::new();
     let mut carry = 0u8;
     let (mut i, mut j) = (a.len(), b.len());
@@ -442,7 +442,7 @@ fn uadd(a: &[u8], b: &[u8]) -> Vec<u8> {
     r.reverse();
     strip0(r)
 }
-fn usub(a: &[u8], b: &[u8]) -> Vec<u8> {
+pub(crate) fn usub(a: &[u8], b: &[u8]) -> Vec<u8> {
     // requires a >= b
     let mut r = Vec::new();
     let mut borrow = 0i8;
@@ -458,7 +458,7 @@ fn usub(a: &[u8], b: &[u8]) -> Vec<u8> {
     r.reverse();
     strip0(r)
 }
-fn umul(a: &[u8], b: &[u8]) -> Vec<u8> {
+pub(crate) fn umul(a: &[u8], b: &[u8]) -> Vec<u8> {
     if a == b"0" || b == b"0" {
         return vec![b'0'];
     }
@@ -505,7 +505,7 @@ fn digits_u128(d: &[u8]) -> u128 {
     d.iter().fold(0u128, |m, &c| m * 10 + (c - b'0') as u128)
 }
 /// (sign, coefficient digits MSD-first, exponent) of a finite value.
-fn parts(d: &Dec) -> (bool, Vec<u8>, i64) {
+pub(crate) fn parts(d: &Dec) -> (bool, Vec<u8>, i64) {
     if let Dec::Finite { neg, coeff, exp } = d {
         (*neg, coeff.to_string().into_bytes(), *exp as i64)
     } else {
@@ -526,7 +526,7 @@ fn parts(d: &Dec) -> (bool, Vec<u8>, i64) {
 ///   cannot carry round away HALF-UP and the exponent clamps to -6176
 ///   (`1E-6000 / 1E+200` is `0E-6176`, `5E-6176 * 0.1` is `1E-6176`), where
 ///   the out-of-range exponent answered garbage (`8.0E-2071`).
-fn finite(neg: bool, digits: Vec<u8>, exp: i64) -> Dec {
+pub(crate) fn finite(neg: bool, digits: Vec<u8>, exp: i64) -> Dec {
     let mut d = strip0(digits);
     let mut exp = exp;
     if d != b"0" && exp < -6176 {
@@ -569,7 +569,7 @@ fn sig_len(d: &[u8]) -> usize {
 }
 /// (quotient, remainder) of `a / b` as digit strings, schoolbook long
 /// division. `b` must be non-zero.
-fn udivmod(a: &[u8], b: &[u8]) -> (Vec<u8>, Vec<u8>) {
+pub(crate) fn udivmod(a: &[u8], b: &[u8]) -> (Vec<u8>, Vec<u8>) {
     if ucmp(a, b) == std::cmp::Ordering::Less {
         return (vec![b'0'], a.to_vec());
     }
