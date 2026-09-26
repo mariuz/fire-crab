@@ -183,24 +183,15 @@ cq "DISTINCT CHAR: the full BYTE image" "SELECT LIST(DISTINCT CU) FROM T"
 cq "a BLOB argument joins by content, one segment" "SELECT LIST(B) FROM T"
 # A text expression over a MULTIBYTE column: measured 2026-09-20, the
 # moment the fixture above started loading rows at all.  The fold itself
-# is right on both sides (3 segments, value/separator/value) but the
-# BYTES differ, and not because of LIST: `<UTF8 column> || '€'` already
-# diverges on its own under a NONE attachment.  The engine keeps the
-# NONE literal's three bytes (E2 82 AC -> 8 octets, "x€y€"); this server
-# re-reads each of them as a Latin-1 codepoint and re-encodes
-# (C3 A2 C2 82 C2 AC -> 11 octets), which is exactly the PROPAGATION
-# half of the law qa/serve-real-litcs.sh owns ("a byte carrier is never
-# transliterated") reached through a *literal* rather than a NONE
-# column - a vector that gate does not carry yet.  Pinned here, both
-# sides, so it fires the day the concat is fixed.
-cqdiff "a text expression (multibyte): engine keeps the NONE literal's bytes, fc re-encodes them" \
-    "SELECT LIST(SU || '€') FROM T WHERE ID < 3" \
-    "cols 1: type 521 sub 1 scale 4 len 8
-info: 4=3 5=8 6=17 7=0
-segs: [8:x€y€] [1:,] [8:plain€] end=0" \
-    "cols 1: type 521 sub 1 scale 4 len 8
-info: 4=3 5=11 6=23 7=0
-segs: [11:x€yâ¬] [1:,] [11:plainâ¬] end=0"
+# was right on both sides (3 segments, value/separator/value) but the
+# BYTES differed: `<UTF8 column> || '€'` under a NONE attachment.  The
+# engine keeps the NONE literal's three bytes (E2 82 AC -> 8 octets,
+# "x€y€"); this server re-read each of them as a Latin-1 codepoint and
+# re-encoded (C3 A2 C2 82 C2 AC -> 11 octets).  Recorded as a divergence
+# until 2026-09-26, when the concat began reading the literal as the
+# carrier's bytes (Expr::CarrierDec) - promoted the day the gap closed.
+cq "a text expression (multibyte): the NONE literal's bytes are kept" \
+    "SELECT LIST(SU || '€') FROM T WHERE ID < 3"
 cq "a single value: one segment, no separator" "SELECT LIST(S) FROM T WHERE ID = 1"
 cq "an empty set answers NULL" "SELECT LIST(S) FROM T WHERE ID > 100"
 cq "a per-row separator column (one NULL poisons)" "SELECT LIST(S, SEP) FROM T"
