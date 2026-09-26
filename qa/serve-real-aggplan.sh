@@ -54,6 +54,18 @@
 #     holding a parenthesis or a comma, a duplicate named window (-204)
 #     and a frame offset past INTEGER (22003 at execute) - refused or
 #     answered on fc/integ.
+#   - THE RELATION UNDER A DERIVED TABLE (section 17): a window over a
+#     derived table, CTE or view that reads one relation through plain
+#     levels sorts that relation's record - every field the statement
+#     references, the derived table's own WHERE among them, in the
+#     relation's field order; the ORDER BY over a WINDOWED derived table
+#     ties by that table's window streams; a RANGE offset past INTEGER
+#     answers (only a ROWS offset is an INTEGER row count); a grouped
+#     item that IS a GROUP BY expression is one field of the aggregate,
+#     and an ORDER BY key lifted beside an item it restores leaves the
+#     record. Red on fc/aggplan-r3 6f1adf6 (wrong ties, a spurious
+#     22003, a wrong FIRST row set, a refusal); a FIRST, a DISTINCT
+#     or a view inside the derived table reads the same relation.
 #
 # RECORDED, not fixed (section 12 and the refused/differs cells): CREATE
 # VIEW over an aggregate, a GROUP BY or a window; LAG/LEAD/NTH_VALUE with
@@ -112,6 +124,9 @@ CREATE TABLE RW (ID INTEGER, GRP VARCHAR(5), VAL INTEGER);
 INSERT INTO RW VALUES (1,'A',10); INSERT INTO RW VALUES (2,'A',20); INSERT INTO RW VALUES (3,'B',20); INSERT INTO RW VALUES (4,'B',NULL); INSERT INTO RW VALUES (5,NULL,5); INSERT INTO RW VALUES (6,'C',10); INSERT INTO RW VALUES (7,'A',10);
 CREATE TABLE RG (GRP VARCHAR(5), NAME VARCHAR(10));
 INSERT INTO RG VALUES ('A','alpha'); INSERT INTO RG VALUES ('B','beta'); INSERT INTO RG VALUES ('D','delta');
+CREATE TABLE RU (ID INTEGER, K INTEGER, K2 INTEGER, S VARCHAR(10), V INTEGER, B BIGINT);
+INSERT INTO RU VALUES (1,1,1,'b',3,3); INSERT INTO RU VALUES (2,2,2,'a',1,5); INSERT INTO RU VALUES (3,1,NULL,'a',2,-7); INSERT INTO RU VALUES (4,2,1,'c',3,-1); INSERT INTO RU VALUES (5,1,2,NULL,1,NULL); INSERT INTO RU VALUES (6,NULL,2,'b',2,3); INSERT INTO RU VALUES (7,2,NULL,'b',NULL,-7); INSERT INTO RU VALUES (8,1,1,'c',3,0); INSERT INTO RU VALUES (9,NULL,NULL,'a',1,5); INSERT INTO RU VALUES (10,2,2,'ab',2,-1); INSERT INTO RU VALUES (11,1,1,'',1,3); INSERT INTO RU VALUES (12,2,NULL,'b',3,NULL);
+CREATE VIEW RUV (ID, K, S, V) AS SELECT ID, K, S, V FROM RU;
 COMMIT;
 SQL
 } | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/aggplan-build.log 2>&1
@@ -468,11 +483,40 @@ pin  "16 ...2147483648, over no rows too" "SELECT ID, SUM(VAL) OVER (ORDER BY ID
 pin  "16 ...the shorthand" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS 3000000000 PRECEDING) FROM RW;" "ID SUM|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range"
 pin  "16 CONTROL: 2147483647 answers" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 2147483647 PRECEDING AND CURRENT ROW) FROM RW;" "ID SUM|1 10|2 30|3 50|4 50|5 55|6 65|7 75"
 
+echo "--- 17. A WINDOW OVER A DERIVED TABLE SORTS THE RELATION'S RECORD; RANGE OFFSETS PAST INTEGER; GROUPED EXPRESSION ITEMS; ORDER BY OVER A WINDOWED DERIVED TABLE"
+pin  "17 a window over a derived table with a WHERE ties by the relation's record" "SELECT S, ROW_NUMBER() OVER (ORDER BY K) FROM (SELECT S, K FROM RU WHERE ID > 2);" "S ROW_NUMBER|a 1|b 2|3|a 4|c 5|<null> 6|b 7|b 8|c 9|ab 10"
+pin  "17 ...a WHERE on a field the derived table does not expose" "SELECT S, ROW_NUMBER() OVER (ORDER BY K) FROM (SELECT S, K FROM RU WHERE K2 > 0);" "S ROW_NUMBER|b 1|2|b 3|c 4|<null> 5|a 6|c 7|ab 8"
+pin  "17 ...a CTE" "WITH C AS (SELECT S, K FROM RU WHERE ID > 2) SELECT S, ROW_NUMBER() OVER (ORDER BY K) FROM C;" "S ROW_NUMBER|a 1|b 2|3|a 4|c 5|<null> 6|b 7|b 8|c 9|ab 10"
+pin  "17 ...qualified, an inner ORDER BY, an outer WHERE" "SELECT X.S, ROW_NUMBER() OVER (ORDER BY X.K) FROM (SELECT S, K FROM RU WHERE ID > 2 ORDER BY ID) X WHERE X.K IS NOT NULL;" "S ROW_NUMBER|1|a 2|c 3|<null> 4|b 5|b 6|c 7|ab 8"
+pin  "17 ...FIRST inside the derived table" "SELECT S, ROW_NUMBER() OVER (ORDER BY K) FROM (SELECT FIRST 20 S, K FROM RU WHERE ID > 2);" "S ROW_NUMBER|a 1|b 2|3|a 4|c 5|<null> 6|b 7|b 8|c 9|ab 10"
+pin  "17 ...a view" "SELECT S, ROW_NUMBER() OVER (ORDER BY K) FROM (SELECT S, K FROM RUV WHERE ID > 2);" "S ROW_NUMBER|a 1|b 2|3|a 4|c 5|<null> 6|b 7|b 8|c 9|ab 10"
+pin  "17 ...the relation's field order, not the derived table's" "SELECT S, K2, ROW_NUMBER() OVER (ORDER BY K) FROM (SELECT S, K, K2 FROM RU);" "S K2 ROW_NUMBER|b 2 1|a <null> 2|1 3|b 1 4|c 1 5|a <null> 6|<null> 2 7|a 2 8|c 1 9|ab 2 10|b <null> 11|b <null> 12"
+pin  "17 ...DISTINCT inside the derived table" "SELECT S, ROW_NUMBER() OVER (ORDER BY K) FROM (SELECT DISTINCT S, K FROM RU WHERE ID > 2);" "S ROW_NUMBER|a 1|b 2|3|a 4|c 5|<null> 6|b 7|c 8|ab 9"
+pin  "17 CONTROL: a WHERE on the key keeps the NULL second" "SELECT S, ROW_NUMBER() OVER (ORDER BY K) FROM (SELECT S, K FROM RU WHERE K > -5);" "S ROW_NUMBER|1|<null> 2|a 3|b 4|c 5|a 6|b 7|b 8|c 9|ab 10"
+pin  "17 a RANGE offset past INTEGER answers" "SELECT ID, SUM(V) OVER (ORDER BY ID RANGE BETWEEN 3000000000 PRECEDING AND CURRENT ROW) FROM RU;" "ID SUM|1 3|2 4|3 6|4 9|5 10|6 12|7 12|8 15|9 16|10 18|11 19|12 22"
+pin  "17 ...the shorthand" "SELECT ID, SUM(V) OVER (ORDER BY ID RANGE 3000000000 PRECEDING) FROM RU;" "ID SUM|1 3|2 4|3 6|4 9|5 10|6 12|7 12|8 15|9 16|10 18|11 19|12 22"
+pin  "17 ...over a BIGINT key, both bounds" "SELECT ID, SUM(V) OVER (ORDER BY B RANGE BETWEEN 3000000000 PRECEDING AND 3000000000 FOLLOWING) FROM RU;" "ID SUM|5 4|12 4|3 18|7 18|4 18|10 18|8 18|1 18|6 18|11 18|2 18|9 18"
+pin  "17 ...over no rows: no rows" "SELECT ID, SUM(V) OVER (ORDER BY ID RANGE BETWEEN CURRENT ROW AND 2147483648 FOLLOWING) FROM RU WHERE 1 = 0;" ""
+pin  "17 ...in INSERT .. SELECT" "INSERT INTO E (ID, VAL) SELECT ID, SUM(V) OVER (ORDER BY ID RANGE BETWEEN 3000000000 PRECEDING AND CURRENT ROW) FROM RU; SELECT COUNT(*), SUM(VAL) FROM E; ROLLBACK;" "COUNT SUM|12 146"
+pin  "17 grouped, ORDER BY an aggregate item: FIRST takes the engine's rows" "SELECT FIRST 2 S, COUNT(*), ROW_NUMBER() OVER (ORDER BY S) FROM RU GROUP BY S ORDER BY COUNT(*);" "S COUNT ROW_NUMBER|1 2|<null> 1 1"
+pin  "17 ...DESC" "SELECT S, COUNT(*), ROW_NUMBER() OVER (ORDER BY S) FROM RU GROUP BY S ORDER BY COUNT(*) DESC;" "S COUNT ROW_NUMBER|b 4 5|a 3 3|c 2 6|1 2|<null> 1 1|ab 1 4"
+pin  "17 ...then a group key" "SELECT K, S, COUNT(*), ROW_NUMBER() OVER (ORDER BY K) FROM RU GROUP BY K, S ORDER BY COUNT(*), K;" "K S COUNT ROW_NUMBER|<null> a 1 1|<null> b 1 2|1 1 3|1 <null> 1 7|1 a 1 4|1 b 1 5|1 c 1 6|2 a 1 8|2 c 1 10|2 ab 1 11|2 b 2 9"
+pin  "17 grouped by an expression's alias" "SELECT K + 1 KK, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY KK;" "KK COUNT ROW_NUMBER|<null> 2 1|2 5 2|3 5 3"
+pin  "17 ...by the expression" "SELECT K + 1, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY K + 1;" "ADD COUNT ROW_NUMBER|<null> 2 1|2 5 2|3 5 3"
+pin  "17 ...by a function" "SELECT UPPER(S) US, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY UPPER(S);" "US COUNT ROW_NUMBER|1 1|AB 1 2|<null> 1 3|C 2 4|A 3 5|B 4 6"
+pin  "17 ...DENSE_RANK over MAX" "SELECT K * 10 + 1, MAX(V), DENSE_RANK() OVER (ORDER BY MAX(V)) FROM RU GROUP BY K * 10 + 1;" "ADD MAX DENSE_RANK|<null> 2 1|11 3 2|21 3 2"
+pin  "17 ...by ordinal" "SELECT S || 'x' SX, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1;" "SX COUNT RANK|x 1 1|abx 1 1|<null> 1 1|cx 2 4|ax 3 5|bx 4 6"
+pin  "17 CONTROL: an expression over a bare group key" "SELECT K + 1, K, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY K;" "ADD K COUNT ROW_NUMBER|<null> <null> 2 1|2 1 5 2|3 2 5 3"
+pin  "17 ORDER BY over a windowed derived table ties by its window streams" "SELECT X.S, RN FROM (SELECT S, K, ROW_NUMBER() OVER (ORDER BY K) RN FROM RU) X ORDER BY X.K;" "S RN|a 1|b 2|3|<null> 7|a 4|b 5|c 6|a 8|b 9|b 10|c 11|ab 12"
+pin  "17 ...a CTE" "WITH C AS (SELECT S, K, ROW_NUMBER() OVER (ORDER BY V) RN FROM RU) SELECT * FROM C ORDER BY K;" "S K RN|a <null> 4|b <null> 8|1 2|<null> 1 5|a 1 6|b 1 9|c 1 11|a 2 3|b 2 1|b 2 10|c 2 12|ab 2 7"
+pin  "17 ...FIRST takes the engine's rows" "SELECT FIRST 5 X.S, RN FROM (SELECT S, K, ROW_NUMBER() OVER (ORDER BY K) RN FROM RU) X ORDER BY X.K;" "S RN|a 1|b 2|3|<null> 7|a 4"
+pin  "17 ...a PARTITION BY stream's slot" "SELECT X.S, RN FROM (SELECT K, S, SUM(V) OVER (PARTITION BY K2) RN FROM RU) X ORDER BY X.K;" "S RN|a 6|b 6|10|a 6|b 10|c 10|<null> 6|a 6|b 6|b 6|c 10|ab 6"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-aggplan-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 260 ]; then echo "FAIL only $ran checks ran (floor 260)"; fail=1; fi
+if [ "$ran" -lt 287 ]; then echo "FAIL only $ran checks ran (floor 287)"; fail=1; fi
 exit $fail

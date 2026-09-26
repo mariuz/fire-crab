@@ -11570,7 +11570,7 @@ struct Frame {
     /// a negative literal offset was written on either bound: the
     /// engine's execute-time refusal ([EvalErr::WindowFrameNegative])
     negative: bool,
-    /// an offset past INTEGER was written on either bound: the engine
+    /// a ROWS offset past INTEGER was written on either bound: the engine
     /// reads the offset as an INTEGER at EXECUTE and raises 22003
     /// *numeric value is out of range* (measured on 2182: `ROWS BETWEEN
     /// 2147483648 PRECEDING AND CURRENT ROW` raises, over `WHERE 1 = 0`
@@ -45428,7 +45428,7 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<(String, 
         &l2_wins,
         &win_pos,
         &order_plain_keys,
-        (table_s, where_s, order_s),
+        (table_s, where_s, order_s, group_s),
         group_s.is_some() || having_s.is_some() || has_agg,
         db,
     );
@@ -45605,7 +45605,7 @@ fn win_tie_names(
     l2_wins: &[(String, String)],
     win_pos: &[usize],
     order_plain_keys: &[String],
-    (table_s, where_s, order_s): (&str, Option<&str>, Option<&str>),
+    (table_s, where_s, order_s, group_s): (&str, Option<&str>, Option<&str>, Option<&str>),
     grouped: bool,
     db: &Option<Database>,
 ) -> WinTieNames {
@@ -45622,6 +45622,23 @@ fn win_tie_names(
     let mut map_at = usize::MAX;
     let mut plain_k = 0usize;
     if grouped {
+        // the GROUP BY keys (aliases already their bodies), compared as
+        // text; a bare key's column name
+        let gkeys: Vec<String> = group_s.map(split_top_level_commas).unwrap_or_default().iter().map(|g| norm_sql_text(g)).collect();
+        let gcols: Vec<String> = group_s
+            .map(split_top_level_commas)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|g| split_ident_chain(g.trim())?.last().and_then(|c| canon_ident(c)))
+            .collect();
+        // a column token L1 may read beside its GROUP BY: an aggregate
+        // call, or a column that is itself a bare group key
+        let groupable = |tok: &str| {
+            parse_agg_item(tok).is_some()
+                || split_ident_chain(tok)
+                    .and_then(|p| p.last().and_then(|c| canon_ident(c)))
+                    .is_some_and(|c| gcols.contains(&c))
+        };
         for (pos, it) in items_raw.iter().enumerate() {
             let (body, _) = split_alias(it.trim());
             let body = body.trim();
@@ -45629,7 +45646,17 @@ fn win_tie_names(
                 continue;
             }
             plain_k += 1;
-            let names: Vec<String> = if bare_col(body) || parse_agg_item(body).is_some() {
+            // an item that IS a group key - by text, by ordinal, by its
+            // alias (already its body) - is ONE field of the aggregate's
+            // stream, and so is an item over some expression key: the
+            // engine's aggregate maps `K + 1` under `GROUP BY K + 1`
+            // whole (lifting its K beside that GROUP BY is no query)
+            let is_key = gkeys.iter().any(|g| *g == norm_sql_text(body) || *g == plain_k.to_string() || *g == (pos + 1).to_string());
+            let names: Vec<String> = if bare_col(body)
+                || parse_agg_item(body).is_some()
+                || is_key
+                || !tokens(body).iter().all(|t| groupable(t))
+            {
                 vec![format!("FC$I{}", plain_k)]
             } else {
                 let text = lift.lift_column_tokens(body);
@@ -45641,6 +45668,17 @@ fn win_tie_names(
             for n in names {
                 if !map.contains(&n) {
                     map.push(n);
+                }
+            }
+            // an ORDER BY key L1 lifts on its own (`ORDER BY COUNT(*)`
+            // beside a COUNT(*) item) restores this item's field: the
+            // outer record drops it as it drops a key it names directly
+            // (measured on 2182: `SELECT S, COUNT(*), ROW_NUMBER() OVER
+            // (ORDER BY S) .. GROUP BY S ORDER BY COUNT(*) DESC` ties the
+            // count-1 groups '', NULL, 'ab' - S's length in word 0)
+            for (e, n) in lift.exprs.iter().filter(|(_, n)| n.starts_with("FC$O")) {
+                if norm_sql_text(e) == norm_sql_text(body) {
+                    t.same.push((n.clone(), format!("FC$I{}", plain_k)));
                 }
             }
         }
@@ -45800,6 +45838,30 @@ fn win_tie_names(
     t
 }
 
+/// SQL text compared as the parser reads it: whitespace dropped and the
+/// words upper-cased outside quotes, a literal or a quoted name verbatim.
+fn norm_sql_text(t: &str) -> String {
+    let mut out = String::new();
+    let mut quote: Option<char> = None;
+    for c in t.trim().chars() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            None if c.is_whitespace() => {}
+            None => out.push(c.to_ascii_uppercase()),
+        }
+    }
+    out
+}
+
 /// An identifier chain's parts as written - `a`, `"a"`, `a.b`,
 /// `a."b.c"` - split at the dots outside quotes; None for an empty part.
 fn split_ident_chain(tok: &str) -> Option<Vec<&str>> {
@@ -45860,7 +45922,10 @@ fn attach_win_tie(plan: &mut Plan, names: &WinTieNames) {
         let at = |n: &str| l1_cols.iter().position(|c| c.name == n);
         let key_alias = names.same.iter().filter_map(|(a, b)| Some((at(a)?, at(b)?))).collect();
         if map.is_some() || base.is_some() {
-            *t2 = Some(Box::new(WinTie { outer: Vec::new(), map, base, key_alias }));
+            let t = t2.get_or_insert_with(Default::default);
+            t.map = map.or(t.map.take());
+            t.base = base.or(t.base.take());
+            t.key_alias = key_alias;
         }
     }
 }
@@ -49692,7 +49757,7 @@ fn plan_over_source(
         )?,
     };
     drop(params_cell);
-    Some(Plan::Derived {
+    let mut plan = Plan::Derived {
         inner: Box::new(src.into_plan(cols)),
         cols: out_cols,
         filter,
@@ -49700,7 +49765,237 @@ fn plan_over_source(
         win_base,
         order_by,
         tie: None,
-    })
+    };
+    derived_window_tie(&mut plan);
+    Some(plan)
+}
+
+/// A WINDOW OVER A DERIVED TABLE THAT READS ONE RELATION
+/// sorts the RELATION's record: the engine flattens the derived table
+/// into its parent, so the window sorts' base stream is the relation
+/// itself, holding every field the statement references - the derived
+/// table's own WHERE among them - in the relation's field order, not the
+/// derived table's column order. Measured on 2182 over U (ID, K, K2, S,
+/// ..): `SELECT S, ROW_NUMBER() OVER (ORDER BY K) FROM (SELECT S, K FROM
+/// U WHERE ID > 2)` numbers the K = 1 ties '', a, c, NULL - ID's flag
+/// byte pushes S's length out of word 0 - exactly as `.. FROM U WHERE
+/// ID > 2` does, where `WHERE K > -5` keeps the NULL second; and `SELECT
+/// S, K2, .. FROM (SELECT S, K, K2 FROM U)` ties by K2's flag before S's
+/// (K2 is U's earlier field); a FIRST inside the derived table, a view
+/// and a CTE flatten the same way. A field only the derived table's
+/// WHERE reads is fetched beside the row ([WinTie::hidden],
+/// [derived_window_rows]). Any other inner shape ([flat_source]: a
+/// DISTINCT, a union, a join, a group) keeps the level's own record.
+fn derived_window_tie(plan: &mut Plan) {
+    let Plan::Derived { inner, cols, filter, windows, win_base, order_by, tie } = plan else { return };
+    if tie.is_some() {
+        return;
+    }
+    if windows.is_empty() {
+        // THE ORDER BY OVER A WINDOWED DERIVED TABLE sorts the record of
+        // the window streams under it - the derived table's bare fields,
+        // then its windows ([outer_window_tie]) - as the ORDER BY of the
+        // windowed statement itself does. Measured on 2182: `SELECT X.S,
+        // RN FROM (SELECT S, K, ROW_NUMBER() OVER (ORDER BY K) RN FROM U)
+        // X ORDER BY X.K` ties the K = 1 rows '', NULL, a, b, c (S's flag
+        // and length share word 0) where the delivery order put the NULL
+        // last. A stream field the derived table does not expose as a
+        // bare column keeps the stable sort.
+        if order_by.is_empty() {
+            return;
+        }
+        let Plan::Project { cols: icols, filter: ifilter, windows: iwins, win_base: ibase, .. } = &**inner else {
+            return;
+        };
+        if iwins.is_empty() {
+            return;
+        }
+        let rec = window_record(icols, ifilter.as_ref(), iwins, &[], *ibase);
+        let slots: Option<Vec<Option<usize>>> = outer_window_tie(&rec, iwins, &[], *ibase)
+            .into_iter()
+            .map(|f| match f {
+                None => Some(None),
+                Some(f) => icols.iter().position(|c| c.expr.is_none() && c.field_id == f).map(Some),
+            })
+            .collect();
+        if let Some(outer) = slots.filter(|o| !o.is_empty()) {
+            *tie = Some(Box::new(WinTie { outer, ..WinTie::default() }));
+        }
+        return;
+    }
+    let Some(src) = flat_source(inner) else { return };
+    if src.slots.len() != *win_base {
+        return;
+    }
+    let rec = window_record(cols, filter.as_ref(), windows, order_by, *win_base);
+    let mut fields: Vec<usize> = src.filtered.clone();
+    for &s in &rec.base {
+        fields.extend(src.slots[s].0.iter().copied());
+    }
+    fields.sort_unstable();
+    fields.dedup();
+    let mut hidden: Vec<(usize, Descriptor)> = Vec::new();
+    let mut base: Vec<usize> = Vec::new();
+    for f in fields {
+        match src.slots.iter().position(|(fs, bare)| *bare && fs[..] == [f]) {
+            Some(s) => base.push(s),
+            None => {
+                let Some(d) = src.descs.get(f) else { return };
+                base.push(*win_base + windows.len() + hidden.len());
+                hidden.push((f, *d));
+            }
+        }
+    }
+    *tie = Some(Box::new(WinTie { base: Some(base), hidden, ..WinTie::default() }));
+}
+
+/// A row source that is ONE relation read through plain levels - a
+/// Project, a FIRST/SKIP or DISTINCT over one, a derived table or view
+/// over one - whose relation stream the engine's window sort reads
+/// through them ([derived_window_tie]; measured on 2182: `.. FROM (SELECT
+/// DISTINCT S, K FROM U WHERE ID > 2)` ties the NULL S last, as the
+/// plain derived table does).
+struct FlatSource {
+    /// per output slot: the relation fields it reads, and whether it IS
+    /// that one field bare
+    slots: Vec<(Vec<usize>, bool)>,
+    /// the relation fields some level's WHERE reads
+    filtered: Vec<usize>,
+    /// the relation's field descriptors (its newest format)
+    descs: Vec<Descriptor>,
+}
+
+fn flat_source(plan: &Plan) -> Option<FlatSource> {
+    let reads = |e: &Expr| -> Vec<usize> {
+        let v = std::cell::RefCell::new(Vec::new());
+        expr_reads(e, &|f| {
+            v.borrow_mut().push(f);
+            false
+        });
+        v.into_inner()
+    };
+    let filter_reads = |p: &Option<Predicate>| -> Vec<usize> {
+        let v = std::cell::RefCell::new(Vec::new());
+        if let Some(p) = p {
+            let mark = |f: usize| {
+                v.borrow_mut().push(f);
+                false
+            };
+            for g in &p.groups {
+                for t in g {
+                    collect_term_fids(t, &mark);
+                }
+            }
+        }
+        v.into_inner()
+    };
+    match plan {
+        Plan::Project { cols, filter, formats, windows, gen_cols, .. } if windows.is_empty() && gen_cols.is_empty() => {
+            let slots = cols
+                .iter()
+                .map(|c| match &c.expr {
+                    None => (vec![c.field_id], true),
+                    Some(e) => (reads(e), false),
+                })
+                .collect();
+            let descs = formats.iter().max_by_key(|(n, _)| *n)?.1.clone();
+            Some(FlatSource { slots, filtered: filter_reads(filter), descs })
+        }
+        Plan::Modified { inner, .. } => flat_source(inner),
+        Plan::Derived { inner, cols, filter, windows, tie: None, .. } if windows.is_empty() => {
+            let src = flat_source(inner)?;
+            let through = |fs: Vec<usize>| -> Option<Vec<usize>> {
+                let mut out = Vec::new();
+                for f in fs {
+                    out.extend(src.slots.get(f)?.0.iter().copied());
+                }
+                Some(out)
+            };
+            let mut slots = Vec::new();
+            for c in cols {
+                slots.push(match &c.expr {
+                    None => src.slots.get(c.field_id)?.clone(),
+                    Some(e) => (through(reads(e))?, false),
+                });
+            }
+            let mut filtered = src.filtered.clone();
+            filtered.extend(through(filter_reads(filter))?);
+            Some(FlatSource { slots, filtered, descs: src.descs })
+        }
+        _ => None,
+    }
+}
+
+/// `plan` with the relation `fields` appended to its output, read through
+/// every level [flat_source] flattens; None for any other shape, and for
+/// a DISTINCT (the fields would split its rows) unless `loose`, which
+/// reads through every modifier - more rows, each an original row's.
+fn plan_with_fields(plan: &Plan, fields: &[usize], loose: bool) -> Option<Plan> {
+    // the raw value, never announced: no wire-width check applies
+    let raw = |tmpl: &ProjCol, f: usize| ProjCol { field_id: f, expr: None, wire: Wire::Int128, ..tmpl.clone() };
+    let mut p = plan.clone();
+    match &mut p {
+        Plan::Project { cols, .. } => {
+            let tmpl = cols.first()?.clone();
+            cols.extend(fields.iter().map(|&f| raw(&tmpl, f)));
+        }
+        Plan::Modified { inner, .. } if loose => return plan_with_fields(inner, fields, loose),
+        Plan::Modified { inner, distinct: false, .. } => **inner = plan_with_fields(inner, fields, loose)?,
+        Plan::Derived { inner, cols, .. } => {
+            let n = output_cols_of(inner).len();
+            **inner = plan_with_fields(inner, fields, loose)?;
+            let tmpl = cols.first()?.clone();
+            cols.extend((0..fields.len()).map(|j| raw(&tmpl, n + j)));
+        }
+        _ => return None,
+    }
+    Some(p)
+}
+
+/// A windowed derived table's inner rows, each followed by an empty slot
+/// per window and the fields [derived_window_tie] found the record needs
+/// but the columns do not expose ([WinTie::hidden]).
+fn derived_window_rows(
+    inner: &Plan,
+    tie: Option<&WinTie>,
+    nwin: usize,
+    db: &Database,
+    args: &[WireParam],
+) -> Result<Vec<Vec<Value>>, EvalErr> {
+    let hidden: Vec<usize> = tie.map_or(Vec::new(), |t| t.hidden.iter().map(|(f, _)| *f).collect());
+    if hidden.is_empty() {
+        return branch_rows_res(inner, db, args);
+    }
+    let n = output_cols_of(inner).len();
+    let lay = |mut r: Vec<Value>, h: Vec<Value>| {
+        r.resize(n + nwin, Value::Null);
+        r.extend(h);
+        r
+    };
+    if let Some(aug) = plan_with_fields(inner, &hidden, false) {
+        return Ok(branch_rows_res(&aug, db, args)?
+            .into_iter()
+            .map(|mut r| {
+                let h = r.split_off(n.min(r.len()));
+                lay(r, h)
+            })
+            .collect());
+    }
+    // under a DISTINCT: the rows as it delivers them, each with the
+    // fields of the first original row that spells it
+    let Some(aug) = plan_with_fields(inner, &hidden, true) else { return branch_rows_res(inner, db, args) };
+    let mut first: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+    for mut r in branch_rows_res(&aug, db, args)? {
+        let h = r.split_off(n.min(r.len()));
+        first.entry(format!("{:?}", r)).or_insert(h);
+    }
+    Ok(branch_rows_res(inner, db, args)?
+        .into_iter()
+        .map(|r| {
+            let h = first.get(&format!("{:?}", r)).cloned().unwrap_or_else(|| vec![Value::Null; hidden.len()]);
+            lay(r, h)
+        })
+        .collect())
 }
 
 /// Every UNQUALIFIED relation name a statement names after `FROM` or
@@ -54644,7 +54939,11 @@ fn branch_rows_res(
             .collect();
     }
     if let Plan::Derived { inner, cols, filter, windows, win_base, order_by, tie } = plan {
-        let rows = branch_rows_res(inner, db, args)?;
+        let rows = if windows.is_empty() {
+            branch_rows_res(inner, db, args)?
+        } else {
+            derived_window_rows(inner, tie.as_deref(), windows.len(), db, args)?
+        };
         let filtered = RowSource::Filter {
             input: Box::new(RowSource::Rows(rows)),
             pred: bind_filter_eval(filter, args)?,
@@ -65759,8 +66058,14 @@ fn compute_windows(
     let mut out: Vec<Vec<Value>> = Vec::with_capacity(n);
     for i in order {
         let mut r = slots[i].take().unwrap_or_default();
+        let carried = if rec.carry > 0 && r.len() > win_base + windows.len() {
+            r.split_off(win_base + windows.len())
+        } else {
+            Vec::new()
+        };
         r.resize(win_base, Value::Null);
         r.extend(std::mem::take(&mut vals[i]));
+        r.extend(carried);
         out.push(r);
     }
     Ok(out)
@@ -66010,6 +66315,9 @@ struct WinRecord {
     map_at: usize,
     descs: Vec<Option<Descriptor>>,
     key_alias: Vec<(usize, usize)>,
+    /// trailing row slots past the window values that the fold carries
+    /// through untouched ([WinTie::hidden])
+    carry: usize,
 }
 
 fn window_record(
@@ -66027,6 +66335,7 @@ fn window_record(
             map_at: usize::MAX,
             descs: Vec::new(),
             key_alias: Vec::new(),
+            carry: 0,
         },
         0usize, // the visit's clock
     ));
@@ -66152,6 +66461,10 @@ struct WinTie {
     /// lifted as its own L1 column beside the base field it reads, so a
     /// key the sort restores drops that base field too
     key_alias: Vec<(usize, usize)>,
+    /// a windowed derived table's base-relation fields its columns do not
+    /// expose (field id, descriptor) - read beside each inner row and
+    /// carried past the window slots ([derived_window_tie])
+    hidden: Vec<(usize, Descriptor)>,
 }
 
 /// THE STATEMENT ORDER BY ABOVE A WINDOW breaks its ties by the WINDOW
@@ -66312,6 +66625,11 @@ fn fold_windows_ordered(
             rec.base = b.clone();
         }
         rec.key_alias = t.key_alias.clone();
+        if !t.hidden.is_empty() {
+            rec.descs.resize(win_base + windows.len(), None);
+            rec.descs.extend(t.hidden.iter().map(|(_, d)| Some(*d)));
+            rec.carry = t.hidden.len();
+        }
     }
     let outer = outer_window_tie(&rec, windows, order_by, win_base);
     let mut rows = compute_windows(rows, windows, win_base, &rec)?;
@@ -72493,7 +72811,8 @@ fn emit_rows_inner(
                     // ships (a partition is not known until its last row
                     // is seen), so this shape materialises, like the
                     // windowed Project does
-                    let rows = branch_rows_res(inner, db, args).map_err(EmitErr::Eval)?;
+                    let rows = derived_window_rows(inner, tie.as_deref(), windows.len(), db, args)
+                        .map_err(EmitErr::Eval)?;
                     let filtered = RowSource::Filter { input: Box::new(RowSource::Rows(rows)), pred }
                         .rows(db)
                         .map_err(EmitErr::Eval)?;
@@ -99370,16 +99689,21 @@ fn parse_frame_clause(s: &str) -> Option<Frame> {
     };
     let body = s[kwlen..].trim();
     let up = body.to_ascii_uppercase();
+    // only a ROWS offset is the INTEGER row count the engine refuses past
+    // 2147483647 ([Frame::too_big]); a RANGE offset is value arithmetic on
+    // the order key and answers (measured on 2182: `RANGE BETWEEN
+    // 3000000000 PRECEDING AND CURRENT ROW` sums every earlier ID)
+    let rows = mode == FrameMode::Rows;
     if up.strip_prefix("BETWEEN ").is_some() {
         // BETWEEN <start> AND <end>; split at the depth-0 ` AND `
         let and_at = find_word_depth0(&up, "AND", "BETWEEN ".len())?;
         let (start, n1, b1) = parse_frame_bound(body["BETWEEN ".len()..and_at].trim())?;
         let (end, n2, b2) = parse_frame_bound(body[and_at + "AND".len()..].trim())?;
-        Some(Frame { mode, start, end, negative: n1 || n2, too_big: b1 || b2 })
+        Some(Frame { mode, start, end, negative: n1 || n2, too_big: rows && (b1 || b2) })
     } else {
         // shorthand: <mode> <start> == BETWEEN <start> AND CURRENT ROW
-        let (start, negative, too_big) = parse_frame_bound(body)?;
-        Some(Frame { mode, start, end: FrameBound::CurrentRow, negative, too_big })
+        let (start, negative, big) = parse_frame_bound(body)?;
+        Some(Frame { mode, start, end: FrameBound::CurrentRow, negative, too_big: rows && big })
     }
 }
 
@@ -99389,7 +99713,8 @@ fn parse_frame_clause(s: &str) -> Option<Frame> {
 /// and `(-1) PRECEDING` are the engine's execute-time refusal, not a
 /// parse error (measured), so the second field says "negative" and the
 /// bound carries the magnitude; the third says "past INTEGER" (the
-/// magnitude then saturates - the fold never runs).
+/// magnitude saturates past usize: a RANGE key's i128 arithmetic reads
+/// it, a ROWS frame never runs).
 fn parse_frame_bound(s: &str) -> Option<(FrameBound, bool, bool)> {
     let t = s.trim();
     let up = t.to_ascii_uppercase();
@@ -99411,7 +99736,7 @@ fn parse_frame_bound(s: &str) -> Option<(FrameBound, bool, bool)> {
                     return None;
                 }
                 let big = mag.trim_start_matches('0').len() > 10 || mag.parse::<u64>().ok()? > i32::MAX as u64;
-                Some((if big { i32::MAX as usize } else { mag.parse::<usize>().ok()? }, neg, big))
+                Some((mag.parse::<usize>().unwrap_or(usize::MAX), neg, big))
             };
             if let Some(n) = up.strip_suffix(" PRECEDING") {
                 let (k, neg, big) = offset(n)?;
@@ -141030,6 +141355,10 @@ mod tests {
         assert!(parse_frame_clause("ROWS BETWEEN 2147483648 PRECEDING AND CURRENT ROW").is_some_and(|f| f.too_big));
         assert!(parse_frame_clause("ROWS 99999999999999999999999 PRECEDING").is_some_and(|f| f.too_big));
         assert!(parse_frame_clause("ROWS BETWEEN 2147483647 PRECEDING AND CURRENT ROW").is_some_and(|f| !f.too_big));
+        assert!(parse_frame_clause("RANGE BETWEEN 3000000000 PRECEDING AND CURRENT ROW").is_some_and(|f| !f.too_big));
+        // a GROUP BY key and a select item compare as the parser reads them
+        assert_eq!(norm_sql_text("k + 1"), norm_sql_text("K+1"));
+        assert_ne!(norm_sql_text("COALESCE(S, 'a')"), norm_sql_text("COALESCE(S, 'A')"));
         // a literal's parenthesis or comma is text to the item splitter
         assert_eq!(split_top_level_commas("grp, ')' x, 'a,b', \"c,d\", count(*)").len(), 5);
     }
