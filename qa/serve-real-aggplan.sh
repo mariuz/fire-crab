@@ -26,7 +26,19 @@
 #     the bare dsql_window_incompat_frames; a NULL or string offset the
 #     bare dsql_window_frame_value_inv_type; a NEGATIVE offset raises at
 #     EXECUTE, over an empty input too. fc/integ ANSWERED the first four
-#     shapes (rows or NULLs) where the engine raises.
+#     shapes (rows or NULLs) where the engine raises. The same rule in a
+#     NAMED window (WINDOW W AS (...)) and inside DML - an UPDATE's or
+#     DELETE's subquery, an INSERT's source - where a folded frame had
+#     MODIFIED rows (section 15).
+#   - A GROUP BY name is a select-list ALIAS first, then a column, even
+#     when the alias shadows a base column's name: `SELECT VAL ID,
+#     COUNT(*) FROM W GROUP BY VAL, ID` groups by VAL twice over (four
+#     groups); a bare field item of the alias's name beside it is the
+#     42702 "Ambiguous field name between a field and an alias". HAVING,
+#     WHERE, an aggregate's argument and a window's own ORDER BY /
+#     PARTITION BY name the COLUMN; a QUALIFIED key is the column. The
+#     group planner grouped five ways, and every windowed form of the
+#     shape answered that grouping through the rewrite's L1 (section 14).
 #
 # RECORDED, not fixed (section 12 and the refused/differs cells): CREATE
 # VIEW over an aggregate, a GROUP BY or a window; LAG/LEAD/NTH_VALUE with
@@ -35,7 +47,10 @@
 # LIST and PERCENTILE_CONT as windows; MIN and COUNT(DISTINCT) over a
 # BLOB; CREATE VIEW ... WITH CHECK OPTION; DISTINCT in an ordered window (the engine's 0A000, a generic
 # refusal here); a bare column under a lone HAVING or in the ORDER BY of
-# an implicit group (the engine's specific -104, a generic refusal here).
+# an implicit group (the engine's specific -104, a generic refusal here);
+# a qualified GROUP BY / ORDER BY key whose bare name a select-list alias
+# shadows (the column on the engine - answered or refused with -104 - a
+# generic refusal here); an illegal frame inside EXECUTE BLOCK.
 #
 # Usage: qa/serve-real-aggplan.sh [port]   (default 6010)
 set -u
@@ -335,11 +350,71 @@ pin  "13 CREATE OR ALTER VIEW creates when absent" "CREATE OR ALTER VIEW V2 AS S
 pin  "13 ...and redefines when present" "CREATE OR ALTER VIEW V2 AS SELECT ID, N FROM T1; COMMIT; SELECT * FROM V2 ORDER BY ID; CREATE OR ALTER VIEW V2 (A, B, C) AS SELECT ID, N, S FROM T1; COMMIT; SELECT * FROM V2 ORDER BY A;" "ID N|1 5|2 7|A B C|1 5 a|2 7 b"
 dpin "13 describe: the redefined view" "SELECT * FROM V2;" "01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: A alias: A|: table: V2 schema: PUBLIC owner: SYSDBA|02: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: B alias: B|: table: V2 schema: PUBLIC owner: SYSDBA|03: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 10 charset: 0 SYSTEM.NONE|: name: C alias: C|: table: V2 schema: PUBLIC owner: SYSDBA"
 
+echo "--- 14. GROUP BY A SELECT-LIST ALIAS THAT SHADOWS A COLUMN"
+pin  "14 GROUP BY VAL, ID under VAL ID groups by VAL twice over" "SELECT VAL ID, COUNT(*) FROM W GROUP BY VAL, ID;" "ID COUNT|<null> 1|5 1|10 1|20 2"
+pin  "14 ...GROUP BY the alias alone" "SELECT VAL ID, COUNT(*) FROM W GROUP BY ID;" "ID COUNT|<null> 1|5 1|10 1|20 2"
+pin  "14 ...ORDER BY the alias" "SELECT VAL ID, COUNT(*) FROM W GROUP BY ID ORDER BY ID DESC;" "ID COUNT|20 2|10 1|5 1|<null> 1"
+pin  "14 ...GROUP BY the column, ORDER BY the alias" "SELECT VAL ID, COUNT(*) FROM W GROUP BY VAL ORDER BY ID;" "ID COUNT|<null> 1|5 1|10 1|20 2"
+pin  "14 an aliased EXPRESSION shadows the column" "SELECT VAL + 1 ID, COUNT(*) FROM W GROUP BY ID;" "ID COUNT|<null> 1|6 1|11 1|21 2"
+pin  "14 ...and beside its own column" "SELECT VAL + 1 ID, COUNT(*) FROM W GROUP BY ID, VAL;" "ID COUNT|<null> 1|6 1|11 1|21 2"
+pin  "14 a text column's name as the alias" "SELECT GRP VAL, COUNT(*) FROM W GROUP BY GRP, VAL;" "VAL COUNT|<null> 1|A 2|B 2"
+pin  "14 the aggregate's argument is the COLUMN" "SELECT VAL ID, MAX(ID) FROM W GROUP BY ID;" "ID MAX|<null> 4|5 5|10 1|20 3"
+pin  "14 ...SUM of the shadowed column" "SELECT GRP VAL, SUM(VAL) FROM W GROUP BY VAL;" "VAL SUM|<null> 5|A 30|B 20"
+pin  "14 HAVING names the column" "SELECT VAL ID, COUNT(*) FROM W GROUP BY ID HAVING VAL > 5;" "ID COUNT|10 1|20 2"
+pin  "14 WHERE names the column" "SELECT VAL ID, COUNT(*) FROM W WHERE ID > 1 GROUP BY ID;" "ID COUNT|<null> 1|5 1|20 2"
+pin  "14 swapped aliases" "SELECT ID VAL, VAL ID, COUNT(*) FROM W GROUP BY ID, VAL;" "VAL ID COUNT|4 <null> 1|5 5 1|1 10 1|2 20 1|3 20 1"
+pin  "14 a second key beside the alias" "SELECT VAL ID, GRP, COUNT(*) FROM W GROUP BY GRP, ID;" "ID GRP COUNT|5 <null> 1|10 A 1|20 A 1|<null> B 1|20 B 1"
+pin  "14 the same key thrice" "SELECT VAL ID, COUNT(*) FROM W GROUP BY ID, VAL, ID;" "ID COUNT|<null> 1|5 1|10 1|20 2"
+pin  "14 a quoted alias" "SELECT VAL \"id\", COUNT(*) FROM W GROUP BY \"id\";" "id COUNT|<null> 1|5 1|10 1|20 2"
+pin  "14 FIRST over it" "SELECT FIRST 2 VAL ID, COUNT(*) FROM W GROUP BY ID ORDER BY ID;" "ID COUNT|<null> 1|5 1"
+pin  "14 in a derived table" "SELECT * FROM (SELECT VAL ID, COUNT(*) C FROM W GROUP BY ID) D ORDER BY 1;" "ID C|<null> 1|5 1|10 1|20 2"
+pin  "14 a FIELD item beside the alias: 42702" "SELECT ID, VAL ID, COUNT(*) FROM W GROUP BY ID;" "Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between a field and an alias in the select list with name|-ID"
+pin  "14 ...a qualified field item too" "SELECT W.ID, VAL ID, COUNT(*) FROM W GROUP BY ID;" "Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between a field and an alias in the select list with name|-ID"
+pin  "14 ...without an aggregate" "SELECT ID, VAL ID FROM W GROUP BY ID;" "Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between a field and an alias in the select list with name|-ID"
+pin  "14 ...ordinals resolve without ambiguity" "SELECT ID, VAL ID, COUNT(*) FROM W GROUP BY 1, 2;" "ID ID COUNT|1 10 1|2 20 1|3 20 1|4 <null> 1|5 5 1"
+pin  "14 windowed: RANK over the alias grouping" "SELECT VAL ID, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM W GROUP BY VAL, ID;" "ID COUNT RANK|5 1 1|10 1 1|<null> 1 1|20 2 4"
+pin  "14 windowed: ROW_NUMBER over GRP VAL" "SELECT GRP VAL, COUNT(*), ROW_NUMBER() OVER (ORDER BY GRP) FROM W GROUP BY GRP, VAL;" "VAL COUNT ROW_NUMBER|<null> 1 1|A 2 2|B 2 3"
+pin  "14 windowed: ORDER BY the alias" "SELECT VAL ID, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM W GROUP BY ID ORDER BY ID;" "ID COUNT RANK|<null> 1 1|5 1 1|10 1 1|20 2 4"
+pin  "14 windowed: the window sorts by the column" "SELECT VAL ID, ROW_NUMBER() OVER (ORDER BY VAL) FROM W GROUP BY VAL, ID ORDER BY ID;" "ID ROW_NUMBER|<null> 1|5 2|10 3|20 4"
+pin  "14 windowed: PARTITION BY the column" "SELECT VAL ID, RANK() OVER (PARTITION BY VAL ORDER BY COUNT(*)) FROM W GROUP BY VAL, ID ORDER BY ID;" "ID RANK|<null> 1|5 1|10 1|20 1"
+pin  "14 windowed: HAVING the column" "SELECT VAL ID, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM W GROUP BY ID HAVING VAL > 5;" "ID COUNT RANK|10 1 1|20 2 2"
+pin  "14 windowed, in a derived table" "SELECT * FROM (SELECT VAL ID, COUNT(*) C, RANK() OVER (ORDER BY COUNT(*)) R FROM W GROUP BY VAL, ID) D ORDER BY R, 1;" "ID C R|<null> 1 1|5 1 1|10 1 1|20 2 4"
+pin  "14 windowed: a field item beside the alias: 42702" "SELECT ID, VAL ID, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM W GROUP BY ID;" "Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between a field and an alias in the select list with name|-ID"
+pin  "14 windowed: an alias that shadows nothing" "SELECT GRP G, COUNT(*) C, RANK() OVER (ORDER BY COUNT(*) DESC) FROM W GROUP BY G ORDER BY G;" "G C RANK|<null> 1 3|A 2 1|B 2 1"
+pin  "14 CONTROL: the windowless alias" "SELECT GRP G, COUNT(*) C FROM W GROUP BY G ORDER BY G;" "G C|<null> 1|A 2|B 2"
+differs "14 RECORDED the window's ORDER BY names the column (engine -104)" "SELECT VAL ID, ROW_NUMBER() OVER (ORDER BY ID) FROM W GROUP BY VAL, ID ORDER BY ID;"
+differs "14 RECORDED PARTITION BY the shadowed name (engine -104)" "SELECT VAL ID, RANK() OVER (PARTITION BY ID ORDER BY COUNT(*)) FROM W GROUP BY VAL, ID;"
+differs "14 RECORDED a qualified key is the column (engine -104)" "SELECT VAL ID, COUNT(*) FROM W GROUP BY W.ID;"
+refused "14 RECORDED ...beside the alias (engine groups five ways)" "SELECT VAL ID, COUNT(*) FROM W GROUP BY ID, W.ID;"
+differs "14 RECORDED ORDER BY the qualified column (engine -104)" "SELECT VAL ID, COUNT(*) FROM W GROUP BY VAL, ID ORDER BY W.ID;"
+differs "14 RECORDED HAVING the alias is the column (engine -104)" "SELECT VAL ID, COUNT(*) FROM W GROUP BY ID HAVING ID > 5;"
+differs "14 RECORDED HAVING an alias that shadows nothing (engine -206)" "SELECT VAL X, COUNT(*) FROM W GROUP BY X HAVING X > 5;"
+
+echo "--- 15. FRAME BOUNDS IN A NAMED WINDOW AND INSIDE DML"
+pin  "15 named window: FOLLOWING then CURRENT ROW" "SELECT ID, SUM(VAL) OVER WIN FROM W WINDOW WIN AS (ORDER BY ID ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW);" "Statement failed, SQLSTATE = 42000|If <window frame bound 1> specifies FOLLOWING, then <window frame bound 2> shall not specify PRECEDING or CURRENT ROW"
+pin  "15 named window: UNBOUNDED FOLLOWING as bound 1" "SELECT ID, SUM(VAL) OVER WIN FROM W WINDOW WIN AS (ORDER BY ID ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING);" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 87|-FOLLOWING"
+pin  "15 named window: CURRENT ROW then PRECEDING" "SELECT ID, SUM(VAL) OVER WIN FROM W WINDOW WIN AS (ORDER BY ID ROWS BETWEEN CURRENT ROW AND 1 PRECEDING);" "Statement failed, SQLSTATE = 42000|If <window frame bound 1> specifies CURRENT ROW, then <window frame bound 2> shall not specify PRECEDING"
+pin  "15 named window: the shorthand FOLLOWING" "SELECT ID, SUM(VAL) OVER WIN FROM W WINDOW WIN AS (ORDER BY ID ROWS 1 FOLLOWING);" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 71|-FOLLOWING"
+pin  "15 named window: a NULL offset" "SELECT ID, SUM(VAL) OVER WIN FROM W WINDOW WIN AS (ORDER BY ID ROWS BETWEEN NULL PRECEDING AND CURRENT ROW);" "Statement failed, SQLSTATE = 42000|Window RANGE/ROWS/GROUPS PRECEDING/FOLLOWING value must be of a numerical type"
+pin  "15 the SECOND named window" "SELECT ID, SUM(VAL) OVER W2 FROM W WINDOW W1 AS (ORDER BY ID), W2 AS (ORDER BY ID ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW);" "Statement failed, SQLSTATE = 42000|If <window frame bound 1> specifies FOLLOWING, then <window frame bound 2> shall not specify PRECEDING or CURRENT ROW"
+pin  "15 ...the parse error outranks the bound rule" "SELECT ID, SUM(VAL) OVER W1, SUM(VAL) OVER W2 FROM W WINDOW W1 AS (ORDER BY ID ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW), W2 AS (ORDER BY ID ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING);" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 165|-FOLLOWING"
+pin  "15 named window: a negative offset raises at EXECUTE" "SELECT ID, SUM(VAL) OVER WIN FROM W WINDOW WIN AS (ORDER BY ID ROWS BETWEEN -1 PRECEDING AND CURRENT ROW);" "ID SUM|Statement failed, SQLSTATE = 42000|Invalid PRECEDING or FOLLOWING offset in window function: cannot be negative"
+pin  "15 CONTROL: a legal named frame" "SELECT ID, SUM(VAL) OVER WIN FROM W WINDOW WIN AS (ORDER BY ID ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING);" "ID SUM|1 30|2 50|3 40|4 25|5 5"
+pin  "15 UPDATE over an illegal frame changes nothing" "UPDATE W SET VAL = 0 WHERE ID IN (SELECT ID FROM (SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) S FROM W) WHERE S IS NULL); SELECT ID, VAL FROM W ORDER BY ID; ROLLBACK;" "Statement failed, SQLSTATE = 42000|If <window frame bound 1> specifies FOLLOWING, then <window frame bound 2> shall not specify PRECEDING or CURRENT ROW|ID VAL|1 10|2 20|3 20|4 <null>|5 5"
+pin  "15 DELETE over an illegal frame deletes nothing" "DELETE FROM W WHERE ID IN (SELECT ID FROM (SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING) S FROM W)); SELECT COUNT(*) FROM W; ROLLBACK;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 105|-FOLLOWING|COUNT|5"
+pin  "15 INSERT .. SELECT over an illegal frame inserts nothing" "INSERT INTO E SELECT ID, GRP, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM W; SELECT COUNT(*) FROM E; ROLLBACK;" "Statement failed, SQLSTATE = 42000|If <window frame bound 1> specifies CURRENT ROW, then <window frame bound 2> shall not specify PRECEDING|COUNT|0"
+pin  "15 ...through a named window" "INSERT INTO E SELECT ID, GRP, SUM(VAL) OVER WIN FROM W WINDOW WIN AS (ORDER BY ID ROWS BETWEEN CURRENT ROW AND 1 PRECEDING); SELECT COUNT(*) FROM E; ROLLBACK;" "Statement failed, SQLSTATE = 42000|If <window frame bound 1> specifies CURRENT ROW, then <window frame bound 2> shall not specify PRECEDING|COUNT|0"
+pin  "15 DELETE over a NULL offset" "DELETE FROM W WHERE ID IN (SELECT ID FROM (SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN NULL PRECEDING AND CURRENT ROW) S FROM W)); SELECT COUNT(*) FROM W; ROLLBACK;" "Statement failed, SQLSTATE = 42000|Window RANGE/ROWS/GROUPS PRECEDING/FOLLOWING value must be of a numerical type|COUNT|5"
+pin  "15 UPDATE over a negative offset raises at EXECUTE" "UPDATE W SET VAL = 0 WHERE ID IN (SELECT ID FROM (SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) S FROM W) WHERE S IS NULL); SELECT ID, VAL FROM W ORDER BY ID; ROLLBACK;" "Statement failed, SQLSTATE = 42000|Invalid PRECEDING or FOLLOWING offset in window function: cannot be negative|ID VAL|1 10|2 20|3 20|4 <null>|5 5"
+pin  "15 a select-list subquery's frame" "SELECT ID, (SELECT SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM W X WHERE X.ID = W.ID) FROM W;" "Statement failed, SQLSTATE = 42000|If <window frame bound 1> specifies FOLLOWING, then <window frame bound 2> shall not specify PRECEDING or CURRENT ROW"
+pin  "15 CONTROL: a legal frame in an UPDATE" "UPDATE W SET VAL = 0 WHERE ID IN (SELECT ID FROM (SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) S FROM W) WHERE S IS NULL); SELECT ID, VAL FROM W ORDER BY ID; ROLLBACK;" "ID VAL|1 10|2 20|3 20|4 <null>|5 5"
+differs "15 RECORDED an illegal frame inside EXECUTE BLOCK (engine's bound rule)" "EXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN FOR SELECT SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM W INTO :N DO SUSPEND; END"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-aggplan-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 173 ]; then echo "FAIL only $ran checks ran (floor 173)"; fail=1; fi
+if [ "$ran" -lt 229 ]; then echo "FAIL only $ran checks ran (floor 229)"; fail=1; fi
 exit $fail

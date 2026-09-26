@@ -44396,6 +44396,71 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<String> {
             l3_order.push(format!("{}{}", quote(&name), dir));
         }
     }
+    // A GROUP BY name that is one of the statement's ALIASES names the
+    // item's BODY, and L1 - whose items are renamed FC$In - must group
+    // by that body, not by the base column the alias shadows: `SELECT
+    // VAL ID, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM W GROUP BY
+    // VAL, ID` groups by VAL twice over on the engine (measured: four
+    // groups), so L1 says `GROUP BY VAL, VAL`; the same rule that
+    // [parse_group_by] applies, applied to the text. A bare FIELD item
+    // of the same name beside the alias is the engine's 42702 (`SELECT
+    // ID, VAL ID ... GROUP BY ID`), posted here and left to refuse; an
+    // alias over a WINDOW item is the engine's -104 "Cannot use an
+    // aggregate or window function in a GROUP BY clause", a refusal.
+    let group_s: Option<String> = match group_s {
+        None => None,
+        Some(g) => {
+            let mut parts: Vec<String> = Vec::new();
+            for part in split_top_level_commas(g) {
+                let part = part.trim();
+                let Some(name) = canon_ident(part) else {
+                    parts.push(part.to_string());
+                    continue;
+                };
+                let mut body_of: Option<&str> = None;
+                let mut field_item = false;
+                for it in &items_raw {
+                    let (body, alias) = split_alias(it.trim());
+                    let body = body.trim();
+                    match alias.map(alias_canon) {
+                        Some(a) if a == name => {
+                            if has_over(body) {
+                                return None;
+                            }
+                            body_of = Some(body);
+                        }
+                        Some(_) => {}
+                        None => {
+                            let own = if is_qualified_col(body) {
+                                body.rsplit('.').next().and_then(canon_ident)
+                            } else {
+                                canon_ident(body)
+                            };
+                            if own.as_deref() == Some(name.as_str()) {
+                                field_item = true;
+                            }
+                        }
+                    }
+                }
+                match body_of {
+                    Some(_) if field_item => {
+                        PREPARE_REFUSAL.with(|r| {
+                            *r.borrow_mut() = Some(EvalErr::AmbiguousField {
+                                first: "a field".to_string(),
+                                second: "an alias in the select list with name".to_string(),
+                                name: name.clone(),
+                            })
+                        });
+                        return None;
+                    }
+                    Some(b) => parts.push(b.to_string()),
+                    None => parts.push(part.to_string()),
+                }
+            }
+            Some(parts.join(", "))
+        }
+    };
+    let group_s = group_s.as_deref();
     // L1 - the query without its windows
     let mut l1 = String::from("SELECT ");
     let mut first = true;
@@ -49414,6 +49479,38 @@ fn ident_span(b: &[char], at: usize) -> Option<(String, usize)> {
     Some((b[at..i].iter().collect(), i))
 }
 
+/// Does a GROUP BY or ORDER BY key name a column QUALIFIED (`W.ID`,
+/// `E.ID`) whose bare name is one of the select list's ALIASES? Such a
+/// key is the column on the engine, while the alias-first law
+/// ([parse_group_by]) would take the alias once the qualifier is
+/// stripped - so the single-relation path refuses it rather than
+/// answer the alias's grouping (measured, see the caller).
+fn alias_shadowed_qualified_key(proj_s: &str, group_s: Option<&str>, order_s: Option<&str>) -> bool {
+    let aliases: Vec<String> = split_top_level_commas(proj_s)
+        .into_iter()
+        .filter_map(|it| {
+            let (_, alias) = split_alias(it.trim());
+            let a = alias?.trim();
+            Some(match a.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                Some(inner) => inner.replace("\"\"", "\""),
+                None => a.to_ascii_uppercase(),
+            })
+        })
+        .collect();
+    if aliases.is_empty() {
+        return false;
+    }
+    let names_alias = |key: &str| -> bool {
+        let k = key.trim();
+        is_qualified_col(k)
+            && k.rsplit('.').next().and_then(canon_ident).is_some_and(|n| aliases.contains(&n))
+    };
+    group_s.is_some_and(|g| split_top_level_commas(g).iter().any(|k| names_alias(k)))
+        || order_s.is_some_and(|o| {
+            split_top_level_commas(o).iter().any(|k| names_alias(split_order_direction(k.trim()).0))
+        })
+}
+
 /// Drop a qualifier that names the query's ONE relation: `E.ID` and
 /// `EMP.ID` both mean `ID` when the FROM is `EMP E`.
 ///
@@ -54368,6 +54465,18 @@ fn plan_query_inner_at(
                     _ => None,
                 },
             };
+            // A QUALIFIED GROUP BY / ORDER BY key is the COLUMN even when
+            // a select-list alias shadows its name (measured: `SELECT VAL
+            // ID, COUNT(*) FROM W GROUP BY W.ID` is -104 "Invalid
+            // expression in the select list" - VAL is ungrouped - and
+            // `GROUP BY ID, W.ID` groups five ways where `GROUP BY ID`
+            // groups four; `ORDER BY W.ID` over the grouped alias is the
+            // -104 of the ORDER BY clause). Stripped to its bare name the
+            // key would resolve to the ALIAS ([parse_group_by]'s law), so
+            // the shape is refused here, before the strip.
+            if alias_shadowed_qualified_key(proj_s, group_s, order_s) {
+                return Some(Plan::Refused);
+            }
             if let Some(rewritten) = unqualify_single(sql, &bind) {
                 if trace {
                     eprintln!("[srv] plan: unqualified to {:?}", rewritten);
@@ -58249,55 +58358,89 @@ fn parse_group_by(
                 return None;
             }
         } else if canon.is_some() {
-            // a bare name is a COLUMN, or one of the select list's
-            // ALIASES: `SELECT G AS X ... GROUP BY X` groups by G (the
-            // engine resolves the alias). A real column of that name
-            // wins, which is what makes an alias that shadows one
-            // harmless.
+            // a bare name is one of the select list's ALIASES FIRST, and
+            // a COLUMN only when no item is aliased so: `SELECT G AS X
+            // ... GROUP BY X` groups by G, and so does `SELECT VAL ID,
+            // COUNT(*) FROM W GROUP BY VAL, ID` - the alias SHADOWS the
+            // base column ID (measured on 2182: four groups, 20 twice
+            // over, the same four for `GROUP BY ID` alone; a qualified
+            // `GROUP BY W.ID` is the column and refuses the ungrouped
+            // VAL). This server let the real column win, which grouped
+            // that statement five ways - a wrong answer in the rows.
             //
-            // ...EXCEPT WHEN THE ALIAS NAMES AN AGGREGATE, and there the
-            // "harmless" above was a WRONG ANSWER. Measured: the bare
-            // `SELECT COUNT(*) AS N FROM T GROUP BY N` refuses on the
-            // engine with 42000 / -104 / "Cannot use an aggregate
-            // function..." - the alias makes `GROUP BY N` look like it
-            // references the AGGREGATE, and the engine rejects the
-            // statement whether or not HAVING or ORDER BY names it
-            // (`ORDER BY 1` refuses too). This server took the real column
-            // and answered `2|1`. `SELECT COUNT(*) AS C FROM T GROUP BY N`
-            // is fine on both, so it is the COLLISION that is invalid, not
-            // the alias.
+            // The alias is what the select list SAYS, so the item's
+            // BODY is what the key becomes: a column item its column,
+            // an expression item its expression (`SELECT VAL+1 ID ...
+            // GROUP BY ID` groups by VAL+1 - measured, four groups
+            // 6/11/21/NULL).
             //
-            // The check runs BEFORE the column lookup precisely because a
-            // real column of that name exists in the failing case - that
-            // is what made it silent.
+            // WHEN THE ALIAS NAMES AN AGGREGATE the statement is
+            // invalid. Measured: the bare `SELECT COUNT(*) AS N FROM T
+            // GROUP BY N` refuses on the engine with 42000 / -104 /
+            // "Cannot use an aggregate function..." - the alias makes
+            // `GROUP BY N` look like it references the AGGREGATE, and
+            // the engine rejects the statement whether or not HAVING or
+            // ORDER BY names it (`ORDER BY 1` refuses too). This server
+            // once took the real column and answered `2|1`. `SELECT
+            // COUNT(*) AS C FROM T GROUP BY N` is fine on both, so it is
+            // the COLLISION that is invalid, not the alias.
             if items.iter().any(|it| matches!(it, SelItem::Agg(_, _, Some(a)) if a == name)) {
                 return None;
             }
-            match find_col(columns, name) {
-                Some(_) => name,
-                None => {
-                    let aliased = items.iter().find_map(|it| match it {
-                        SelItem::Col(c, Some(a)) if a == name => {
-                            Some(c.as_str())
-                        }
-                        _ => None,
-                    });
-                    match aliased {
-                        Some(c) => c,
-                        None => {
-                            // an alias over an EXPRESSION item groups by
-                            // that expression
-                            let raw = items.iter().find_map(|it| match it {
-                                SelItem::Expr(raw, n, _) if n == name => {
-                                    Some(raw.clone())
-                                }
-                                _ => None,
-                            })?;
-                            push_expr(raw, &mut key_exprs, &mut fids, sink)?;
-                            continue;
-                        }
-                    }
+            // the alias: a column item's, or an expression item's (an
+            // expression's NAME is its alias when it has one, else the
+            // engine's symbol - ADD, UPPER - which is not an alias and
+            // is left to the fallback below)
+            enum Aliased<'a> {
+                Col(&'a str),
+                Expr(RawExpr),
+            }
+            let aliased = items.iter().find_map(|it| match it {
+                SelItem::Col(c, Some(a)) if a == name => Some(Aliased::Col(c.as_str())),
+                SelItem::Expr(raw, n, sym) if n == name && n != sym => Some(Aliased::Expr(raw.clone())),
+                _ => None,
+            });
+            // ...and a bare FIELD item of that name beside it - `SELECT
+            // ID, VAL ID ... GROUP BY ID` (or `W.ID, VAL ID`) - is the
+            // engine's 42702 / -204 "Ambiguous field name between a
+            // field and an alias in the select list with name" / ID
+            // (measured; `GROUP BY ID, VAL` and a list without any
+            // aggregate raise it too). Posted for the outermost refusal
+            // arm to serve.
+            let field_item = items.iter().any(|it| match it {
+                SelItem::Col(c, None) => col_name_is(c.rsplit('.').next().unwrap_or(c), name),
+                _ => false,
+            });
+            if aliased.is_some() && field_item {
+                PREPARE_REFUSAL.with(|r| {
+                    *r.borrow_mut() = Some(EvalErr::AmbiguousField {
+                        first: "a field".to_string(),
+                        second: "an alias in the select list with name".to_string(),
+                        name: name.to_string(),
+                    })
+                });
+                return None;
+            }
+            match aliased {
+                Some(Aliased::Col(c)) => c,
+                Some(Aliased::Expr(raw)) => {
+                    push_expr(raw, &mut key_exprs, &mut fids, sink)?;
+                    continue;
                 }
+                None => match find_col(columns, name) {
+                    Some(_) => name,
+                    None => {
+                        // an expression item's SYMBOL (`GROUP BY UPPER`
+                        // over an unaliased UPPER(S)) groups by that
+                        // expression
+                        let raw = items.iter().find_map(|it| match it {
+                            SelItem::Expr(raw, n, _) if n == name => Some(raw.clone()),
+                            _ => None,
+                        })?;
+                        push_expr(raw, &mut key_exprs, &mut fids, sink)?;
+                        continue;
+                    }
+                },
             }
         } else {
             // not a bare column: an expression key - GROUP BY UPPER(S),
@@ -58325,6 +58468,20 @@ fn parse_group_by(
         }
         fids.push(rc.field_id as usize);
     }
+    // the same key named twice - `GROUP BY VAL, ID` under `SELECT VAL
+    // ID` resolves both to VAL, `GROUP BY ID, VAL, ID` spells it out -
+    // groups once (measured: the alias-shadowed statement's four groups
+    // are the same four as `GROUP BY VAL`, in the same order); the
+    // first spelling keeps its place in the group order
+    let mut seen: Vec<usize> = Vec::new();
+    fids.retain(|f| {
+        if seen.contains(f) {
+            false
+        } else {
+            seen.push(*f);
+            true
+        }
+    });
     if fids.is_empty() {
         None
     } else {
@@ -61404,6 +61561,17 @@ fn compute_windows(
     //     val=20 peers 2 and 3 come 3 then 2 - by the first window's
     //     value 3 < 4 - where the base fields alone (id) would say 2
     //     then 3, and `sum(val) over (order by val)` alone says 2, 3.
+    // The tie order here is an APPROXIMATION of that record, not the
+    // engine's compare: sort.cpp's quick() compares the WHOLE sort
+    // record as little-endian ULONG words - the diddled keys, then
+    // the per-field NULL flags (SortedStream.cpp sets the flag TRUE
+    // for NULL), then the raw data bytes - so a NULL tie field sorts
+    // by its flag word and a text one by its bytes, where this
+    // compares VALUES (NULL last, collation order). Measured on a
+    // 15-row table: among the val=10 peers of `row_number() over
+    // (order by val)` the engine numbers the grp=NULL row 3 (NULL,
+    // A, A, A, B, B, C, C), this server 10. A tie-dependent value
+    // over ties with a NULL or a multi-byte text tie field can differ.
     // Until 2026-09-26 this kept scan order and knew only the base
     // fields, which was right whenever a statement ORDER BY re-sorted
     // the result and wrong under FIRST/SKIP/DISTINCT and bare.
@@ -93059,22 +93227,81 @@ fn parse_frame_bound(s: &str) -> Option<(FrameBound, bool)> {
 /// Parse errors outrank the semantic ones, as the parser runs first;
 /// among parse errors the earliest wins. None when every frame is legal
 /// (or there is no window at all - the common case, one word search).
+///
+/// A NAMED window's spec is judged the same way (`WINDOW W AS (ORDER BY
+/// ID ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW)`, and the ones after
+/// the comma): measured, each illegal pair raises the same vector from
+/// the WINDOW clause as from an OVER - the token error at its own
+/// column - and this server had folded them (NULLs, or 5,5,5,5,5 for
+/// `UNBOUNDED FOLLOWING` as bound 1). The lint holds for DML too - an
+/// UPDATE/DELETE subquery's window, an INSERT's source - where the
+/// engine refuses at prepare and changes nothing (measured; this
+/// server had updated five rows, emptied the table, inserted five).
 fn window_frame_lint(sql: &str) -> Option<EvalErr> {
     let up = sql.to_ascii_uppercase();
     let masked = mask_literals(&up);
     let b = masked.as_bytes();
     let mut token_err: Option<EvalErr> = None;
     let mut semantic: Option<EvalErr> = None;
+    // the `(` of every window spec, in text order: each OVER's, and
+    // each definition's in a WINDOW clause (`WINDOW <name> AS (...)
+    // [, <name> AS (...)]*`)
+    let mut specs: Vec<usize> = Vec::new();
+    let skip_ws = |mut i: usize| -> usize {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
     let mut from = 0usize;
     while let Some(o) = find_word(&masked, "OVER", from) {
         from = o + 4;
-        let mut lp = o + 4;
-        while lp < b.len() && b[lp].is_ascii_whitespace() {
-            lp += 1;
+        let lp = skip_ws(o + 4);
+        if b.get(lp) == Some(&b'(') {
+            specs.push(lp);
         }
-        if b.get(lp) != Some(&b'(') {
-            continue;
+    }
+    let mut from = 0usize;
+    while let Some(w) = find_word(&masked, "WINDOW", from) {
+        from = w + 6;
+        let mut at = w + 6;
+        loop {
+            // <name> AS (
+            let ns = skip_ws(at);
+            let mut ne = ns;
+            if b.get(ne) == Some(&b'"') {
+                ne += 1;
+                while ne < b.len() && b[ne] != b'"' {
+                    ne += 1;
+                }
+                ne += 1;
+            } else {
+                while ne < b.len() && is_ident_byte(b[ne]) {
+                    ne += 1;
+                }
+            }
+            if ne == ns {
+                break;
+            }
+            let a = skip_ws(ne);
+            if masked.get(a..a + 2) != Some("AS") {
+                break;
+            }
+            let lp = skip_ws(a + 2);
+            if b.get(lp) != Some(&b'(') {
+                break;
+            }
+            specs.push(lp);
+            let Some(rp) = matching_paren(b, lp) else { break };
+            let c = skip_ws(rp + 1);
+            if b.get(c) != Some(&b',') {
+                break;
+            }
+            at = c + 1;
         }
+    }
+    specs.sort_unstable();
+    for lp in specs {
         let Some(rp) = matching_paren(b, lp) else { break };
         let spec_lo = lp + 1;
         let spec = &masked[spec_lo..rp];
@@ -110915,7 +111142,13 @@ fn after_auth(
                     // inserts nothing - this inserted twelve rows - and a
                     // DELETE / UPDATE whose IN-subquery carries `order by
                     // .. union` or `rows 1 union` deleted / updated.
-                    let dml_lint = limit_lint_scan_db(&stmt_sql, &database).err;
+                    let dml_lint = limit_lint_scan_db(&stmt_sql, &database)
+                        .err
+                        // ...and the window-frame grammar ([window_frame_lint]):
+                        // a frame the parser refuses inside an UPDATE's or
+                        // DELETE's subquery, or an INSERT's source, must not
+                        // fold and then modify rows
+                        .or_else(|| window_frame_lint(&stmt_sql));
                     let planned = if let Some(e) = dml_lint {
                         Some((std::rc::Rc::new(Plan::RefusedEval(e)), std::rc::Rc::new(Vec::new())))
                     } else { timed("plan(dml)", || {
@@ -121293,8 +121526,35 @@ mod tests {
         let (k, ke) =
             parse_group_by("MOD(ID, 2), DEPT_ID, mod( id , 2 )", &items, &columns, &descs, 100, 0, &mut Vec::new())
                 .unwrap();
-        assert_eq!(k, vec![100, 2, 100]);
+        assert_eq!(k, vec![100, 2]);
         assert_eq!(ke.len(), 1);
+        // a key named twice by name groups once too
+        assert_eq!(keys("DEPT_ID, DEPT_ID"), Some(vec![2]));
+        // AN ALIAS RESOLVES FIRST, even over a real column of that name
+        // (measured: `SELECT VAL ID, COUNT(*) FROM W GROUP BY VAL, ID`
+        // groups by VAL twice over): `SELECT DEPT_ID ID ... GROUP BY ID`
+        // is the DEPT_ID key, not the ID column, and `GROUP BY DEPT_ID,
+        // ID` is that one key
+        let shadow = vec![
+            SelItem::Col("DEPT_ID".into(), Some("ID".into())),
+            SelItem::Agg(AggFn::Count, AggTarget::Star, None),
+        ];
+        let skeys = |g: &str| parse_group_by(g, &shadow, &columns, &descs, 100, 0, &mut Vec::new()).map(|(k, _)| k);
+        assert_eq!(skeys("ID"), Some(vec![2]));
+        assert_eq!(skeys("DEPT_ID, ID"), Some(vec![2]));
+        // ...and a bare FIELD item of the alias's name beside it is the
+        // engine's 42702, posted for the refusal arm
+        let ambiguous = vec![
+            SelItem::Col("ID".into(), None),
+            SelItem::Col("DEPT_ID".into(), Some("ID".into())),
+            SelItem::Agg(AggFn::Count, AggTarget::Star, None),
+        ];
+        PREPARE_REFUSAL.with(|r| *r.borrow_mut() = None);
+        assert!(parse_group_by("ID", &ambiguous, &columns, &descs, 100, 0, &mut Vec::new()).is_none());
+        assert!(matches!(
+            PREPARE_REFUSAL.with(|r| r.borrow_mut().take()),
+            Some(EvalErr::AmbiguousField { name, .. }) if name == "ID"
+        ));
     }
 
     #[test]
@@ -133572,6 +133832,32 @@ mod tests {
     /// Which of FIRST/SKIP-with-ROWS and an unknown FROM item the engine
     /// reports: a spec's FROM is resolved before its check, its WHERE and
     /// select list after (measured on 2182).
+    #[test]
+    fn window_frame_lint_judges_named_windows() {
+        // the bound rule and the parser's holes hold in a WINDOW clause
+        // as in an OVER (measured on 2182: the same vectors, the token
+        // error at the keyword's own column)
+        let over = "select id, sum(val) over (order by id rows between 1 following and current row) from w";
+        assert!(matches!(window_frame_lint(over), Some(EvalErr::WindowIncompatFrames("FOLLOWING", _))));
+        let named = "select id, sum(val) over win from w window win as (order by id rows between 1 following and current row)";
+        assert!(matches!(window_frame_lint(named), Some(EvalErr::WindowIncompatFrames("FOLLOWING", _))));
+        let second = "select id, sum(val) over w2 from w window w1 as (order by id), w2 as (order by id rows between current row and 1 preceding)";
+        assert!(matches!(window_frame_lint(second), Some(EvalErr::WindowIncompatFrames("CURRENT ROW", _))));
+        let token = "select id, sum(val) over win from w window win as (order by id rows between unbounded following and unbounded following)";
+        assert!(matches!(
+            window_frame_lint(token),
+            Some(EvalErr::TokenUnknown { line: 1, col: 87, token }) if token == "following"
+        ));
+        let legal = "select id, sum(val) over win from w window win as (order by id rows between 1 preceding and 1 following)";
+        assert!(window_frame_lint(legal).is_none());
+        // ...and inside DML, where a folded frame would modify rows
+        let dml = "delete from w where id in (select id from (select id, sum(val) over (order by id rows between unbounded following and unbounded following) s from w))";
+        assert!(matches!(
+            window_frame_lint(dml),
+            Some(EvalErr::TokenUnknown { line: 1, col: 105, token }) if token == "following"
+        ));
+    }
+
     #[test]
     fn limit_lint_unknown_relation_precedence() {
         let known = |n: &str, _: bool| !n.eq_ignore_ascii_case("nosuch");
