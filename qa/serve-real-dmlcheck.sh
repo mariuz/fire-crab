@@ -41,6 +41,23 @@
 #     not hold is "Table @1 not found", a view is "attempt to reference a
 #     view (@1) in a foreign key" - CREATE TABLE and ALTER TABLE ADD alike.
 #
+#   * THE SECOND ROUND (sections 8-14, each red on the first fix 41ebb1c):
+#     ALTER PROCEDURE / CREATE OR ALTER PROCEDURE keep the body's
+#     RDB$DEPENDENCIES rows (the re-create dropped them and never wrote
+#     them back, so the table it reads was silently droppable); a
+#     RECREATE TABLE whose CREATE the engine refuses fails AS A WHOLE and
+#     the old table and its rows stay; CREATE VIEW ... SELECT DISTINCT
+#     <columns> names its columns (the DISTINCT was read as part of the
+#     first item); an engine-built expression index (dependent type 6)
+#     and a computed column's domain go with THEIR OWN table only - a
+#     COMPUTED BY column of ANOTHER table reading this one counts
+#     (3 dependencies beside two CHECK triggers, 1 once they are gone);
+#     DROP PACKAGE takes the package's rows (types 18 / 19) with it;
+#     and the NAME is checked before the select list: CREATE VIEW of a
+#     held name is 42S01 "Table @1 already exists", ALTER VIEW of a
+#     non-view "View @1 not found", RECREATE VIEW over a table the
+#     missing-view -607 "View @1 does not exist" (42S02).
+#
 # CONTROLS from neighbouring fixes, green before this slice: ALTER TABLE
 # DROP of a column a view reads, ALTER TABLE ADD ... IDENTITY over rows.
 #
@@ -53,7 +70,15 @@
 # generically; a DROP VIEW dependency fires at EXECUTE here where the
 # engine defers it to COMMIT (the DROP TABLE convention); a refused
 # CREATE / ALTER draws no INTEG_n number here where the engine's failed
-# statement consumed one.
+# statement consumed one; FIRST n / SKIP n / ALL views and a DISTINCT
+# over an aliased literal refuse at prepare; a RECREATE TABLE whose FK
+# names a non-key column refuses generically (the table survives); the
+# engine leaves a renamed RDB$TEMP_DEPEND_* row after DROP INDEX of an
+# expression index, this server deletes the row; CREATE OR ALTER VIEW
+# does not plan; a refused RECREATE inside the user transaction (AUTODDL
+# OFF) leaves the engine bugchecking on the next read or write of the table
+# in that transaction (XX000 dpm.cpp "pointer page vanished" / "missing
+# pointer page", measured) where this server answers the row - not a cell.
 #
 # Usage: qa/serve-real-dmlcheck.sh [port]   (default 5710)
 set -u
@@ -98,10 +123,42 @@ CREATE VIEW VSELF AS SELECT A.ID FROM VS A JOIN VS B ON A.ID = B.ID;
 CREATE VIEW TSELF AS SELECT A.ID FROM T3 A JOIN T3 B ON A.ID = B.ID;
 CREATE VIEW VFREE AS SELECT ID FROM T1;
 CREATE VIEW VA1 AS SELECT ID, S FROM TA;
+CREATE TABLE DA (ID INTEGER PRIMARY KEY);
+CREATE TABLE DB (ID INTEGER PRIMARY KEY);
+CREATE TABLE DC (ID INTEGER PRIMARY KEY);
+CREATE VIEW VDC AS SELECT ID FROM DC;
+CREATE TABLE OLD1 (ID INTEGER);
+CREATE TABLE OLD2 (ID INTEGER);
+CREATE TABLE OLD3 (ID INTEGER);
+CREATE TABLE OLD4 (ID INTEGER);
+INSERT INTO OLD1 VALUES (1);
+INSERT INTO OLD2 VALUES (2);
+INSERT INTO OLD3 VALUES (3);
+INSERT INTO OLD4 VALUES (4);
+CREATE TABLE XT (ID INTEGER PRIMARY KEY, S VARCHAR(20));
+CREATE INDEX IX_XT ON XT COMPUTED BY (UPPER(S));
+CREATE TABLE XT2 (ID INTEGER PRIMARY KEY, S VARCHAR(20));
+CREATE INDEX IX_XT2 ON XT2 COMPUTED BY (UPPER(S));
+CREATE TABLE PKA (ID INTEGER PRIMARY KEY);
+CREATE TABLE PKB (ID INTEGER PRIMARY KEY);
+CREATE TABLE PKC (ID INTEGER PRIMARY KEY);
+CREATE VIEW VPKC AS SELECT ID FROM PKC;
+CREATE TABLE CA (ID INTEGER PRIMARY KEY);
+CREATE TABLE CB (ID INTEGER, CNT COMPUTED BY ((SELECT COUNT(*) FROM CA)));
+CREATE TABLE CC (ID INTEGER, CHECK (ID IN (SELECT ID FROM CA)));
 COMMIT;
 SET TERM ^;
 CREATE PROCEDURE PR RETURNS (S INTEGER) AS BEGIN SELECT SUM(ID) FROM VP INTO :S; SUSPEND; END^
 CREATE TRIGGER TRG_O FOR OTHER BEFORE INSERT AS DECLARE X INTEGER; BEGIN SELECT SUM(ID) FROM VP INTO X; END^
+CREATE PROCEDURE PDA RETURNS (X INTEGER) AS BEGIN SELECT COUNT(*) FROM DA INTO :X; SUSPEND; END^
+CREATE PROCEDURE PDB RETURNS (X INTEGER) AS BEGIN SELECT COUNT(*) FROM DB INTO :X; SUSPEND; END^
+CREATE PROCEDURE PVDC RETURNS (X INTEGER) AS BEGIN SELECT COUNT(*) FROM VDC INTO :X; SUSPEND; END^
+CREATE PACKAGE PK AS BEGIN PROCEDURE PP RETURNS (X INTEGER); FUNCTION FF RETURNS INTEGER; END^
+CREATE PACKAGE BODY PK AS BEGIN PROCEDURE PP RETURNS (X INTEGER) AS BEGIN SELECT COUNT(*) FROM PKA INTO X; SUSPEND; END FUNCTION FF RETURNS INTEGER AS DECLARE X INTEGER; BEGIN SELECT COUNT(*) FROM PKB INTO X; RETURN X; END END^
+CREATE PACKAGE PK2 AS BEGIN PROCEDURE PP RETURNS (X INTEGER); END^
+CREATE PACKAGE BODY PK2 AS BEGIN PROCEDURE PP RETURNS (X INTEGER) AS BEGIN SELECT COUNT(*) FROM VPKC INTO X; SUSPEND; END END^
+CREATE PACKAGE PK3 AS BEGIN PROCEDURE PP RETURNS (X INTEGER); END^
+CREATE PACKAGE BODY PK3 AS BEGIN PROCEDURE PP RETURNS (X INTEGER) AS BEGIN SELECT COUNT(*) FROM PKC INTO X; SUSPEND; END END^
 SET TERM ;^
 COMMIT;
 SQL
@@ -361,11 +418,102 @@ pin "7b ALTER TABLE ADD referencing a missing table" "ALTER TABLE PA ADD CONSTRA
 pin "7b a foreign key to a VIEW" "CREATE TABLE PV (A INTEGER REFERENCES V1(ID));" "$META|-CREATE TABLE \"PUBLIC\".\"PV\" failed|-attempt to reference a view (\"PUBLIC\".\"V1\") in a foreign key"
 refused "7b RECORDED ...through ALTER TABLE ADD <column> REFERENCES (the inline form)" "ALTER TABLE PA ADD B INTEGER REFERENCES V1(ID);" "$META|-ALTER TABLE \"PUBLIC\".\"PA\" failed|-attempt to reference a view (\"PUBLIC\".\"V1\") in a foreign key"
 pin "7b a GTT whose key column is not a key: the partner check comes first" "CREATE GLOBAL TEMPORARY TABLE GU (A INTEGER REFERENCES T2(ID), B INTEGER REFERENCES TP(ID));" "$(gttp GU 'global temporary table "PUBLIC"."GU" of type ON COMMIT DELETE ROWS cannot reference persistent table "PUBLIC"."T2"')"
-differs "7b RECORDED a refused statement draws no INTEG_n here (the engine's did)" "CREATE TABLE PN (A INTEGER, UNIQUE (A)); COMMIT; SELECT RDB\$CONSTRAINT_NAME FROM RDB\$RELATION_CONSTRAINTS WHERE RDB\$RELATION_NAME = 'PN';" "RDB\$CONSTRAINT_NAME|INTEG_37" "RDB\$CONSTRAINT_NAME|INTEG_25"
+differs "7b RECORDED a refused statement draws no INTEG_n here (the engine's did)" "CREATE TABLE PN (A INTEGER, UNIQUE (A)); COMMIT; SELECT RDB\$CONSTRAINT_NAME FROM RDB\$RELATION_CONSTRAINTS WHERE RDB\$RELATION_NAME = 'PN';" "RDB\$CONSTRAINT_NAME|INTEG_56" "RDB\$CONSTRAINT_NAME|INTEG_44"
+
+echo "--- 8. ALTER PROCEDURE / CREATE OR ALTER PROCEDURE KEEP THE BODY'S DEPENDENCY ROWS"
+DEPS='SELECT RDB$DEPENDENT_NAME, RDB$DEPENDED_ON_NAME FROM RDB$DEPENDENCIES WHERE RDB$DEPENDENT_NAME = '
+pin "8 ALTER PROCEDURE with the same body: the table is still held" "SET TERM ^; ALTER PROCEDURE PDA RETURNS (X INTEGER) AS BEGIN SELECT COUNT(*) FROM DA INTO :X; SUSPEND; END^ SET TERM ;^ COMMIT; DROP TABLE DA;" "$META$DEP""TABLE \"PUBLIC\".\"DA\"|-there are 1 dependencies"
+pin "8 ...the row is there" "$DEPS'PDA';" "RDB\$DEPENDENT_NAME RDB\$DEPENDED_ON_NAME|PDA DA"
+pin "8 CREATE OR ALTER PROCEDURE of an existing procedure" "SET TERM ^; CREATE OR ALTER PROCEDURE PDB RETURNS (X INTEGER) AS BEGIN SELECT COUNT(*) FROM DB INTO :X; SUSPEND; END^ SET TERM ;^ COMMIT; DROP TABLE DB;" "$META$DEP""TABLE \"PUBLIC\".\"DB\"|-there are 1 dependencies"
+pin "8 ...a procedure reading a VIEW" "SET TERM ^; CREATE OR ALTER PROCEDURE PVDC RETURNS (X INTEGER) AS BEGIN SELECT COUNT(*) FROM VDC INTO :X; SUSPEND; END^ SET TERM ;^ COMMIT; DROP VIEW VDC;" "$META$DEP""VIEW \"PUBLIC\".\"VDC\"|-there are 1 dependencies"
+pin "8 ALTER PROCEDURE to another table moves the rows" "SET TERM ^; ALTER PROCEDURE PDA RETURNS (X INTEGER) AS BEGIN SELECT COUNT(*) FROM DB INTO :X; SUSPEND; END^ SET TERM ;^ COMMIT; $DEPS'PDA'; DROP TABLE DB;" "RDB\$DEPENDENT_NAME RDB\$DEPENDED_ON_NAME|PDA DB|$META$DEP""TABLE \"PUBLIC\".\"DB\"|-there are 2 dependencies"
+pin "8 ...and the table it left drops" "DROP TABLE DA; COMMIT; SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME = 'DA';" "COUNT|0"
+pin "8 control: DROP PROCEDURE frees the table" "DROP PROCEDURE PDA; DROP PROCEDURE PDB; COMMIT; DROP TABLE DB; COMMIT; SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME = 'DB';" "COUNT|0"
+
+echo "--- 9. A RECREATE TABLE THE ENGINE REFUSES FAILS AS A WHOLE: THE OLD TABLE AND ITS ROWS STAY"
+rt() { echo "-RECREATE TABLE \"PUBLIC\".\"$1\" failed"; }
+pin "9 a FK to a missing table" "RECREATE TABLE OLD1 (A INTEGER REFERENCES NOSUCH(ID)); COMMIT; SELECT * FROM OLD1;" "$META|$(rt OLD1)|-Table \"PUBLIC\".\"NOSUCH\" not found|ID|1"
+pin "9 a FK to a view" "RECREATE TABLE OLD2 (A INTEGER REFERENCES V1(ID)); COMMIT; SELECT * FROM OLD2;" "$META|$(rt OLD2)|-attempt to reference a view (\"PUBLIC\".\"V1\") in a foreign key|ID|2"
+pin "9 a FK across the temporary line" "RECREATE TABLE OLD3 (A INTEGER REFERENCES GD(ID)); COMMIT; SELECT * FROM OLD3;" "Statement failed, SQLSTATE = HY000|unsuccessful metadata update|$(rt OLD3)|-persistent table \"PUBLIC\".\"OLD3\" cannot reference global temporary table \"PUBLIC\".\"GD\" of type ON COMMIT DELETE ROWS|ID|3"
+refused "9 RECORDED a FK to a non-key column refuses generically here" "RECREATE TABLE OLD4 (A INTEGER REFERENCES T1(ID));" "$META|$(rt OLD4)|-could not find UNIQUE or PRIMARY KEY constraint in table \"PUBLIC\".\"T1\" with specified columns"
+pin "9 ...but the table survives it" "SELECT * FROM OLD4;" "ID|4"
+pin "9 the same in one transaction, then ROLLBACK" "RECREATE TABLE OLD3 (A INTEGER REFERENCES GD(ID)); ROLLBACK; SELECT * FROM OLD3;" "Statement failed, SQLSTATE = HY000|unsuccessful metadata update|$(rt OLD3)|-persistent table \"PUBLIC\".\"OLD3\" cannot reference global temporary table \"PUBLIC\".\"GD\" of type ON COMMIT DELETE ROWS|ID|3"
+ppin "9 phase: EXECUTE" "RECREATE TABLE OLD3 (A INTEGER REFERENCES GD(ID))" 'PREPARED|EXECUTE ERR: |unsuccessful metadata update |RECREATE TABLE "PUBLIC"."OLD3" failed |persistent table "PUBLIC"."OLD3" cannot reference global temporary table "PUBLIC"."GD" of type ON COMMIT DELETE ROWS'
+# the refusal inside the USER transaction (AUTODDL OFF): the table and
+# its row are there after the COMMIT or the ROLLBACK; touching it in the
+# SAME transaction bugchecks the engine (XX000 dpm.cpp, measured - not a
+# cell), this server answers the row
+pin "9 the refusal in the user transaction (AUTODDL OFF), then COMMIT" "SET AUTODDL OFF; RECREATE TABLE OLD3 (A INTEGER REFERENCES GD(ID)); COMMIT; SELECT * FROM OLD3;" "Statement failed, SQLSTATE = HY000|unsuccessful metadata update|$(rt OLD3)|-persistent table \"PUBLIC\".\"OLD3\" cannot reference global temporary table \"PUBLIC\".\"GD\" of type ON COMMIT DELETE ROWS|ID|3"
+pin "9 ...then ROLLBACK" "SET AUTODDL OFF; RECREATE TABLE OLD3 (A INTEGER REFERENCES GD(ID)); ROLLBACK; SELECT * FROM OLD3;" "Statement failed, SQLSTATE = HY000|unsuccessful metadata update|$(rt OLD3)|-persistent table \"PUBLIC\".\"OLD3\" cannot reference global temporary table \"PUBLIC\".\"GD\" of type ON COMMIT DELETE ROWS|ID|3"
+pin "9 the survivor takes an INSERT" "RECREATE TABLE OLD3 (A INTEGER REFERENCES GD(ID)); INSERT INTO OLD3 VALUES (34); COMMIT; SELECT * FROM OLD3 ORDER BY 1;" "Statement failed, SQLSTATE = HY000|unsuccessful metadata update|$(rt OLD3)|-persistent table \"PUBLIC\".\"OLD3\" cannot reference global temporary table \"PUBLIC\".\"GD\" of type ON COMMIT DELETE ROWS|ID|3|34"
+pin "9 ...and in the transaction after a refusal in the user transaction" "SET AUTODDL OFF; RECREATE TABLE OLD3 (A INTEGER REFERENCES GD(ID)); COMMIT; INSERT INTO OLD3 VALUES (35); COMMIT; SELECT * FROM OLD3 ORDER BY 1;" "Statement failed, SQLSTATE = HY000|unsuccessful metadata update|$(rt OLD3)|-persistent table \"PUBLIC\".\"OLD3\" cannot reference global temporary table \"PUBLIC\".\"GD\" of type ON COMMIT DELETE ROWS|ID|3|34|35"
+pin "9 control: a RECREATE that lands replaces the rows" "RECREATE TABLE OLD1 (A INTEGER REFERENCES TP(ID)); COMMIT; SELECT COUNT(*) FROM OLD1; SELECT RDB\$FIELD_NAME FROM RDB\$RELATION_FIELDS WHERE RDB\$RELATION_NAME = 'OLD1';" "COUNT|0|RDB\$FIELD_NAME|A"
+pin "9 the refused ones kept their columns" "SELECT RDB\$RELATION_NAME, RDB\$FIELD_NAME FROM RDB\$RELATION_FIELDS WHERE RDB\$RELATION_NAME IN ('OLD2', 'OLD3', 'OLD4') ORDER BY 1;" "RDB\$RELATION_NAME RDB\$FIELD_NAME|OLD2 ID|OLD3 ID|OLD4 ID"
+
+echo "--- 10. CREATE VIEW ... SELECT DISTINCT <columns> NAMES ITS COLUMNS"
+pin "10 DISTINCT over two columns" "CREATE VIEW VD1 AS SELECT DISTINCT ID, S FROM T1; COMMIT; $VF'VD1' ORDER BY RDB\$FIELD_POSITION;" "RDB\$FIELD_NAME|ID|S"
+pin "10 DISTINCT over one" "CREATE VIEW VD2 AS SELECT DISTINCT ID FROM T1; COMMIT; $VF'VD2';" "RDB\$FIELD_NAME|ID"
+pin "10 DISTINCT over a literal is still unnamed" "CREATE VIEW VD3 AS SELECT DISTINCT 1 FROM T1;" "$(cv VD3)"
+pin "10 DISTINCT over an expression" "CREATE VIEW VD4 AS SELECT DISTINCT ID + 1 FROM T1;" "$(cv VD4)"
+pin "10 FIRST 1 over a literal" "CREATE VIEW VD5 AS SELECT FIRST 1 1 FROM T1;" "$(cv VD5)"
+pin "10 a column list over DISTINCT" "CREATE VIEW VD6 (A) AS SELECT DISTINCT ID FROM T1; COMMIT; $VF'VD6';" "RDB\$FIELD_NAME|A"
+pin "10 ...of the wrong length" "CREATE VIEW VD6B (A, B) AS SELECT DISTINCT ID FROM T1;" "Statement failed, SQLSTATE = 07002|unsuccessful metadata update|-CREATE VIEW \"PUBLIC\".\"VD6B\" failed|-SQL error code = -607|-Invalid command|-number of columns does not match select list"
+pin "10 the DISTINCT view answers" "INSERT INTO T1 (ID, S) VALUES (1, 'a'); INSERT INTO T1 (ID, S) VALUES (1, 'a'); SELECT * FROM VD1; ROLLBACK;" "ID S|1 a"
+refused "10 RECORDED FIRST n refuses at prepare here" "CREATE VIEW VD7 AS SELECT FIRST 1 ID FROM T1 ORDER BY ID; COMMIT; $VF'VD7';" "RDB\$FIELD_NAME|ID"
+refused "10 RECORDED SKIP n" "CREATE VIEW VD8 AS SELECT SKIP 1 ID FROM T1 ORDER BY ID; COMMIT; $VF'VD8';" "RDB\$FIELD_NAME|ID"
+refused "10 RECORDED SELECT ALL" "CREATE VIEW VD9 AS SELECT ALL ID FROM T1; COMMIT; $VF'VD9';" "RDB\$FIELD_NAME|ID"
+refused "10 RECORDED DISTINCT over an aliased literal" "CREATE VIEW VD10 AS SELECT DISTINCT 1 AS C FROM T1; COMMIT; $VF'VD10';" "RDB\$FIELD_NAME|C"
+
+echo "--- 11. AN EXPRESSION INDEX GOES WITH ITS TABLE (DEPENDENT TYPE 6)"
+pin "11 the engine's rows (a control)" "SELECT RDB\$DEPENDENT_NAME, RDB\$DEPENDENT_TYPE FROM RDB\$DEPENDENCIES WHERE RDB\$DEPENDED_ON_NAME IN ('XT', 'XT2') ORDER BY 1;" "RDB\$DEPENDENT_NAME RDB\$DEPENDENT_TYPE|IX_XT 6|IX_XT2 6"
+pin "11 DROP TABLE under its own expression index" "DROP TABLE XT; COMMIT; SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME = 'XT'; SELECT COUNT(*) FROM RDB\$DEPENDENCIES WHERE RDB\$DEPENDENT_NAME = 'IX_XT';" "COUNT|0|COUNT|0"
+pin "11 DROP INDEX takes the index's row" "DROP INDEX IX_XT2; COMMIT; SELECT COUNT(*) FROM RDB\$DEPENDENCIES WHERE RDB\$DEPENDENT_NAME = 'IX_XT2';" "COUNT|0"
+differs "11 RECORDED the engine leaves a renamed RDB\$TEMP_DEPEND row behind" "SELECT COUNT(*) FROM RDB\$DEPENDENCIES WHERE RDB\$DEPENDED_ON_NAME = 'XT2';" "COUNT|1" "COUNT|0"
+pin "11 ...and the table drops after it" "DROP TABLE XT2; COMMIT; SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME = 'XT2';" "COUNT|0"
+
+echo "--- 12. DROP PACKAGE TAKES THE PACKAGE'S DEPENDENCY ROWS WITH IT"
+pin "12 the engine's rows (a control): the body's reads under the package's name" "SELECT RDB\$DEPENDENT_NAME, RDB\$DEPENDENT_TYPE, RDB\$DEPENDED_ON_NAME FROM RDB\$DEPENDENCIES WHERE RDB\$DEPENDED_ON_NAME IN ('PKA', 'PKB') ORDER BY 3;" "RDB\$DEPENDENT_NAME RDB\$DEPENDENT_TYPE RDB\$DEPENDED_ON_NAME|PK 19 PKA|PK 19 PKB"
+pin "12 control: the package holds its tables" "DROP TABLE PKA;" "$META$DEP""TABLE \"PUBLIC\".\"PKA\"|-there are 1 dependencies"
+pin "12 DROP PACKAGE: the rows go" "DROP PACKAGE PK; COMMIT; SELECT COUNT(*) FROM RDB\$DEPENDENCIES WHERE RDB\$DEPENDENT_NAME = 'PK';" "COUNT|0"
+pin "12 ...and the tables drop" "DROP TABLE PKA; DROP TABLE PKB; COMMIT; SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME IN ('PKA', 'PKB');" "COUNT|0"
+pin "12 control: a body reading a view holds it" "DROP VIEW VPKC;" "$META$DEP""VIEW \"PUBLIC\".\"VPKC\"|-there are 1 dependencies"
+pin "12 ...until its package is dropped" "DROP PACKAGE PK2; COMMIT; DROP VIEW VPKC; COMMIT; SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME = 'VPKC';" "COUNT|0"
+pin "12 control: a package still there holds its table" "DROP TABLE PKC;" "$META$DEP""TABLE \"PUBLIC\".\"PKC\"|-there are 1 dependencies"
+
+echo "--- 13. THE NAME IS CHECKED BEFORE THE SELECT LIST"
+pin "13 CREATE VIEW of a held name: already exists" "CREATE VIEW V1 AS SELECT 1 FROM T1;" "Statement failed, SQLSTATE = 42S01|unsuccessful metadata update|-CREATE VIEW \"PUBLIC\".\"V1\" failed|-Table \"PUBLIC\".\"V1\" already exists"
+pin "13 ...with a wrong-length list too" "CREATE VIEW V1 (A, B, C) AS SELECT ID FROM T1;" "Statement failed, SQLSTATE = 42S01|unsuccessful metadata update|-CREATE VIEW \"PUBLIC\".\"V1\" failed|-Table \"PUBLIC\".\"V1\" already exists"
+pin "13 ...a TABLE's name" "CREATE VIEW T2 AS SELECT 1 FROM T1;" "Statement failed, SQLSTATE = 42S01|unsuccessful metadata update|-CREATE VIEW \"PUBLIC\".\"T2\" failed|-Table \"PUBLIC\".\"T2\" already exists"
+pin "13 ALTER VIEW of a missing name: not found first" "ALTER VIEW NOSUCH AS SELECT 1 FROM T1;" "$META|-ALTER VIEW \"PUBLIC\".\"NOSUCH\" failed|-View \"PUBLIC\".\"NOSUCH\" not found"
+pin "13 ALTER VIEW over a table" "ALTER VIEW T2 AS SELECT 1 FROM T1;" "$META|-ALTER VIEW \"PUBLIC\".\"T2\" failed|-View \"PUBLIC\".\"T2\" not found"
+RVNO='Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-RECREATE VIEW "PUBLIC"."T2" failed|-SQL error code = -607|-Invalid command|-View "PUBLIC"."T2" does not exist'
+pin "13 RECREATE VIEW over a table: the missing-view -607" "RECREATE VIEW T2 AS SELECT 1 FROM T1;" "$RVNO"
+pin "13 ...with a proper select list, and the table stays" "RECREATE VIEW T2 AS SELECT ID FROM T1; COMMIT; SELECT COUNT(*) FROM T2;" "$RVNO|COUNT|0"
+pin "13 control: RECREATE VIEW of a missing name checks its list" "RECREATE VIEW NOSUCH AS SELECT 1 FROM T1;" "$META|-RECREATE VIEW \"PUBLIC\".\"NOSUCH\" failed|-SQL error code = -607|-Invalid command|-must specify column name for view select expression"
+refused "13 RECORDED CREATE OR ALTER VIEW does not plan here" "CREATE OR ALTER VIEW V1 AS SELECT 1 FROM T1;" "$META|-CREATE OR ALTER VIEW \"PUBLIC\".\"V1\" failed|-SQL error code = -607|-Invalid command|-must specify column name for view select expression"
+pin "13 V1 and T2 are what they were" "SELECT RDB\$RELATION_NAME, RDB\$FIELD_NAME FROM RDB\$RELATION_FIELDS WHERE RDB\$RELATION_NAME IN ('V1', 'T2') ORDER BY 1, 2;" "RDB\$RELATION_NAME RDB\$FIELD_NAME|T2 ID|V1 ID|V1 N|V1 S"
+
+echo "--- 14. A COMPUTED COLUMN OF ANOTHER TABLE COUNTS; THE TABLE'S OWN DOMAINS DO NOT"
+pin "14 two CHECK triggers and another table's computed column: 3" "DROP TABLE CA;" "$META$DEP""TABLE \"PUBLIC\".\"CA\"|-there are 3 dependencies"
+pin "14 the CHECK's table gone: the computed column still holds" "DROP TABLE CC; COMMIT; DROP TABLE CA;" "$META$DEP""TABLE \"PUBLIC\".\"CA\"|-there are 1 dependencies"
+pin "14 the computed column's table gone: CA drops" "DROP TABLE CB; COMMIT; DROP TABLE CA; COMMIT; SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME IN ('CA', 'CB', 'CC');" "COUNT|0"
+
+echo "--- 15. THE FILE AFTER ALL OF IT"
+# a put-back image is a whole image: gfix validates fc's file, and the
+# ENGINE reads the tables the refused RECREATEs left
+gf=$(gfix -v -full -user "$U" -pas "$P" "$FC" 2>&1)
+ran=$((ran + 1))
+if [ -z "$gf" ]; then echo "OK   15 gfix -v -full clean on fc's file"; else echo "FAIL 15 gfix: $gf"; fail=1; fi
+ran=$((ran + 1))
+FILEQ="SELECT * FROM OLD3 ORDER BY 1; SELECT COUNT(*) FROM OLD1; SELECT RDB\$RELATION_NAME, RDB\$FIELD_NAME FROM RDB\$RELATION_FIELDS WHERE RDB\$RELATION_NAME IN ('OLD1', 'OLD2', 'OLD3', 'OLD4') ORDER BY 1, 2;"
+ev=$(sess "127.0.0.1/$REAL:$ENG" "$FILEQ"); fv=$(sess "127.0.0.1/$REAL:$FC" "$FILEQ")
+if [ "$ev" != "ID|3|34|35|COUNT|0|RDB\$RELATION_NAME RDB\$FIELD_NAME|OLD1 A|OLD2 ID|OLD3 ID|OLD4 ID" ]; then echo "FAIL 15 - THE ENGINE ANSWERS [$ev] on its own file"; fail=1
+elif [ "$ev" != "$fv" ]; then echo "FAIL 15 the ENGINE reads fc's file differently"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
+else echo "OK   15 the ENGINE reads fc's file: the refused RECREATEs' tables and rows [$ev]"; fi
 
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-dmlcheck-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 else echo "OK   no panic"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 116 ]; then echo "FAIL only $ran checks ran (floor 116)"; fail=1; fi
+if [ "$ran" -lt 175 ]; then echo "FAIL only $ran checks ran (floor 175)"; fail=1; fi
 exit $fail

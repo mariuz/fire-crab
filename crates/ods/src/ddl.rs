@@ -6564,6 +6564,17 @@ pub fn drop_index(file: &mut crate::Image, page_size: usize, index_name: &str) -
         return Err("system relations are read-only".into());
     }
     deferred_drop_index(file, page_size, rel, &want)?;
+    // an expression index's own RDB$DEPENDENCIES rows (dependent type 6,
+    // engine-built) go with it, or they keep counting against the table
+    // (measured: DROP INDEX, then DROP TABLE passes on 2182 - the engine
+    // leaves a renamed RDB$TEMP_DEPEND_* row behind, which this server
+    // does not imitate)
+    {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let w = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| text_is(v.get(dn_f), &w) && int_eq(v.get(dt_f), 6))?;
+    }
     advance_oldest_transactions(file, page_size)?;
     Ok(())
 }
@@ -7340,8 +7351,13 @@ pub fn relation_type_of(file: &crate::Image, page_size: usize, name: &str) -> Op
 ///      by a procedure and a trigger ("there are 2 dependencies"),
 ///      `TABLE @1` for a table. Dependents that go with the relation
 ///      are not counted (the engine's `find_depend_in_dfw`): its own
-///      triggers, and its own computed / validation domains (types 3
-///      and 4).
+///      triggers, its own computed / validation domains (types 3 and
+///      4 whose domain is a RDB$FIELD_SOURCE of the relation - ANOTHER
+///      table's computed column reading it counts: `B.CNT COMPUTED BY
+///      ((SELECT COUNT(*) FROM A))` beside C's two CHECK triggers is
+///      "there are 3 dependencies", and 1 once C is gone), and its own
+///      expression indices (type 6, engine-built: an index COMPUTED BY
+///      over the table drops with it).
 ///
 /// `Some((kind, count))` when something blocks, kind being "TABLE" or
 /// "VIEW" as the message spells it.
@@ -7368,6 +7384,7 @@ fn relation_dependents(file: &crate::Image, page_size: usize, name: &str, is_vie
     }
     // 2. the recorded dependents of the relation's own kind
     let own_triggers = triggers_of_relation(file, page_size, name);
+    let own_domains = relation_field_sources(file, page_size, name);
     let drel = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES")?;
     let dfmts = system_relation_formats(file, page_size, "RDB$DEPENDENCIES")?;
     let (_, ddescs) = dfmts.iter().max_by_key(|(n, _)| *n)?;
@@ -7389,7 +7406,8 @@ fn relation_dependents(file: &crate::Image, page_size: usize, name: &str, is_vie
         let dn = t.trim_end().to_string();
         let goes_with_it = match *dt {
             2 => own_triggers.iter().any(|x| *x == dn),
-            3 | 4 => true,
+            3 | 4 => own_domains.iter().any(|x| *x == dn),
+            6 => find_index_relation(file, page_size, &dn).is_some_and(|(t, _)| t == name),
             _ => false,
         };
         if !goes_with_it && !seen.iter().any(|(n, k)| *n == dn && *k == *dt) {
@@ -7401,6 +7419,26 @@ fn relation_dependents(file: &crate::Image, page_size: usize, name: &str, is_vie
     } else {
         Some((if is_view { "VIEW" } else { "TABLE" }, seen.len()))
     }
+}
+
+/// The RDB$FIELD_SOURCE domains of a relation's columns - the auto
+/// domains its computed columns live in, and any named domain a column
+/// was declared with.
+fn relation_field_sources(file: &crate::Image, page_size: usize, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(fmts) = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS") else { return out };
+    let Some((_, descs)) = fmts.iter().max_by_key(|(n, _)| *n) else { return out };
+    let cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(rn_f), Some(src_f)) = (fid("RDB$RELATION_NAME"), fid("RDB$FIELD_SOURCE")) else { return out };
+    walk_rows(file, page_size, 5, descs, |v| {
+        if text_is(v.get(rn_f), name) {
+            if let Some(Value::Text(t)) = v.get(src_f) {
+                out.push(t.trim_end().to_string());
+            }
+        }
+    });
+    out
 }
 
 /// The names of a relation's own triggers (its RDB$TRIGGERS rows).
@@ -9243,6 +9281,21 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         let fid = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
         delete_catalog_rows(file, page_size, "RDB$FIELDS",
             idx_pred(domain_names.clone(), fid))?;
+    }
+    // ...and what those domains and the table's expression indices
+    // recorded in RDB$DEPENDENCIES (a computed column reading ANOTHER
+    // table, type 3; an engine-built COMPUTED BY index, type 6): left
+    // behind they keep that other table undroppable (measured: DROP
+    // TABLE B whose CNT reads A, then DROP TABLE A passes on 2182)
+    {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let domains = domain_names.clone();
+        let indices = index_names.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            (int_eq(v.get(dt_f), 3) && domains.iter().any(|d| text_is(v.get(dn_f), d)))
+                || (int_eq(v.get(dt_f), 6) && indices.iter().any(|i| text_is(v.get(dn_f), i)))
+        })?;
     }
     {
         let fid = sys_fid(file, page_size, "RDB$FORMATS", "RDB$RELATION_ID")?;
@@ -14330,6 +14383,20 @@ pub fn drop_package(file: &mut crate::Image, page_size: usize, name: &str) -> Re
         let nf = sys_fid(file, page_size, "RDB$PACKAGES", "RDB$PACKAGE_NAME")?;
         let w = want.clone();
         delete_catalog_rows(file, page_size, "RDB$PACKAGES", move |v| text_eq(v.get(nf), &w))?;
+    }
+    // the package's OWN dependency rows go with it - the engine records
+    // a body's reads under the PACKAGE's name (RDB$DEPENDENT_NAME = the
+    // package, type 18 the header, 19 the body, RDB$PACKAGE_NAME NULL;
+    // measured) and deletes them at DROP PACKAGE: left behind, the
+    // table the body read stays undroppable ("there are 1 dependencies"
+    // where the engine drops it)
+    {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let w = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            text_eq(v.get(dn_f), &w) && (int_eq(v.get(dt_f), 18) || int_eq(v.get(dt_f), 19))
+        })?;
     }
     advance_oldest_transactions(file, page_size)
 }

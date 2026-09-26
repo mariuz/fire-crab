@@ -1914,6 +1914,8 @@ fn ddl_dup_codes(plan: &Plan) -> Option<(i32, i32, String)> {
         Plan::CreateTable { name, .. } => Some((336397286, 336068740, qc(name))),
         Plan::CreateException { name, .. } => Some((336397280, 336068861, q(name))),
         Plan::CreateView { name, .. } => Some((336397298, 336068740, qc(name))), // CREATE VIEW @1 failed / Table @1 already exists
+        // ...the name check comes before the select-list one (measured)
+        Plan::CreateViewRefused { name, verb: 336397298, .. } => Some((336397298, 336068740, qc(name))),
         Plan::CreateFunction { name, .. } => Some((336397260, 336068876, q(name))), // CREATE FUNCTION @1 failed / Function @1 already exists
         Plan::CreateSequence { name, .. } => Some((336397285, 336068862, q(name))),
         Plan::CreateProcedure { name, .. } => Some((336397265, 336068743, q(name))),
@@ -1956,7 +1958,7 @@ fn respond_ddl_meta(
     // -607 / Invalid command / <reason>" - the reason isc_specify_field_err
     // (42000) or isc_num_field_err (07002), measured on 2182.
     if let Plan::CreateViewRefused { .. } = plan {
-        if let Some((verb, qn)) = verb_of(plan) {
+        if let Some((verb, qn)) = verb_of(plan).filter(|_| lc.contains("column name") || lc.contains("number of columns")) {
             let reason = if lc.contains("number of columns") { 335544599 } else { 335544598 };
             let mut w = W::default();
             w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
@@ -2408,11 +2410,12 @@ fn respond_ddl_meta(
             return Ok(true);
         }
     }
-    if lc.contains("not found") {
-        if let Plan::AlterView { name, .. } = plan {
+    if lc.contains("not found") || lc.contains("does not exist") {
+        if let Plan::AlterView { name, .. } | Plan::CreateViewRefused { name, verb: 336397299, .. } = plan {
             // ALTER VIEW of a missing name: "unsuccessful metadata update /
             // ALTER VIEW @1 failed / view @1 not found" (probed - no nested
-            // -607, three items).
+            // -607, three items). The name is checked before the select
+            // list, so the refused plan lands here too (measured).
             // the CANONICAL name, printed as stored: `ALTER VIEW "nope"`
             // is `"PUBLIC"."nope"` on the engine, not `"PUBLIC"."NOPE"`
             // (a bare `Nope` folded to NOPE back at the parse boundary,
@@ -2429,14 +2432,26 @@ fn respond_ddl_meta(
             w.send(s, enc)?;
             return Ok(true);
         }
-        if let Plan::DropView { name } = plan {
-            // DROP VIEW of a missing name (or of a TABLE - probed): the
-            // same nested -607 as DROP TABLE, with the view verbs
+        // DROP VIEW of a missing name (or of a TABLE - probed): the
+        // same nested -607 as DROP TABLE, with the view verbs; RECREATE
+        // VIEW over a table is the same item under its own verb
+        // (measured: "RECREATE VIEW @1 failed / ... / View @1 does not
+        // exist", the table untouched)
+        let view_gone = match plan {
+            Plan::DropView { name } => Some((336397302, name)),
+            Plan::Recreate(inner) if lc.contains("does not exist") => match inner.as_ref() {
+                Plan::CreateView { name, .. } => Some((336397301, name)),
+                _ => None,
+            },
+            Plan::CreateViewRefused { name, verb: 336397301, .. } if lc.contains("does not exist") => Some((336397301, name)),
+            _ => None,
+        };
+        if let Some((verb, name)) = view_gone {
             let qn = format!("\"PUBLIC\".\"{}\"", name.trim_end()); // canonical, as stored
             let mut w = W::default();
             w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
             w.int(1).int(GDS_NO_META_UPDATE)
-                .int(1).int(336397302) // isc_dsql_drop_view_failed
+                .int(1).int(verb) // isc_dsql_drop_view_failed / isc_dsql_recreate_view_failed
                 .int(2).bytes(qn.as_bytes())
                 .int(1).int(335544436).int(4).int(-607)
                 .int(1).int(335544570)
@@ -28514,7 +28529,10 @@ fn plan_create_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descr
         None => {
             let head = split_union(select).and_then(|(b, _)| b.first().cloned()).unwrap_or_else(|| select.to_string());
             if let Some((proj, ..)) = split_query(&head) {
-                for item in split_top_level_commas(proj) {
+                // `FIRST n`, `SKIP n`, `DISTINCT` and `ALL` are not the
+                // first item (measured: `SELECT DISTINCT ID, S` names
+                // both; `SELECT DISTINCT 1` and `SELECT FIRST 1 1` do not)
+                for item in split_top_level_commas(strip_select_modifiers(proj)) {
                     if !view_item_names_its_column(item) {
                         return refused("must specify column name for view select expression");
                     }
@@ -28600,6 +28618,49 @@ fn plan_create_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descr
         return None;
     };
     Some((Plan::CreateView { name, blr, source: select.to_string(), fields, contexts }, Vec::new()))
+}
+
+/// A projection without its leading result modifiers - `FIRST <n>`,
+/// `SKIP <n>` (a literal, a `?`, a `:name`, or a parenthesised
+/// expression) in either order, then `DISTINCT` or `ALL`.
+fn strip_select_modifiers(proj: &str) -> &str {
+    let mut rest = proj.trim_start();
+    let word_at = |s: &str, w: &str| {
+        s.len() >= w.len()
+            && s[..w.len()].eq_ignore_ascii_case(w)
+            && s[w.len()..].chars().next().is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '$'))
+    };
+    loop {
+        let kw = if word_at(rest, "FIRST") { "FIRST" } else if word_at(rest, "SKIP") { "SKIP" } else { break };
+        let after = rest[kw.len()..].trim_start();
+        let arg_end = if after.starts_with('(') {
+            let mut depth = 0i32;
+            let mut end = after.len();
+            for (i, c) in after.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            end
+        } else {
+            after.find(|c: char| c.is_whitespace()).unwrap_or(after.len())
+        };
+        rest = after[arg_end..].trim_start();
+    }
+    if word_at(rest, "DISTINCT") {
+        rest = rest["DISTINCT".len()..].trim_start();
+    } else if word_at(rest, "ALL") {
+        rest = rest["ALL".len()..].trim_start();
+    }
+    rest
 }
 
 /// Does a view's select item name its column without a column list -
@@ -37394,6 +37455,42 @@ fn execute_dml_collecting_inner(
         return execute_dml_collecting(inner, database, args, ctx, affected);
     }
     if let Plan::Recreate(inner) = plan {
+        // RECREATE VIEW over a TABLE is the missing-view -607 "View @1
+        // does not exist" (42S02) under the RECREATE verb, and the table
+        // stays (measured) - the mirror of DROP TABLE over a view
+        if let Plan::CreateView { name, .. } = inner.as_ref() {
+            if let Some(db) = database.as_ref() {
+                if fire_crab_ods::ddl::relation_type_of(&db.bytes(), db.page_size, name).is_some_and(|t| t != 1) {
+                    return Err(ExecErr::Text(format!("View {} does not exist", name.trim_end())));
+                }
+            }
+        }
+        // THE STATEMENT FAILS AS A WHOLE: the engine's RECREATE is one
+        // request, so a CREATE it refuses (a foreign key to a missing
+        // table or a view, one across the temporary line, a duplicate
+        // column) leaves the OLD object and its rows in place (measured:
+        // `RECREATE TABLE OLD3 (A INTEGER REFERENCES GD(ID))` refuses and
+        // OLD3 still answers its row). The drop below publishes its own
+        // image, so the image before it is kept and put back if the
+        // create fails - with the DDL residue and deferred work the
+        // drop appended (the relation's storage release at commit, on the
+        // window or on the attachment). THE TRANSACTION'S ID IS DRAWN
+        // FIRST, so the image kept already carries it: a RECREATE that is
+        // the transaction's first write would otherwise put back a header
+        // from before the id was handed out, and the writes after it in
+        // the same transaction would carry a number the file could hand
+        // out again.
+        if let Some(db) = database.as_mut() {
+            if db.write_tx().is_none() {
+                let (w, tx) = db.work_copy_with_tx()?;
+                db.install_dirty(w);
+                db.adopt_tx(tx);
+            }
+        }
+        let before = database.as_ref().map(|d| d.bytes());
+        let marks = database
+            .as_ref()
+            .map(|d| (d.ddl_deferred.len(), d.windows.last().map(|w| (w.residue.len(), w.deferred.len()))));
         // Drop the existing object of the CREATE's kind first, swallowing a
         // "not found" (RECREATE of a name that does not exist is a plain
         // CREATE); a drop blocked another way (a dependency) propagates.
@@ -37408,7 +37505,21 @@ fn execute_dml_collecting_inner(
                 Err(e) => return Err(e),
             }
         }
-        return execute_dml_collecting(inner, database, args, ctx, affected);
+        let created = execute_dml_collecting(inner, database, args, ctx, affected);
+        if created.is_err() {
+            if let (Some(img), Some(db)) = (before, database.as_mut()) {
+                db.shared.publish_image(img);
+                if let Some((a, win)) = marks {
+                    db.ddl_deferred.truncate(a);
+                    if let (Some((r, d)), Some(w)) = (win, db.windows.last_mut()) {
+                        w.residue.truncate(r);
+                        w.deferred.truncate(d);
+                    }
+                }
+                db.invalidate_meta();
+            }
+        }
+        return created;
     }
     // the upsert recurses BEFORE the working copy is taken: each half
     // commits through the ordinary path, and the row count of the
@@ -37682,8 +37793,22 @@ fn execute_dml_collecting_inner(
             fire_crab_ods::ddl::drop_view(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
-        // the engine's execute-phase refusal, nothing written
-        Plan::CreateViewRefused { reason, .. } => return Err(ExecErr::Text(reason.clone())),
+        // the engine's execute-phase refusal, nothing written - and the
+        // NAME is checked before the select list is (measured): CREATE
+        // VIEW of a name the catalog holds is "Table @1 already exists"
+        // (42S01), ALTER VIEW of a name that is not a view is "View @1
+        // not found", RECREATE VIEW over a table "View @1 does not exist"
+        Plan::CreateViewRefused { name, reason, verb } => {
+            let kind = fire_crab_ods::ddl::relation_type_of(&work, db.page_size, name);
+            let qn = name.trim_end();
+            match *verb {
+                336397298 if kind.is_some() => return Err(format!("Table {} already exists", qn).into()),
+                336397299 if kind != Some(1) => return Err(format!("View {} not found", qn).into()),
+                336397301 if kind.is_some_and(|t| t != 1) => return Err(format!("View {} does not exist", qn).into()),
+                _ => {}
+            }
+            return Err(ExecErr::Text(reason.clone()));
+        }
         Plan::CreateFunction { name, args, deterministic, source, blr } => {
             fire_crab_ods::ddl::restore_carried_function(&mut work, db.page_size, name, args, 0, *deterministic, source, blr, None, None, None, false, None)?;
             (0, 0, 0)
@@ -38036,6 +38161,11 @@ fn execute_dml_collecting_inner(
             }
             fire_crab_ods::ddl::drop_procedure(&mut work, db.page_size, name)?;
             fire_crab_ods::ddl::create_procedure_with_id(&mut work, db.page_size, name, ins, outs, *selectable, source, blr, None, Some(id), false)?;
+            // the drop took the old body's dependency rows with it; the
+            // new body records its own, as the engine's ALTER does
+            // (measured: after ALTER PROCEDURE PA with the same body,
+            // DROP TABLE A is still "there are 1 dependencies")
+            fire_crab_ods::ddl::store_dependencies_deferred(&mut work, db.page_size, 5, name)?;
             (0, 0, 0)
         }
         Plan::CreateOrAlterProcedure { name, ins, outs, selectable, source, blr } => {
@@ -38046,6 +38176,7 @@ fn execute_dml_collecting_inner(
                 }
                 None => fire_crab_ods::ddl::create_procedure(&mut work, db.page_size, name, ins, outs, *selectable, source, blr, None)?,
             }
+            fire_crab_ods::ddl::store_dependencies_deferred(&mut work, db.page_size, 5, name)?;
             (0, 0, 0)
         }
         Plan::AlterFunction { name, args, deterministic, source, blr } => {
@@ -126220,6 +126351,21 @@ mod tests {
             Tok::FnExpr(RawExpr::Func(SysFn::Upper, args))
                 if matches!(args[0], RawExpr::Func(SysFn::Left, _))
         ));
+    }
+
+    #[test]
+    fn view_items_are_judged_without_the_result_modifiers() {
+        // `SELECT DISTINCT ID, S` names both columns - the DISTINCT (and
+        // FIRST n / SKIP n / ALL before it) is not part of the first item
+        assert_eq!(strip_select_modifiers("DISTINCT ID, S"), "ID, S");
+        assert_eq!(strip_select_modifiers("FIRST 1 SKIP 1 ID, N"), "ID, N");
+        assert_eq!(strip_select_modifiers("SKIP (1 + 1) DISTINCT ID"), "ID");
+        assert_eq!(strip_select_modifiers("first ? all id"), "id");
+        assert_eq!(strip_select_modifiers("DISTINCTX, ID"), "DISTINCTX, ID");
+        assert_eq!(strip_select_modifiers("ID, S"), "ID, S");
+        assert!(view_item_names_its_column("ID"));
+        assert!(!view_item_names_its_column("DISTINCT ID"));
+        assert!(!view_item_names_its_column("1"));
     }
 
     #[test]
