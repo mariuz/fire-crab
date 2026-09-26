@@ -17702,7 +17702,7 @@ fn fire_ddl_triggers(
             })?;
             let mut frame = PsqlFrame {
  stop_after: None,
-            types: Vec::new(),
+            types: trig_slot_types(&d.source),
                 vars: vec![Value::Null; names.len()],
                 out_at: names.len(),
                 out_len: 0,
@@ -17803,7 +17803,7 @@ fn fire_db_triggers(
             .ok_or_else(|| ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name)))?;
         let mut frame = PsqlFrame {
  stop_after: None,
-            types: Vec::new(),
+            types: trig_slot_types(&d.source),
             vars: vec![Value::Null; names.len()],
             out_at: names.len(),
             out_len: 0,
@@ -18490,6 +18490,23 @@ fn collect_raise_names<'a>(s: &'a TrigStmt, out: &mut Vec<&'a String>) {
 
 /// A trigger's body as the interpreter's tree, with the variable names
 /// its `DECLARE`s introduce. `None` = outside the PSQL surface.
+/// A trigger's local slots' DECLARED TYPES, in slot order - what a
+/// write into each converts through ([coerce_to_slot]), exactly as a
+/// procedure's or a block's locals do. A trigger has no parameters, so
+/// its slots are its DECLAREs alone (the same list [trig_body_of] names
+/// them from). Measured: a NUMERIC(10,2) local taking NEW.V = 1.005
+/// holds 1.01, a CHAR(4) local holding 'ab' concatenates as 'ab  ', and
+/// 70000 into a SMALLINT local raises 22003 `At trigger` and fails the
+/// INSERT - where the untyped frame stored 1.005 and 'ab' in the row
+/// and inserted it.
+fn trig_slot_types(source: &str) -> Vec<Option<CastTarget>> {
+    let up = source.to_ascii_uppercase();
+    match find_word(&up, "BEGIN", 0) {
+        Some(begin_at) => declared_vars(&source[..begin_at]).into_iter().map(|(_, t)| t).collect(),
+        None => Vec::new(),
+    }
+}
+
 fn trig_body_of(t: &TrigDef) -> Option<(TrigStmt, Vec<String>)> {
     let up = t.source.to_ascii_uppercase();
     let begin_at = find_word(&up, "BEGIN", 0)?;
@@ -24374,6 +24391,8 @@ fn parse_trig_stmt(
             // CASE, IIF, NULLIF, CAST, or a scalar subquery (incl. one
             // over a system table or after a DML). Keep the text and its
             // :variable binds and let the planner answer it at run time.
+            let rhs_text = colon_bare_vars(rhs, vars);
+            let rhs = rhs_text.as_str();
             let mut binds: Vec<(String, u16)> = Vec::new();
             for name in named_refs(rhs) {
                 let slot = vars.iter().position(|v| *v == name)? as u16;
@@ -24384,6 +24403,70 @@ fn parse_trig_stmt(
             Some(TrigStmt::Assign { target, expr: fire_crab_ods::expr::Expr::NullLiteral, raw: Some((rhs.to_string(), binds)), src_off: start })
         }
     }
+}
+
+/// A raw right-hand side with its BARE variable references written as
+/// `:NAME`. In an assignment a bare name that is a declared variable IS
+/// that variable (PSQL needs no colon outside a statement's own
+/// columns), but the planner that answers a raw value reads it as a
+/// column of RDB$DATABASE and refused - measured: `R = X + 0.01` over a
+/// NUMERIC(9,2) X is 1.01 on the engine, `X = -X` -5 and
+/// `CHAR_LENGTH(X)` over a CHAR(3) 3, where all three refused here.
+///
+/// Only a value with NO QUERY in it is rewritten: inside a subquery a
+/// bare name may be the subquery's own column, and that text keeps the
+/// colons it was written with. A name followed by `(` (a function) or
+/// by or after a `.` (a qualifier, NEW./OLD.), inside a string or a
+/// quoted identifier, or one of the words a function's own grammar uses
+/// (`EXTRACT(DAY FROM D)`, `TRIM(BOTH ...)`) is left as written.
+fn colon_bare_vars(rhs: &str, vars: &[String]) -> String {
+    const GRAMMAR_WORDS: &[&str] = &[
+        "FROM", "FOR", "IN", "AS", "BOTH", "LEADING", "TRAILING", "YEAR", "MONTH", "DAY",
+        "HOUR", "MINUTE", "SECOND", "MILLISECOND", "WEEK", "WEEKDAY", "YEARDAY", "USING",
+        "SIMILAR", "ESCAPE", "PLACING", "CHARACTER", "SET", "COLLATE", "VALUE",
+    ];
+    if find_word(&rhs.to_ascii_uppercase(), "SELECT", 0).is_some() {
+        return rhs.to_string();
+    }
+    let b = rhs.as_bytes();
+    let mut out = String::with_capacity(rhs.len() + 8);
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' || c == b'"' {
+            // a string or a quoted identifier, copied whole
+            let mut j = i + 1;
+            while j < b.len() && b[j] != c {
+                j += 1;
+            }
+            let end = (j + 1).min(b.len());
+            out.push_str(&rhs[i..end]);
+            i = end;
+            continue;
+        }
+        let word_start = (c.is_ascii_alphabetic() || c == b'_')
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || matches!(b[i - 1], b'_' | b'$' | b'.' | b':')));
+        if !word_start {
+            out.push(c as char);
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'$') {
+            j += 1;
+        }
+        let word = rhs[i..j].to_ascii_uppercase();
+        let next = rhs[j..].trim_start().chars().next();
+        let is_var = vars.iter().any(|v| *v == word)
+            && !matches!(next, Some('(') | Some('.'))
+            && !GRAMMAR_WORDS.contains(&word.as_str());
+        if is_var {
+            out.push(':');
+        }
+        out.push_str(&rhs[i..j]);
+        i = j;
+    }
+    out
 }
 
 /// Emit a user trigger's BLR (probed): `version5, begin,` then for a
@@ -44083,6 +44166,27 @@ fn parse_proc_args(text: &str) -> Option<Vec<Value>> {
 /// `PT('a,b')` carries a comma INSIDE the literal, and the naive
 /// `split(',')` the two call sites used made text arguments impossible
 /// to even delimit, let alone read.
+/// `CAST(<integer literal> AS SMALLINT | INTEGER | INT | BIGINT)` as a
+/// call argument: the literal's value, which the parameter binding then
+/// converts like any integer argument (measured: `PI(CAST(5 AS BIGINT))`
+/// into an INTEGER parameter answers 10, where this refused the call).
+/// A literal the CAST itself would overflow is not taken - that is the
+/// CAST's own 22003, which an argument list of values cannot carry - and
+/// neither is any other target or operand.
+fn cast_int_literal_arg(t: &str) -> Option<i64> {
+    let up = t.to_ascii_uppercase();
+    let inner = up.strip_prefix("CAST")?.trim_start().strip_prefix('(')?.strip_suffix(')')?;
+    let as_at = find_word(inner, "AS", 0)?;
+    let n: i64 = inner[..as_at].trim().parse().ok()?;
+    let fits = match inner[as_at + "AS".len()..].trim() {
+        "SMALLINT" => i16::try_from(n).is_ok(),
+        "INTEGER" | "INT" => i32::try_from(n).is_ok(),
+        "BIGINT" => true,
+        _ => false,
+    };
+    fits.then_some(n)
+}
+
 fn parse_call_args(text: &str, allow_placeholder: bool) -> Option<Vec<Option<Value>>> {
     let text = text.trim();
     if text.is_empty() {
@@ -44135,6 +44239,8 @@ fn parse_call_args(text: &str, allow_placeholder: bool) -> Option<Vec<Option<Val
             } else if t.eq_ignore_ascii_case("NULL") {
                 Some(Some(Value::Null))
             } else if let Ok(n) = t.parse::<i64>() {
+                Some(Some(Value::Int(n)))
+            } else if let Some(n) = cast_int_literal_arg(t) {
                 Some(Some(Value::Int(n)))
             } else if let Some(TextNum::Dec { mantissa, exp }) =
                 (!t.starts_with('\'')).then(|| text_number(t)).flatten()
@@ -96919,8 +97025,9 @@ fn exec_psql_stmt_inner(
                 if !sink.is_empty() {
                     return Err(PsqlStop::Unsupported); // a `?` in a loop query
                 }
-                psql_plan_rows(&plan, db, ctx, *src_off)?
+                psql_plan_rows_then(&plan, db, ctx, *src_off)?
             };
+            let (rows, then) = rows;
             // ROW_COUNT COUNTS THE LOOP'S FETCHES, measured: 0 once the
             // cursor opens (an UPDATE of 5 rows followed by a FOR over no
             // rows reads 0), then the running count after each fetch -
@@ -96929,6 +97036,7 @@ fn exec_psql_stmt_inner(
             // end leaves it alone (a body whose UPDATE touched 1 row
             // reads 1 after the loop). This read 0 after any loop.
             set_row_count(f, 0);
+            let mut left = false;
             for (fetched, row) in rows.into_iter().enumerate() {
                 if row.len() != into.len() {
                     return Err(PsqlStop::Unsupported);
@@ -96939,7 +97047,10 @@ fn exec_psql_stmt_inner(
                 set_row_count(f, fetched as i64 + 1);
                 match exec_psql_stmt(body, f, steps, db, ctx) {
                     Ok(()) => {}
-                    Err(PsqlStop::Leave(t)) if t.is_none() || t.as_deref() == label.as_deref() => break,
+                    Err(PsqlStop::Leave(t)) if t.is_none() || t.as_deref() == label.as_deref() => {
+                        left = true;
+                        break;
+                    }
                     Err(PsqlStop::Continue(t)) if t.is_none() || t.as_deref() == label.as_deref() => {}
                     Err(e) => return Err(e),
                 }
@@ -96948,7 +97059,13 @@ fn exec_psql_stmt_inner(
                     return Err(PsqlStop::Unsupported);
                 }
             }
-            Ok(())
+            // the fetch after the last delivered row is the one that
+            // raises - after the body has run for every row before it,
+            // and never when a LEAVE closed the cursor before that fetch
+            match then {
+                Some(raise) if !left => Err(raise),
+                _ => Ok(()),
+            }
         }
         // SUSPEND takes a SNAPSHOT of the output parameters as they are
         // now and carries on; the body may assign them again and suspend
@@ -97544,6 +97661,28 @@ fn psql_plan_rows(
     ctx: &SessionCtx,
     src_off: usize,
 ) -> Result<Vec<Vec<Value>>, PsqlStop> {
+    match psql_plan_rows_then(plan, db, ctx, src_off)? {
+        (rows, None) => Ok(rows),
+        (_, Some(raise)) => Err(raise),
+    }
+}
+
+/// [psql_plan_rows] keeping THE ROWS A PROCEDURE SUSPENDED BEFORE IT
+/// RAISED, with the raise beside them. A FOR SELECT's cursor fetches
+/// them one at a time on the engine, so the loop body has run for every
+/// one of them before the fetch that fails - measured: `FOR SELECT R
+/// FROM PSEL(0)` (1 suspended, then E_SIMPLE) appending into a string
+/// answers '1 caught' under a `WHEN EXCEPTION E_SIMPLE`, a WHEN ANY
+/// counter over a source that fails at its fourth row reads 103, and a
+/// selectable block suspending each row delivers 1 and 2 before the
+/// 22012. Reading the source whole first raised before the body ran at
+/// all, answering ' caught', 100 and the error alone.
+fn psql_plan_rows_then(
+    plan: &Plan,
+    db: &mut Option<Database>,
+    ctx: &SessionCtx,
+    src_off: usize,
+) -> Result<(Vec<Vec<Value>>, Option<PsqlStop>), PsqlStop> {
     if let Plan::ProcSelect { name, args, picks, arg_slots, .. } = plan {
         // a body's own statement carries no `?` to bind: a slot here
         // would mean running the body with a NULL in its seat
@@ -97556,23 +97695,25 @@ fn psql_plan_rows(
                 .collect()
         };
         match try_procedure_blr(&*db, name, args, false) {
-            BlrProcOutcome::Rows(sus, _) => return Ok(project(sus)),
+            BlrProcOutcome::Rows(sus, _) => return Ok((project(sus), None)),
             BlrProcOutcome::Runtime(e) => {
-                let err = runtime_with_position(db, name, args, ctx, e, false);
-                return Err(PsqlStop::Raise(Thrown::Runtime { err, trace: vec![src_off] }));
+                let (err, sus) = runtime_with_position_rows(db, name, args, ctx, e, false);
+                let raise = PsqlStop::Raise(Thrown::Runtime { err, trace: vec![src_off] });
+                return Ok((project(sus), Some(raise)));
             }
             BlrProcOutcome::Outside => {}
         }
         return match psql_depth_guard(|| run_procedure(db, name, args, ctx, false))? {
-            Ok((_, sus)) => Ok(project(sus)),
-            Err(ProcErr { status: Some(err), .. }) => {
-                Err(PsqlStop::Raise(Thrown::Runtime { err, trace: vec![src_off] }))
+            Ok((_, sus)) => Ok((project(sus), None)),
+            Err(ProcErr { status: Some(err), rows, .. }) => {
+                let raise = PsqlStop::Raise(Thrown::Runtime { err, trace: vec![src_off] });
+                Ok((project(rows), Some(raise)))
             }
             Err(_) => Err(PsqlStop::Unsupported),
         };
     }
     let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
-    branch_rows(plan, dbr, &[]).ok_or(PsqlStop::Unsupported)
+    branch_rows(plan, dbr, &[]).ok_or(PsqlStop::Unsupported).map(|rows| (rows, None))
 }
 
 fn psql_raise(err: EvalErr) -> PsqlStop {
@@ -98392,6 +98533,17 @@ fn with_proc_defaults(meta: &ProcMeta, args: &[Value], ctx: Option<&SessionCtx>)
 /// engine would convert ('12' into an INTEGER parameter) - a
 /// conversion this surface has not measured, and a silently wrong one
 /// would be worse than the refusal.
+/// Does integer `n` fit an integer parameter of descriptor `d`? A
+/// SMALLINT holds 16 bits and an INTEGER 32; a BIGINT holds any `i64`.
+fn int_fits_param(d: &Descriptor, n: i64) -> bool {
+    use fire_crab_ods::format::dtype as dt;
+    match d.dtype {
+        dt::SHORT => i16::try_from(n).is_ok(),
+        dt::LONG => i32::try_from(n).is_ok(),
+        _ => true,
+    }
+}
+
 fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Value>, ProcErr> {
     let mut bound: Vec<Value> = Vec::with_capacity(args.len());
     for (arg, param) in args.iter().zip(meta.ins.iter()) {
@@ -98409,13 +98561,7 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
             // parameter raises *numeric value is out of range* with no
             // `At procedure` item, where this bound 70000 and answered it)
             (Value::Int(n), Some(ColKind::Int)) => {
-                use fire_crab_ods::format::dtype as dt;
-                let fits = match d.dtype {
-                    dt::SHORT => i16::try_from(*n).is_ok(),
-                    dt::LONG => i32::try_from(*n).is_ok(),
-                    _ => true,
-                };
-                if !fits {
+                if !int_fits_param(d, *n) {
                     return Err(ProcErr {
                         rows: Vec::new(),
                         text: format!("procedure {}: {} out of range for {}", name, n, param.name),
@@ -98455,6 +98601,19 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
             // string"), and an integer into a text parameter renders as
             // decimal, then obeys the parameter's width/pad like any text.
             (Value::Text(t), Some(ColKind::Int)) => match t.trim().parse::<i64>() {
+                // ...and the parsed number obeys the parameter's width like
+                // an integer argument does (measured: `Q5('70000')` into a
+                // SMALLINT is the same locationless 22003 as `Q5(70000)`,
+                // where this bound 70000 and answered it - or, when the
+                // body wrote the parameter on, raised it with an `At
+                // procedure` item the engine does not carry)
+                Ok(n) if !int_fits_param(d, n) => {
+                    return Err(ProcErr {
+                        rows: Vec::new(),
+                        text: format!("procedure {}: {} out of range for {}", name, n, param.name),
+                        status: Some(EvalErr::NumericOutOfRange),
+                    })
+                }
                 Ok(n) => Value::Int(n),
                 Err(_) => {
                     return Err(ProcErr {
@@ -98842,7 +99001,9 @@ fn materialise_user_fn_rows(
             // the arithmetic-only source interpreter for what it declines
             let v = match try_function_blr(database, &c.name, &argv) {
                 FnBlrOutcome::Value(v) => v,
-                FnBlrOutcome::Runtime(ev) => return Err(ev),
+                FnBlrOutcome::Runtime(ev) => {
+                    return Err(fn_runtime_with_position(database, &c.name, &argv, ctx, ev))
+                }
                 FnBlrOutcome::Outside => {
                     run_function(database, &c.name, &argv, ctx).map_err(|e| {
                         if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -98870,6 +99031,28 @@ fn materialise_user_fn_rows(
     }
     FN_VALS.with(|m| m.borrow_mut().clear());
     Ok(out)
+}
+
+/// A FUNCTION's BLR-path runtime error WITH THE FRAME the engine names:
+/// the executor reports the raise alone, so the body is re-run through
+/// the source interpreter, and its positioned error is taken when it is
+/// the same raise - the function mirror of [runtime_with_position]
+/// (measured: `F3(33)` whose RETURN overflows its SMALLINT result is
+/// 22003 `-At function "PUBLIC"."F3" line: 1, col: 58`, where this
+/// answered the 22003 bare). Any other outcome keeps the BLR error.
+fn fn_runtime_with_position(
+    database: &mut Option<Database>,
+    name: &str,
+    args: &[Value],
+    ctx: &SessionCtx,
+    e: EvalErr,
+) -> EvalErr {
+    match run_function(database, name, args, ctx) {
+        Err(ProcErr { status: Some(EvalErr::AtProcedure { inner, at }), .. }) if *inner == e => {
+            EvalErr::AtProcedure { inner, at }
+        }
+        _ => e,
+    }
 }
 
 fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
@@ -99322,7 +99505,7 @@ fn fire_triggers(
         })?;
         let mut frame = PsqlFrame {
  stop_after: None,
-            types: Vec::new(),
+            types: trig_slot_types(&d.source),
             vars: vec![Value::Null; names.len()],
             out_at: names.len(),
             out_len: 0,
@@ -99356,7 +99539,7 @@ fn fire_triggers(
             };
             let mut scout = PsqlFrame {
  stop_after: None,
-            types: Vec::new(),
+            types: trig_slot_types(&d.source),
                 vars: vec![Value::Null; names.len()],
                 out_at: names.len(),
                 out_len: 0,

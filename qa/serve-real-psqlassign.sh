@@ -30,10 +30,13 @@
 # RECORDED, not fixed (both still refuse, the engine answers): a local
 # declared by DOMAIN or TYPE OF COLUMN keeps the untyped store, so the
 # body refuses rather than guessing the conversion; DOUBLE PRECISION /
-# DATE arithmetic on a local, `DECLARE ... DEFAULT <decimal>`, an
-# integer local times a decimal literal, and FLOAT / DOUBLE / BOOLEAN /
+# DATE arithmetic on a local, `DECLARE ... DEFAULT <decimal>`, and
+# FLOAT / DOUBLE / BOOLEAN /
 # TIMESTAMP outputs of an EXECUTE BLOCK are outside the interpreter's
 # surface as they were before - clean refusals, pinned as such below.
+# (An integer local times a decimal literal was recorded here too; it
+# answers since the bare local is bound into the planner's value -
+# qa/serve-real-psqlfetch.sh - and is pinned in 6b.)
 #
 # Usage: qa/serve-real-psqlassign.sh [port]   (default 5400)
 set -u
@@ -203,12 +206,14 @@ pin  "6 ...qualified" "EXECUTE PROCEDURE PUBLIC.NOSUCHPROC;" "Statement failed, 
 pin  "6 ...quoted lower case" "EXECUTE PROCEDURE \"nosuchproc\";" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -204|-Procedure unknown|-\"nosuchproc\""
 pin  "6 ...a foreign package qualifier" "EXECUTE PROCEDURE NOPKG.NOSUCHPROC;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -204|-Procedure unknown|-\"NOPKG\".\"NOSUCHPROC\""
 
+echo "--- 6b. PROMOTED from the record: a bare local in a value the planner answers is the local"
+pin  "6b an integer local times a decimal literal" "$(eb 'EXECUTE BLOCK RETURNS (R NUMERIC(10,2)) AS DECLARE X INTEGER = 3; BEGIN R = X * 1.001; SUSPEND; END')" "R|3.00"
+
 echo "--- 7. RECORDED: still refused where the engine answers (a clean refusal, never a wrong value)"
 refused "7 a local declared by a DOMAIN" "$(eb 'EXECUTE BLOCK RETURNS (R VARCHAR(30)) AS DECLARE X DNUM; BEGIN X = 1.005; R = X; SUSPEND; END')" "R|1.01"
 refused "7 a local declared TYPE OF COLUMN" "$(eb 'EXECUTE BLOCK RETURNS (R VARCHAR(30)) AS DECLARE X TYPE OF COLUMN T2.N; BEGIN X = 1.0005; R = X; SUSPEND; END')" "R|1.001"
 refused "7 DOUBLE PRECISION arithmetic on a local" "$(eb 'EXECUTE BLOCK RETURNS (R VARCHAR(30)) AS DECLARE X DOUBLE PRECISION; BEGIN X = 1; R = X / 3; SUSPEND; END')" "R|0.3333333333333333"
 refused "7 DECLARE ... DEFAULT a decimal" "$(eb 'EXECUTE BLOCK RETURNS (R VARCHAR(30)) AS DECLARE X NUMERIC(10,2) DEFAULT 2.345; BEGIN R = X; SUSPEND; END')" "R|2.35"
-refused "7 an integer local times a decimal literal" "$(eb 'EXECUTE BLOCK RETURNS (R NUMERIC(10,2)) AS DECLARE X INTEGER = 3; BEGIN R = X * 1.001; SUSPEND; END')" "R|3.00"
 refused "7 a DOUBLE PRECISION output" "$(eb 'EXECUTE BLOCK RETURNS (R DOUBLE PRECISION) AS BEGIN R = 2.5; SUSPEND; END')" "R|2.500000000000000"
 
 echo "--- panic check"

@@ -1687,7 +1687,8 @@ pub fn bind_and_execute(
 const HALT_LABEL: u8 = u8::MAX;
 
 /// [bind_and_execute] with the EXECUTE PROCEDURE semantics available:
-/// with `halt_at_stall` the request stops at its first blr_stall - the
+/// with `halt_at_stall` the request stops at its first output send (or a
+/// blr_stall after one) - the
 /// engine's `EXECUTE PROCEDURE` sends the inputs, receives ONE output
 /// message and unwinds the request, so a body's statements after its
 /// first SUSPEND never run (probed: an UPDATE after the first SUSPEND
@@ -1786,6 +1787,15 @@ impl<'a> Exec<'a> {
                     .ok_or("send names an undeclared message")?
                     .clone();
                 self.sends.push((*msg, buf));
+                // A SUSPEND IS THE SEND ITSELF on the 2182 engine: the
+                // compiler emits `blr_send 1` with no stall after it (the
+                // only stall is the prologue's, before any send), so under
+                // EXECUTE PROCEDURE the request ends at the first output
+                // send - measured: a body that SUSPENDs 1 and then divides
+                // by zero answers X = 1, where running on raised 22012
+                if self.halt_at_stall && *msg == 1 {
+                    self.leaving = Some(HALT_LABEL);
+                }
             }
             Stmt::Assign(from, to) => {
                 let v = self.eval(from)?;
