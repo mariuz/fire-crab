@@ -162,10 +162,42 @@ fn mul(a: &Num, b: &Num, ctx: &Ctx) -> Result<Num, bool> {
     range_check(r, ctx)
 }
 
+/// decSetSubnormal: a value whose exponent lies below `etiny` loses the
+/// digits under it in ONE rounding (the context's mode, `sticky` the
+/// residue of any digits already dropped), and the result stays AT
+/// `etiny` - a carry out of the kept digits (`999..` rounding up) widens
+/// the coefficient by one digit rather than moving the exponent, as the
+/// routine's `decShiftToMost` fix-up does. Returns (digits, exponent);
+/// the digits are `b"0"` when the value rounded away entirely.
+fn subnormal_round(mag: &[u8], exp: i64, etiny: i64, round: Round, sticky: bool) -> (Vec<u8>, i64) {
+    let drop = etiny - exp;
+    let len = mag.len() as i64;
+    if drop <= 0 {
+        return (mag.to_vec(), exp);
+    }
+    if drop >= len {
+        // every digit falls below etiny: only a leading digit exactly at
+        // the rounding place can round up to one unit
+        let up = drop == len
+            && match round {
+                Round::Down => false,
+                Round::HalfUp => mag[0] >= b'5',
+                Round::HalfEven => mag[0] > b'5' || (mag[0] == b'5' && (mag[1..].iter().any(|&d| d != b'0') || sticky)),
+            };
+        return (if up { vec![b'1'] } else { vec![b'0'] }, etiny);
+    }
+    let (mut kept, dropped, _) = round_mag(mag, len - drop, round, sticky);
+    if exp + dropped > etiny {
+        kept.push(b'0');
+    }
+    (strip0(kept), etiny)
+}
+
 /// decFinalize's exponent checks for a working context: an adjusted
 /// exponent past `emax` is Overflow; below `emin` the value is SUBNORMAL
 /// and rounds (context rounding) at the tiniest exponent
-/// `emin - (digits - 1)`, possibly to zero.
+/// `emin - (digits - 1)`; a value that rounds away entirely is a
+/// terminal underflow, `Err(false)` (the caller's zero sits at etiny).
 fn range_check(r: Num, ctx: &Ctx) -> Result<Num, bool> {
     if r.is_zero() {
         return Ok(r);
@@ -176,33 +208,21 @@ fn range_check(r: Num, ctx: &Ctx) -> Result<Num, bool> {
     if r.adjusted() < ctx.emin {
         let etiny = ctx.emin - (ctx.digits - 1);
         if r.exp < etiny {
-            let drop = (etiny - r.exp) as usize;
-            let (mag, dropped) = if drop >= r.mag.len() {
-                // all digits fall below etiny: round on the leading one
-                let up = drop == r.mag.len()
-                    && match ctx.round {
-                        Round::Down => false,
-                        Round::HalfUp => r.mag[0] >= b'5',
-                        Round::HalfEven => {
-                            r.mag[0] > b'5'
-                                || (r.mag[0] == b'5' && r.mag[1..].iter().any(|&d| d != b'0'))
-                        }
-                    };
-                (if up { vec![b'1'] } else { vec![b'0'] }, drop as i64)
-            } else {
-                let keep = (r.mag.len() - drop) as i64;
-                let (kept, extra, _) = round_mag(&r.mag, keep, ctx.round, false);
-                (strip0(kept), drop as i64 + extra)
-            };
-            let z = mag == b"0";
-            let n = Num { neg: r.neg && !z, mag, exp: r.exp + dropped };
-            if z {
+            let (mag, exp) = subnormal_round(&r.mag, r.exp, etiny, ctx.round, false);
+            if mag == b"0" {
                 return Err(false);
             }
-            return Ok(n);
+            return Ok(Num { neg: r.neg, mag, exp });
         }
     }
     Ok(r)
+}
+
+/// The zero a working context's terminal underflow leaves: decSetSubnormal
+/// clamps it to that context's etiny, which the final decFinalize clamps
+/// again to decimal128's -6176 - so `POWER(2, -25000)` is 0E-6176, not 0.
+fn underflow_zero(ctx: &Ctx) -> Num {
+    Num { neg: false, mag: vec![b'0'], exp: ctx.emin - (ctx.digits - 1) }
 }
 
 /// decDivideOp (DIVIDE): the quotient to `ctx.digits` digits with the
@@ -283,7 +303,24 @@ fn cmp_mag(a: &Num, b: &Num) -> std::cmp::Ordering {
 /// its digits (with the sticky residue the math routines pass), then the
 /// decimal128 range - Overflow past emax, subnormal rounding and the
 /// exponent clamp through [crate::decfloat::finite].
+///
+/// A SUBNORMAL result (its exponent, after the cut to 34 digits, below
+/// etiny = -6176) is rounded ONCE, at etiny: decCopyFit only truncates
+/// and carries the residue, and decFinalize's decSetSubnormal applies
+/// the rounding there - `EXP(CAST(-14200 AS INT128))` is
+/// 1.043174528E-6167 and `POWER(CAST(2 AS INT128), -20500)` 7.6752E-6172
+/// (measured on 2182; the clamp this replaced kept 17 digits at E-6143,
+/// a value 10^24 too large). A zero keeps its exponent, clamped to
+/// etiny (`POWER(2, -25000)` 0E-6176).
 fn finish(n: &Num, round: Round, sticky: bool, set: &Ctx) -> Result<Dec, MathErr> {
+    let etiny = set.emin - (set.digits - 1);
+    if n.is_zero() {
+        return Ok(Dec::Finite { neg: n.neg, coeff: 0, exp: n.exp.clamp(etiny, set.emax - (set.digits - 1)) as i32 });
+    }
+    if n.exp + (n.digits() - set.digits).max(0) < etiny {
+        let (mag, exp) = subnormal_round(&n.mag, n.exp, etiny, round, sticky);
+        return Ok(finite(n.neg, mag, exp));
+    }
     let ctx = Ctx { digits: set.digits, round, emax: set.emax, emin: set.emin };
     let (r, _) = fit(n, &ctx, sticky && !n.is_zero());
     if !r.is_zero() && r.adjusted() > set.emax {
@@ -386,7 +423,7 @@ fn exp_op(rhs: &Num, set: &Ctx) -> Result<(Num, bool), bool> {
                     }
                     Err(false) => {
                         underflow = true;
-                        t = Num { neg: false, mag: vec![b'0'], exp: 0 };
+                        t = underflow_zero(&aset);
                         continue;
                     }
                 }
@@ -402,7 +439,7 @@ fn exp_op(rhs: &Num, set: &Ctx) -> Result<(Num, bool), bool> {
                 Err(true) => overflow = true,
                 Err(false) => {
                     underflow = true;
-                    t = Num { neg: false, mag: vec![b'0'], exp: 0 };
+                    t = underflow_zero(&aset);
                 }
             }
         }
@@ -561,6 +598,58 @@ fn d128() -> Ctx {
     Ctx { digits: 34, round: Round::HalfUp, emax: D128_EMAX, emin: D128_EMIN }
 }
 
+/// decNumberPower's INFINITE EXPONENT arm: a negative (non-zero) base is
+/// Invalid; otherwise the base against 1 decides - below 1 the power is
+/// 0 (+Infinity for -Infinity), exactly 1 a fully padded 1.000...
+/// (deemed inexact), above 1 (+Infinity included) +Infinity (0 for
+/// -Infinity). Measured on 2182: `POWER(2, Inf)` Infinity, `POWER(0.5,
+/// -Inf)` Infinity, `POWER(1, Inf)` 1.000000000000000000000000000000000,
+/// `POWER(-2, Inf)` 22000, `POWER(-0, Inf)` 0.
+fn pow_to_infinity(lhs: &Dec, rneg: bool) -> Result<Dec, MathErr> {
+    let zero = Dec::Finite { neg: false, coeff: 0, exp: 0 };
+    let inf = Dec::Infinity { neg: false };
+    let ord = match lhs {
+        Dec::Infinity { neg: true } => return Err(MathErr::Invalid),
+        Dec::Infinity { neg: false } => std::cmp::Ordering::Greater,
+        _ => {
+            let l = Num::from_dec(lhs).ok_or(MathErr::Invalid)?;
+            if l.neg && !l.is_zero() {
+                return Err(MathErr::Invalid);
+            }
+            cmp_mag(&l, &one())
+        }
+    };
+    Ok(match ord {
+        std::cmp::Ordering::Less => if rneg { inf } else { zero },
+        std::cmp::Ordering::Equal => finite(false, padded_one(34).mag, -33),
+        std::cmp::Ordering::Greater => if rneg { zero } else { inf },
+    })
+}
+
+/// decNumberPower's INFINITE BASE arm (the exponent finite): `x ** 0` is
+/// 1, otherwise Infinity for a positive exponent and zero for a negative
+/// one, signed when the base is -Infinity and the exponent an ODD
+/// integer (decGetInt's parity, a huge integer's too). The engine's
+/// build does NOT raise for -Infinity to a non-integer (the source's
+/// `-Inf**nonint` Invalid is not what runs): measured on 2182,
+/// `POWER(Inf, 2)` Infinity, `POWER(Inf, -2)` 0, `POWER(-Inf, 3)`
+/// -Infinity, `POWER(-Inf, -3)` -0, `POWER(-Inf, 1234567891)` -Infinity,
+/// `POWER(-Inf, 0.5)` and `(-Inf, 1.5)` Infinity, `(-Inf, -0.5)` 0,
+/// `POWER(Inf, 0)` 1.
+fn pow_of_infinity(lneg: bool, rhs: &Dec) -> Result<Dec, MathErr> {
+    let r = Num::from_dec(rhs).ok_or(MathErr::Invalid)?;
+    let (zero_exp, odd) = match get_int(&r) {
+        Ok(Some(v)) => (v == 0, v & 1 == 1),
+        Ok(None) => (false, false),
+        Err(odd) => (false, odd),
+    };
+    if zero_exp {
+        return Ok(Dec::Finite { neg: false, coeff: 1, exp: 0 });
+    }
+    let neg = lneg && odd;
+    Ok(if r.neg { Dec::Finite { neg, coeff: 0, exp: 0 } } else { Dec::Infinity { neg } })
+}
+
 /// `Decimal128::pow` - decNumberPower. An integer exponent goes by
 /// repeated squaring at 34 + (its integer digits) + 2 digits HALF-EVEN
 /// (a negative one inverts the base first), a fractional one by
@@ -570,11 +659,16 @@ fn d128() -> Ctx {
 /// `x ** 0` is 1, `1 ** y` is a padded 1.000...
 pub fn pow(lhs: &Dec, rhs: &Dec) -> Result<Dec, MathErr> {
     let set = d128();
-    let (l, r) = match (lhs, rhs) {
-        (Dec::Nan, _) | (_, Dec::Nan) => return Ok(Dec::Nan),
-        (Dec::Infinity { .. }, _) | (_, Dec::Infinity { .. }) => return Err(MathErr::Invalid),
-        _ => (Num::from_dec(lhs).ok_or(MathErr::Invalid)?, Num::from_dec(rhs).ok_or(MathErr::Invalid)?),
-    };
+    if matches!(lhs, Dec::Nan) || matches!(rhs, Dec::Nan) {
+        return Ok(Dec::Nan);
+    }
+    if let Dec::Infinity { neg: rneg } = rhs {
+        return pow_to_infinity(lhs, *rneg);
+    }
+    if let Dec::Infinity { neg: lneg } = lhs {
+        return pow_of_infinity(*lneg, rhs);
+    }
+    let (l, r) = (Num::from_dec(lhs).ok_or(MathErr::Invalid)?, Num::from_dec(rhs).ok_or(MathErr::Invalid)?);
     let n = get_int(&r);
     let (rhsint, useint, isodd, nval) = match n {
         Ok(Some(v)) => (true, true, v & 1 == 1, v),
@@ -609,7 +703,7 @@ pub fn pow(lhs: &Dec, rhs: &Dec) -> Result<Dec, MathErr> {
         dac = match exp_op(&m, &aset) {
             Ok((v, _)) => v,
             Err(true) => return Err(MathErr::Overflow),
-            Err(false) => Num { neg: false, mag: vec![b'0'], exp: 0 },
+            Err(false) => underflow_zero(&aset),
         };
     } else {
         if nval == 0 {
@@ -642,7 +736,7 @@ pub fn pow(lhs: &Dec, rhs: &Dec) -> Result<Dec, MathErr> {
                     }
                     Err(false) => {
                         underflow = true;
-                        acc = Num { neg: false, mag: vec![b'0'], exp: 0 };
+                        acc = underflow_zero(&aset);
                         continue;
                     }
                 }
@@ -658,7 +752,7 @@ pub fn pow(lhs: &Dec, rhs: &Dec) -> Result<Dec, MathErr> {
                 Err(true) => overflow = true,
                 Err(false) => {
                     underflow = true;
-                    acc = Num { neg: false, mag: vec![b'0'], exp: 0 };
+                    acc = underflow_zero(&aset);
                 }
             }
         }
@@ -811,6 +905,50 @@ mod tests {
         assert_eq!(s(pow(&Dec::Finite { neg: true, coeff: 2, exp: 0 }, &d(5, -1))), "Invalid");
         assert_eq!(s(pow(&Dec::Finite { neg: true, coeff: 2, exp: 0 }, &d(3, 0))), "-8");
         assert_eq!(s(pow(&d(55, -1), &d(2, 0))), "30.25");
+    }
+
+    #[test]
+    fn subnormal_results_round_once_at_etiny() {
+        // measured on 2182: the digits below E-6176 go in ONE rounding,
+        // and an underflow to nothing is 0E-6176
+        let neg = |c: u128| Dec::Finite { neg: true, coeff: c, exp: 0 };
+        assert_eq!(s(exp(&neg(14200))), "1.043174528E-6167");
+        assert_eq!(s(exp(&neg(14170))), "1.1147858072722035504387E-6154");
+        assert_eq!(s(exp(&neg(14150))), "5.408552740252794394663671821483E-6146");
+        assert_eq!(s(exp(&neg(14215))), "3.19E-6174");
+        assert_eq!(s(exp(&neg(14220))), "2E-6176");
+        assert_eq!(s(exp(&neg(14300))), "0E-6176");
+        assert_eq!(s(pow(&d(2, 0), &neg(20500))), "7.6752E-6172");
+        assert_eq!(s(pow(&d(2, 0), &neg(25000))), "0E-6176");
+        assert_eq!(s(pow(&d(3, 0), &neg(12900))), "1.367143545262418933351E-6155");
+        assert_eq!(s(pow(&d(10, 0), &neg(6176))), "1E-6176");
+        assert_eq!(s(pow(&d(10, 0), &neg(6177))), "0E-6176");
+    }
+
+    #[test]
+    fn infinite_operands_as_the_engine_answers() {
+        let inf = Dec::Infinity { neg: false };
+        let ninf = Dec::Infinity { neg: true };
+        let m = |c: u128, e: i32| Dec::Finite { neg: true, coeff: c, exp: e };
+        assert_eq!(s(pow(&inf, &d(2, 0))), "Infinity");
+        assert_eq!(s(pow(&inf, &m(2, 0))), "0");
+        assert_eq!(s(pow(&inf, &d(0, 0))), "1");
+        assert_eq!(s(pow(&ninf, &d(3, 0))), "-Infinity");
+        assert_eq!(s(pow(&ninf, &m(3, 0))), "-0");
+        assert_eq!(s(pow(&ninf, &d(2, 0))), "Infinity");
+        // no Invalid for -Infinity to a non-integer in the engine's build
+        assert_eq!(s(pow(&ninf, &d(5, -1))), "Infinity");
+        assert_eq!(s(pow(&ninf, &m(5, -1))), "0");
+        assert_eq!(s(pow(&d(2, 0), &inf)), "Infinity");
+        assert_eq!(s(pow(&d(2, 0), &ninf)), "0");
+        assert_eq!(s(pow(&d(5, -1), &inf)), "0");
+        assert_eq!(s(pow(&d(5, -1), &ninf)), "Infinity");
+        assert_eq!(s(pow(&d(1, 0), &inf)), "1.000000000000000000000000000000000");
+        assert_eq!(s(pow(&m(2, 0), &inf)), "Invalid");
+        assert_eq!(s(pow(&d(0, 0), &inf)), "0");
+        assert_eq!(s(exp(&inf)), "Infinity");
+        assert_eq!(s(exp(&ninf)), "0");
+        assert_eq!(s(pow(&Dec::Nan, &d(2, 0))), "NaN");
     }
 
     #[test]

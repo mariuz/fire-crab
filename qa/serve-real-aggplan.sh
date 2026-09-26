@@ -66,6 +66,13 @@
 #     record. Red on fc/aggplan-r3 6f1adf6 (wrong ties, a spurious
 #     22003, a wrong FIRST row set, a refusal); a FIRST, a DISTINCT
 #     or a view inside the derived table reads the same relation.
+#   - THE MERGED OUTER RECORD (section 18, fc/aggplan-r3 x fc/collkey-r3):
+#     the ORDER BY above a window ties by the window MAPS in first-posting
+#     order - the plain map holding the bare fields AND every OVER ()
+#     window as written, each other clause's map its windows then a NULL
+#     copy of every COLUMN its PARTITION BY reads (G + K + ID three, at
+#     the column's own width) - on the plain path, the FIRST/ROWS
+#     rewrite, a join, a group and a windowed derived table alike.
 #
 # RECORDED, not fixed (section 12 and the refused/differs cells): CREATE
 # VIEW over an aggregate, a GROUP BY or a window; LAG/LEAD/NTH_VALUE with
@@ -127,6 +134,10 @@ INSERT INTO RG VALUES ('A','alpha'); INSERT INTO RG VALUES ('B','beta'); INSERT 
 CREATE TABLE RU (ID INTEGER, K INTEGER, K2 INTEGER, S VARCHAR(10), V INTEGER, B BIGINT);
 INSERT INTO RU VALUES (1,1,1,'b',3,3); INSERT INTO RU VALUES (2,2,2,'a',1,5); INSERT INTO RU VALUES (3,1,NULL,'a',2,-7); INSERT INTO RU VALUES (4,2,1,'c',3,-1); INSERT INTO RU VALUES (5,1,2,NULL,1,NULL); INSERT INTO RU VALUES (6,NULL,2,'b',2,3); INSERT INTO RU VALUES (7,2,NULL,'b',NULL,-7); INSERT INTO RU VALUES (8,1,1,'c',3,0); INSERT INTO RU VALUES (9,NULL,NULL,'a',1,5); INSERT INTO RU VALUES (10,2,2,'ab',2,-1); INSERT INTO RU VALUES (11,1,1,'',1,3); INSERT INTO RU VALUES (12,2,NULL,'b',3,NULL);
 CREATE VIEW RUV (ID, K, S, V) AS SELECT ID, K, S, V FROM RU;
+CREATE TABLE RA (ID INTEGER, K INTEGER, A VARCHAR(4), B VARCHAR(4), G INTEGER, M VARCHAR(4), V5 VARCHAR(5));
+INSERT INTO RA VALUES (1,1,'dcba','x',1,'q','p'); INSERT INTO RA VALUES (2,1,'dbca','x',2,'q','p'); INSERT INTO RA VALUES (3,1,'cdab','x',1,'q','r'); INSERT INTO RA VALUES (4,1,'badc','x',2,'q','r'); INSERT INTO RA VALUES (5,1,'acbd','x',1,'q','p'); INSERT INTO RA VALUES (6,1,'abcd','x',2,'q','r');
+CREATE TABLE RB (ID INTEGER, K INTEGER, A VARCHAR(4), B VARCHAR(4));
+INSERT INTO RB VALUES (1,1,'x','z'); INSERT INTO RB VALUES (2,1,'x','a'); INSERT INTO RB VALUES (3,1,'x','m'); INSERT INTO RB VALUES (4,2,'y','q');
 COMMIT;
 SQL
 } | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/aggplan-build.log 2>&1
@@ -512,11 +523,34 @@ pin  "17 ...a CTE" "WITH C AS (SELECT S, K, ROW_NUMBER() OVER (ORDER BY V) RN FR
 pin  "17 ...FIRST takes the engine's rows" "SELECT FIRST 5 X.S, RN FROM (SELECT S, K, ROW_NUMBER() OVER (ORDER BY K) RN FROM RU) X ORDER BY X.K;" "S RN|a 1|b 2|3|<null> 7|a 4"
 pin  "17 ...a PARTITION BY stream's slot" "SELECT X.S, RN FROM (SELECT K, S, SUM(V) OVER (PARTITION BY K2) RN FROM RU) X ORDER BY X.K;" "S RN|a 6|b 6|10|a 6|b 10|c 10|<null> 6|a 6|b 6|b 6|c 10|ab 6"
 
+echo "--- 18. THE MERGED OUTER RECORD (window streams, OVER () in the plain map, one NULL copy per partition COLUMN at its width)"
+pin  "18 the plain map precedes a window's map (A, RN, B ties by B, not by RN)" "SELECT A, ROW_NUMBER() OVER (ORDER BY ID DESC) RN, B FROM RB ORDER BY K;" "A RN B|x 3 a|x 2 m|x 4 z|y 1 q"
+pin  "18 CONTROL: where A's bytes start (one field: on a word)" "SELECT A FROM RA ORDER BY K;" "A|dcba|dbca|cdab|badc|acbd|abcd"
+pin  "18 a PARTITION BY clause copies each column its keys read (G + K + ID: three)" "SELECT A, COUNT(*) OVER (PARTITION BY G + K + ID) FROM RA ORDER BY K;" "A COUNT|dcba 1|dbca 2|cdab 2|badc 2|acbd 2|abcd 1"
+pin  "18 ...G + K + ID, K: still three" "SELECT A, COUNT(*) OVER (PARTITION BY G + K + ID, K) FROM RA ORDER BY K;" "A COUNT|dcba 1|dbca 2|cdab 2|badc 2|acbd 2|abcd 1"
+pin  "18 ...G + K: two" "SELECT A, COUNT(*) OVER (PARTITION BY G + K) FROM RA ORDER BY K;" "A COUNT|badc 3|abcd 3|dbca 3|acbd 3|dcba 3|cdab 3"
+pin  "18 the copy follows its clause's window, before a later map" "SELECT MIN(M) OVER (PARTITION BY G) MM, A FROM RA ORDER BY K;" "MM A|q badc|q abcd|q dbca|q acbd|q dcba|q cdab"
+pin  "18 ...after every window of the clause" "SELECT COUNT(*) OVER (PARTITION BY K) C, MIN(M) OVER (PARTITION BY K) MM, A FROM RA ORDER BY K;" "C MM A|6 q badc|6 q abcd|6 q dbca|6 q acbd|6 q dcba|6 q cdab"
+pin  "18 ...at the column's own width (a VARCHAR(5) key)" "SELECT MIN(M) OVER (PARTITION BY V5) MM, A FROM RA ORDER BY K;" "MM A|q dcba|q dbca|q cdab|q badc|q acbd|q abcd"
+pin  "18 an OVER () window is the plain map's, where it is written" "SELECT B, MIN(M) OVER () MM, A FROM RA ORDER BY K;" "B MM A|x q badc|x q abcd|x q dbca|x q acbd|x q dcba|x q cdab"
+pin  "18 ...written last" "SELECT B, A, MIN(M) OVER () MM FROM RA ORDER BY K;" "B A MM|x dcba q|x dbca q|x cdab q|x badc q|x acbd q|x abcd q"
+pin  "18 ...an ordered window's map keeps its own place" "SELECT MIN(M) OVER (ORDER BY K) MM, B, A FROM RA ORDER BY K;" "MM B A|q x badc|q x abcd|q x dbca|q x acbd|q x dcba|q x cdab"
+pin  "18 the rewrite (FIRST): the copies of G + K + ID" "SELECT FIRST 6 A, MIN(M) OVER (PARTITION BY G + K + ID) MM FROM RA ORDER BY K;" "A MM|dcba q|dbca q|cdab q|badc q|acbd q|abcd q"
+pin  "18 ...FIRST: the copy of a VARCHAR(5) key" "SELECT FIRST 6 MIN(M) OVER (PARTITION BY V5) MM, A FROM RA ORDER BY K;" "MM A|q dcba|q dbca|q cdab|q badc|q acbd|q abcd"
+pin  "18 ...FIRST: an OVER () window between two fields" "SELECT FIRST 6 B, MIN(M) OVER () MM, A FROM RA ORDER BY K;" "B MM A|x q badc|x q abcd|x q dbca|x q acbd|x q dcba|x q cdab"
+pin  "18 ...FIRST: two windows of one clause, then the copy" "SELECT FIRST 6 COUNT(*) OVER (PARTITION BY K) C, MIN(M) OVER (PARTITION BY K) MM, A FROM RA ORDER BY K;" "C MM A|6 q badc|6 q abcd|6 q dbca|6 q acbd|6 q dcba|6 q cdab"
+pin  "18 ...a join: the copy of G" "SELECT RA.A, MIN(RA.M) OVER (PARTITION BY RA.G) MM FROM RA JOIN RA R2 ON R2.ID = RA.ID ORDER BY RA.K;" "A MM|badc q|abcd q|dbca q|acbd q|dcba q|cdab q"
+pin  "18 ...a join: an OVER () window between two fields" "SELECT RA.B, MIN(RA.M) OVER () MM, RA.A FROM RA JOIN RA R2 ON R2.ID = RA.ID ORDER BY RA.K;" "B MM A|x q badc|x q abcd|x q dbca|x q acbd|x q dcba|x q cdab"
+pin  "18 ...a join: the copies of G + K + ID" "SELECT RA.A, MIN(RA.M) OVER (PARTITION BY RA.G + RA.K + RA.ID) MM FROM RA JOIN RA R2 ON R2.ID = RA.ID ORDER BY RA.K;" "A MM|dcba q|dbca q|cdab q|badc q|acbd q|abcd q"
+pin  "18 ...grouped" "SELECT MIN(A) OVER (PARTITION BY K) MM, A FROM RA GROUP BY A, K ORDER BY K;" "MM A|abcd badc|abcd abcd|abcd dbca|abcd acbd|abcd dcba|abcd cdab"
+pin  "18 ...a windowed derived table: the copies" "SELECT X.A, X.MM FROM (SELECT A, K, MIN(M) OVER (PARTITION BY G + K + ID) MM FROM RA) X ORDER BY X.K;" "A MM|dcba q|dbca q|cdab q|badc q|acbd q|abcd q"
+pin  "18 ...a windowed derived table: an OVER () window" "SELECT X.B, X.MM, X.A FROM (SELECT B, MIN(M) OVER () MM, A, K FROM RA) X ORDER BY X.K;" "B MM A|x q badc|x q abcd|x q dbca|x q acbd|x q dcba|x q cdab"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-aggplan-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 287 ]; then echo "FAIL only $ran checks ran (floor 287)"; fail=1; fi
+if [ "$ran" -lt 308 ]; then echo "FAIL only $ran checks ran (floor 308)"; fail=1; fi
 exit $fail

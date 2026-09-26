@@ -55,6 +55,25 @@
 # and a WITH prefix ahead of the locked table, whose parser refusal
 # carries the unused CTEs' warnings.
 #
+# THIRD ROUND (the review of the merged binary): a CTE read as a SECOND
+# or later comma item of a FROM is READ - the unused-CTE pass saw the
+# word after FROM / JOIN only, and refused `FROM A, B` as an alias
+# conflict; a CTE body holding a multi-byte character (a UTF8 attachment)
+# closed one character late and refused; a column is counted in BYTES of
+# the text as sent; a committed DDL, in any attachment, purges the
+# statement cache and the warning comes back; a named WINDOW clause is
+# passed after the select list's plain fields, before the rest of it, in
+# declaration order, read or not; and a whole-item subquery's name is NO
+# ALIAS - a bare ORDER / GROUP BY of it is the column (one group of six
+# answered here) or -206, a qualified key of its name answers (refused
+# after the merge), and it names a derived table's column.
+#
+# FOURTH ROUND: the same law for a CORRELATED whole-item subquery - the
+# per-row marker was spliced `FC$CORR(<id>) AS <name>`, so a qualified
+# GROUP BY key of its name was refused (master answered) and a bare ORDER
+# BY of it sorted by the subquery where the engine sorts by the outer
+# column; a quoted inner alias keeps its case.
+#
 # RECORDED, not fixed (every one a refusal on this server, never a wrong
 # answer): a quoted CTE name; a CTE referenced only inside a subquery or
 # a derived table; a nested WITH; a bare (unqualified) unknown column,
@@ -70,7 +89,11 @@
 # own -104s); a bare unknown column under WITH LOCK; a PLAN over a user
 # table under WITH LOCK; a star over a join inside a derived table (a
 # NATURAL JOIN's merged column answers on the engine, a JOIN ON's pair is
-# its duplicate - this server calls both an unnamed column).
+# its duplicate - this server calls both an unnamed column); a qualified
+# ORDER / GROUP BY key under a select-list ALIAS of its name (the
+# alias-first law's refusal); under a NONE attachment a non-ASCII name in
+# an error text (re-encoded here, the engine echoes its bytes); a window
+# defined over another one (the engine's -204 comes first).
 #
 # Usage: qa/serve-real-semchk.sh [port]   (default 5950)
 set -u
@@ -127,7 +150,8 @@ fail=0
 ran=0
 # a SCRIPT (a session), its lines squeezed and joined; errors included,
 # so an error cell compares the engine's whole message, warnings included
-sess() { printf '%s\n' "$2" | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
+# (SESS_CS names the attachment character set; unset is NONE)
+sess() { printf '%s\n' "$2" | timeout 25 "$ISQL" -q ${SESS_CS:+-ch "$SESS_CS"} -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
     | grep -av '^ *$' | grep -av '^=' | grep -av '^After line' | sed 's/^ *//;s/ *$//;s/  */ /g' | paste -sd'|'; }
 # an EXECUTE BLOCK / CREATE PROCEDURE script, terminators switched
 eb() { printf 'SET TERM ^;\n%s^\nSET TERM ;^\n' "$1"; }
@@ -736,11 +760,174 @@ refused "1c RECORDED ...T1.*, T2.X" "select * from (select t1.*, t2.x from t1 jo
 err_differs "1c RECORDED a JOIN ON's star: the engine's duplicate ID, this server's unnamed column" "select * from (select * from t1 join t2 on t1.id = t2.id) x where x.id = 1;" "column ID $DUP X"
 pin  "1c CONTROL the top-level NATURAL JOIN star answers" "select count(*) from t1 natural join t2 where id = 1;" "COUNT|1"
 
+echo "--- 2d. A CTE READ AS A COMMA ITEM IS READ (the third review's regression: an alias conflict here)"
+CAB='with a as (select 1 x from rdb$database), b as (select 2 y from rdb$database)'
+pin  "2d the member: FROM A, B" "$CAB select * from a, b;" "X Y|1 2"
+pin  "2d ...FROM B, A" "$CAB select * from b, a;" "Y X|2 1"
+pin  "2d ...FROM A, B, C" "$CAB, c as (select 3 z from rdb\$database) select * from a, b, c;" "X Y Z|1 2 3"
+pin  "2d ...FROM T1, A warns only the B it leaves unread" "$CAB select count(*) from t1, a;" "$W104|-CTE \"B\" $NOTUSED|COUNT|6"
+pin  "2d ...FROM T1 T, A, B" "$CAB select count(*) from t1 t, a, b;" "COUNT|6"
+pin  "2d ...FROM T1, T2, A" "with a as (select 1 x from rdb\$database) select count(*) from t1, t2, a;" "COUNT|36"
+pin  "2d ...a derived table between" "$CAB select * from a, (select 4 w from rdb\$database) d, b;" "X W Y|1 4 2"
+pin  "2d ...after a JOIN chain" "with a as (select 1 x from rdb\$database) select count(*) from t1 join t2 on t2.t1id = t1.id, a;" "COUNT|4"
+pin  "2d ...after a JOIN over a derived table" "$CAB select * from a join (select 1 z from rdb\$database) d on d.z = a.x, b;" "X Z Y|1 1 2"
+pin  "2d ...aliased: no warning" "$CAB select * from a a1, b b1;" "X Y|1 2"
+pin  "2d ...one aliased" "$CAB select * from a, b a2;" "X Y|1 2"
+pin  "2d ...ORDER BY after the list" "$CAB select * from a, b order by 1;" "X Y|1 2"
+pin  "2d ...reached through the comma item's body" "with a as (select 1 x from rdb\$database), b as (select x from a) select t.id, b.x from t1 t, b where t.id = 1;" "ID X|1 1"
+pin  "2d ...a comma inside a body" "with a as (select 1 x from rdb\$database), b as (select x from rdb\$database, a) select * from b;" "X|1"
+pin  "2d ...a SUBSTRING's FROM ahead of the list" "with a as (select 1 x from rdb\$database) select substring(t.v from 1 for 2), t.id from t1 t, a where t.id = 1;" "SUBSTRING ID|ap 1"
+pin  "2d ...an EXTRACT's FROM" "with a as (select 1 x from rdb\$database) select extract(year from t.d), t.id from t1 t, a where t.id = 1;" "EXTRACT ID|2020 1"
+pin  "2d ...a cycle through a comma item" "with a as (select * from t3, b), b as (select * from a) select * from a;" "$R104|-CTE '\"A\"' has cyclic dependencies"
+pin  "2d ...a recursive member's comma self-reference" "with recursive r (n) as (select 1 from rdb\$database union all select r.n + 1 from t3, r where r.n < 3 and t3.k = 1 and t3.name = 'x') select * from r;" "N|1|2|3"
+pin  "2d CONTROL an unused CTE named like a comma item's alias still conflicts" "with a as (select 1 x from rdb\$database), c as (select 2 y from rdb\$database) select count(*) from a, t1 c;" "$A204 \"C\" $CONF|$W104|-CTE \"C\" $NOTUSED"
+pin  "2d CONTROL a comma item aliased as a CTE the list reads" "$CAB select * from a b, b;" "$A204 \"B\" $CONF"
+pin  "2d CONTROL WITH LOCK over two comma CTEs" "$CAB select * from a, b with lock;" "$R104|-WITH LOCK can be used only with a single physical table"
+pin  "2d CONTROL CROSS JOIN" "$CAB select * from a cross join b;" "X Y|1 2"
+
+echo "--- 2e. A NON-ASCII BODY UNDER A UTF8 ATTACHMENT (byte offsets: the body closed one character late)"
+SESS_CS=UTF8
+pin  "2e an unused CTE over a non-ASCII literal warns and answers" "with c as (select 'ă' x from rdb\$database) select 1 from rdb\$database;" "$W104|-CTE \"C\" $NOTUSED|CONSTANT|1"
+pin  "2e ...read" "with c as (select 'ă' x from rdb\$database) select x from c;" "X|ă"
+pin  "2e ...in a WHERE" "with c as (select v from t1 where v = 'ă') select 1 from rdb\$database;" "$W104|-CTE \"C\" $NOTUSED|CONSTANT|1"
+pin  "2e ...under a CAST" "with c as (select cast('ă' as varchar(5)) x from rdb\$database) select 1 from rdb\$database;" "$W104|-CTE \"C\" $NOTUSED|CONSTANT|1"
+pin  "2e ...a non-ASCII main query too" "with c as (select 'ă' x from rdb\$database) select 'â' from rdb\$database;" "$W104|-CTE \"C\" $NOTUSED|CONSTANT|â"
+pin  "2e ...two CTEs, the second read" "with c as (select 'ă' x from rdb\$database), d as (select 'î' y from rdb\$database) select y from d;" "$W104|-CTE \"C\" $NOTUSED|Y|î"
+pin  "2e CONTROL the derived table" "select * from (select 'ă' x from rdb\$database);" "X|ă"
+
+echo "--- 3d. A COLUMN IS COUNTED IN BYTES OF THE TEXT AS SENT (a UTF8 attachment)"
+pin  "3d a literal ahead of the offender" "select 'ăâî', t.id from t1 t where t1.id = 1;" "$E206|-\"T1\".\"ID\"|-At line 1, column 39"
+pin  "3d ...and a quoted alias" "select 'ăâî' as \"ăă\", t.id from t1 t where t1.id = 1;" "$E206|-\"T1\".\"ID\"|-At line 1, column 49"
+pin  "3d ...a non-ASCII alias" "select t.id from t1 \"ă\" where \"ă\".nope = 1;" "$E206|-\"ă\".\"NOPE\"|-At line 1, column 32"
+pin  "3d ...a literal in the WHERE" "select t.id from t1 t where t.v = 'ăâ' and t1.id = 1;" "$E206|-\"T1\".\"ID\"|-At line 1, column 46"
+pin  "3d ...a -204's position too" "select 'ă' from nosuchtab;" "Statement failed, SQLSTATE = 42S02|Dynamic SQL Error|-SQL error code = -204|-Table unknown|-\"NOSUCHTAB\"|-At line 1, column 18"
+unset SESS_CS
+pin  "3d CONTROL under NONE a byte is a character" "select 'ăâî', t.id from t1 t where t1.id = 1;" "$E206|-\"T1\".\"ID\"|-At line 1, column 39"
+err_differs "3d RECORDED under NONE a non-ASCII name is re-encoded (the engine echoes its bytes)" "select t.id from t1 t where \"ă\".id = 1;" "-\"ă\".\"ID\""
+err_differs "3d RECORDED ...a derived table's" "select * from (select id, id from t1) \"ă\";" "derived table ă"
+
+echo "--- 3e. A NAMED WINDOW CLAUSE: after the plain fields, before the rest of the list, in declaration order"
+pin  "3e the member" "select sum(t.a) over w from t1 t window w as (order by t1.id);" "$E206|-\"T1\".\"ID\"|-At line 1, column 56"
+pin  "3e ...before the aggregate's own argument" "select sum(t1.a) over w from t1 t window w as (order by t1.id);" "$E206|-\"T1\".\"ID\"|-At line 1, column 57"
+pin  "3e ...after the WHERE" "select sum(t.a) over w from t1 t where t1.b = 1 window w as (order by t1.id);" "$E206|-\"T1\".\"B\"|-At line 1, column 40"
+pin  "3e ...after a plain field item" "select sum(t.a) over w, t1.b from t1 t window w as (order by t1.id);" "$E206|-\"T1\".\"B\"|-At line 1, column 25"
+pin  "3e ...before an expression item" "select t.b + t1.b, sum(t.a) over w from t1 t window w as (order by t1.id);" "$E206|-\"T1\".\"ID\"|-At line 1, column 68"
+pin  "3e ...before a subquery item" "select (select t1.a from rdb\$database), sum(t.a) over w from t1 t window w as (order by t1.id);" "$E206|-\"T1\".\"ID\"|-At line 1, column 89"
+pin  "3e ...an unread window is passed" "select t.id from t1 t window w as (order by t1.id);" "$E206|-\"T1\".\"ID\"|-At line 1, column 45"
+pin  "3e ...before GROUP BY" "select sum(t.a) over w from t1 t group by t1.a window w as (order by t1.id);" "$E206|-\"T1\".\"ID\"|-At line 1, column 70"
+pin  "3e ...before HAVING" "select count(*) from t1 t having max(t1.a) > 0 window w as (order by t1.id);" "$E206|-\"T1\".\"ID\"|-At line 1, column 70"
+pin  "3e ...before ORDER BY" "select sum(t.a) over w from t1 t window w as (order by t1.id) order by t1.b;" "$E206|-\"T1\".\"ID\"|-At line 1, column 56"
+pin  "3e ...ORDER BY after a clean window" "select sum(t.a) over w from t1 t window w as (order by t.id) order by t1.id;" "$E206|-\"T1\".\"ID\"|-At line 1, column 71"
+pin  "3e ...declaration order, not the list's" "select sum(t.a) over w2, sum(t.a) over w1 from t1 t window w1 as (order by t1.a), w2 as (order by t1.b);" "$E206|-\"T1\".\"A\"|-At line 1, column 76"
+pin  "3e ...declaration order, reversed" "select sum(t.a) over w1 from t1 t window w2 as (order by t1.b), w1 as (order by t1.a);" "$E206|-\"T1\".\"B\"|-At line 1, column 58"
+pin  "3e ...inside: the ORDER BY before the PARTITION BY" "select sum(t.a) over w from t1 t window w as (partition by t1.b order by t1.id);" "$E206|-\"T1\".\"ID\"|-At line 1, column 74"
+pin  "3e ...the frame first" "select sum(t.a) over w from t1 t window w as (partition by t1.b order by t1.id rows between t1.a preceding and current row);" "$E206|-\"T1\".\"A\"|-At line 1, column 93"
+pin  "3e ...the named window under an inline extension" "select sum(t.a) over (w order by t1.id) from t1 t window w as (partition by t1.b);" "$E206|-\"T1\".\"B\"|-At line 1, column 77"
+pin  "3e ...over a join" "select sum(t.a) over w from t1 t join t2 u on u.id = t.id window w as (order by t1.id);" "$E206|-\"T1\".\"ID\"|-At line 1, column 81"
+pin  "3e CONTROL a clean named window answers" "select sum(t.a) over w from t1 t window w as (order by t.id);" "SUM|10|30|30|40|70|90"
+pin  "3e CONTROL ...two items over one window" "select sum(t.a) over w, count(*) over w from t1 t window w as (order by t.id) order by t.id;" "SUM COUNT|10 1|30 2|30 3|40 4|70 5|90 6"
+err_differs "3e RECORDED a window over another: the engine's -204 comes first" "select sum(t.a) over w from t1 t window w as (order by t.id), w2 as (w partition by t1.b);" "Cannot use PARTITION BY clause while overriding the window W"
+
+echo "--- 1d. A SUBQUERY's NAME IS NO ALIAS - and it names a derived table's column (a merge's regression: refused here)"
+pin  "1d the member: ORDER BY a qualified key of the subquery's name" "select (select x.id from t2 x where x.id = 1) from t1 t order by t.id;" "ID|1|1|1|1|1|1"
+pin  "1d ...DESC" "select (select x.id from t2 x where x.id = 1) from t1 t order by t.id desc;" "ID|1|1|1|1|1|1"
+pin  "1d ...GROUP BY" "select (select x.id from t2 x where x.id = 1) from t1 t group by t.id;" "ID|1|1|1|1|1|1"
+pin  "1d ...an unaliased inner" "select (select id from t2 where id = 1) from t1 t order by t.id;" "ID|1|1|1|1|1|1"
+pin  "1d ...beside the key's own field" "select t.id, (select t1.id from t2 t1 where t1.id = 1) from t1 t order by t.id;" "ID ID|1 1|2 1|3 1|4 1|5 1|6 1"
+pin  "1d ...an X over T2" "select (select x.x from t2 x where x.id = 1) from t2 t order by t.x;" "X|5|5|5|5|5|5"
+pin  "1d ...an unaliased FROM" "select (select x.id from t2 x where x.id = 1) from t1 order by t1.id;" "ID|1|1|1|1|1|1"
+pin  "1d ...ORDER BY 1, T.ID" "select (select x.id from t2 x where x.id = 1) from t1 t order by 1, t.id;" "ID|1|1|1|1|1|1"
+pin  "1d ...under a WHERE" "select (select x.id from t2 x where x.id = 1) from t1 t where t.id = 1 order by t.id;" "ID|1"
+pin  "1d ...beside a field item" "select (select x.id from t2 x where x.id = 1), t.a from t1 t order by t.id;" "ID A|1 10|1 20|1 <null>|1 10|1 30|1 20"
+pin  "1d a bare GROUP BY of its name is the COLUMN: six groups (one here before)" "select (select x.id from t2 x where x.id = 1) from t1 t group by id;" "ID|1|1|1|1|1|1"
+err_differs "1d ...a bare ORDER BY of a name only the subquery carries is -206 (answered here before)" "select (select x.x from t2 x where x.id = 2) from t1 t order by x;" "-\"X\"|-At line 1, column 65"
+err_differs "1d ...GROUP BY" "select (select x.x from t2 x where x.id = 2) from t1 t group by x;" "-\"X\"|-At line 1, column 65"
+err_differs "1d ...a text one" "select (select x.s from t2 x where x.id = 2) from t1 t where t.id < 3 order by s;" "-\"S\"|-At line 1, column 80"
+pin  "1d a derived table's subquery column is named" "select * from (select (select x.x from t2 x where x.id = 2), t.id from t1 t where t.id < 3) d;" "X ID|6 1|6 2"
+pin  "1d ...correlated" "select * from (select (select x.x from t2 x where x.id = t.id) from t1 t where t.id < 3) d;" "X|5|6"
+pin  "1d ...an unqualified inner" "select * from (select (select name from t3 where k = 2) from t1 t where t.id < 3) d;" "NAME|y|y"
+pin  "1d ...no row" "select * from (select (select x.x from t2 x where x.id = 99) from t1 t where t.id < 3) d;" "X|<null>|<null>"
+pin  "1d ...through a CTE" "with c as (select (select x.x from t2 x where x.id = 2) from t1 t where t.id < 3) select * from c;" "X|6|6"
+pin  "1d ...two of one name are the duplicate" "select * from (select (select x.x from t2 x where x.id = 2), (select y.x from t2 y where y.id = 1) from t1 t where t.id < 3) d;" "$I104|-column X $DUP D"
+pin  "1d ...and beside a field of its name" "select * from (select (select x.id from t2 x where x.id = 2), t.id from t1 t where t.id < 3) d;" "$I104|-column ID $DUP D"
+pin  "1d CONTROL an aggregate inner is unnamed" "select * from (select (select max(x.x) from t2 x) from t1 t where t.id < 3) d;" "$I104|-$NU 1 in derived table D"
+pin  "1d CONTROL ...an expression inner" "select * from (select (select x.x + 1 from t2 x where x.id = 2) from t1 t where t.id < 3) d;" "$I104|-$NU 1 in derived table D"
+pin  "1d CONTROL ...an arithmetic over the subquery" "select * from (select (select x.x from t2 x where x.id = 2) + 0 from t1 t where t.id < 3) d;" "$I104|-$NU 1 in derived table D"
+pin  "1d CONTROL ...a CAST of a field" "select * from (select cast(t.a as bigint) from t1 t) d;" "$I104|-$NU 1 in derived table D"
+pin  "1d CONTROL an aliased inner item" "select * from (select (select x.x c from t2 x where x.id = 2) from t1 t where t.id < 3) d;" "C|6|6"
+pin  "1d CONTROL the subquery's describe" "set sqlda_display on; select (select x.x from t2 x where x.id = 2) from t1 t where t.id < 2;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: X alias: X|: table: T2 schema: PUBLIC owner: SYSDBA|X|6"
+refused "1d RECORDED a qualified key under an ALIAS of its name (the alias-first law's refusal)" "select 1 id from t1 t order by t.id;"
+refused "1d RECORDED ...a subquery aliased so" "select (select x.id from t2 x where x.id = 1) id from t1 t order by t.id;"
+refused "1d RECORDED a FIRST .. ORDER BY inner in a derived table" "select * from (select (select first 1 x.x from t2 x order by 1) from t1 t where t.id < 3) d;"
+
+echo "--- 1e. A CORRELATED SUBQUERY's NAME IS NO ALIAS EITHER (the fourth review: a regression from master to a refusal, and wrong sorts)"
+pin  "1e the member: GROUP BY a qualified key of a correlated subquery's name" "select (select x.id from t2 x where x.id = t.id) from t1 t group by t.id;" "ID|1|2|3|4|5|6"
+pin  "1e ...ORDER BY 1 DESC" "select (select x.id from t2 x where x.id = t.id) from t1 t group by t.id order by 1 desc;" "ID|6|5|4|3|2|1"
+pin  "1e ...beside the key's field, ORDER BY T.ID DESC" "select t.id, (select x.id from t2 x where x.id = t.id) from t1 t group by t.id order by t.id desc;" "ID ID|6 6|5 5|4 4|3 3|2 2|1 1"
+pin  "1e ...under a WHERE" "select (select x.id from t2 x where x.id = t.id) from t1 t where t.id > 2 group by t.id;" "ID|3|4|5|6"
+pin  "1e ...a HAVING" "select (select x.id from t2 x where x.id = t.id) from t1 t group by t.id having t.id > 3;" "ID|4|5|6"
+pin  "1e ...two of them" "select (select x.id from t2 x where x.id = t.id), (select y.x from t2 y where y.id = t.id) from t1 t group by t.id order by t.id;" "ID X|1 5|2 6|3 <null>|4 8|5 9|6 10"
+pin  "1e ...a bare GROUP BY of its name is the COLUMN" "select (select x.id from t2 x where x.id = t.id) from t1 t group by id;" "ID|1|2|3|4|5|6"
+pin  "1e ...a bare ORDER BY of it after two keys" "select (select x.id from t2 x where x.id = t.id) from t1 t group by t.id, t.a order by id;" "ID|1|2|3|4|5|6"
+pin  "1e a bare ORDER BY of its name sorts by the OUTER column (by the subquery here before)" "select (select x.a from t1 x where x.id = 7 - t.id) from t1 t order by a;" "A|10|20|<null>|30|10|20"
+pin  "1e ...an ID-named one" "select (select x.id from t2 x where x.id = 7 - t.id) from t1 t order by id;" "ID|6|5|4|3|2|1"
+pin  "1e ...NULLS FIRST beside a field" "select (select x.v from t1 x where x.id = 7 - t.id), t.id from t1 t order by v nulls first;" "V ID|cherry 4|apple 6|banana 5|Apple 1|a_b%c 2|<null> 3"
+pin  "1e ...a qualified key of its name (refused here before)" "select (select x.a from t1 x where x.id = 7 - t.id) from t1 t order by t.a, t.id;" "A|10|20|<null>|30|10|20"
+pin  "1e ...beside the field of its name" "select (select x.a from t1 x where x.id = 7 - t.id), t.a from t1 t order by a, 1;" "A A|10 <null>|<null> 10|20 10|10 20|30 20|20 30"
+pin  "1e ...under a WHERE" "select (select x.a from t1 x where x.id = 7 - t.id) from t1 t where t.id > 1 order by a;" "A|10|<null>|30|10|20"
+pin  "1e ...FIRST" "select first 3 (select x.a from t1 x where x.id = 7 - t.id) from t1 t order by a desc;" "A|20|30|10"
+pin  "1e ...ROWS" "select (select x.a from t1 x where x.id = 7 - t.id) from t1 t order by a desc rows 2;" "A|20|30"
+pin  "1e ...over a derived table" "select (select x.a from t1 x where x.id = 7 - d.id) from (select id, a from t1) d order by a;" "A|10|20|<null>|30|10|20"
+pin  "1e ...over a CTE" "with c as (select id, a from t1) select (select x.a from t1 x where x.id = 7 - c.id) from c order by a;" "A|10|20|<null>|30|10|20"
+pin  "1e ...over a join" "select (select x.a from t1 x where x.id = 7 - t.id) from t1 t join t2 u on u.id = t.id order by a;" "A|10|20|<null>|30|10|20"
+err_differs "1e ...a name only the subquery carries is -206 (answered here before)" "select (select x.x from t2 x where x.id = t.id) from t1 t order by x;" "-\"X\"|-At line 1, column 68"
+err_differs "1e ...a text one" "select (select x.s from t2 x where x.id = t.id) from t1 t order by s;" "-\"S\"|-At line 1, column 68"
+err_differs "1e ...an inner alias" "select (select x.x as q from t2 x where x.id = t.id) from t1 t order by q;" "-\"Q\"|-At line 1, column 73"
+err_differs "1e ...DISTINCT" "select distinct (select x.x from t2 x where x.id = t.id) from t1 t order by x;" "-\"X\"|-At line 1, column 77"
+err_differs "1e ...beside an EXISTS" "select (select x.s from t2 x where x.id = t.id) from t1 t where exists (select 1 from t2 z where z.t1id = t.id) order by s;" "-\"S\"|-At line 1, column 122"
+err_differs "1e ...grouped" "select (select x.s from t2 x where x.id = t.id) from t1 t group by t.id order by s;" "-\"S\"|-At line 1, column 82"
+err_differs "1e ...GROUP BY" "select (select x.x from t2 x where x.id = t.id) from t1 t group by x;" "-\"X\"|-At line 1, column 68"
+err_differs "1e ...over a derived table" "select (select x.x from t2 x where x.id = d.id) from (select id, a from t1) d order by x;" "-\"X\"|-At line 1, column 88"
+pin  "1e CONTROL a real alias of its name still sorts by the subquery" "select (select x.x from t2 x where x.id = t.id) as x from t1 t order by x;" "X|<null>|5|6|8|9|10"
+pin  "1e CONTROL ...ORDER BY 1 DESC" "select (select x.x from t2 x where x.id = t.id) from t1 t order by 1 desc;" "X|10|9|8|6|5|<null>"
+pin  "1e CONTROL a per-row one beside a lookup one keeps its name" "select (select x.s from t2 x where x.id = 7 - t.id), (select y.v from t1 y where y.id = t.id) from t1 t order by v;" "S V|three <null>|one Apple|two a_b%c|six apple|five banana|<null> cherry"
+pin  "1e CONTROL ...an inner alias beside an aggregate one" "select (select x.s as q from t2 x where x.id = 7 - t.id), (select count(*) from t2 y where y.t1id = t.id) from t1 t order by t.id;" "Q COUNT|six 2|five 1|<null> 0|three 1|two 0|one 0"
+pin  "1e a quoted lower-case inner alias keeps its case" "select (select x.s as \"q\" from t2 x where x.id = 7 - t.id) from t1 t where t.id = 1;" "q|six"
+pin  "1e ...folded (upper-cased here before)" "select (select x.s as \"q\" from t2 x where x.id = 1) from t1 t where t.id = 1;" "q|one"
+pin  "1e ...a lower-case column folds" "select (select x.s from t2 x where x.id = 7 - t.id) from t1 t where t.id = 1;" "S|six"
+pin  "1e ...a spaced name" "select (select x.s as \"My Q\" from t2 x where x.id = 7 - t.id) from t1 t where t.id = 1;" "My Q|six"
+pin  "1e ...over a derived table" "select (select x.s as \"q\" from t2 x where x.id = 7 - d.id) from (select id from t1) d where d.id = 1;" "q|six"
+pin  "1e CONTROL the describe" "set sqlda_display on; select (select x.s from t2 x where x.id = 7 - t.id) from t1 t where t.id = 1;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 20 charset: 0 SYSTEM.NONE|: name: S alias: S|: table: T2 schema: PUBLIC owner: SYSDBA|S|six"
+refused "1e RECORDED a star beside it" "select t.*, (select x.s from t2 x where x.id = 7 - t.id) from t1 t order by id;"
+refused "1e RECORDED a GROUP BY over a join" "select (select x.x from t2 x where x.id = t.id) from t1 t join t2 u on u.id = t.id group by t.id order by t.id;"
+
+echo "--- 2f. A COMMITTED DDL PURGES THE STATEMENT CACHE: the warning comes back"
+WA='with a as (select 1 x from rdb$database) select 1 from rdb$database;'
+pin  "2f a CREATE TABLE and its COMMIT between two prepares" "$WA $WA create table zz1 (i int); commit; $WA" "$W104|-CTE \"A\" $NOTUSED|CONSTANT|1|CONSTANT|1|$W104|-CTE \"A\" $NOTUSED|CONSTANT|1"
+WB='with a as (select 1 x from rdb$database) select 2 from rdb$database;'
+pin  "2f ...an ALTER; a COMMIT or ROLLBACK alone does not" "$WB commit; $WB alter table t3 add q int; commit; $WB rollback; $WB" "$W104|-CTE \"A\" $NOTUSED|CONSTANT|2|CONSTANT|2|$W104|-CTE \"A\" $NOTUSED|CONSTANT|2|CONSTANT|2"
+# another attachment's DDL: session 1 warns, session 2 commits a table,
+# session 1 repeats the text - and warns again
+xatt() { # <dsn> <table>
+    local q='with a as (select 1 x from rdb$database) select 3 from rdb$database;'
+    { echo "$q"; sleep 2; echo "$q"; sleep 3; echo "$q"; } | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
+        | grep -av '^ *$' | grep -av '^=' | sed 's/^ *//;s/ *$//;s/  */ /g' | paste -sd'|' &
+    local s1=$!
+    sleep 3.5; echo "create table $2 (i int); commit;" | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" >/dev/null 2>&1
+    wait $s1
+}
+ran=$((ran + 1))
+XW="$W104|-CTE \"A\" $NOTUSED|CONSTANT|3|CONSTANT|3|$W104|-CTE \"A\" $NOTUSED|CONSTANT|3"
+xe=$(xatt "127.0.0.1/$REAL:$ENG" zz2); xf=$(xatt "127.0.0.1/$PORT:$FC" zz2)
+if [ "$xe" != "$XW" ]; then echo "FAIL 2f ...another attachment's DDL - THE ENGINE ANSWERS [$xe]"; fail=1
+elif [ "$xe" != "$xf" ]; then echo "FAIL 2f ...another attachment's DDL"; echo "     eng=[$xe]"; echo "     fc =[$xf]"; fail=1
+else echo "OK   2f ...another attachment's DDL [$xe]"; fi
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-semchk-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 430 ]; then echo "FAIL only $ran checks ran (floor 430)"; fail=1; fi
+if [ "$ran" -lt 560 ]; then echo "FAIL only $ran checks ran (floor 560)"; fail=1; fi
 exit $fail

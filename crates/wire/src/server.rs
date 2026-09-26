@@ -1901,6 +1901,55 @@ fn ddl_relation_target(plan: &Plan) -> Option<&str> {
     }
 }
 
+/// The relation an `ALTER TABLE` statement names, for every ALTER TABLE
+/// form this server plans.
+fn alter_table_target(plan: &Plan) -> Option<&str> {
+    match plan {
+        Plan::DropTable { .. } => None,
+        Plan::AlterColumnDropIdentity { table, .. } | Plan::AlterColumnPosition { table, .. } => Some(table),
+        _ => ddl_relation_target(plan),
+    }
+}
+
+/// A COMMIT refused because a dropped exception (7) or sequence (14) is
+/// still used ([fire_crab_ods::ddl::refused_drop]): "unsuccessful
+/// metadata update / cannot delete / EXCEPTION @1 | GENERATOR @1 / there
+/// are N dependencies" (42000, measured on 2182 - the commit's answer
+/// under AUTODDL OFF, and under isql's AUTODDL the DDL statement's).
+fn respond_drop_refused(
+    s: &mut TcpStream,
+    enc: &mut Option<Rc4>,
+    name: &str,
+    on_type: i64,
+    n: usize,
+) -> std::io::Result<()> {
+    let kind = if on_type == 7 { 335544610 } else { 335544815 }; // isc_exception_name / isc_generator_name
+    let qn = format!("\"PUBLIC\".\"{}\"", name.trim_end());
+    let mut w = W::default();
+    w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+    w.int(1).int(GDS_NO_META_UPDATE)
+        .int(1).int(335544673) // isc_no_delete - "cannot delete"
+        .int(1).int(kind).int(2).bytes(qn.as_bytes())
+        .int(1).int(335544630).int(4).int(n as i32) // isc_dependency
+        .int(0);
+    w.send(s, enc)
+}
+
+/// The refusal a COMMIT owes before it writes anything: a pending
+/// [fire_crab_ods::DdlDeferred::CheckDependents] whose object something
+/// still uses, counted on the image this transaction sees. The
+/// transaction stays ACTIVE when it answers (measured on 2182: the
+/// dropped exception is still invisible to it afterwards, a DROP of its
+/// user and a second COMMIT pass, a ROLLBACK brings it back).
+fn commit_refusal(database: &Option<Database>) -> Option<(String, i64, usize)> {
+    let db = database.as_ref()?;
+    let pending = db.ddl_deferred.iter().chain(db.windows.iter().flat_map(|w| w.deferred.iter()));
+    if !pending.clone().any(|d| matches!(d, fire_crab_ods::DdlDeferred::CheckDependents { .. })) {
+        return None;
+    }
+    fire_crab_ods::ddl::refused_drop(&db.bytes(), db.page_size, pending)
+}
+
 fn ddl_dup_codes(plan: &Plan) -> Option<(i32, i32, String)> {
     // RELATIONS carry a CANONICAL name by now ([canon_ident] at the
     // planner): print it as stored, or `CREATE TABLE "tq"` beside TQ
@@ -1944,6 +1993,7 @@ fn respond_ddl_meta(
     let verb_of = |plan: &Plan| -> Option<(i32, String)> {
         match plan {
             Plan::CreateTable { name, .. } => Some((336397286, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
+            Plan::CreateView { name, .. } => Some((336397298, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
             Plan::Recreate(inner) => match inner.as_ref() {
                 Plan::CreateTable { name, .. } => Some((336397289, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
                 Plan::CreateView { name, .. } => Some((336397301, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
@@ -2461,6 +2511,24 @@ fn respond_ddl_meta(
             w.send(s, enc)?;
             return Ok(true);
         }
+        // ALTER TABLE over a view or a missing name: the DROP TABLE
+        // vector below under the ALTER verb (measured)
+        let alter_gone = alter_table_target(plan).filter(|_| lc.ends_with(": table does not exist"));
+        if let Some(name) = alter_gone {
+            let qn = format!("\"PUBLIC\".\"{}\"", name.trim_end()); // canonical, as stored
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(ALTER_TABLE_FAILED)
+                .int(2).bytes(qn.as_bytes())
+                .int(1).int(335544436).int(4).int(-607) // isc_sqlerr
+                .int(1).int(335544570) // isc_dsql_command_err
+                .int(1).int(336397206) // isc_dsql_table_not_found, 42S02
+                .int(2).bytes(qn.as_bytes())
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
         if let Plan::DropTable { name } = plan {
             let qn = format!("\"PUBLIC\".\"{}\"", name.trim_end()); // canonical, as stored
             let mut w = W::default();
@@ -2601,7 +2669,20 @@ fn respond_ddl_meta(
         return Ok(true);
     }
     // (verb-failed code, qualified name, reason code, reason-carries-name)
-    let parts: Option<(i32, String, i32, bool)> = if lc.contains("already exists") {
+    let relation_verb = verb_of(plan);
+    let parts: Option<(i32, String, i32, bool)> = if let (true, Some((f, qn))) =
+        (lc.starts_with("procedure ") && lc.ends_with(" already exists"), relation_verb)
+    {
+        // a relation named like a plain procedure: the relation verb and
+        // isc "Procedure @1 already exists" (measured, 42000). A RELATION
+        // verb only: a duplicate CREATE PROCEDURE says the same words and
+        // takes the uniform duplicate arm below (review-caught: it lost
+        // its "CREATE PROCEDURE @1 failed" line to a bare Dynamic SQL Error)
+        Some((f, qn, 336068743, true))
+    } else if let (true, Plan::CreateProcedure { name, .. }) = (lc.starts_with("table ") && lc.ends_with(" already exists"), plan) {
+        // ...and the mirror: a procedure named like a relation
+        Some((336397265, q(name), 336068740, true))
+    } else if lc.contains("already exists") {
         // a DUPLICATE create - uniform across every object type
         ddl_dup_codes(plan).map(|(f, r, qn)| (f, qn, r, true))
     } else if lc.contains("not found") || lc.contains("is not defined") {
@@ -3011,12 +3092,20 @@ fn take_repeat_warnings(db: &Option<Database>, text: &str) {
     if PREPARE_WARNINGS.with(|p| p.borrow().is_empty()) {
         return;
     }
+    // ...AND A COMMITTED DDL PURGES THAT CACHE, this attachment's or
+    // another's (measured: `WITH A AS (..) SELECT 1 FROM RDB$DATABASE`,
+    // then `CREATE TABLE ZZ (I INT)` / `ALTER TABLE T3 ADD Q INT` and a
+    // COMMIT - here or in a second session - then the same text warns
+    // again; a COMMIT, a ROLLBACK or a SET TRANSACTION alone does not).
+    // The metadata generation every DDL moves is the purge: a text is
+    // remembered under the generation it warned in.
+    let gen = db.meta.generation();
     let mut warned = db.warned_texts.borrow_mut();
     // bounded the way the engine's cache is: a full one starts over
     if warned.len() >= 4096 {
         warned.clear();
     }
-    if !warned.insert(text.to_string()) {
+    if !warned.insert((gen, text.to_string())) {
         PREPARE_WARNINGS.with(|p| p.borrow_mut().clear());
     }
 }
@@ -3307,7 +3396,7 @@ struct Database {
     /// the statement texts whose prepare WARNINGS this attachment has
     /// already been given - the engine's statement cache serves a
     /// repeated text without them ([take_repeat_warnings])
-    warned_texts: std::cell::RefCell<std::collections::HashSet<String>>,
+    warned_texts: std::cell::RefCell<std::collections::HashSet<(u64, String)>>,
     /// the event names this transaction has posted, so its commit can
     /// say what the counters became - the only thing observable about an
     /// event until the auxiliary connection carries deliveries.
@@ -18115,6 +18204,9 @@ thread_local! {
     /// planner threads its database handle through 49 signatures already,
     /// and this is one connection-wide fact, not a per-call argument.
     static CURRENT_ATT_CS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// set while [simple_case_mixed] resolves a CASE's branches: no
+    /// distribution is attempted inside ([push_into_simple_case])
+    static PUSH_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Decode STATEMENT TEXT by the attachment character set.
@@ -18912,6 +19004,14 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
         // a body whose stored source lost a literal is not the body the
         // engine runs ([source_literals_lost]) - refused, whole
         if trig_source_lost(db, values, blr_f, &source) {
+            refuse = true;
+            return;
+        }
+        // ...and so is one with a local of a collation no slot carries
+        // ([body_declares_collated_slot]): `DECLARE V DCI; ... NEW.R =
+        // IIF(V = 'É', 1, 0)` over a UNICODE_CI domain stores 1 on 2182,
+        // and the byte compare here stored 0
+        if source_declares_collated_slot(Some(db), &source) {
             refuse = true;
             return;
         }
@@ -20017,6 +20117,16 @@ fn line_col_of(before: &str) -> (i64, i64) {
     // measures the whole text before it (probed: `SELECT *<CR>FROM
     // PNOOUT` is line 2 column 6, and `SELECT *<CR><LF>FROM PNOOUT` is
     // the SAME line 2 column 6, not line 3).
+    //
+    // A COLUMN IS COUNTED IN BYTES OF THE TEXT AS SENT (measured on 2182
+    // under a UTF8 attachment: `SELECT 'ăâî', T.ID FROM T1 T WHERE T1.ID
+    // = 1` is column 39, three more than its characters; under NONE the
+    // same text is 39 too, one byte per character). This server's text
+    // is the decoded statement: under UTF8 / UNICODE_FSS a character's
+    // wire bytes are its UTF-8 bytes, under a byte carrier or a
+    // single-byte set it was one byte, and the other multi-byte sets
+    // keep the character count they always had.
+    let utf8_att = matches!(CURRENT_ATT_CS.with(|c| c.get()), 3 | 4);
     let (mut line, mut col) = (1i64, 1i64);
     let mut after_cr = false;
     for c in before.chars() {
@@ -20024,6 +20134,7 @@ fn line_col_of(before: &str) -> (i64, i64) {
             '\r' => (line, col) = (line + 1, 1),
             '\n' if after_cr => {}
             '\n' => (line, col) = (line + 1, 1),
+            _ if utf8_att => col += c.len_utf8() as i64,
             _ => col += 1,
         }
         after_cr = c == '\r';
@@ -20714,10 +20825,15 @@ fn text_form_m(
     // (cubic; serve-real-deepexpr timed out); [expr_is_octets] and
     // [carrier_fn_args] do the same at every level of nested UPPERs. The
     // early answers are unchanged: these types are Text or None, neither
-    // of which any probe matches, and none has a DECFLOAT width.
+    // of which any probe matches, and none has a DECFLOAT width. A CAST
+    // TO TEXT is Text or untypeable too - and it is the synthetic
+    // transcoding CAST the recode passes put at every level of a nested
+    // string-function chain, where its probe made the form quadratic
+    // again (390 nested `TRIM(... || 'b')`, serve-real-deepexpr).
     let concat = matches!(
         e,
         Expr::Concat(..)
+            | Expr::Cast(_, CastTarget::Text { .. }, _)
             | Expr::Func(
                 SysFn::Upper
                     | SysFn::Lower
@@ -20997,10 +21113,17 @@ fn text_form_m(
             // LEFT, RIGHT, REVERSE, LPAD and REPLACE answer charset 0
             // NONE and STAY NONE under UTF8. Not a uniform rule, so it
             // is applied only to the four that were measured to take it.
+            //
+            // A temporal's form is the NONE one the temporal arm above
+            // answers, so only an operand of that form is probed: the
+            // probe walks the operand's whole subtree, and asked at every
+            // level of a nested chain it made the form quadratic (390
+            // nested `TRIM(... || 'b')`, serve-real-deepexpr).
             let ascii_over_temporal = |i: usize, r: Option<(bool, i32, TfCs)>| {
-                let temporal = args
-                    .get(i)
-                    .is_some_and(|a| matches!(a.type_of(descs), Some(ExprType::Temporal(_))));
+                let temporal = matches!(r, Some((true, _, TfCs::Ttype(0))))
+                    && args
+                        .get(i)
+                        .is_some_and(|a| matches!(a.type_of(descs), Some(ExprType::Temporal(_))));
                 match (temporal, r) {
                     (true, Some((v, w, _))) => {
                         Some((v, w, TfCs::Ttype(fire_crab_ods::intl::CS_ASCII as i32)))
@@ -21267,15 +21390,7 @@ fn deliver_in_announced_set(e: Expr, descs: &[Descriptor]) -> Expr {
     }
     let Some((_, w, run)) = value_form(&e, descs) else { return e };
     let att = CURRENT_ATT_CS.with(|c| c.get());
-    let sub_type = text_sub_type(&e, descs);
-    let announced = if sub_type == ATT_SUBTYPE {
-        att
-    } else if sub_type <= -2 {
-        let cs = (-2 - sub_type) as u8;
-        if att != 0 { att } else { cs }
-    } else {
-        charset_id(sub_type as i16)
-    };
+    let announced = announced_set(text_sub_type(&e, descs));
     // a literal under a NONE attachment is a NONE value like any other
     // here - `REPLACE('aÉb', U, 'x')` is one, delivered through the
     // UTF8 its describe negotiated (the bytes validated, measured)
@@ -32199,7 +32314,7 @@ fn wrap_returning(
                     new_rel.qual_only = true;
                     scope.rels.push(new_rel);
                 }
-                lifted = lift_corr_text(body, &scope, dbr, db, false)?;
+                lifted = lift_corr_text(body, &scope, dbr, db, None)?;
                 lifted.as_str()
             } else {
                 body
@@ -33411,7 +33526,27 @@ fn plan_insert_select(
     // (probed: `... SELECT X, Y FROM SRC WHERE X = ? AND Y = ?` ->
     // `496 LONG`, then `448 VARYING len 10`).
     let mut sink: Vec<Option<Descriptor>> = Vec::new();
-    let src = plan_query_inner(s[sel..].trim(), db, &mut sink)?;
+    // each select item is ASSIGNED TO ITS TARGET COLUMN, whose type
+    // decides the literal fold ([ItemFold]): `INSERT INTO T (DBL) SELECT
+    // CAST(0.4e0 + 0.4e0 AS INT128) ..` stores 1, into an INT128 0
+    if let Some(Proj::Items(items)) = split_query(s[sel..].trim()).and_then(|(p, ..)| parse_projection(p)) {
+        let folds: Vec<(RawExpr, ItemFold)> = items
+            .iter()
+            .zip(&listed)
+            .filter_map(|(it, fid)| {
+                let raw = match it {
+                    SelItem::Col(c, _) => RawExpr::Col(c.clone()),
+                    SelItem::Expr(raw, ..) => raw.clone(),
+                    _ => return None,
+                };
+                Some((raw, dest_item_fold(descs.get(*fid)?)))
+            })
+            .collect();
+        PENDING_ITEM_FOLDS.with(|p| *p.borrow_mut() = Some(folds));
+    }
+    let src = plan_query_inner(s[sel..].trim(), db, &mut sink);
+    PENDING_ITEM_FOLDS.with(|p| p.borrow_mut().take());
+    let src = src?;
     // A SOURCE THE PLANNER REFUSED refuses the INSERT at prepare too. A
     // derived-table source whose outer clauses do not resolve comes back
     // as [Plan::Refused] (not None), and carried into the INSERT it
@@ -33426,6 +33561,29 @@ fn plan_insert_select(
         Plan::RefusedEval(e) => return Some((Plan::RefusedEval(e), Vec::new())),
         other => other,
     };
+    // A SIMPLE CASE's branch is stored from its own set: each moves into
+    // the target column's ([deliver_simple_case]), not into the CASE's
+    // negotiated set first
+    if let Plan::Project { formats: sf, cols: scols, .. } = &mut src {
+        let sdescs = sf.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.clone()).unwrap_or_default();
+        for (c, fid) in scols.iter_mut().zip(listed.iter()) {
+            let Some(t) = descs.get(*fid) else { continue };
+            if !matches!(t.dtype, dtype::TEXT | dtype::VARYING) {
+                continue;
+            }
+            let tcs = fire_crab_ods::intl::charset_id(t.sub_type);
+            if !(fire_crab_ods::intl::byte_carrier(tcs)
+                || fire_crab_ods::intl::tabled(tcs)
+                || tcs == fire_crab_ods::intl::CS_UTF8)
+            {
+                continue;
+            }
+            if let Some(d) = c.expr.as_ref().and_then(|e| deliver_simple_case(e, tcs, Some(&sdescs))) {
+                c.expr = Some(d);
+                c.sub_type = tcs as i32;
+            }
+        }
+    }
     peel_delivery_wrap(&mut src);
     // an approximate source that is not a RUNTIME double - a literal,
     // ROUND / TRUNC, a conditional - into a DECFLOAT column refuses: the
@@ -33589,7 +33747,30 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         if parts.len() != count_top_commas(inner) + 1 {
             return None;
         }
-        for part_text in parts {
+        // each value is ASSIGNED TO ITS COLUMN, whose type decides the
+        // literal fold ([ItemFold]): the destination per position, read
+        // ahead of the target-list resolution below
+        let dest_folds: Vec<ItemFold> = db
+            .as_ref()
+            .and_then(|dbr| {
+                let meta = dbr.relation_meta(table)?;
+                let (_, descs) = meta.formats.iter().max_by_key(|(n, _)| *n)?;
+                let fids: Vec<usize> = match &collist {
+                    Some(names) => names
+                        .iter()
+                        .map(|n| find_col(&meta.columns, n).map(|rc| rc.field_id as usize))
+                        .collect::<Option<_>>()?,
+                    None => meta
+                        .columns
+                        .iter()
+                        .map(|c| c.field_id as usize)
+                        .filter(|f| !is_computed_fid(descs, *f))
+                        .collect(),
+                };
+                fids.iter().map(|f| descs.get(*f).map(dest_item_fold)).collect()
+            })
+            .unwrap_or_default();
+        for (part_no, part_text) in parts.into_iter().enumerate() {
             let toks = tokenize(&part_text)?;
             vals.push(match &toks[..] {
                 [Tok::Int(n)] => InsVal::Int(*n),
@@ -33668,8 +33849,10 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                     // REAL value, and a TYPED fold answering NULL (a
                     // CASE whose ELSE is NULL types None but folds its
                     // date arm; CAST(NULL AS ..)), both stay accepted.
-                    let e = parse_raw_expr_any(part_text.trim())
-                        .and_then(|r| resolve_expr(&r, &[], &[]))?;
+                    let e = parse_raw_expr_any(part_text.trim()).and_then(|r| match dest_folds.get(part_no) {
+                        Some(f) => resolve_item_folded(&r, *f, || resolve_expr(&r, &[], &[])),
+                        None => resolve_expr(&r, &[], &[]),
+                    })?;
                     let typed = e.type_of(&[]).is_some();
                     // A CONSTANT TREE WHOSE DOUBLE FOLD OVERFLOWS is not a
                     // refusal yet: its value may be perfectly representable
@@ -36582,7 +36765,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 let rhs = if rhs.contains('(')
                     && find_word(&mask_literals(&rhs.to_ascii_uppercase()), "SELECT", 0).is_some()
                 {
-                    rhs_lifted = lift_corr_text(rhs, &set_scope, db, db_outer, false)?;
+                    rhs_lifted = lift_corr_text(rhs, &set_scope, db, db_outer, None)?;
                     if trace_on() {
                         eprintln!("[srv] update SET per-row sub {:?}", rhs_lifted);
                     }
@@ -36630,7 +36813,9 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                     continue;
                 }
                 let raw = raw;
-                let e = resolve_expr(&raw, &columns, descs)?;
+                // the value is assigned to its column ([ItemFold])
+                let fold = dest_item_fold(descs.get(fid0)?);
+                let e = resolve_item_folded(&raw, fold, || resolve_expr(&raw, &columns, descs))?;
                 // A BARE NUMERIC LITERAL aimed at a DECFLOAT column is read
                 // as DECIMAL FROM ITS OWN SPELLING, not from the double it
                 // folded to - the INSERT arm's twin ([InsVal::ApproxConst]),
@@ -38178,6 +38363,18 @@ fn execute_dml_collecting_inner(
     if let Plan::RefusedEval(e) = plan {
         return Err(ExecErr::Eval(e.clone()));
     }
+    // ALTER TABLE OF A NAME THAT IS NOT A TABLE: a VIEW (or a name the
+    // catalog does not hold) is the -607 "Table @1 does not exist"
+    // (42S02) for EVERY form - ADD, DROP, ALTER TYPE, POSITION, TO,
+    // ADD/DROP CONSTRAINT - and the view keeps its columns (measured on
+    // 2182). `ALTER TABLE V1 ADD X` / `DROP N` rewrote the view's
+    // RDB$RELATION_FIELDS here, and `SELECT * FROM V1` then answered the
+    // old N value under the name X.
+    if let (Some(t), Some(d)) = (alter_table_target(plan), database.as_ref()) {
+        if !matches!(fire_crab_ods::ddl::relation_type_of(&d.bytes(), d.page_size, t), Some(k) if k != 1) {
+            return Err(ExecErr::Text(format!("alter table {}: table does not exist", t.trim_end())));
+        }
+    }
     // REASSIGNABLE: a statement that fires a trigger body needing the
     // database hands its working copy back for the length of the body
     // ([fire_triggers_published]) and takes this borrow again after
@@ -38402,6 +38599,11 @@ fn execute_dml_collecting_inner(
         }
         Plan::AlterView { name, blr, source, fields, contexts } => {
             fire_crab_ods::ddl::alter_view(&mut work, db.page_size, name, blr, source, fields, contexts)?;
+            // the redefinition's own rows: alter_view deleted the old
+            // ones with the old definition, and the engine records the new
+            // body's (measured on 2182: CREATE OR ALTER VIEW V1 moved from
+            // T1 to T2 lists V1 -> T2 NULL / V1 -> T2 ID; none was left)
+            fire_crab_ods::ddl::store_dependencies_deferred(&mut work, db.page_size, 1, name)?;
             (0, 0, 0)
         }
         Plan::DropView { name } => {
@@ -44032,7 +44234,18 @@ fn plan_join_bound(
             if multi_on_param {
                 return None;
             }
-            let inner = plan_query_inner_at(&inner_sql, db_opt, params, false, sbase)?;
+            // the side's items fold by what the join does with them
+            // ([derived_item_folds]): every ON reads them too
+            let others: Vec<&str> = [where_s, having_s]
+                .into_iter()
+                .flatten()
+                .chain(joins.iter().map(|(_, _, on_s, _)| *on_s))
+                .collect();
+            let folds = derived_item_folds(&inner_sql, &declared, proj, group_s, &others);
+            PENDING_ITEM_FOLDS.with(|p| *p.borrow_mut() = Some(folds));
+            let inner = plan_query_inner_at(&inner_sql, db_opt, params, false, sbase);
+            PENDING_ITEM_FOLDS.with(|p| p.borrow_mut().take());
+            let inner = inner?;
             // An inner PROJECTION `?` on a derived SIDE is bound now:
             // the side's rows are a `RowSource::PlanRows`, and
             // [materialise_bound_src] binds that plan's projection
@@ -45567,8 +45780,9 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<(String, 
 /// once the levels are planned).
 #[derive(Default)]
 struct WinTieNames {
-    /// L3's ORDER BY record over L2's columns; None a NULL slot
-    outer: Vec<Option<String>>,
+    /// L3's ORDER BY record over L2's columns: (Some(column), _) a field,
+    /// (None, the column whose width it takes) a NULL partition copy
+    outer: Vec<(Option<String>, Option<String>)>,
     /// L2's window-sort map and base over L1's columns
     map: Option<Vec<String>>,
     base: Option<Vec<String>>,
@@ -45594,10 +45808,12 @@ struct WinTieNames {
 /// ruling. A relation this cannot list (a derived table, a CTE, no
 /// database) leaves those records to the levels' own references.
 ///
-/// The outer record lists the streams in first-appearance order: the
-/// map's fields (as above, then the fields only a non-window ORDER BY
-/// key reads), and each OVER clause's windows, a PARTITION BY clause's
-/// led by one NULL slot per key ([outer_window_tie]).
+/// The outer record lists the streams in first-appearance order
+/// ([outer_window_tie]): the plain map's fields (as above, then the
+/// fields only a non-window ORDER BY key reads) with every `OVER ()`
+/// window where it is written, and each other OVER clause's windows, a
+/// PARTITION BY clause's followed by a NULL copy of each column its keys
+/// read.
 #[allow(clippy::too_many_arguments)]
 fn win_tie_names(
     lift: &mut WinLift,
@@ -45619,7 +45835,13 @@ fn win_tie_names(
     let bare_col = |body: &str| canon_ident(body).is_some() || is_qualified_col(body);
     let mut t = WinTieNames::default();
     let mut map: Vec<String> = Vec::new();
+    // where each map field is first posted (an item's index; past the
+    // list for an ORDER BY key)
+    let mut map_pos: Vec<usize> = Vec::new();
     let mut map_at = usize::MAX;
+    // a partition key's column token -> the L1/L2 column whose width its
+    // NULL copy takes
+    let mut copy_desc: Vec<(String, String)> = Vec::new();
     let mut plain_k = 0usize;
     if grouped {
         // the GROUP BY keys (aliases already their bodies), compared as
@@ -45668,6 +45890,7 @@ fn win_tie_names(
             for n in names {
                 if !map.contains(&n) {
                     map.push(n);
+                    map_pos.push(pos);
                 }
             }
             // an ORDER BY key L1 lifts on its own (`ORDER BY COUNT(*)`
@@ -45778,6 +46001,7 @@ fn win_tie_names(
                     }
                     if !map.contains(&r) {
                         map.push(r);
+                        map_pos.push(pos);
                     }
                 }
             }
@@ -45790,19 +46014,37 @@ fn win_tie_names(
                     }
                     if !map.contains(&r) {
                         map.push(r);
+                        map_pos.push(items_raw.len());
                     }
+                }
+            }
+        }
+        for (e, _) in lift.exprs.iter().filter(|(_, n)| n.starts_with("FC$W")) {
+            for tok in tokens(e) {
+                if let Some(r) = r_of(&tok) {
+                    copy_desc.push((norm_sql_text(&tok), r));
                 }
             }
         }
         t.base = Some(lift.exprs.iter().filter(|(_, n)| n.starts_with("FC$R")).map(|(_, n)| n.clone()).collect());
     }
     // the outer record: the streams in first-appearance order
-    let mut streams: Vec<(usize, Vec<Option<String>>)> = Vec::new();
-    if !map.is_empty() {
-        streams.push((map_at, map.iter().cloned().map(Some).collect()));
-    }
     let over_of = |call: &str| call.find(" OVER (").map(|p| call[p..].to_string()).unwrap_or_default();
-    let mut seen = vec![false; l2_wins.len()];
+    let pos_of = |j: usize| win_pos.get(j).copied().unwrap_or(usize::MAX);
+    type Entry = (Option<String>, Option<String>);
+    let mut streams: Vec<(usize, Vec<Entry>)> = Vec::new();
+    // the plain map: its fields and every `OVER ()` window, as posted
+    let mut plain: Vec<(usize, Entry)> = map.iter().zip(map_pos.iter()).map(|(n, &p)| (p, (Some(n.clone()), None))).collect();
+    for (j, (call, name)) in l2_wins.iter().enumerate() {
+        if over_of(call) == " OVER ()" {
+            plain.push((pos_of(j), (Some(name.clone()), None)));
+        }
+    }
+    plain.sort_by_key(|(p, _)| *p);
+    if let Some(&(at, _)) = plain.first() {
+        streams.push((at.min(map_at), plain.into_iter().map(|(_, e)| e).collect()));
+    }
+    let mut seen: Vec<bool> = l2_wins.iter().map(|(call, _)| over_of(call) == " OVER ()").collect();
     for i in 0..l2_wins.len() {
         if seen[i] {
             continue;
@@ -45810,26 +46052,38 @@ fn win_tie_names(
         let o = over_of(&l2_wins[i].0);
         let members: Vec<usize> = (i..l2_wins.len()).filter(|&j| !seen[j] && over_of(&l2_wins[j].0) == o).collect();
         members.iter().for_each(|&j| seen[j] = true);
-        let pos_of = |j: usize| win_pos.get(j).copied().unwrap_or(usize::MAX);
-        // the clause's PARTITION BY keys, each a quoted lifted name
-        let mut nkeys = 0usize;
+        let mut ms = members.clone();
+        ms.sort_by_key(|&j| pos_of(j));
+        let mut fields: Vec<Entry> = ms.iter().map(|&j| (Some(l2_wins[j].1.clone()), None)).collect();
+        // the clause's PARTITION BY keys, each a quoted lifted name: a
+        // NULL copy of every column they read, each once (a key that reads
+        // none - an aggregate, a literal - is one copy of its own width)
         if let Some(mut rest) = o.strip_prefix(" OVER (PARTITION BY ") {
-            while rest.starts_with('"') {
-                nkeys += 1;
-                match rest[1..].find('"') {
-                    Some(e) => rest = &rest[e + 2..],
-                    None => break,
+            let mut toks: Vec<String> = Vec::new();
+            while let Some(r) = rest.strip_prefix('"') {
+                let Some(e) = r.find('"') else { break };
+                let key = &r[..e];
+                let text = lift.exprs.iter().find(|(_, n)| n == key).map(|(t, _)| t.clone()).unwrap_or_default();
+                let kt = tokens(&text);
+                if kt.is_empty() {
+                    fields.push((None, Some(key.to_string())));
                 }
+                for tok in kt {
+                    let tn = norm_sql_text(&tok);
+                    if toks.contains(&tn) {
+                        continue;
+                    }
+                    let d = copy_desc.iter().find(|(c, _)| *c == tn).map(|(_, n)| n.clone());
+                    fields.push((None, d.or_else(|| (tokens(&text).len() == 1).then(|| key.to_string()))));
+                    toks.push(tn);
+                }
+                rest = &r[e + 1..];
                 match rest.strip_prefix(", ") {
                     Some(r) => rest = r,
                     None => break,
                 }
             }
         }
-        let mut fields: Vec<Option<String>> = vec![None; nkeys];
-        let mut ms = members.clone();
-        ms.sort_by_key(|&j| pos_of(j));
-        fields.extend(ms.iter().map(|&j| Some(l2_wins[j].1.clone())));
         streams.push((members.iter().map(|&j| pos_of(j)).min().unwrap_or(usize::MAX), fields));
     }
     streams.sort_by_key(|(at, _)| *at);
@@ -45898,8 +46152,25 @@ fn attach_win_tie(plan: &mut Plan, names: &WinTieNames) {
     };
     let l2_cols = output_cols_of(l2);
     let slot = |n: &str| l2_cols.iter().position(|c| c.name == n);
-    let outer: Option<Vec<Option<usize>>> =
-        names.outer.iter().map(|o| o.as_ref().map_or(Some(None), |n| slot(n).map(Some))).collect();
+    // a NULL copy's width: the named column's, at L2 or below it in L1
+    let l1_cols = match &**l2 {
+        Plan::Derived { inner: l1, .. } => output_cols_of(l1),
+        _ => Vec::new(),
+    };
+    let width_of = |n: &Option<String>| -> Descriptor {
+        n.as_ref()
+            .and_then(|n| l2_cols.iter().chain(l1_cols.iter()).find(|c| c.name == *n))
+            .map(desc_of_projcol)
+            .unwrap_or(SORT_REC_NULL_SLOT)
+    };
+    let outer: Option<Vec<Result<usize, Descriptor>>> = names
+        .outer
+        .iter()
+        .map(|(f, w)| match f {
+            Some(n) => slot(n).map(Ok),
+            None => Some(Err(width_of(w))),
+        })
+        .collect();
     if let Some(outer) = outer.filter(|o| !o.is_empty()) {
         let descs: Vec<Option<Descriptor>> = l2_cols.iter().map(|c| Some(desc_of_projcol(c))).collect();
         let same: Vec<(usize, usize)> =
@@ -45911,7 +46182,11 @@ fn attach_win_tie(plan: &mut Plan, names: &WinTieNames) {
         };
         let outer = outer
             .into_iter()
-            .filter(|o| !o.is_some_and(|f| keyed(f) && descs.get(f).copied().flatten().is_none_or(|d| sort_key_restored(&d))))
+            .filter(|o| !o.is_ok_and(|f| keyed(f) && descs.get(f).copied().flatten().is_none_or(|d| sort_key_restored(&d))))
+            .map(|o| match o {
+                Ok(f) => RecItem { slot: Some(f), desc: descs.get(f).copied().flatten(), null: false },
+                Err(d) => RecItem { slot: None, desc: Some(d), null: true },
+            })
             .collect();
         *tie = Some(Box::new(WinTie { outer, ..WinTie::default() }));
     }
@@ -46414,8 +46689,14 @@ fn derived_columns_verdict(
         }
     } else if let Some(at) = inner_cols.iter().position(|c| {
         // the DESCRIBE-slot test the unnamed check has always used: an
-        // unaliased expression carries its kind-name in both slots
-        let plain = c.expr.is_none() && c.relation.is_some() && c.fname.is_some();
+        // unaliased expression carries its kind-name in both slots, and
+        // a column with a source RELATION is a field. A whole-item
+        // subquery over a plain field is one too, though it plans as its
+        // folded literal (measured: `SELECT * FROM (SELECT (SELECT X.X
+        // FROM T2 X WHERE X.ID = 2) FROM T1 T) D` answers X - describe
+        // `name: X table: T2` - where `(SELECT MAX(X.X) ..)` is unnamed);
+        // keying on the missing `expr` called it unnamed
+        let plain = c.relation.is_some() && c.fname.is_some();
         !plain && c.fname.as_deref().unwrap_or(c.name.as_str()) == c.name.as_str()
     }) {
         return Some(EvalErr::DerivedFieldUnnamed { pos: at as i32 + 1, table });
@@ -47037,9 +47318,57 @@ impl QualCtx<'_> {
     /// One query: its FROM binds the level's names, then the clauses are
     /// read in the engine's order.
     fn member(&self, text: &str, outer: &[Vec<ScopeQual>]) -> QualScan {
-        let Some((proj, table_s, wh, group, having, order)) = split_query(text) else {
+        let Some((proj, mut table_s, mut wh, mut group, mut having, order)) = split_query(text) else {
             return QualScan::Aside;
         };
+        // A NAMED WINDOW CLAUSE sits after HAVING and before ORDER BY, and
+        // the splitter leaves it on the tail of whichever clause precedes
+        // it: cut there, and keep its definitions for their turn below
+        let mut windows: Vec<&str> = Vec::new();
+        if let Some(wpos) = find_word_depth0(self.up_of(text), "WINDOW", 0) {
+            let at = self.off_of(text) + wpos;
+            let covers = |c: &str| {
+                let o = self.off_of(c);
+                o <= at && at < o + c.len()
+            };
+            fn cut<'t>(c: &mut &'t str, rel: usize) -> &'t str {
+                let (head, tail) = c.split_at(rel);
+                *c = head;
+                tail
+            }
+            let tail: &str = if covers(table_s) {
+                let rel = at - self.off_of(table_s);
+                cut(&mut table_s, rel)
+            } else if let Some(c) = wh.as_mut().filter(|c| covers(c)) {
+                let rel = at - self.off_of(c);
+                cut(c, rel)
+            } else if let Some(c) = group.as_mut().filter(|c| covers(c)) {
+                let rel = at - self.off_of(c);
+                cut(c, rel)
+            } else if let Some(c) = having.as_mut().filter(|c| covers(c)) {
+                let rel = at - self.off_of(c);
+                cut(c, rel)
+            } else {
+                return QualScan::Aside;
+            };
+            for def in split_top_level_commas(&tail["WINDOW".len()..]) {
+                let open = def.find('(');
+                let spec = open.and_then(|o| {
+                    let close = matching_paren(def.as_bytes(), o)?;
+                    Some(&def[o + 1..close])
+                });
+                let Some(spec) = spec else { return QualScan::Aside };
+                // a definition over ANOTHER window has laws of its own
+                // the engine checks first (measured: `W2 AS (W PARTITION
+                // BY T1.B)` is -204 "Cannot use PARTITION BY clause while
+                // overriding the window W"), which the planner refuses
+                let first = self.up_of(spec).split_whitespace().next().unwrap_or("");
+                if !first.is_empty() && !matches!(first, "PARTITION" | "ORDER" | "ROWS" | "RANGE") {
+                    return QualScan::Aside;
+                }
+                windows.push(spec);
+            }
+        }
         let Some((from, joins)) = parse_from(table_s) else {
             return QualScan::Aside;
         };
@@ -47129,7 +47458,28 @@ impl QualCtx<'_> {
                 other => return other,
             }
         }
-        match self.list(proj, &scopes, true) {
+        // the select list's PLAIN FIELD items, then the WINDOW clause's
+        // definitions in declaration order, read or not, then the rest of
+        // the list (measured on 2182: `SELECT T1.B, SUM(T.A) OVER W .. WINDOW
+        // W AS (ORDER BY T1.ID)` names T1.B, `SELECT T.B + T1.B, SUM(T.A)
+        // OVER W ..` names T1.ID, and so does a subquery item's T1.A beside
+        // it, `SUM(T1.A) OVER W` and an unread W; GROUP BY, HAVING and
+        // ORDER BY come after; `WINDOW W1 AS (.. T1.A), W2 AS (.. T1.B)`
+        // names T1.A whichever the list reads first). The planner rewrites
+        // the clause away, and this scanner stood aside for it: `SUM(T.A)
+        // OVER W FROM T1 T WINDOW W AS (ORDER BY T1.ID)` answered a
+        // running sum where the engine raises -206
+        match self.select_items(proj, &scopes, true) {
+            QualScan::Clean => {}
+            other => return other,
+        }
+        for w in windows {
+            match self.window(w, &scopes) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        match self.select_items(proj, &scopes, false) {
             QualScan::Clean => {}
             other => return other,
         }
@@ -47215,6 +47565,22 @@ impl QualCtx<'_> {
     /// CAST(T1.A AS INTEGER), T1.B FROM T1 T` names T1.B, `UPPER(T1.V),
     /// T1.A AS X` names T1.V, `(SELECT T1.A ..), UPPER(T1.V)` names T1.A,
     /// `(SELECT T1.B ..), UPPER(T1.V), T1.A` names T1.A).
+    /// One of the select list's two passes: its plain field items
+    /// (`plain`), or every other item in text order.
+    fn select_items(&self, text: &str, scopes: &[Vec<ScopeQual>], plain: bool) -> QualScan {
+        for item in split_top_level_commas(text) {
+            if self.is_plain_field(item) != plain {
+                continue;
+            }
+            let r = if plain { self.refs(item, scopes) } else { self.boolean(item, scopes) };
+            match r {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        QualScan::Clean
+    }
+
     fn list(&self, text: &str, scopes: &[Vec<ScopeQual>], select_list: bool) -> QualScan {
         let items = split_top_level_commas(text);
         if select_list {
@@ -48706,6 +49072,12 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
         },
         None => plan_query_outer(sql, db),
     };
+    // the client's own statement, whole: its select items reach the
+    // client's fields ([deliver_plan_items])
+    let mut out = out;
+    if armed {
+        deliver_plan_items(&mut out.0);
+    }
     if outermost {
         STMT_TEXT.with(|t| *t.borrow_mut() = None);
     }
@@ -49409,29 +49781,39 @@ fn plan_over_source(
     // the source's own columns ([lift_corr_text]); a correlated one names
     // the source by its binding alias
     let corr_scope = CorrScope::single(alias, None, None, &columns, &descs);
-    let lift = |t: &str, sel: bool| -> Option<String> {
+    let lift = |t: &str, names: Option<&mut Vec<(usize, String)>>| -> Option<String> {
         match db.as_ref() {
             Some(dbr)
                 if t.contains('(')
                     && find_word(&mask_literals(&t.to_ascii_uppercase()), "SELECT", 0).is_some() =>
             {
-                lift_corr_text(t, &corr_scope, dbr, db, sel)
+                lift_corr_text(t, &corr_scope, dbr, db, names)
             }
             _ => Some(t.to_string()),
         }
     };
-    let proj_l = lift(proj_s, true)?;
+    // (select-list position, name) of each whole-item subquery: laid on
+    // the planned column once ORDER BY has resolved without it
+    let mut sub_names: Vec<(usize, String)> = Vec::new();
+    let proj_l = lift(proj_s, Some(&mut sub_names))?;
     let where_l = match where_s {
-        Some(w) => Some(lift(w, false)?),
+        Some(w) => Some(lift(w, None)?),
         None => None,
     };
     let having_l = match having_s {
-        Some(h) => Some(lift(h, false)?),
+        Some(h) => Some(lift(h, None)?),
         None => None,
     };
     let order_l = match order_s {
-        Some(o) => Some(lift(o, false)?),
+        Some(o) => Some(lift(o, None)?),
         None => None,
+    };
+    let name_subs = |cols: &mut [ProjCol]| {
+        for (i, n) in &sub_names {
+            if let Some(c) = cols.get_mut(*i) {
+                c.name = n.clone();
+            }
+        }
     };
     let proj_s = proj_l.as_str();
     let where_s = where_l.as_deref();
@@ -49559,6 +49941,7 @@ fn plan_over_source(
             })?,
         };
         stamp_group_order_coll(&mut order_by, &slot_descs);
+        name_subs(&mut gcols);
         // a collation decides which rows are one group, and which value
         // a MIN/MAX or a COUNT(DISTINCT) folds to ([coll_groupable],
         // [agg_needs_unkeyable_coll]) - the fold check was missing here
@@ -49757,6 +50140,8 @@ fn plan_over_source(
         )?,
     };
     drop(params_cell);
+    let mut out_cols = out_cols;
+    name_subs(&mut out_cols);
     let mut plan = Plan::Derived {
         inner: Box::new(src.into_plan(cols)),
         cols: out_cols,
@@ -49791,36 +50176,9 @@ fn derived_window_tie(plan: &mut Plan) {
     if tie.is_some() {
         return;
     }
+    // (an ORDER BY over a windowed derived table ties by that table's
+    // window streams: [derived_record_items] at execute)
     if windows.is_empty() {
-        // THE ORDER BY OVER A WINDOWED DERIVED TABLE sorts the record of
-        // the window streams under it - the derived table's bare fields,
-        // then its windows ([outer_window_tie]) - as the ORDER BY of the
-        // windowed statement itself does. Measured on 2182: `SELECT X.S,
-        // RN FROM (SELECT S, K, ROW_NUMBER() OVER (ORDER BY K) RN FROM U)
-        // X ORDER BY X.K` ties the K = 1 rows '', NULL, a, b, c (S's flag
-        // and length share word 0) where the delivery order put the NULL
-        // last. A stream field the derived table does not expose as a
-        // bare column keeps the stable sort.
-        if order_by.is_empty() {
-            return;
-        }
-        let Plan::Project { cols: icols, filter: ifilter, windows: iwins, win_base: ibase, .. } = &**inner else {
-            return;
-        };
-        if iwins.is_empty() {
-            return;
-        }
-        let rec = window_record(icols, ifilter.as_ref(), iwins, &[], *ibase);
-        let slots: Option<Vec<Option<usize>>> = outer_window_tie(&rec, iwins, &[], *ibase)
-            .into_iter()
-            .map(|f| match f {
-                None => Some(None),
-                Some(f) => icols.iter().position(|c| c.expr.is_none() && c.field_id == f).map(Some),
-            })
-            .collect();
-        if let Some(outer) = slots.filter(|o| !o.is_empty()) {
-            *tie = Some(Box::new(WinTie { outer, ..WinTie::default() }));
-        }
         return;
     }
     let Some(src) = flat_source(inner) else { return };
@@ -49999,11 +50357,26 @@ fn derived_window_rows(
 }
 
 /// Every UNQUALIFIED relation name a statement names after `FROM` or
-/// `JOIN`, ANYWHERE in it - a subquery, a derived table's body, either
-/// branch of a union, an `IN`/`EXISTS` body. Modelled on
+/// `JOIN` - or after a COMMA of a FROM clause, the older spelling of a
+/// cross join - ANYWHERE in it: a subquery, a derived table's body,
+/// either branch of a union, an `IN`/`EXISTS` body. Modelled on
 /// [first_unknown_relation], which walks the same two keywords for the
 /// same reason; this one collects the names instead of checking them
 /// against the catalog.
+///
+/// THE COMMA ITEMS COUNT (measured on 2182: `WITH A AS (..), B AS (..)
+/// SELECT * FROM A, B` answers `1 2` with no warning, `FROM T1 T, A, B`
+/// and `FROM T1 JOIN T2 ON .., A` read A and B too, and `FROM T1, A`
+/// warns only the B it leaves unread). Reading the word after FROM and
+/// JOIN alone judged every CTE read as a second or later comma item
+/// UNUSED, and the unused-CTE pass then refused the statement as an
+/// alias conflict with the reference - a regression of `06ba249` over
+/// statements this server had answered. A comma belongs to the FROM
+/// clause when it sits at the FROM keyword's own depth, before that
+/// clause ends (a depth-0 WHERE / GROUP / HAVING / ORDER / UNION / PLAN
+/// / ROWS / FETCH / OFFSET / WINDOW / WITH / FOR / RETURNING, or the
+/// paren that closes the query); a FROM that is a function's operand
+/// (`SUBSTRING(S FROM 2)`) has no list.
 ///
 /// [bound_refs] cannot serve here: it reads ONE query's top-level FROM
 /// and joins, while the engine's cycle check reaches a self-reference
@@ -50022,44 +50395,83 @@ fn from_names(sql: &str) -> Vec<String> {
     let b = masked.as_bytes();
     let sb = up.as_bytes();
     let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    // the relation name that starts at `at` (whitespace skipped), if one
+    // does: not a derived table's paren, not a qualified name
+    let name_at = |at: usize| -> Option<String> {
+        let mut i = at;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() || b[i] == b'(' {
+            return None;
+        }
+        let (start, end, after);
+        if sb[i] == b'"' {
+            start = i + 1;
+            let mut j = start;
+            while j < sb.len() && sb[j] != b'"' {
+                j += 1;
+            }
+            end = j;
+            after = (j + 1).min(sb.len());
+        } else {
+            start = i;
+            let mut j = i;
+            while j < b.len() && is_ident(b[j]) {
+                j += 1;
+            }
+            end = j;
+            after = j;
+        }
+        if end <= start {
+            return None;
+        }
+        // `PUBLIC.C1` names the TABLE, never the CTE
+        if sb.get(after) == Some(&b'.') {
+            return None;
+        }
+        Some(up[start..end].to_string())
+    };
     let mut out: Vec<String> = Vec::new();
     for kw in ["FROM", "JOIN"] {
         let mut at = 0;
         while let Some(k) = find_word(&masked, kw, at) {
             at = k + kw.len();
+            if kw == "FROM" && from_is_operand(b, k) {
+                continue;
+            }
+            out.extend(name_at(at));
+            if kw != "FROM" {
+                continue;
+            }
+            // the clause's depth-level commas, up to its end
+            let mut depth = 0i32;
             let mut i = at;
-            while i < b.len() && b[i].is_ascii_whitespace() {
+            while i < b.len() {
+                match b[i] {
+                    b'(' => depth += 1,
+                    b')' if depth == 0 => break,
+                    b')' => depth -= 1,
+                    b',' if depth == 0 => out.extend(name_at(i + 1)),
+                    c if depth == 0 && c.is_ascii_alphabetic() && (i == 0 || !is_ident(b[i - 1])) => {
+                        let mut j = i;
+                        while j < b.len() && is_ident(b[j]) {
+                            j += 1;
+                        }
+                        if matches!(
+                            &masked[i..j],
+                            "WHERE" | "GROUP" | "HAVING" | "ORDER" | "UNION" | "PLAN" | "ROWS"
+                                | "FETCH" | "OFFSET" | "WINDOW" | "WITH" | "FOR" | "RETURNING"
+                        ) {
+                            break;
+                        }
+                        i = j;
+                        continue;
+                    }
+                    _ => {}
+                }
                 i += 1;
             }
-            if i >= b.len() || b[i] == b'(' {
-                continue;
-            }
-            let (start, end, after);
-            if sb[i] == b'"' {
-                start = i + 1;
-                let mut j = start;
-                while j < sb.len() && sb[j] != b'"' {
-                    j += 1;
-                }
-                end = j;
-                after = (j + 1).min(sb.len());
-            } else {
-                start = i;
-                let mut j = i;
-                while j < b.len() && is_ident(b[j]) {
-                    j += 1;
-                }
-                end = j;
-                after = j;
-            }
-            if end <= start {
-                continue;
-            }
-            // `PUBLIC.C1` names the TABLE, never the CTE
-            if sb.get(after) == Some(&b'.') {
-                continue;
-            }
-            out.push(up[start..end].to_string());
         }
     }
     out
@@ -50115,46 +50527,53 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
     if find_word(&up, "WITH", 0) != Some(0) {
         return None;
     }
-    let b: Vec<char> = t.chars().collect();
+    // BYTE offsets throughout: [matching_paren] answers one, and this
+    // walked a `Vec<char>` and mixed the two - a body holding a
+    // multi-byte character (`WITH C AS (SELECT 'ă' X FROM RDB$DATABASE)`
+    // under a UTF8 attachment) closed one character late, spliced as
+    // `(SELECT 'ă' X FROM RDB$DATABASE))` and refused, where the engine
+    // answers `ă` (and, unused, answers the main query with the warning)
+    let b = t.as_bytes();
+    let is_name = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
     let mut i = "WITH".len();
-    let skip_ws = |b: &[char], i: &mut usize| {
-        while *i < b.len() && b[*i].is_whitespace() {
+    let skip_ws = |b: &[u8], i: &mut usize| {
+        while *i < b.len() && b[*i].is_ascii_whitespace() {
             *i += 1;
         }
     };
     let mut ctes: Vec<(String, ViewDef)> = Vec::new();
     let mut recursive = false;
     loop {
-        skip_ws(&b, &mut i);
+        skip_ws(b, &mut i);
         // the name
         let start = i;
-        while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+        while i < b.len() && is_name(b[i]) {
             i += 1;
         }
         if i == start {
             return None;
         }
-        let mut name: String = b[start..i].iter().collect();
+        let mut name: String = t[start..i].to_string();
         // `WITH RECURSIVE` marks the whole list; the name follows it
         if name.eq_ignore_ascii_case("RECURSIVE") {
             recursive = true;
-            skip_ws(&b, &mut i);
+            skip_ws(b, &mut i);
             let start = i;
-            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+            while i < b.len() && is_name(b[i]) {
                 i += 1;
             }
             if i == start {
                 return None;
             }
-            name = b[start..i].iter().collect();
-            skip_ws(&b, &mut i);
+            name = t[start..i].to_string();
+            skip_ws(b, &mut i);
         }
-        skip_ws(&b, &mut i);
+        skip_ws(b, &mut i);
         // an optional column list, which RENAMES the query's columns
         let mut cols: Vec<String> = Vec::new();
-        if b.get(i) == Some(&'(') {
-            let close = matching_paren(t.as_bytes(), i)?;
-            let inner: String = b[i + 1..close].iter().collect();
+        if b.get(i) == Some(&b'(') {
+            let close = matching_paren(b, i)?;
+            let inner: String = t[i + 1..close].to_string();
             for c in inner.split(',') {
                 let c = c.trim().trim_matches('"');
                 if !ident_ok(c) {
@@ -50163,20 +50582,19 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
                 cols.push(c.to_ascii_uppercase());
             }
             i = close + 1;
-            skip_ws(&b, &mut i);
+            skip_ws(b, &mut i);
         }
         // AS ( ... )
-        let kw: String = b[i..(i + 2).min(b.len())].iter().collect();
-        if !kw.eq_ignore_ascii_case("AS") {
+        if !b[i..(i + 2).min(b.len())].eq_ignore_ascii_case(b"AS") {
             return None;
         }
         i += 2;
-        skip_ws(&b, &mut i);
-        if b.get(i) != Some(&'(') {
+        skip_ws(b, &mut i);
+        if b.get(i) != Some(&b'(') {
             return None;
         }
-        let close = matching_paren(t.as_bytes(), i)?;
-        let source: String = b[i + 1..close].iter().collect();
+        let close = matching_paren(b, i)?;
+        let source: String = t[i + 1..close].to_string();
         i = close + 1;
         // the column names: the explicit list, else the query's own
         // The CTE's column names, when they can be read off its body -
@@ -50218,14 +50636,14 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
             cols
         };
         ctes.push((name.to_ascii_uppercase(), ViewDef { source: source.trim().to_string(), cols }));
-        skip_ws(&b, &mut i);
-        if b.get(i) == Some(&',') {
+        skip_ws(b, &mut i);
+        if b.get(i) == Some(&b',') {
             i += 1;
             continue;
         }
         break;
     }
-    let main: String = b[i..].iter().collect();
+    let main: String = t[i..].to_string();
     let main = main.trim().to_string();
     if main.is_empty() || ctes.is_empty() {
         return None;
@@ -54811,10 +55229,33 @@ fn branch_rows_res(
         }
         if *distinct {
             let oc = output_cols_of(plan);
-            distinct_rows(&mut rows, order_by.is_some(), &coll_cols(&oc), &varying_cols(&oc), union_tie_unknown(branches))?;
+            distinct_rows(&mut rows, order_by.is_some(), &union_coll_cols(branches, &oc), &varying_cols(&oc), union_tie_unknown(branches))?;
         }
         if let Some(key) = order_by {
-            let keys = [key.clone()];
+            let mut key = key.clone();
+            // the union's column orders by its COLLATION: `SELECT ci ...
+            // UNION ALL SELECT ci ... ORDER BY 1` is the UCA order under
+            // UNICODE_CI on 2182 (<null> | abc | abc | abc | Abc | ABC |
+            // b | B | c | c), as a distinct union's already was
+            if key.coll == 0 && key.expr.is_none() {
+                let oc = output_cols_of(plan);
+                // ...the union's own column, else the first leg's (an
+                // explicit `COLLATE` on the legs, `SELECT s COLLATE
+                // UNICODE_CI ... UNION ALL ...`, measured the same)
+                let tt = coll_cols(&oc).get(key.field).copied().filter(|&t| t != 0).or_else(|| {
+                    branches
+                        .first()
+                        .and_then(|b| coll_cols(&output_cols_of(b)).get(key.field).copied())
+                        .filter(|&t| t != 0)
+                });
+                if let Some(tt) = tt {
+                    if oc.get(key.field).is_some_and(|c| matches!(c.sql_type & !1, 448 | 452)) {
+                        key.coll = order_ttype_of(tt);
+                        key.own_coll = if fire_crab_ods::coll::icu_strength_of_ttype(tt).is_some() { tt } else { 0 };
+                    }
+                }
+            }
+            let keys = [key];
             rows.sort_by(|a, b| {
                 let o = order_cmp(a, b, &keys);
                 o
@@ -54951,18 +55392,21 @@ fn branch_rows_res(
         .rows(db)?;
         // a window folds over the FILTERED rows and is appended to each
         // before the sort, exactly as the Project path orders it; a
-        // rewrite's top level sorts its ties by the record it was handed
+        // rewrite's top level sorts its ties by the record it was handed,
+        // an ORDER BY over a windowed derived table by that table's
+        // window streams ([derived_record_items])
         let inner_descs: Vec<Option<Descriptor>> =
             output_cols_of(inner).iter().map(|c| Some(desc_of_projcol(c))).collect();
         let out = if !windows.is_empty() {
             let rec = window_record(cols, filter.as_ref(), windows, order_by, *win_base);
             let descs = window_slot_descs(inner_descs, cols, windows.len(), *win_base);
             fold_windows_ordered(filtered, windows, *win_base, rec, descs, order_by, tie.as_deref())?
-        } else if let Some(t) = tie.as_deref().filter(|t| !t.outer.is_empty() && !order_by.is_empty()) {
-            let mut rows = filtered;
-            let outer = outer_tie_less_keys(t.outer.clone(), order_by, &inner_descs);
-            sort_rows_tied(&mut rows, order_by, &outer, &inner_descs)?;
-            rows
+        } else if order_by.is_empty() {
+            filtered
+        } else if let Some(t) = tie.as_deref().filter(|t| !t.outer.is_empty()) {
+            sort_by_record(filtered, order_by, t.outer.clone())?
+        } else if let Some(items) = derived_record_items(inner, cols, order_by) {
+            sort_by_record(filtered, order_by, items)?
         } else {
             RowSource::Sort { input: Box::new(RowSource::Rows(filtered)), keys: order_by.clone() }.rows(db)?
         };
@@ -55374,8 +55818,26 @@ fn stamp_group_order_coll(keys: &mut [OrderKey], slot_descs: &[Option<Descriptor
 /// and so does a key over [icu_blind_fn], whose value this server gets
 /// wrong before any bucketing.
 fn expr_key_coll(e: &Expr, descs: &[Descriptor]) -> Option<u16> {
+    // AN EXPLICIT COLLATION READ THROUGH THE FUNCTIONS THAT KEEP IT - the
+    // ONE reader the comparisons use ([explicit_collate_of]). This fold
+    // had its own, which saw the bare wrapper only: `DISTINCT LPAD(U
+    // COLLATE UNICODE_CI, 2, 'z')`, TRIM, SUBSTRING, LEFT, RIGHT, RPAD,
+    // REPLACE, REVERSE, COALESCE, IIF, CASE, NULLIF and `U COLLATE
+    // UNICODE_CI || 'x'` keyed BYTES and counted 7 where the engine counts
+    // 4 over {é, É, e, E, ab, AB, ö} (measured on 2182 under UTF8, NONE
+    // and WIN1252 callers, and GROUP BY the same keys 4 groups)
+    if let Some(tt) = explicit_collate_of(e, descs) {
+        return Some(tt);
+    }
     match e {
         Expr::Collate(_, tt) | Expr::CollKey(_, tt) | Expr::CollCanon(_, tt, _) => Some(*tt),
+        // the resolver's SYNTHETIC text casts (a delivery recode, the
+        // CHAR pad) are not the user's: the value is keyed before it is
+        // delivered, by what is under them. Read as a CAST they dropped
+        // an ICU column's collation under a WIN1252 caller alone:
+        // `DISTINCT LPAD(UC, 2, 'z')` and `DISTINCT N || UC` over a
+        // UNICODE_CI UC counted 7 where the engine counts 4 (measured)
+        Expr::Cast(inner, CastTarget::Text { synthetic: true, .. }, _) => expr_key_coll(inner, descs),
         // a CAST to a text type takes the target's charset and its DEFAULT
         // collation - the source's collation does not survive it
         Expr::Cast(..) => Some(expr_text_ttype(e, descs).map(|t| t & 0x00FF).unwrap_or(0)),
@@ -56428,6 +56890,27 @@ fn plan_query_inner_at(
     in_view: bool,
     base: usize,
 ) -> Option<Plan> {
+    // the item folds a caller set for THIS query ([PENDING_ITEM_FOLDS])
+    // are its own while it plans; without any, it keeps the enclosing
+    // ones (a rewrite re-planning the same select list)
+    match PENDING_ITEM_FOLDS.with(|p| p.borrow_mut().take()) {
+        None => plan_query_inner_at_body(sql, db, params, in_view, base),
+        Some(folds) => {
+            let prev = ITEM_FOLDS.with(|t| std::mem::replace(&mut *t.borrow_mut(), folds));
+            let out = plan_query_inner_at_body(sql, db, params, in_view, base);
+            ITEM_FOLDS.with(|t| *t.borrow_mut() = prev);
+            out
+        }
+    }
+}
+
+fn plan_query_inner_at_body(
+    sql: &str,
+    db: &Option<Database>,
+    params: &mut Vec<Option<Descriptor>>,
+    in_view: bool,
+    base: usize,
+) -> Option<Plan> {
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
     {
         let up = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
@@ -57262,7 +57745,16 @@ fn plan_query_inner_at(
                 }
                 mask_literals(&sql[..q - h]).matches('?').count()
             };
-            let Some(inner) = plan_query_inner_at(&inner_sql, db, params, false, dbase) else {
+            // the inner items fold by what this query does with them
+            // ([derived_item_folds])
+            if let Some(outer) = parse_projection(proj_s) {
+                let others: Vec<&str> = [where_s, having_s].into_iter().flatten().collect();
+                let folds = derived_item_folds(inner_sql, &declared, &outer, group_s, &others);
+                PENDING_ITEM_FOLDS.with(|p| *p.borrow_mut() = Some(folds));
+            }
+            let inner = plan_query_inner_at(&inner_sql, db, params, false, dbase);
+            PENDING_ITEM_FOLDS.with(|p| p.borrow_mut().take());
+            let Some(inner) = inner else {
                 if trace {
                     eprintln!("[srv] plan: derived table {:?} not planned", inner_sql);
                 }
@@ -57445,7 +57937,7 @@ fn plan_query_inner_at(
         let on_sub = parsed.as_ref().is_some_and(|(_, j)| j.iter().any(|(_, _, on_s, _)| has_sub(Some(on_s))));
         if has_sub(order_s) || has_sub(having_s) || (joined && has_sub(where_s)) || on_sub {
             if let Some(scope) = CorrScope::of_from(table_s, dbr, db) {
-                let lift = |t: &str| lift_corr_text(t, &scope, dbr, db, false);
+                let lift = |t: &str| lift_corr_text(t, &scope, dbr, db, None);
                 // ON conditions, spliced back into the FROM text from the
                 // end so earlier offsets stay valid
                 let mut from_out = table_s.to_string();
@@ -57514,8 +58006,12 @@ fn plan_query_inner_at(
                     let (p, _, _, _, _, _) = split_query(sub)?;
                     match parse_projection(p)? {
                         Proj::Items(items) => match items.first()? {
+                            // an alias comes canonical from the parse
+                            // (a quoted `"q"` keeps its case, measured on
+                            // 2182: `q`); a column is folded here
                             SelItem::Col(c, alias) => Some(alias.clone().unwrap_or_else(|| {
-                                c.rsplit('.').next().unwrap_or(c).to_string()
+                                let bare = c.rsplit('.').next().unwrap_or(c);
+                                canon_ident(bare).unwrap_or_else(|| bare.to_string())
                             })),
                             SelItem::Agg(f, _, alias) => Some(alias.clone().unwrap_or_else(|| {
                                 f.name()
@@ -57708,6 +58204,9 @@ fn plan_query_inner_at(
                 // marker the projection builder resolves.
                 #[allow(clippy::type_complexity)]
                 let mut correlated: Vec<(usize, String, Expr, Descriptor)> = Vec::new();
+                // (select-list position, name) of each whole-item folded
+                // or per-row subquery - its describe name, never an alias
+                let mut name_patches: Vec<(usize, String)> = Vec::new();
                 for (i, sub) in subs.iter().enumerate() {
                     let mark = format!("{}{}", SUBQ_MARK, i);
                     let scan = scope.as_ref().and_then(|sc| corr_scan(sub, sc, dbr, db));
@@ -57804,7 +58303,21 @@ fn plan_query_inner_at(
                     }
                     // `corr: None` - a subquery naming the outer row is
                     // never read as a constant ([corr_scan] decides)
-                    let folded_v = if is_corr { None } else { eval_subquery(sub, dbr, db, None, None, false) };
+                    // a subquery INSIDE an expression is no assignment
+                    // to its own type: its literals stay doubles
+                    // ([ItemFold]; `(SELECT CAST(0.4e0 + 0.4e0 AS INT128)
+                    // ..) || ''` is 1 on 2182, the whole item 0)
+                    let whole_item = split_top_level_commas(&folded).iter().any(|item| {
+                        let (body, _) = split_alias(item);
+                        body.trim() == mark
+                    });
+                    let folded_v = if is_corr {
+                        None
+                    } else if whole_item {
+                        eval_subquery(sub, dbr, db, None, None, false)
+                    } else {
+                        with_runtime_double_casts(|| eval_subquery(sub, dbr, db, None, None, false))
+                    };
                     let Some(rows) = folded_v else {
                         let whole = split_top_level_commas(&folded).iter().any(|item| {
                             let (body, _) = split_alias(item);
@@ -57848,8 +58361,20 @@ fn plan_query_inner_at(
                             }
                             return Some(Plan::Refused);
                         };
-                        let repl = match (alone.get(i), subq_name(sub)) {
-                            (Some(true), Some(n)) => format!("FC$CORR({}) AS \"{}\"", id, n.replace('"', "\"\"")),
+                        // the name is NO ALIAS here either (the law at
+                        // the fold below): spliced as `FC$CORR(<id>) AS
+                        // <name>` it made `.. GROUP BY T.ID` over an
+                        // ID-named subquery an alias-shadowed refusal and
+                        // `ORDER BY A` sort by the subquery, where the
+                        // engine sorts by T.A (measured on 2182)
+                        if let (Some(true), Some(n)) = (alone.get(i), subq_name(sub)) {
+                            let pos = split_top_level_commas(&folded).iter().position(|item| item.trim() == mark);
+                            if let Some(pos) = pos {
+                                name_patches.push((pos, n));
+                            }
+                        }
+                        let repl = match alone.get(i) {
+                            Some(true) => corr_unnamed_item(id),
                             _ => format!("FC$CORR({})", id),
                         };
                         proj_out = proj_out.replace(&mark, &repl);
@@ -57868,11 +58393,27 @@ fn plan_query_inner_at(
                             None => return Some(Plan::Refused),
                         },
                     };
-                    let repl = match (alone.get(i), subq_name(sub)) {
-                        (Some(true), Some(n)) => format!("{} AS {}", lit, n),
-                        _ => lit,
-                    };
-                    proj_out = proj_out.replace(&format!("{}{}", SUBQ_MARK, i), &repl);
+                    // THE SUBQUERY's NAME IS NO ALIAS: the engine
+                    // describes a whole-item subquery by its inner item's
+                    // name, but ORDER BY / GROUP BY never resolve to it
+                    // (measured on 2182: `SELECT (SELECT X.X FROM T2 X
+                    // WHERE X.ID = 2) FROM T1 T ORDER BY X` is -206 "X",
+                    // `.. GROUP BY ID` over an ID-named one groups by
+                    // T.ID - six rows - and `.. ORDER BY T.ID` answers).
+                    // Spliced as `<lit> AS <name>` it WAS an alias: the
+                    // bare keys answered through it (one group for six)
+                    // and the qualified key over its name was refused as
+                    // alias-shadowed. The name is laid on the planned
+                    // column afterwards, like the field name.
+                    if let (Some(true), Some(n)) = (alone.get(i), subq_name(sub)) {
+                        let pos = split_top_level_commas(&folded)
+                            .iter()
+                            .position(|item| item.trim() == format!("{}{}", SUBQ_MARK, i));
+                        if let Some(pos) = pos {
+                            name_patches.push((pos, n));
+                        }
+                    }
+                    proj_out = proj_out.replace(&format!("{}{}", SUBQ_MARK, i), &lit);
                 }
                 // GROUP BY over a per-row subquery item - by its ordinal,
                 // its alias or its text - is the engine's -104 (probed;
@@ -57927,9 +58468,19 @@ fn plan_query_inner_at(
                             correlated.len()
                         );
                     }
-                    return plan_correlated_select(
+                    let mut plan = plan_correlated_select(
                         &proj_out, &correlated, table_s, where_s, order_s, dbr, params, trace,
                     );
+                    // a per-row subquery beside the lookup one carries its
+                    // placeholder name until here ([corr_unnamed_item])
+                    if let Some(Plan::Project { cols, .. }) = plan.as_mut() {
+                        for (idx, n) in &name_patches {
+                            if let Some(c) = cols.get_mut(*idx) {
+                                c.name = n.clone();
+                            }
+                        }
+                    }
+                    return plan;
                 }
                 if trace {
                     eprintln!("[srv] plan: select-list subqueries folded to {:?}", out);
@@ -57967,6 +58518,20 @@ fn plan_query_inner_at(
                             if let Some(c) = cols.get_mut(*i) {
                                 c.sql_type = nullable(c.sql_type);
                             }
+                        }
+                    }
+                }
+                for (idx, n) in &name_patches {
+                    if let Plan::Project { cols, .. }
+                    | Plan::Join { cols, .. }
+                    | Plan::JoinGroup { cols, .. }
+                    | Plan::Group { cols, .. }
+                    | Plan::Union { cols, .. }
+                    | Plan::Derived { cols, .. }
+                    | Plan::Rows { cols, .. } = &mut plan
+                    {
+                        if let Some(c) = cols.get_mut(*idx) {
+                            c.name = n.clone();
                         }
                     }
                 }
@@ -60045,7 +60610,7 @@ fn resolve_agg_src(
             // resolve_expr.
             if is_computed_fid(descs, fid) {
                 let e = resolve_expr(&RawExpr::Col(name.clone()), columns, descs)?;
-                (agg_expr_src(e)?, distinct)
+                (agg_expr_src(e, descs)?, distinct)
             } else {
                 (agg_field_src(fid, descs), distinct)
             }
@@ -60059,11 +60624,11 @@ fn resolve_agg_src(
         // assignment to the result's type ([runtime_double_cast])
         AggTarget::DistinctExpr(raw) => {
             let e = with_runtime_double_casts(|| resolve_expr_sink(raw, columns, descs, sink))?;
-            (agg_expr_src(deliver_in_announced_set(e, descs))?, true)
+            (agg_expr_src(deliver_in_announced_set(e, descs), descs)?, true)
         }
         AggTarget::Expr(raw) => {
             let e = with_runtime_double_casts(|| resolve_expr_sink(raw, columns, descs, sink))?;
-            (agg_expr_src(deliver_in_announced_set(e, descs))?, false)
+            (agg_expr_src(deliver_in_announced_set(e, descs), descs)?, false)
         }
         AggTarget::Pair(y, x) => (
             AggSrc::Pair(
@@ -60724,10 +61289,12 @@ fn raw_described_not_null(e: &RawExpr) -> bool {
 /// shape every walker already carries (an explicit NULL branch is
 /// transparent to the type, width, scale and sub_type, and never fires) -
 /// so [expr_nullable] reads the node as nullable through the one arm it
-/// judges by. A default-less simple CASE is nullable already.
+/// judges by. A default-less simple CASE is nullable already, and wears
+/// the arm too: it is also what tells a resolved simple CASE from a
+/// searched one ([is_simple_case]).
 fn simple_case_nullable(simple: bool, e: Expr) -> Expr {
     match e {
-        Expr::Case(mut arms, els @ Some(_)) if simple => {
+        Expr::Case(mut arms, els) if simple => {
             arms.insert(0, (Cond2::IsNull(Box::new(Expr::Int(0))), Expr::Null));
             Expr::Case(arms, els)
         }
@@ -61409,9 +61976,13 @@ fn build_group_items(
                             // describe (a FLOAT column stays 482/len4;
                             // the fold keeps the winning Value verbatim,
                             // so a Value::Float survives)
-                            ExprType::Approx => match field_desc {
-                                Some(d) => wire_for(d),
-                                None => (Wire::Double, 480, 8, 0, 0),
+                            // ...and a FLOAT EXPRESSION stays FLOAT too
+                            // (`MAX(COALESCE(I, F))`, `MAX(COALESCE(F,
+                            // 0))`: 482 FLOAT len 4 on 2182, measured)
+                            ExprType::Approx => match (field_desc, &src) {
+                                (Some(d), _) => wire_for(d),
+                                (None, AggSrc::Expr(e)) if approx_expr_single(e, descs) => (Wire::Float, 482, 4, 0, 0),
+                                (None, _) => (Wire::Double, 480, 8, 0, 0),
                             },
                             ExprType::Bool => (Wire::Bool, 32764, 1, 0, 0),
                             ExprType::Temporal(TKind::Date) => (Wire::Date, 570, 4, 0, 0),
@@ -61897,6 +62468,21 @@ fn plan_group(
     drop(params_cell);
     let mut order_by = order_by;
     stamp_group_order_coll(&mut order_by, &slot_descs);
+    // a key over an EXPRESSION group key ([build_group_items] leaves its
+    // slot without a descriptor) orders by the collation the key carries
+    // ([expr_key_coll]): `SELECT S COLLATE UNICODE AS K, COUNT(*) ... GROUP
+    // BY K ORDER BY K` is a | A | b | B | c on 2182, and was the bytes here
+    for k in order_by.iter_mut().filter(|k| k.expr.is_none() && !k.coll_explicit && k.coll == 0) {
+        let Some(GItem::Key(f)) = gitems.get(k.field) else { continue };
+        let Some((_, e)) = f.checked_sub(synth_base).and_then(|p| key_exprs.get(p)) else { continue };
+        if expr_is_nontext(e, descs) {
+            continue;
+        }
+        if let Some(tt) = expr_key_coll(e, descs).filter(|&t| t != 0) {
+            k.coll = order_ttype_of(tt);
+            k.own_coll = if fire_crab_ods::coll::icu_strength_of_ttype(tt).is_some() { tt } else { 0 };
+        }
+    }
     // AN ICU COLLATION DECIDES WHICH ROWS ARE ONE GROUP - `UNICODE_CI`
     // buckets 'apple' with 'APPLE' where the bytes make two groups - and
     // this server has no table for it ([coll_keyable]); MIN/MAX over
@@ -61909,6 +62495,8 @@ fn plan_group(
     {
         return Some(Plan::Refused);
     }
+    let mut gitems = gitems;
+    explicit_extreme_order(&mut gitems, &mut order_by, &key_fids, descs);
     Some(Plan::Group {
         rel,
         formats,
@@ -61925,6 +62513,59 @@ fn plan_group(
         index: None,
         defer: None,
     })
+}
+
+/// A grouped MIN or MAX under an EXPLICIT ICU collation, ordered.
+///
+/// (1) The ORDER BY over its slot sorts under that collation - at full
+/// strength, as every sort does ([order_ttype_of]); the slot's describe
+/// is the column's and carries none of it. `MIN(U COLLATE UNICODE_CI)
+/// .. GROUP BY K / 4 ORDER BY 1` over TD is 'ab', 'AB', 'E' on 2182,
+/// where the byte order answered 'AB', 'E', 'ab'.
+///
+/// (2) An ORDER BY that is not a constant takes such an extreme out of
+/// the lone-extreme scan order ([group_rows]): the ties go by the
+/// grouping record, as beside a COUNT(*). Measured over {é, É, e, E,
+/// ab, AB, ö} and over TD's reordered {AB, ab, E, e, É, é}: `MIN(U
+/// COLLATE UNICODE_CI) .. GROUP BY CHAR_LENGTH(U)` is the scan's 'e',
+/// 'ab' (TD: 'E', 'AB'), and with `ORDER BY 1`, `ORDER BY 1 DESC` or
+/// `ORDER BY MIN(U COLLATE UNICODE_CI)` it is 'AB', 'E' on both; `ORDER
+/// BY 2` over a constant second column leaves the scan's, and a WHERE
+/// on ID puts ID first in the record ('ab', 'e'). A COLUMN's own
+/// collation keeps the scan order under the same ORDER BY (`MIN(UC) ..
+/// ORDER BY 1` is 'ab', 'e'), so only a written COLLATE - one that is
+/// not the column's own - or an expression stamped with one
+/// ([agg_expr_src]) counts. The break is a hidden COUNT(*) slot, which
+/// reads no field and so adds nothing to the record's tie order.
+fn explicit_extreme_order(gitems: &mut Vec<GItem>, order_by: &mut [OrderKey], key_fids: &[usize], descs: &[Descriptor]) {
+    let explicit_tt = |g: &GItem| match g {
+        GItem::Agg(AggFn::Min | AggFn::Max, AggSrc::CollField(fid, tt), _)
+            if descs.get(*fid).is_some_and(|d| d.sub_type as u16 != *tt) =>
+        {
+            Some(*tt)
+        }
+        GItem::Agg(AggFn::Min | AggFn::Max, AggSrc::Expr(Expr::Collate(_, tt)), _) => Some(*tt),
+        _ => None,
+    }
+    .filter(|tt| fire_crab_ods::coll::icu_strength_of_ttype(*tt).is_some());
+    for k in order_by.iter_mut() {
+        if k.expr.is_none() && !k.coll_explicit && k.coll == 0 {
+            if let Some(tt) = gitems.get(k.field).and_then(explicit_tt) {
+                k.coll = order_ttype_of(tt);
+                k.own_coll = tt;
+            }
+        }
+    }
+    if key_fids.is_empty() || !gitems.iter().any(|g| explicit_tt(g).is_some()) {
+        return;
+    }
+    let constant = |k: &OrderKey| match &k.expr {
+        Some(e) => !expr_reads(e, &|_| true),
+        None => matches!(gitems.get(k.field), Some(GItem::Const(_))),
+    };
+    if order_by.iter().any(|k| !constant(k)) {
+        gitems.push(GItem::Agg(AggFn::Count, AggSrc::Star, false));
+    }
 }
 
 /// Parse a GROUP BY list into record field ids. Items are column names or
@@ -62928,6 +63569,30 @@ impl<'a> ReadView<'a> {
 /// (measured, `serve-real-unionrep`: `SELECT DISTINCT c3 .. UNION SELECT
 /// v5 ..` keeps the CHAR leg's 'ab ' - OCTET_LENGTH 3 - where `SELECT c3
 /// .. UNION SELECT v5 ..` keeps the VARCHAR leg's 2) - unknown, refused.
+/// What a distinct UNION deduplicates by, column for column: the FIRST
+/// branch's collation, read through its expressions ([plan_coll_cols]) -
+/// the union's own columns are positional and carry only the first
+/// branch's ttype, which an explicit `COLLATE` under a function never
+/// reached. Measured on 2182 over {é, É, e, E, ab, AB, ö} under UTF8,
+/// NONE and WIN1252 callers: `UPPER(U COLLATE UNICODE_CI) UNION U` is 4
+/// rows, `LPAD(U COLLATE UNICODE_CI, 2, 'z') UNION U` 7, `U COLLATE
+/// UNICODE_CI || 'x' UNION U || 'x'` 4, `U COLLATE UNICODE_CI UNION U
+/// COLLATE UNICODE_CI_AI` 4 (the first's; the second's would be 3) and
+/// `U UNION U COLLATE UNICODE_CI` 7 - this server answered 8, 12, 7 and
+/// 7 by bytes.
+fn union_coll_cols(branches: &[Plan], oc: &[ProjCol]) -> Vec<u16> {
+    let own = coll_cols(oc);
+    let Some(first) = branches.first() else { return own };
+    let fc = plan_coll_cols(first, &output_cols_of(first));
+    own.iter()
+        .enumerate()
+        .map(|(i, tt)| match fc.get(i) {
+            Some(f) if fire_crab_ods::intl::collation_id(*f as i16) != 0 => *f,
+            _ => *tt,
+        })
+        .collect()
+}
+
 fn union_tie_unknown(branches: &[Plan]) -> bool {
     branches.iter().any(|b| !matches!(b, Plan::Project { windows, gen_cols, .. } if windows.is_empty() && gen_cols.is_empty()))
 }
@@ -65376,9 +66041,9 @@ fn sort_key_restored(d: &Descriptor) -> bool {
 ///     ([WinRecord::base]) less the keys this sort restores from their
 ///     key slot ([WinSpec::restored_keys]) - the streams the sort names,
 ///     outermost first, compared as the engine's record image
-///     ([sort_record_image]: NULL flag bytes, then aligned values, as
-///     little-endian words; [group_tie_cmp]'s per-value reading where a
-///     descriptor is unknown);
+///     ([SortRecImage]: NULL flag bytes, then aligned values, as
+///     little-endian words; a slot with no descriptor laid out by its
+///     values);
 ///   - then the row's position in the sort before it (the outermost
 ///     stream's record number): scan order for the first.
 /// Measured on 2182 (`serve-real-collkey` section 9): `SELECT Y, X,
@@ -65547,6 +66212,16 @@ fn compute_windows(
                 spec.restored_keys.contains(&f)
                     || rec.key_alias.iter().any(|(k, b)| *b == f && spec.restored_keys.contains(k))
             };
+            // the slot each record field is read from (a window value's at
+            // `win_base + w`), which names its descriptor
+            let mut tslots: Vec<usize> = Vec::new();
+            for st in &chain {
+                match st {
+                    Stream::Wins(ws) => tslots.extend(ws.iter().map(|&w| win_base + w)),
+                    Stream::Map => tslots.extend(rec.map.iter().copied()),
+                }
+            }
+            tslots.extend(rec.base.iter().copied().filter(|&f| !restored(f)));
             let trec: Vec<Vec<Value>> = (0..n)
                 .map(|i| {
                     let mut t: Vec<Value> = Vec::new();
@@ -65560,26 +66235,33 @@ fn compute_windows(
                     t
                 })
                 .collect();
-            let tfields: Vec<usize> = (0..trec.first().map_or(0, |t| t.len())).collect();
-            // the record's byte image ([sort_record_image]) where every
-            // field's descriptor is known - the engine's word compare;
-            // otherwise the per-value approximation [group_tie_cmp]
-            let tdescs: Option<Vec<Descriptor>> = {
-                let d = |f: usize| rec.descs.get(f).copied().flatten();
-                let mut v: Vec<Option<Descriptor>> = Vec::new();
-                for st in &chain {
-                    match st {
-                        Stream::Wins(ws) => v.extend(ws.iter().map(|&w| d(win_base + w))),
-                        Stream::Map => v.extend(rec.map.iter().map(|&f| d(f))),
-                    }
-                }
-                v.extend(rec.base.iter().filter(|&&f| !restored(f)).map(|&f| d(f)));
-                v.into_iter().collect()
-            };
-            // all rows or none: the two compares never mix in one sort
-            let images: Option<Vec<Vec<u32>>> = tdescs.as_ref().and_then(|td| {
-                trec.iter().map(|t| sort_record_image(&t.iter().collect::<Vec<_>>(), td)).collect()
-            });
+            // the record as the engine lays it out and compares it
+            // ([SortRecImage]): measured, `SELECT NAME, ROW_NUMBER() OVER
+            // (ORDER BY DEPT) FROM E2` numbers the DEPT 1 tie bob, dan,
+            // ann (NAME's bytes start on a word), and with `ORDER BY DEPT`
+            // above it dan, ann, bob (two more fields ahead of it move them
+            // two bytes in); a CHAR(4) NAME there ties by its first byte. A
+            // slot with no descriptor is laid out by its values.
+            let tdescs: Vec<Option<Descriptor>> = tslots
+                .iter()
+                .enumerate()
+                .map(|(i, &f)| {
+                    rec.descs.get(f).copied().flatten().or_else(|| {
+                        let col: Vec<Vec<Value>> = trec.iter().map(|t| vec![t[i].clone()]).collect();
+                        sort_rec_desc_of_values(&col, 0)
+                    })
+                })
+                .collect();
+            let layout = SortRecImage::new(&tdescs);
+            let images: Vec<Vec<u8>> =
+                trec.iter().map(|t| layout.image(&t.iter().collect::<Vec<_>>())).collect();
+            let opaque: Vec<usize> = layout
+                .at
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, d))| d.is_none())
+                .map(|(i, _)| i)
+                .collect();
             let mut perm: Vec<usize> = (0..n).collect();
             perm.sort_by(|&a, &b| {
                 order_cmp(&keyrows[a], &keyrows[b], &pkeys_sort)
@@ -65590,9 +66272,13 @@ fn compute_windows(
                             order_cmp(&ordrows[a], &ordrows[b], &okeys)
                         }
                     })
-                    .then_with(|| match &images {
-                        Some(im) => im[a].cmp(&im[b]),
-                        None => group_tie_cmp(&trec[a], &trec[b], &[], &tfields),
+                    .then_with(|| SortRecImage::cmp(&images[a], &images[b]))
+                    .then_with(|| {
+                        opaque
+                            .iter()
+                            .map(|&i| value_cmp(&trec[a][i], &trec[b][i]))
+                            .find(|c| c.is_ne())
+                            .unwrap_or(Equal)
                     })
                     .then_with(|| prev_pos[a].cmp(&prev_pos[b]))
             });
@@ -66071,8 +66757,9 @@ fn compute_windows(
     Ok(out)
 }
 
-/// THE SORT RECORD PAST ITS KEYS, AS THE ENGINE LAYS IT OUT AND COMPARES
-/// IT - the tie law of every sort a window takes part in.
+/// ONE VALUE OF THE SORT RECORD PAST ITS KEYS, AS THE ENGINE LAYS IT OUT
+/// AND COMPARES IT - the tie law of every sort a window takes part in
+/// ([SortRecImage] lays the whole record out).
 ///
 /// `Optimizer::generateSort` puts one NULL-flag BYTE per record field
 /// right after the keys (a 4-aligned offset), then each field's value at
@@ -66096,127 +66783,99 @@ fn compute_windows(
 /// start at the flags: the key region is 4-aligned, and an 8-aligned
 /// field only inserts a zero word into both records alike.
 ///
-/// Answers the words, or None when a field's descriptor is unknown or
-/// its value is not one this image can spell (the caller then keeps its
-/// per-value comparison). A `None` descriptor slot in `descs` is a NULL
-/// INTEGER-sized placeholder the caller asks for ([SORT_REC_NULL_SLOT]).
-fn sort_record_image(vals: &[&Value], descs: &[Descriptor]) -> Option<Vec<u32>> {
+/// [SortRecImage] lays the record out and compares it; this spells ONE
+/// value into its slot (`slot` is exactly the descriptor's length, over
+/// zeros), or None when the value is not one the descriptor's form can
+/// hold - the caller leaves that slot zero and compares it by value.
+fn sort_rec_put(slot: &mut [u8], v: &Value, d: &Descriptor) -> Option<()> {
     use fire_crab_ods::intl;
-    if vals.len() != descs.len() {
-        return None;
-    }
-    let align = |t: u8| -> usize {
-        match t {
-            dtype::VARYING | dtype::SHORT => 2,
-            dtype::DOUBLE | dtype::INT64 | dtype::DEC64 | dtype::DEC128 | dtype::INT128 => 8,
-            dtype::BOOLEAN => 1,
-            t if t >= dtype::VARYING => 4,
-            _ => 1,
+    // an exact value's raw integer
+    let raw = |v: &Value| -> Option<i128> {
+        match v {
+            Value::Int(x) | Value::Scaled(x, _) | Value::Rounded(x, _) => Some(*x as i128),
+            Value::Int128(x, _) => Some(*x),
+            Value::Bool(x) => Some(*x as i128),
+            _ => None,
         }
     };
-    let mut buf: Vec<u8> = vec![0u8; vals.len()];
-    for (i, (v, d)) in vals.iter().zip(descs.iter()).enumerate() {
-        let a = align(d.dtype);
-        let at = buf.len().div_ceil(a) * a;
-        let len = d.length as usize;
-        buf.resize(at + len, 0);
-        if matches!(v, Value::Null) {
-            buf[i] = 1;
-            continue;
+    let put = |slot: &mut [u8], b: &[u8]| -> Option<()> {
+        if b.len() > slot.len() {
+            return None;
         }
-        let slot = &mut buf[at..at + len];
-        // an exact value's raw integer at the descriptor's own scale
-        let raw = |v: &Value| -> Option<i128> {
-            match v {
-                Value::Int(x) if d.scale == 0 => Some(*x as i128),
-                Value::Scaled(x, s) if *s == d.scale => Some(*x as i128),
-                Value::Int128(x, s) if *s == d.scale => Some(*x),
-                _ => None,
-            }
-        };
-        let put = |slot: &mut [u8], b: &[u8]| -> Option<()> {
-            if b.len() > slot.len() {
-                return None;
-            }
-            slot[..b.len()].copy_from_slice(b);
-            Some(())
-        };
-        match d.dtype {
-            dtype::TEXT | dtype::VARYING => {
-                let Value::Text(s) = v else { return None };
-                let cs = intl::charset_id(d.sub_type);
-                let bytes = match intl::encode_text(cs, s) {
-                    Ok(Some(b)) => b,
-                    _ if intl::byte_carrier(cs) => intl::carrier_encode(s).unwrap_or_else(|| s.as_bytes().to_vec()),
-                    _ => s.as_bytes().to_vec(),
-                };
-                if d.dtype == dtype::VARYING {
-                    if bytes.len() + 2 > len {
-                        return None;
-                    }
-                    slot[..2].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
-                    slot[2..2 + bytes.len()].copy_from_slice(&bytes);
-                } else {
-                    put(slot, &bytes)?;
-                    let pad = intl::pad_byte(cs);
-                    slot[bytes.len()..].iter_mut().for_each(|b| *b = pad);
+        slot[..b.len()].copy_from_slice(b);
+        Some(())
+    };
+    match d.dtype {
+        dtype::TEXT | dtype::VARYING => {
+            let Value::Text(s) = v else { return None };
+            let cs = intl::charset_id(d.sub_type);
+            let bytes = match intl::encode_text(cs, s) {
+                Ok(Some(b)) => b,
+                _ if intl::byte_carrier(cs) => intl::carrier_encode(s).unwrap_or_else(|| s.as_bytes().to_vec()),
+                _ => s.as_bytes().to_vec(),
+            };
+            if d.dtype == dtype::VARYING {
+                let n = bytes.len().min(slot.len().saturating_sub(2));
+                if slot.len() < 2 {
+                    return None;
                 }
+                slot[..2].copy_from_slice(&(n as u16).to_le_bytes());
+                slot[2..2 + n].copy_from_slice(&bytes[..n]);
+            } else {
+                let n = bytes.len().min(slot.len());
+                slot[..n].copy_from_slice(&bytes[..n]);
+                let pad = intl::pad_byte(cs);
+                slot[n..].iter_mut().for_each(|b| *b = pad);
             }
-            dtype::SHORT => put(slot, &i16::try_from(raw(v)?).ok()?.to_le_bytes())?,
-            dtype::LONG => put(slot, &i32::try_from(raw(v)?).ok()?.to_le_bytes())?,
-            dtype::INT64 => put(slot, &i64::try_from(raw(v)?).ok()?.to_le_bytes())?,
-            dtype::INT128 => put(slot, &raw(v)?.to_le_bytes())?,
-            dtype::DOUBLE => match v {
-                Value::Double(x) => put(slot, &x.to_le_bytes())?,
-                Value::Float(x) => put(slot, &(*x as f64).to_le_bytes())?,
-                _ => return None,
-            },
-            dtype::REAL => match v {
-                Value::Float(x) => put(slot, &x.to_le_bytes())?,
-                _ => return None,
-            },
-            dtype::SQL_DATE => match v {
-                Value::Date(x) => put(slot, &x.to_le_bytes())?,
-                _ => return None,
-            },
-            dtype::SQL_TIME => match v {
-                Value::Time(x) => put(slot, &x.to_le_bytes())?,
-                _ => return None,
-            },
-            dtype::TIMESTAMP => match v {
-                Value::Timestamp(dd, tt) => {
-                    put(slot, &dd.to_le_bytes())?;
-                    put(&mut slot[4..], &tt.to_le_bytes())?;
-                }
-                _ => return None,
-            },
-            dtype::BOOLEAN => match v {
-                Value::Bool(x) => put(slot, &[*x as u8])?,
-                _ => return None,
-            },
-            dtype::DEC64 => match v {
-                Value::DecFloat16(x) => put(slot, &x.to_le_bytes())?,
-                _ => return None,
-            },
-            dtype::DEC128 => match v {
-                Value::DecFloat34(x) => put(slot, &x.to_le_bytes())?,
-                _ => return None,
-            },
+        }
+        dtype::SHORT => put(slot, &(raw(v)? as i16).to_le_bytes())?,
+        dtype::LONG => put(slot, &(raw(v)? as i32).to_le_bytes())?,
+        dtype::INT64 => put(slot, &(raw(v)? as i64).to_le_bytes())?,
+        dtype::INT128 => put(slot, &raw(v)?.to_le_bytes())?,
+        dtype::BOOLEAN => put(slot, &[raw(v)? as u8])?,
+        dtype::DOUBLE => match v {
+            Value::Double(x) => put(slot, &x.to_le_bytes())?,
+            Value::Float(x) => put(slot, &(*x as f64).to_le_bytes())?,
             _ => return None,
-        }
+        },
+        dtype::REAL => match v {
+            Value::Float(x) => put(slot, &x.to_le_bytes())?,
+            Value::Double(x) => put(slot, &(*x as f32).to_le_bytes())?,
+            _ => return None,
+        },
+        dtype::SQL_DATE => match v {
+            Value::Date(x) => put(slot, &x.to_le_bytes())?,
+            _ => return None,
+        },
+        dtype::SQL_TIME => match v {
+            Value::Time(x) => put(slot, &x.to_le_bytes())?,
+            _ => return None,
+        },
+        dtype::TIMESTAMP => match v {
+            Value::Timestamp(dd, tt) => {
+                put(slot, &dd.to_le_bytes())?;
+                put(slot.get_mut(4..)?, &tt.to_le_bytes())?;
+            }
+            _ => return None,
+        },
+        dtype::DEC64 => match v {
+            Value::DecFloat16(x) => put(slot, &x.to_le_bytes())?,
+            _ => return None,
+        },
+        dtype::DEC128 => match v {
+            Value::DecFloat34(x) => put(slot, &x.to_le_bytes())?,
+            _ => return None,
+        },
+        _ => return None,
     }
-    buf.resize(buf.len().div_ceil(4) * 4, 0);
-    Some(buf.chunks(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect())
+    Some(())
 }
 
-/// The descriptor a sort record gives a field this server cannot name
-/// but the engine's record carries: a PARTITION BY window's stream holds
-/// one per partition key that the outer sort reads as NULL on every row
-/// (measured: `SELECT S, COUNT(*) OVER (PARTITION BY K2) .. ORDER BY K`
-/// puts the NULL S LAST where `SELECT S, COUNT(*) OVER (ORDER BY ID)`
-/// puts it FIRST - a third flag byte moves S's length out of word 0 -
-/// and a NULL K2 does not move its row). Its width is unmeasured; an
-/// INTEGER's keeps every later field's offset within its word.
+/// The width a NULL partition copy ([outer_window_tie]) takes when the
+/// column it copies has no known descriptor: the copy is the COLUMN's
+/// own width (measured: a VARCHAR(5) key's copy moves a later VARCHAR
+/// two bytes further than an INTEGER's), so an INTEGER here is only
+/// the fallback.
 const SORT_REC_NULL_SLOT: Descriptor =
     Descriptor { dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 0 };
 
@@ -66305,9 +66964,15 @@ fn group_tie_cmp(a: &[Value], b: &[Value], keys: &[OrderKey], extra: &[usize]) -
 ///     window streams are chained in;
 ///   - `descs`: each row slot's descriptor (a field's, then each
 ///     window's value at `win_base + w`) - the widths and alignments of
-///     [sort_record_image]; empty or a `None` slot keeps the per-value
-///     compare.
-/// A window value's own slot (at or past `win_base`) is no record field.
+///     [SortRecImage]; a `None` slot is laid out by its values;
+///   - `outer`: every bare field AND every window value in the order
+///     the select list and then the ORDER BY post them - what the OUTER
+///     sort's maps hold ([outer_window_tie] splits it into them);
+///   - `part`: per distinct PARTITIONED clause (its first window), the
+///     fields its keys read - the NULL copies closing its map in the
+///     outer record ([outer_window_tie]).
+/// A window value's own slot (at or past `win_base`) is no record field
+/// of the window sorts; it is one of the outer sort's.
 struct WinRecord {
     map: Vec<usize>,
     base: Vec<usize>,
@@ -66318,6 +66983,8 @@ struct WinRecord {
     /// trailing row slots past the window values that the fold carries
     /// through untouched ([WinTie::hidden])
     carry: usize,
+    outer: Vec<usize>,
+    part: Vec<(usize, Vec<usize>)>,
 }
 
 fn window_record(
@@ -66336,6 +67003,8 @@ fn window_record(
             descs: Vec::new(),
             key_alias: Vec::new(),
             carry: 0,
+            outer: Vec::new(),
+            part: Vec::new(),
         },
         0usize, // the visit's clock
     ));
@@ -66355,6 +67024,9 @@ fn window_record(
             let mut s = st.borrow_mut();
             s.1 += 1;
             let tick = s.1;
+            if !s.0.outer.contains(&f) {
+                s.0.outer.push(f);
+            }
             if f >= win_base {
                 if let Some(slot) = s.0.first_at.get_mut(f - win_base) {
                     if *slot == usize::MAX {
@@ -66437,7 +67109,40 @@ fn window_record(
         }
     }
     order_by.iter().for_each(|k| key(&post, k));
+    // the partition keys' fields ride the outer record after everything
+    // the select list and the ORDER BY post (measured: `N, COUNT(*) OVER
+    // (PARTITION BY G)` carries three fields, `N, ROW_NUMBER() OVER
+    // (ORDER BY G)` two - an OVER's ORDER BY and a window's argument are
+    // posted nowhere). They are the partitioned CLAUSE's own map fields
+    // (`pass1_rse_impl` remaps the PARTITION BY into that clause's
+    // window map), so each distinct clause carries its fields once -
+    // never merged with a select-list field, an ORDER BY key or another
+    // clause's (measured on 2182 by where a leading VARCHAR's bytes
+    // fall: `N, G, ID, COUNT(*) OVER (PARTITION BY G)` carries five
+    // fields, `N, COUNT(*) OVER (PARTITION BY G), ROW_NUMBER() OVER
+    // (PARTITION BY G ORDER BY ID)` five, `N, COUNT(*) OVER (PARTITION
+    // BY G), SUM(Y) OVER (PARTITION BY G)` four, `PARTITION BY G + K +
+    // ID` three fields, `PARTITION BY G, G` one)
+    let mut part: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (wi, w) in windows.iter().enumerate() {
+        let same = |a: &WinSpec, b: &WinSpec| a.part_raw == b.part_raw && a.order_text == b.order_text;
+        if w.part.is_empty() || windows[..wi].iter().any(|v| same(v, w)) {
+            continue;
+        }
+        let own = std::cell::RefCell::new(Vec::<usize>::new());
+        for e in &w.part {
+            expr_reads(e, &|f| {
+                let mut o = own.borrow_mut();
+                if f < win_base && !o.contains(&f) {
+                    o.push(f);
+                }
+                false
+            });
+        }
+        part.push((wi, own.into_inner()));
+    }
     let (mut rec, _) = st.into_inner();
+    rec.part = part;
     rec.base.sort_unstable();
     rec
 }
@@ -66450,9 +67155,8 @@ fn window_record(
 #[derive(Clone, Default)]
 struct WinTie {
     /// L3: the statement ORDER BY's record past its keys
-    /// ([outer_window_tie]'s law); `None` a NULL placeholder slot
-    /// ([SORT_REC_NULL_SLOT])
-    outer: Vec<Option<usize>>,
+    /// ([outer_window_tie]'s law)
+    outer: Vec<RecItem>,
     /// L2: the window sorts' map and base fields ([WinRecord]), each
     /// overriding what [window_record] reads off the level
     map: Option<Vec<usize>>,
@@ -66469,120 +67173,284 @@ struct WinTie {
 
 /// THE STATEMENT ORDER BY ABOVE A WINDOW breaks its ties by the WINDOW
 /// STREAMS' record, not by the order the windows delivered the rows in.
-/// The outer sort's streams are the WindowSourceNode's
-/// (`computeRseStreams`: one per distinct OVER clause, the bare-field
-/// map's among them), in first-appearance order, each contributing its
-/// referenced fields in field order: the map's bare fields as the select
-/// list posts them (an expression's fields as it reads them), a window
-/// stream's values, and - for a PARTITION BY stream - one more slot per
-/// partition key that reads NULL ([SORT_REC_NULL_SLOT]). A plain-field
-/// key rides in its key slot and leaves the record unless its key cannot
-/// be restored ([sort_key_restored]); [sort_record_image] compares what
-/// is left. Measured on 2182 over T (ID, K, S, V): `SELECT ID, ROW_NUMBER()
-/// OVER (ORDER BY ID DESC) FROM T ORDER BY K` ties by ID (6, 9, 1, 3, 5,
-/// 8, 2, 4, 7, 10), `SELECT 11 - ID R, ..` by ID too (R = 5, 2, 10, ..),
-/// `SELECT S, ID, ..` by S then ID, and `SELECT ROW_NUMBER() .. RN, ID`
-/// by RN - the window's stream appears first. This server sorted the
-/// windows' delivery order stably, which is the last window's order.
-fn outer_window_tie(
-    rec: &WinRecord,
-    windows: &[WinSpec],
-    order_by: &[OrderKey],
-    win_base: usize,
-) -> Vec<Option<usize>> {
+/// The outer sort's streams are the WindowSourceNode's (one window MAP
+/// per distinct OVER clause), in the order the select list and then the
+/// ORDER BY first post into them, each contributing its items in posting
+/// order:
+///   - the PLAIN map - the one `OVER ()` names - holds the bare fields
+///     (an expression's fields as it reads them) AND every window over
+///     an empty clause, interleaved as written;
+///   - a clause's map holds its windows' values, then - for a PARTITION
+///     BY clause - its copy of every field its keys read (each once,
+///     `PARTITION BY G + K + ID` three, `G, G` one), at the field's own
+///     width and NULL in every row (`WindowStream` assigns a map's plain
+///     items only for a clause without a partition).
+/// A plain-field key rides in its key slot and leaves the record unless
+/// its key cannot be restored ([sort_by_record]); [SortRecImage]
+/// compares what is left. Measured on 2182 over T (ID, K, A VARCHAR(4),
+/// B, ...) with the K ties spelling 'dcba', 'dbca', 'cdab', 'badc',
+/// 'acbd', 'abcd' (their order tells where A's bytes fall in a word):
+/// `SELECT A, RN, B .. ORDER BY K` ties by B before RN (the window's map
+/// follows the plain one); `SELECT B, MIN(M) OVER () MM, A` lays MM
+/// between B and A, `SELECT MIN(M) OVER (PARTITION BY G) MM, A` puts G's
+/// copy between MM and A, `SELECT C, MM, A` over one PARTITION BY clause
+/// puts it after both windows, a VARCHAR(5) key's copy is seven bytes
+/// wide; `SELECT ID, ROW_NUMBER() OVER (ORDER BY ID DESC) FROM T ORDER
+/// BY K` ties by ID, `SELECT ROW_NUMBER() .. RN, ID` by RN.
+fn outer_window_tie(rec: &WinRecord, windows: &[WinSpec], win_base: usize) -> Vec<RecItem> {
     let same_clause = |a: &WinSpec, b: &WinSpec| a.part_raw == b.part_raw && a.order_text == b.order_text;
-    let mut streams: Vec<(usize, Vec<Option<usize>>)> = Vec::new();
-    if !rec.map.is_empty() {
-        streams.push((rec.map_at, rec.map.iter().map(|&f| Some(f)).collect()));
-    }
-    let mut seen = vec![false; windows.len()];
-    for wi in 0..windows.len() {
-        if seen[wi] {
-            continue;
+    // a window's map: None the plain one, else its clause's first window
+    let map_of = |w: usize| -> Option<usize> {
+        let spec = windows.get(w)?;
+        if spec.part.is_empty() && spec.order.is_empty() {
+            return None;
         }
-        let mut members: Vec<usize> =
-            (wi..windows.len()).filter(|&w| !seen[w] && same_clause(&windows[wi], &windows[w])).collect();
-        members.iter().for_each(|&w| seen[w] = true);
-        let first = |w: usize| rec.first_at.get(w).copied().unwrap_or(usize::MAX);
-        members.sort_by_key(|&w| first(w));
-        let at = members.iter().map(|&w| first(w)).min().unwrap_or(usize::MAX);
-        let mut fields: Vec<Option<usize>> = vec![None; windows[wi].part.len()];
-        fields.extend(members.iter().map(|&w| Some(win_base + w)));
-        streams.push((at, fields));
+        (0..windows.len()).find(|&v| same_clause(&windows[v], spec))
+    };
+    let desc = |f: usize| rec.descs.get(f).copied().flatten();
+    let mut streams: Vec<(Option<usize>, Vec<RecItem>)> = Vec::new();
+    for &f in &rec.outer {
+        let m = if f < win_base { None } else { map_of(f - win_base) };
+        let at = match streams.iter().position(|(k, _)| *k == m) {
+            Some(i) => i,
+            None => {
+                streams.push((m, Vec::new()));
+                streams.len() - 1
+            }
+        };
+        streams[at].1.push(RecItem { slot: Some(f), desc: desc(f), null: false });
     }
-    streams.sort_by_key(|(at, _)| *at);
-    outer_tie_less_keys(streams.into_iter().flat_map(|(_, f)| f).collect(), order_by, &rec.descs)
+    // each partitioned clause's copies close its map; a clause no item
+    // posted (its windows only inside an expression) still carries them
+    for (wi, fields) in &rec.part {
+        let m = map_of(*wi);
+        let at = match streams.iter().position(|(k, _)| *k == m) {
+            Some(i) => i,
+            None => {
+                streams.push((m, Vec::new()));
+                streams.len() - 1
+            }
+        };
+        streams[at].1.extend(fields.iter().map(|&f| RecItem {
+            slot: None,
+            desc: Some(desc(f).unwrap_or(SORT_REC_NULL_SLOT)),
+            null: true,
+        }));
+    }
+    streams.into_iter().flat_map(|(_, items)| items).collect()
 }
 
-/// A record field that is also a plain-field sort key leaves the record
-/// (`generateSort` restores it from its key slot) unless its key is one
-/// the sort cannot turn back into the value ([sort_key_restored]).
-fn outer_tie_less_keys(
-    tie: Vec<Option<usize>>,
+/// One field of an engine sort record past its keys, laid out the way
+/// `Optimizer::generateSort` lays it: a NULL flag byte per field packed
+/// right after the (4-aligned) key area, then each field's value at its
+/// `type_alignments` boundary (a VARCHAR on 2, an INTEGER on 4, a
+/// BIGINT or DOUBLE on 8, a CHAR on 1) in the form the record holds it -
+/// a VARCHAR's 2-byte length then its bytes, a CHAR padded to its width,
+/// a number in its native little-endian bytes - over a zeroed buffer
+/// (`SortedStream::init`'s memset: a NULL leaves zeros). `Sort::
+/// sortBuffer` compares the WHOLE record as unsigned 32-bit words, so on
+/// a little-endian host a later byte of a word outweighs an earlier one:
+/// a text value's order past the keys depends on where its bytes fall in
+/// the words (measured on 2182 with `ORDER BY X` over equal X: 'dcba',
+/// 'dbca', 'cdab', 'badc', 'acbd', 'abcd' when the data starts on a word,
+/// 'badc', 'abcd', 'dbca', 'acbd', 'dcba', 'cdab' when it starts two
+/// bytes in). The key area's own length is left out: it is a multiple
+/// of 4, so it moves no value's place within its word.
+struct SortRecImage {
+    /// (offset, descriptor) of each field, None for one this image cannot
+    /// spell (a blob id, a zoned time) - compared by value
+    /// after the image, in field order
+    at: Vec<(usize, Option<Descriptor>)>,
+    len: usize,
+}
+
+impl SortRecImage {
+    fn new(descs: &[Option<Descriptor>]) -> SortRecImage {
+        let mut off = descs.len(); // the NULL flags
+        let mut at = Vec::with_capacity(descs.len());
+        for d in descs {
+            let (align, size) = match d.map(|d| (d.dtype, d.length as usize)) {
+                Some((dtype::TEXT, n)) => (1, n),
+                Some((dtype::VARYING, n)) | Some((dtype::SHORT, n)) => (2, n),
+                Some((dtype::LONG | dtype::REAL | dtype::SQL_DATE | dtype::SQL_TIME, n)) => (4, n),
+                Some((dtype::TIMESTAMP, n)) => (4, n),
+                Some((dtype::INT64 | dtype::DOUBLE | dtype::INT128, n)) => (8, n),
+                Some((dtype::BOOLEAN, n)) => (1, n),
+                Some((dtype::DEC64 | dtype::DEC128, n)) => (8, n),
+                Some((dtype::BLOB | dtype::ARRAY | dtype::QUAD, n)) => (4, n),
+                Some((dtype::SQL_TIME_TZ | dtype::EX_TIME_TZ, n)) => (4, n),
+                Some((dtype::TIMESTAMP_TZ | dtype::EX_TIMESTAMP_TZ, n)) => (4, n),
+                Some((_, n)) => (1, n),
+                None => (8, 8),
+            };
+            off = off.div_ceil(align) * align;
+            let spelt = d.filter(|d| {
+                matches!(
+                    d.dtype,
+                    dtype::TEXT
+                        | dtype::VARYING
+                        | dtype::SHORT
+                        | dtype::LONG
+                        | dtype::INT64
+                        | dtype::INT128
+                        | dtype::REAL
+                        | dtype::DOUBLE
+                        | dtype::SQL_DATE
+                        | dtype::SQL_TIME
+                        | dtype::TIMESTAMP
+                        | dtype::BOOLEAN
+                        | dtype::DEC64
+                        | dtype::DEC128
+                )
+            });
+            at.push((off, spelt));
+            off += size;
+        }
+        SortRecImage { at, len: off.div_ceil(4) * 4 }
+    }
+
+    /// The record image of one row's fields (`vals` in field order); a
+    /// value its descriptor cannot hold ([sort_rec_put]) leaves zeros.
+    fn image(&self, vals: &[&Value]) -> Vec<u8> {
+        let mut b = vec![0u8; self.len];
+        for (i, (v, (off, d))) in vals.iter().zip(self.at.iter()).enumerate() {
+            if matches!(v, Value::Null) {
+                b[i] = 1;
+                continue;
+            }
+            let Some(d) = d else { continue };
+            let end = (*off + d.length as usize).min(b.len());
+            let slot = &mut b[*off..end];
+            if sort_rec_put(slot, v, d).is_none() {
+                slot.iter_mut().for_each(|x| *x = 0);
+            }
+        }
+        b
+    }
+
+    /// `Sort::sortBuffer`'s compare of two images: unsigned native words.
+    fn cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        let w = |x: &[u8], i: usize| u32::from_le_bytes([x[i], x[i + 1], x[i + 2], x[i + 3]]);
+        let mut i = 0;
+        while i + 4 <= a.len().min(b.len()) {
+            let c = w(a, i).cmp(&w(b, i));
+            if c != std::cmp::Ordering::Equal {
+                return c;
+            }
+            i += 4;
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
+/// The descriptor a record field is laid out by when the plan does not
+/// name one: read off the values the slot holds (a text as a VARCHAR as
+/// wide as its longest value).
+fn sort_rec_desc_of_values(rows: &[Vec<Value>], slot: usize) -> Option<Descriptor> {
+    let mut d = Descriptor { dtype: 0, scale: 0, length: 0, sub_type: 0, flags: 0, offset: 0 };
+    for r in rows {
+        let (t, n) = match r.get(slot) {
+            None | Some(Value::Null) => continue,
+            Some(Value::Text(t)) => (dtype::VARYING, (t.len() + 2).max(d.length as usize)),
+            Some(Value::Int(_) | Value::Scaled(..) | Value::Rounded(..)) => (dtype::INT64, 8),
+            Some(Value::Int128(..)) => (dtype::INT128, 16),
+            Some(Value::Double(_)) => (dtype::DOUBLE, 8),
+            Some(Value::Float(_)) => (dtype::REAL, 4),
+            Some(Value::Bool(_)) => (dtype::BOOLEAN, 1),
+            Some(Value::Date(_)) => (dtype::SQL_DATE, 4),
+            Some(Value::Time(_)) => (dtype::SQL_TIME, 4),
+            Some(Value::Timestamp(..)) => (dtype::TIMESTAMP, 8),
+            Some(_) => return None,
+        };
+        d.dtype = t;
+        d.length = n.min(u16::MAX as usize) as u16;
+    }
+    (d.dtype != 0).then_some(d)
+}
+
+/// One field of an outer sort's record ([sort_by_record]): the row slot
+/// holding its value, or None for a field the rows do not carry (it
+/// still has its NULL flag, never NULL, and its place) - or, `null`, a
+/// field that is NULL in every row: a partitioned clause's copy of its
+/// PARTITION BY fields. `WindowedStream::WindowStream` assigns its map's
+/// plain items only for a clause WITHOUT a partition, so under one they
+/// keep the NULLs `internalOpen`'s `nullify()` left (measured on 2182:
+/// `SELECT ID, COUNT(*) OVER (PARTITION BY G) FROM P ORDER BY V` ties
+/// by ID whatever row's G is NULL - 1 2 3 4 5, with G NULL on row 4).
+#[derive(Clone, Debug)]
+struct RecItem {
+    slot: Option<usize>,
+    desc: Option<Descriptor>,
+    null: bool,
+}
+
+/// Sort by the ORDER BY keys, then by the engine's record of `items`
+/// ([SortRecImage]) less each plain-field key the sort restores from its
+/// key slot (`Optimizer::generateSort` pops it), then in arrival order.
+fn sort_by_record(
+    rows: Vec<Vec<Value>>,
     order_by: &[OrderKey],
-    descs: &[Option<Descriptor>],
-) -> Vec<Option<usize>> {
-    let restored = |f: usize| {
-        order_by.iter().any(|k| k.expr.is_none() && k.field == f)
-            && descs.get(f).copied().flatten().is_none_or(|d| sort_key_restored(&d))
-    };
-    let mut out: Vec<Option<usize>> = Vec::new();
-    for t in tie {
-        match t {
-            Some(f) if restored(f) || out.contains(&Some(f)) => {}
-            t => out.push(t),
-        }
-    }
-    out
-}
-
-/// Sort by `keys`, the ties by the record `tie` names ([sort_record_image]
-/// over `descs`), then stably. A record this server cannot spell for
-/// every row - an unknown descriptor, a value the image has no arm for -
-/// keeps the plain stable sort.
-fn sort_rows_tied(
-    rows: &mut Vec<Vec<Value>>,
-    keys: &[OrderKey],
-    tie: &[Option<usize>],
-    descs: &[Option<Descriptor>],
-) -> Result<(), EvalErr> {
-    let td: Option<Vec<Descriptor>> = tie
-        .iter()
-        .map(|t| match t {
-            Some(f) => descs.get(*f).copied().flatten(),
-            None => Some(SORT_REC_NULL_SLOT),
+    items: Vec<RecItem>,
+) -> Result<Vec<Vec<Value>>, EvalErr> {
+    let items: Vec<RecItem> = items
+        .into_iter()
+        .filter(|it| {
+            let Some(f) = it.slot.filter(|_| !it.null) else { return true };
+            let key = order_by.iter().any(|k| k.expr.is_none() && k.field == f);
+            !(key && it.desc.is_none_or(|d| sort_key_restored(&d)))
         })
         .collect();
-    let Some(td) = td.filter(|v| !v.is_empty()) else {
-        return sort_rows(rows, keys);
-    };
+    let descs: Vec<Option<Descriptor>> =
+        items.iter().map(|it| if it.slot.is_some() || it.null { it.desc } else { None }).collect();
+    let layout = SortRecImage::new(&descs);
+    // a field the rows do not carry is a constant non-NULL value
+    let absent = Value::Int(0);
     let null = Value::Null;
-    let images: Option<Vec<Vec<u32>>> = rows
-        .iter()
-        .map(|r| {
-            let vals: Vec<&Value> = tie.iter().map(|t| t.and_then(|f| r.get(f)).unwrap_or(&null)).collect();
-            sort_record_image(&vals, &td)
-        })
-        .collect();
-    let Some(images) = images else {
-        return sort_rows(rows, keys);
-    };
-    let mut dec: Vec<(Vec<Value>, Vec<u32>, Vec<Value>)> = Vec::with_capacity(rows.len());
-    for (r, img) in rows.drain(..).zip(images) {
-        let mut k = Vec::with_capacity(keys.len());
-        for key in keys {
-            k.push(key.value_of(&r)?);
+    let mut keyvals: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+    let mut images: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let mut k = Vec::with_capacity(order_by.len());
+        for key in order_by {
+            k.push(key.value_of(r)?);
         }
-        dec.push((k, img, r));
+        keyvals.push(k);
+        let vals: Vec<&Value> = items
+            .iter()
+            .map(|it| match it.slot {
+                _ if it.null => &null,
+                Some(f) => r.get(f).unwrap_or(&null),
+                None => &absent,
+            })
+            .collect();
+        images.push(layout.image(&vals));
     }
-    let flat: Vec<OrderKey> = keys
+    let flat: Vec<OrderKey> = order_by
         .iter()
         .enumerate()
         .map(|(i, k)| OrderKey { field: i, expr: None, ..k.clone() })
         .collect();
-    dec.sort_by(|a, b| order_cmp(&a.0, &b.0, &flat).then_with(|| a.1.cmp(&b.1)));
-    rows.extend(dec.into_iter().map(|(_, _, r)| r));
-    Ok(())
+    // the fields the image cannot spell, compared by value after it
+    let opaque: Vec<usize> = layout
+        .at
+        .iter()
+        .zip(items.iter())
+        .filter(|((_, d), it)| d.is_none() && !it.null)
+        .filter_map(|(_, it)| it.slot)
+        .collect();
+    let mut perm: Vec<usize> = (0..rows.len()).collect();
+    perm.sort_by(|&a, &b| {
+        order_cmp(&keyvals[a], &keyvals[b], &flat)
+            .then_with(|| SortRecImage::cmp(&images[a], &images[b]))
+            .then_with(|| {
+                opaque
+                    .iter()
+                    .map(|&f| value_cmp(rows[a].get(f).unwrap_or(&null), rows[b].get(f).unwrap_or(&null)))
+                    .find(|c| c.is_ne())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let mut slots_rows: Vec<Option<Vec<Value>>> = rows.into_iter().map(Some).collect();
+    Ok(perm.into_iter().map(|i| slots_rows[i].take().unwrap_or_default()).collect())
 }
 
 /// Each row slot's descriptor for [WinRecord::descs]: the fields' own,
@@ -66631,12 +67499,138 @@ fn fold_windows_ordered(
             rec.carry = t.hidden.len();
         }
     }
-    let outer = outer_window_tie(&rec, windows, order_by, win_base);
-    let mut rows = compute_windows(rows, windows, win_base, &rec)?;
-    if !order_by.is_empty() {
-        sort_rows_tied(&mut rows, order_by, &outer, &rec.descs)?;
+    let rows = compute_windows(rows, windows, win_base, &rec)?;
+    if order_by.is_empty() {
+        return Ok(rows);
     }
-    Ok(rows)
+    // a slot no descriptor names (a window only inside an expression) is
+    // laid out by the values it holds
+    let items: Vec<RecItem> = outer_window_tie(&rec, windows, win_base)
+        .into_iter()
+        .map(|mut it| {
+            if let (Some(f), None) = (it.slot, it.desc) {
+                it.desc = sort_rec_desc_of_values(&rows, f);
+            }
+            it
+        })
+        .collect();
+    sort_by_record(rows, order_by, items)
+}
+
+/// The outer sort's record for a DERIVED TABLE OVER A WINDOWED SELECT,
+/// None when `inner` holds no window. The engine merges the derived
+/// table into the window's map stream, so the record is the WINDOWED
+/// LEVEL's map in ITS posting order ([WinRecord::outer]) - every item of
+/// its select list whether the outer query reads it or not, then its
+/// partition keys' fields - wherever the outer query lists them.
+/// Measured on 2182 (`serve-real-collkey` section 13): `SELECT C, N FROM
+/// (SELECT N, X, COUNT(*) OVER () C FROM T7) ORDER BY X` lays N out
+/// first, an unread inner `Y` and a pass-through derived level in
+/// between change nothing but the field count. The rewrite of a windowed
+/// select that is not the plain shape ([rewrite_windowed_select]) is the
+/// one exception: its middle level lists the lifted items, not the
+/// statement's, so the statement's own order is the OUTER level's
+/// (`SELECT FIRST 3 COUNT(*) OVER () C, N` lays C out first). A field
+/// the outer rows do not carry keeps its place as a constant; an inner
+/// EXPRESSION column stands at the place of the first field it reads.
+fn derived_record_items(inner: &Plan, cols: &[ProjCol], order_by: &[OrderKey]) -> Option<Vec<RecItem>> {
+    // walk down pass-through derived levels, mapping the outer row's
+    // columns onto the level below
+    let width = match inner {
+        Plan::Derived { cols, .. } | Plan::Project { cols, .. } => cols.len(),
+        _ => return None,
+    };
+    let mut map: Vec<Option<usize>> = (0..width).map(Some).collect();
+    let mut level = inner;
+    loop {
+        match level {
+            Plan::Derived { inner: below, cols: lc, windows, .. } if windows.is_empty() && lc.iter().all(|c| c.expr.is_none()) => {
+                // outer index i -> this level's column map[i] -> the level
+                // below's field lc[map[i]].field_id
+                map = map.iter().map(|m| m.and_then(|i| lc.get(i).map(|c| c.field_id))).collect();
+                level = below;
+            }
+            _ => break,
+        }
+    }
+    let (wcols, wfilter, windows, win_base, worder) = match level {
+        Plan::Derived { cols, filter, windows, win_base, order_by, .. } if !windows.is_empty() => {
+            (cols, filter, windows, *win_base, order_by)
+        }
+        Plan::Project { cols, filter, windows, win_base, order_by, .. } if !windows.is_empty() => {
+            (cols, filter, windows, *win_base, order_by)
+        }
+        _ => return None,
+    };
+    // the windowed level's column c is carried in the outer row at the
+    // outer index i with map[i] == c
+    let outer_at = |c: usize| map.iter().position(|m| *m == Some(c));
+    let rewritten = std::ptr::eq(level, inner) && wcols.iter().all(|c| c.name.starts_with("FC$"));
+    if rewritten {
+        // the statement's own order: the outer level's posting, then the
+        // windowed level's partition fields the outer does not carry
+        let orec = window_record(cols, None, &[], order_by, usize::MAX);
+        let mut items: Vec<RecItem> = orec
+            .outer
+            .iter()
+            .map(|&f| RecItem { slot: Some(f), desc: wcols.get(f).map(desc_of_projcol), null: false })
+            .collect();
+        let wrec = window_record(wcols, wfilter.as_ref(), windows, worder, win_base);
+        let read_by_cols: Vec<usize> =
+            wcols.iter().filter(|c| c.expr.is_none()).map(|c| c.field_id).collect();
+        for &s in &wrec.outer {
+            if s < win_base && !read_by_cols.contains(&s) {
+                items.push(RecItem { slot: None, desc: None, null: false });
+            }
+        }
+        items.extend(wrec.part.iter().flat_map(|(_, f)| f).map(|_| RecItem { slot: None, desc: None, null: true }));
+        return Some(items);
+    }
+    let mut wrec = window_record(wcols, wfilter.as_ref(), windows, worder, win_base);
+    // the windowed level's slot descriptors: its source's fields, then its
+    // windows' values - the widths of the partition copies
+    let src_descs: Vec<Option<Descriptor>> = match level {
+        Plan::Project { formats, .. } => formats
+            .iter()
+            .max_by_key(|(n, _)| *n)
+            .map(|(_, d)| d.iter().map(|d| Some(*d)).collect())
+            .unwrap_or_default(),
+        Plan::Derived { inner: below, .. } => output_cols_of(below).iter().map(|c| Some(desc_of_projcol(c))).collect(),
+        _ => Vec::new(),
+    };
+    wrec.descs = window_slot_descs(src_descs, wcols, windows.len(), win_base);
+    let mut items: Vec<RecItem> = Vec::new();
+    let mut used = vec![false; wcols.len()];
+    for it in outer_window_tie(&wrec, windows, win_base) {
+        let Some(s) = it.slot else {
+            items.push(it);
+            continue;
+        };
+        let plain = wcols.iter().position(|c| c.expr.is_none() && c.field_id == s);
+        let by_expr = || {
+            wcols.iter().enumerate().position(|(ci, c)| {
+                !used[ci]
+                    && c.expr.as_ref().is_some_and(|e| {
+                        let hit = std::cell::Cell::new(false);
+                        expr_reads(e, &|f| {
+                            if f == s {
+                                hit.set(true);
+                            }
+                            false
+                        });
+                        hit.get()
+                    })
+            })
+        };
+        match plain.or_else(by_expr) {
+            Some(ci) if !used[ci] || plain.is_some() => {
+                used[ci] = true;
+                items.push(RecItem { slot: outer_at(ci), desc: Some(desc_of_projcol(&wcols[ci])), null: false });
+            }
+            _ => items.push(RecItem { slot: None, desc: None, null: false }),
+        }
+    }
+    Some(items)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -66727,8 +67721,38 @@ fn group_rows(
         let text_key = key_fids.iter().any(|f| {
             input.iter().any(|r| matches!(r.get(*f), Some(Value::Text(_))))
         });
+        // a key that READS a field - a constant one (`GROUP BY 1 = 1`,
+        // `GROUP BY 'x'`) leaves a lone MIN / MAX in scan order on the
+        // engine (`MIN(UC) ... GROUP BY 1 = 1` and `GROUP BY 'x'` are
+        // 'ab', measured, where a LIST beside it makes it 'AB')
+        let field_key = key_fids.iter().any(|f| match f.checked_sub(synth_base) {
+            Some(i) if !key_exprs.is_empty() => key_exprs.get(i).is_some_and(|e| expr_reads(e, &|_| true)),
+            _ => true,
+        });
+        // ...and a statement that asks its groups for ONE collated MIN or
+        // MAX and nothing else (constants aside) leaves it in scan order
+        // too: `SELECT MIN(UC) ... GROUP BY CHAR_LENGTH(UC)` is 'ab' and
+        // 'e', `MIN(UC), MIN(UC)` and `MIN(UC), 1` the same, where a
+        // COUNT(*), a SUM(1), a MAX(UC), a MIN(U), the key itself in the
+        // select list or a HAVING COUNT(*) beside it make it 'AB' and 'E'
+        // (all measured on 2182 over {é, É, e, E, ab, AB, ö})
+        // (an expression stamped with its explicit collation
+        // [agg_expr_src] is one too: `MIN(LPAD(U COLLATE UNICODE_CI, 2,
+        // 'z')) .. GROUP BY CHAR_LENGTH(U)` is 'ze', the scan's first of
+        // {ze, zE}, and 'zE' beside a COUNT(*), measured)
+        let lone_extreme = {
+            let mut it = gitems.iter().filter(|g| !matches!(g, GItem::Const(_)));
+            match it.next() {
+                Some(GItem::Agg(f @ (AggFn::Min | AggFn::Max), AggSrc::CollField(a, t), _)) => it.all(|g| {
+                    matches!(g, GItem::Agg(f2, AggSrc::CollField(b, u), _) if f2 == f && b == a && u == t)
+                }),
+                Some(GItem::Agg(AggFn::Min | AggFn::Max, AggSrc::Expr(Expr::Collate(..)), _)) => it.next().is_none(),
+                _ => false,
+            }
+        };
         let tie_fids = if tie_order
-            && (text_key
+            // a constant text key has one spelling: nothing to survive
+            && ((text_key && field_key)
                 || gitems.iter().any(|g| {
                     matches!(
                         g,
@@ -66743,6 +67767,19 @@ fn group_rows(
                             ..
                         )
                     ) || matches!(g, GItem::Agg(f, ..) if f.is_statistical2())
+                        // MIN / MAX under an ICU collation keep the FIRST of
+                        // the values it calls equal, and inside a sorted
+                        // group "first" is this record order: `MIN(UC),
+                        // COUNT(*) .. GROUP BY CHAR_LENGTH(U)` over {ab, AB}
+                        // is 'AB' on the engine (the bytes put AB first)
+                        // where the scan order answered 'ab', and `MAX(UC)`
+                        // the same;
+                        // with ID referenced the lower ID leads and 'ab'
+                        // it is (all measured on 2182) - over a key that
+                        // reads a field ([field_key]), beside something
+                        // else ([lone_extreme])
+                        || field_key && !lone_extreme && matches!(g, GItem::Agg(AggFn::Min | AggFn::Max, AggSrc::CollField(_, tt) | AggSrc::Expr(Expr::Collate(_, tt)), _)
+                            if fire_crab_ods::coll::icu_strength_of_ttype(*tt).is_some())
                 }))
         {
             let refs = std::cell::RefCell::new(Vec::<usize>::new());
@@ -67472,7 +68509,9 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
     // answers (measured both ways round). Everything else keeps the one
     // comparison rule every other fold has used.
     fn fold_cmp(a: &Value, b: &Value, src: &AggSrc) -> std::cmp::Ordering {
-        if let AggSrc::CollField(_, tt) = src {
+        // ...and so does an EXPRESSION source [agg_expr_src] stamped
+        // with the explicit collation it carries (the outer wrapper)
+        if let AggSrc::CollField(_, tt) | AggSrc::Expr(Expr::Collate(_, tt)) = src {
             if let Some(o) = coll_value_cmp(a, b, *tt) {
                 return o;
             }
@@ -72534,7 +73573,7 @@ fn emit_rows_inner(
                 // duplicates of each other here (SQL's set semantics),
                 // unlike `= NULL` in a predicate.
                 if *distinct {
-                    distinct_rows(&mut rows, order_by.is_some(), &coll_cols(cols), &varying_cols(cols), union_tie_unknown(branches)).map_err(EmitErr::Eval)?;
+                    distinct_rows(&mut rows, order_by.is_some(), &union_coll_cols(branches, cols), &varying_cols(cols), union_tie_unknown(branches)).map_err(EmitErr::Eval)?;
                 }
                 if let Some(key) = order_by {
                     let keys = [key.clone()];
@@ -72836,14 +73875,11 @@ fn emit_rows_inner(
                     // original statement's window-stream record
                     // ([WinTie::outer]), so it materialises and sorts
                     // whole rather than by records
-                    let inner_descs: Vec<Option<Descriptor>> =
-                        output_cols_of(inner).iter().map(|c| Some(desc_of_projcol(c))).collect();
                     let rows = branch_rows_res(inner, db, args).map_err(EmitErr::Eval)?;
-                    let mut rows = RowSource::Filter { input: Box::new(RowSource::Rows(rows)), pred }
+                    let rows = RowSource::Filter { input: Box::new(RowSource::Rows(rows)), pred }
                         .rows(db)
                         .map_err(EmitErr::Eval)?;
-                    let outer = outer_tie_less_keys(t.outer.clone(), order_by, &inner_descs);
-                    sort_rows_tied(&mut rows, order_by, &outer, &inner_descs).map_err(EmitErr::Eval)?;
+                    let rows = sort_by_record(rows, order_by, t.outer.clone()).map_err(EmitErr::Eval)?;
                     for values in &rows {
                         encode_row(w, cols, values, out)?;
                     }
@@ -72936,15 +73972,25 @@ fn emit_rows_inner(
                         }
                     }
                     let rows = branch_rows_res(inner, db, args).map_err(EmitErr::Eval)?;
-                    let sorted = RowSource::Sort {
-                        input: Box::new(RowSource::Filter {
-                            input: Box::new(RowSource::Rows(rows)),
-                            pred,
-                        }),
-                        keys: order_by.clone(),
-                    }
-                    .rows(db)
-                    .map_err(EmitErr::Eval)?;
+                    let sorted = match derived_record_items(inner, cols, order_by) {
+                        // a windowed inner: the ties fall to the window
+                        // map's record, as the fetch path sorts them
+                        Some(items) => {
+                            let filtered = RowSource::Filter { input: Box::new(RowSource::Rows(rows)), pred }
+                                .rows(db)
+                                .map_err(EmitErr::Eval)?;
+                            sort_by_record(filtered, order_by, items).map_err(EmitErr::Eval)?
+                        }
+                        None => RowSource::Sort {
+                            input: Box::new(RowSource::Filter {
+                                input: Box::new(RowSource::Rows(rows)),
+                                pred,
+                            }),
+                            keys: order_by.clone(),
+                        }
+                        .rows(db)
+                        .map_err(EmitErr::Eval)?,
+                    };
                     for values in &sorted {
                         encode_row(w, cols, values, out)?;
                     }
@@ -78835,6 +79881,121 @@ fn resolve_raw_cond(
     columns: &[RelationColumn],
     descs: &[Descriptor],
 ) -> Option<Cond2> {
+    if let RawCond::Cmp(a, op, b) = c {
+        if let Some(d) = distribute_cmp(a, *op, b, columns, descs) {
+            return resolve_distributed(&d, columns, descs);
+        }
+    }
+    resolve_raw_cond_body(c, columns, descs)
+}
+
+/// [distribute_cmp]'s condition, resolved - and each branch's comparison
+/// of a UTF8 value with one of a single-byte set MOVES the UTF8 side into
+/// that set first, as CVT2_compare does: measured on 2182 under UTF8,
+/// `CASE ID WHEN 1 THEN W1 ELSE 'Ω' END = 'Ω'` is 22018 (the literal
+/// has no WIN1252 image) where `CASE ID WHEN 1 THEN W1 ELSE 'q' END =
+/// 'q'` counts 3, and so are `W1 = 'Ω'` and `'Ω' = W1` alone - which
+/// this server answers 0 (recorded, outside this seam). Where the
+/// negotiated reading moved the branch into WIN1252 it raised too.
+fn resolve_distributed(d: &RawCond, columns: &[RelationColumn], descs: &[Descriptor]) -> Option<Cond2> {
+    fn walk(c: Cond2, descs: &[Descriptor]) -> Cond2 {
+        use fire_crab_ods::intl::{tabled, CS_UTF8};
+        match c {
+            Cond2::And(v) => Cond2::And(v.into_iter().map(|x| walk(x, descs)).collect()),
+            Cond2::Or(v) => Cond2::Or(v.into_iter().map(|x| walk(x, descs)).collect()),
+            Cond2::Cmp(l, op, r) => {
+                let (cl, cr) = (cmp_text_charset(&l, descs), cmp_text_charset(&r, descs));
+                let into = |x: Box<Expr>, dst: u8| match value_form(&x, descs) {
+                    Some((_, w, _)) => transcode_cast(x, CS_UTF8, w, dst),
+                    None => x,
+                };
+                match (cl, cr) {
+                    (Some(CS_UTF8), Some(t)) if t != CS_UTF8 && tabled(t) => Cond2::Cmp(into(l, t), op, r),
+                    (Some(t), Some(CS_UTF8)) if t != CS_UTF8 && tabled(t) => Cond2::Cmp(l, op, into(r, t)),
+                    _ => Cond2::Cmp(l, op, r),
+                }
+            }
+            other => other,
+        }
+    }
+    Some(walk(resolve_raw_cond(d, columns, descs)?, descs))
+}
+
+/// A COMPARISON OVER A SIMPLE CASE / DECODE WHOSE BRANCHES ARE IN
+/// DIFFERENT SETS compares the chosen branch's value as it is, in its
+/// own set ([push_into_simple_case]: DecodeNode has no cast), so it is
+/// resolved per branch - `CASE x WHEN a THEN v1 ELSE v2 END < s` as
+/// `(sel = 1 AND v1 < s) OR (sel = 0 AND v2 < s)`, where `sel` is the
+/// same CASE answering which branch it takes (never NULL, so exactly one
+/// disjunct is live and it carries the three-valued answer). Each `vi <
+/// s` then takes the law a comparison of that set already has. Measured
+/// on 2182 over the csfn fixture: under UTF8 `CASE ID WHEN 2 THEN N ELSE
+/// W1 END = 'é'` counts 0 (the NONE `E9` against the UTF8 'é' is a byte
+/// compare, as `N = 'é'` is), `CASE ID WHEN 2 THEN W1 ELSE U END = N`
+/// counts 1 under NONE, UTF8 and WIN1252, `CASE ID WHEN 1 THEN W1 ELSE
+/// 'q' END < 'r'` counts 3; reading the CASE in its negotiated set
+/// counted 1 and 0 for the first two. A side with a parameter, a
+/// subquery or a stored function call keeps the negotiated reading.
+fn distribute_cmp(
+    a: &RawExpr,
+    op: Cmp,
+    b: &RawExpr,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<RawCond> {
+    if PUSH_PROBE.with(|p| p.get()) {
+        return None;
+    }
+    let opaque = |x: &RawExpr| {
+        raw_any(x, &|y| matches!(y, RawExpr::Param(_) | RawExpr::Subq(_) | RawExpr::UserFn(..) | RawExpr::BareTrue))
+    };
+    if opaque(a) || opaque(b) {
+        return None;
+    }
+    for left in [true, false] {
+        let side = if left { a } else { b };
+        let (branches, else_) = match side {
+            RawExpr::Case(br, el, true) => {
+                if !simple_case_mixed(br, el.as_deref(), columns, descs) {
+                    continue;
+                }
+                (br.clone(), el.clone())
+            }
+            other => match push_into_simple_case(other, columns, descs) {
+                Some(RawExpr::Case(br, el, true)) => (br, el),
+                _ => continue,
+            },
+        };
+        let other = if left { b } else { a };
+        let sel = RawExpr::Case(
+            branches.iter().enumerate().map(|(k, (c, _))| (c.clone(), RawExpr::Int(k as i64 + 1))).collect(),
+            Some(Box::new(RawExpr::Int(0))),
+            false,
+        );
+        let arm = |k: usize, v: RawExpr| {
+            let cmp = if left {
+                RawCond::Cmp(Box::new(v), op, Box::new(other.clone()))
+            } else {
+                RawCond::Cmp(Box::new(other.clone()), op, Box::new(v))
+            };
+            RawCond::And(vec![RawCond::Cmp(Box::new(sel.clone()), Cmp::Eq, Box::new(RawExpr::Int(k as i64))), cmp])
+        };
+        let mut arms: Vec<RawCond> = Vec::with_capacity(branches.len() + 1);
+        for (k, (_, v)) in branches.into_iter().enumerate() {
+            arms.push(arm(k + 1, v));
+        }
+        arms.push(arm(0, else_.map(|v| *v).unwrap_or(RawExpr::Null)));
+        return Some(RawCond::Or(arms));
+    }
+    None
+}
+
+fn resolve_raw_cond_body(
+    c: &RawCond,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Cond2> {
+    let _depth = ResolveDepth::enter();
     Some(match c {
         // the SAME side typing the predicate resolver applies - a
         // temporal or approximate or boolean side against something it
@@ -78922,7 +80083,7 @@ fn resolve_raw_cond(
             if raw_has_param(pat) {
                 return None;
             }
-            if collate_canon_of(&e).is_some() {
+            if collate_canon_of(&e, descs).is_some() {
                 return None;
             }
             let p = resolve_expr(pat, columns, descs)?;
@@ -79074,6 +80235,7 @@ fn resolve_raw_cond_sink(
     descs: &[Descriptor],
     sink: &mut Vec<Option<Descriptor>>,
 ) -> Option<Cond2> {
+    let _depth = ResolveDepth::enter();
     let (r, fresh) = marking_chunk_new(sink, |sink| resolve_raw_cond_sink_body(c, columns, descs, sink))?;
     if chunk_new_text_slot(sink, &fresh) && raw_cond_any(c, &text_arm_node) {
         cap_note("K4 (a text-slot conditional value arm in a condition)");
@@ -79096,6 +80258,9 @@ fn resolve_raw_cond_sink_body(
                     return None;
                 }
                 return resolve_raw_cond(c, columns, descs);
+            }
+            if let Some(d) = distribute_cmp(a, *op, b, columns, descs) {
+                return resolve_distributed(&d, columns, descs);
             }
             let (l, r) = resolve_cmp_pair(a, b, columns, descs, sink)?;
             Cond2::Cmp(Box::new(l), *op, Box::new(r))
@@ -79126,12 +80291,36 @@ fn resolve_expr(
     columns: &[RelationColumn],
     descs: &[Descriptor],
 ) -> Option<Expr> {
+    let _depth = ResolveDepth::enter();
+    // an ITEM: resolved under what it is assigned to ([ItemFold])
+    if let Some(fold) = item_fold_of(raw) {
+        return resolve_item_folded(raw, fold, || resolve_expr_body(raw, columns, descs));
+    }
+    resolve_expr_body(raw, columns, descs)
+}
+
+fn resolve_expr_body(
+    raw: &RawExpr,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Expr> {
+    // a function that reads its operand's set, over a simple CASE whose
+    // branches are in different sets, runs per branch
+    if let Some(pushed) = push_into_simple_case(raw, columns, descs) {
+        return resolve_expr(&pushed, columns, descs);
+    }
     // every level of resolution goes through here, so a CHAR-formed
     // conditional is padded - and a scaled one ALIGNED - wherever it
     // appears: inside a concatenation, a comparison, an aggregate's
-    // source or the select list
+    // source or the select list. A simple CASE's branches move into its
+    // negotiated set here too: that is the type the engine folds, sorts
+    // and groups it in (`MAX(DECODE(ID, 1, W1, 'Ω'))` under UTF8 is
+    // 22018, the literal into WIN1252, measured), and where its value is
+    // DELIVERED or STORED as it is the moves are redone per branch into
+    // the field's set ([deliver_simple_case])
     let e = align_conditional(resolve_expr_inner(raw, columns, descs)?, descs);
-    let e = pad_conditional(recode_conditional(recode_concat(e, descs), descs), descs);
+    let e = recode_conditional(recode_concat(e, descs), descs);
+    let e = pad_conditional(e, descs);
     let e = recode_strfn(e, descs);
     // a FLOAT branch beside a DOUBLE one widens to the common DOUBLE
     let e = float_conditional(e, descs);
@@ -79340,7 +80529,7 @@ fn tf_charset(c: TfCs) -> u8 {
 /// run-time set. None for a function this law was not measured for, or
 /// an operand with no text form.
 fn strfn_result_cs(f: SysFn, args: &[Expr], descs: &[Descriptor]) -> Option<TfCs> {
-    let form = |i: usize| value_form(args.get(i)?, descs).map(|(_, _, c)| c);
+    let form = |i: usize| value_cs(args.get(i)?, descs);
     match f {
         SysFn::Lpad | SysFn::Rpad | SysFn::Replace => form(0),
         SysFn::Trim(_) if args.len() >= 2 => form(1),
@@ -79377,24 +80566,31 @@ fn strfn_result_cs(f: SysFn, args: &[Expr], descs: &[Descriptor]) -> Option<TfCs
 /// synthetic pad wrap ([pad_conditional]) in its operand's.
 fn value_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
     let (v, w, c) = text_form(e, descs)?;
-    // the run-time set descends the operands, and each level's
-    // [text_form] walks its whole subtree, so a chain of 2000 `||` or
-    // 390 nested UPPERs (serve-real-deepexpr) went cubic and timed out;
-    // past a depth no real statement reaches the describe's set stands
-    // for the value's, as it did before the run-time set was modelled
-    thread_local! { static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
-    struct Guard;
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            DEPTH.with(|d| d.set(d.get() - 1));
-        }
+    Some((v, w, value_run_cs(e, descs).unwrap_or(c)))
+}
+
+/// The set a TEXT OPERAND's value is in at run time - [value_form]'s
+/// set alone, for the walks that descend: the run-time law's own
+/// descent, [strfn_result_cs]. It asks [text_form] only of the node
+/// where the correction stops, never at every level on the way down:
+/// asked at every level (the form's width is not needed there), 390
+/// nested UPPERs or `TRIM(... || 'b')`s went cubic - every level of
+/// resolution asks this of its operand, the descent was n deep and
+/// each step walked its whole subtree again - and serve-real-deepexpr
+/// timed out at 50 s and past 90 s where the prepare takes about a
+/// second.
+fn value_cs(e: &Expr, descs: &[Descriptor]) -> Option<TfCs> {
+    match value_run_cs(e, descs) {
+        Some(c) => Some(c),
+        None => text_form(e, descs).map(|(_, _, c)| c),
     }
-    if DEPTH.with(|d| d.get()) >= 48 {
-        return Some((v, w, c));
-    }
-    DEPTH.with(|d| d.set(d.get() + 1));
-    let _g = Guard;
-    let run = match e {
+}
+
+/// [value_form]'s correction: Some where the value's run-time set is
+/// decided by an operand's rather than by the describe, None where the
+/// describe's set ([text_form]) stands.
+fn value_run_cs(e: &Expr, descs: &[Descriptor]) -> Option<TfCs> {
+    match e {
         Expr::Func(f, args) => match f {
             SysFn::Lpad | SysFn::Rpad | SysFn::Replace | SysFn::Trim(_) => {
                 strfn_result_cs(*f, args, descs)
@@ -79408,7 +80604,7 @@ fn value_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
             | SysFn::UpperCs(_)
             | SysFn::LowerCs(_)
             | SysFn::UpperColl(_)
-            | SysFn::LowerColl(_) => args.first().and_then(|a| value_form(a, descs)).map(|(_, _, c)| c),
+            | SysFn::LowerColl(_) => args.first().and_then(|a| value_cs(a, descs)),
             _ => None,
         },
         // a concatenation negotiates its run-time set from its operands'
@@ -79418,25 +80614,45 @@ fn value_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
         // delivered through the UTF8 describe as `C3 83 E2 82 AC 65 C3
         // 83 C5 BD` + W1's letters (measured) - where the describe
         // negotiates UTF8 from UTF8 and WIN1252
-        Expr::Concat(a, b) => match (value_form(a, descs), value_form(b, descs)) {
-            (Some((_, _, ca)), Some((_, _, cb))) => Some(cs_join(ca, cb)),
+        Expr::Concat(a, b) => match (value_cs(a, descs), value_cs(b, descs)) {
+            (Some(ca), Some(cb)) => Some(cs_join(ca, cb)),
             _ => None,
         },
         Expr::Cast(_, CastTarget::Text { synthetic: true, cs: Some(dst), .. }, _) => {
             Some(TfCs::Ttype(*dst as i32))
         }
-        Expr::Cast(inner, CastTarget::Text { synthetic: true, cs: None, .. }, _) => {
-            value_form(inner, descs).map(|(_, _, c)| c)
-        }
+        Expr::Cast(inner, CastTarget::Text { synthetic: true, cs: None, .. }, _) => value_cs(inner, descs),
         // NULLIF's value IS its first operand's (`NULLIF(REPLACE(N, 'É',
         // 'e'), 'q')` under UTF8 delivers the `E9` row as *Malformed
         // string*, measured - the NONE value through the UTF8 describe)
-        Expr::NullIf(a, _) => value_form(a, descs).map(|(_, _, c)| c),
+        Expr::NullIf(a, _) => value_cs(a, descs),
         // a carrier's octets DECODED into a real set are in that set
         Expr::CarrierDec(_, _, dst) => Some(TfCs::Ttype(*dst as i32)),
+        // a conditional's value is its chosen BRANCH's - a searched CASE,
+        // IIF and COALESCE cast it into the negotiated type first
+        // ([recode_conditional] spells that per branch), a simple CASE /
+        // DECODE returns it as it is (DecodeNode::execute) - so where
+        // every branch is in one set, so is the conditional
+        Expr::Case(arms, els) => branches_agree(arms.iter().map(|(_, x)| x).chain(els.as_deref()), descs),
+        Expr::Iif(_, a, b) => branches_agree([&**a, &**b].into_iter(), descs),
+        Expr::Coalesce(v) => branches_agree(v.iter(), descs),
         _ => None,
-    };
-    Some((v, w, run.unwrap_or(c)))
+    }
+}
+
+/// The one set every non-NULL branch's value is in, or None when they
+/// differ (or no branch has a value).
+fn branches_agree<'a>(xs: impl Iterator<Item = &'a Expr>, descs: &[Descriptor]) -> Option<TfCs> {
+    let mut one: Option<TfCs> = None;
+    for x in xs.filter(|x| !matches!(x, Expr::Null)) {
+        let c = value_cs(x, descs)?;
+        match one {
+            None => one = Some(c),
+            Some(o) if tf_charset(o) == tf_charset(c) => {}
+            Some(_) => return None,
+        }
+    }
+    one
 }
 
 /// EACH STRING-FUNCTION TEXT OPERAND IS CONVERTED INTO THE RESULT'S
@@ -79576,11 +80792,9 @@ fn recode_strfn(e: Expr, descs: &[Descriptor]) -> Expr {
 /// destination and must not be touched. Which branch runs is a RUNTIME
 /// choice, so the conversion cannot be hoisted onto the whole node.
 fn recode_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
-    use fire_crab_ods::intl::{byte_carrier, tabled, CS_UTF8};
     if !matches!(e, Expr::Case(..) | Expr::Coalesce(_) | Expr::Iif(..)) {
         return e;
     }
-    let att = CURRENT_ATT_CS.with(|c| c.get());
     let Some((_, _, joined)) = text_form(&e, descs) else { return e };
     // AND UNDER A REAL ATTACHMENT TOO: there the LITERAL is of the
     // attachment's set and it is the CARRIER branch - a NONE column, a
@@ -79600,9 +80814,7 @@ fn recode_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
     // under NONE is *Malformed string* for the row that takes the
     // literal, measured) - and a destination [transcode_text] does not
     // implement is left to the row encoder as before
-    if (byte_carrier(dst) && dst != fire_crab_ods::intl::CS_ASCII)
-        || !(tabled(dst) || dst == CS_UTF8 || dst == fire_crab_ods::intl::CS_ASCII)
-    {
+    if !recodes_into(dst) {
         return e;
     }
     // ...AND EVERY BRANCH under any attachment, from the set its VALUE
@@ -79617,26 +80829,7 @@ fn recode_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
     // NONE branch shipped their UTF-8 spelling (12 octets for 6) and,
     // under WIN1252, dropped the connection (08006) on the char with
     // no image.
-    let wrap = |x: Expr| -> Expr {
-        // a bare NULL branch has no value to move (and [text_form]
-        // skips it by shape: wrapped, it would widen the describe -
-        // serve-real-cscast caught `COALESCE(NULL, CAST(... WIN1252))`
-        // announcing 80 for 8); a blob branch keeps its own rules
-        if matches!(x, Expr::Null) || blob_result(&x, descs).is_some() {
-            return x;
-        }
-        match value_form(&x, descs) {
-            // an attachment-typed branch under a carrier attachment: its
-            // bytes are the carrier's
-            Some((_, w, TfCs::Att)) if byte_carrier(att) => Expr::Cast(
-                Box::new(x),
-                CastTarget::Text { len: w.max(0) as usize, pad: false, synthetic: true, cs: Some(dst) },
-                att,
-            ),
-            Some((_, w, c)) => *recode_operand(Box::new(x), c, w, dst),
-            None => x,
-        }
-    };
+    let wrap = |x: Expr| recode_branch(x, dst, descs);
     match e {
         Expr::Coalesce(xs) => Expr::Coalesce(xs.into_iter().map(wrap).collect()),
         Expr::Iif(c, a, b) => Expr::Iif(c, Box::new(wrap(*a)), Box::new(wrap(*b))),
@@ -79646,6 +80839,531 @@ fn recode_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
         ),
         other => other,
     }
+}
+
+/// How many simple CASEs a `||` or a many-operand function may carry
+/// and still be distributed ([push_into_simple_case]): the resolution is
+/// a product of their branch counts.
+const PUSH_CASES: usize = 4;
+
+/// A SIMPLE CASE / DECODE RETURNS ITS CHOSEN BRANCH AS IT IS, IN THE
+/// BRANCH's OWN SET - so a function over it runs, per row, over a value
+/// of whichever set that row's branch is in.
+///
+/// The engine keeps two conditional nodes apart. The searched CASE and
+/// IIF are a ValueIfNode, whose genBlr wraps them in a `blr_cast` to the
+/// negotiated type (the chosen branch MOVES into it: `IIF(ID = 1, W1,
+/// 'Ω')` under UTF8 is 22018 for the row that takes the literal); the
+/// simple CASE and DECODE are a DecodeNode, which has no cast and whose
+/// execute returns `EVL_expr` of the matching value untouched. Measured
+/// on 2182 over the csfn fixture (W1 WIN1252 `C0 C9 CE`, N NONE `E9`)
+/// under a UTF8 attachment: `LOWER(DECODE(ID, 1, W1, 'Ω'))` is 'àéî'
+/// for row 1 and 'ω' for the rows that take the literal, `HASH(...)`
+/// 52574 (W1's WIN1252 bytes) and 3465 (the literal's UTF8 bytes),
+/// `CHAR_LENGTH` 3 and 1 - under WIN1252 the literal is its two WIN1252
+/// bytes, `CHAR_LENGTH` 2 and LOWER cases them by that table (`EE A9`),
+/// under NONE ASCII only (`CE A9`); `LOWER(CASE ID WHEN 1 THEN N ELSE
+/// W1 END)` cases row 1 ASCII only and row 2 by the WIN1252 table;
+/// `HASH(CASE ID WHEN 2 THEN N ELSE W1 END)` is 233 for the NONE `E9`.
+/// Converting every branch into the negotiated set (WIN1252 here, the
+/// first operand's) answered 22018 for every row that took the literal,
+/// and under NONE cased the literal's bytes by the WIN1252 table.
+///
+/// So a function that reads its operand's set at run time distributes
+/// over the branches: `F(CASE x WHEN a THEN v1 ELSE v2 END)` is resolved
+/// as `CASE x WHEN a THEN F(v1) ELSE F(v2) END`, and each `F(vi)` takes
+/// its own branch's law through the resolution every function already
+/// has. The describe is unchanged: these functions keep their operand's
+/// set and width, or answer a number, so the negotiated form over the
+/// `F(vi)` is the form of `F` over the negotiated one. Only a CASE whose
+/// branches are in DIFFERENT sets is rewritten - where they agree the
+/// two readings are one. The CASE is found under a chain of such
+/// functions (`UPPER(LOWER(DECODE(...)))` distributes both). A branch
+/// that calls a stored function or reads a subquery is not resolved
+/// twice to find out, and keeps the negotiated set.
+fn push_into_simple_case(raw: &RawExpr, columns: &[RelationColumn], descs: &[Descriptor]) -> Option<RawExpr> {
+    // not while [simple_case_mixed] resolves a CASE's branches to read
+    // their sets: distributing in there too resolved every level of a
+    // nest of `UPPER(DECODE(...))` twice per level - 2^n, and 22 levels
+    // took 31 s to prepare
+    if PUSH_PROBE.with(|p| p.get()) {
+        return None;
+    }
+    // the operand whose value's set the node reads
+    let at = match raw {
+        RawExpr::Func(f, args) => match f {
+            SysFn::Upper
+            | SysFn::Lower
+            | SysFn::CharLength
+            | SysFn::OctetLength
+            | SysFn::BitLength
+            | SysFn::Hash(_)
+            | SysFn::AsciiVal
+            | SysFn::Substring
+            | SysFn::Left
+            | SysFn::Right
+            | SysFn::Reverse
+            | SysFn::Lpad
+            | SysFn::Rpad
+            | SysFn::Replace => 0,
+            SysFn::Trim(_) if !args.is_empty() => args.len() - 1,
+            SysFn::Position if args.len() >= 2 => 1,
+            _ => return None,
+        },
+        RawExpr::Concat(..) => 0,
+        RawExpr::Cast(_, CastTarget::Text { .. }) => 0,
+        _ => return None,
+    };
+    // borrowed: the walk runs at every level of resolution, and a copy of
+    // the operand at each step made a 2000-deep `||` chain cubic again
+    let operand = |i: usize| -> Option<&RawExpr> {
+        match raw {
+            RawExpr::Func(_, args) => args.get(i),
+            RawExpr::Concat(a, b) => Some(if i == 0 { &**a } else { &**b }),
+            RawExpr::Cast(a, _) => Some(&**a),
+            _ => None,
+        }
+    };
+    let with = |i: usize, v: RawExpr| -> RawExpr {
+        match raw {
+            RawExpr::Func(f, args) => {
+                let mut args = args.clone();
+                args[i] = v;
+                RawExpr::Func(*f, args)
+            }
+            RawExpr::Concat(_, b) if i == 0 => RawExpr::Concat(Box::new(v), b.clone()),
+            RawExpr::Concat(a, _) => RawExpr::Concat(a.clone(), Box::new(v)),
+            RawExpr::Cast(_, t) => RawExpr::Cast(Box::new(v), t.clone()),
+            other => other.clone(),
+        }
+    };
+    // a concatenation reads both sides' sets
+    let tries: &[usize] = if matches!(raw, RawExpr::Concat(..)) { &[0, 1] } else { std::slice::from_ref(&at) };
+    for &i in tries {
+        let op = operand(i)?;
+        let case = match op {
+            RawExpr::Case(branches, else_, true) => {
+                if !simple_case_mixed(branches, else_.as_deref(), columns, descs) {
+                    continue;
+                }
+                (branches.clone(), else_.clone())
+            }
+            // a function over it distributed first
+            other => match push_into_simple_case(other, columns, descs) {
+                Some(RawExpr::Case(branches, else_, true)) => (branches, else_),
+                _ => continue,
+            },
+        };
+        let (branches, else_) = case;
+        // distributing copies the node's OTHER operands into every branch, and
+        // each copy distributes again over a simple CASE of its own: n
+        // concatenated DECODEs resolved about 2^n branches (16 took 35 s to
+        // prepare, 18 ran past 100 s at 3.9 GB). A node with more than
+        // [PUSH_CASES] simple CASEs under it keeps the negotiated set; a
+        // one-operand function copies nothing and is not counted here.
+        let operands = match raw {
+            RawExpr::Func(_, args) => args.len(),
+            RawExpr::Concat(..) => 2,
+            _ => 1,
+        };
+        if operands > 1 {
+            let n = std::cell::Cell::new(0usize);
+            let over = raw_any(raw, &|x| {
+                if matches!(x, RawExpr::Case(_, _, true)) {
+                    n.set(n.get() + 1);
+                }
+                n.get() > PUSH_CASES
+            });
+            if over {
+                return None;
+            }
+        }
+        // a NULL branch stays NULL: every function here answers NULL
+        // for a NULL operand
+        let wrap = |v: RawExpr| if matches!(v, RawExpr::Null) { v } else { with(i, v) };
+        return Some(RawExpr::Case(
+            branches.into_iter().map(|(c, v)| (c, wrap(v))).collect(),
+            else_.map(|v| Box::new(wrap(*v))),
+            true,
+        ));
+    }
+    None
+}
+
+/// Are a simple CASE's text branches in more than one set?
+fn simple_case_mixed(
+    branches: &[(RawCond, RawExpr)],
+    else_: Option<&RawExpr>,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> bool {
+    let values: Vec<&RawExpr> = branches
+        .iter()
+        .map(|(_, v)| v)
+        .chain(else_)
+        .filter(|v| !matches!(v, RawExpr::Null))
+        .collect();
+    if values.iter().any(|v| raw_any(v, &|x| matches!(x, RawExpr::UserFn(..) | RawExpr::Subq(_) | RawExpr::Param(_)))) {
+        return false;
+    }
+    // literals and what is built from them are all of the attachment's
+    // set - nothing to resolve to know that
+    let names_a_set = |x: &RawExpr| {
+        !matches!(
+            x,
+            RawExpr::Str(_)
+                | RawExpr::Int(_)
+                | RawExpr::Dec(..)
+                | RawExpr::Double(_)
+                | RawExpr::Bool(_)
+                | RawExpr::Null
+                | RawExpr::Neg(_)
+                | RawExpr::Bin(..)
+                | RawExpr::Concat(..)
+                | RawExpr::Coalesce(_)
+                | RawExpr::NullIf(..)
+                | RawExpr::Iif(..)
+                | RawExpr::Case(..)
+                | RawExpr::Cond(_)
+                | RawExpr::Func(..)
+                | RawExpr::Cast(_, CastTarget::Text { cs: None, .. })
+        )
+    };
+    if !values.iter().any(|v| raw_any(v, &names_a_set)) {
+        return false;
+    }
+    // the branches are resolved to read their sets, and each nested
+    // conditional under a distributing function is resolved once more
+    // for its own - past a few the CASE keeps its negotiated set rather
+    // than let a deep nest cost a power of its depth
+    fn conditionals(e: &RawExpr) -> usize {
+        let own = usize::from(matches!(e, RawExpr::Case(..) | RawExpr::Iif(..) | RawExpr::Coalesce(_)));
+        own + match e {
+            RawExpr::Neg(a) | RawExpr::Cast(a, _) | RawExpr::Collate(a, _) => conditionals(a),
+            RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) | RawExpr::Iif(_, a, b) => {
+                conditionals(a) + conditionals(b)
+            }
+            RawExpr::Coalesce(v) | RawExpr::Func(_, v) => v.iter().map(conditionals).sum(),
+            RawExpr::Case(b, e, _) => {
+                b.iter().map(|(_, x)| conditionals(x)).sum::<usize>() + e.as_deref().map_or(0, conditionals)
+            }
+            _ => 0,
+        }
+    }
+    if values.iter().map(|v| conditionals(v)).sum::<usize>() > 8 {
+        return false;
+    }
+    let mut sets: Vec<TfCs> = Vec::new();
+    for v in values {
+        if !raw_run_sets(v, columns, descs, &mut sets) {
+            return false;
+        }
+    }
+    sets.len() > 1
+}
+
+/// Every set a text operand's VALUE can be in at run time, gathered into
+/// `out` one per set; false where it is not text, or not known. A
+/// branch of a simple CASE that is itself one - bare, under a function
+/// that keeps its operand's set, or concatenated - is walked rather
+/// than resolved: resolved alone it distributes nothing ([PUSH_PROBE])
+/// and reads as the one negotiated set, which found `LOWER(DECODE(ID,
+/// 2, U, LOWER(DECODE(ID, 2, U, DECODE(ID, 1, W1, 'Ω')))))` agreeing and
+/// left the rows that take the literal to 22018 under UTF8 (the engine
+/// answers 'ω', measured).
+fn raw_run_sets(x: &RawExpr, columns: &[RelationColumn], descs: &[Descriptor], out: &mut Vec<TfCs>) -> bool {
+    fn add(out: &mut Vec<TfCs>, c: TfCs) {
+        if !out.iter().any(|o| tf_charset(*o) == tf_charset(c)) {
+            out.push(c);
+        }
+    }
+    if raw_any(x, &|y| matches!(y, RawExpr::Case(_, _, true))) {
+        match x {
+            RawExpr::Case(branches, else_, true) => {
+                return branches
+                    .iter()
+                    .map(|(_, v)| v)
+                    .chain(else_.as_deref())
+                    .filter(|v| !matches!(v, RawExpr::Null))
+                    .all(|v| raw_run_sets(v, columns, descs, out));
+            }
+            RawExpr::Func(f, args) => {
+                let at = match f {
+                    SysFn::Upper
+                    | SysFn::Lower
+                    | SysFn::Substring
+                    | SysFn::Left
+                    | SysFn::Right
+                    | SysFn::Reverse
+                    | SysFn::Lpad
+                    | SysFn::Rpad
+                    | SysFn::Replace => args.first(),
+                    SysFn::Trim(_) => args.last(),
+                    _ => None,
+                };
+                if let Some(a) = at {
+                    return raw_run_sets(a, columns, descs, out);
+                }
+            }
+            RawExpr::Concat(a, b) => {
+                let (mut sa, mut sb) = (Vec::new(), Vec::new());
+                if !raw_run_sets(a, columns, descs, &mut sa) || !raw_run_sets(b, columns, descs, &mut sb) {
+                    return false;
+                }
+                for &p in &sa {
+                    for &q in &sb {
+                        add(out, cs_join(p, q));
+                    }
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
+    let outer = PUSH_PROBE.with(|p| p.replace(true));
+    let e = resolve_expr(x, columns, descs);
+    PUSH_PROBE.with(|p| p.set(outer));
+    let Some(e) = e else { return false };
+    if matches!(e, Expr::Null) {
+        return true;
+    }
+    if !matches!(e.type_of(descs), Some(ExprType::Text)) || blob_result(&e, descs).is_some() {
+        return false;
+    }
+    let Some(c) = value_cs(&e, descs) else { return false };
+    add(out, c);
+    true
+}
+
+/// A destination a conditional's branches are moved into: a carrier
+/// keeps the carrier bytes as they are - but ASCII, a carrier here, is
+/// a real set in the engine and a destination a high byte does not copy
+/// into (`COALESCE(A, 'É')` under NONE is *Malformed string* for the row
+/// that takes the literal, measured) - and a set [transcode_text] does
+/// not implement is left to the row encoder as before.
+fn recodes_into(dst: u8) -> bool {
+    use fire_crab_ods::intl::{byte_carrier, tabled, CS_ASCII, CS_UTF8};
+    !(byte_carrier(dst) && dst != CS_ASCII) && (tabled(dst) || dst == CS_UTF8 || dst == CS_ASCII)
+}
+
+/// One conditional branch moved from the set its value is in into `dst`.
+fn recode_branch(x: Expr, dst: u8, descs: &[Descriptor]) -> Expr {
+    use fire_crab_ods::intl::byte_carrier;
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    // a bare NULL branch has no value to move (and [text_form] skips it
+    // by shape: wrapped, it would widen the describe - serve-real-cscast
+    // caught `COALESCE(NULL, CAST(... WIN1252))` announcing 80 for 8); a
+    // blob branch keeps its own rules
+    if matches!(x, Expr::Null) || blob_result(&x, descs).is_some() {
+        return x;
+    }
+    match value_form(&x, descs) {
+        // an attachment-typed branch under a carrier attachment: its
+        // bytes are the carrier's
+        Some((_, w, TfCs::Att)) if byte_carrier(att) => Expr::Cast(
+            Box::new(x),
+            CastTarget::Text { len: w.max(0) as usize, pad: false, synthetic: true, cs: Some(dst) },
+            att,
+        ),
+        Some((_, w, c)) => *recode_operand(Box::new(x), c, w, dst),
+        None => x,
+    }
+}
+
+/// A SIMPLE CASE DELIVERED OR STORED: each branch moves from its own set
+/// into the field - the client's (the attachment's set under a real
+/// attachment, the describe's under NONE: [deliver_plan_items]) or the
+/// target column's ([plan_insert_select]) - where the resolution moved
+/// it into the CASE's negotiated set ([recode_conditional]), the type
+/// the engine folds and sorts it in. Measured on 2182 over the csfn
+/// fixture: delivered under UTF8, a WIN1252 branch's letters and a UTF8
+/// literal 'Ω' both arrive and a NONE `E9` branch is *Malformed string*;
+/// under NONE, where the field is typed WIN1252, a UTF8 'ß' branch
+/// arrives as `DF` beside a WIN1252 one and a NONE `E9` as itself;
+/// stored, `INSERT INTO TT (ID, N) SELECT ID, DECODE(ID, 1, W1, U)`
+/// under UTF8 writes W1's `C0 C9 CE` and U's `C3 9F` into the NONE
+/// column, and `CASE ID WHEN 2 THEN N ELSE W1 END` into a WIN1252 one
+/// the NONE `E9` as é.
+///
+/// The moves are redone from the resolved form alone: a moved branch is
+/// the synthetic transcoding CAST [recode_branch] wrapped it in, which
+/// names the set it came from and its width; a branch it left alone is
+/// in the negotiated set (or is a literal under a carrier attachment,
+/// in the attachment's). A branch that is itself a simple CASE
+/// ([is_simple_case]) is walked the same way. None where the branches
+/// share one set, or where a branch's set or width cannot be read -
+/// `descs` reads an unmoved branch's; without them the width of the
+/// whole-value delivery around the CASE ([deliver_in_announced_set])
+/// stands in.
+fn deliver_simple_case(e: &Expr, dst: u8, descs: Option<&[Descriptor]>) -> Option<Expr> {
+    use fire_crab_ods::intl::{byte_carrier, bytes_per_char};
+    // a synthetic transcoding CAST's width, in its source's characters
+    // (the inverse of [transcode_cast])
+    fn width(len: usize, src: u8, dst: u8) -> i32 {
+        if byte_carrier(dst) {
+            (len / (bytes_per_char(src).max(1) as usize)) as i32
+        } else {
+            len as i32
+        }
+    }
+    fn moved(x: &Expr) -> Option<(&Expr, u8, i32, u8)> {
+        match x {
+            Expr::Cast(inner, CastTarget::Text { len, pad: false, synthetic: true, cs: Some(d) }, src) => {
+                Some((&**inner, *src, width(*len, *src, *d), *d))
+            }
+            _ => None,
+        }
+    }
+    // the value delivered whole, in the negotiated set
+    let (e, whole, whole_src) = match moved(e) {
+        Some((inner, src, w, _)) => (inner, Some(w), Some(src)),
+        None => (e, None, None),
+    };
+    // a CHAR-formed CASE's pad stays outside
+    if let Expr::Cast(inner, t @ CastTarget::Text { pad: true, synthetic: true, cs: None, .. }, s) = e {
+        return Some(Expr::Cast(Box::new(deliver_simple_case(inner, dst, descs)?), *t, *s));
+    }
+    if !is_simple_case(e) {
+        return None;
+    }
+    // a level's negotiated set: where its moved branches went
+    fn negotiated(x: &Expr) -> Option<u8> {
+        let Expr::Case(arms, els) = x else { return None };
+        arms.iter().map(|(_, v)| v).chain(els.as_deref()).find_map(|v| moved(v).map(|(_, _, _, d)| d))
+    }
+    // nothing moved at all: the branches were in one set
+    fn any_moved(x: &Expr) -> bool {
+        let Expr::Case(arms, els) = x else { return false };
+        arms.iter().map(|(_, v)| v).chain(els.as_deref()).any(|v| match moved(v) {
+            Some(_) => true,
+            None => is_simple_case(v) && any_moved(v),
+        })
+    }
+    if !any_moved(e) {
+        return None;
+    }
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    // unmoved at the top, a branch is in the set the whole value is in -
+    // the field's own when nothing delivered it whole
+    let neg = negotiated(e).or(whole_src).unwrap_or(dst);
+    // `neg` and `w` are the set a branch left unmoved is in at this level,
+    // and the width it can be given
+    struct Walk<'a> {
+        dst: u8,
+        att: u8,
+        descs: Option<&'a [Descriptor]>,
+        sets: Vec<u8>,
+    }
+    impl Walk<'_> {
+        fn case(&mut self, x: &Expr, neg: u8, w: Option<i32>) -> Option<Expr> {
+            let Expr::Case(arms, els) = x else { return None };
+            let neg = negotiated(x).unwrap_or(neg);
+            let mut out = Vec::with_capacity(arms.len());
+            for (c, v) in arms {
+                out.push((c.clone(), self.branch(v, neg, w)?));
+            }
+            let els = match els {
+                Some(v) => Some(Box::new(self.branch(v, neg, w)?)),
+                None => None,
+            };
+            Some(Expr::Case(out, els))
+        }
+        fn branch(&mut self, x: &Expr, neg: u8, whole: Option<i32>) -> Option<Expr> {
+            if matches!(x, Expr::Null) {
+                return Some(Expr::Null);
+            }
+            if is_simple_case(x) {
+                return self.case(x, neg, whole);
+            }
+            if let Some((inner, src, w, _)) = moved(x) {
+                if is_simple_case(inner) {
+                    return self.case(inner, src, Some(w));
+                }
+                self.sets.push(src);
+                return Some(*transcode_cast(Box::new(inner.clone()), src, w, self.dst));
+            }
+            // left where it was: a literal under a carrier attachment is
+            // the attachment's octets, anything else the negotiated set's
+            let (src, w) = match (x, self.descs) {
+                (Expr::Str(t), _) if fire_crab_ods::intl::byte_carrier(self.att) => {
+                    (self.att, t.chars().count() as i32)
+                }
+                (_, Some(d)) => {
+                    if !matches!(x.type_of(d), Some(ExprType::Text)) || blob_result(x, d).is_some() {
+                        return None;
+                    }
+                    let (_, w, c) = value_form(x, d)?;
+                    (tf_charset(c), w)
+                }
+                (_, None) if neg == self.dst => (neg, 0),
+                (_, None) => (neg, whole?),
+            };
+            self.sets.push(src);
+            Some(*transcode_cast(Box::new(x.clone()), src, w, self.dst))
+        }
+    }
+    let mut walk = Walk { dst, att, descs, sets: Vec::new() };
+    let out = walk.case(e, neg, whole)?;
+    if walk.sets.windows(2).all(|w| w[0] == w[1]) {
+        return None;
+    }
+    Some(out)
+}
+
+/// The set a text column's value is delivered in: the field its
+/// `sub_type` announces, resolved against the attachment as the
+/// emission resolves it ([ATT_SUBTYPE], [enc_real_cs]).
+fn announced_set(sub_type: i32) -> u8 {
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    if sub_type == ATT_SUBTYPE {
+        att
+    } else if sub_type <= -2 {
+        if att != 0 { att } else { (-2 - sub_type) as u8 }
+    } else {
+        fire_crab_ods::intl::charset_id(sub_type as i16)
+    }
+}
+
+/// The CLIENT's statement: each select item that is a simple CASE whose
+/// branches are in different sets is delivered branch by branch
+/// ([deliver_simple_case]). Only here - a query read by another (a
+/// derived table, a view, a subquery, a UNION branch, an INSERT's
+/// source) keeps the negotiated set its column describes - and after
+/// every rewrite the planner makes of the statement (a select-list
+/// subquery folded, a CTE expanded, ROWS / FIRST / DISTINCT wrapped),
+/// whose re-planned outer query is the one the client reads.
+fn deliver_plan_items(plan: &mut Plan) {
+    let cols = match plan {
+        // DISTINCT compares the values in the negotiated set, as the
+        // engine's sort does (`SELECT DISTINCT DECODE(ID, 1, W1, 'Ω')`
+        // under UTF8 is 22018, measured) - and hands on what it compared
+        Plan::Modified { distinct: true, .. } => return,
+        Plan::Modified { inner, .. } => return deliver_plan_items(inner),
+        Plan::Project { cols, .. }
+        | Plan::Join { cols, .. }
+        | Plan::JoinGroup { cols, .. }
+        | Plan::Lateral { cols, .. }
+        | Plan::Group { cols, .. }
+        | Plan::Derived { cols, .. } => cols,
+        _ => return,
+    };
+    for c in cols.iter_mut() {
+        let Some(e) = &c.expr else { continue };
+        let dst = announced_set(c.sub_type);
+        if !recodes_into(dst) {
+            continue;
+        }
+        if let Some(d) = deliver_simple_case(e, dst, None) {
+            c.expr = Some(d);
+        }
+    }
+}
+
+/// Is this the resolved form of a SIMPLE CASE / DECODE? It carries the
+/// leading `WHEN 0 IS NULL THEN NULL` arm [simple_case_nullable] gives it.
+fn is_simple_case(e: &Expr) -> bool {
+    matches!(e, Expr::Case(arms, _)
+        if matches!(arms.first(), Some((Cond2::IsNull(b), Expr::Null)) if matches!(**b, Expr::Int(0))))
 }
 
 fn align_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
@@ -82855,6 +84573,19 @@ fn resolve_proj_expr(
     if !raw_has_param(raw) {
         return resolve_expr(raw, columns, descs);
     }
+    let _depth = ResolveDepth::enter();
+    if let Some(fold) = item_fold_of(raw) {
+        return resolve_item_folded(raw, fold, || resolve_proj_expr_body(raw, columns, descs, sink));
+    }
+    resolve_proj_expr_body(raw, columns, descs, sink)
+}
+
+fn resolve_proj_expr_body(
+    raw: &RawExpr,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    sink: &mut Vec<Option<Descriptor>>,
+) -> Option<Expr> {
     // K4 (round 12): a TRIM over a bare `?` inside a conditional's value
     // arm refuses at prepare ([raw_cond_arm_trim_param])
     if raw_cond_arm_trim_param(raw) {
@@ -82914,7 +84645,7 @@ fn resolve_proj_expr(
                         return None;
                     }
                     let cs = cast_source_charset(&e, t, descs);
-                    Expr::Cast(Box::new(runtime_double_cast(e, t, cs)), *t, cs)
+                    Expr::Cast(Box::new(assignment_literal_fold(runtime_double_cast(e, t, cs), t)?), *t, cs)
                 }
             }
         }
@@ -83072,7 +84803,13 @@ fn resolve_expr_inner(
         // OPERAND'S OWN character set, so it resolves against the
         // inner expression's descriptor.
         RawExpr::Collate(inner, name) => {
-            let e = resolve_expr_inner(inner, columns, descs)?;
+            // through the FULL resolver, whose passes move a conditional's
+            // carrier branch into its negotiated set ([recode_conditional])
+            // as they do at every other level: `COALESCE(N, 'q') COLLATE
+            // UNICODE_CI = 'É'` over a NONE N holding C3 A9 counts 2 under
+            // -ch UTF8 on the engine (the 'é' and 'É' rows), and the
+            // unmoved branch was re-encoded as 'Ã©' and counted 0
+            let e = resolve_expr(inner, columns, descs)?;
             let cs = match text_form(&e, descs) {
                 Some((_, _, TfCs::Ttype(t))) => Some(fire_crab_ods::intl::charset_id(t as i16)),
                 // an ATTACHMENT-charset expression (an untyped literal)
@@ -83241,7 +84978,7 @@ fn resolve_expr_inner(
                 return None;
             }
             let cs = cast_source_charset(&inner, t, descs);
-            Expr::Cast(Box::new(runtime_double_cast(inner, t, cs)), *t, cs)
+            Expr::Cast(Box::new(assignment_literal_fold(runtime_double_cast(inner, t, cs), t)?), *t, cs)
         }
         RawExpr::Coalesce(args) => Expr::Coalesce(
             args.iter()
@@ -83359,6 +85096,26 @@ fn resolve_expr_inner(
                 // POSITION's third argument is a start, not an operand
                 let n = if matches!(f, SysFn::Position) { resolved.len().min(2) } else { resolved.len() };
                 carrier_fn_operands(&mut resolved[..n], descs);
+            }
+            // A REPLACE WHOSE SOURCE CARRIES A CASE- OR ACCENT-BLIND
+            // COLLATION searches under it: the source's first argument is
+            // stamped with that collation ([Expr::Collate], transparent
+            // to everything but [replace_canonical], which reads it at
+            // eval). Measured on 2182 under UTF8, NONE and WIN1252
+            // callers: `REPLACE(U COLLATE UNICODE_CI, 'B', 'c')` over
+            // 'ab' / 'AB' is 'ac' / 'Ac', `REPLACE('aAáÁ' COLLATE
+            // UNICODE_CI_AI, 'a', '.')` is '....', and `REPLACE(U COLLATE
+            // UNICODE_CI, 'b', 'c') = 'AC'` counts 2 where the byte
+            // search counted 1.
+            let mut resolved = resolved;
+            if matches!(f, SysFn::Replace) && !matches!(resolved.first(), Some(Expr::Collate(..))) {
+                if let Some(tt) = resolved.first().and_then(|a| explicit_collate_of(a, descs)).filter(|tt| {
+                    fire_crab_ods::coll::icu_strength_of_ttype(*tt)
+                        .is_some_and(|st| st != fire_crab_ods::coll::Strength::Tertiary)
+                }) {
+                    let a = resolved.remove(0);
+                    resolved.insert(0, Expr::Collate(Box::new(a), tt));
+                }
             }
             let resolved = resolved;
             // OCTET_LENGTH over a COLUMN of a tabled single-byte set
@@ -84196,6 +85953,15 @@ impl Cond2 {
                 let (x, y) = (a.eval(values)?, b.eval(values)?);
                 if matches!(x, Value::Null) || matches!(y, Value::Null) {
                     None
+                } else if dec_is_nan(&x) || dec_is_nan(&y) {
+                    // a DECFLOAT NaN compares through Decimal128::compare,
+                    // whose decQuadToInt32 of the NaN answer is the
+                    // context's Invalid: 22000 for any operator (measured
+                    // on 2182: `CAST('NaN' AS DECFLOAT(34)) > 1`,
+                    // `IIF(ID = 2, <NaN>, D34) > 1`, a scalar subquery
+                    // answering NaN) - where the total order below ranked
+                    // it above everything and answered the rows
+                    return Err(EvalErr::DecfloatInvalidOperation);
                 } else {
                     // A NaN ON EITHER SIDE has the engine's own order,
                     // which `value_cmp` cannot give: its approximate arm
@@ -85243,9 +87009,49 @@ fn float_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
         _ => false,
     };
     if !widen_needed {
-        return e;
+        // ...and an EXACT branch beside a FLOAT one, when the whole
+        // conditional is FLOAT (no DOUBLE branch): the same MOV_get_double
+        // reads every branch value, which is where a raw INT128 / NUMERIC
+        // / BIGINT one reached the fold beside Floats - VAR_POP(IIF(ID =
+        // 1, I, F)) answered 0 (engine 1.555555555555556), STDDEV_POP /
+        // CORR / PERCENTILE_CONT(COALESCE(I, F)) 0, AVG 0 (2.333333333333333),
+        // SUM(COALESCE(B, F)) 0 (7.000000000000000), MAX / MIN(COALESCE(I,
+        // F)) 22003 (4 / 1), all measured on 2182
+        let single_exact = e.type_of(descs) == Some(ExprType::Approx) && approx_expr_single(&e, descs);
+        if !single_exact {
+            return e;
+        }
+        let widen = |b: Expr| -> Expr {
+            if matches!(b.type_of(descs), Some(ExprType::Int | ExprType::Numeric)) {
+                Expr::Cast(Box::new(b), CastTarget::Float, fire_crab_ods::intl::CS_UTF8)
+            } else {
+                b
+            }
+        };
+        return match e {
+            Expr::Coalesce(v) => Expr::Coalesce(v.into_iter().map(widen).collect()),
+            Expr::Iif(c, a, b) => Expr::Iif(c, Box::new(widen(*a)), Box::new(widen(*b))),
+            Expr::Case(arms, els) => Expr::Case(
+                arms.into_iter().map(|(c, t)| (c, widen(t))).collect(),
+                els.map(|b| Box::new(widen(*b))),
+            ),
+            other => other,
+        };
     }
+    // an EXACT branch beside a DOUBLE one converts too, when the whole
+    // conditional is DOUBLE: the engine's consumers read the node's
+    // DOUBLE descriptor and take every branch value through
+    // MOV_get_double, where a raw INT128 / NUMERIC value here reached
+    // the fold beside Doubles - VAR_POP(IIF(ID = 1, I, DBL)) read the
+    // mixed values as a decimal fold and answered 0 (engine
+    // 1.555555555555556), SUM / AVG(COALESCE(I, DBL)) 0 (7.0 / 2.333..)
+    // and MAX(IIF(ID = 1, I, DBL)) raised 22003 (4.0), all measured on
+    // 2182. A DECFLOAT branch makes the node DECFLOAT and is left alone.
+    let whole_double = e.type_of(descs) == Some(ExprType::Approx);
     let widen = |b: Expr| -> Expr {
+        if whole_double && matches!(b.type_of(descs), Some(ExprType::Int | ExprType::Numeric)) {
+            return Expr::Cast(Box::new(b), CastTarget::Approx, fire_crab_ods::intl::CS_UTF8);
+        }
         if approx_expr_single(&b, descs) {
             Expr::Cast(Box::new(b), CastTarget::Approx, fire_crab_ods::intl::CS_UTF8)
         } else {
@@ -85471,7 +87277,14 @@ fn nullif_dec_literal(a: Expr, b: Expr, descs: &[Descriptor]) -> Option<Expr> {
     // first operand, untouched, is still what comes through. Measured:
     // `NULLIF(a, 'abc')` over a UNICODE_CI 'AbC' is NULL on the engine,
     // where the plain value compare here answered 'AbC'.
-    if expr_reads_coll(&a, descs) || expr_reads_coll(&b, descs) {
+    // ...and so does an EXPLICIT one on either operand ([explicit_collate_of]):
+    // `NULLIF(U COLLATE UNICODE_CI, 'e') IS NULL` counts the 'e' and 'E'
+    // rows on 2182 (2; the byte compare nulled 1) and `GROUP BY` it makes
+    // 4 groups over {é, É, e, E, ab, AB, ö}
+    if expr_reads_coll(&a, descs)
+        || expr_reads_coll(&b, descs)
+        || explicit_collate_of(&a, descs).or_else(|| explicit_collate_of(&b, descs)).is_some()
+    {
         let (l, r) = cmp_sides(a.clone(), b.clone(), descs)?;
         if matches!(l, Expr::CollKey(..)) || matches!(r, Expr::CollKey(..)) {
             return Some(Expr::Iif(
@@ -86256,6 +88069,12 @@ fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
             Expr::Func(SysFn::Ceil | SysFn::Ceiling | SysFn::Floor, args) if args.len() == 1 => {
                 walk(&args[0], descs)?
             }
+            // a scalar subquery evaluated per row whose one column is a
+            // DECFLOAT - a DECFLOAT column's fold, or since the wide
+            // numerics a DblDec call / statistical fold over an INT128:
+            // `(SELECT VAR_POP(X.I) FROM BIG2 X) > 1` compares in decimal
+            // on the engine (every row, measured on 2182) and refused here
+            Expr::CorrSub { desc: Some(pc), .. } if matches!(pc.sql_type & !1, 32760 | 32762) => true,
             Expr::Func(SysFn::Round | SysFn::Trunc, args) if !args.is_empty() => {
                 let w = walk(&args[0], descs)?;
                 if let Some(n) = args.get(1) {
@@ -86297,13 +88116,353 @@ fn runtime_double_cast(inner: Expr, t: &CastTarget, cs: u8) -> Expr {
     }
 }
 
+/// The stamp of the implicit CAST [assignment_literal_fold] puts around a
+/// double literal: the literal as the ASSIGNMENT's target type, read from
+/// its spelling by the CAST arms' literal fold. An enclosing INT128 /
+/// DECFLOAT cast re-targets it (the outermost target is the one the
+/// engine's `csb_preferredDesc` names).
+const CS_LIT_FOLD: u8 = 0xEE;
+
+thread_local! {
+    /// How deep the resolvers are: [resolve_expr], [resolve_proj_expr]
+    /// (past its no-parameter hand-off) and the condition resolvers each
+    /// count one. [assignment_literal_fold] acts only at depth 1 - a CAST
+    /// that IS the item being resolved, so a top-level item's type is the
+    /// CAST's target, the engine's `csb_preferredDesc` (an item assigned
+    /// elsewhere takes its target from [ItemFold]). A cast under a
+    /// concatenation, a comparison or any other operator is not the
+    /// assignment's target (`CAST(CAST(1e37 AS DOUBLE PRECISION) AS
+    /// NUMERIC(38,0)) || ''` is VARCHAR, and the engine's literal there is
+    /// cvt.cpp's double: 10000000000000000719354278919532445696, measured).
+    static RESOLVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// One level of [RESOLVE_DEPTH], released on every exit path.
+struct ResolveDepth;
+
+impl ResolveDepth {
+    fn enter() -> ResolveDepth {
+        RESOLVE_DEPTH.with(|d| d.set(d.get() + 1));
+        ResolveDepth
+    }
+}
+
+impl Drop for ResolveDepth {
+    fn drop(&mut self) {
+        RESOLVE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// WHAT AN ITEM IS ASSIGNED TO, for [assignment_literal_fold]: the
+/// engine's `csb_preferredDesc` is the descriptor of the ASSIGNMENT's
+/// target, and only an INT128-backed or DECFLOAT one re-reads a double
+/// literal from its text. A top-level select item's target is its own
+/// message slot - the item's type, so a CAST that IS the item names it
+/// ([ItemFold::Own]). A DML value's is its COLUMN and a derived table's,
+/// CTE's or scalar subquery's item's is the OUTER item that reads it
+/// ([ItemFold::To] or, for any other type, [ItemFold::Runtime]: no fold
+/// anywhere in the item, cvt.cpp's double). Measured on 2182 with
+/// `CAST(0.4e0 + 0.4e0 AS INT128)` (0 folded, 1 not): into an INT128 or
+/// NUMERIC(38,0) column 0, into DOUBLE / VARCHAR / SMALLINT / BIGINT /
+/// NUMERIC(18,2) 1, into a DECFLOAT(34) column 1 (the literals are
+/// decimal 0.4 there, 0.8 rounds to 1); through `(SELECT .. X ..)` read
+/// as `SELECT X` 0 and as `X || ''`, `CAST(X AS DOUBLE PRECISION)`,
+/// `MAX(X)`, `X * 1.0` 1, `CAST(X AS INT128)` 0 and `CAST(X AS
+/// DECFLOAT(34))` 1; `(SELECT ..)` as the whole item 0, under `|| ''` 1.
+#[derive(Clone, Copy, PartialEq)]
+enum ItemFold {
+    /// the item's own type is the target: a CAST that is the item folds
+    /// by its own target
+    Own,
+    /// the target is no INT128 / DECFLOAT: no literal in the item folds
+    Runtime,
+    /// the target is this INT128 / DECFLOAT type, whatever the item's own
+    To(CastTarget),
+    /// two consumers disagree (`SELECT X, X || ''` over one derived
+    /// column: the engine evaluates the inlined expression once per
+    /// consumer, 0 and 1) - one materialised value cannot be both
+    Conflict,
+}
+
+thread_local! {
+    /// the fold of the item being resolved at [RESOLVE_DEPTH] 1
+    static CUR_ITEM_FOLD: std::cell::Cell<ItemFold> = const { std::cell::Cell::new(ItemFold::Own) };
+    /// the folds of the select list being planned, by its items' raw
+    /// expressions (a bare column as `RawExpr::Col`): read by the depth-1
+    /// resolvers and by a derived table's planning ([derived_item_folds])
+    static ITEM_FOLDS: std::cell::RefCell<Vec<(RawExpr, ItemFold)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// the folds the NEXT [plan_query_inner_at] takes as its own
+    /// [ITEM_FOLDS] - set by a caller that knows what the planned
+    /// query's items are assigned to (a derived table, INSERT .. SELECT)
+    /// set while a cast to DOUBLE / FLOAT evaluates its DECFLOAT cast
+    /// operand: a signalling or negative NaN text may take the quiet
+    /// NaN's form there, whose conversion raises the same 22000
+    static SNAN_TO_APPROX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PENDING_ITEM_FOLDS: std::cell::RefCell<Option<Vec<(RawExpr, ItemFold)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The fold an assignment to a column of this descriptor gives.
+fn dest_item_fold(d: &Descriptor) -> ItemFold {
+    match d.dtype {
+        dtype::INT128 => ItemFold::To(CastTarget::Numeric { scale: d.scale, bytes: 16, sub_type: d.sub_type }),
+        dtype::DEC128 => ItemFold::To(CastTarget::DecFloat { wide: true }),
+        dtype::DEC64 => ItemFold::To(CastTarget::DecFloat { wide: false }),
+        _ => ItemFold::Runtime,
+    }
+}
+
+/// Resolve one item under `fold` ([ItemFold]). `None` for a conflict over
+/// an item that holds a double literal (its value depends on which
+/// consumer reads it); a conflict over one without is harmless.
+fn resolve_item_folded<T>(raw: &RawExpr, fold: ItemFold, f: impl FnOnce() -> Option<T>) -> Option<T> {
+    match fold {
+        ItemFold::Runtime => with_runtime_double_casts(f),
+        ItemFold::Conflict if raw_any(raw, &|e| matches!(e, RawExpr::Double(_))) => None,
+        ItemFold::Conflict => f(),
+        _ => {
+            let prev = CUR_ITEM_FOLD.with(|c| c.replace(fold));
+            let out = f();
+            CUR_ITEM_FOLD.with(|c| c.set(prev));
+            out
+        }
+    }
+}
+
+/// At [RESOLVE_DEPTH] 1: the fold [ITEM_FOLDS] names for this raw item.
+fn item_fold_of(raw: &RawExpr) -> Option<ItemFold> {
+    if RESOLVE_DEPTH.with(|d| d.get()) != 1 || RUNTIME_DOUBLE_CASTS.with(|c| c.get()) {
+        return None;
+    }
+    ITEM_FOLDS.with(|t| {
+        let t = t.borrow();
+        let mut found = t.iter().filter(|(r, _)| r == raw).map(|(_, f)| *f);
+        let first = found.next()?;
+        Some(if found.all(|f| f == first) { first } else { ItemFold::Conflict })
+    })
+}
+
+/// An output-column name as the outer query spells it: a quoted one
+/// keeps its case, anything else folds to upper.
+fn fold_col_name(s: &str) -> String {
+    let s = s.trim();
+    let last = s.rsplit('.').next().unwrap_or(s).trim();
+    match last.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        Some(q) => q.to_string(),
+        None => last.to_ascii_uppercase(),
+    }
+}
+
+/// THE FOLDS OF A DERIVED TABLE's (or CTE's) ITEMS, from what the OUTER
+/// query does with each column: a bare column item passes its own fold
+/// on (so `SELECT X` over it folds as the item's type, and an outer that
+/// is itself a derived table or an INSERT .. SELECT source hands on what
+/// IT is assigned to); `CAST(X AS <t>)` folds as `t` when that is INT128
+/// / DECFLOAT; every other use - an operator, a function, an aggregate,
+/// a WHERE / ON / GROUP BY / HAVING condition - is no assignment
+/// ([ItemFold::Runtime]). The engine inlines the derived expression into
+/// each consumer, so two consumers that disagree are a
+/// [ItemFold::Conflict]. Measured on 2182 (see [ItemFold]); `SELECT 'W'
+/// FROM (..) WHERE X = 1` finds the row (X is 1 there), while `SELECT X
+/// .. WHERE X = 1` answers X = 0 - both consumers at once.
+///
+/// A column the outer GROUP BY names is read as its GROUP KEY, which is
+/// no assignment either: `SELECT X, COUNT(*) FROM (..) GROUP BY X` is X
+/// = 1 on 2182 - the bare item does not fold it.
+fn derived_item_folds(
+    inner_sql: &str,
+    declared: &[String],
+    outer: &Proj,
+    group: Option<&str>,
+    others: &[&str],
+) -> Vec<(RawExpr, ItemFold)> {
+    let Some(Proj::Items(items)) = split_query(inner_sql).and_then(|(p, ..)| parse_projection(p)) else {
+        return Vec::new();
+    };
+    let keyed: Vec<(RawExpr, String)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(j, it)| {
+            let (raw, name) = match it {
+                SelItem::Col(c, alias) => (RawExpr::Col(c.clone()), alias.clone().unwrap_or_else(|| c.clone())),
+                SelItem::Expr(raw, name, _) => (raw.clone(), name.clone()),
+                _ => return None,
+            };
+            let name = declared.get(j).cloned().unwrap_or(name);
+            Some((raw, fold_col_name(&name)))
+        })
+        .collect();
+    let outer_fold = |raw: &RawExpr| {
+        ITEM_FOLDS.with(|t| t.borrow().iter().find(|(r, _)| r == raw).map(|(_, f)| *f)).unwrap_or(ItemFold::Own)
+    };
+    let foldable = |t: &CastTarget| matches!(t, CastTarget::Numeric { bytes: 16, .. } | CastTarget::DecFloat { .. });
+    let mut consumers: Vec<Vec<ItemFold>> = vec![Vec::new(); keyed.len()];
+    let mut consume = |name: Option<&str>, f: ItemFold| {
+        for (j, (_, n)) in keyed.iter().enumerate() {
+            if name.is_none_or(|x| x == n) {
+                consumers[j].push(f);
+            }
+        }
+    };
+    match outer {
+        Proj::Star => consume(None, ItemFold::Own),
+        Proj::Items(outs) => {
+            for it in outs {
+                match it {
+                    SelItem::Col(c, _) if c.trim().ends_with('*') => consume(None, ItemFold::Own),
+                    SelItem::Col(c, _) => consume(Some(&fold_col_name(c)), outer_fold(&RawExpr::Col(c.clone()))),
+                    SelItem::Expr(RawExpr::Cast(x, t), ..) if matches!(&**x, RawExpr::Col(_)) => {
+                        let RawExpr::Col(c) = &**x else { unreachable!() };
+                        let f = match outer_fold(&RawExpr::Cast(x.clone(), *t)) {
+                            ItemFold::Own if foldable(t) => ItemFold::To(*t),
+                            ItemFold::Own => ItemFold::Runtime,
+                            f => f,
+                        };
+                        consume(Some(&fold_col_name(c)), f);
+                    }
+                    SelItem::Expr(raw, ..) | SelItem::WinExpr(raw, ..) => {
+                        for (_, n) in keyed.clone() {
+                            if raw_any(raw, &|e| matches!(e, RawExpr::Col(c) if fold_col_name(c) == n)) {
+                                consume(Some(&n), ItemFold::Runtime);
+                            }
+                        }
+                    }
+                    // an aggregate, a window, a generator: whatever it
+                    // reads is no assignment
+                    _ => consume(None, ItemFold::Runtime),
+                }
+            }
+        }
+    }
+    let named = |text: &str, n: &str| find_word(&mask_literals(&text.to_ascii_uppercase()), &n.to_ascii_uppercase(), 0).is_some();
+    for (j, (_, n)) in keyed.iter().enumerate() {
+        if group.is_some_and(|g| named(g, n)) {
+            consumers[j] = vec![ItemFold::Runtime];
+        } else if others.iter().any(|t| named(t, n)) {
+            consumers[j].push(ItemFold::Runtime);
+        }
+    }
+    keyed
+        .into_iter()
+        .zip(consumers)
+        .map(|((raw, _), cs)| {
+            let f = match cs.split_first() {
+                None => ItemFold::Runtime,
+                Some((first, rest)) if rest.iter().all(|f| f == first) => *first,
+                _ => ItemFold::Conflict,
+            };
+            (raw, f)
+        })
+        .collect()
+}
+
+/// THE LITERAL FOLD IS NOT THE CAST's, IT IS THE ASSIGNMENT's: the
+/// engine's LiteralNode::pass2 reads `csb_preferredDesc`, which
+/// AssignmentNode::pass2 sets to its TARGET's descriptor around the
+/// whole source expression - so EVERY double literal anywhere in an
+/// INT128 / DECFLOAT item is re-read from its text as that type (an
+/// INT128 at the target's scale, rounded half away from zero, or a
+/// decimal128), and only then do the operators around it run. Measured
+/// on 2182: `CAST(CAST(1e37 AS DOUBLE PRECISION) AS INT128)` is
+/// 9999999999999999538762658202121142272 (10^37 exact, then the nearest
+/// double, then Int128::set(double)) where cvt.cpp's own double gives
+/// 10000000000000000719354278919532445696; `CAST(CAST(1e37 AS DOUBLE
+/// PRECISION) AS DECFLOAT(34))` 9.9999999999999995E+36;
+/// `CAST(CAST(0.4999999999999999e0 AS DOUBLE PRECISION) AS INT128)` 0
+/// and `.. 2.49999999999999e0 ..` 2 (the exact decimal rounds, not the
+/// double); `CAST(0.4e0 + 0.4e0 AS INT128)` 0 (each literal is 0 before
+/// the add); `CAST(CAST(1e37 AS DOUBLE PRECISION) + 0 AS INT128)` the
+/// folded value too. A UNION branch and an aggregate argument are no
+/// assignment ([RUNTIME_DOUBLE_CASTS]): there the literal is cvt.cpp's
+/// double (the same statements answer 170141183460469193952755440758722396160
+/// for 1.7014118346046921e38 and 1 for 0.4999999999999999e0 in a UNION
+/// branch, measured). A bare literal operand keeps the CAST arms' own
+/// fold; every literal deeper in the operand is wrapped in an implicit
+/// cast to `t` ([CS_LIT_FOLD]), an inner INT128 / DECFLOAT cast's wraps
+/// re-targeted to this, the outer one.
+///
+/// The target is the ASSIGNMENT's ([ItemFold]): a CAST that is a top-level
+/// item folds by its own target, one whose item is assigned elsewhere by
+/// that target (`INSERT INTO T (D34) VALUES (CAST(0.4e0 + 0.4e0 AS
+/// INT128))` reads the literals as DECFLOAT 0.4 and stores 1), and one
+/// assigned to anything else not at all - its item resolved under
+/// [RUNTIME_DOUBLE_CASTS], which never reaches here.
+fn assignment_literal_fold(inner: Expr, t: &CastTarget) -> Option<Expr> {
+    if RUNTIME_DOUBLE_CASTS.with(|c| c.get()) || RESOLVE_DEPTH.with(|d| d.get()) != 1 {
+        return Some(inner);
+    }
+    let own = matches!(t, CastTarget::Numeric { bytes: 16, .. } | CastTarget::DecFloat { .. });
+    let t = &match CUR_ITEM_FOLD.with(|c| c.get()) {
+        ItemFold::To(u) => u,
+        ItemFold::Own if own => *t,
+        _ => return Some(inner),
+    };
+    fn is_lit(e: &Expr) -> bool {
+        match e {
+            Expr::Double(_) => true,
+            Expr::Neg(x) => matches!(**x, Expr::Double(_)),
+            _ => false,
+        }
+    }
+    // a literal whose spelling the fold cannot pick ([double_literal_text];
+    // an INT128 target reads spellings by value) clears `ok`, and the
+    // item refuses here, at prepare
+    fn walk(e: Expr, t: &CastTarget, ok: &std::cell::Cell<bool>) -> Expr {
+        let w = |x: Box<Expr>| Box::new(walk(*x, t, ok));
+        match e {
+            e if is_lit(&e) => {
+                let d = match &e {
+                    Expr::Neg(x) => match **x {
+                        Expr::Double(d) => -d,
+                        _ => 0.0,
+                    },
+                    Expr::Double(d) => *d,
+                    _ => 0.0,
+                };
+                if double_literal_text(d, !matches!(t, CastTarget::DecFloat { .. })).is_none() {
+                    ok.set(false);
+                }
+                Expr::Cast(Box::new(e), *t, CS_LIT_FOLD)
+            }
+            Expr::Cast(x, _, CS_LIT_FOLD) => Expr::Cast(x, *t, CS_LIT_FOLD),
+            Expr::Cast(x, tt, cs) => Expr::Cast(w(x), tt, cs),
+            Expr::Neg(x) => Expr::Neg(w(x)),
+            Expr::Bin(a, op, b) => Expr::Bin(w(a), op, w(b)),
+            Expr::Coalesce(v) => Expr::Coalesce(v.into_iter().map(|x| walk(x, t, ok)).collect()),
+            Expr::NullIf(a, b) => Expr::NullIf(w(a), w(b)),
+            Expr::Iif(c, a, b) => Expr::Iif(c, w(a), w(b)),
+            Expr::Case(arms, els) => {
+                Expr::Case(arms.into_iter().map(|(c, x)| (c, walk(x, t, ok))).collect(), els.map(w))
+            }
+            Expr::Func(f, args) => Expr::Func(f, args.into_iter().map(|x| walk(x, t, ok)).collect()),
+            other => other,
+        }
+    }
+    if is_lit(&inner) && own && CUR_ITEM_FOLD.with(|c| c.get()) == ItemFold::Own {
+        return Some(inner);
+    }
+    let ok = std::cell::Cell::new(true);
+    let out = walk(inner, t, &ok);
+    ok.get().then_some(out)
+}
+
 /// A double LITERAL under a CAST to DECFLOAT folds from its spelling
 /// ([double_literal_text]); when two spellings of the same double in one
 /// statement read to different decimals the fold cannot pick, and the
 /// statement refuses HERE, at prepare, rather than at fetch. Every other
 /// shape passes.
+///
+/// An INT128-backed target reads the spellings BY VALUE: `1e37` beside
+/// `1.0e37` (or `10e36` in a predicate) is one decimal 10^37 whichever
+/// is read (`CAST(1e37 AS INT128), CAST(1.0e37 AS INT128)` is 10^37
+/// twice, and `CAST(-1e37 AS INT128) .. WHERE 1e0 < 10e36` -10^37, on
+/// 2182), where the bit-for-bit reading declined and the cast fell to
+/// cvt.cpp's runtime double, 10000000000000000719354278919532445696 - a
+/// silent wrong value. Two different VALUES of one double still decline,
+/// and refuse.
 fn dec_literal_cast_spelled(inner: &Expr, t: &CastTarget) -> bool {
-    if !matches!(t, CastTarget::DecFloat { .. }) || RUNTIME_DOUBLE_CASTS.with(|c| c.get()) {
+    if !matches!(t, CastTarget::DecFloat { .. } | CastTarget::Numeric { bytes: 16, .. })
+        || RUNTIME_DOUBLE_CASTS.with(|c| c.get())
+    {
         return true;
     }
     let lit = match inner {
@@ -86314,7 +88473,8 @@ fn dec_literal_cast_spelled(inner: &Expr, t: &CastTarget) -> bool {
         },
         _ => None,
     };
-    lit.is_none_or(|d| double_literal_text(d).is_some())
+    let by_value = !matches!(t, CastTarget::DecFloat { .. });
+    lit.is_none_or(|d| double_literal_text(d, by_value).is_some())
 }
 
 /// Run `f` with [RUNTIME_DOUBLE_CASTS] set, restoring the previous state.
@@ -86718,21 +88878,58 @@ fn classify_exp_literal(text: &str) -> Option<ExpLit> {
 /// decimals (`1.5e0` beside `1.50e0` for a DECFLOAT target) cannot be
 /// told apart by the bits, and decline; a literal no lexer recorded (a
 /// double built in code) takes the shortest round-trip form.
-fn double_literal_text(d: f64) -> Option<String> {
-    DOUBLE_LITERAL_TEXT.with(|t| {
-        let t = t.borrow();
-        let mut spellings = t.iter().filter(|(b, _)| *b == d.to_bits()).map(|(_, s)| s);
-        let first = match spellings.next() {
-            Some(s) => s.clone(),
-            None => return Some(format!("{:e}", d)),
-        };
-        let bits_of = |s: &str| text_to_dec128_clamped(s).ok();
-        if spellings.all(|s| bits_of(s) == bits_of(&first)) {
-            Some(first)
-        } else {
-            None
+///
+/// A NEGATED literal is spelled with its minus: the engine's
+/// NegateNode::genBlr hands a literal child to genConstant with
+/// `negateValue`, so the BLR carries the text `-1e37` and the fold reads
+/// it exactly (`CAST(-1e37 AS INT128)` is -10^37, `CAST(-1.7e38 AS
+/// INT128)` -1.7x10^38, `CAST(-9007199254740993e0 AS NUMERIC(38,0))`
+/// -9007199254740993, measured on 2182). The lexer records the unsigned
+/// spelling, so a double with no spelling of its own takes its
+/// negation's, minus prefixed - where this fell to the shortest decimal
+/// of the one-ULP-off double (-10000000000000001000000000000000000000).
+///
+/// `by_value` (an INT128-backed target) takes two spellings as one when
+/// they are the same NUMBER (`1e37`, `1.0e37`, `10e36`): the fold rounds
+/// the exact value to the target's scale, which the trailing zeros of a
+/// coefficient do not change. A DECFLOAT target keeps them apart - its
+/// value carries the exponent (`1.5e0` is 1.5, `1.50e0` 1.50).
+fn double_literal_text(d: f64, by_value: bool) -> Option<String> {
+    let key = |s: &str| -> Option<(bool, u128, i32)> {
+        let bits = text_to_dec128_clamped(s).ok()?;
+        if !by_value {
+            return Some((false, bits, 0));
         }
-    })
+        match fire_crab_ods::decfloat::decode_dec128(bits) {
+            fire_crab_ods::decfloat::Dec::Finite { coeff: 0, .. } => Some((false, 0, 0)),
+            fire_crab_ods::decfloat::Dec::Finite { neg, mut coeff, mut exp } => {
+                while coeff % 10 == 0 {
+                    coeff /= 10;
+                    exp += 1;
+                }
+                Some((neg, coeff, exp))
+            }
+            _ => None,
+        }
+    };
+    let spelled = |d: f64| -> Option<Option<String>> {
+        DOUBLE_LITERAL_TEXT.with(|t| {
+            let t = t.borrow();
+            let mut spellings = t.iter().filter(|(b, _)| *b == d.to_bits()).map(|(_, s)| s);
+            let first = spellings.next()?.clone();
+            Some(spellings.all(|s| key(s) == key(&first)).then_some(first))
+        })
+    };
+    match spelled(d) {
+        Some(found) => found,
+        None => match spelled(-d) {
+            Some(found) => found.map(|s| match s.strip_prefix('-') {
+                Some(pos) => pos.to_string(),
+                None => format!("-{}", s),
+            }),
+            None => Some(format!("{:e}", d)),
+        },
+    }
 }
 
 fn cvt_text_to_double(text: &str) -> Option<f64> {
@@ -89417,10 +91614,14 @@ fn dec_round_family(
         }
         Dec::Finite { neg: v < 0, coeff: v.unsigned_abs() as u128, exp: 0 }
     };
-    let modf = |x: &Dec| -> (Dec, Dec) {
+    // Decimal128::modf: decQuadToIntegralValue, then `x - ip` - which for
+    // an Infinity is Inf - Inf, the context's Invalid: `TRUNC(Inf)`,
+    // `TRUNC(-Inf)`, `TRUNC(Inf, 2)` and `TRUNC(Inf, -2)` all raise 22000
+    // (measured on 2182), where a quiet NaN passes as NaN
+    let modf = |x: &Dec| -> Result<(Dec, Dec), EvalErr> {
         let ip = dec_to_integral(x, RndMode::Trunc);
         let r = dfl::sub(x, &ip);
-        (ip, r)
+        Ok((ip, trap(&[x], r)?))
     };
     match mode {
         RndMode::Ceil | RndMode::Floor => Ok(out(dec_to_integral(d, mode))),
@@ -89442,15 +91643,15 @@ fn dec_round_family(
             let result_scale = -round_places(places, "TRUNC")?;
             if result_scale > 0 {
                 let vv = pow_i64(result_scale);
-                let (ip, _) = modf(&div(d, &vv)?);
+                let (ip, _) = modf(&div(d, &vv)?)?;
                 Ok(out(mul(&ip, &vv)?))
             } else {
-                let (ip, r) = modf(d);
+                let (ip, r) = modf(d)?;
                 if result_scale == 0 {
                     return Ok(out(ip));
                 }
                 let vv = pow_i64(-result_scale);
-                let (ri, _) = modf(&mul(&r, &vv)?);
+                let (ri, _) = modf(&mul(&r, &vv)?)?;
                 Ok(out(trap(&[&ip], dfl::add(&ip, &div(&ri, &vv)?))?))
             }
         }
@@ -89920,6 +92121,11 @@ fn cvt_dec_to_int64(d: &fire_crab_ods::decfloat::Dec, scale: i32) -> Result<i64,
     i64::try_from(raw).map_err(|_| EvalErr::FloatInvalidOperand)
 }
 
+/// A DECFLOAT value holding a NaN (either width).
+fn dec_is_nan(v: &Value) -> bool {
+    matches!(dec_of(v), Some(fire_crab_ods::decfloat::Dec::Nan))
+}
+
 /// The DECFLOAT a value holds, decoded - `None` for any other value
 fn dec_of(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
     match v {
@@ -90147,6 +92353,8 @@ impl Expr {
             // cannot say, since an empty inner table has no value to
             // read a type from
             Expr::Lookup { ty, .. } => Some(*ty),
+            // a DECFLOAT scalar is typeless like a DECFLOAT column
+            Expr::CorrSub { desc: Some(pc), .. } if matches!(pc.sql_type & !1, 32760 | 32762) => None,
             Expr::CorrSub { ty, .. } => Some(*ty),
             // a generator's value is a plain INT64, whatever wraps it
             Expr::GenVal(_) => Some(ExprType::Int),
@@ -91199,13 +93407,13 @@ impl Expr {
                         rows.first().cloned().unwrap_or(Value::Null)
                     }
                     CorrKind::Exists { negated } => Value::Bool(!rows.is_empty() != *negated),
-                    CorrKind::In { lhs, negated } => {
+                    CorrKind::In { lhs, negated, coll } => {
                         let l = lhs.eval(values)?;
-                        corr_quantified(&l, Cmp::Eq, false, *negated, &rows)
+                        corr_quantified(&l, Cmp::Eq, false, *negated, &rows, *coll)
                     }
-                    CorrKind::Quant { lhs, op, all, negated } => {
+                    CorrKind::Quant { lhs, op, all, negated, coll } => {
                         let l = lhs.eval(values)?;
-                        corr_quantified(&l, *op, *all, *negated, &rows)
+                        corr_quantified(&l, *op, *all, *negated, &rows, *coll)
                     }
                 }
             }
@@ -91944,7 +94152,20 @@ impl Expr {
                 }
             },
             Expr::Cast(e, t, cs) => {
-                let v = e.eval(values)?;
+                // [SNAN_TO_APPROX]: taken by the first cast evaluated
+                // under it, which is the DECFLOAT operand of a cast to
+                // DOUBLE / FLOAT
+                let snan_ok = SNAN_TO_APPROX.with(|c| c.replace(false));
+                let v = if matches!(t, CastTarget::Approx | CastTarget::Float)
+                    && matches!(**e, Expr::Cast(_, CastTarget::DecFloat { .. }, _))
+                {
+                    SNAN_TO_APPROX.with(|c| c.set(true));
+                    let v = e.eval(values);
+                    SNAN_TO_APPROX.with(|c| c.set(false));
+                    v?
+                } else {
+                    e.eval(values)?
+                };
                 if matches!(v, Value::Null) {
                     return Ok(Value::Null); // NULL casts to NULL of any type
                 }
@@ -92129,6 +94350,24 @@ impl Expr {
                     // decimal64 (16). NaN/Infinity carry through as-is (a
                     // CAST re-represents, it does not trap).
                     CastTarget::DecFloat { wide } => {
+                        // a SIGNALLING or a NEGATIVE NaN has no form here:
+                        // the decoded value is one quiet, unsigned NaN,
+                        // so every consumer would answer the quiet one's
+                        // result where the engine's differs (measured on
+                        // 2182: CEILING / FLOOR / TRUNC / EXP / POWER of
+                        // 'sNaN' raise 22000, SIGN('-NaN') is -1, and
+                        // the casts themselves print sNaN / -NaN) - the
+                        // cast refuses rather than answer the wrong one.
+                        // Straight into a cast to DOUBLE / FLOAT the two
+                        // agree - any NaN is the conversion's 22000 there
+                        // (`CAST(CAST('sNaN' AS DECFLOAT(34)) AS DOUBLE
+                        // PRECISION)`, measured; castdfnonfinite's cells)
+                        if let (false, Value::Text(s)) = (snan_ok, &v) {
+                            let t = s.to_ascii_lowercase();
+                            if dec_special_text(s) && (t.trim_start_matches(['+', '-']).starts_with("snan") || (t.starts_with('-') && t.contains("nan"))) {
+                                return Err(EvalErr::Unsupported);
+                            }
+                        }
                         let dec = if let Value::Text(s) = &v {
                             // an exponent past decimal128's range CLAMPS
                             // ('1E-6177' is 0E-6176, '1E+6112' 1.0E+6112) and
@@ -92171,7 +94410,7 @@ impl Expr {
                                 _ => (false, None),
                             };
                             let bits = lit
-                                .and_then(double_literal_text)
+                                .and_then(|d| double_literal_text(d, false))
                                 .and_then(|t| text_to_dec128_clamped(&t).ok())
                                 .ok_or(EvalErr::ConversionError(None))?;
                             // the minus is part of the re-read TEXT, so
@@ -92798,7 +95037,7 @@ impl Expr {
                                     {
                                         return Err(EvalErr::NumericOutOfRange);
                                     }
-                                    match double_literal_text(d).and_then(|t| text_number(&t)) {
+                                    match double_literal_text(d, true).and_then(|t| text_number(&t)) {
                                         Some(TextNum::Dec { mantissa, exp })
                                             if i8::try_from(exp).is_ok() =>
                                         {
@@ -93650,6 +95889,14 @@ impl Expr {
                         let count = s.chars().count() as i64;
                         Value::Text(substring_impl(&s, (count - n + 1).max(1), None)?)
                     }
+                    SysFn::Replace if matches!(args.first(), Some(Expr::Collate(_, tt))
+                        if fire_crab_ods::coll::icu_strength_of_ttype(*tt)
+                            .is_some_and(|st| st != fire_crab_ods::coll::Strength::Tertiary)) =>
+                    {
+                        let Some(Expr::Collate(_, tt)) = args.first() else { unreachable!() };
+                        let st = fire_crab_ods::coll::icu_strength_of_ttype(*tt).expect("guarded");
+                        Value::Text(replace_canonical(&fn_text(&vs[0]), &fn_text(&vs[1]), &fn_text(&vs[2]), st))
+                    }
                     SysFn::Replace => {
                         let (s, find, repl) =
                             (fn_text(&vs[0]), fn_text(&vs[1]), fn_text(&vs[2]));
@@ -93946,16 +96193,29 @@ impl Expr {
                         use fire_crab_ods::decmath as dm;
                         let ds = dec_math_operands(&vs).unwrap_or_default();
                         let zero = Dec::Finite { neg: false, coeff: 0, exp: 0 };
-                        let le0 = |d: &Dec| cmp(d, &zero) != std::cmp::Ordering::Greater;
+                        // the domain checks are `Decimal128::compare`
+                        // against 0: decQuadCompare answers NaN for a NaN
+                        // operand and decQuadToInt32 of that is the
+                        // context's Invalid - so a NaN argument to SQRT /
+                        // LN / LOG10 / LOG raises 22000 BEFORE the math,
+                        // where EXP and POWER (no compare) let a quiet NaN
+                        // through as NaN (measured on 2182, both ways)
+                        let dcmp = |d: &Dec| -> Result<std::cmp::Ordering, EvalErr> {
+                            if matches!(d, Dec::Nan) {
+                                return Err(EvalErr::DecfloatInvalidOperation);
+                            }
+                            Ok(cmp(d, &zero))
+                        };
+                        let le0 = |d: &Dec| dcmp(d).map(|o| o != std::cmp::Ordering::Greater);
                         let r = match f {
                             SysFn::Sqrt => {
-                                if cmp(&ds[0], &zero) == std::cmp::Ordering::Less {
+                                if dcmp(&ds[0])? == std::cmp::Ordering::Less {
                                     return Err(EvalErr::MathDomain { func: "SQRT", code: GDS_SYSF_ARG_NONNEG });
                                 }
                                 dm::sqrt(&ds[0])
                             }
                             SysFn::Ln | SysFn::Log10 => {
-                                if le0(&ds[0]) {
+                                if le0(&ds[0])? {
                                     return Err(EvalErr::MathDomain {
                                         func: if matches!(f, SysFn::Ln) { "LN" } else { "LOG10" },
                                         code: GDS_SYSF_ARG_POSITIVE,
@@ -93967,23 +96227,40 @@ impl Expr {
                             SysFn::Power => dm::pow(&ds[0], &ds[1]),
                             _ => {
                                 // LOG(base, value) = ln(value) / ln(base): each
-                                // ln at 34 digits, then the decimal128 divide
-                                // (a zero divisor is the 22012, 0 / 0 the 22000)
-                                if le0(&ds[0]) {
+                                // ln at 34 digits, then decQuadDivide - whose
+                                // specials come first: Inf / Inf is the 22000,
+                                // Inf / x (a zero x too) a signed Infinity, x /
+                                // Inf a signed zero at etiny; then a zero
+                                // divisor is the 22012 and 0 / 0 the 22000.
+                                // Measured: `LOG(2, Inf)` Infinity, `LOG(Inf,
+                                // 2)` 0E-6176, `LOG(Inf, 0.5)` -0E-6176, `LOG(1,
+                                // Inf)` Infinity, `LOG(Inf, Inf)` 22000.
+                                if le0(&ds[0])? {
                                     return Err(EvalErr::MathDomain { func: "LOG", code: GDS_SYSF_BASE_POSITIVE });
                                 }
-                                if le0(&ds[1]) {
+                                if le0(&ds[1])? {
                                     return Err(EvalErr::MathDomain { func: "LOG", code: GDS_SYSF_ARG_POSITIVE });
                                 }
+                                let sign = |d: &Dec| match d {
+                                    Dec::Finite { neg, coeff, .. } => *neg && *coeff != 0,
+                                    Dec::Infinity { neg } => *neg,
+                                    Dec::Nan => false,
+                                };
                                 match (dm::ln(&ds[1]), dm::ln(&ds[0])) {
-                                    (Ok(a), Ok(b)) => {
-                                        if fire_crab_ods::decfloat::is_zero(&b) {
+                                    (Ok(a), Ok(b)) => match (&a, &b) {
+                                        (Dec::Infinity { .. }, Dec::Infinity { .. }) => Err(dm::MathErr::Invalid),
+                                        (Dec::Infinity { .. }, _) => Ok(Dec::Infinity { neg: sign(&a) != sign(&b) }),
+                                        (_, Dec::Infinity { .. }) => {
+                                            Ok(Dec::Finite { neg: sign(&a) != sign(&b), coeff: 0, exp: -6176 })
+                                        }
+                                        _ if fire_crab_ods::decfloat::is_zero(&b) => {
                                             Err(if fire_crab_ods::decfloat::is_zero(&a) { dm::MathErr::Invalid } else { dm::MathErr::DivByZero })
-                                        } else {
+                                        }
+                                        _ => {
                                             let q = fire_crab_ods::decfloat::div(&a, &b);
                                             if matches!(q, Dec::Infinity { .. }) { Err(dm::MathErr::Overflow) } else { Ok(q) }
                                         }
-                                    }
+                                    },
                                     (Err(e), _) | (_, Err(e)) => Err(e),
                                 }
                             }
@@ -94552,6 +96829,23 @@ fn value_to_tok(v: &Value, key: bool) -> Option<Tok> {
         // as a DATE, and a Tok::Str would have taken the text path
         Value::Double(d) => Tok::FnExpr(RawExpr::Double(*d)),
         Value::Float(f) => Tok::FnExpr(RawExpr::Double(*f as f64)),
+        // a FINITE DECFLOAT answer folds back as the decimal128 literal
+        // it is (a DECFLOAT(16) one widened, which is exact): the
+        // DECFLOAT(34) results of SQRT / POWER / the statistical folds
+        // over an INT128 feed `I IN (SELECT SQRT(I) ..)` and `(SELECT
+        // VAR_POP(X.I) ..) > 1`, which the engine compares in decimal
+        // (measured on 2182: 1, 2 and every row) and this refused. A
+        // NaN or an Infinity keeps the refusal: its compare traps
+        // per row on the engine.
+        Value::DecFloat34(b) if matches!(fire_crab_ods::decfloat::decode_dec128(*b), fire_crab_ods::decfloat::Dec::Finite { .. }) => {
+            Tok::FnExpr(RawExpr::DecFloat34(*b))
+        }
+        Value::DecFloat16(b) => match fire_crab_ods::decfloat::decode_dec64(*b) {
+            d @ fire_crab_ods::decfloat::Dec::Finite { .. } => {
+                Tok::FnExpr(RawExpr::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&d)))
+            }
+            _ => return None,
+        },
         Value::Date(d) => Tok::FnExpr(RawExpr::DateLit(*d)),
         Value::Time(t) => Tok::FnExpr(RawExpr::TimeLit(*t)),
         Value::Timestamp(d, t) => Tok::FnExpr(RawExpr::TsLit(*d, *t)),
@@ -94565,6 +96859,11 @@ struct SubqRows {
     /// the projected column's values, in scan order (NULLs included -
     /// they decide NOT IN)
     values: Vec<Value>,
+    /// For a CORRELATED read: the text ttype of the INNER column the
+    /// correlation leaf compares - the collation a membership test built
+    /// from `values` must compare under ([subq_fold_coll]). None when
+    /// the column is not text or the reading cannot say.
+    inner_tt: Option<u16>,
     /// the inner query matched at least one row
     any: bool,
     /// For a CORRELATED read: the OUTER column the correlation leaf
@@ -94613,6 +96912,11 @@ struct SubqRows {
 /// None whenever the shape is not a text value of a REAL character set,
 /// and the caller keeps the plain literal it used before.
 fn subq_text_literal(v: &Value, sub: &str, db: &Option<Database>) -> Option<String> {
+    subq_text_literal_cs(v, sub, db).map(|(l, _)| l)
+}
+
+/// [subq_text_literal], with the character set the literal names.
+fn subq_text_literal_cs(v: &Value, sub: &str, db: &Option<Database>) -> Option<(String, u8)> {
     let Value::Text(t) = v else { return None };
     let ty = match plan_query_inner(sub, db, &mut Vec::new())? {
         Plan::Scalar(_, _, _, ty) => ty,
@@ -94649,7 +96953,7 @@ fn subq_text_literal(v: &Value, sub: &str, db: &Option<Database>) -> Option<Stri
     for b in &bytes {
         hex.push_str(&format!("{:02X}", b));
     }
-    Some(format!("CAST(x'{}' AS VARCHAR({}) CHARACTER SET {})", hex, width, name))
+    Some((format!("CAST(x'{}' AS VARCHAR({}) CHARACTER SET {})", hex, width, name), cs))
 }
 
 fn value_literal(v: &Value) -> Option<String> {
@@ -95949,15 +98253,26 @@ fn corr_literal(v: &Value, d: &Descriptor) -> Option<String> {
                 .max(1)
                 .max(t.chars().count());
             let kw = if d.dtype == dtype::VARYING { "VARCHAR" } else { "CHAR" };
+            // ...and an ICU column's COLLATION with them: the outer value
+            // compares under it inside the subquery (measured: a UNICODE_CI
+            // outer `ci` against a plain UTF8 inner column matches 'abc',
+            // 'ABC' and 'Abc' alike), which the bare cast loses
+            let coll = match (fire_crab_ods::coll::icu_strength_of_ttype(d.sub_type as u16), (d.sub_type as u16) >> 8) {
+                (Some(_), 2) => " COLLATE UNICODE",
+                (Some(_), 3) => " COLLATE UNICODE_CI",
+                (Some(_), 4) => " COLLATE UNICODE_CI_AI",
+                (Some(_), _) => return None,
+                _ => "",
+            };
             if t.is_empty() {
-                format!("CAST('' AS {}({}) CHARACTER SET {})", kw, chars, name)
+                format!("CAST('' AS {}({}) CHARACTER SET {}){}", kw, chars, name, coll)
             } else {
                 let bytes = blob_bytes_in(t, cs).ok()?;
                 let mut hex = String::with_capacity(bytes.len() * 2);
                 for b in &bytes {
                     hex.push_str(&format!("{:02X}", b));
                 }
-                format!("CAST(x'{}' AS {}({}) CHARACTER SET {})", hex, kw, chars, name)
+                format!("CAST(x'{}' AS {}({}) CHARACTER SET {}){}", hex, kw, chars, name, coll)
             }
         }
         Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
@@ -95984,8 +98299,10 @@ fn corr_literal_form_ok(d: &Descriptor) -> bool {
 enum CorrKindRaw {
     Scalar,
     Exists { negated: bool },
-    In { lhs: RawExpr, negated: bool },
-    Quant { lhs: RawExpr, op: Cmp, all: bool, negated: bool },
+    /// `coll`: the ICU collation the per-row membership compares under
+    /// ([corr_member_coll]), set after registration ([corr_set_coll])
+    In { lhs: RawExpr, negated: bool, coll: Option<u16> },
+    Quant { lhs: RawExpr, op: Cmp, all: bool, negated: bool, coll: Option<u16> },
 }
 
 /// A registered correlated subquery: what a `FC$CORR(<id>)` marker stands
@@ -96484,8 +98801,13 @@ fn corr_cmp_before(text: &str, at: usize) -> Option<(usize, Cmp)> {
 /// ANY|SOME|ALL (...)` - become `FC$CORR(<id>) = TRUE`, the three-valued
 /// result compared as a BOOLEAN so a NOT around it still works.
 ///
-/// `select_list`: a subquery standing alone as a select item is named by
-/// its own item (`... AS <name>`), the way the constant fold names one.
+/// `names`: the text is a select list, and a subquery standing alone as a
+/// select item is named by its own item - a NAME, never an alias (measured
+/// on 2182: `SELECT (SELECT X.A FROM T1 X WHERE X.ID = 7 - D.ID) FROM
+/// (SELECT ID, A FROM T1) D ORDER BY A` sorts by D.A, and `.. ORDER BY X`
+/// over an X-named one is -206 "X"). Its (item position, name) is pushed
+/// for the caller to lay on the planned column; a list holding a star,
+/// whose positions the expansion shifts, keeps the `AS <name>` splice.
 /// The text comes back unchanged when it holds no subquery; None when one
 /// cannot be lifted (the statement then keeps its refusal).
 fn lift_corr_text(
@@ -96493,12 +98815,18 @@ fn lift_corr_text(
     scope: &CorrScope,
     db: &Database,
     db_opt: &Option<Database>,
-    select_list: bool,
+    mut names: Option<&mut Vec<(usize, String)>>,
 ) -> Option<String> {
+    let select_list = names.is_some();
     let (folded, subs) = extract_subqueries(text)?;
     if subs.is_empty() {
         return Some(text.to_string());
     }
+    let items = split_top_level_commas(&folded);
+    let starred = items.iter().any(|it| {
+        let t = it.trim();
+        t == "*" || t.ends_with(".*")
+    });
     // which markers stand alone (no alias) as a select item
     let alone: Vec<bool> = if select_list {
         (0..subs.len())
@@ -96512,6 +98840,7 @@ fn lift_corr_text(
     } else {
         vec![false; subs.len()]
     };
+    let items: Vec<String> = items.iter().map(|it| it.to_string()).collect();
     let mut out = folded;
     for (i, sub) in subs.iter().enumerate().rev() {
         let mark = format!("{}{}", SUBQ_MARK, i);
@@ -96531,29 +98860,101 @@ fn lift_corr_text(
                 };
                 let (ls, lhs) = corr_lhs_before(&out, ns)?;
                 let lhs = parse_raw_expr_any(lhs)?;
-                (ls, CorrKindRaw::In { lhs, negated }, true)
+                (ls, CorrKindRaw::In { lhs, negated, coll: None }, true)
             }
             Some((ws, w)) if matches!(w.as_str(), "ANY" | "SOME" | "ALL") => {
                 let all = w == "ALL";
                 let (cs, op) = corr_cmp_before(&out, ws)?;
                 let (ls, lhs) = corr_lhs_before(&out, cs)?;
                 let lhs = parse_raw_expr_any(lhs)?;
-                (ls, CorrKindRaw::Quant { lhs, op, all, negated: false }, true)
+                (ls, CorrKindRaw::Quant { lhs, op, all, negated: false, coll: None }, true)
             }
             _ => (at, CorrKindRaw::Scalar, false),
         };
-        let id = corr_register(sub, scan, kind, scope, db_opt, None)?;
+        // AN ICU VALUE ON EITHER SIDE of a per-row comparison: the engine
+        // compares under that collation. A scalar beside a plain column of
+        // its character set is spelt with the collation on the COLUMN
+        // (the explicit-collation compare reads it there); a membership
+        // test compares its values per row under the ICU side's collation
+        // ([corr_member_coll]).
+        let id = corr_register(sub, scan, kind.clone(), scope, db_opt, None)?;
+        let icu = corr_icu_ttype(id, sub, db_opt);
+        let scope_desc = |name: &str| -> Option<Descriptor> {
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            let bare = canon_ident(bare).unwrap_or_else(|| bare.to_string());
+            scope.rels.iter().flat_map(|r| r.cols.iter()).find(|(n, _)| col_name_is(n, &bare)).and_then(|(_, d)| *d)
+        };
+        let icu_col = |e: &RawExpr| match e {
+            RawExpr::Col(n) => scope_desc(n).is_some_and(|d| {
+                matches!(col_kind(&d), Some(ColKind::Text))
+                    && d.sub_type > 0
+                    && fire_crab_ods::coll::icu_strength_of_ttype(d.sub_type as u16).is_some()
+            }),
+            _ => false,
+        };
+        let mut coll_after: Option<(usize, &'static str)> = None;
+        match &kind {
+            CorrKindRaw::In { lhs, .. } | CorrKindRaw::Quant { lhs, .. } if icu.is_some() || icu_col(lhs) => {
+                let d = match lhs {
+                    RawExpr::Col(n) => scope_desc(n),
+                    _ => None,
+                };
+                corr_set_coll(id, corr_member_coll(corr_text_ttype(id, sub, db_opt), d)?);
+            }
+            CorrKindRaw::Scalar if icu.is_some() && !select_list => {
+                let it = icu?;
+                let lhs = corr_cmp_before(&out, at).and_then(|(cs_at, _)| corr_lhs_before(&out, cs_at));
+                if let Some((ls, lt)) = lhs {
+                    if let Some(RawExpr::Col(n)) = parse_raw_expr_any(lt) {
+                        if let Some(d) = scope_desc(&n).filter(|d| matches!(col_kind(d), Some(ColKind::Text)) && d.sub_type >= 0) {
+                            let ot = d.sub_type as u16;
+                            let same_cs = fire_crab_ods::intl::charset_id(ot as i16)
+                                == fire_crab_ods::intl::charset_id(it as i16);
+                            if fire_crab_ods::coll::icu_strength_of_ttype(ot).is_some() {
+                                if ot != it {
+                                    return None;
+                                }
+                            } else if same_cs {
+                                coll_after = Some((ls + lt.len(), icu_coll_name(it)?));
+                            } else {
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
         let repl = if wrap {
             format!("FC$CORR({}) = TRUE", id)
-        } else if select_list && alone[i] {
+        } else if select_list && alone[i] && starred {
             let name = corr_template(id)?.desc.name;
             format!("FC$CORR({}) AS \"{}\"", id, name.replace('"', "\"\""))
+        } else if select_list && alone[i] {
+            let name = corr_template(id)?.desc.name;
+            if let Some(pos) = items.iter().position(|it| it.trim() == mark) {
+                names.as_deref_mut()?.push((pos, name));
+            }
+            corr_unnamed_item(id)
         } else {
             format!("FC$CORR({})", id)
         };
         out = format!("{}{}{}", &out[..cut], repl, &out[end..]);
+        if let Some((pos, name)) = coll_after {
+            out.insert_str(pos, &format!(" COLLATE {}", name));
+        }
     }
     Some(out)
+}
+
+/// A whole select item standing for per-row subquery `id`, spelled so the
+/// planner gives it NO name a statement can write: bare, `FC$CORR(<id>)`
+/// takes the inner item's name ([default_expr_name]) and an ORDER BY or
+/// GROUP BY key of that name resolved to it - a key the engine resolves
+/// to the FROM's column or refuses -206 (measured on 2182). The caller
+/// lays the real name on the planned column afterwards.
+fn corr_unnamed_item(id: usize) -> String {
+    format!("FC$CORR({}) AS \"FC$ITEM{}\"", id, id)
 }
 
 /// How a per-row subquery is used, operands resolved.
@@ -96561,8 +98962,8 @@ fn lift_corr_text(
 enum CorrKind {
     Scalar,
     Exists { negated: bool },
-    In { lhs: Expr, negated: bool },
-    Quant { lhs: Expr, op: Cmp, all: bool, negated: bool },
+    In { lhs: Expr, negated: bool, coll: Option<u16> },
+    Quant { lhs: Expr, op: Cmp, all: bool, negated: bool, coll: Option<u16> },
 }
 
 /// The memo of one [Expr::CorrSub]: the inner rows' first column per
@@ -96787,6 +99188,10 @@ fn corr_result_type(pc: &ProjCol) -> Option<(ExprType, i8, Option<NumRank>)> {
         32756 => (ExprType::Temporal(TKind::TimeTz), 0, None),
         32754 => (ExprType::Temporal(TKind::TimestampTz), 0, None),
         32764 => (ExprType::Bool, 0, None),
+        // a DECFLOAT column has no ExprType ([Expr::type_of] answers None
+        // for this template's DECFLOAT desc) - the decimal compare takes
+        // it through [is_decfloat_arith]; the placeholder is never read
+        32760 | 32762 => (ExprType::Numeric, 0, None),
         _ => return None,
     })
 }
@@ -96816,14 +99221,15 @@ fn resolve_corr_sub(id: usize, columns: &[RelationColumn], descs: &[Descriptor])
     let kind = match &t.kind {
         CorrKindRaw::Scalar => CorrKind::Scalar,
         CorrKindRaw::Exists { negated } => CorrKind::Exists { negated: *negated },
-        CorrKindRaw::In { lhs, negated } => {
-            CorrKind::In { lhs: resolve_expr_inner(lhs, columns, descs)?, negated: *negated }
+        CorrKindRaw::In { lhs, negated, coll } => {
+            CorrKind::In { lhs: resolve_expr_inner(lhs, columns, descs)?, negated: *negated, coll: *coll }
         }
-        CorrKindRaw::Quant { lhs, op, all, negated } => CorrKind::Quant {
+        CorrKindRaw::Quant { lhs, op, all, negated, coll } => CorrKind::Quant {
             lhs: resolve_expr_inner(lhs, columns, descs)?,
             op: *op,
             all: *all,
             negated: *negated,
+            coll: *coll,
         },
     };
     let (ty, scale, rank, desc) = match kind {
@@ -96870,8 +99276,10 @@ fn corr_built_count() -> u64 {
 /// vacuously TRUE and ANY FALSE - NULL left side included; otherwise a
 /// NULL on either side of a comparison is UNKNOWN, which ANY ignores when
 /// another element answers TRUE and ALL ignores when another answers
-/// FALSE; a NOT flips TRUE and FALSE and leaves UNKNOWN.
-fn corr_quantified(lhs: &Value, op: Cmp, all: bool, negated: bool, set: &[Value]) -> Value {
+/// FALSE; a NOT flips TRUE and FALSE and leaves UNKNOWN. Two texts
+/// compare under `coll`, an ICU collation, when the statement names one
+/// ([corr_member_coll]).
+fn corr_quantified(lhs: &Value, op: Cmp, all: bool, negated: bool, set: &[Value], coll: Option<u16>) -> Value {
     let verdict: Option<bool> = if set.is_empty() {
         Some(all)
     } else {
@@ -96882,7 +99290,10 @@ fn corr_quantified(lhs: &Value, op: Cmp, all: bool, negated: bool, set: &[Value]
                 unknown = true;
                 continue;
             }
-            let o = num_cmp(lhs, v).unwrap_or_else(|| value_cmp(lhs, v));
+            let o = coll
+                .and_then(|tt| coll_value_cmp(lhs, v, tt))
+                .or_else(|| num_cmp(lhs, v))
+                .unwrap_or_else(|| value_cmp(lhs, v));
             let t = match op {
                 Cmp::Eq => o == std::cmp::Ordering::Equal,
                 Cmp::Ne => o != std::cmp::Ordering::Equal,
@@ -97267,12 +99678,21 @@ fn plan_correlated_select(
     // build the output columns: the marker becomes the lookup, every
     // other item is an ordinary select item
     let mut cols: Vec<ProjCol> = Vec::new();
+    // the lookup columns that carry only the INNER item's name: that name
+    // describes the column but is no alias an ORDER BY resolves to
+    // (measured on 2182: `SELECT (SELECT X.A FROM T1 X WHERE X.ID = T.ID)
+    // FROM T1 T ORDER BY A` sorts by T.A, `.. ORDER BY X` over an X-named
+    // one is -206 "X")
+    let mut unaliased: Vec<usize> = Vec::new();
     for item in split_top_level_commas(proj_marked) {
         let (body, alias) = split_alias(item);
         if let Some((_, lookup, result_desc, (ifname, iname), (irel, iralias))) = lookups
             .iter()
             .find(|(m, _, _, _, _)| body.trim() == format!("{}{}", SUBQ_MARK, m))
         {
+            if alias.is_none() {
+                unaliased.push(cols.len());
+            }
             let (wire, sql_type, length, scale, sub_type) = wire_for(result_desc);
             cols.push(ProjCol {
                 // the subquery DELEGATES naming to its inner item: the
@@ -97327,18 +99747,24 @@ fn plan_correlated_select(
     }
     let order_by = match order_s {
         None => Vec::new(),
-        Some(os) => parse_order_by_expr(
-            &unq(os),
-            &cols,
-            &descs,
-            |n| {
-                columns
-                    .iter()
-                    .find(|c| col_name_is(&c.name, n))
-                    .map(|c| c.field_id as usize)
-            },
-            |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
-        )?,
+        Some(os) => {
+            let mut order_cols = cols.clone();
+            for i in &unaliased {
+                order_cols[*i].name.clear();
+            }
+            parse_order_by_expr(
+                &unq(os),
+                &order_cols,
+                &descs,
+                |n| {
+                    columns
+                        .iter()
+                        .find(|c| col_name_is(&c.name, n))
+                        .map(|c| c.field_id as usize)
+                },
+                |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+            )?
+        }
     };
     // The OUTER retrieval's access path, chosen the way every other
     // single-relation retrieval chooses one. Gated on a WHERE existing
@@ -97505,6 +99931,26 @@ fn build_correlated_lookup(
     let toks = tokenize(ws)?;
     let (corr_fid, outer_name, residual) =
         split_correlation(&toks, table, from.alias.as_deref(), &columns, outer_cols, Some(outer_bind))?;
+    // the table below is keyed by the value's bytes ([lookup_key_eq]); a
+    // correlation whose either side carries an ICU collation matches
+    // under it on the engine (`(SELECT COUNT(*) FROM cs WHERE cs.s =
+    // cn.s)` counts 'abc', 'ABC', 'Abc' for each under UNICODE_CI, 3 3 3
+    // where this table answered 1 1 1), so it is the per-row reading's
+    let icu_text = |d: Option<&Descriptor>| {
+        d.is_some_and(|d| {
+            matches!(col_kind(d), Some(ColKind::Text))
+                && d.sub_type > 0
+                && fire_crab_ods::coll::icu_strength_of_ttype(d.sub_type as u16).is_some()
+        })
+    };
+    let outer_bare = outer_name.rsplit('.').next().unwrap_or(&outer_name).to_string();
+    let outer_d = outer_cols
+        .iter()
+        .find(|c| col_name_is(&c.name, &outer_bare))
+        .and_then(|c| outer_descs.get(c.field_id as usize));
+    if icu_text(descs.get(corr_fid)) || icu_text(outer_d) {
+        return None;
+    }
 
     // The residual WHERE names the INNER table, often by its alias
     // (`AND E.SALARY > 150`). The correlation split needed those
@@ -98192,7 +100638,8 @@ fn eval_subquery_corr_planned(
             Err(_) => return None, // the relation path refuses here too
         }
     }
-    Some(SubqRows { values, any, outer: Some(outer_name) })
+    let inner_tt = descs.get(corr_fid).filter(|d| matches!(col_kind(d), Some(ColKind::Text))).map(|d| d.sub_type as u16);
+    Some(SubqRows { values, any, inner_tt, outer: Some(outer_name) })
 }
 
 /// The uncorrelated subquery as a PLANNED STATEMENT: one column, its
@@ -98225,7 +100672,7 @@ fn eval_subquery_planned(
             .map(|r| r.first().cloned().unwrap_or(Value::Null))
             .collect()
     };
-    Some(SubqRows { values, any, outer: None })
+    Some(SubqRows { values, any, inner_tt: None, outer: None })
 }
 
 fn eval_subquery_rel(
@@ -98461,7 +100908,7 @@ fn eval_subquery_rel(
             }
             AggTarget::DistinctExpr(raw) => {
                 // COUNT-only (checked below), so no SUM/AVG type guard
-                (agg_expr_src(resolve_expr(raw, &columns, &descs)?)?, true)
+                (agg_expr_src(resolve_expr(raw, &columns, &descs)?, &descs)?, true)
             }
             AggTarget::Expr(raw) => {
                 let e = resolve_expr(raw, &columns, &descs)?;
@@ -98473,7 +100920,7 @@ fn eval_subquery_rel(
                 {
                     return None;
                 }
-                (agg_expr_src(e)?, false)
+                (agg_expr_src(e, &descs)?, false)
             }
         };
         if distinct && !matches!(func, AggFn::Count | AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max) {
@@ -98488,6 +100935,7 @@ fn eval_subquery_rel(
         return Some(SubqRows {
             values: vec![v],
             any: true,
+            inner_tt: None,
             outer: corr_outer.clone(),
         });
     }
@@ -98512,7 +100960,7 @@ fn eval_subquery_rel(
         if ferr {
             return None;
         }
-        return Some(SubqRows { values: Vec::new(), any, outer: corr_outer.clone() });
+        return Some(SubqRows { values: Vec::new(), any, inner_tt: None, outer: corr_outer.clone() });
     }
     let fid = want_fid?;
     let mut values = Vec::new();
@@ -98543,7 +100991,11 @@ fn eval_subquery_rel(
     if ferr {
         return None;
     }
-    Some(SubqRows { values, any, outer: corr_outer })
+    let inner_tt = corr_inner_fid
+        .and_then(|f| descs.get(f))
+        .filter(|d| matches!(col_kind(d), Some(ColKind::Text)))
+        .map(|d| d.sub_type as u16);
+    Some(SubqRows { values, any, inner_tt, outer: corr_outer })
 }
 
 /// Is the token at `at` reached through nothing but top-level `AND`s -
@@ -98642,12 +101094,12 @@ fn resolve_subqueries(
     };
     // a set of values becomes the body of an IN list; `key` marks the
     // text ones as HASH KEYS (see [conjunctive_position])
-    let list_tokens = |vals: &[Value], key: bool| -> Option<Vec<Tok>> {
+    let list_tokens = |vals: &[Value], key: bool, fc: &FoldColl| -> Option<Vec<Tok>> {
         let mut out = vec![Tok::LParen];
         // duplicates change nothing for membership and cost time
         let mut seen: Vec<Tok> = Vec::new();
         for v in vals {
-            let t = value_to_tok(v, key)?;
+            let t = fold_value_tok(v, key, fc)?;
             if !seen.iter().any(|s| tok_eq(s, &t)) {
                 seen.push(t);
             }
@@ -98741,6 +101193,14 @@ fn resolve_subqueries(
                         // divergence. (A literal `NOT IN (SELECT ...)`
                         // is the opposite case: there the NULL genuinely
                         // does poison, and it is kept.)
+                        // the inner column's collation, when the outer
+                        // one has none of its own
+                        let fc = subq_fold_coll(
+                            Some(&Tok::Ident(outer.clone())),
+                            rows.inner_tt,
+                            outer_cols,
+                            outer_descs,
+                        )?;
                         let vals: Vec<Value> = rows
                             .values
                             .into_iter()
@@ -98771,12 +101231,12 @@ fn resolve_subqueries(
                             // NOT EXISTS is an ANTI-join: the engine
                             // never hashes it, so the values keep the
                             // lenient grammar (probed)
-                            out.extend(list_tokens(&vals, false)?);
+                            out.extend(list_tokens(&vals, false, &fc)?);
                             out.push(Tok::RParen);
                         } else {
                             out.push(Tok::Ident(outer));
                             out.push(Tok::In);
-                            out.extend(list_tokens(&vals, keys && conjunctive_position(toks, i))?);
+                            out.extend(list_tokens(&vals, keys && conjunctive_position(toks, i), &fc)?);
                         }
                     }
                     // uncorrelated: the verdict is the same for every row
@@ -98871,20 +101331,26 @@ fn resolve_subqueries(
                 };
                 let Some(rows) = folded else {
                     let scan = scan?;
+                    // the per-row membership compares the VALUES
+                    // ([corr_quantified]) under the ICU side's collation
+                    // ([corr_member_coll]), or refuses
                     let lhs = tok_lhs_raw(&lhs_tok)?;
                     out.pop();
                     if negated {
                         out.pop();
                     }
                     let id = corr_register(
-                        sql, scan, CorrKindRaw::Quant { lhs, op: *op, all, negated }, &scope, db_opt,
+                        sql, scan, CorrKindRaw::Quant { lhs, op: *op, all, negated, coll: None }, &scope, db_opt,
                         prm_base(toks, i, param_base, prm_used),
                     )?;
+                    let coll = corr_member_coll(corr_text_ttype(id, sql, db_opt), lhs_col_desc(&lhs_tok, outer_cols, outer_descs))?;
+                    corr_set_coll(id, coll);
                     prm_used += corr_param_count(id);
                     push_corr_bool(&mut out, id);
                     i += 3;
                     continue;
                 };
+                let fc = subq_fold_coll(Some(&lhs_tok), subq_icu_ttype(sql, db_opt), outer_cols, outer_descs)?;
                 let Tok::Ident(lhs) = lhs_tok else { return None };
                 let has_null = rows.values.iter().any(|v| matches!(v, Value::Null));
                 let vals: Vec<Value> = rows
@@ -98911,13 +101377,13 @@ fn resolve_subqueries(
                     // = ANY IS `IN`, marking and all
                     out.push(Tok::Ident(lhs));
                     out.push(Tok::In);
-                    out.extend(list_tokens(&vals, conjunctive_position(toks, i))?);
+                    out.extend(list_tokens(&vals, conjunctive_position(toks, i), &fc)?);
                 } else if all && matches!(op, Cmp::Ne) && !negated {
                     // <> ALL IS `NOT IN` - never hashed, so never marked
                     out.push(Tok::Not);
                     out.push(Tok::Ident(lhs));
                     out.push(Tok::In);
-                    out.extend(list_tokens(&vals, false)?);
+                    out.extend(list_tokens(&vals, false, &fc)?);
                 } else {
                     // the general form: AND of comparisons for ALL, OR
                     // for ANY, each one the LHS against a value
@@ -98931,7 +101397,7 @@ fn resolve_subqueries(
                         }
                         out.push(Tok::Ident(lhs.clone()));
                         out.push(Tok::Cmp(*op));
-                        out.push(value_to_tok(v, false)?);
+                        out.push(fold_value_tok(v, false, &fc)?);
                     }
                     out.push(Tok::RParen);
                 }
@@ -98965,11 +101431,16 @@ fn resolve_subqueries(
                     if negated {
                         out.pop();
                     }
-                    let lhs = tok_lhs_raw(&out.pop()?)?;
+                    let lhs_tok = out.pop()?;
+                    // compared by VALUE per row, under an ICU side's
+                    // collation, as the quantified form is
+                    let lhs = tok_lhs_raw(&lhs_tok)?;
                     let id = corr_register(
-                        sql, scan, CorrKindRaw::In { lhs, negated }, &scope, db_opt,
+                        sql, scan, CorrKindRaw::In { lhs, negated, coll: None }, &scope, db_opt,
                         prm_base(toks, i, param_base, prm_used),
                     )?;
+                    let coll = corr_member_coll(corr_text_ttype(id, sql, db_opt), lhs_col_desc(&lhs_tok, outer_cols, outer_descs))?;
+                    corr_set_coll(id, coll);
                     prm_used += corr_param_count(id);
                     push_corr_bool(&mut out, id);
                     i += 2;
@@ -98990,12 +101461,18 @@ fn resolve_subqueries(
                     }
                     out.push(Tok::Const(negated));
                 } else {
+                    // the LHS column, behind a NOT when there is one
+                    let lhs = match out.last() {
+                        Some(Tok::Not) => out.get(out.len().wrapping_sub(2)),
+                        l => l,
+                    };
+                    let fc = subq_fold_coll(lhs, subq_icu_ttype(sql, db_opt), outer_cols, outer_descs)?;
                     out.push(Tok::In);
                     // a NOT still standing in front of the column makes
                     // this an anti-join, which the engine does not hash
                     let negated = toks.get(i.wrapping_sub(1)).is_some_and(|t| matches!(t, Tok::Not));
                     out.extend(
-                        list_tokens(&rows.values, keys && !negated && conjunctive_position(toks, i))?,
+                        list_tokens(&rows.values, keys && !negated && conjunctive_position(toks, i), &fc)?,
                     );
                 }
                 i += 2;
@@ -99029,16 +101506,60 @@ fn resolve_subqueries(
                         prm_base(toks, i, param_base, prm_used),
                     )?;
                     prm_used += corr_param_count(id);
+                    // a plain column against an ICU value compares under
+                    // the value's collation: written on the COLUMN, where
+                    // the explicit-collation compare reads it (`S COLLATE
+                    // UNICODE_CI = (SELECT ...)` is the engine's answer to
+                    // `S = (SELECT ci ...)`, measured 2 | 3 per row)
+                    let icu = corr_icu_ttype(id, sql, db_opt);
+                    if let Some(FoldColl::Wrap(tt)) = subq_fold_coll(out.last(), icu, outer_cols, outer_descs) {
+                        if let (Some(Tok::Ident(name)), Some(coll)) = (out.last().cloned(), icu_coll_name(tt)) {
+                            out.pop();
+                            out.push(Tok::FnExpr(RawExpr::Collate(Box::new(RawExpr::Col(name)), coll.to_string())));
+                        }
+                    }
                     out.push(Tok::Cmp(*op));
-                    out.push(Tok::FnExpr(RawExpr::Subq(id)));
+                    out.push(Tok::FnExpr(corr_subq_raw(id, sql, db_opt)));
                     i += 2;
                     continue;
+                };
+                let fc = match &rows.values[0] {
+                    Value::Text(_) => subq_fold_coll(out.last(), subq_icu_ttype(sql, db_opt), outer_cols, outer_descs)?,
+                    _ => FoldColl::Plain,
                 };
                 out.push(Tok::Cmp(*op));
                 // a SCALAR subquery is a singleton stream, never a hash
                 // key: `A = (SELECT T FROM J2)` answers where the same
                 // value through `A IN (SELECT T FROM J2)` raises (probed)
-                let lit = value_to_tok(&rows.values[0], false)?;
+                // an answer carrying the inner column's ICU collation is
+                // spelled typed in its own set already ([fold_value_tok])
+                let wrapped = matches!(fc, FoldColl::Wrap(_));
+                let lit = fold_value_tok(&rows.values[0], false, &fc)?;
+                // A NON-ASCII TEXT answer folds as its column's bytes AND
+                // set ([subq_text_literal]), as the select-list fold does:
+                // a plain literal is of the ATTACHMENT's set, and under -ch
+                // NONE a UTF8 'é' spelled as one became the octet E9 -
+                // `UPPER(U COLLATE UNICODE_CI) = (SELECT U FROM TC WHERE ID
+                // = 1)` raised 22000 *Malformed string* and `UPPER(U) =
+                // (SELECT U ... ID = 2)` counted 0 where the engine counts
+                // 2 for both (measured), and under -ch UTF8 a NONE
+                // column's C3 A9 was read as the two letters 'Ã©' (`=
+                // (SELECT N ...)` 0 for 2). An ASCII answer means the same
+                // in every set and keeps the plain literal, and so does an
+                // answer already in the ATTACHMENT's set - the plain literal
+                // IS its octets and its set there, and adopts a collated
+                // column's as the engine does (`UC = (SELECT N ...)` under
+                // -ch NONE counts 2; `U COLLATE UNICODE_CI = (SELECT O
+                // ...)` stays OCTETS and counts 1 - both measured).
+                let att = CURRENT_ATT_CS.with(|c| c.get());
+                let lit = match &rows.values[0] {
+                    Value::Text(t) if !wrapped && !t.is_ascii() => subq_text_literal_cs(&rows.values[0], sql, db_opt)
+                        .filter(|(_, cs)| *cs != att)
+                        .and_then(|(l, _)| parse_raw_expr_any(&l))
+                        .map(Tok::FnExpr)
+                        .unwrap_or(lit),
+                    _ => lit,
+                };
                 // a `?` elsewhere in the statement may take ITS slot from
                 // this fold: the literal then carries the inner column's
                 // own exact type ([corr_fold_typed_tok])
@@ -99059,7 +101580,7 @@ fn resolve_subqueries(
                     prm_base(toks, i, param_base, prm_used),
                 )?;
                 prm_used += corr_param_count(id);
-                out.push(Tok::FnExpr(RawExpr::Subq(id)));
+                out.push(Tok::FnExpr(corr_subq_raw(id, sql, db_opt)));
                 i += 1;
             }
             other => {
@@ -99069,6 +101590,215 @@ fn resolve_subqueries(
         }
     }
     Some(out)
+}
+
+/// What a text value FOLDED out of a subquery must compare under once it
+/// is spliced back beside the outer operand as a literal
+/// ([resolve_subqueries]).
+enum FoldColl {
+    /// the literal as it is: the outer operand's own collation (or bytes)
+    /// is the one the engine compares under
+    Plain,
+    /// the literal carries the inner value's ICU collation (this ttype)
+    Wrap(u16),
+}
+
+/// The ttype of the value a subquery answers when it is TEXT under an ICU
+/// collation - a column's, an explicit `COLLATE`'s, or the one an
+/// expression over such a column carries ([expr_key_coll]: `UPPER(ci)`
+/// keeps it) - else None.
+fn subq_icu_ttype(sql: &str, db_opt: &Option<Database>) -> Option<u16> {
+    let icu = |t: u16| fire_crab_ods::coll::icu_strength_of_ttype(t).is_some();
+    subq_text_ttype(sql, db_opt).filter(|&t| icu(t))
+}
+
+/// The ttype of the TEXT value a subquery answers, whatever its
+/// collation ([subq_icu_ttype]), None for a value that is not text or
+/// that this cannot type.
+fn subq_text_ttype(sql: &str, db_opt: &Option<Database>) -> Option<u16> {
+    let plan = plan_query_inner(sql, db_opt, &mut Vec::new())?;
+    if let Plan::Project { formats, cols, .. } = &plan {
+        let descs: Vec<Descriptor> =
+            formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.clone()).unwrap_or_default();
+        let c = cols.first()?;
+        let tt = match &c.expr {
+            None => descs
+                .get(c.field_id)
+                .filter(|d| matches!(col_kind(d), Some(ColKind::Text)))
+                .map(|d| d.sub_type as u16),
+            Some(e) if !expr_is_nontext(e, &descs) => expr_key_coll(e, &descs),
+            Some(_) => None,
+        };
+        return tt;
+    }
+    let (t, sub) = match &plan {
+        Plan::Scalar(_, _, _, ty) => (ty.sql_type & !1, ty.sub_type),
+        p => {
+            let c = output_cols_of(p).into_iter().next()?;
+            let d = desc_of_projcol(&c);
+            (if matches!(col_kind(&d), Some(ColKind::Text)) { 448 } else { 0 }, d.sub_type as i32)
+        }
+    };
+    (matches!(t, 448 | 452) && sub >= 0).then_some(sub as u16)
+}
+
+/// The collation a subquery's folded text values compare under against
+/// the outer operand `lhs`, `inner` being the value's ICU ttype
+/// ([subq_icu_ttype]). Measured on 2182 from a NONE attachment: a plain
+/// UTF8 column against a UNICODE_CI column's values - `S IN (SELECT S
+/// FROM CS ...)`, `S = (SELECT ...)`, `= ANY`, `NOT IN`, `<> ALL`, a
+/// correlated EXISTS - compares under UNICODE_CI (1 | 2 | 3 | 5 of 'abc',
+/// 'ABC', 'Abc', 'b', 'abc '), as the JOIN `cn.s = cs.s` does; spliced
+/// back as bare literals they compared BYTES (1 | 5). None - refuse -
+/// when the outer operand is not a column this can type, is of another
+/// character set, or carries a different ICU collation of its own.
+fn subq_fold_coll(
+    lhs: Option<&Tok>,
+    inner: Option<u16>,
+    outer_cols: &[RelationColumn],
+    outer_descs: &[Descriptor],
+) -> Option<FoldColl> {
+    let icu = |t: u16| fire_crab_ods::coll::icu_strength_of_ttype(t).is_some();
+    let Some(it) = inner.filter(|&t| icu(t)) else { return Some(FoldColl::Plain) };
+    let Some(Tok::Ident(name)) = lhs else { return None };
+    let bare = name.rsplit('.').next().unwrap_or(name);
+    let bare = canon_ident(bare).unwrap_or_else(|| bare.to_string());
+    let rc = outer_cols.iter().find(|c| col_name_is(&c.name, &bare))?;
+    let d = outer_descs.get(rc.field_id as usize)?;
+    if !matches!(col_kind(d), Some(ColKind::Text)) || d.sub_type < 0 {
+        return Some(FoldColl::Plain);
+    }
+    let ot = d.sub_type as u16;
+    if icu(ot) {
+        return (ot == it).then_some(FoldColl::Plain);
+    }
+    (fire_crab_ods::intl::charset_id(ot as i16) == fire_crab_ods::intl::charset_id(it as i16))
+        .then_some(FoldColl::Wrap(it))
+}
+
+/// [subq_icu_ttype] for a REGISTERED per-row subquery: its text names
+/// the outer row, so it is planned with each outer reference standing
+/// as a NULL (the value type of the one output column is all it asks).
+fn corr_icu_ttype(id: usize, sql: &str, db_opt: &Option<Database>) -> Option<u16> {
+    let icu = |t: u16| fire_crab_ods::coll::icu_strength_of_ttype(t).is_some();
+    corr_text_ttype(id, sql, db_opt).filter(|&t| icu(t))
+}
+
+/// [subq_text_ttype] for a REGISTERED per-row subquery, planned as
+/// [corr_icu_ttype] plans it.
+fn corr_text_ttype(id: usize, sql: &str, db_opt: &Option<Database>) -> Option<u16> {
+    subq_text_ttype(sql, db_opt).or_else(|| {
+        let t = corr_template(id)?;
+        if !t.params.is_empty() {
+            return None;
+        }
+        let text = subst_out_markers(&t.text, &|_| Some("NULL".to_string()))?;
+        subq_text_ttype(&text, db_opt)
+    })
+}
+
+/// The descriptor of an outer operand token that names a column, None
+/// for any other operand.
+fn lhs_col_desc(t: &Tok, outer_cols: &[RelationColumn], outer_descs: &[Descriptor]) -> Option<Descriptor> {
+    let Tok::Ident(name) = t else { return None };
+    let bare = name.rsplit('.').next().unwrap_or(name);
+    let bare = canon_ident(bare).unwrap_or_else(|| bare.to_string());
+    outer_cols
+        .iter()
+        .find(|c| col_name_is(&c.name, &bare))
+        .and_then(|c| outer_descs.get(c.field_id as usize))
+        .cloned()
+}
+
+/// The collation a PER-ROW membership (`IN`, `<op> ANY / ALL` over a
+/// correlated set, [corr_quantified]) compares its texts under: `inner`
+/// the set's text ttype ([corr_text_ttype]), `lhs` the outer operand's
+/// descriptor when it is a column. The engine compares under the ICU
+/// side's collation, as the folded set does ([subq_fold_coll]):
+/// measured on 2182, `U8.S = ANY (SELECT S FROM CS WHERE CS.ID = U8.ID)`
+/// answers 1 | 2 | 3 | 4 (each row's spelling against the CI one), `S
+/// IN (SELECT S FROM CS WHERE CS.ID > U8.ID)` 1 | 2 ('abc' against
+/// {ABC, Abc, b}) and, the CI column outside, `CS.S IN (SELECT S FROM
+/// U8 WHERE U8.ID > CS.ID)` 1 | 2 | 3. None - refuse - for an operand
+/// this cannot type beside an ICU set, texts of two character sets, two
+/// different ICU collations, or an ICU column beside a set this cannot
+/// type.
+fn corr_member_coll(inner: Option<u16>, lhs: Option<Descriptor>) -> Option<Option<u16>> {
+    let icu = |t: u16| fire_crab_ods::coll::icu_strength_of_ttype(t).is_some();
+    let cs = |t: u16| fire_crab_ods::intl::charset_id(t as i16);
+    let text = lhs.filter(|d| matches!(col_kind(d), Some(ColKind::Text)) && d.sub_type >= 0);
+    let lt = text.map(|d| d.sub_type as u16);
+    match (lt.filter(|&t| icu(t)), inner.filter(|&t| icu(t))) {
+        (None, None) => Some(None),
+        (Some(o), Some(i)) => (o == i).then_some(Some(o)),
+        (Some(o), None) => inner.filter(|&t| cs(t) == cs(o)).map(|_| Some(o)),
+        (None, Some(i)) => match (lhs, lt) {
+            (None, _) => None,
+            (Some(_), None) => Some(None), // not text: compared as values
+            (Some(_), Some(t)) => (cs(t) == cs(i)).then_some(Some(i)),
+        },
+    }
+}
+
+/// Stamp a registered per-row membership with its collation.
+fn corr_set_coll(id: usize, coll: Option<u16>) {
+    CORR_REG.with(|r| {
+        if let Some(t) = r.borrow_mut().get_mut(id) {
+            if let CorrKindRaw::In { coll: c, .. } | CorrKindRaw::Quant { coll: c, .. } = &mut t.kind {
+                *c = coll;
+            }
+        }
+    });
+}
+
+/// A per-row subquery's value as the expression that carries its ICU
+/// collation ([subq_icu_ttype]) into the comparison around it - the
+/// engine compares a plain column against it under that collation.
+fn corr_subq_raw(id: usize, sql: &str, db_opt: &Option<Database>) -> RawExpr {
+    let e = RawExpr::Subq(id);
+    match corr_icu_ttype(id, sql, db_opt).and_then(icu_coll_name) {
+        Some(name) => RawExpr::Collate(Box::new(e), name.to_string()),
+        None => e,
+    }
+}
+
+/// The name of a UTF8 ICU collation's ttype.
+fn icu_coll_name(tt: u16) -> Option<&'static str> {
+    match tt >> 8 {
+        2 => Some("UNICODE"),
+        3 => Some("UNICODE_CI"),
+        4 => Some("UNICODE_CI_AI"),
+        _ => None,
+    }
+}
+
+/// A folded value as the token that means it under `fc`: a text value
+/// under [FoldColl::Wrap] is `CAST(<v> AS VARCHAR(n) CHARACTER SET <cs>)
+/// COLLATE <name>` - the engine's own spelling of a collated literal from
+/// an attachment whose literals carry no such collation. A value past
+/// ASCII is cast from its UTF-8 OCTETS (`x'..'`): a bare literal is read
+/// in the attachment's set, and under NONE its chars are octets, so 'Ä'
+/// cast to UTF8 was *Malformed string* (22000) where the engine answers
+/// (`S NOT IN (SELECT ci ...)` over 'ÄÖÜäöüßéèê', measured from isql's
+/// default NONE attachment).
+fn fold_value_tok(v: &Value, key: bool, fc: &FoldColl) -> Option<Tok> {
+    match (v, fc) {
+        (Value::Text(t), FoldColl::Wrap(tt)) => {
+            let cs = fire_crab_ods::intl::charset_id(*tt as i16);
+            let name = icu_coll_name(*tt)?;
+            let (src, len) = if t.is_ascii() {
+                (RawExpr::Str(t.clone()), t.len().max(1))
+            } else {
+                (RawExpr::Hex(t.as_bytes().to_vec()), t.len())
+            };
+            let cast = RawExpr::Cast(
+                Box::new(src),
+                CastTarget::Text { len, pad: false, synthetic: false, cs: Some(cs) },
+            );
+            Some(Tok::FnExpr(RawExpr::Collate(Box::new(cast), name.to_string())))
+        }
+        _ => value_to_tok(v, key),
+    }
 }
 
 /// A folded scalar subquery's literal, typed as the INNER COLUMN
@@ -100907,6 +103637,17 @@ fn parse_order_by_expr(
                     k.coll = order_key_ttype(d);
                     k.own_coll = coll_key_ttype(d).unwrap_or(0);
                 }
+            }
+            // an EXPLICIT collation on the key's operand orders it, whatever
+            // the operand's own: `SELECT S COLLATE UNICODE_CI AS K ... ORDER
+            // BY K` (or `ORDER BY 1`) is the UCA order over a plain UTF8 S,
+            // measured on 2182 (a | A | b | B | c), as `ORDER BY S COLLATE
+            // UNICODE_CI` written out is
+            Some(Expr::Collate(_, tt)) if !expr_is_nontext(k.expr.as_ref().unwrap(), descs) => {
+                let tt = *tt;
+                k.coll = order_ttype_of(tt);
+                k.coll_explicit = true;
+                k.own_coll = if fire_crab_ods::coll::icu_strength_of_ttype(tt).is_some() { tt } else { 0 };
             }
             // an EXPRESSION key sorts binary when its RESULT is binary
             Some(e) => {
@@ -103569,6 +106310,10 @@ impl ColKind {
 struct ProcParam {
     name: String,
     desc: Descriptor,
+    /// declared with a collation other than its set's default - kept
+    /// OFF the descriptor, whose describe carries the charset alone;
+    /// read by [body_declares_collated_slot]
+    collated: bool,
     /// an input parameter's LITERAL DEFAULT value (decoded from
     /// RDB$DEFAULT_VALUE), used to fill an omitted trailing argument at a
     /// call; None for a parameter without a literal default
@@ -103999,7 +106744,11 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         }
         let default_cs = defval.as_ref().and_then(|(_, c)| *c);
         let (default, default_ctx) = split_default(defval.map(|(d, _)| d));
-        let p = ProcParam { name: pnm, desc, default, default_ctx, default_cs };
+        let collated = fire_crab_ods::ddl::domain_collation_id(&db.bytes(), db.page_size, &fs).is_some_and(|c| {
+            let cs = fire_crab_ods::ddl::domain_charset_id(&db.bytes(), db.page_size, &fs).unwrap_or(0);
+            !byte_order_coll(cs as u8, c as u8)
+        });
+        let p = ProcParam { name: pnm, desc, collated, default, default_ctx, default_cs };
         if typ == 0 {
             ins.push(p)
         } else {
@@ -110175,6 +112924,155 @@ fn blr_reads_collated_relation(db: &Database, blr: &[u8]) -> bool {
     }
 }
 
+/// Does a body declare a parameter, an output or a local of an EXPLICIT
+/// COLLATION? Neither body runner carries one: a slot is typed by its
+/// set and width ([slot_cast_target]) and the BLR executor compares
+/// values with no descriptor in reach, so every comparison over such a
+/// variable fell back to bytes. Measured on engine 2182 with `DECLARE V
+/// VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE_CI = 'é'` over the TC
+/// fixture: `WHERE U = UPPER(:V)` counts 2, `IF (V = 'É')` is taken,
+/// `WHERE :V = U` counts 2, and a `'ab'` local's `IF (V || 'x' = 'ABx')`
+/// is taken (a concatenation keeps its first operand's collation); this
+/// server answered 1, not taken, 1 and not taken - and 0 for every cell
+/// under a NONE caller. A collated PARAMETER the same (`U = :V` bound
+/// 'ab' 2, answered 1). Refused - both runners - until a slot carries
+/// its collation; the set's own collation (`COLLATE UTF8`) still runs.
+///
+/// A slot is typed by a DOMAIN as well as by a COLLATE clause, and
+/// both are read: `DECLARE V DCI`, `TYPE OF DCI` and `TYPE OF COLUMN
+/// TC.UC` (a UNICODE_CI domain and column) make `IF (V = 'É')` taken
+/// and `WHERE U = :V` count 2 on 2182 for a 'é' local, and a BEFORE
+/// INSERT trigger with such a local stores R = 1 - this server, reading
+/// only the keyword, answered 0 and 1 and stored 0 ([user_triggers]
+/// refuses such a trigger now). A BYTE-ORDER collation is the plain
+/// comparison and runs: the set's own name, and `UCS_BASIC` (UTF8's
+/// collation 1 - `DECLARE V .. COLLATE UCS_BASIC = 'é'` answers 1 for
+/// 'é' and 0 for 'É', and a UCS_BASIC parameter counts 1, as here). The
+/// scan reads the SOURCE with its comments and literals blanked, so a
+/// `/* COLLATE UNICODE_CI */` before BEGIN is not a declaration (1 on
+/// the engine, as here), and every DECLARE is read - a sub-routine's
+/// own locals and parameters included - up to its `;` or its BEGIN.
+fn body_declares_collated_slot(db: Option<&Database>, meta: &ProcMeta) -> bool {
+    meta.ins.iter().chain(meta.outs.iter()).any(|p| p.collated) || source_declares_collated_slot(db, &meta.source)
+}
+
+/// Is a collation id of a character set the BYTE order - the set's own
+/// default (0), or UTF8's `UCS_BASIC` (1)?
+fn byte_order_coll(cs: u8, coll: u8) -> bool {
+    coll == 0 || (cs == fire_crab_ods::intl::CS_UTF8 && coll == 1)
+}
+
+/// The DECLARE half of [body_declares_collated_slot], over a body's
+/// source text (a trigger's too).
+fn source_declares_collated_slot(db: Option<&Database>, source: &str) -> bool {
+    let text = mask_literals(&strip_sql_comments(source).to_ascii_uppercase());
+    let ident = |t: &str| -> String {
+        t.trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+            .collect()
+    };
+    let domains = db.map(collated_domains);
+    let columns = db.map(collated_columns);
+    let mut at = 0;
+    while let Some(d) = find_word(&text, "DECLARE", at) {
+        at = d + "DECLARE".len();
+        let semi = text[at..].find(';').map_or(text.len(), |i| at + i);
+        let end = find_word(&text, "BEGIN", at).map_or(semi, |b| b.min(semi));
+        let seg = &text[at..end];
+        // an explicit COLLATE <name>, not the byte order
+        let mut c = 0;
+        while let Some(p) = find_word(seg, "COLLATE", c) {
+            c = p + "COLLATE".len();
+            let name = ident(&seg[c..]);
+            if name != "UCS_BASIC" && charset_name_id(&name).is_none() {
+                return true;
+            }
+        }
+        // TYPE OF COLUMN <rel>.<col>
+        let mut c = 0;
+        while let Some(p) = find_word(seg, "COLUMN", c) {
+            c = p + "COLUMN".len();
+            let rel = ident(&seg[c..]);
+            let after = seg[c..].trim_start()[rel.len()..].trim_start();
+            let Some(col) = after.strip_prefix('.').map(ident) else { continue };
+            if columns.as_ref().is_some_and(|cs| cs.iter().any(|(r, k)| *r == rel && *k == col)) {
+                return true;
+            }
+        }
+        // a DOMAIN named anywhere in the declaration (`V DCI`, `TYPE OF
+        // DCI`, a sub-routine parameter's type)
+        if let Some(ds) = &domains {
+            if seg
+                .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
+                .any(|w| !w.is_empty() && ds.iter().any(|n| n == w))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The domains whose collation is not their set's byte order, by name -
+/// one catalog walk per generation.
+fn collated_domains(db: &Database) -> std::sync::Arc<Vec<String>> {
+    db.meta_memo("collated-domains", "", || {
+        use fire_crab_ods::format::Value;
+        let Some((cols, descs)) = sys_rel(db, "RDB$FIELDS") else { return Vec::new() };
+        let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+        let (Some(name_f), Some(coll_f), Some(cs_f)) =
+            (fid("RDB$FIELD_NAME"), fid("RDB$COLLATION_ID"), fid("RDB$CHARACTER_SET_ID"))
+        else {
+            return Vec::new();
+        };
+        let Some(rel) = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$FIELDS") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for_each_catalog_record(db, rel, &[(0u8, descs)], usize::MAX, |v| {
+            if let (Some(Value::Text(n)), Some(Value::Int(coll))) = (v.get(name_f), v.get(coll_f)) {
+                let cs = match v.get(cs_f) {
+                    Some(Value::Int(c)) => *c as u8,
+                    _ => 0,
+                };
+                if !byte_order_coll(cs, *coll as u8) {
+                    out.push(n.trim_end().to_ascii_uppercase());
+                }
+            }
+        });
+        out
+    })
+}
+
+/// The (relation, column) pairs whose text carries a collation that is
+/// not the byte order - what a `TYPE OF COLUMN` local takes.
+fn collated_columns(db: &Database) -> std::sync::Arc<Vec<(String, String)>> {
+    db.meta_memo("collated-columns", "", || {
+        let image = db.bytes();
+        let ps = db.page_size;
+        let mut out = Vec::new();
+        for (id, name) in fire_crab_ods::catalog::list_relations(&image, ps) {
+            let formats = fire_crab_ods::format::relation_formats(&image, ps, id);
+            let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else { continue };
+            let rel = name.trim_end().to_ascii_uppercase();
+            for c in relation_columns(&image, ps, name.trim_end()) {
+                let Some(d) = descs.get(c.field_id as usize) else { continue };
+                if matches!(col_kind(d), Some(ColKind::Text))
+                    && d.sub_type >= 0
+                    && !byte_order_coll(
+                        fire_crab_ods::intl::charset_id(d.sub_type),
+                        fire_crab_ods::intl::collation_id(d.sub_type),
+                    )
+                {
+                    out.push((rel.clone(), c.name.trim_end().to_ascii_uppercase()));
+                }
+            }
+        }
+        out
+    })
+}
+
 fn try_procedure_blr(
     database: &Option<Database>,
     name: &str,
@@ -110209,6 +113107,7 @@ fn try_procedure_blr_at(
     // one call: the truncation raise is typed, everything else falls
     // to the source interpreter to refuse in its own words
     let bound_args = match load_procedure(db, name) {
+        Some(meta) if body_declares_collated_slot(Some(db), &meta) => return BlrProcOutcome::Outside,
         Some(meta) => {
             // fill omitted trailing defaults, then REQUIRE an exact arity -
             // bind_proc_args zips and would otherwise silently drop extra
@@ -110352,6 +113251,9 @@ fn try_function_blr_at(database: &Option<Database>, name: &str, args: &[Value], 
     let Some(meta) = load_function(db, name) else {
         return FnBlrOutcome::Outside;
     };
+    if body_declares_collated_slot(Some(db), &meta) {
+        return FnBlrOutcome::Outside;
+    }
     // fill omitted trailing defaults, then require exact arity (as the
     // procedure fast path does) - a mismatch falls to the source path
     let filled = with_proc_defaults(&meta, args, None);
@@ -111343,12 +114245,16 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
         if col_kind(&desc).is_none() && !is_numeric_col(&desc) {
             return None;
         }
+        let collated = fire_crab_ods::ddl::domain_collation_id(&db.bytes(), db.page_size, &fs).is_some_and(|c| {
+            let cs = fire_crab_ods::ddl::domain_charset_id(&db.bytes(), db.page_size, &fs).unwrap_or(0);
+            !byte_order_coll(cs as u8, c as u8)
+        });
         if pos == 0 {
-            outs.push(ProcParam { name: "RETURN".into(), desc, default: None, default_ctx: None, default_cs: None });
+            outs.push(ProcParam { name: "RETURN".into(), desc, collated, default: None, default_ctx: None, default_cs: None });
         } else {
             let default_cs = defval.as_ref().and_then(|(_, c)| *c);
             let (default, default_ctx) = split_default(defval.map(|(d, _)| d));
-            ins.push(ProcParam { name: pname, desc, default, default_ctx, default_cs });
+            ins.push(ProcParam { name: pname, desc, collated, default, default_ctx, default_cs });
         }
     }
     if outs.len() != 1 {
@@ -111902,6 +114808,12 @@ fn run_body_source(
     // the consumer's row limit, when it is known - see [PsqlFrame::stop_after]
     stop_after: Option<BodyCap>,
 ) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
+    if body_declares_collated_slot(database.as_ref(), meta) {
+        return Err(ProcErr::from(format!(
+            "{}: a parameter or variable of an explicit collation is outside this server's PSQL surface",
+            name
+        )));
+    }
     // omitted trailing arguments take their parameters' DEFAULTs
     let given = args.len();
     let args = with_proc_defaults(meta, args, Some(ctx));
@@ -112698,8 +115610,20 @@ fn stat_dec_src(func: AggFn, src: AggSrc, decimal: bool) -> AggSrc {
     }
 }
 
-fn agg_expr_src(e: Expr) -> Option<AggSrc> {
+fn agg_expr_src(e: Expr, descs: &[Descriptor]) -> Option<AggSrc> {
     match e {
+        // the delivery recode [deliver_in_announced_set] wraps round a
+        // real-set argument under a caller of another set: the fold
+        // compares under the collation BEFORE delivery. Read as a plain
+        // expression it dropped the collation under -ch WIN1252 alone:
+        // `MIN(U COLLATE UNICODE_CI)` answered 'AB' for the engine's
+        // 'ab' (and 'E' for 'e' over {e, E}), and `COUNT(DISTINCT U
+        // COLLATE UNICODE_CI)` 7 for 4 (measured)
+        Expr::Cast(inner, CastTarget::Text { synthetic: true, .. }, _)
+            if matches!(&*inner, Expr::Collate(c, _) if matches!(**c, Expr::Col(_))) =>
+        {
+            agg_expr_src(*inner, descs)
+        }
         Expr::Collate(inner, tt) => match *inner {
             Expr::Col(fid) => {
                 if fire_crab_ods::intl::collation_id(tt as i16) == 0 {
@@ -112715,7 +115639,35 @@ fn agg_expr_src(e: Expr) -> Option<AggSrc> {
             }
             _ => None,
         },
-        other => Some(AggSrc::Expr(other)),
+        // AN EXPRESSION CARRYING AN EXPLICIT ICU COLLATION folds under
+        // it, read through the functions that keep it
+        // ([explicit_collate_of]); the outer wrapper is the stamp the
+        // fold keys by ([compute_group]) and is transparent at eval.
+        // Measured on 2182 over {é, É, e, E, ab, AB, ö} and over {z, É,
+        // e, Z, ä, A, b-1, B-1}: `COUNT(DISTINCT UPPER(U COLLATE
+        // UNICODE_CI))` 4, `MIN(UPPER(..))` 'AB', `MAX(UPPER(..))` 'Z'
+        // (the bytes put 'É' last), `MIN(UPPER(U COLLATE UNICODE_CI_AI))`
+        // 'Ä' (equal to 'A', and first), `MIN(LPAD(U COLLATE UNICODE_CI,
+        // 2, 'z'))` 'ab' and `COUNT(DISTINCT LPAD(..))` 4 - the byte fold
+        // answered 'É', 'A', 'AB' and 7. The delivery recode
+        // ([deliver_in_announced_set]) comes off as it does for a bare
+        // column above: the fold compares before delivery.
+        other => {
+            let bare = match &other {
+                Expr::Cast(inner, CastTarget::Text { synthetic: true, .. }, _) => &**inner,
+                e => e,
+            };
+            match explicit_collate_of(bare, descs) {
+                Some(tt)
+                    if fire_crab_ods::intl::collation_id(tt as i16) != 0
+                        && fire_crab_ods::coll::icu_strength_of_ttype(tt).is_some()
+                        && !matches!(bare, Expr::Collate(..)) =>
+                {
+                    Some(AggSrc::Expr(Expr::Collate(Box::new(bare.clone()), tt)))
+                }
+                _ => Some(AggSrc::Expr(other)),
+            }
+        }
     }
 }
 
@@ -112753,9 +115705,24 @@ fn agg_needs_unkeyable_coll(gitems: &[GItem], descs: &[Descriptor]) -> bool {
                 }
                 // keyed by the fold itself
                 AggSrc::CollField(..) => false,
-                // an expression carrying a collation into its result
+                // an expression stamped with its explicit ICU collation
+                // ([agg_expr_src]) - keyed by the fold too
+                AggSrc::Expr(Expr::Collate(inner, tt))
+                    if !matches!(**inner, Expr::Col(_))
+                        && fire_crab_ods::coll::icu_strength_of_ttype(*tt).is_some() =>
+                {
+                    false
+                }
+                // an expression carrying a collation into its result -
+                // a collated column's, or an explicit one read through
+                // the functions that keep it ([explicit_collate_of]):
+                // `MIN(LPAD(U COLLATE UNICODE_CI, 2, 'z'))` is 'ab' and
+                // `COUNT(DISTINCT LPAD(...))` 4 on the engine, and the
+                // plain fold answered 'AB' and 7 (measured)
                 AggSrc::Expr(e) => {
                     expr_reads(e, &|fid| descs.get(fid).is_some_and(collated))
+                        || explicit_collate_of(e, descs)
+                            .is_some_and(|tt| fire_crab_ods::intl::collation_id(tt as i16) != 0)
                 }
                 _ => false,
             }
@@ -112846,6 +115813,7 @@ fn icu_canon_strength(d: &Descriptor) -> Option<(u16, fire_crab_ods::coll::Stren
 /// the string itself, so the plain matcher is already right).
 fn collate_canon_of(
     e: &Expr,
+    descs: &[Descriptor],
 ) -> Option<(Expr, u16, fire_crab_ods::coll::Strength)> {
     match e {
         Expr::Collate(inner, tt) => fire_crab_ods::coll::icu_strength_of_ttype(*tt)
@@ -112853,7 +115821,7 @@ fn collate_canon_of(
         // a collation under a function that keeps it
         // ([explicit_collate_of]); the wrapper inside is transparent
         // at eval, so the whole expression is the operand
-        other => explicit_collate_of(other).and_then(|tt| {
+        other => explicit_collate_of(other, descs).and_then(|tt| {
             fire_crab_ods::coll::icu_strength_of_ttype(tt).map(|st| (other.clone(), tt, st))
         }),
     }
@@ -113015,7 +115983,7 @@ fn collate_operand_ttype(e: Expr, descs: &[Descriptor]) -> Option<(Expr, u16)> {
         Expr::Collate(inner, tt) => ((*inner), tt),
         // a collation under a function that keeps it
         // ([explicit_collate_of]) decides too
-        other => match explicit_collate_of(&other) {
+        other => match explicit_collate_of(&other, descs) {
             Some(tt) => (other, tt),
             None => {
                 let tt = expr_text_ttype(&other, descs).unwrap_or(0);
@@ -113285,6 +116253,22 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
 /// with the column's descriptor (a leaf the DNF cross-product
 /// duplicated fills its one slot twice with the same descriptor).
 fn resolve_predicate(
+    raw: (Vec<Vec<RawTerm>>, Vec<Vec<u32>>),
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    params: &mut Vec<Option<Descriptor>>,
+) -> Option<Predicate> {
+    // a predicate is no assignment: its casts never fold their literals
+    // ([assignment_literal_fold]), and a bare literal cast converts
+    // cvt.cpp's double at run time ([runtime_double_cast]) - `WHERE
+    // CAST(1e37 AS INT128) = 10000000000000000000000000000000000000` is
+    // no row on 2182 (the double's 10000000000000000719354278919532445696),
+    // where the CAST arm's fold answered every row
+    let _depth = ResolveDepth::enter();
+    with_runtime_double_casts(|| resolve_predicate_body(raw, columns, descs, params))
+}
+
+fn resolve_predicate_body(
     raw: (Vec<Vec<RawTerm>>, Vec<Vec<u32>>),
     columns: &[RelationColumn],
     descs: &[Descriptor],
@@ -113608,6 +116592,38 @@ fn resolve_expr_term(
     descs: &[Descriptor],
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
+    // a comparison over a simple CASE whose branches are in different
+    // sets runs per branch ([distribute_cmp]), as a condition term
+    if rt.in_list.is_none() {
+        let lhs = match &rt.lhs {
+            RawLhs::Expr(e) => Some(e.clone()),
+            RawLhs::Col(c) => Some(RawExpr::Col(c.clone())),
+            _ => None,
+        };
+        let rhs = match &rt.kind {
+            RawKind::CmpExpr(op, r) => Some((*op, r.clone())),
+            RawKind::Cmp(op, r) => match r {
+                Rhs::Int(i) => Some((*op, RawExpr::Int(*i))),
+                Rhs::Str(t) => Some((*op, RawExpr::Str(t.clone()))),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let (Some(l), Some((op, r))) = (lhs, rhs) {
+            if let Some(d) = distribute_cmp(&l, op, &r, columns, descs) {
+                return Some(Term::ExprCond(Box::new(resolve_distributed(&d, columns, descs)?)));
+            }
+        }
+    }
+    resolve_expr_term_body(rt, columns, descs, params)
+}
+
+fn resolve_expr_term_body(
+    rt: &RawTerm,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    params: &mut Vec<Option<Descriptor>>,
+) -> Option<Term> {
     // A BARE `?` INSIDE ARITHMETIC OR `||` AS THE TESTED SIDE - `ID * ? = 2`,
     // `? + 1 = ID`, `S || ? = 'abx'`, `SUM(ID) * ? > 3` (over the HAVING
     // view). The engine describes such a `?` as the OTHER side's complete
@@ -113719,7 +116735,7 @@ fn resolve_expr_term(
     // cannot key by default is keyable when the statement says which
     // collation to use (`CI COLLATE UCS_BASIC = 'APPLE'` is the byte
     // comparison, and the engine answers it).
-    let explicit_ok = matches!(explicit_collate_of(&lhs), Some(tt)
+    let explicit_ok = matches!(explicit_collate_of(&lhs, descs), Some(tt)
         if fire_crab_ods::intl::collation_id(tt as i16) == 0
             || fire_crab_ods::coll::icu_strength_of_ttype(tt).is_some()
             || tt == fire_crab_ods::coll::TTYPE_PXW_INTL);
@@ -113789,7 +116805,7 @@ fn resolve_expr_term(
             if raw_has_param(pat) {
                 return None;
             }
-            if collate_canon_of(&lhs).is_some() {
+            if collate_canon_of(&lhs, descs).is_some() {
                 return None;
             }
             let pat = resolve_expr(pat, columns, descs)?;
@@ -114076,17 +117092,41 @@ fn resolve_expr_term(
                 && matches!(lhs.type_of(descs), Some(ExprType::Text))
             {
                 Term::BadExprLike(Box::new(lhs), lenient_like_prefix(p, *escape))
-            } else if let Some((inner, tt, st)) = collate_canon_of(&lhs) {
+            } else if let Some((inner, tt, st)) = collate_canon_of(&lhs, descs) {
                 // `<x> COLLATE <name> LIKE ...` - the WRITTEN collation
                 // decides the match, and a pattern match reads its
                 // CANONICAL form, not its key
                 let esc = canon_escape(*escape, st)?;
-                Term::ExprLike(
-                    Box::new(Expr::CollCanon(Box::new(inner), tt, false)),
-                    fire_crab_ods::coll::icu_canonical(p, st),
-                    esc,
-                    *negated,
-                )
+                // ...and a pattern written under a BYTE-CARRIER attachment
+                // is read in the collation's set, with the column path's
+                // raise ([carrier_expr_like]): under -ch NONE `U COLLATE
+                // UNICODE_CI LIKE 'É'`, `'%É'`, `'%é%'` and `LOWER(U
+                // COLLATE UNICODE_CI) LIKE '%É'` count 2 on the engine and
+                // `LIKE 'é%'` / `'É%'` / `UPPER(...) LIKE 'é%'` raise 22000
+                // (measured), where the octets as chars matched nothing
+                let att = CURRENT_ATT_CS.with(|c| c.get());
+                let cs = fire_crab_ods::intl::charset_id(tt as i16);
+                let read;
+                let p = if fire_crab_ods::intl::byte_carrier(att) && !fire_crab_ods::intl::byte_carrier(cs) {
+                    read = transcode_text(att, cs, p.clone()).unwrap_or_else(|_| p.clone());
+                    &read
+                } else {
+                    p
+                };
+                if fire_crab_ods::intl::byte_carrier(att)
+                    && !fire_crab_ods::intl::byte_carrier(cs)
+                    && !negated
+                    && carrier_like_raises(p, *escape)
+                {
+                    Term::MalformedLike(Box::new(lhs))
+                } else {
+                    Term::ExprLike(
+                        Box::new(Expr::CollCanon(Box::new(inner), tt, false)),
+                        fire_crab_ods::coll::icu_canonical(p, st),
+                        esc,
+                        *negated,
+                    )
+                }
             } else {
                 // a BYTE-CARRIER pattern against a REAL-charset expression
                 // reinterprets into that charset (and may raise) - the
@@ -114179,6 +117219,22 @@ fn resolve_expr_term(
             // does ([converting_expr_pattern]); a DECFLOAT expression has
             // no type here and refuses. A parameter pattern is a later
             // slice.
+            // An explicit collation that canonicalises decides the match
+            // on the engine, which this regex over the bytes cannot: `U
+            // COLLATE UNICODE_CI SIMILAR TO 'É'` counts 2 there (measured
+            // under UTF8 and NONE) and 1 or 0 here - refused. The
+            // tertiary UNICODE's canonical form is the string itself, and
+            // the byte regex answers it (`U COLLATE UNICODE SIMILAR TO
+            // 'a%'`, `'%b'`, `'é'` count 1 on 2182, as here) - but not a
+            // non-ASCII pattern written under a byte-carrier attachment,
+            // whose octets this regex would read as characters (under -ch
+            // NONE `SIMILAR TO 'é'` counts 1 there and 0 here, measured)
+            if collate_canon_of(&lhs, descs).is_some_and(|(_, _, st)| {
+                st != fire_crab_ods::coll::Strength::Tertiary
+                    || (!p.is_ascii() && fire_crab_ods::intl::byte_carrier(CURRENT_ATT_CS.with(|c| c.get())))
+            }) {
+                return None;
+            }
             if !matches!(
                 lhs.type_of(descs),
                 Some(
@@ -114413,7 +117469,7 @@ fn resolve_expr_term(
                 }
                 _ => p.clone(),
             };
-            match collate_canon_of(&lhs) {
+            match collate_canon_of(&lhs, descs) {
                 // the WRITTEN collation decides the prefix test, and it
                 // reads the CANONICAL form of both sides - a prefix
                 // written under a byte-carrier attachment read in the
@@ -114461,7 +117517,7 @@ fn resolve_expr_term(
                 let _ = (a, b); // the mix is reconciled below, not refused
             }
             let pre = carrier_pattern(&lhs, pre, descs);
-            match collate_canon_of(&lhs) {
+            match collate_canon_of(&lhs, descs) {
                 // the written collation reads the CANONICAL form of both
                 // sides; the prefix's half of that moves per row
                 Some((inner, tt, _)) => Term::ExprStartingExpr(
@@ -114572,8 +117628,8 @@ fn resolve_expr_term(
 }
 
 /// The explicit `COLLATE` an operand carries into a comparison, a
-/// match or a sort: the wrapper itself ([Expr::Collate]), or one under
-/// a function that keeps its operand's text type - the engine's
+/// match, a sort or a fold: the wrapper itself ([Expr::Collate]), or one
+/// under a function that keeps its operand's text type - the engine's
 /// result descriptor for these is the argument's, collation included.
 /// Measured on engine 2182 under -ch UTF8 over a UTF8 U holding 'é':
 /// `UPPER('é' COLLATE UNICODE_CI) = U` counts 1, and so do LOWER,
@@ -114581,20 +117637,32 @@ fn resolve_expr_term(
 /// NULLIF and a COALESCE whose FIRST value carries it (`COALESCE(NULL,
 /// 'É' COLLATE UNICODE_CI) = U` 1, `COALESCE('z', 'É' COLLATE
 /// UNICODE_CI) = U` 0); a CAST (`CAST('É' COLLATE UNICODE_CI AS
-/// VARCHAR(5)) = U` 0) and a concatenation (`'x' || UPPER(...) = 'x'
-/// || U` 0) drop it. Only the wrapper was seen before, and every one
-/// of the function cells counted 0 - a silent wrong answer, since
-/// the literal under it resolves.
-fn explicit_collate_of(e: &Expr) -> Option<u16> {
+/// VARCHAR(5)) = U` 0) drops it. Only the wrapper was seen before, and
+/// every one of the function cells counted 0 - a silent wrong answer,
+/// since the literal under it resolves.
+///
+/// A CONCATENATION takes the WHOLE text type of the operand whose
+/// character set wins ([cs_join], `DataTypeUtilBase::getResultTextType`):
+/// the FIRST, unless it is NONE, or ASCII beside a real set, or the
+/// second is OCTETS (which has no collation). Measured on 2182 over the
+/// TC fixture (U plain UTF8, UC UTF8 UNICODE_CI, N NONE): under -ch UTF8
+/// `U COLLATE UNICODE_CI || 'x' = 'Éx'` counts 2, `UPPER('é' COLLATE
+/// UNICODE_CI) || 'x' = U || 'x'` 2, `U COLLATE UNICODE_CI || U COLLATE
+/// UNICODE_CI_AI = 'EE'` 2 (the first's, not the second's 4), `'x' ||
+/// U COLLATE UNICODE_CI = 'xÉ'` 1 (the UTF8 literal wins); under -ch
+/// NONE that last one counts 2, the NONE literal yielding - and `N ||
+/// UC = 'ÉÉ'` counts 2 under both. Reading only the second operand's
+/// (the first pass) answered 1 for the first three.
+fn explicit_collate_of(e: &Expr, descs: &[Descriptor]) -> Option<u16> {
     match e {
         Expr::Collate(_, tt) => Some(*tt),
         // the SYNTHETIC casts the resolver wraps a conditional in (the
         // CHAR pad, [pad_conditional]) are not the user's CAST
-        Expr::Cast(inner, CastTarget::Text { synthetic: true, .. }, _) => explicit_collate_of(inner),
+        Expr::Cast(inner, CastTarget::Text { synthetic: true, .. }, _) => explicit_collate_of(inner, descs),
         Expr::Func(f, args) => match f {
             // TRIM's source is its LAST argument: the written-out (or
             // filled-in) character to trim comes first
-            SysFn::Trim(_) => args.last().and_then(explicit_collate_of),
+            SysFn::Trim(_) => args.last().and_then(|a| explicit_collate_of(a, descs)),
             SysFn::Upper
             | SysFn::Lower
             | SysFn::UpperCs(_)
@@ -114607,21 +117675,109 @@ fn explicit_collate_of(e: &Expr) -> Option<u16> {
             | SysFn::Replace
             | SysFn::Reverse
             | SysFn::Lpad
-            | SysFn::Rpad => args.first().and_then(explicit_collate_of),
+            | SysFn::Rpad => args.first().and_then(|a| explicit_collate_of(a, descs)),
             _ => None,
         },
-        Expr::Coalesce(args) => args
-            .iter()
-            .find(|a| !matches!(synthetic_inner(a), Expr::Null))
-            .and_then(explicit_collate_of),
-        Expr::Iif(_, a, _) | Expr::NullIf(a, _) => explicit_collate_of(a),
-        Expr::Case(arms, els) => arms
-            .first()
-            .map(|(_, x)| x)
-            .or(els.as_deref())
-            .and_then(explicit_collate_of),
+        Expr::Concat(a, b) => {
+            use fire_crab_ods::intl::{CS_ASCII, CS_OCTETS};
+            // each operand's OWN set, under the transcoding cast the
+            // resolver moves it with ([recode_concat]): a NONE COLUMN
+            // first yields as a NONE literal does - `N || U COLLATE
+            // UNICODE_CI = N || 'É'` counts 2 under NONE and UTF8
+            // callers, `LIKE '%B'` 2, and `GROUP BY` it makes 4 groups
+            // (measured; read after the cast, N looked UTF8 and won)
+            let own = |e: &Expr| cmp_text_charset(synthetic_inner(e), descs);
+            match (own(a), own(b)) {
+                (Some(CS_OCTETS), _) | (_, Some(CS_OCTETS)) => None,
+                (Some(0), _) => explicit_collate_of(b, descs),
+                (Some(CS_ASCII), Some(cb)) if cb != 0 => explicit_collate_of(b, descs),
+                _ => explicit_collate_of(a, descs),
+            }
+        }
+        Expr::Coalesce(args) => arms_collate_of(args.iter(), descs),
+        Expr::Iif(_, a, b) => arms_collate_of([&**a, &**b].into_iter(), descs),
+        Expr::NullIf(a, _) => explicit_collate_of(a, descs),
+        Expr::Case(arms, els) => arms_collate_of(arms.iter().map(|(_, x)| x).chain(els.as_deref()), descs),
         _ => None,
     }
+}
+
+/// The explicit collation a CONDITIONAL's result takes from its value
+/// arms (COALESCE's arguments, IIF's two, CASE's THEN arms and ELSE):
+/// the arms fold left to right by the concatenation's law ([cs_join],
+/// `getResultTextType`) - a NONE arm, or an ASCII one beside a real set,
+/// yields to the next, an OCTETS arm has no collation, and a NULL arm
+/// has no type at all. Measured on 2182 over the TC fixture (N a NONE
+/// copy of U): `COALESCE(N, U COLLATE UNICODE_CI) = 'É'` counts 2 under
+/// NONE and UTF8 callers and `GROUP BY` it makes 4 groups; under -ch
+/// NONE `IIF(ID < 0, 'q', U COLLATE UNICODE_CI) = 'É'` and the CASE twin
+/// count 2 (the NONE literal yields); `COALESCE(NULL, 'É' COLLATE
+/// UNICODE_CI) = U` counts 1 and `COALESCE('z', 'É' COLLATE UNICODE_CI)
+/// = U` 0 under UTF8 (the UTF8 literal wins with its default collation).
+/// Reading only the first arm answered 1 and 7 for the first two.
+fn arms_collate_of<'a>(arms: impl Iterator<Item = &'a Expr>, descs: &[Descriptor]) -> Option<u16> {
+    use fire_crab_ods::intl::{CS_ASCII, CS_OCTETS};
+    let mut win: Option<&Expr> = None;
+    for b in arms.filter(|a| !matches!(synthetic_inner(a), Expr::Null)) {
+        let Some(a) = win else {
+            win = Some(b);
+            continue;
+        };
+        // each arm's OWN set, under the cast [recode_conditional] moves a
+        // carrier arm with (as [explicit_collate_of]'s concatenation)
+        let own = |e: &Expr| cmp_text_charset(synthetic_inner(e), descs);
+        match (own(a), own(b)) {
+            (Some(CS_OCTETS), _) | (_, Some(CS_OCTETS)) => return None,
+            (Some(0), _) => win = Some(b),
+            (Some(CS_ASCII), Some(cb)) if cb != 0 => win = Some(b),
+            _ => {}
+        }
+    }
+    explicit_collate_of(win?, descs)
+}
+
+/// REPLACE under a case- or accent-blind ICU collation: the search runs
+/// over each character's CANONICAL form ([fire_crab_ods::coll::icu_canonical]
+/// - the upper-cased and, for CI_AI, mark-stripped spelling, one
+/// character at a time, as the engine's canonical buffer is), and a
+/// match replaces the SOURCE characters it spans. Measured on 2182:
+/// `REPLACE('abcABC' COLLATE UNICODE_CI, 'bC', '-')` is 'a-A-', `'aaa'
+/// .. 'AA'` is '-a' (leftmost, not overlapping), `'straße' .. 'ß'` is
+/// 'stra.e' while `'STRASSE' .. 'ß'` and `'straße' .. 'SS'` replace
+/// nothing (the simple case mapping keeps 'ß' one character), and the
+/// replacement goes in as written.
+fn replace_canonical(s: &str, find: &str, repl: &str, st: fire_crab_ods::coll::Strength) -> String {
+    let target = fire_crab_ods::coll::icu_canonical(find, st);
+    // an empty search leaves the value as it stands (the byte arm's rule)
+    if target.is_empty() {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let canon: Vec<String> = chars
+        .iter()
+        .map(|c| fire_crab_ods::coll::icu_canonical(c.encode_utf8(&mut [0u8; 4]), st))
+        .collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    'scan: while i < chars.len() {
+        let mut acc = String::new();
+        let mut j = i;
+        while j < chars.len() && acc.len() < target.len() {
+            acc.push_str(&canon[j]);
+            j += 1;
+            if !acc.is_empty() && acc == target {
+                out.push_str(repl);
+                i = j;
+                continue 'scan;
+            }
+            if !target.starts_with(acc.as_str()) {
+                break;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// The expression under the resolver's SYNTHETIC text casts (the CHAR
@@ -114967,23 +118123,90 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             // VARCHAR(5) CHARACTER SET UTF8) COLLATE UNICODE_CI` over a
             // NONE N holding C3 A9 counts 1; the byte-space branch
             // compared octets for both and counted 0.
-            let coll_cs = explicit_collate_of(&lhs)
-                .or_else(|| explicit_collate_of(&rhs))
+            // ...AND SO DOES A BARE COLUMN'S OWN collation: under -ch UTF8
+            // `UC = CAST(x'C389' AS VARCHAR(2) CHARACTER SET NONE)` over a
+            // UTF8 UNICODE_CI UC counts 2 (the 'é' and 'É' rows), where the
+            // octet compare took the one spelling (measured)
+            let col_coll = |e: &Expr| match e {
+                Expr::Col(f) => descs
+                    .get(*f)
+                    .filter(|d| matches!(col_kind(d), Some(ColKind::Text)) && d.sub_type >= 0)
+                    .map(|d| d.sub_type as u16)
+                    .filter(|tt| fire_crab_ods::coll::icu_strength_of_ttype(*tt).is_some()),
+                // an expression over such a column carries it into its
+                // result ([expr_key_coll]): `UPPER(UC) = N` counts 7
+                // (measured), the octet compare 3
+                _ if expr_reads_icu(e, descs) => expr_text_ttype(e, descs)
+                    .filter(|tt| fire_crab_ods::coll::icu_strength_of_ttype(*tt).is_some()),
+                _ => None,
+            };
+            let coll_cs = explicit_collate_of(&lhs, descs)
+                .or_else(|| explicit_collate_of(&rhs, descs))
+                .or_else(|| col_coll(&lhs))
+                .or_else(|| col_coll(&rhs))
                 .map(|tt| fire_crab_ods::intl::charset_id(tt as i16))
                 .filter(|cs| !fire_crab_ods::intl::byte_carrier(*cs));
+            // the collation an EXPRESSION over such a column carries into
+            // a comparison with a carrier it lifted - keyed below, where
+            // a bare column's own is ([coll_key_ttype])
+            let expr_coll = match (&lhs, &rhs) {
+                _ if coll_cs.is_none()
+                    || explicit_collate_of(&lhs, descs).is_some()
+                    || explicit_collate_of(&rhs, descs).is_some() =>
+                {
+                    None
+                }
+                // a bare column's own is keyed below ([coll_key_ttype])
+                (Expr::Col(f), _) | (_, Expr::Col(f)) if descs.get(*f).and_then(coll_key_ttype).is_some() => None,
+                _ if !cmp_text_charset(&lhs, descs)
+                    .into_iter()
+                    .chain(cmp_text_charset(&rhs, descs))
+                    .any(fire_crab_ods::intl::byte_carrier) =>
+                {
+                    None
+                }
+                _ => [&lhs, &rhs]
+                    .into_iter()
+                    .filter(|e| !matches!(e, Expr::Col(_)))
+                    .find_map(|e| col_coll(e)),
+            };
             let (lhs, rhs) = match (coll_cs, cmp_text_charset(&lhs, descs), cmp_text_charset(&rhs, descs)) {
                 // ...an OCTETS side stays binary (measured under -ch UTF8:
                 // `O = CAST('É' AS VARCHAR(5) CHARACTER SET UTF8) COLLATE
                 // UNICODE_CI` over an OCTETS C3 A9 counts 0)
+                // ...by the OCTETS of each side: a real-set side is
+                // re-spelled as its OWN bytes ([Expr::CarrierEnc]), as the
+                // byte-space branch below does. Keyed without it, a UTF8
+                // 'é' became the one octet E9 and every non-ASCII row
+                // dropped out: `UPPER(U COLLATE UNICODE_CI) = O` counts
+                // 3 on the engine (rows É, E, AB - `C3 89` is `C3 89`),
+                // `U COLLATE UNICODE_CI = O` 7, `LOWER(...) = O` 4, and
+                // this counted 2, 4 and 2 (measured under UTF8, NONE and
+                // WIN1252 callers)
                 (Some(_), Some(ca), Some(cb))
                     if ca == fire_crab_ods::intl::CS_OCTETS || cb == fire_crab_ods::intl::CS_OCTETS =>
                 {
+                    let own_bytes = |e: Expr, cs: u8| {
+                        if fire_crab_ods::intl::byte_carrier(cs) {
+                            e
+                        } else {
+                            Expr::CarrierEnc(Box::new(e), cs)
+                        }
+                    };
                     return Some((
-                        Expr::OctKey(Box::new(lhs), false),
-                        Expr::OctKey(Box::new(rhs), false),
+                        Expr::OctKey(Box::new(own_bytes(lhs, ca)), false),
+                        Expr::OctKey(Box::new(own_bytes(rhs, cb)), false),
                     ));
                 }
-                (Some(cc), Some(ca), Some(cb)) => {
+                // ...a literal the adoption above already READ in the
+                // collated side's set is in it, and is not moved twice:
+                // lifted again, the NONE 'É' (C3 89, adopted as the one
+                // char É) was decoded as the octet C9 and raised 22000
+                // *Malformed string* under -ch NONE for `U COLLATE
+                // UNICODE_CI = 'É'`, `IN ('É', 'x')`, `BETWEEN`, `<>`,
+                // `>` and `UPPER(U) COLLATE UNICODE_CI = 'é'`, where the
+                // engine counts 2, 2, 2, 5, 1 and 2 (measured)
+                (Some(cc), Some(ca), Some(cb)) if !adopted => {
                     let lift = |e: Expr, cs: u8| {
                         if fire_crab_ods::intl::byte_carrier(cs) {
                             Expr::CarrierDec(Box::new(e), cs, cc)
@@ -115049,7 +118272,7 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             // ...and it is READ THROUGH the functions that keep it
             // ([explicit_collate_of]): `UPPER('é' COLLATE UNICODE_CI) =
             // U` counts the 'é' row, as the engine does.
-            let explicit = explicit_collate_of;
+            let explicit = |e: &Expr| explicit_collate_of(e, descs);
             let unwrap = |e: Expr| match e {
                 Expr::Collate(inner, _) => *inner,
                 other => other,
@@ -115115,6 +118338,17 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
                     Expr::CollKey(Box::new(lhs), tt),
                     Expr::CollKey(Box::new(rhs), tt),
                 )),
+                // an expression over an ICU column beside a CARRIER it
+                // lifted into the column's set compares under the
+                // column's collation: `UPPER(UC) = N` and `TRIM(UC) = N`
+                // count 7 on 2182 under NONE, UTF8 and WIN1252 callers
+                // (N a NONE copy of U), and under -ch NONE `UC || 'x' = N
+                // || 'x'` 7 - where the octet compare answered 3 for the
+                // first
+                _ if expr_coll.is_some() => {
+                    let tt = expr_coll.expect("guarded");
+                    Some((Expr::CollKey(Box::new(lhs), tt), Expr::CollKey(Box::new(rhs), tt)))
+                }
                 // NEITHER side is a bare collated column - but an
                 // EXPRESSION over one carries its collation into the
                 // result, and there is no key to wrap it in. Any
@@ -118970,6 +122204,14 @@ fn after_auth(
                         } else {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
+                    } else if let Some((name, on_type, n)) = match &*plan {
+                        Plan::TxControl { rollback: false, .. } => commit_refusal(&database),
+                        _ => None,
+                    } {
+                        // a COMMIT the deferred dependency check refuses:
+                        // nothing is written and the transaction goes on
+                        last_dml = (0, 0, 0);
+                        respond_drop_refused(&mut s, &mut enc, &name, on_type, n)?;
                     } else if let Plan::TxControl { rollback, retain } = &*plan {
                         // ending the transaction discards every mark
                         if let Some(d) = database.as_mut() { d.savepoints.clear(); }
@@ -119407,7 +122649,7 @@ fn after_auth(
                         outs: out_names
                             .iter()
                             .zip(out_descs.iter())
-                            .map(|(n, d)| ProcParam { name: n.clone(), desc: *d, default: None, default_ctx: None, default_cs: None })
+                            .map(|(n, d)| ProcParam { name: n.clone(), desc: *d, collated: false, default: None, default_ctx: None, default_cs: None })
                             .collect(),
                         source,
                         body_at: Some(body_at),
@@ -120973,6 +124215,16 @@ fn after_auth(
                         // a ROLLBACK cannot be refused - everything the
                         // body did goes back with the transaction anyway
                         Err(_) => {}
+                    }
+                }
+                // ...and so does the deferred work's dependency check
+                // (tra.cpp: the commit triggers, then DFW_perform_work):
+                // a dropped exception or sequence still in use refuses
+                // the commit and the transaction stays open
+                if !rollback {
+                    if let Some((name, on_type, n)) = commit_refusal(&database) {
+                        respond_drop_refused(&mut s, &mut enc, &name, on_type, n)?;
+                        continue;
                     }
                 }
                 if let Some(d) = database.as_mut() { d.prepared = false; }
@@ -126832,6 +130084,26 @@ mod tests {
         assert_eq!(ctes[0].1.cols, vec!["X", "Y"]);
         // and an ordinary statement is not a WITH
         assert!(parse_with("SELECT ID FROM EMP").is_none());
+    }
+
+    #[test]
+    fn parse_with_closes_a_multibyte_body_where_it_ends() {
+        // byte offsets throughout: the body ends at its own paren, not
+        // one character later (it was `(SELECT 'ă' X FROM T))`)
+        let (ctes, main, _) =
+            parse_with("WITH C AS (SELECT 'ă' X FROM T), D AS (SELECT 'î' Y FROM T) SELECT Y FROM D").unwrap();
+        assert_eq!(ctes[0].1.source, "SELECT 'ă' X FROM T");
+        assert_eq!(ctes[1].1.source, "SELECT 'î' Y FROM T");
+        assert_eq!(main, "SELECT Y FROM D");
+    }
+
+    #[test]
+    fn from_names_reads_the_comma_items_of_a_from_clause() {
+        assert_eq!(from_names("SELECT * FROM A, B"), vec!["A", "B"]);
+        assert_eq!(from_names("SELECT * FROM T1 T, A, (SELECT 1 FROM R) D, B WHERE X IN (1, 2)"), vec!["T1", "A", "B", "R"]);
+        assert_eq!(from_names("SELECT * FROM T1 JOIN T2 ON T2.K = T1.K, A ORDER BY 1, 2"), vec!["T1", "A", "T2"]);
+        // a qualified item is the table, a function's FROM has no list
+        assert_eq!(from_names("SELECT SUBSTRING(V FROM 1 FOR 2), X FROM T, PUBLIC.A"), vec!["T"]);
     }
 
     #[test]
@@ -141331,24 +144603,25 @@ mod tests {
     #[test]
     fn sort_record_image_and_the_window_lints() {
         // the record as the engine lays it out and compares it (measured
-        // on 2182, [sort_record_image]): a VARCHAR's length shares word 0
+        // on 2182, [SortRecImage]): a VARCHAR's length shares word 0
         // with the NULL flags, so a NULL (length 0) leads 'a' and 'b',
         // and 'ab' (length 2) trails them
         let vc = Descriptor { dtype: dtype::VARYING, scale: 0, length: 12, sub_type: 0, flags: 0, offset: 0 };
-        let img = |v: Value| sort_record_image(&[&v], &[vc]).unwrap();
+        let img = |v: Value| SortRecImage::new(&[Some(vc)]).image(&[&v]);
+        let lt = |a: &[u8], b: &[u8]| SortRecImage::cmp(a, b) == std::cmp::Ordering::Less;
         let (n, a, b, ab) = (img(Value::Null), img(Value::Text("a".into())), img(Value::Text("b".into())), img(Value::Text("ab".into())));
-        assert!(n < a && a < b && b < ab);
+        assert!(lt(&n, &a) && lt(&a, &b) && lt(&b, &ab));
         // a third field pushes the length out of word 0: the NULL trails
-        let slot = SORT_REC_NULL_SLOT;
-        let img3 = |v: Value| sort_record_image(&[&v, &Value::Null, &Value::Null], &[vc, slot, slot]).unwrap();
-        assert!(img3(Value::Text("ab".into())) < img3(Value::Null));
+        let slot = Some(SORT_REC_NULL_SLOT);
+        let img3 = |v: Value| SortRecImage::new(&[Some(vc), slot, slot]).image(&[&v, &Value::Null, &Value::Null]);
+        assert!(lt(&img3(Value::Text("ab".into())), &img3(Value::Null)));
         // a BIGINT by its low word first, unsigned: 3, 5, -7, -1
         let bi = Descriptor { dtype: dtype::INT64, scale: 0, length: 8, sub_type: 0, flags: 0, offset: 0 };
-        let w: Vec<Vec<u32>> =
-            [3i64, 5, -7, -1].iter().map(|x| sort_record_image(&[&Value::Int(*x)], &[bi]).unwrap()).collect();
-        assert!(w.windows(2).all(|p| p[0] < p[1]));
-        // a value the image cannot spell keeps the caller's compare
-        assert!(sort_record_image(&[&Value::Text("x".into())], &[bi]).is_none());
+        let w: Vec<Vec<u8>> =
+            [3i64, 5, -7, -1].iter().map(|x| SortRecImage::new(&[Some(bi)]).image(&[&Value::Int(*x)])).collect();
+        assert!(w.windows(2).all(|p| lt(&p[0], &p[1])));
+        // a value the descriptor cannot hold is not spelt
+        assert!(sort_rec_put(&mut [0u8; 8], &Value::Text("x".into()), &bi).is_none());
         // a duplicate named window, and an offset past INTEGER
         let dup = "select id, sum(val) over win from w window win as (order by id), win as (order by val)";
         assert!(matches!(window_frame_lint(dup), Some(EvalErr::WindowDuplicate(n)) if n == "WIN"));
