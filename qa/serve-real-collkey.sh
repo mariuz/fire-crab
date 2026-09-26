@@ -48,6 +48,41 @@
 # and the engine's -104 for a select-list column that is not the `GROUP
 # BY <col> COLLATE` key, which this server answers with its bare 42000.
 #
+# SECTIONS 9-12 (the review of the first pass, measured 2026-09-26):
+#   * THE WINDOW RECORD. Every distinct OVER clause is one sort, run in
+#     the order the clauses first appear; a tie among equal keys falls to
+#     the sort record - the values of the clauses sorted before this one
+#     (latest first), then the select list's BARE FIELDS in written order
+#     (an expression's fields as it reads them; a window's own argument
+#     and keys are posted nowhere), then the base record's referenced
+#     fields in field order (the WHERE's among them), then the previous
+#     sort's position. `SELECT Y, X, ROW_NUMBER() OVER (ORDER BY G)`
+#     numbers a tie by Y, `SELECT X, Y, ...` by X, a second clause's ties
+#     by the first clause's values. The rows come back in the LAST
+#     clause's order when nothing sorts above. (The first pass sorted
+#     every window by the referenced fields in field order, the WHERE's
+#     included - a regression from the fc/integ binary's scan order on
+#     every ranking and navigation window; a running SUM was wrong on
+#     both.)
+#   * A KEY THAT IS NOT TEXT (`CHAR_LENGTH(ci)`, `ci = 'abc'`, `ci IS
+#     NULL`) carries no collation and groups or partitions as a plain
+#     value - the first pass refused it. A key over POSITION or REPLACE
+#     of an ICU column refuses: this server's POSITION and REPLACE match
+#     bytes where the engine matches under the collation (pre-existing,
+#     outside this gate - `refused` cells).
+#   * `s COLLATE UNICODE_CI = 'abc'` over a PLAIN UTF8 column from a
+#     NONE attachment (isql's default, and this gate's: `SET NAMES`
+#     inside a script does not change a running attachment) compared
+#     BYTES on both binaries; every grouping shape over it then answered
+#     the byte-filtered rows once the statement-wide refusal was gone.
+#   * THE DISTINCT FOLD'S KEY (`COUNT(DISTINCT)`, `LIST(DISTINCT)`): a
+#     UTF8 VARCHAR under its default collation keys its exact bytes
+#     ('abc' and 'abc ' are two values), NONE / WIN1252 / UNICODE merge
+#     them and keep the byte-greatest spelling. A DISTINCT over an
+#     EXPRESSION reading a CI column dedups by the collation: one spelling
+#     answers (`UPPER(ci)`), a merge of several refuses (`ci || 'x'`) -
+#     the survivor is not the projection's to name.
+#
 # Usage: qa/serve-real-collkey.sh [port]   (default 5770)
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
@@ -123,6 +158,32 @@ CREATE TABLE J1 (ID INTEGER, S VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE_CI
 INSERT INTO J1 VALUES (1,'x',10); INSERT INTO J1 VALUES (2,'X',20); INSERT INTO J1 VALUES (3,'y',30);
 CREATE TABLE J2 (S VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE_CI, W INTEGER);
 INSERT INTO J2 VALUES ('X',1); INSERT INTO J2 VALUES ('Y',2); INSERT INTO J2 VALUES ('x',3);
+CREATE TABLE TQ (G INTEGER, X INTEGER, Y INTEGER);
+INSERT INTO TQ VALUES (1,3,1); INSERT INTO TQ VALUES (1,2,2); INSERT INTO TQ VALUES (1,1,3); INSERT INTO TQ VALUES (2,5,4); INSERT INTO TQ VALUES (2,4,5);
+CREATE TABLE TQ2 (G INTEGER, X INTEGER, S VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE_CI);
+INSERT INTO TQ2 VALUES (1,1,'abc'); INSERT INTO TQ2 VALUES (1,2,'Abc'); INSERT INTO TQ2 VALUES (1,3,'ABC');
+CREATE TABLE TQ3 (G INTEGER, Y INTEGER, Z INTEGER, W VARCHAR(5));
+INSERT INTO TQ3 VALUES (1,1,3,'a'); INSERT INTO TQ3 VALUES (1,1,2,'b'); INSERT INTO TQ3 VALUES (1,1,1,'c'); INSERT INTO TQ3 VALUES (1,2,5,'d'); INSERT INTO TQ3 VALUES (2,1,9,'e');
+CREATE TABLE TQ4 (G INTEGER, Y INTEGER, H INTEGER);
+INSERT INTO TQ4 VALUES (1,2,1); INSERT INTO TQ4 VALUES (1,1,1); INSERT INTO TQ4 VALUES (2,3,0); INSERT INTO TQ4 VALUES (2,4,0);
+CREATE TABLE TQ5 (G INTEGER, Y INTEGER, H INTEGER);
+INSERT INTO TQ5 VALUES (1,2,1); INSERT INTO TQ5 VALUES (2,1,1); INSERT INTO TQ5 VALUES (1,4,2); INSERT INTO TQ5 VALUES (2,3,2);
+CREATE TABLE TQ6 (G INTEGER, A INTEGER, Z INTEGER, Y INTEGER);
+INSERT INTO TQ6 VALUES (1,3,1,1); INSERT INTO TQ6 VALUES (1,2,2,1); INSERT INTO TQ6 VALUES (1,1,3,1);
+CREATE TABLE U8 (ID INTEGER, S VARCHAR(10) CHARACTER SET UTF8);
+INSERT INTO U8 VALUES (1,'abc'); INSERT INTO U8 VALUES (2,'ABC'); INSERT INTO U8 VALUES (3,'Abc'); INSERT INTO U8 VALUES (4,'b'); INSERT INTO U8 VALUES (5,'abc ');
+CREATE TABLE DP (ID INTEGER, P VARCHAR(10) CHARACTER SET UTF8);
+INSERT INTO DP VALUES (1,'abc '); INSERT INTO DP VALUES (2,'abc'); INSERT INTO DP VALUES (3,'xyz');
+CREATE TABLE DN (ID INTEGER, P VARCHAR(10) CHARACTER SET NONE);
+INSERT INTO DN VALUES (1,'abc '); INSERT INTO DN VALUES (2,'abc'); INSERT INTO DN VALUES (3,'xyz');
+CREATE TABLE DW (ID INTEGER, P VARCHAR(10) CHARACTER SET WIN1252);
+INSERT INTO DW VALUES (1,'abc '); INSERT INTO DW VALUES (2,'abc'); INSERT INTO DW VALUES (3,'xyz');
+CREATE TABLE DU (ID INTEGER, P VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE);
+INSERT INTO DU VALUES (1,'abc '); INSERT INTO DU VALUES (2,'abc'); INSERT INTO DU VALUES (3,'xyz');
+CREATE TABLE DC (ID INTEGER, P CHAR(5) CHARACTER SET UTF8);
+INSERT INTO DC VALUES (1,'abc'); INSERT INTO DC VALUES (2,'abc '); INSERT INTO DC VALUES (3,'xyz');
+CREATE TABLE D3 (ID INTEGER, P VARCHAR(10) CHARACTER SET UTF8);
+INSERT INTO D3 VALUES (1,'abc'); INSERT INTO D3 VALUES (2,'abc '); INSERT INTO D3 VALUES (3,'abc  ');
 COMMIT;
 SQL
 } | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/collkey-build.log 2>&1
@@ -145,6 +206,11 @@ ran=0
 # shown by isql as its content lines, which is what a cell compares
 sess() { printf 'SET NAMES UTF8;\n%s\n' "$2" | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
     | grep -av '^ *$' | grep -av '^=' | grep -av '^After line' | grep -av '^LIST: *$' | sed 's/^ *//;s/ *$//;s/  */ /g;s/0:[0-9a-f]*/0:B/g' | paste -sd'|'; }
+# the same session from a UTF8 ATTACHMENT (`-ch UTF8`): `SET NAMES` inside
+# a script does not change a running attachment, so every other cell here
+# runs from isql's default NONE attachment
+sess8() { printf '%s\n' "$2" | timeout 25 "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
+    | grep -av '^ *$' | grep -av '^=' | grep -av '^After line' | grep -av '^LIST: *$' | sed 's/^ *//;s/ *$//;s/  */ /g;s/0:[0-9a-f]*/0:B/g' | paste -sd'|'; }
 # engine and this server print the same thing - value or error
 same() { # <label> <script>
     ran=$((ran + 1))
@@ -160,6 +226,16 @@ pin() { # <label> <script> <engine-output>
     ran=$((ran + 1))
     local ev fv
     ev=$(sess "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2")
+    if [ "$ev" != "$3" ]; then echo "FAIL $1 - THE ENGINE ANSWERS [$ev], not the pinned [$3]"; fail=1
+    elif [ "$ev" != "$fv" ]; then
+        echo "FAIL $1"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
+    else echo "OK   $1 [$ev]"; fi
+}
+# [pin] from a UTF8 attachment
+pin8() { # <label> <script> <engine-output>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(sess8 "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess8 "127.0.0.1/$PORT:$FC" "$2")
     if [ "$ev" != "$3" ]; then echo "FAIL $1 - THE ENGINE ANSWERS [$ev], not the pinned [$3]"; fail=1
     elif [ "$ev" != "$fv" ]; then
         echo "FAIL $1"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
@@ -339,11 +415,92 @@ refused "8 DISTINCT ci with a WHERE on another column (the record orders ID firs
 refused "8 DISTINCT ci, id ORDER BY ci (the ORDER BY folded into the unique sort)" "SELECT DISTINCT S, ID FROM C2 WHERE ID IN (1, 2, 3) ORDER BY S;"
 botherr "8 the select-list column is not the GROUP BY <col> COLLATE key" "SELECT S FROM N1 GROUP BY S COLLATE UNICODE_CI;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)"
 
+echo "--- 9. THE WINDOW RECORD: a tie among equal keys falls to the select list's bare fields in written order, then the base record's, then the earlier clause's values"
+pin  "9 ROW_NUMBER: ties by the select list's Y" "SELECT Y, X, ROW_NUMBER() OVER (ORDER BY G) FROM TQ ORDER BY Y;" "Y X ROW_NUMBER|1 3 1|2 2 2|3 1 3|4 5 4|5 4 5"
+pin  "9 LAG / LEAD" "SELECT Y, X, LAG(Y) OVER (ORDER BY G), LEAD(Y) OVER (ORDER BY G) FROM TQ ORDER BY Y;" "Y X LAG LEAD|1 3 <null> 2|2 2 1 3|3 1 2 4|4 5 3 5|5 4 4 <null>"
+pin  "9 FIRST_VALUE / NTH_VALUE" "SELECT Y, X, FIRST_VALUE(Y) OVER (ORDER BY G), NTH_VALUE(Y, 2) OVER (ORDER BY G) FROM TQ ORDER BY Y;" "Y X FIRST_VALUE NTH_VALUE|1 3 1 2|2 2 1 2|3 1 1 2|4 5 1 2|5 4 1 2"
+pin  "9 ROW_NUMBER OVER (PARTITION BY G)" "SELECT Y, X, ROW_NUMBER() OVER (PARTITION BY G) FROM TQ ORDER BY Y;" "Y X ROW_NUMBER|1 3 1|2 2 2|3 1 3|4 5 1|5 4 2"
+pin  "9 the WHERE's column takes no part while Y decides" "SELECT Y, ROW_NUMBER() OVER (ORDER BY G) FROM TQ WHERE X > 0 ORDER BY Y;" "Y ROW_NUMBER|1 1|2 2|3 3|4 4|5 5"
+pin  "9 the argument is posted nowhere: Y leads X" "SELECT FIRST_VALUE(X) OVER (ORDER BY G), Y FROM TQ ORDER BY Y;" "FIRST_VALUE Y|3 1|3 2|3 3|3 4|3 5"
+pin  "9 SELECT X, Y: ties by X" "SELECT X, Y, ROW_NUMBER() OVER (ORDER BY G) FROM TQ ORDER BY Y;" "X Y ROW_NUMBER|3 1 3|2 2 2|1 3 1|5 4 5|4 5 4"
+pin  "9 an expression posts its field: X + 0" "SELECT X + 0 AS XX, Y, ROW_NUMBER() OVER (ORDER BY G) FROM TQ ORDER BY Y;" "XX Y ROW_NUMBER|3 1 3|2 2 2|1 3 1|5 4 5|4 5 4"
+pin  "9 a running SUM folds in that order" "SELECT Y, X, SUM(X) OVER (ORDER BY G ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM TQ ORDER BY Y;" "Y X SUM|1 3 3|2 2 5|3 1 6|4 5 11|5 4 15"
+pin  "9 the running default frame" "SELECT Y, X, SUM(X) OVER (ORDER BY G) FROM TQ ORDER BY Y;" "Y X SUM|1 3 6|2 2 6|3 1 6|4 5 15|5 4 15"
+pin  "9 a projected CI column ties by its bytes" "SELECT S, X, ROW_NUMBER() OVER (ORDER BY G) FROM TQ2 ORDER BY S;" "S X ROW_NUMBER|abc 1 3|Abc 2 2|ABC 3 1"
+pin  "9 no bare item: the base record's Y" "SELECT FIRST_VALUE(Y) OVER (ORDER BY G) FROM TQ;" "FIRST_VALUE|1|1|1|1|1"
+pin  "9 no bare item: the WHERE's X leads Y" "SELECT FIRST_VALUE(Y) OVER (ORDER BY G) FROM TQ WHERE X > 0;" "FIRST_VALUE|3|3|3|3|3"
+pin  "9 no bare item: a WHERE on Y itself" "SELECT FIRST_VALUE(Y) OVER (ORDER BY G) FROM TQ WHERE Y > 0;" "FIRST_VALUE|1|1|1|1|1"
+pin  "9 the projected key ties, then the base record's X" "SELECT G, FIRST_VALUE(Y) OVER (ORDER BY G) FROM TQ WHERE X > 0;" "G FIRST_VALUE|1 3|1 3|1 3|2 3|2 3"
+pin  "9 ...without the WHERE, Y" "SELECT G, FIRST_VALUE(Y) OVER (ORDER BY G) FROM TQ;" "G FIRST_VALUE|1 1|1 1|1 1|2 1|2 1"
+pin  "9 the outer ORDER BY's column is posted after the select list" "SELECT Y, ROW_NUMBER() OVER (ORDER BY G) AS RN FROM TQ6 WHERE A > 0 ORDER BY Z, RN;" "Y RN|1 1|1 2|1 3"
+pin  "9 ...and a WHERE column with a lower id follows it" "SELECT Y, ROW_NUMBER() OVER (ORDER BY G) AS RN FROM TQ6 ORDER BY Z, RN;" "Y RN|1 1|1 2|1 3"
+pin  "9 TQ3: ties by Y then the ORDER BY's Z" "SELECT Y, ROW_NUMBER() OVER (ORDER BY G) AS RN FROM TQ3 ORDER BY Z, RN;" "Y RN|1 1|1 2|1 3|2 4|1 5"
+pin  "9 an expression over X, FIRST_VALUE(Y)" "SELECT X + 0 AS XX, FIRST_VALUE(Y) OVER (ORDER BY G) FROM TQ;" "XX FIRST_VALUE|1 3|2 3|3 3|4 3|5 3"
+pin  "9 an expression over Y, FIRST_VALUE(X)" "SELECT Y + 0 AS YY, FIRST_VALUE(X) OVER (ORDER BY G) FROM TQ;" "YY FIRST_VALUE|1 3|2 3|3 3|4 3|5 3"
+pin  "9 OVER () beside the bare fields" "SELECT Y, ROW_NUMBER() OVER (ORDER BY G), COUNT(*) OVER () FROM TQ4 ORDER BY Y;" "Y ROW_NUMBER COUNT|1 1 4|2 2 4|3 3 4|4 4 4"
+pin  "9 OVER () first" "SELECT COUNT(*) OVER (), Y, ROW_NUMBER() OVER (ORDER BY G) FROM TQ4 ORDER BY Y;" "COUNT Y ROW_NUMBER|4 1 1|4 2 2|4 3 3|4 4 4"
+pin  "9 a second clause's ties fall to the first clause's values" "SELECT Y, ROW_NUMBER() OVER (ORDER BY G) AS R1, ROW_NUMBER() OVER (ORDER BY H) AS R2 FROM TQ5 ORDER BY Y;" "Y R1 R2|1 3 2|2 1 1|3 4 4|4 2 3"
+pin  "9 ...the clauses swapped in the select list" "SELECT Y, ROW_NUMBER() OVER (ORDER BY H) AS R2, ROW_NUMBER() OVER (ORDER BY G) AS R1 FROM TQ5 ORDER BY Y;" "Y R2 R1|1 1 3|2 2 1|3 3 4|4 4 2"
+pin  "9 ...with H projected too" "SELECT Y, H, ROW_NUMBER() OVER (ORDER BY G) AS R1, ROW_NUMBER() OVER (ORDER BY H) AS R2 FROM TQ5 ORDER BY Y;" "Y H R1 R2|1 1 3 2|2 1 1 1|3 2 4 4|4 2 2 3"
+pin  "9 no outer ORDER BY: the window's order" "SELECT Y, ROW_NUMBER() OVER (ORDER BY G DESC) FROM TQ4;" "Y ROW_NUMBER|3 1|4 2|1 3|2 4"
+pin  "9 no outer ORDER BY: the LAST clause's order" "SELECT Y, ROW_NUMBER() OVER (ORDER BY G) AS R1, ROW_NUMBER() OVER (ORDER BY H) AS R2 FROM TQ5;" "Y R1 R2|2 1 1|1 3 2|4 2 3|3 4 4"
+pin  "9 ...swapped" "SELECT Y, ROW_NUMBER() OVER (ORDER BY H) AS R2, ROW_NUMBER() OVER (ORDER BY G) AS R1 FROM TQ5;" "Y R2 R1|2 2 1|4 4 2|1 1 3|3 3 4"
+pin  "9 no outer ORDER BY: PARTITION BY sorts too" "SELECT Y, ROW_NUMBER() OVER (PARTITION BY G) FROM TQ4;" "Y ROW_NUMBER|1 1|2 2|3 1|4 2"
+pin  "9 no outer ORDER BY: OVER () keeps scan order" "SELECT Y, COUNT(*) OVER () FROM TQ4;" "Y COUNT|2 4|1 4|3 4|4 4"
+
+echo "--- 10. A KEY THAT IS NOT TEXT carries no collation"
+pin  "10 GROUP BY CHAR_LENGTH(ci)" "SELECT CHAR_LENGTH(S) AS L, COUNT(*) FROM CS GROUP BY CHAR_LENGTH(S);" "L COUNT|1 1|3 3"
+pin  "10 GROUP BY 1 over OCTET_LENGTH(ci)" "SELECT OCTET_LENGTH(S) AS L, COUNT(*) FROM CS GROUP BY 1;" "L COUNT|1 1|3 3"
+pin  "10 GROUP BY ASCII_VAL(ci)" "SELECT ASCII_VAL(S) AS A, COUNT(*) FROM CS GROUP BY 1;" "A COUNT|65 2|97 1|98 1"
+pin  "10 GROUP BY a boolean over ci" "SELECT S = 'abc' AS B, COUNT(*) FROM CS GROUP BY 1;" "B COUNT|<false> 1|<true> 3"
+pin  "10 GROUP BY a numeric CASE over ci" "SELECT CASE WHEN S = 'abc' THEN 1 ELSE 0 END AS K, COUNT(*) FROM CS GROUP BY 1;" "K COUNT|0 1|1 3"
+pin  "10 COUNT(*) OVER (PARTITION BY CHAR_LENGTH(ci))" "SELECT ID, COUNT(*) OVER (PARTITION BY CHAR_LENGTH(S)) FROM CS ORDER BY ID;" "ID COUNT|1 3|2 3|3 3|4 1"
+pin  "10 PARTITION BY id + CHAR_LENGTH(ci)" "SELECT ID, COUNT(*) OVER (PARTITION BY ID + CHAR_LENGTH(S)) FROM CS ORDER BY ID;" "ID COUNT|1 1|2 2|3 1|4 2"
+pin  "10 ROW_NUMBER OVER (ORDER BY CHAR_LENGTH(ci), id)" "SELECT ID, ROW_NUMBER() OVER (ORDER BY CHAR_LENGTH(S), ID) FROM CS ORDER BY ID;" "ID ROW_NUMBER|1 2|2 3|3 4|4 1"
+pin  "10 DENSE_RANK OVER (ORDER BY OCTET_LENGTH(ci))" "SELECT ID, DENSE_RANK() OVER (ORDER BY OCTET_LENGTH(S)) FROM CS ORDER BY ID;" "ID DENSE_RANK|1 2|2 2|3 2|4 1"
+pin  "10 COUNT(*) OVER (ORDER BY CHAR_LENGTH(ci))" "SELECT ID, COUNT(*) OVER (ORDER BY CHAR_LENGTH(S)) FROM CS ORDER BY ID;" "ID COUNT|1 4|2 4|3 4|4 1"
+pin  "10 PARTITION BY ci IS NULL" "SELECT ID, COUNT(*) OVER (PARTITION BY S IS NULL) FROM C2 ORDER BY ID;" "ID COUNT|1 7|2 7|3 7|4 7|5 7|6 7|7 7|8 1"
+pin  "10 ORDER BY CHAR_LENGTH(ci) (control)" "SELECT ID FROM CS ORDER BY CHAR_LENGTH(S), ID;" "ID|4|1|2|3"
+refused "10 GROUP BY POSITION over ci: this server's POSITION matches bytes (pre-existing)" "SELECT POSITION('b' IN S) AS P, COUNT(*) FROM CS GROUP BY 1;"
+refused "10 GROUP BY REPLACE over ci: the same" "SELECT REPLACE(S, 'b', 'x') AS K, COUNT(*) FROM CS GROUP BY 1;"
+
+echo "--- 11. AN EXPLICIT COLLATE from a NONE attachment (isql's default, and this gate's)"
+pin  "11 WHERE s COLLATE UNICODE_CI = literal from a NONE attachment" "SELECT S FROM U8 WHERE S COLLATE UNICODE_CI = 'abc' ORDER BY ID;" "S|abc|ABC|Abc|abc"
+pin  "11 ...upper-case literal" "SELECT ID FROM U8 WHERE S COLLATE UNICODE_CI = 'ABC' ORDER BY ID;" "ID|1|2|3|5"
+pin  "11 ...the literal on the left" "SELECT ID FROM U8 WHERE 'abc' = S COLLATE UNICODE_CI ORDER BY ID;" "ID|1|2|3|5"
+pin  "11 ...DISTINCT over it" "SELECT DISTINCT S FROM U8 WHERE S COLLATE UNICODE_CI = 'abc';" "S|ABC|Abc|abc"
+pin  "11 ...GROUP BY over it" "SELECT S, COUNT(*) FROM U8 WHERE S COLLATE UNICODE_CI = 'abc' GROUP BY S;" "S COUNT|ABC 1|Abc 1|abc 2"
+pin  "11 ...DISTINCT id over it" "SELECT DISTINCT ID FROM U8 WHERE S COLLATE UNICODE_CI = 'abc';" "ID|1|2|3|5"
+pin  "11 ...IN" "SELECT DISTINCT S FROM U8 WHERE S COLLATE UNICODE_CI IN ('abc');" "S|ABC|Abc|abc"
+pin  "11 ...BETWEEN" "SELECT DISTINCT S FROM U8 WHERE S COLLATE UNICODE_CI BETWEEN 'a' AND 'abc';" "S|ABC|Abc|abc"
+pin  "11 ...a distinct UNION over it" "SELECT S FROM U8 WHERE S COLLATE UNICODE_CI = 'abc' UNION SELECT S FROM U8 WHERE ID = 4;" "S|ABC|Abc|abc|b"
+pin  "11 ...> and <>" "SELECT ID FROM U8 WHERE S COLLATE UNICODE_CI > 'ab' ORDER BY ID; SELECT ID FROM U8 WHERE S COLLATE UNICODE_CI <> 'abc' ORDER BY ID;" "ID|1|2|3|4|5|ID|4"
+pin  "11 ...COUNT(DISTINCT) over it" "SELECT COUNT(DISTINCT S) FROM U8 WHERE S COLLATE UNICODE_CI = 'abc';" "COUNT|4"
+pin  "11 the plain compare stays byte-exact (control)" "SELECT ID FROM U8 WHERE S = 'abc' ORDER BY ID;" "ID|1|5"
+pin8 "11 the same from a UTF8 attachment" "SELECT S FROM U8 WHERE S COLLATE UNICODE_CI = 'abc' ORDER BY ID; SELECT DISTINCT S FROM U8 WHERE S COLLATE UNICODE_CI = 'abc'; SELECT COUNT(DISTINCT S) FROM U8 WHERE S COLLATE UNICODE_CI = 'abc';" "S|abc|ABC|Abc|abc|S|ABC|Abc|abc|COUNT|4"
+
+echo "--- 12. THE DISTINCT FOLD'S KEY, and a DISTINCT over an expression"
+pin  "12 COUNT / LIST(DISTINCT) over a UTF8 VARCHAR keep 'abc' and 'abc ' apart" "SELECT COUNT(DISTINCT P), LIST(DISTINCT P) FROM DP;" "COUNT LIST|3 0:B|abc,abc ,xyz"
+pin  "12 ...three lengths" "SELECT COUNT(DISTINCT P), LIST(DISTINCT P) FROM D3;" "COUNT LIST|3 0:B|abc,abc ,abc"
+pin  "12 ...a CHAR(5) is one value" "SELECT COUNT(DISTINCT P), LIST(DISTINCT P) FROM DC;" "COUNT LIST|2 0:B|abc ,xyz"
+pin  "12 ...NONE merges them, the byte-greatest survives" "SELECT COUNT(DISTINCT P), LIST(DISTINCT P) FROM DN;" "COUNT LIST|2 0:B|abc ,xyz"
+pin  "12 ...WIN1252 merges them" "SELECT COUNT(DISTINCT P), LIST(DISTINCT P) FROM DW;" "COUNT LIST|2 0:B|abc ,xyz"
+pin  "12 ...UNICODE merges them" "SELECT COUNT(DISTINCT P), LIST(DISTINCT P) FROM DU;" "COUNT LIST|2 0:B|abc ,xyz"
+pin  "12 ...the GROUP BY sort merges the UTF8 pair (control)" "SELECT '[' || P || ']', COUNT(*) FROM DP GROUP BY P;" "CONCATENATION COUNT|[abc] 2|[xyz] 1"
+pin  "12 LIST(DISTINCT) over the plain UTF8 U8" "SELECT LIST(DISTINCT S) FROM U8;" "LIST|0:B|ABC,Abc,abc,abc ,b"
+pin  "12 LIST(DISTINCT) per group" "SELECT ID, LIST(DISTINCT P) FROM DP GROUP BY ID;" "ID LIST|1 0:B|abc|2 0:B|abc|3 0:B|xyz"
+pin  "12 DISTINCT UPPER(ci): one spelling" "SELECT DISTINCT UPPER(S) FROM CS;" "UPPER|ABC|B"
+pin  "12 DISTINCT LOWER(ci)" "SELECT DISTINCT LOWER(S) FROM CS;" "LOWER|abc|b"
+pin  "12 DISTINCT CHAR_LENGTH(ci)" "SELECT DISTINCT CHAR_LENGTH(S) FROM CS;" "CHAR_LENGTH|1|3"
+pin  "12 DISTINCT ci || 'x' when nothing collides" "SELECT DISTINCT S || 'x' FROM CS WHERE ID > 3;" "CONCATENATION|bx"
+pin  "12 DISTINCT over a plain UTF8 expression" "SELECT DISTINCT S || 'x' FROM U8;" "CONCATENATION|ABCx|Abcx|abc x|abcx|bx"
+refused "12 DISTINCT ci || 'x' merges three spellings: the survivor is not the projection's to name" "SELECT DISTINCT S || 'x' FROM CS;"
+refused "12 DISTINCT SUBSTRING(ci ...) the same" "SELECT DISTINCT SUBSTRING(S FROM 1 FOR 2) FROM CS;"
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-collkey-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 137 ]; then echo "FAIL only $ran checks ran (floor 137)"; fail=1; fi
+if [ "$ran" -lt 211 ]; then echo "FAIL only $ran checks ran (floor 211)"; fail=1; fi
 exit $fail
