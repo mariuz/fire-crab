@@ -77,6 +77,13 @@
 #     columns it reads are, as the group's last row spells them, so
 #     `COALESCE(S, '?') .. GROUP BY 1` ranks the '?' group (NULL S) after
 #     'ab' - 809a74b answered it before, fc/integ refused.
+# 19. THE GROUP'S LAST ROW that an expression key's lifted columns read is
+#     the grouping sort's last by its RECORD IMAGE (flags and values in
+#     shared words: a lone VARCHAR's length outranks its NULL flag, so
+#     `COALESCE(S, 'a') .. GROUP BY 1` keeps an 'a' row last, and the
+#     K * V = 2 group's last is (2, 1), not the scan's (1, 2)); a COLLATE
+#     or CHARACTER SET name inside such a key is no column to lift
+#     (9144d1c refused them with a bare 42000).
 #
 # RECORDED, not fixed (section 12 and the refused/differs cells): CREATE
 # VIEW over an aggregate, a GROUP BY or a window; LAG/LEAD/NTH_VALUE with
@@ -142,6 +149,8 @@ CREATE TABLE RA (ID INTEGER, K INTEGER, A VARCHAR(4), B VARCHAR(4), G INTEGER, M
 INSERT INTO RA VALUES (1,1,'dcba','x',1,'q','p'); INSERT INTO RA VALUES (2,1,'dbca','x',2,'q','p'); INSERT INTO RA VALUES (3,1,'cdab','x',1,'q','r'); INSERT INTO RA VALUES (4,1,'badc','x',2,'q','r'); INSERT INTO RA VALUES (5,1,'acbd','x',1,'q','p'); INSERT INTO RA VALUES (6,1,'abcd','x',2,'q','r');
 CREATE TABLE RB (ID INTEGER, K INTEGER, A VARCHAR(4), B VARCHAR(4));
 INSERT INTO RB VALUES (1,1,'x','z'); INSERT INTO RB VALUES (2,1,'x','a'); INSERT INTO RB VALUES (3,1,'x','m'); INSERT INTO RB VALUES (4,2,'y','q');
+CREATE TABLE RX (ID INTEGER, K INTEGER, U VARCHAR(10) CHARACTER SET UTF8, CI VARCHAR(8) CHARACTER SET UTF8 COLLATE UNICODE_CI_AI, S VARCHAR(10));
+INSERT INTO RX VALUES (1,1,'ü','Straße','b'); INSERT INTO RX VALUES (2,2,'u','STRASSE','a'); INSERT INTO RX VALUES (3,1,'Ü','strasse',NULL); INSERT INTO RX VALUES (4,2,'ü','café','a'); INSERT INTO RX VALUES (5,1,NULL,'CAFE','ab');
 COMMIT;
 SQL
 } | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/aggplan-build.log 2>&1
@@ -561,11 +570,32 @@ pin  "18 ...a HAVING" "SELECT COALESCE(S, '?') CS, COUNT(*) C, RANK() OVER (ORDE
 pin  "18 ...the statement ORDER BY above" "SELECT COALESCE(S, '?') CS, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1 ORDER BY 3, 1;" "CS COUNT RANK|1 1|? 1 1|ab 1 1|c 2 4|a 3 5|b 4 6"
 pin  "18 CONTROL: no window, the value order" "SELECT COALESCE(S, '?') CS, COUNT(*) FROM RU GROUP BY 1 ORDER BY COUNT(*);" "CS COUNT|1|? 1|ab 1|c 2|a 3|b 4"
 
+echo "--- 19. AN EXPRESSION GROUP KEY'S LAST ROW BY THE GROUPING RECORD IMAGE; A COLLATE / CHARACTER SET NAME IS NO COLUMN"
+pin  "19 AN EXPRESSION KEY'S LAST ROW is the grouping record's last (NULL and 'a' rows share the 'a' group; 9144d1c took the NULL row)" "SELECT COALESCE(S, 'a') X, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1 ORDER BY 1;" "X COUNT ROW_NUMBER|1 1|a 4 4|ab 1 2|b 4 5|c 2 3"
+pin  "19 ...LAG" "SELECT COALESCE(S, 'a') X, COUNT(*), LAG(COALESCE(S, 'a')) OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1 ORDER BY 1;" "X COUNT LAG|1 <null>|a 4 c|ab 1|b 4 a|c 2 ab"
+pin  "19 ...no COUNT(*) item" "SELECT COALESCE(S, 'a') X, ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1 ORDER BY 1;" "X ROW_NUMBER|1|a 4|ab 2|b 5|c 3"
+pin  "19 ...K * V: the X = 2 group's last row is (2, 1), not the scan's (1, 2)" "SELECT K * V X, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1 ORDER BY 1;" "X COUNT ROW_NUMBER|<null> 3 6|1 2 2|2 2 4|3 2 3|4 1 1|6 2 5"
+pin  "19 ...K * V, LAG" "SELECT K * V X, COUNT(*), LAG(K * V) OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1 ORDER BY 1;" "X COUNT LAG|<null> 3 6|1 2 4|2 2 3|3 2 1|4 1 <null>|6 2 2"
+pin  "19 ...K * V, no COUNT(*) item" "SELECT K * V X, ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1 ORDER BY 1;" "X ROW_NUMBER|<null> 6|1 2|2 4|3 3|4 1|6 5"
+pin  "19 ...K + V" "SELECT K + V X, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1 ORDER BY 1;" "X COUNT ROW_NUMBER|<null> 3 5|2 2 1|3 2 2|4 3 4|5 2 3"
+pin  "19 CONTROL: COALESCE(S, 'a') with no window" "SELECT COALESCE(S, 'a') X, COUNT(*) FROM RU GROUP BY 1 ORDER BY 1;" "X COUNT|1|a 4|ab 1|b 4|c 2"
+pin  "19 A COLLATE NAME IS NO COLUMN (9144d1c: a bare 42000): U COLLATE UNICODE_CI, OVER ()" "SELECT U COLLATE UNICODE_CI X, COUNT(*) OVER () FROM RX GROUP BY 1;" "X COUNT|<null> 3|u 3|ü 3"
+pin  "19 ...CI COLLATE UNICODE" "SELECT CI COLLATE UNICODE X, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM RX GROUP BY 1;" "X COUNT RANK|CAFE 1 1|STRASSE 1 1|café 1 1|Straße 1 1|strasse 1 1"
+pin  "19 ...CAST AS VARCHAR(5) CHARACTER SET UTF8" "SELECT CAST(K AS VARCHAR(5) CHARACTER SET UTF8) X, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM RX GROUP BY 1;" "X COUNT RANK|2 2 1|1 3 2"
+pin  "19 ...U COLLATE UNICODE_CI, ORDER BY the window" "SELECT U COLLATE UNICODE_CI X, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM RX GROUP BY 1 ORDER BY 3;" "X COUNT RANK|<null> 1 1|u 1 1|ü 3 3"
+pin  "19 ...U COLLATE UTF8" "SELECT U COLLATE UTF8 X, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM RX GROUP BY 1 ORDER BY 3, 1;" "X COUNT RANK|<null> 1 1|u 1 1|Ü 1 1|ü 2 4"
+pin  "19 ...S COLLATE NONE" "SELECT S COLLATE NONE X, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RX GROUP BY 1 ORDER BY 1;" "X COUNT ROW_NUMBER|<null> 1 3|a 2 4|ab 1 2|b 1 1"
+pin  "19 ...UPPER(U COLLATE UNICODE_CI)" "SELECT UPPER(U COLLATE UNICODE_CI) X, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM RX GROUP BY 1 ORDER BY 3, 1;" "X COUNT RANK|<null> 1 1|U 1 1|Ü 3 3"
+pin  "19 ...GROUP BY the expression spelled out" "SELECT U COLLATE UNICODE_CI X, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RX GROUP BY U COLLATE UNICODE_CI ORDER BY 3;" "X COUNT ROW_NUMBER|u 1 1|<null> 1 2|ü 3 3"
+pin  "19 ...CAST(S AS VARCHAR(4) CHARACTER SET UTF8)" "SELECT CAST(S AS VARCHAR(4) CHARACTER SET UTF8) X, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RX GROUP BY 1 ORDER BY 1;" "X COUNT ROW_NUMBER|<null> 1 3|a 2 4|ab 1 2|b 1 1"
+pin  "19 ...COALESCE(S COLLATE NONE, 'a')" "SELECT COALESCE(S COLLATE NONE, 'a') X, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RX GROUP BY 1 ORDER BY 1;" "X COUNT ROW_NUMBER|a 3 3|ab 1 2|b 1 1"
+pin  "19 CONTROL: U COLLATE UNICODE_CI with no window" "SELECT U COLLATE UNICODE_CI X, COUNT(*) FROM RX GROUP BY 1 ORDER BY 1;" "X COUNT|<null> 1|u 1|ü 3"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-aggplan-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 319 ]; then echo "FAIL only $ran checks ran (floor 319)"; fail=1; fi
+if [ "$ran" -lt 338 ]; then echo "FAIL only $ran checks ran (floor 338)"; fail=1; fi
 exit $fail

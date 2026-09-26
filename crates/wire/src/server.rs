@@ -9209,6 +9209,18 @@ impl RowSource {
                     RowSource::Filter { pred, .. } => pred.as_ref(),
                     _ => None,
                 };
+                // the relation's field descriptors, when the fold reads one
+                // relation's records: the grouping sort's record image is
+                // laid out from them ([group_rows])
+                let leaf = match input.as_ref() {
+                    RowSource::Filter { input, .. } => input.as_ref(),
+                    other => other,
+                };
+                let rec_descs = match leaf {
+                    RowSource::TableScan { formats, width: None, .. }
+                    | RowSource::IndexScan { formats, width: None, .. } => formats.last().map(|f| &f.1[..]),
+                    _ => None,
+                };
                 group_rows(
                     input.rows(db)?,
                     gitems,
@@ -9219,6 +9231,7 @@ impl RowSource {
                     filter,
                     *tie_order,
                     key_coll,
+                    rec_descs,
                 )
             }
             RowSource::Sort { input, keys } => {
@@ -45815,6 +45828,62 @@ struct WinTieNames {
 /// PARTITION BY clause's followed by a NULL copy of each column its keys
 /// read.
 #[allow(clippy::too_many_arguments)]
+/// A text with each `COLLATE <name>` and `CHARACTER SET <name>` blanked
+/// out (string literals and quoted names aside), so a column-token scan
+/// does not read the collation or charset name as a column.
+fn strip_coll_names(text: &str) -> String {
+    let masked = mask_literals(&text.to_ascii_uppercase());
+    let mb = masked.as_bytes();
+    let mut out = text.as_bytes().to_vec();
+    let is_id = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    // the end of the name that starts at or after `i` (whitespace skipped)
+    let name_end = |mut i: usize| -> usize {
+        while i < mb.len() && mb[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < mb.len() && text.as_bytes()[i] == b'"' {
+            i += 1;
+            while i < mb.len() {
+                if text.as_bytes()[i] == b'"' {
+                    if text.as_bytes().get(i + 1) == Some(&b'"') {
+                        i += 2;
+                        continue;
+                    }
+                    return i + 1;
+                }
+                i += 1;
+            }
+            return i;
+        }
+        while i < mb.len() && is_id(mb[i]) {
+            i += 1;
+        }
+        i
+    };
+    let mut blank = |from: usize, to: usize| out[from..to].iter_mut().for_each(|b| *b = b' ');
+    let mut i = 0;
+    while let Some(p) = find_word(&masked, "COLLATE", i) {
+        let e = name_end(p + 7);
+        blank(p, e);
+        i = e.max(p + 7);
+    }
+    i = 0;
+    while let Some(p) = find_word(&masked, "CHARACTER", i) {
+        let mut j = p + 9;
+        while j < mb.len() && mb[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if masked[j..].starts_with("SET") && !mb.get(j + 3).is_some_and(|c| is_id(*c)) {
+            let e = name_end(j + 3);
+            blank(p, e);
+            i = e;
+        } else {
+            i = p + 9;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+}
+
 fn win_tie_names(
     lift: &mut WinLift,
     items_raw: &[&str],
@@ -45859,6 +45928,37 @@ fn win_tie_names(
             .collect();
         // a column token L1 may read beside its GROUP BY: an aggregate
         // call, or a column that is itself a bare group key
+        // is this token a column of a FROM relation? (true when a relation
+        // is one the catalog cannot list - a derived table, a CTE)
+        let from_cols: Option<Vec<(String, std::sync::Arc<Vec<fire_crab_ods::RelationColumn>>)>> =
+            db.as_ref().and_then(|db| {
+                let (base, steps) = parse_from(table_s)?;
+                let mut v = Vec::new();
+                for r in std::iter::once(&base).chain(steps.iter().map(|(_, r, _, _)| r)) {
+                    if r.table.trim_start().starts_with('(') {
+                        return None;
+                    }
+                    let cols = db.columns(&r.table);
+                    if cols.is_empty() {
+                        return None;
+                    }
+                    v.push((r.key().to_string(), cols));
+                }
+                Some(v)
+            });
+        let rel_col = |tok: &str| -> bool {
+            let Some(rels) = from_cols.as_ref() else { return true };
+            let Some(parts) = split_ident_chain(tok).and_then(|p| p.iter().map(|x| canon_ident(x)).collect::<Option<Vec<String>>>())
+            else {
+                return false;
+            };
+            let (q, c) = match parts.as_slice() {
+                [c] => (None, c),
+                [q, c] | [_, q, c] => (Some(q), c),
+                _ => return false,
+            };
+            rels.iter().any(|(key, cols)| q.is_none_or(|q| q == key) && cols.iter().any(|rc| rc.name == *c))
+        };
         let groupable = |tok: &str| {
             parse_agg_item(tok).is_some()
                 || split_ident_chain(tok)
@@ -45878,8 +45978,18 @@ fn win_tie_names(
             // engine's aggregate maps `K + 1` under `GROUP BY K + 1`
             // whole (lifting its K beside that GROUP BY is no query)
             let is_key = gkeys.iter().any(|g| *g == norm_sql_text(body) || *g == plain_k.to_string() || *g == (pos + 1).to_string());
+            // (a COLLATE or CHARACTER SET name is no column: `U COLLATE
+            // UNICODE_CI .. GROUP BY 1` lifts U alone; and a token no FROM
+            // relation holds keeps the item whole rather than lift a
+            // column that is not there)
             let key_cols: Vec<String> = if is_key && !bare_col(body) {
-                tokens(body).into_iter().filter(|t| parse_agg_item(t).is_none()).collect()
+                let cols: Vec<String> =
+                    tokens(&strip_coll_names(body)).into_iter().filter(|t| parse_agg_item(t).is_none()).collect();
+                if cols.iter().all(|c| rel_col(c)) {
+                    cols
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
             };
@@ -67696,6 +67806,7 @@ fn group_rows(
     filter: Option<&Predicate>,
     tie_order: bool,
     key_coll: &[u16],
+    rec_descs: Option<&[Descriptor]>,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
     // expression keys: evaluate each into its synthetic slot, so the
     // bucketing sort and the Key output items read it like a field.
@@ -67802,9 +67913,17 @@ fn group_rows(
                 _ => false,
             }
         };
+        // a column the windowed rewrite lifted beside an expression group
+        // key (`FC$L`, [win_tie_names]) is read as the group's LAST row
+        // spells it, and "last" is the grouping sort's record order:
+        // `SELECT K * V X, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*))
+        // .. GROUP BY 1` ranks the X = 2 group of (1, 2) and (2, 1) by
+        // (2, 1) on 2182, the record's last, not the scan's
+        let last_fed = gitems.iter().any(|g| matches!(g, GItem::Key(f) if !key_fids.contains(f)));
         let tie_fids = if tie_order
             // a constant text key has one spelling: nothing to survive
             && ((text_key && field_key)
+                || (last_fed && field_key)
                 || gitems.iter().any(|g| {
                     matches!(
                         g,
@@ -67844,7 +67963,12 @@ fn group_rows(
             };
             for g in gitems {
                 match g {
-                    GItem::Key(_) | GItem::Const(_) => {}
+                    GItem::Key(f) => {
+                        if !key_fids.contains(f) {
+                            mark(*f);
+                        }
+                    }
+                    GItem::Const(_) => {}
                     GItem::Agg(_, src, _) => match src {
                         AggSrc::Star => {}
                         AggSrc::Field(f) | AggSrc::CollField(f, _) => {
@@ -67920,6 +68044,58 @@ fn group_rows(
             // 'ba','ca','ab' in that order). Integer/temporal values do
             // not drive (measured: they ride word-compared too, but at
             // offsets the common shapes leave undecided - unpinned).
+            // with every referenced field's descriptor in hand the ties
+            // compare as the engine's sort record IMAGE ([SortRecImage]):
+            // the NULL flags and the values share words, so a lone
+            // VARCHAR's length outranks its own flag (measured on 2182:
+            // `COALESCE(S, 'a') .. GROUP BY 1` over S = 'a' and S = NULL
+            // rows keeps the 'a' row LAST, where flags-first sank the NULL)
+            Some(extra)
+                if !extra.is_empty()
+                    && rec_descs.is_some_and(|d| extra.iter().all(|f| *f < d.len())) =>
+            {
+                let descs = rec_descs.unwrap_or(&[]);
+                let img = SortRecImage::new(&extra.iter().map(|f| Some(descs[*f])).collect::<Vec<_>>());
+                let image = |r: &[Value]| {
+                    let vals: Vec<&Value> = extra.iter().map(|f| r.get(*f).unwrap_or(&Value::Null)).collect();
+                    img.image(&vals)
+                };
+                let rows = std::mem::take(&mut input);
+                let budget = crate::extsort::budget();
+                let est: usize = rows.iter().map(|r| crate::extsort::row_bytes(r)).sum();
+                if est <= budget {
+                    let mut tagged: Vec<(Vec<u8>, Vec<Value>)> = rows.into_iter().map(|r| (image(&r), r)).collect();
+                    tagged.sort_by(|a, b| {
+                        order_cmp(&a.1, &b.1, &keys).then_with(|| SortRecImage::cmp(&a.0, &b.0))
+                    });
+                    tagged.into_iter().map(|(_, r)| r).collect()
+                } else {
+                    let mut sorter = crate::extsort::ExternalSort::with_budget(
+                        |a: &[Value], b: &[Value]| {
+                            order_cmp(a, b, &keys).then_with(|| SortRecImage::cmp(&image(a), &image(b)))
+                        },
+                        budget,
+                    );
+                    for r in rows {
+                        sorter.put(r).map_err(|e| {
+                            eprintln!("[srv] sort spill: {}", e);
+                            EvalErr::Unsupported
+                        })?;
+                    }
+                    let mut cursor = sorter.finish().map_err(|e| {
+                        eprintln!("[srv] sort spill: {}", e);
+                        EvalErr::Unsupported
+                    })?;
+                    let mut out = Vec::new();
+                    while let Some(r) = cursor.next().map_err(|e| {
+                        eprintln!("[srv] sort spill: {}", e);
+                        EvalErr::Unsupported
+                    })? {
+                        out.push(r);
+                    }
+                    out
+                }
+            }
             Some(extra) => {
                 let rows = std::mem::take(&mut input);
                 let budget = crate::extsort::budget();
@@ -144650,6 +144826,16 @@ mod tests {
             window_frame_lint(dml),
             Some(EvalErr::TokenUnknown { line: 1, col: 105, token }) if token == "following"
         ));
+    }
+
+    #[test]
+    fn strip_coll_names_blanks_collation_and_charset_names() {
+        let t = |x: &str| strip_coll_names(x).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(t("U COLLATE UNICODE_CI"), "U");
+        assert_eq!(t("UPPER(U collate \"UNICODE_CI\")"), "UPPER(U )");
+        assert_eq!(t("CAST(K AS VARCHAR(5) CHARACTER SET UTF8)"), "CAST(K AS VARCHAR(5) )");
+        assert_eq!(t("COALESCE(S, 'x COLLATE Y')"), "COALESCE(S, 'x COLLATE Y')");
+        assert_eq!(t("CHARACTER_LENGTH(S)"), "CHARACTER_LENGTH(S)");
     }
 
     #[test]
