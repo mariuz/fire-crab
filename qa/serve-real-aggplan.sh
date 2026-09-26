@@ -72,7 +72,11 @@
 #     window as written, each other clause's map its windows then a NULL
 #     copy of every COLUMN its PARTITION BY reads (G + K + ID three, at
 #     the column's own width) - on the plain path, the FIRST/ROWS
-#     rewrite, a join, a group and a windowed derived table alike.
+#     rewrite, a join, a group and a windowed derived table alike. AN
+#     EXPRESSION GROUP KEY is no field of the aggregate's stream: the
+#     columns it reads are, as the group's last row spells them, so
+#     `COALESCE(S, '?') .. GROUP BY 1` ranks the '?' group (NULL S) after
+#     'ab' - 809a74b answered it before, fc/integ refused.
 #
 # RECORDED, not fixed (section 12 and the refused/differs cells): CREATE
 # VIEW over an aggregate, a GROUP BY or a window; LAG/LEAD/NTH_VALUE with
@@ -523,7 +527,7 @@ pin  "17 ...a CTE" "WITH C AS (SELECT S, K, ROW_NUMBER() OVER (ORDER BY V) RN FR
 pin  "17 ...FIRST takes the engine's rows" "SELECT FIRST 5 X.S, RN FROM (SELECT S, K, ROW_NUMBER() OVER (ORDER BY K) RN FROM RU) X ORDER BY X.K;" "S RN|a 1|b 2|3|<null> 7|a 4"
 pin  "17 ...a PARTITION BY stream's slot" "SELECT X.S, RN FROM (SELECT K, S, SUM(V) OVER (PARTITION BY K2) RN FROM RU) X ORDER BY X.K;" "S RN|a 6|b 6|10|a 6|b 10|c 10|<null> 6|a 6|b 6|b 6|c 10|ab 6"
 
-echo "--- 18. THE MERGED OUTER RECORD (window streams, OVER () in the plain map, one NULL copy per partition COLUMN at its width)"
+echo "--- 18. THE MERGED OUTER RECORD (window streams, OVER () in the plain map, one NULL copy per partition COLUMN at its width); AN EXPRESSION GROUP KEY'S COLUMNS"
 pin  "18 the plain map precedes a window's map (A, RN, B ties by B, not by RN)" "SELECT A, ROW_NUMBER() OVER (ORDER BY ID DESC) RN, B FROM RB ORDER BY K;" "A RN B|x 3 a|x 2 m|x 4 z|y 1 q"
 pin  "18 CONTROL: where A's bytes start (one field: on a word)" "SELECT A FROM RA ORDER BY K;" "A|dcba|dbca|cdab|badc|acbd|abcd"
 pin  "18 a PARTITION BY clause copies each column its keys read (G + K + ID: three)" "SELECT A, COUNT(*) OVER (PARTITION BY G + K + ID) FROM RA ORDER BY K;" "A COUNT|dcba 1|dbca 2|cdab 2|badc 2|acbd 2|abcd 1"
@@ -545,6 +549,17 @@ pin  "18 ...a join: the copies of G + K + ID" "SELECT RA.A, MIN(RA.M) OVER (PART
 pin  "18 ...grouped" "SELECT MIN(A) OVER (PARTITION BY K) MM, A FROM RA GROUP BY A, K ORDER BY K;" "MM A|abcd badc|abcd abcd|abcd dbca|abcd acbd|abcd dcba|abcd cdab"
 pin  "18 ...a windowed derived table: the copies" "SELECT X.A, X.MM FROM (SELECT A, K, MIN(M) OVER (PARTITION BY G + K + ID) MM FROM RA) X ORDER BY X.K;" "A MM|dcba q|dbca q|cdab q|badc q|acbd q|abcd q"
 pin  "18 ...a windowed derived table: an OVER () window" "SELECT X.B, X.MM, X.A FROM (SELECT B, MIN(M) OVER () MM, A, K FROM RA) X ORDER BY X.K;" "B MM A|x q badc|x q abcd|x q dbca|x q acbd|x q dcba|x q cdab"
+pin  "18 AN EXPRESSION GROUP KEY: its column rides, as the group's last row spells it (809a74b answered '?' before 'ab')" "SELECT COALESCE(S, '?') CS, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1;" "CS COUNT RANK|1 1|ab 1 1|? 1 1|c 2 4|a 3 5|b 4 6"
+pin  "18 ...ROW_NUMBER" "SELECT COALESCE(S, '?') CS, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1;" "CS COUNT ROW_NUMBER|1 1|ab 1 2|? 1 3|c 2 4|a 3 5|b 4 6"
+pin  "18 ...GROUP BY the expression" "SELECT COALESCE(S, '?') CS, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY COALESCE(S, '?');" "CS COUNT ROW_NUMBER|1 1|ab 1 2|? 1 3|c 2 4|a 3 5|b 4 6"
+pin  "18 ...no COUNT(*) item: two fields, the NULL flag below S's length" "SELECT COALESCE(S, '?') CS, ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1;" "CS ROW_NUMBER|1|? 2|ab 3|c 4|a 5|b 6"
+pin  "18 ...the '' group whose last row's S is NULL follows 'c'" "SELECT COALESCE(S, '') CS, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1;" "CS COUNT ROW_NUMBER|ab 1 1|c 2 2|2 3|a 3 4|b 4 5"
+pin  "18 ...CASE" "SELECT CASE WHEN S IS NULL THEN '?' ELSE S END CS, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1;" "CS COUNT ROW_NUMBER|1 1|ab 1 2|? 1 3|c 2 4|a 3 5|b 4 6"
+pin  "18 ...IIF" "SELECT IIF(S IS NULL, 'zz', S) CS, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1;" "CS COUNT ROW_NUMBER|1 1|ab 1 2|zz 1 3|c 2 4|a 3 5|b 4 6"
+pin  "18 ...SUBSTRING: the 'a' group's last S is 'ab'" "SELECT SUBSTRING(S FROM 1 FOR 1) S1, COUNT(*), ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1;" "S1 COUNT ROW_NUMBER|1 1|<null> 1 2|c 2 3|b 4 4|a 4 5"
+pin  "18 ...a HAVING" "SELECT COALESCE(S, '?') CS, COUNT(*) C, RANK() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY COALESCE(S, '?') HAVING COUNT(*) < 3;" "CS C RANK|1 1|ab 1 1|? 1 1|c 2 4"
+pin  "18 ...the statement ORDER BY above" "SELECT COALESCE(S, '?') CS, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM RU GROUP BY 1 ORDER BY 3, 1;" "CS COUNT RANK|1 1|? 1 1|ab 1 1|c 2 4|a 3 5|b 4 6"
+pin  "18 CONTROL: no window, the value order" "SELECT COALESCE(S, '?') CS, COUNT(*) FROM RU GROUP BY 1 ORDER BY COUNT(*);" "CS COUNT|1|? 1|ab 1|c 2|a 3|b 4"
 
 echo "--- panic check"
 ran=$((ran + 1))
@@ -552,5 +567,5 @@ if grep -aq 'panicked at' "/tmp/fc-serve-aggplan-$PORT.log"; then echo "FAIL the
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 308 ]; then echo "FAIL only $ran checks ran (floor 308)"; fail=1; fi
+if [ "$ran" -lt 319 ]; then echo "FAIL only $ran checks ran (floor 319)"; fail=1; fi
 exit $fail

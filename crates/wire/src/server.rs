@@ -45729,7 +45729,7 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<(String, 
     for (_, name) in lift
         .exprs
         .iter()
-        .filter(|(_, n)| n.starts_with("FC$O") || n.starts_with("FC$C") || n.starts_with("FC$R"))
+        .filter(|(_, n)| ["FC$O", "FC$C", "FC$R", "FC$L"].iter().any(|p| n.starts_with(p)))
     {
         parts.push(quote(name));
     }
@@ -45842,6 +45842,10 @@ fn win_tie_names(
     // a partition key's column token -> the L1/L2 column whose width its
     // NULL copy takes
     let mut copy_desc: Vec<(String, String)> = Vec::new();
+    // an expression group key's columns were lifted ([GItem::Key]'s last
+    // row), and the window keys naming an item's aggregate field
+    let mut last_fed = false;
+    let mut w_same: Vec<(String, String)> = Vec::new();
     let mut plain_k = 0usize;
     if grouped {
         // the GROUP BY keys (aliases already their bodies), compared as
@@ -45874,7 +45878,29 @@ fn win_tie_names(
             // engine's aggregate maps `K + 1` under `GROUP BY K + 1`
             // whole (lifting its K beside that GROUP BY is no query)
             let is_key = gkeys.iter().any(|g| *g == norm_sql_text(body) || *g == plain_k.to_string() || *g == (pos + 1).to_string());
-            let names: Vec<String> = if bare_col(body)
+            let key_cols: Vec<String> = if is_key && !bare_col(body) {
+                tokens(body).into_iter().filter(|t| parse_agg_item(t).is_none()).collect()
+            } else {
+                Vec::new()
+            };
+            let names: Vec<String> = if !key_cols.is_empty() {
+                // AN EXPRESSION GROUP KEY is no field of the aggregate's
+                // stream: the COLUMNS it reads are, each as the group's
+                // LAST-fed row spells it (the aggregate assigns them on
+                // every row; [GItem::Key] reads the last), lifted as `FC$L`
+                // columns, and the key's value is computed over them.
+                // Measured on 2182: `SELECT COALESCE(S, '?') CS, COUNT(*),
+                // RANK() OVER (ORDER BY COUNT(*)) .. GROUP BY 1` ties the
+                // count-1 groups '', 'ab', '?' - the '?' group's NULL S
+                // flag last, three fields - where `SELECT COALESCE(S, '?')
+                // CS, ROW_NUMBER() OVER (ORDER BY COUNT(*))` ties '', '?',
+                // 'ab' (two fields: S's length shares the flags' word);
+                // `COALESCE(S, '') .. GROUP BY 1` numbers 'c' before the ''
+                // group whose last row's S is NULL; `SUBSTRING(S FROM 1 FOR
+                // 1)` ties 'b' before the 'a' group whose last S is 'ab'
+                last_fed = true;
+                key_cols.iter().map(|tok| lift.name_for(tok, "FC$L")).collect()
+            } else if bare_col(body)
                 || parse_agg_item(body).is_some()
                 || is_key
                 || !tokens(body).iter().all(|t| groupable(t))
@@ -45893,6 +45919,13 @@ fn win_tie_names(
                     map_pos.push(pos);
                 }
             }
+            // a window key lifted on its own (`OVER (ORDER BY COUNT(*))`
+            // beside a COUNT(*) item) names this item's field
+            for (e, n) in lift.exprs.iter().filter(|(_, n)| n.starts_with("FC$W")) {
+                if norm_sql_text(e) == norm_sql_text(body) {
+                    w_same.push((n.clone(), format!("FC$I{}", plain_k)));
+                }
+            }
             // an ORDER BY key L1 lifts on its own (`ORDER BY COUNT(*)`
             // beside a COUNT(*) item) restores this item's field: the
             // outer record drops it as it drops a key it names directly
@@ -45904,6 +45937,20 @@ fn win_tie_names(
                     t.same.push((n.clone(), format!("FC$I{}", plain_k)));
                 }
             }
+        }
+        if last_fed {
+            // the window sorts' base stream is the aggregate's: the map's
+            // fields and what the windows read, a key restoring its item's
+            // field ([WinTie::key_alias]); the expression items read no
+            // field of their own
+            let mut base = map.clone();
+            for (_, n) in lift.exprs.iter().filter(|(_, n)| n.starts_with("FC$W")) {
+                if !base.contains(n) {
+                    base.push(n.clone());
+                }
+            }
+            t.base = Some(base);
+            t.same.extend(w_same.drain(..));
         }
     } else {
         // the FROM relations, each with its binding key and columns
@@ -61661,8 +61708,13 @@ fn build_group_items(
                     slot_descs.push(None);
                     continue;
                 }
-                if !key_fids.contains(&fid) {
-                    return None; // a selected column that is not grouped
+                // a selected column that is not grouped refuses - except
+                // the windowed rewrite's own `FC$L` column: a column an
+                // expression group key reads, as the group's LAST row
+                // spells it ([win_tie_names]; [GItem::Key] reads the last)
+                let last_fed = alias.as_deref().is_some_and(|a| a.starts_with("FC$L"));
+                if !key_fids.contains(&fid) && !last_fed {
+                    return None;
                 }
                 let (wire, sql_type, length, scale, sub_type) = wire_for(descs.get(fid)?);
                 // the engine describes a grouped key by its COLUMN name,
