@@ -2823,16 +2823,48 @@ fn build_records_info(inserted: i32, updated: i32, deleted: i32) -> Vec<u8> {
     d
 }
 
-/// One op_response carrying a describe buffer.
+/// One op_response carrying a describe buffer - and the prepare's
+/// WARNINGS, when the planner posted any ([PREPARE_WARNINGS]): a
+/// successful prepare with an unused CTE carries them in its status
+/// vector, which isql prints before the rows (measured: `SQL warning
+/// code = -104` / `-CTE "C" is not used in query`, then the rows).
 fn respond_prepare(s: &mut TcpStream, enc: &mut Option<Rc4>, describe: &[u8]) -> std::io::Result<()> {
+    let warnings = PREPARE_WARNINGS.with(|p| std::mem::take(&mut *p.borrow_mut()));
     let mut w = W::default();
     w.int(OP_RESPONSE)
         .int(0)
         .int(0)
         .int(0)
-        .bytes(describe)
-        .int(0);
+        .bytes(describe);
+    if !warnings.is_empty() {
+        // THE SUCCESS MARKER COMES FIRST: the engine's vector reads
+        // `isc_arg_gds 0`, then the warnings (captured raw) - a vector
+        // that OPENS with a warning item is read by libfbclient as an
+        // error and the connection dies on it (measured: isql printed the
+        // warning and then "Error reading data from the connection")
+        w.int(1).int(0);
+        write_cte_unused_warnings(&mut w, &warnings);
+    }
+    w.int(0);
     w.send(s, enc)
+}
+
+/// The "CTE is not used in query" warnings as the engine appends them
+/// to a status vector: ONE `isc_sqlwarn -104` header, then one
+/// `isc_dsql_cte_not_used` item per CTE, in declaration order (captured
+/// raw off 2182 with one, two and three unused CTEs). Nothing at all
+/// when there are none.
+fn write_cte_unused_warnings(w: &mut W, unused: &[String]) {
+    if unused.is_empty() {
+        return;
+    }
+    w.int(ISC_ARG_WARNING).int(GDS_SQLWARN).int(ISC_ARG_NUMBER).int(-104);
+    for name in unused {
+        w.int(ISC_ARG_WARNING)
+            .int(GDS_DSQL_CTE_NOT_USED)
+            .int(2) // isc_arg_string - @1, bare: the template quotes it
+            .bytes(name.as_bytes());
+    }
 }
 
 /// The describe buffer for N projected columns - the reciprocal of a
@@ -19658,6 +19690,7 @@ fn downgrade_rewritten(p: Plan) -> Plan {
             EvalErr::NotSelectable { .. }
             | EvalErr::ProcNoOutputs { .. }
             | EvalErr::TableUnknown { .. }
+            | EvalErr::ColumnUnknown { .. }
             | EvalErr::ProcUnknown { .. }
             | EvalErr::ProcArgMismatch(_),
         ) => Plan::Refused,
@@ -43057,17 +43090,14 @@ fn plan_join_bound(
             // the side's rows are a `RowSource::PlanRows`, and
             // [materialise_bound_src] binds that plan's projection
             // before materialising it at the fetch. This used to refuse.
+            // an inner diagnosis is carried, as the plain-FROM path
+            // carries it (the engine names the innermost scope)
+            if let Plan::RefusedEval(e) = &inner {
+                return Some(Plan::RefusedEval(e.clone()));
+            }
             let mut inner_cols = output_cols_of(&inner);
             if inner_cols.is_empty() {
                 return None;
-            }
-            if !declared.is_empty() {
-                if declared.len() != inner_cols.len() {
-                    return None;
-                }
-                for (c, n) in inner_cols.iter_mut().zip(declared.iter()) {
-                    c.name = n.clone();
-                }
             }
             // ...and the same law on a derived table used as a JOIN SIDE,
             // which never reaches the plain-FROM check in
@@ -43081,18 +43111,15 @@ fn plan_join_bound(
             // and returns None otherwise, and the lone-`COUNT(*)` fast path
             // that does the same - both of which REFUSE rather than answer,
             // so the law holds and the gap is recorded.
-            if let Some(at) = inner_cols.iter().position(|c| {
-                let plain = c.expr.is_none() && c.relation.is_some() && c.fname.is_some();
-                !plain && c.fname.as_deref().unwrap_or(c.name.as_str()) == c.name.as_str()
-            }) {
-                return Some(Plan::RefusedEval(EvalErr::DerivedFieldUnnamed {
-                    pos: at as i32 + 1,
-                    // an UNNAMED derived table names itself with nothing,
-                    // which is what the engine's own rendering does -
-                    // refusing here instead would turn a legal statement
-                    // into an error for want of a name it never needed
-                    table: tr.alias.clone().unwrap_or_default(),
-                }));
+            // THE ENGINE'S THREE COLUMN CHECKS - the declared list's
+            // count, an unnamed column, a duplicate name - in its order,
+            // by the one reader the plain-FROM path and the unused-CTE
+            // pass use too ([derived_columns_verdict]); an UNNAMED side
+            // reports itself as `<unnamed>`, as every message spells it
+            if let Some(e) =
+                derived_columns_verdict(&mut inner_cols, &declared, &tr.alias.clone().unwrap_or_default())
+            {
+                return Some(Plan::RefusedEval(e));
             }
             let (columns, descs) = derived_view(&inner_cols);
             let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
@@ -43295,9 +43322,20 @@ fn plan_join_bound(
     // across them, which is a -204 raised where the column resolves,
     // not here. Comparing the empty keys made this server refuse the
     // whole statement.
+    // Two ALIASES the same is the engine's -204 "alias conflicts with an
+    // alias in the same statement" ([GDS_ALIAS_CONFLICT_ERR]) - a CTE
+    // reference or a derived table counts as aliased by its name. Two
+    // UNALIASED mentions of one table are not that (measured: `FROM T1,
+    // T1` answers 36 rows) and stay a plain refusal here.
     for i in 0..sides.len() {
         for j in i + 1..sides.len() {
             if !sides[i].key.is_empty() && sides[i].key == sides[j].key {
+                if sides[i].rel_alias.is_some() && sides[j].rel_alias.is_some() {
+                    return Some(Plan::RefusedEval(EvalErr::AliasConflict(format!(
+                        "\"{}\"",
+                        sides[j].key
+                    ))));
+                }
                 return None;
             }
         }
@@ -44164,6 +44202,1359 @@ fn from_is_operand(b: &[u8], k: usize) -> bool {
     false
 }
 
+// ===================================================================
+// STATEMENT-LEVEL SEMANTIC CHECKS THE ENGINE RUNS AT PREPARE
+//
+// Five laws measured on 2182 that this server skipped, each answering
+// rows where the engine refuses: a derived table's duplicate / miscounted
+// columns, a CTE alias conflict (with the "not used" warnings the engine
+// attaches), a recursive member's join shape, a qualifier nothing in the
+// FROM binds (-206), and a WITH LOCK over a relation the request parser
+// will not lock.
+// ===================================================================
+
+/// The engine's three column checks on a derived table - and on a CTE,
+/// which is a derived table by another name - in the order
+/// PASS1_derived_table runs them ([GDS_DSQL_DERIVED_FIELD_DUP_NAME]):
+/// the declared column list's COUNT, then an UNNAMED column, then a
+/// DUPLICATE name. The declared names are laid over the body's on the
+/// way, since they are what the duplicate check compares (`DT (X, X)`
+/// reports X). An empty `alias` is an unnamed derived table, which every
+/// one of the messages spells `<unnamed>`.
+fn derived_columns_verdict(
+    inner_cols: &mut [ProjCol],
+    declared: &[String],
+    alias: &str,
+) -> Option<EvalErr> {
+    let table = if alias.is_empty() { "<unnamed>".to_string() } else { alias.to_string() };
+    if !declared.is_empty() {
+        if declared.len() != inner_cols.len() {
+            return Some(EvalErr::DerivedColumnCount {
+                table,
+                more: declared.len() > inner_cols.len(),
+            });
+        }
+        for (c, n) in inner_cols.iter_mut().zip(declared.iter()) {
+            c.name = n.clone();
+        }
+    } else if let Some(at) = inner_cols.iter().position(|c| {
+        // the DESCRIBE-slot test the unnamed check has always used: an
+        // unaliased expression carries its kind-name in both slots
+        let plain = c.expr.is_none() && c.relation.is_some() && c.fname.is_some();
+        !plain && c.fname.as_deref().unwrap_or(c.name.as_str()) == c.name.as_str()
+    }) {
+        return Some(EvalErr::DerivedFieldUnnamed { pos: at as i32 + 1, table });
+    }
+    // exact compare, first pair in list order (`ID, A, ID` reports ID)
+    for i in 0..inner_cols.len() {
+        for j in i + 1..inner_cols.len() {
+            if inner_cols[i].name == inner_cols[j].name {
+                return Some(EvalErr::DerivedFieldDup { name: inner_cols[i].name.clone(), table });
+            }
+        }
+    }
+    None
+}
+
+/// What `blr_writelock` says about locking `name` (par.cpp): None when
+/// the engine takes it, else one of its three refusals with the quoted
+/// schema-qualified name - virtual first, then system, then temporary,
+/// the order the parser tests them in (a MON$ table is both virtual and
+/// system and reports virtual). Read off the relation's RDB$RELATIONS
+/// row, the way [relation_schema] reads the schema: RDB$RELATION_TYPE 3
+/// is virtual (MON$, SEC$ - measured), 4 and 5 the two GTT kinds, and
+/// RDB$SYSTEM_FLAG 1 a system table.
+fn with_lock_relation_refusal(db: &Database, name: &str) -> Option<EvalErr> {
+    let want_rel = rel_row_name(db, name);
+    let (rcols, rdescs) = sys_rel(db, "RDB$RELATIONS")?;
+    let fid = |n: &str| rcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let name_f = fid("RDB$RELATION_NAME")?;
+    let (schema_f, flag_f, type_f) =
+        (fid("RDB$SCHEMA_NAME"), fid("RDB$SYSTEM_FLAG"), fid("RDB$RELATION_TYPE"));
+    let fmts = vec![(0u8, rdescs)];
+    let mut found: Option<(String, i64, i64)> = None;
+    for_each_catalog_record(db, 6, &fmts, usize::MAX, |v| {
+        let hit = matches!(v.get(name_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
+        if !hit || found.is_some() {
+            return;
+        }
+        let int_at = |f: Option<usize>| match f.and_then(|i| v.get(i)) {
+            Some(Value::Int(n)) => *n,
+            _ => 0,
+        };
+        let flag = int_at(flag_f);
+        let schema = match schema_f.and_then(|i| v.get(i)) {
+            Some(Value::Text(t)) => t.trim_end().to_string(),
+            _ => if flag == 0 { "PUBLIC" } else { "SYSTEM" }.to_string(),
+        };
+        found = Some((schema, flag, int_at(type_f)));
+    });
+    let (schema, flag, ty) = found?;
+    let code = if ty == 3 {
+        GDS_FORUPDATE_VIRTUALTBL
+    } else if flag != 0 {
+        GDS_FORUPDATE_SYSTBL
+    } else if ty == 4 || ty == 5 {
+        GDS_FORUPDATE_TEMPTBL
+    } else {
+        return None;
+    };
+    Some(EvalErr::ForUpdateTable { code, name: format!("\"{}\".\"{}\"", schema, want_rel) })
+}
+
+/// Which CTEs of a WITH the statement READS: those the main query names
+/// - anywhere in it, a subquery included (measured: a reference inside
+/// an IN-subquery keeps the CTE used) - and, transitively, those the
+/// bodies of used CTEs name. A name resolves to the FIRST CTE that
+/// carries it, which is how the engine's findCTE walks the list; a
+/// second CTE of the same name is therefore never used.
+fn cte_used(ctes: &[(String, ViewDef)], main: &str) -> Vec<bool> {
+    let idx_of = |r: &str| ctes.iter().position(|(n, _)| n.eq_ignore_ascii_case(r));
+    let mut used = vec![false; ctes.len()];
+    let mut stack: Vec<usize> = from_names(main).iter().filter_map(|r| idx_of(r)).collect();
+    while let Some(i) = stack.pop() {
+        if std::mem::replace(&mut used[i], true) {
+            continue;
+        }
+        stack.extend(from_names(&ctes[i].1.source).iter().filter_map(|r| idx_of(r)));
+    }
+    used
+}
+
+/// The context ALIASES the main query makes at its own scope level -
+/// what an unused CTE's definition, passed under its own name at the
+/// end of the statement, will conflict with ([GDS_ALIAS_CONFLICT_ERR]):
+/// every FROM item's alias, and a bare CTE reference's name (a CTE is a
+/// derived table aliased by its name). An unaliased base table makes
+/// NO alias (measured: `WITH T2 AS (...) SELECT * FROM PUBLIC.T2`
+/// answers with the warning), and contexts inside a subquery or a
+/// derived table sit one level deeper and never conflict (measured).
+fn main_level_aliases(main: &str, cte_names: &[String]) -> Vec<String> {
+    let Some((from, joins)) = split_query(main).and_then(|(_, t, ..)| parse_from(t)) else {
+        return Vec::new();
+    };
+    std::iter::once(&from)
+        .chain(joins.iter().map(|(_, r, _, _)| r))
+        .filter_map(|tr| match &tr.alias {
+            Some(a) if !a.is_empty() => Some(a.clone()),
+            Some(_) => None, // an unnamed derived table binds nothing
+            None if tr.schema.is_none() && cte_names.iter().any(|n| n == &tr.table) => {
+                Some(tr.table.clone())
+            }
+            None => None,
+        })
+        .collect()
+}
+
+/// The engine's end-of-statement pass over the UNUSED CTEs
+/// (checkUnusedCTEs, DsqlCompilerScratch.cpp), run after the main query
+/// planned: first ONE warning per unused CTE, in declaration order, then
+/// each unused definition is passed as the derived table it is - which
+/// makes a context under the CTE's name at the main level (a conflict
+/// with an alias already there, an earlier unused CTE's included) and
+/// runs the derived-table column checks. An error from that pass carries
+/// the whole warning list (measured on nine shapes: `c, c SELECT * FROM
+/// c` warns C once, `c, d, c SELECT * FROM c` warns D then C, `c (a) AS
+/// (SELECT 1, 2 ..), d ... SELECT * FROM d` is the count error with the
+/// warning, and so on).
+///
+/// `Ok(warnings)` is the list to attach to a SUCCESSFUL prepare;
+/// `Err(Some(e))` the engine's refusal; `Err(None)` a definition this
+/// server cannot pass at all - refused rather than answered, since the
+/// engine's own pass may have refused it for a reason this server has
+/// not learned.
+fn unused_ctes_verdict(
+    ctes: &[(String, ViewDef)],
+    used: &[bool],
+    main_aliases: &[String],
+    db: &Option<Database>,
+) -> Result<Vec<String>, Option<EvalErr>> {
+    let unused: Vec<String> = ctes
+        .iter()
+        .zip(used.iter())
+        .filter(|(_, u)| !**u)
+        .map(|((n, _), _)| n.clone())
+        .collect();
+    if unused.is_empty() {
+        return Ok(unused);
+    }
+    let mut level: Vec<String> = main_aliases.to_vec();
+    for (i, (name, _)) in ctes.iter().enumerate() {
+        if used[i] {
+            continue;
+        }
+        if level.iter().any(|a| a == name) {
+            return Err(Some(EvalErr::CteUnused {
+                err: Box::new(EvalErr::AliasConflict(format!("\"{}\"", name))),
+                unused,
+            }));
+        }
+        level.push(name.clone());
+        // the body, passed as the derived table `(<body>) NAME [(cols)]`
+        // it is - [splice_ctes] writes exactly that, and the derived
+        // table planner runs the column checks on it
+        let probe = format!("SELECT * FROM {}", render_canon_ref(name));
+        let Some(spliced) = splice_ctes(&probe, std::slice::from_ref(&ctes[i])) else {
+            return Err(None);
+        };
+        let mut ps: Vec<Option<Descriptor>> = Vec::new();
+        match plan_query_inner(&spliced, db, &mut ps) {
+            Some(Plan::RefusedEval(
+                e @ (EvalErr::DerivedFieldUnnamed { .. }
+                | EvalErr::DerivedFieldDup { .. }
+                | EvalErr::DerivedColumnCount { .. }),
+            )) => return Err(Some(EvalErr::CteUnused { err: Box::new(e), unused })),
+            Some(Plan::RefusedEval(_)) | Some(Plan::Refused) | None => return Err(None),
+            Some(_) if !ps.is_empty() => return Err(None),
+            Some(_) => {}
+        }
+    }
+    Ok(unused)
+}
+
+/// The members of a recursive CTE's body, each with whether a `UNION
+/// ALL` links it to the one before it (a bare UNION - `UNION DISTINCT`
+/// included - is `false`; the first member carries `true`, having no
+/// link). Split at the depth-0 UNION keywords.
+fn union_members(source: &str) -> Vec<(String, bool)> {
+    let up = mask_literals(&source.to_ascii_uppercase());
+    let word_after = |at: usize, w: &str| -> Option<usize> {
+        let rest = up[at..].trim_start();
+        (rest.starts_with(w)
+            && rest[w.len()..].chars().next().is_none_or(|c| !(c.is_alphanumeric() || c == '_')))
+        .then(|| at + (up[at..].len() - rest.len()) + w.len())
+    };
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let (mut at, mut start, mut linked_all) = (0usize, 0usize, true);
+    while let Some(u) = find_word_depth0(&up, "UNION", at) {
+        out.push((source[start..u].trim().to_string(), linked_all));
+        let after = u + "UNION".len();
+        let (next, all) = match (word_after(after, "ALL"), word_after(after, "DISTINCT")) {
+            (Some(n), _) => (n, true),
+            (None, Some(n)) => (n, false),
+            (None, None) => (after, false),
+        };
+        linked_all = all;
+        start = next;
+        at = next;
+    }
+    out.push((source[start..].trim().to_string(), linked_all));
+    out
+}
+
+/// The engine's checks on ONE recursive member (pass1RecursiveCte and
+/// pass1JoinIsRecursive), in their measured order: the FROM's join walk
+/// first - an OUTER join whose tree holds the self-reference, the CROSS
+/// / NATURAL shape (which the engine reports as a reference outside the
+/// FROM), then a second self-reference - then DISTINCT, GROUP BY, HAVING,
+/// an aggregate or window function, and a self-reference inside a
+/// subquery or derived table. None when the member passes, or when its
+/// FROM is a shape this reader does not parse (the caller then refuses
+/// as it always has).
+fn recursive_member_verdict(name: &str, member: &str) -> Option<EvalErr> {
+    let (proj, table_s, _, group, having, _) = split_query(member)?;
+    let quoted = || format!("\"{}\"", name);
+    let is_self =
+        |tr: &TableRef<'_>| tr.schema.is_none() && tr.table.eq_ignore_ascii_case(name);
+    // the join walk, one comma item (one join tree) at a time: the tree
+    // up to step k holds items 0..=k+1, and a node whose subtree holds
+    // the reference must be an INNER join. The step's own keyword decides
+    // CROSS / NATURAL, which parse_from folds into an inner step.
+    let mut refs_total = 0usize;
+    for part in split_top_level_commas(table_s) {
+        let (base, steps) = parse_from(part.trim())?;
+        let items: Vec<&TableRef<'_>> =
+            std::iter::once(&base).chain(steps.iter().map(|(_, r, _, _)| r)).collect();
+        let refs: Vec<usize> =
+            items.iter().enumerate().filter(|(_, tr)| is_self(tr)).map(|(i, _)| i).collect();
+        refs_total += refs.len();
+        if refs.is_empty() {
+            continue;
+        }
+        // the JOIN keywords of this item in text order - one per step
+        let pu = mask_literals(&part.to_ascii_uppercase());
+        let mut joins: Vec<usize> = Vec::new();
+        let mut from = 0;
+        while let Some(j) = find_word_depth0(&pu, "JOIN", from) {
+            joins.push(j);
+            from = j + "JOIN".len();
+        }
+        if joins.len() != steps.len() {
+            return None;
+        }
+        for (k, ((kind, _, _, _), j)) in steps.iter().zip(joins.iter()).enumerate() {
+            if !refs.iter().any(|&r| r <= k + 1) {
+                continue;
+            }
+            let before: Vec<&str> = pu[..*j].split_whitespace().rev().take(3).collect();
+            let cross = before.first().is_some_and(|w| *w == "CROSS");
+            let natural = before.iter().any(|w| *w == "NATURAL");
+            if cross || natural {
+                return Some(EvalErr::CteWrongReference(quoted()));
+            }
+            if !matches!(kind, JoinKind::Inner) {
+                return Some(EvalErr::CteOuterJoin);
+            }
+        }
+    }
+    if refs_total > 1 {
+        return Some(EvalErr::CteMultReferences);
+    }
+    let pu = mask_literals(&proj.to_ascii_uppercase());
+    if proj_distinct(&pu) {
+        return Some(EvalErr::CteWrongClause { name: name.to_string(), clause: "DISTINCT" });
+    }
+    if group.is_some() {
+        return Some(EvalErr::CteWrongClause { name: name.to_string(), clause: "GROUP BY" });
+    }
+    if having.is_some() {
+        return Some(EvalErr::CteWrongClause { name: name.to_string(), clause: "HAVING" });
+    }
+    // an aggregate or a window function in the select list
+    let b = pu.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_alphabetic() {
+            let st = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let word = &pu[st..i];
+            let mut j = i;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if (agg_named(word) || word == "OVER") && b.get(j) == Some(&b'(') {
+                return Some(EvalErr::CteRecursiveAggregate);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    // a self-reference somewhere other than a plain FROM item: every
+    // FROM/JOIN mention minus the top-level ones is inside a subquery or
+    // a derived table
+    let mentions = from_names(member).iter().filter(|r| r.eq_ignore_ascii_case(name)).count();
+    if mentions > refs_total {
+        return Some(EvalErr::CteWrongReference(quoted()));
+    }
+    None
+}
+
+/// The engine's verdict on a `WITH RECURSIVE` CTE whose body names
+/// itself, decided when the CTE is ADDED - before the main query, and
+/// for every recursive CTE of the WITH whether the main reads it or not
+/// (measured: an unused one with an outer join still refuses). Member
+/// by member: one that does not name the CTE after one that does is
+/// "non-recursive member after recursive"; a recursive one takes
+/// [recursive_member_verdict] and must be linked by UNION ALL. A body
+/// with no UNION at all "must be an UNION"; one whose members ALL recurse
+/// has no anchor.
+fn recursive_cte_verdict(name: &str, source: &str) -> Option<EvalErr> {
+    let members = union_members(source);
+    if members.len() == 1 {
+        return Some(EvalErr::CteNotAUnion(name.to_string()));
+    }
+    let names_it = |m: &str| from_names(m).iter().any(|r| r.eq_ignore_ascii_case(name));
+    let mut seen_rec = false;
+    for (i, (m, linked_all)) in members.iter().enumerate() {
+        if !names_it(m) {
+            if seen_rec {
+                return Some(EvalErr::CteNonRecursAfterRecurs(name.to_string()));
+            }
+            continue;
+        }
+        seen_rec = true;
+        if let Some(e) = recursive_member_verdict(name, m) {
+            return Some(e);
+        }
+        if i > 0 && !*linked_all {
+            return Some(EvalErr::CteUnionAll(name.to_string()));
+        }
+    }
+    if names_it(&members[0].0) {
+        return Some(EvalErr::CteMissNonRecursive(name.to_string()));
+    }
+    None
+}
+
+// -------------------------------------------------------------------
+// THE -206 OF A QUALIFIER NOTHING BINDS
+//
+// A qualified column reference resolves through the contexts of its own
+// query level and the levels around it, and a qualifier that names none
+// of them is "Column unknown" at the reference's first character - the
+// base name of an ALIASED table above all (`FROM T1 T ... T1.ID`), which
+// this server resolved as if the alias were optional. The engine reports
+// the FIRST such reference IN ITS OWN PASS ORDER, measured over ~90
+// shapes: the FROM's ON conditions and derived bodies first, then WHERE,
+// the select list, ORDER BY, GROUP BY, HAVING; inside a boolean the
+// RIGHT operand of AND / OR is passed first (so a chain reports its last
+// bad term), a comparison's left side first, an arithmetic's right
+// operand first, a subquery inline where it sits - except `IN (SELECT
+// ..)`, whose subquery precedes its left side, and a select-list
+// subquery, passed after the plain items.
+// -------------------------------------------------------------------
+
+/// One name a qualified reference may resolve through at one query
+/// level: a FROM item's alias, or an unaliased item's relation name -
+/// with its schema when it is a base relation, so `PUBLIC.T.C` resolves
+/// too. An alias is EXCLUSIVE: once given, the relation's own name binds
+/// nothing (measured: `FROM T1 T ... T1.ID` is -206 while `FROM T1, T1 T
+/// ... T1.ID` answers through the bare item).
+#[derive(Clone)]
+struct ScopeQual {
+    name: String,
+    schema: Option<String>,
+    /// the canonical base relation behind the name (a table or view),
+    /// whose column list decides a qualified reference that names a
+    /// column it does not have (measured: `T.NOPE` over `FROM T1 T` is
+    /// -206 `"T"."NOPE"` too); None for a CTE, a procedure, a derived
+    /// table - shapes whose columns this reader does not know
+    relation: Option<String>,
+}
+
+/// A scan's outcome: an offender, a clean text, or "stand aside" - a
+/// shape this reader does not parse, or a FROM item the catalog does not
+/// have (the planner's -204 comes first there).
+enum QualScan {
+    Hit { at: usize, len: usize, name: String },
+    /// a positionless refusal met on the way - a nested derived table's
+    /// column check ([derived_columns_verdict]), which the engine runs
+    /// while it passes the FROM and this server ran only at the fetch
+    Err(EvalErr),
+    Clean,
+    Aside,
+}
+
+/// The statement under scan: its text, the literal-masked upper-cased
+/// twin (same byte layout, so a slice of one indexes the other), the
+/// catalog, and the CTE names the FROM may bind.
+struct QualCtx<'a> {
+    sql: &'a str,
+    up: String,
+    db: &'a Database,
+    /// the same database as the planner takes it, for the derived-table
+    /// bodies the scan plans ahead of the FROM
+    dbo: &'a Option<Database>,
+    ctes: Vec<String>,
+    /// check the TOP level's derived tables too: the statement locks
+    /// (`WITH LOCK`), and the engine's column checks come before its
+    /// lock checks (measured: `(SELECT ID, ID FROM T) WITH LOCK` is the
+    /// duplicate, not the lock message)
+    check_top: bool,
+}
+
+/// The -206 the engine raises for `sql` at prepare, if any: the first
+/// qualified column reference whose qualifier resolves to nothing in
+/// scope, in the engine's pass order. Only SELECT / WITH / UPDATE /
+/// DELETE statements are read; anything else, and any shape the reader
+/// cannot parse, answers None and leaves the planner to decide.
+fn first_unresolved_qualifier(sql: &str, dbo: &Option<Database>) -> Option<EvalErr> {
+    let db = dbo.as_ref()?;
+    let body = sql.trim_start();
+    let body = &body[..body.trim_end().trim_end_matches(';').trim_end().len()];
+    let up = mask_literals(&sql.to_ascii_uppercase());
+    let check_top = {
+        let mut from = 0;
+        let mut locks = false;
+        while let Some(w) = find_word_depth0(&up, "WITH", from) {
+            from = w + "WITH".len();
+            if up[from..].trim_start().starts_with("LOCK") {
+                locks = true;
+                break;
+            }
+        }
+        locks
+    };
+    let mut ctx = QualCtx { sql, up, db, dbo, ctes: Vec::new(), check_top };
+    // the row-locking / optimizer tail is not a clause of the query, and
+    // it is cut off the text before the scan the way the planner cuts it
+    // ([strip_row_locking]); it holds no reference and no position moves
+    let body = {
+        let ub = ctx.up_of(body);
+        let after = |at: usize, w: &str| ub[at..].trim_start().starts_with(w);
+        let mut cut = ub.len();
+        let mut from = 0;
+        while let Some(w) = find_word_depth0(ub, "WITH", from) {
+            from = w + "WITH".len();
+            if after(from, "LOCK") {
+                cut = cut.min(w);
+                break;
+            }
+        }
+        if let Some(f) = find_depth0_for_update(ub) {
+            cut = cut.min(f);
+        }
+        if let Some(o) = find_word_depth0(ub, "OPTIMIZE", 0) {
+            cut = cut.min(o);
+        }
+        body[..cut].trim_end()
+    };
+    let head = ctx.up_of(body).split_whitespace().next().unwrap_or("").to_string();
+    let scan = match head.as_str() {
+        "SELECT" => ctx.select(body, &[]),
+        "WITH" => ctx.with(body),
+        "UPDATE" => ctx.update(body),
+        "DELETE" => ctx.delete(body),
+        _ => QualScan::Aside,
+    };
+    match scan {
+        QualScan::Hit { at, len, name } => {
+            let (line, col) = text_line_col(sql, &sql[at..at + len])?;
+            Some(EvalErr::ColumnUnknown { name, line, col })
+        }
+        QualScan::Err(e) => Some(e),
+        QualScan::Clean | QualScan::Aside => None,
+    }
+}
+
+/// Words a dotted name may legally follow without naming a column: a
+/// sequence (`NEXT VALUE FOR PUBLIC.G`), a cast target (`AS PUBLIC.D`,
+/// `TYPE OF COLUMN T.C`), a collation, a PLAN's index, a character set.
+const QUAL_SKIP_AFTER: [&str; 8] = ["FOR", "AS", "COLLATE", "COLUMN", "INDEX", "ORDER", "OF", "SET"];
+
+impl QualCtx<'_> {
+    /// the masked, upper-cased twin of a slice of the statement
+    fn up_of(&self, part: &str) -> &str {
+        let off = self.off_of(part);
+        &self.up[off..off + part.len()]
+    }
+    /// a slice's byte offset in the statement
+    fn off_of(&self, part: &str) -> usize {
+        part.as_ptr() as usize - self.sql.as_ptr() as usize
+    }
+
+    /// Does `quals` (the parts before the column, canonical) name a
+    /// context in `scopes`? One part: an alias or bare relation name at
+    /// any level, or the trigger contexts NEW / OLD. Two parts: an
+    /// unaliased base relation under that schema (measured:
+    /// `PUBLIC.RDB$DATABASE.X` over `FROM RDB$DATABASE` is -206 - the
+    /// schema must be the relation's own).
+    fn resolves(&self, scopes: &[Vec<ScopeQual>], quals: &[String], column: Option<&str>) -> bool {
+        let hits: Vec<&ScopeQual> = match quals {
+            [one] => {
+                if one == "NEW" || one == "OLD" {
+                    return true;
+                }
+                scopes.iter().flatten().filter(|q| &q.name == one).collect()
+            }
+            [sch, rel] => scopes
+                .iter()
+                .flatten()
+                .filter(|q| {
+                    &q.name == rel
+                        && match (q.schema.as_deref(), q.relation.as_deref()) {
+                            (Some(""), Some(r)) => relation_schema(self.db, r).as_deref() == Some(sch.as_str()),
+                            (Some(s), _) => s == sch,
+                            _ => false,
+                        }
+                })
+                .collect(),
+            _ => return true, // longer: not a shape this reader judges
+        };
+        if hits.is_empty() {
+            return false;
+        }
+        // ONE base relation answers to the name: the column must be its
+        // (a name bound twice - an outer level's too - is left to the
+        // planner, since which context the engine picks is not measured)
+        if let (Some(col), [one]) = (column, hits.as_slice()) {
+            if let Some(rel) = one.relation.as_deref() {
+                if let Some(meta) = self.db.relation_meta(rel) {
+                    return find_col(&meta.columns, col).is_some();
+                }
+            }
+        }
+        true
+    }
+
+    /// A SELECT (one query, or a UNION of them, each member in order).
+    fn select(&self, text: &str, outer: &[Vec<ScopeQual>]) -> QualScan {
+        let text = text.trim();
+        let up = self.up_of(text);
+        let mut members: Vec<&str> = Vec::new();
+        let (mut at, mut start) = (0usize, 0usize);
+        while let Some(u) = find_word_depth0(up, "UNION", at) {
+            members.push(&text[start..u]);
+            let mut next = u + "UNION".len();
+            let rest = up[next..].trim_start();
+            for w in ["ALL", "DISTINCT"] {
+                if rest.starts_with(w)
+                    && rest[w.len()..].chars().next().is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+                {
+                    next += (up[next..].len() - rest.len()) + w.len();
+                    break;
+                }
+            }
+            start = next;
+            at = next;
+        }
+        members.push(&text[start..]);
+        // a UNION's trailing ORDER BY belongs to the union, whose own
+        // rule (select-list positions only) the engine checks first
+        if members.len() > 1 {
+            let last = members.len() - 1;
+            if let Some(o) = find_word_depth0(self.up_of(members[last]), "ORDER", 0) {
+                members[last] = &members[last][..o];
+            }
+        }
+        for m in members {
+            let mut m = m.trim();
+            // a parenthesised member
+            while m.starts_with('(') && matching_paren(m.as_bytes(), 0) == Some(m.len() - 1) {
+                m = m[1..m.len() - 1].trim();
+            }
+            match self.member(m, outer) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        QualScan::Clean
+    }
+
+    /// One query: its FROM binds the level's names, then the clauses are
+    /// read in the engine's order.
+    fn member(&self, text: &str, outer: &[Vec<ScopeQual>]) -> QualScan {
+        let Some((proj, table_s, wh, group, having, order)) = split_query(text) else {
+            return QualScan::Aside;
+        };
+        let Some((from, joins)) = parse_from(table_s) else {
+            return QualScan::Aside;
+        };
+        let items: Vec<&TableRef<'_>> =
+            std::iter::once(&from).chain(joins.iter().map(|(_, r, _, _)| r)).collect();
+        let mut quals: Vec<ScopeQual> = Vec::new();
+        for tr in &items {
+            if tr.table.starts_with('(') {
+                if let Some(a) = tr.alias.as_ref().filter(|a| !a.is_empty()) {
+                    quals.push(ScopeQual { name: a.clone(), schema: None, relation: None });
+                }
+                continue;
+            }
+            let is_cte = tr.schema.is_none() && self.ctes.iter().any(|n| n == &tr.table);
+            // a base relation (the cached metadata first, the catalog
+            // walk for what it does not hold - a view), a procedure, or
+            // nothing - which is the planner's -204 first
+            let is_relation = !is_cte
+                && (self.db.relation_meta(&tr.table).is_some()
+                    || relation_schema(self.db, &tr.table).is_some());
+            if !is_cte && !is_relation && !procedure_defined(self.db, &tr.table) {
+                return QualScan::Aside;
+            }
+            let schema = if is_relation {
+                Some(match tr.schema {
+                    Some((sch, true)) => sch.to_string(),
+                    Some((sch, false)) => sch.to_ascii_uppercase(),
+                    None => String::new(), // the catalog's, read when asked
+                })
+            } else {
+                None
+            };
+            let relation = is_relation.then(|| tr.table.clone());
+            match &tr.alias {
+                Some(a) => quals.push(ScopeQual { name: a.clone(), schema: None, relation }),
+                None => quals.push(ScopeQual { name: tr.table.clone(), schema, relation }),
+            }
+        }
+        let mut scopes: Vec<Vec<ScopeQual>> = outer.to_vec();
+        scopes.push(quals);
+        // the FROM: a derived body where it sits, then the step's ON
+        for (i, tr) in items.iter().enumerate() {
+            if tr.table.starts_with('(') {
+                if let Some(close) = matching_paren(tr.span.as_bytes(), 0) {
+                    let inner = tr.span[1..close].trim();
+                    if self.up_of(inner).starts_with("SELECT") {
+                        match self.select(inner, &scopes) {
+                            QualScan::Clean => {}
+                            other => return other,
+                        }
+                    }
+                }
+                // ITS COLUMNS, checked as the engine checks them while it
+                // passes the FROM: a NESTED derived table (an IN / EXISTS
+                // body's) was planned at the fetch here, so its duplicate
+                // column raised after the header where the engine refuses
+                // the prepare (measured: `WHERE ID IN (SELECT X.ID FROM
+                // (SELECT ID, ID FROM T1) X)`). A body this server cannot
+                // plan on its own (a correlated one) is left to the planner.
+                if !outer.is_empty() || self.check_top {
+                    if let Some((inner, alias, declared)) = parse_derived_table(tr.whole) {
+                        let mut ps: Vec<Option<Descriptor>> = Vec::new();
+                        if let Some(plan) = plan_query_inner(inner, self.dbo, &mut ps) {
+                            let mut cols = output_cols_of(&plan);
+                            if !cols.is_empty() && ps.is_empty() {
+                                if let Some(e) = derived_columns_verdict(&mut cols, &declared, &alias) {
+                                    return QualScan::Err(e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if i >= 1 {
+                let on = joins[i - 1].2;
+                if !on.is_empty() && !on.starts_with('\u{0}') {
+                    match self.boolean(on, &scopes) {
+                        QualScan::Clean => {}
+                        other => return other,
+                    }
+                }
+            }
+        }
+        if let Some(w) = wh {
+            match self.boolean(w, &scopes) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        match self.list(proj, &scopes, true) {
+            QualScan::Clean => {}
+            other => return other,
+        }
+        for clause in [order, group] {
+            if let Some(c) = clause {
+                match self.list(c, &scopes, false) {
+                    QualScan::Clean => {}
+                    other => return other,
+                }
+            }
+        }
+        // a HAVING without a GROUP BY makes an aggregate query, and a
+        // PLAIN column in its select list is the engine's -104 ("Invalid
+        // expression in the select list", measured) before the HAVING is
+        // read - so that HAVING is left unread; `COUNT(*) ... HAVING
+        // MAX(T1.A) > 0` still reaches its -206 (measured)
+        if let Some(h) = having {
+            if group.is_none() && self.plain_column_in_list(proj) {
+                return QualScan::Clean;
+            }
+            return self.boolean(h, &scopes);
+        }
+        QualScan::Clean
+    }
+
+    /// Does a select list carry a bare column reference at its top level
+    /// - an identifier outside every parenthesis that is not a call and
+    /// not a keyword of the list's grammar?
+    fn plain_column_in_list(&self, proj: &str) -> bool {
+        let up = self.up_of(proj);
+        let b = up.as_bytes();
+        let (mut i, mut depth) = (0usize, 0i32);
+        while i < b.len() {
+            match b[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                c if depth == 0 && (c.is_ascii_alphabetic() || c == b'_' || c == b'"') => {
+                    let st = i;
+                    if c == b'"' {
+                        i += 1;
+                        while i < b.len() && b[i] != b'"' {
+                            i += 1;
+                        }
+                        i += 1;
+                    } else {
+                        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] == b'.') {
+                            i += 1;
+                        }
+                    }
+                    let word = &up[st..i.min(b.len())];
+                    let mut j = i;
+                    while j < b.len() && b[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if b.get(j) == Some(&b'(') {
+                        continue; // a call
+                    }
+                    if !matches!(
+                        word,
+                        "DISTINCT" | "ALL" | "FIRST" | "SKIP" | "AS" | "NULL" | "TRUE" | "FALSE" | "UNKNOWN"
+                            | "NOT" | "AND" | "OR" | "IS" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END"
+                            | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "CURRENT_USER"
+                            | "USER" | "LOCALTIME" | "LOCALTIMESTAMP"
+                    ) && !word.starts_with("XXX")
+                    {
+                        return true;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// A comma list of values (a select list, an ORDER BY, a GROUP BY)
+    /// in text order. `defer_sub` is the select list's rule: its
+    /// subqueries are passed after its plain items (measured: `SELECT
+    /// (SELECT T1.A ..), T1.B FROM T1 T` reports T1.B).
+    fn list(&self, text: &str, scopes: &[Vec<ScopeQual>], defer_sub: bool) -> QualScan {
+        for item in split_top_level_commas(text) {
+            match self.value(item, scopes, defer_sub) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        if defer_sub {
+            return self.subqueries_only(text, scopes);
+        }
+        QualScan::Clean
+    }
+
+    /// The subqueries of `text`, outermost ones in text order, each read
+    /// as a query level.
+    fn subqueries_only(&self, text: &str, scopes: &[Vec<ScopeQual>]) -> QualScan {
+        let up = self.up_of(text);
+        let b = up.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'(' {
+                let inner = up[i + 1..].trim_start();
+                if inner.starts_with("SELECT") {
+                    let Some(close) = matching_paren(text.as_bytes(), i) else { return QualScan::Aside };
+                    match self.select(&text[i + 1..close], scopes) {
+                        QualScan::Clean => {}
+                        other => return other,
+                    }
+                    i = close + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        QualScan::Clean
+    }
+
+    /// The depth-0 occurrences of `word` in `text`, as split points.
+    /// With `between_aware`, an AND that closes a BETWEEN is not one.
+    fn split_word<'t>(&self, text: &'t str, word: &str, between_aware: bool) -> Vec<&'t str> {
+        let up = self.up_of(text);
+        let mut out: Vec<&'t str> = Vec::new();
+        let (mut start, mut at, mut counted, mut pending) = (0usize, 0usize, 0usize, 0usize);
+        while let Some(p) = find_word_depth0(up, word, at) {
+            if between_aware {
+                let mut c = counted;
+                while let Some(bw) = find_word_depth0(&up[..p], "BETWEEN", c) {
+                    pending += 1;
+                    c = bw + "BETWEEN".len();
+                }
+                counted = p;
+                if pending > 0 {
+                    pending -= 1;
+                    at = p + word.len();
+                    continue;
+                }
+            }
+            out.push(&text[start..p]);
+            start = p + word.len();
+            at = start;
+        }
+        out.push(&text[start..]);
+        out
+    }
+
+    /// A boolean: OR operands right first, then AND operands right first,
+    /// a NOT stripped, a parenthesised group opened, a subquery read as a
+    /// level, and a plain term read as a value.
+    fn boolean(&self, text: &str, scopes: &[Vec<ScopeQual>]) -> QualScan {
+        let text = text.trim();
+        if text.is_empty() {
+            return QualScan::Clean;
+        }
+        let ors = self.split_word(text, "OR", false);
+        if ors.len() > 1 {
+            for p in ors.iter().rev() {
+                match self.boolean(p, scopes) {
+                    QualScan::Clean => {}
+                    other => return other,
+                }
+            }
+            return QualScan::Clean;
+        }
+        let ands = self.split_word(text, "AND", true);
+        if ands.len() > 1 {
+            for p in ands.iter().rev() {
+                match self.boolean(p, scopes) {
+                    QualScan::Clean => {}
+                    other => return other,
+                }
+            }
+            return QualScan::Clean;
+        }
+        let up = self.up_of(text);
+        if up.starts_with("NOT") && up[3..].chars().next().is_none_or(|c| !(c.is_alphanumeric() || c == '_')) {
+            return self.boolean(&text[3..], scopes);
+        }
+        if text.starts_with('(') && matching_paren(text.as_bytes(), 0) == Some(text.len() - 1) {
+            let inner = &text[1..text.len() - 1];
+            if self.up_of(inner).trim_start().starts_with("SELECT") {
+                return self.select(inner, scopes);
+            }
+            return self.boolean(inner, scopes);
+        }
+        self.value(text, scopes, false)
+    }
+
+    /// A value: a comparison's left side first, then its right - except
+    /// `IN (SELECT ..)`, whose subquery the engine passes first.
+    fn value(&self, text: &str, scopes: &[Vec<ScopeQual>], defer_sub: bool) -> QualScan {
+        let text = text.trim();
+        if text.is_empty() {
+            return QualScan::Clean;
+        }
+        let up = self.up_of(text);
+        let b = up.as_bytes();
+        // the first depth-0 comparison: an operator run, or a predicate
+        // keyword as a whole word
+        let mut depth = 0i32;
+        let mut split: Option<(usize, usize, bool)> = None; // (at, len, in-subquery)
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b'=' | b'<' | b'>' | b'!' | b'~' | b'^' if depth == 0 => {
+                    let st = i;
+                    while i < b.len() && matches!(b[i], b'=' | b'<' | b'>' | b'!' | b'~' | b'^') {
+                        i += 1;
+                    }
+                    split = Some((st, i - st, false));
+                    break;
+                }
+                c if depth == 0 && c.is_ascii_alphabetic() => {
+                    let st = i;
+                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                        i += 1;
+                    }
+                    let w = &up[st..i];
+                    if st > 0 && (b[st - 1].is_ascii_alphanumeric() || b[st - 1] == b'_' || b[st - 1] == b'$' || b[st - 1] == b'.') {
+                        continue; // the tail of a longer word
+                    }
+                    if matches!(w, "IS" | "IN" | "BETWEEN" | "LIKE" | "CONTAINING" | "STARTING" | "SIMILAR") {
+                        let sub = w == "IN" && up[i..].trim_start().starts_with("(SELECT");
+                        split = Some((st, i - st, sub));
+                        break;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let Some((at, len, sub_first)) = split else {
+            return self.arith(text, scopes, defer_sub);
+        };
+        let (left, right) = (&text[..at], &text[at + len..]);
+        let order: [&str; 2] = if sub_first { [right, left] } else { [left, right] };
+        for side in order {
+            match self.arith(side, scopes, defer_sub) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        QualScan::Clean
+    }
+
+    /// An arithmetic: the operands of the depth-0 `||`, `+`, `-`, `*`,
+    /// `/` RIGHT first (measured: `T1.A + T1.ID` reports T1.ID, and so
+    /// does `T1.A * 2 + T1.ID`).
+    fn arith(&self, text: &str, scopes: &[Vec<ScopeQual>], defer_sub: bool) -> QualScan {
+        let text = text.trim();
+        let up = self.up_of(text);
+        let b = up.as_bytes();
+        let mut cuts: Vec<(usize, usize)> = Vec::new();
+        let mut depth = 0i32;
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b'|' if depth == 0 && b.get(i + 1) == Some(&b'|') => {
+                    cuts.push((i, 2));
+                    i += 1;
+                }
+                b'+' | b'-' | b'*' | b'/' if depth == 0 => {
+                    // binary only after an operand: a sign or a lone
+                    // `*` is not, nor the `*` of `T.*`
+                    let prev = up[..i].trim_end().bytes().last();
+                    let operand_before = prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b')' || c == b'"');
+                    let star_of_ref = b[i] == b'*' && prev == Some(b'.');
+                    if operand_before && !star_of_ref {
+                        cuts.push((i, 1));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if cuts.is_empty() {
+            return self.operand(text, scopes, defer_sub);
+        }
+        let mut operands: Vec<&str> = Vec::new();
+        let mut start = 0;
+        for (at, len) in cuts {
+            operands.push(&text[start..at]);
+            start = at + len;
+        }
+        operands.push(&text[start..]);
+        for o in operands.iter().rev() {
+            match self.operand(o, scopes, defer_sub) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        QualScan::Clean
+    }
+
+    /// One operand: a sign stripped, a parenthesised group opened (a
+    /// subquery read as a level), a call's arguments in order, anything
+    /// else read for its references in text order.
+    fn operand(&self, text: &str, scopes: &[Vec<ScopeQual>], defer_sub: bool) -> QualScan {
+        let text = text.trim();
+        if text.is_empty() {
+            return QualScan::Clean;
+        }
+        if text.starts_with('-') || text.starts_with('+') {
+            return self.operand(&text[1..], scopes, defer_sub);
+        }
+        let up = self.up_of(text);
+        if text.starts_with('(') && matching_paren(text.as_bytes(), 0) == Some(text.len() - 1) {
+            let inner = &text[1..text.len() - 1];
+            if self.up_of(inner).trim_start().starts_with("SELECT") {
+                return if defer_sub { QualScan::Clean } else { self.select(inner, scopes) };
+            }
+            return self.value(inner, scopes, defer_sub);
+        }
+        if let Some(open) = up.find('(') {
+            let head = up[..open].trim_end();
+            let is_name = !head.is_empty()
+                && head.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'.');
+            if is_name && matching_paren(text.as_bytes(), open) == Some(text.len() - 1) {
+                if head == "GEN_ID" {
+                    return QualScan::Clean; // its first argument is a sequence name
+                }
+                let inner = &text[open + 1..text.len() - 1];
+                if self.up_of(inner).trim_start().starts_with("SELECT") {
+                    return if defer_sub { QualScan::Clean } else { self.select(inner, scopes) };
+                }
+                for a in split_top_level_commas(inner) {
+                    match self.value(a, scopes, defer_sub) {
+                        QualScan::Clean => {}
+                        other => return other,
+                    }
+                }
+                return QualScan::Clean;
+            }
+        }
+        self.refs(text, scopes, defer_sub)
+    }
+
+    /// The dotted references of `text` in text order - the lexer under
+    /// every reader above. A subquery met on the way is read as a level
+    /// (or skipped, when the select list defers them).
+    fn refs(&self, text: &str, scopes: &[Vec<ScopeQual>], defer_sub: bool) -> QualScan {
+        let base = self.off_of(text);
+        let sb = text.as_bytes();
+        let up = self.up_of(text);
+        let ub = up.as_bytes();
+        let ident_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+        let mut prev_word = String::new();
+        let mut i = 0;
+        while i < sb.len() {
+            let c = sb[i];
+            if c == b'\'' {
+                // a string literal, `''` an escaped quote
+                i += 1;
+                while i < sb.len() {
+                    if sb[i] == b'\'' {
+                        if sb.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            if c == b'(' {
+                if up[i + 1..].trim_start().starts_with("SELECT") {
+                    let Some(close) = matching_paren(sb, i) else { return QualScan::Aside };
+                    if !defer_sub {
+                        match self.select(&text[i + 1..close], scopes) {
+                            QualScan::Clean => {}
+                            other => return other,
+                        }
+                    }
+                    i = close + 1;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if c == b'"' || c.is_ascii_alphabetic() || c == b'_' {
+                let start = i;
+                let mut parts: Vec<(String, bool)> = Vec::new();
+                let mut star = false;
+                loop {
+                    if sb.get(i) == Some(&b'"') {
+                        let mut j = i + 1;
+                        while j < sb.len() {
+                            if sb[j] == b'"' {
+                                if sb.get(j + 1) == Some(&b'"') {
+                                    j += 2;
+                                    continue;
+                                }
+                                break;
+                            }
+                            j += 1;
+                        }
+                        if j >= sb.len() {
+                            return QualScan::Aside; // unterminated
+                        }
+                        parts.push((String::from_utf8_lossy(&sb[i + 1..j]).into_owned(), true));
+                        i = j + 1;
+                    } else {
+                        let st = i;
+                        while i < sb.len() && ident_byte(sb[i]) {
+                            i += 1;
+                        }
+                        parts.push((up[st..i].to_string(), false));
+                    }
+                    let mut j = i;
+                    while j < sb.len() && sb[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if sb.get(j) != Some(&b'.') {
+                        break;
+                    }
+                    j += 1;
+                    while j < sb.len() && sb[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if sb.get(j) == Some(&b'*') {
+                        star = true;
+                        i = j + 1;
+                        break;
+                    }
+                    if !(sb.get(j).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_' || *c == b'"')) {
+                        break;
+                    }
+                    i = j;
+                }
+                let end = i;
+                let mut j = i;
+                while j < sb.len() && ub[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let is_call = sb.get(j) == Some(&b'(');
+                let word = parts.first().map(|p| p.0.clone()).unwrap_or_default();
+                if is_call && parts.len() == 1 && word == "GEN_ID" {
+                    // a sequence name, not a column: step over the call
+                    let Some(close) = matching_paren(sb, j) else { return QualScan::Aside };
+                    i = close + 1;
+                    prev_word.clear();
+                    continue;
+                }
+                let qualified = parts.len() >= 2 || (star && !parts.is_empty());
+                if qualified && !is_call && !QUAL_SKIP_AFTER.contains(&prev_word.as_str()) {
+                    let quals: Vec<String> = if star {
+                        parts.iter().map(|p| p.0.clone()).collect()
+                    } else {
+                        parts[..parts.len() - 1].iter().map(|p| p.0.clone()).collect()
+                    };
+                    // the column, when its relation's list can judge it
+                    let column: Option<&str> = match (star, parts.last()) {
+                        (false, Some((c, quoted))) if *quoted || c != "RDB$DB_KEY" => Some(c.as_str()),
+                        _ => None,
+                    };
+                    if !self.resolves(scopes, &quals, column) {
+                        let mut name = parts.iter().map(|(p, _)| format!("\"{}\"", p)).collect::<Vec<_>>();
+                        if star {
+                            name.push("*".to_string());
+                        } else if let Some(last) = parts.last() {
+                            // the engine spells the record key bare, and short
+                            if !last.1 && last.0 == "RDB$DB_KEY" {
+                                *name.last_mut().unwrap() = "DB_KEY".to_string();
+                            }
+                        }
+                        return QualScan::Hit { at: base + start, len: end - start, name: name.join(".") };
+                    }
+                }
+                prev_word = if parts.len() == 1 && !parts[0].1 { word } else { String::new() };
+                continue;
+            }
+            if c.is_ascii_digit() {
+                while i < sb.len() && (ident_byte(sb[i]) || sb[i] == b'.') {
+                    i += 1;
+                }
+                prev_word.clear();
+                continue;
+            }
+            i += 1;
+        }
+        QualScan::Clean
+    }
+
+    /// `WITH [RECURSIVE] name [(cols)] AS (body) [, ...] <main>`: the
+    /// bodies in declaration order, then the main query - each a level
+    /// of its own, the main allowed to bind the CTE names.
+    fn with(&mut self, body: &str) -> QualScan {
+        // an owned twin: the CTE names are pushed while it is read
+        let up = self.up_of(body).to_string();
+        let b = body.as_bytes();
+        let ws = |i: &mut usize| {
+            while *i < b.len() && b[*i].is_ascii_whitespace() {
+                *i += 1;
+            }
+        };
+        let mut i = "WITH".len();
+        ws(&mut i);
+        if up[i..].starts_with("RECURSIVE") && !up[i + "RECURSIVE".len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            i += "RECURSIVE".len();
+            ws(&mut i);
+        }
+        let mut bodies: Vec<&str> = Vec::new();
+        loop {
+            ws(&mut i);
+            // the CTE's name, bare or quoted
+            let st = i;
+            let mut j = i;
+            if b.get(j) == Some(&b'"') {
+                j += 1;
+                while j < b.len() && b[j] != b'"' {
+                    j += 1;
+                }
+                j += 1;
+            } else {
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'$') {
+                    j += 1;
+                }
+            }
+            if j <= st || j > b.len() {
+                return QualScan::Aside;
+            }
+            let raw = &body[st..j];
+            let next = j;
+            let Some(name) = canon_ident(raw) else { return QualScan::Aside };
+            self.ctes.push(name);
+            i = next;
+            ws(&mut i);
+            if b.get(i) == Some(&b'(') {
+                let Some(close) = matching_paren(b, i) else { return QualScan::Aside };
+                i = close + 1;
+                ws(&mut i);
+            }
+            if !up[i..].starts_with("AS") {
+                return QualScan::Aside;
+            }
+            i += 2;
+            ws(&mut i);
+            if b.get(i) != Some(&b'(') {
+                return QualScan::Aside;
+            }
+            let Some(close) = matching_paren(b, i) else { return QualScan::Aside };
+            bodies.push(&body[i + 1..close]);
+            i = close + 1;
+            ws(&mut i);
+            if b.get(i) == Some(&b',') {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        let main = body[i..].trim();
+        for cte in bodies {
+            match self.select(cte, &[]) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        let head = self.up_of(main).split_whitespace().next().unwrap_or("").to_string();
+        match head.as_str() {
+            "SELECT" => self.select(main, &[]),
+            _ => QualScan::Aside,
+        }
+    }
+
+    /// The one target relation of an UPDATE or DELETE, as the level's
+    /// scope: its alias, else its name with its schema.
+    fn target_scope(&self, target: &str) -> Option<Vec<ScopeQual>> {
+        let tr = parse_table_ref(target.trim())?;
+        let schema = relation_schema(self.db, &tr.table)?;
+        let relation = Some(tr.table.clone());
+        Some(vec![match &tr.alias {
+            Some(a) => ScopeQual { name: a.clone(), schema: None, relation },
+            None => ScopeQual {
+                name: tr.table.clone(),
+                schema: Some(match tr.schema {
+                    Some((sch, true)) => sch.to_string(),
+                    Some((sch, false)) => sch.to_ascii_uppercase(),
+                    None => schema,
+                }),
+                relation,
+            },
+        }])
+    }
+
+    /// Where a DML statement's WHERE ends: the first depth-0 tail clause.
+    fn dml_tail(&self, up: &str, from: usize) -> usize {
+        ["RETURNING", "PLAN", "ORDER", "ROWS", "SKIP"]
+            .iter()
+            .filter_map(|w| find_word_depth0(up, w, from))
+            .min()
+            .unwrap_or(up.len())
+    }
+
+    /// `UPDATE <table> [alias] SET ... [WHERE ...]`: the WHERE first (the
+    /// engine passes it before the assignments - measured), then each
+    /// assignment's value.
+    fn update(&self, body: &str) -> QualScan {
+        let up = self.up_of(body);
+        if up["UPDATE".len()..].trim_start().starts_with("OR") {
+            return QualScan::Aside; // UPDATE OR INSERT
+        }
+        let Some(set) = find_word_depth0(up, "SET", 0) else { return QualScan::Aside };
+        let Some(scope) = self.target_scope(&body["UPDATE".len()..set]) else { return QualScan::Aside };
+        let scopes = vec![scope];
+        let after = set + "SET".len();
+        let end = self.dml_tail(up, after);
+        let wh = find_word_depth0(up, "WHERE", after).filter(|w| *w < end);
+        if let Some(w) = wh {
+            match self.boolean(&body[w + "WHERE".len()..end], &scopes) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        let assigns = &body[after..wh.unwrap_or(end)];
+        for a in split_top_level_commas(assigns) {
+            match self.value(a, &scopes, false) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        QualScan::Clean
+    }
+
+    /// `DELETE FROM <table> [alias] [WHERE ...]`.
+    fn delete(&self, body: &str) -> QualScan {
+        let up = self.up_of(body);
+        let Some(from) = find_word_depth0(up, "FROM", 0) else { return QualScan::Aside };
+        let after = from + "FROM".len();
+        let end = self.dml_tail(up, after);
+        let wh = find_word_depth0(up, "WHERE", after).filter(|w| *w < end);
+        let Some(scope) = self.target_scope(&body[after..wh.unwrap_or(end)]) else {
+            return QualScan::Aside;
+        };
+        match wh {
+            Some(w) => self.boolean(&body[w + "WHERE".len()..end], &[scope]),
+            None => QualScan::Clean,
+        }
+    }
+}
+
 /// The first FROM/JOIN item in `sql` naming a relation the catalog does
 /// not have - not a table, view, procedure or CTE. It is the fallback
 /// that lets a query refused generically still answer the engine's -204
@@ -44372,6 +45763,24 @@ enum WithLockVerdict {
 /// to right supplies the message (`COUNT(*) UNION ALL DISTINCT` reports
 /// aggregates, `DISTINCT UNION ALL COUNT(*)` reports DISTINCT).
 fn with_lock_verdict(sql: &str, db: &Option<Database>) -> WithLockVerdict {
+    // a FROM item the catalog does not have is the planner's -204 first
+    // (measured: `FROM NOSUCH WITH LOCK` and `FROM RDB$DATABASE, NOSUCH
+    // WITH LOCK` are both "Table unknown"): the clause is taken so the
+    // planner reaches the name
+    if let Some(dbr) = db.as_ref() {
+        let unknown_item = split_query(sql)
+            .and_then(|(_, t, ..)| parse_from(t))
+            .is_some_and(|(from, joins)| {
+                std::iter::once(&from).chain(joins.iter().map(|(_, r, _, _)| r)).any(|tr| {
+                    !tr.table.starts_with('(')
+                        && relation_schema(dbr, &tr.table).is_none()
+                        && !procedure_defined(dbr, &tr.table)
+                })
+            });
+        if unknown_item || first_unknown_relation(sql, dbr).is_some() {
+            return WithLockVerdict::Takes;
+        }
+    }
     let up = mask_literals(&sql.trim().to_ascii_uppercase());
     // A BARE UNION ANYWHERE outranks every other defect - including a
     // chain that MIXES it with UNION ALL, in either order (measured: both
@@ -44414,23 +45823,33 @@ fn with_lock_verdict(sql: &str, db: &Option<Database>) -> WithLockVerdict {
             });
         };
         for p in &parts {
-            if let Some(e) = with_lock_one_bad(p, db) {
+            if let Err(e) = with_lock_one_bad(p, db) {
                 return WithLockVerdict::Refuses(e);
             }
         }
+        // ...and the engine LOCKS a chain over a system table (measured:
+        // `SELECT 1 FROM RDB$DATABASE UNION ALL SELECT 1 FROM RDB$DATABASE
+        // WITH LOCK` answers two rows), so the parser's refusals below
+        // are the single statement's only
         return WithLockVerdict::Takes;
     }
     match with_lock_one_bad(sql, db) {
-        Some(e) => WithLockVerdict::Refuses(e),
-        None => WithLockVerdict::Takes,
+        Err(e) => WithLockVerdict::Refuses(e),
+        // the request PARSER's own refusals - a virtual, system or
+        // temporary table - come after every DSQL check
+        // ([with_lock_relation_refusal])
+        Ok(table) => match db.as_ref().and_then(|dbr| with_lock_relation_refusal(dbr, &table)) {
+            Some(e) => WithLockVerdict::Refuses(e),
+            None => WithLockVerdict::Takes,
+        },
     }
 }
 
-/// One branch, or a whole un-chained statement: the engine's defect for
-/// this target, or None when it locks it.
-fn with_lock_one_bad(sql: &str, db: &Option<Database>) -> Option<EvalErr> {
-    let simple = || Some(EvalErr::WithLock { code: GDS_WLOCK_SIMPLE, what: None });
-    let aggregates = || Some(EvalErr::WithLock { code: GDS_WLOCK_AGGREGATES, what: None });
+/// One branch, or a whole un-chained statement: the engine's DSQL defect
+/// for this target, or the one physical table it locks.
+fn with_lock_one_bad(sql: &str, db: &Option<Database>) -> Result<String, EvalErr> {
+    let simple = || Err(EvalErr::WithLock { code: GDS_WLOCK_SIMPLE, what: None });
+    let aggregates = || Err(EvalErr::WithLock { code: GDS_WLOCK_AGGREGATES, what: None });
     // A ROWS / OFFSET / FETCH TAIL says nothing about what is locked.
     // Measured: `select id from t1 rows 2 with lock` answers 1,2 (and
     // `count(*) .. rows 1 with lock` is the aggregates message, `distinct
@@ -44488,9 +45907,9 @@ fn with_lock_one_bad(sql: &str, db: &Option<Database>) -> Option<EvalErr> {
         }
     }
     if proj_distinct(&pu) {
-        return Some(EvalErr::WithLock { code: GDS_WLOCK_CONFLICT, what: Some("DISTINCT") });
+        return Err(EvalErr::WithLock { code: GDS_WLOCK_CONFLICT, what: Some("DISTINCT") });
     }
-    None
+    Ok(name.to_string())
 }
 
 /// The offset of a depth-0 `FOR UPDATE` in already masked, upper-cased
@@ -44694,10 +46113,21 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     // the limit-clause grammar around UNION is the PARSER's, so it is
     // judged on the text as sent, before any rewrite ([limit_clause_lint])
     let lint = if outermost { Some(limit_lint_scan_db(sql, db)) } else { None };
+    // THE ENGINE'S -206 FOR A QUALIFIER NOTHING BINDS, judged on the text
+    // as sent and only for a statement a client sent whole
+    // ([SEMANTIC_SCAN_ARMED]): a parser error (the lint's -104) still
+    // comes first, and a FROM item the catalog does not have makes the
+    // scan stand aside for the planner's -204
+    let armed = outermost && SEMANTIC_SCAN_ARMED.with(|a| a.replace(false));
+    let unresolved = match (&lint, db.as_ref()) {
+        (Some(LimitLint { err: None, .. }), Some(_)) if armed => first_unresolved_qualifier(sql, db),
+        _ => None,
+    };
     let out = match lint {
         // a -104, or the -204 of a FROM item the engine resolves before
         // its FIRST/SKIP check ([LimitLint::unknown])
         Some(LimitLint { err: Some(e), .. }) => (Plan::RefusedEval(e), Vec::new()),
+        _ if unresolved.is_some() => (Plan::RefusedEval(unresolved.unwrap()), Vec::new()),
         Some(LimitLint { unknown, .. }) => match (plan_query_outer(sql, db), unknown) {
             // a statement refused BARE that names an unknown relation the
             // keyword scan of the fallback misses - a comma-joined one:
@@ -44723,6 +46153,7 @@ fn plan_query_outer(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>)
     FN_CALLS.with(|l| l.borrow_mut().clear());
     clear_corr_registry();
     PREPARE_REFUSAL.with(|r| *r.borrow_mut() = None);
+    PREPARE_WARNINGS.with(|p| p.borrow_mut().clear());
     EXPLICIT_COLL_SEEN.with(|c| c.set(false));
     // the two system-SQL pieces libfbclient's array helpers lean on,
     // folded into plain SQL before planning - see [rewrite_system_sql]
@@ -52005,29 +53436,22 @@ fn plan_query_inner_at(
                 if !names_self {
                     continue;
                 }
-                match (recursive, split_recursive_body(&def.source)) {
-                    // measured: `WITH RECURSIVE X AS (SELECT .. FROM X)`
-                    // is "Recursive CTE (X) must be an UNION"
-                    (true, None) => {
-                        PREPARE_REFUSAL
-                            .with(|r| *r.borrow_mut() = Some(EvalErr::CteNotAUnion(name.clone())));
+                // THE RECURSIVE MEMBER'S SHAPE, judged when the CTE is
+                // ADDED - before the main query, read or not: no union,
+                // no anchor, an outer join, a second self-reference,
+                // DISTINCT / GROUP BY / HAVING, an aggregate, a reference
+                // outside the FROM, a bare UNION link
+                // ([recursive_cte_verdict]). This server answered the
+                // outer-join shape (five rows for `R LEFT JOIN T3`).
+                // WITHOUT the RECURSIVE keyword a self-reference is a
+                // plain cycle, union body or not (measured, both branch
+                // positions).
+                if recursive {
+                    if let Some(e) = recursive_cte_verdict(name, &def.source) {
+                        PREPARE_REFUSAL.with(|r| *r.borrow_mut() = Some(e));
                         return Some(Plan::Refused);
                     }
-                    (true, Some((seed, _))) => {
-                        if from_names(&seed).iter().any(|r| r.eq_ignore_ascii_case(name)) {
-                            // measured: a union whose FIRST member already
-                            // names the CTE has no anchor to start from
-                            PREPARE_REFUSAL.with(|r| {
-                                *r.borrow_mut() = Some(EvalErr::CteMissNonRecursive(name.clone()))
-                            });
-                            return Some(Plan::Refused);
-                        }
-                        legal_rec[i] = true;
-                    }
-                    // WITHOUT the RECURSIVE keyword a self-reference is a
-                    // plain cycle, union body or not (measured, both
-                    // branch positions)
-                    (false, _) => {}
+                    legal_rec[i] = true;
                 }
             }
             let edges: Vec<Vec<usize>> = ctes
@@ -52076,6 +53500,13 @@ fn plan_query_inner_at(
                 });
                 return Some(Plan::Refused);
             }
+            // WHICH CTEs THE STATEMENT READS, and the aliases its main
+            // query binds at its own level - both read off the text as
+            // written, before the bodies are spliced ([cte_used],
+            // [main_level_aliases]); the unused ones are passed AFTER
+            // the main query plans, as the engine passes them
+            let used = cte_used(&ctes, &main);
+            let main_aliases = main_level_aliases(&main, &cte_names);
             let self_referencing = ctes.len() == 1
                 && split_recursive_body(&ctes[0].1.source)
                     .is_some_and(|(_, rec)| bound_refs(&rec, &ctes[0].0) > 0);
@@ -52438,7 +53869,27 @@ fn plan_query_inner_at(
             // the CTE text is REWRITTEN - a positional refusal computed
             // against it would name the wrong column (see
             // [downgrade_rewritten])
-            return plan_query_inner(&cur, db, params).map(downgrade_rewritten);
+            let planned = plan_query_inner(&cur, db, params).map(downgrade_rewritten);
+            match planned {
+                Some(Plan::Refused) | Some(Plan::RefusedEval(_)) | None => return planned,
+                _ => {}
+            }
+            // THE UNUSED CTEs ARE PASSED LAST, as checkUnusedCTEs passes
+            // them: their "is not used" warnings ride a successful
+            // prepare ([PREPARE_WARNINGS]), and a definition that cannot
+            // stand - its name already an alias at the main level, its
+            // columns unnamed, duplicated or miscounted - refuses with
+            // those warnings attached ([unused_ctes_verdict]). This
+            // server answered `WITH C AS (..), C AS (..) SELECT * FROM C`
+            // from the first definition.
+            match unused_ctes_verdict(&ctes, &used, &main_aliases, db) {
+                Ok(warnings) => {
+                    PREPARE_WARNINGS.with(|p| *p.borrow_mut() = warnings);
+                    return planned;
+                }
+                Err(Some(e)) => return Some(Plan::RefusedEval(e)),
+                Err(None) => return Some(Plan::Refused),
+            }
         }
     }
 
@@ -52714,14 +54165,6 @@ fn plan_query_inner_at(
             if inner_cols.is_empty() {
                 return Some(Plan::Refused);
             }
-            if !declared.is_empty() {
-                if declared.len() != inner_cols.len() {
-                    return Some(Plan::Refused); // the engine counts them
-                }
-                for (c, n) in inner_cols.iter_mut().zip(declared.iter()) {
-                    c.name = n.clone();
-                }
-            }
             // EVERY COLUMN HERE MUST HAVE A NAME OF ITS OWN, and only
             // three things give one: a plain field reference, an explicit
             // `AS`, or the declared column list just applied above. An
@@ -52752,21 +54195,16 @@ fn plan_query_inner_at(
             // A UNION takes its name from the FIRST branch only (measured:
             // `1+1 AS E UNION ALL 2+2` answers E, `1+1 UNION ALL 2+2 AS E`
             // refuses), which the existing blank `fname` already encodes.
-            if let Some(at) = inner_cols.iter().position(|c| {
-                let plain = c.expr.is_none() && c.relation.is_some() && c.fname.is_some();
-                !plain && c.fname.as_deref().unwrap_or(c.name.as_str()) == c.name.as_str()
-            }) {
+            //
+            // The count of a DECLARED list and a DUPLICATE name are the
+            // same pass's other two checks, measured in that order around
+            // this one ([derived_columns_verdict]): `(SELECT ID, ID FROM
+            // T)` answered twelve rows here where the engine refuses.
+            if let Some(e) = derived_columns_verdict(&mut inner_cols, &declared, &alias) {
                 if trace {
-                    eprintln!(
-                        "[srv] plan: derived table {:?} column {} has no name",
-                        alias,
-                        at + 1
-                    );
+                    eprintln!("[srv] plan: derived table {:?} refused: {:?}", alias, e);
                 }
-                return Some(Plan::RefusedEval(EvalErr::DerivedFieldUnnamed {
-                    pos: at as i32 + 1,
-                    table: alias.clone(),
-                }));
+                return Some(Plan::RefusedEval(e));
             }
             // A SUBQUERY IN THE INNER SELECT LIST BLANKS EVERY
             // EXPRESSION COLUMN'S SYMBOLIC NAME, one level up. Measured
@@ -63424,8 +64862,80 @@ const GDS_DSQL_CTE_NOT_A_UNION: i32 = 336397229;
 const GDS_DSQL_CTE_MISS_NONRECURSIVE: i32 = 336397233;
 /// `isc_dsql_cte_not_used` (336397237) - "CTE \"@1\" is not used in
 /// query" - is a WARNING, not an error: the engine emits it and then
-/// ANSWERS the rows (measured). Recorded here rather than emitted,
-/// because this server has no warning channel on the prepare path yet.
+/// ANSWERS the rows (measured). It travels as `isc_arg_warning` items
+/// AFTER the error items of a failed prepare ([EvalErr::CteUnused]) and
+/// alone in the status vector of a successful one ([PREPARE_WARNINGS]);
+/// both shapes were captured raw off 2182 (`[warn isc_sqlwarn][num
+/// -104]` once, then `[warn cte_not_used][str name]` per CTE).
+const GDS_DSQL_CTE_NOT_USED: i32 = 336397237;
+/// `isc_sqlwarn` - "SQL warning code = @1", the header the engine puts
+/// in front of the first warning of a statement (once per vector, not
+/// once per warning - measured with two and three unused CTEs).
+const GDS_SQLWARN: i32 = 335544807;
+/// `isc_arg_warning` - the status-vector tag a warning item carries in
+/// place of `isc_arg_gds`; isql prints the run of them under their own
+/// header, without "Statement failed".
+const ISC_ARG_WARNING: i32 = 18;
+/// `isc_dsql_derived_field_dup_name` (336397221, -104, 42000): "column
+/// @1 was specified multiple times for derived table @2". The engine's
+/// PASS1_derived_table (pass1.cpp) runs THREE column checks in this
+/// order, each over the whole list before the next: the declared
+/// column list's COUNT (the two 54001 codes below), then an UNNAMED
+/// column ([GDS_DSQL_DERIVED_FIELD_UNNAMED]), then a DUPLICATE name -
+/// measured: `(SELECT 1 X, 1 X, 2 FROM RDB$DATABASE)` reports the
+/// unnamed column 3, `(SELECT ID, ID FROM T) DT (X)` the count. @1 is
+/// the name AS THE COLUMN CARRIES IT (`"id"` reports `id`) and the
+/// compare is exact; @2 is the alias, or `<unnamed>` for a derived
+/// table with none (all three codes spell it that way - measured).
+const GDS_DSQL_DERIVED_FIELD_DUP_NAME: i32 = 336397221;
+/// `isc_dsql_derived_table_more_columns` / `_less_columns` (SQLSTATE
+/// 54001): a declared column list longer / shorter than the body's
+/// select list, `@1` the derived table's alias.
+const GDS_DSQL_DERIVED_TABLE_MORE_COLUMNS: i32 = 336397218;
+const GDS_DSQL_DERIVED_TABLE_LESS_COLUMNS: i32 = 336397219;
+/// `isc_alias_conflict_err` (335544620, -204, 42000): "alias @1
+/// conflicts with an alias in the same statement", @1 PRE-QUOTED
+/// (`"C"`, and `"c"` for a quoted lower-case alias - captured raw).
+/// PASS1_make_context posts it when a context alias is already on the
+/// stack AT THE SAME SCOPE LEVEL: two FROM items of one query level
+/// with the same alias, and - the measured shape this server missed -
+/// an UNUSED CTE, whose definition is passed at the end of the
+/// statement (checkUnusedCTEs) and makes a level-1 context under its
+/// own name. Only ALIASES conflict: `FROM T1, T1` answers 36 rows.
+const GDS_ALIAS_CONFLICT_ERR: i32 = 335544620;
+/// `isc_dsql_field_err` (335544578, -206, 42S22): "Column unknown",
+/// followed by `isc_random` carrying the reference AS WRITTEN, quoted
+/// part by part, and the line/column of its FIRST CHARACTER. Measured
+/// on 2182 for a qualifier that names no context in scope - the base
+/// name of an ALIASED table (`FROM T1 T ... T1.ID`), a wrong schema, a
+/// name nothing in the FROM binds.
+const GDS_DSQL_FIELD_ERR: i32 = 335544578;
+/// The three `blr_writelock` refusals of par.cpp, raised while the
+/// request is PARSED - after every DSQL check (the -104 WITH LOCK
+/// messages, the -206 of a bad column) and BEFORE any row: "Cannot
+/// select virtual table @1 / system table @1 / temporary table @1 for
+/// update WITH LOCK", @1 the quoted schema-qualified name. Tested in
+/// that order (a MON$ table is both virtual and system and reports
+/// virtual). One gds code and one string, no wrapper, SQLSTATE HY000.
+const GDS_FORUPDATE_VIRTUALTBL: i32 = 335545073;
+const GDS_FORUPDATE_SYSTBL: i32 = 335545074;
+const GDS_FORUPDATE_TEMPTBL: i32 = 335545075;
+/// The recursive-CTE member checks of pass1RecursiveCte /
+/// pass1JoinIsRecursive (DsqlCompilerScratch.cpp), each under the -104
+/// wrapper with no "Invalid command" line. Measured order on one
+/// member: the FROM's join walk first (outer join, then the CROSS /
+/// NATURAL shape that reports "only in FROM clause", then a second
+/// self-reference), then DISTINCT, GROUP BY, HAVING, an aggregate or
+/// window function, a self-reference inside a subquery, and last the
+/// member's link to the one before it (a bare UNION). A NON-recursive
+/// member after a recursive one is its own error, before any of these.
+const GDS_DSQL_CTE_OUTER_JOIN: i32 = 336397227;
+const GDS_DSQL_CTE_MULT_REFERENCES: i32 = 336397228;
+const GDS_DSQL_CTE_WRONG_REFERENCE: i32 = 336397225;
+const GDS_DSQL_CTE_WRONG_CLAUSE: i32 = 336397231;
+const GDS_DSQL_CTE_UNION_ALL: i32 = 336397232;
+const GDS_DSQL_CTE_NONRECURS_AFTER_RECURS: i32 = 336397230;
+const GDS_DSQL_CTE_RECURSIVE_AGGREGATE: i32 = 336397321;
 const GDS_RANDOM: i32 = 335544382;
 
 /// isc_string_truncation - "string right truncation" - and
@@ -64125,6 +65635,145 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(GDS_DSQL_CTE_MISS_NONRECURSIVE)
                 .int(2) // isc_arg_string - @1 bare: the template quotes it
                 .bytes(name.as_bytes());
+        }
+        // the derived-table column family: the four lines of the unnamed
+        // vector above, then the diagnosis's own arguments
+        EvalErr::DerivedFieldDup { name, table } => {
+            w.int(1) // isc_arg_gds - Dynamic SQL Error
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds - isc_sqlerr
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1) // isc_arg_gds - "Invalid command"
+                .int(GDS_DSQL_COMMAND_ERR)
+                .int(1) // isc_arg_gds - the diagnosis
+                .int(GDS_DSQL_DERIVED_FIELD_DUP_NAME)
+                .int(2) // isc_arg_string - @1 the column's name
+                .bytes(name.as_bytes())
+                .int(2) // isc_arg_string - @2 the derived table's alias
+                .bytes(table.as_bytes());
+        }
+        EvalErr::DerivedColumnCount { table, more } => {
+            w.int(1) // isc_arg_gds - Dynamic SQL Error
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds - isc_sqlerr
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1) // isc_arg_gds - "Invalid command"
+                .int(GDS_DSQL_COMMAND_ERR)
+                .int(1) // isc_arg_gds - the diagnosis
+                .int(if *more {
+                    GDS_DSQL_DERIVED_TABLE_MORE_COLUMNS
+                } else {
+                    GDS_DSQL_DERIVED_TABLE_LESS_COLUMNS
+                })
+                .int(2) // isc_arg_string - @1 the derived table's alias
+                .bytes(table.as_bytes());
+        }
+        // three lines: "Dynamic SQL Error", "SQL error code = -204", the
+        // conflict (captured raw: no "Invalid command", no position)
+        EvalErr::AliasConflict(alias) => {
+            w.int(1) // isc_arg_gds - Dynamic SQL Error
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds - isc_sqlerr
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-204)
+                .int(1) // isc_arg_gds - the conflict
+                .int(GDS_ALIAS_CONFLICT_ERR)
+                .int(2) // isc_arg_string - @1, PRE-QUOTED
+                .bytes(alias.as_bytes());
+        }
+        // the error's own items first, then the warnings - the shape
+        // captured raw off 2182: ONE "SQL warning code = -104" header,
+        // then one "CTE "@1" is not used in query" per CTE
+        EvalErr::CteUnused { err, unused } => {
+            eval_status_items(w, err);
+            write_cte_unused_warnings(w, unused);
+        }
+        // the -206 "Column unknown" family: the same five-item shape as
+        // the -204 "Table unknown", with the field code in place of the
+        // relation one (captured raw)
+        EvalErr::ColumnUnknown { name, line, col } => {
+            w.int(1) // isc_arg_gds - Dynamic SQL Error
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds - isc_sqlerr
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-206)
+                .int(1) // isc_arg_gds - Column unknown
+                .int(GDS_DSQL_FIELD_ERR)
+                .int(1) // isc_arg_gds - isc_random
+                .int(GDS_RANDOM)
+                .int(2) // isc_arg_string - the reference, PRE-QUOTED
+                .bytes(name.as_bytes())
+                .int(1) // isc_arg_gds - At line @1, column @2
+                .int(GDS_DSQL_LINE_COL_ERROR)
+                .int(ISC_ARG_NUMBER)
+                .int(*line as i32)
+                .int(ISC_ARG_NUMBER)
+                .int(*col as i32);
+        }
+        // one gds code and its quoted relation, no wrapper - isql prints
+        // two lines under SQLSTATE HY000 (captured raw)
+        EvalErr::ForUpdateTable { code, name } => {
+            w.int(1) // isc_arg_gds
+                .int(*code)
+                .int(2) // isc_arg_string - "SCHEMA"."NAME"
+                .bytes(name.as_bytes());
+        }
+        // the recursive-member family: three lines, as the CTE vectors
+        // above, plus the diagnosis's own arguments where it has any
+        EvalErr::CteOuterJoin
+        | EvalErr::CteMultReferences
+        | EvalErr::CteRecursiveAggregate
+        | EvalErr::CteWrongReference(_)
+        | EvalErr::CteWrongClause { .. }
+        | EvalErr::CteUnionAll(_)
+        | EvalErr::CteNonRecursAfterRecurs(_) => {
+            w.int(1)
+                .int(GDS_DSQL_ERROR)
+                .int(1)
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1);
+            match e {
+                EvalErr::CteOuterJoin => {
+                    w.int(GDS_DSQL_CTE_OUTER_JOIN);
+                }
+                EvalErr::CteMultReferences => {
+                    w.int(GDS_DSQL_CTE_MULT_REFERENCES);
+                }
+                EvalErr::CteRecursiveAggregate => {
+                    w.int(GDS_DSQL_CTE_RECURSIVE_AGGREGATE);
+                }
+                EvalErr::CteWrongReference(name) => {
+                    w.int(GDS_DSQL_CTE_WRONG_REFERENCE)
+                        .int(2) // isc_arg_string - @1 PRE-QUOTED (the template parenthesises)
+                        .bytes(name.as_bytes());
+                }
+                EvalErr::CteWrongClause { name, clause } => {
+                    w.int(GDS_DSQL_CTE_WRONG_CLAUSE)
+                        .int(2) // isc_arg_string - @1 bare: the template quotes it
+                        .bytes(name.as_bytes())
+                        .int(2) // isc_arg_string - @2 the clause keyword
+                        .bytes(clause.as_bytes());
+                }
+                EvalErr::CteUnionAll(name) => {
+                    w.int(GDS_DSQL_CTE_UNION_ALL)
+                        .int(2) // isc_arg_string - @1 bare: the template parenthesises
+                        .bytes(name.as_bytes());
+                }
+                EvalErr::CteNonRecursAfterRecurs(name) => {
+                    w.int(GDS_DSQL_CTE_NONRECURS_AFTER_RECURS)
+                        .int(2) // isc_arg_string - @1 bare: the template quotes it
+                        .bytes(name.as_bytes());
+                }
+                _ => unreachable!("narrowed by the arm above"),
+            }
         }
         EvalErr::ReadOnlyView(name) => {
             w.int(1) // isc_arg_gds
@@ -67465,6 +69114,20 @@ thread_local! {
     /// the buffer it came from, so a position measured on a borrowed
     /// slice of it can be placed in the whole ([text_line_col])
     static STMT_TEXT: std::cell::RefCell<Option<(usize, String)>> = std::cell::RefCell::new(None);
+    /// the CTEs the statement being prepared declares and never reads:
+    /// the engine answers the rows AND posts one "CTE is not used"
+    /// warning per name in the prepare's status vector. Cleared with
+    /// [PREPARE_REFUSAL], set by the CTE planner, taken by
+    /// [respond_prepare]; a plan that warns is not cached, so the
+    /// second prepare of the same text warns too, as the engine's does
+    static PREPARE_WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// set by the op_prepare / op_exec_immediate handlers right before
+    /// the outermost [plan_query] of a CLIENT statement, and taken by
+    /// it: the -206 scan of [first_unresolved_qualifier] runs only on
+    /// text a client sent whole. A SELECT a PSQL body or a MERGE source
+    /// hands to the planner may qualify a column by a cursor or a
+    /// context this scanner cannot see, and must not be refused for it.
+    static SEMANTIC_SCAN_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 thread_local! {
@@ -77980,6 +79643,52 @@ enum EvalErr {
     /// `I IS NOT FALSE` - which the engine refuses AT PREPARE
     /// ([GDS_INVALID_BOOLEAN_USAGE] under the -104 wrapper, measured)
     InvalidBooleanUsage,
+    /// two columns of a derived table (or CTE) carrying the same name
+    /// ([GDS_DSQL_DERIVED_FIELD_DUP_NAME]): `name` as the column carries
+    /// it, `table` the alias or `<unnamed>`
+    DerivedFieldDup { name: String, table: String },
+    /// a derived table's declared column list whose count differs from
+    /// its body's select list: `more` when the LIST is the longer one
+    /// ([GDS_DSQL_DERIVED_TABLE_MORE_COLUMNS] / `_LESS_`, 54001)
+    DerivedColumnCount { table: String, more: bool },
+    /// two contexts at one query level under the same alias
+    /// ([GDS_ALIAS_CONFLICT_ERR]); the string is PRE-QUOTED
+    AliasConflict(String),
+    /// an error the engine raised while passing the statement's UNUSED
+    /// CTEs (checkUnusedCTEs): the error's own items, then the "is not
+    /// used" warning for every unused CTE in declaration order - the
+    /// warnings are posted BEFORE the definitions are passed, so they
+    /// name the whole unused set, the failing one included
+    CteUnused { err: Box<EvalErr>, unused: Vec<String> },
+    /// a qualified column reference whose qualifier names nothing in
+    /// scope ([GDS_DSQL_FIELD_ERR], -206): `name` pre-quoted as written
+    /// (`"T1"."ID"`, `"PUBLIC"."T1"."ID"`, `"T1".*`, `"T1".DB_KEY`),
+    /// `line`/`col` its first character. Built from the statement as
+    /// sent, so [downgrade_rewritten] drops it like the -204
+    ColumnUnknown { name: String, line: i64, col: i64 },
+    /// `WITH LOCK` over a relation the request parser refuses to lock:
+    /// `code` one of [GDS_FORUPDATE_VIRTUALTBL] / `_SYSTBL` / `_TEMPTBL`,
+    /// `name` the quoted schema-qualified relation
+    ForUpdateTable { code: i32, name: String },
+    /// the recursive member of a CTE is a side of an OUTER join
+    CteOuterJoin,
+    /// the recursive member names the CTE twice in one FROM
+    CteMultReferences,
+    /// the recursive member names the CTE somewhere other than a plain
+    /// FROM item - a subquery, a derived table, a CROSS or NATURAL join
+    /// side (measured: both report this); the string is pre-quoted
+    CteWrongReference(String),
+    /// "Recursive member of CTE '@1' has @2 clause": DISTINCT, GROUP BY
+    /// or HAVING on a recursive member (the name bare, the template
+    /// quotes it)
+    CteWrongClause { name: String, clause: &'static str },
+    /// a recursive member linked to the one before it by a bare UNION
+    CteUnionAll(String),
+    /// a member that does not name the CTE, after one that does
+    CteNonRecursAfterRecurs(String),
+    /// an aggregate or window function in a recursive member's select
+    /// list
+    CteRecursiveAggregate,
 }
 
 /// What an expression's result is typed as - which drives its wire form
@@ -86909,6 +88618,17 @@ fn note_plan_read_rows() {
 /// Did the plan just built read row data? Clears the flag.
 fn took_plan_read_rows() -> bool {
     PLAN_READ_ROWS.with(|f| f.replace(false))
+}
+
+/// May the plan just built be kept in the statement cache? Not when it
+/// read row data ([took_plan_read_rows]), and not when it posted a
+/// prepare WARNING ([PREPARE_WARNINGS]): a cached plan answers the next
+/// prepare of the same text without the planner, and the engine warns
+/// on every prepare.
+fn plan_cacheable() -> bool {
+    let read = took_plan_read_rows();
+    let warned = PREPARE_WARNINGS.with(|p| !p.borrow().is_empty());
+    !read && !warned
 }
 
 /// Forget whatever the LAST plan read - called immediately before a
@@ -109208,7 +110928,9 @@ fn after_auth(
                     respond_name_too_long(&mut s, &mut enc, l, c)?;
                     continue;
                 }
+                SEMANTIC_SCAN_ARMED.with(|a| a.set(true));
                 let (p, _ps) = plan_query(&text, &database);
+                SEMANTIC_SCAN_ARMED.with(|a| a.set(false));
                 // op_sql_response carries the single output message (a
                 // scalar row: 4-byte null bitmap then the BIGINT), then a
                 // plain op_response echoes the transaction handle. A
@@ -109281,6 +111003,9 @@ fn after_auth(
                 // the recorded plan is stale: the next execute must record
                 // the NEW one rather than restore the old
                 prepared_plans.remove(&h);
+                // a warning the previous prepare posted and never sent
+                // (it failed) must not ride this one's response
+                PREPARE_WARNINGS.with(|p| p.borrow_mut().clear());
                 read_int(&mut s, &mut dec)?; // dialect
                 let sql = read_wire_bytes(&mut s, &mut dec)?; // sql
                 let prep_items = read_wire_bytes(&mut s, &mut dec)?; // items
@@ -109533,7 +111258,15 @@ fn after_auth(
                     // DELETE / UPDATE whose IN-subquery carries `order by
                     // .. union` or `rows 1 union` deleted / updated.
                     let dml_lint = limit_lint_scan_db(&stmt_sql, &database).err;
-                    let planned = if let Some(e) = dml_lint {
+                    // ...and so does the -206 of a qualifier nothing binds
+                    // - the base name of an aliased target (`UPDATE T1 T
+                    // ... WHERE T1.ID = 1`), judged on the whole statement
+                    // ([first_unresolved_qualifier])
+                    let dml_unresolved = match (&dml_lint, database.as_ref()) {
+                        (None, Some(_)) => first_unresolved_qualifier(&stmt_sql, &database),
+                        _ => None,
+                    };
+                    let planned = if let Some(e) = dml_lint.or(dml_unresolved) {
                         Some((std::rc::Rc::new(Plan::RefusedEval(e)), std::rc::Rc::new(Vec::new())))
                     } else { timed("plan(dml)", || {
                         let build = || {
@@ -109569,7 +111302,7 @@ fn after_auth(
                                     clear_plan_read_rows();
                                     build()
                                 },
-                                || !took_plan_read_rows(),
+                                || plan_cacheable(),
                             ),
                             None => build().map(|(p, d)| {
                                 (std::rc::Rc::new(p), std::rc::Rc::new(d))
@@ -109679,6 +111412,11 @@ fn after_auth(
                         let up = stmt_sql.to_ascii_uppercase();
                         user_function_sigs(db).keys().any(|n| sql_calls_name(&up, n))
                     });
+                    // a CLIENT statement, whole: the -206 qualifier scan
+                    // may run on it ([SEMANTIC_SCAN_ARMED]) - disarmed
+                    // again after, since a cache hit never reaches the
+                    // planner that would have taken the flag
+                    SEMANTIC_SCAN_ARMED.with(|a| a.set(true));
                     let (p, ps) = timed("plan(select)", || match database.as_ref() {
                         Some(db) if !calls_fn => db
                             .stmts
@@ -109689,7 +111427,7 @@ fn after_auth(
                                     clear_plan_read_rows();
                                     Some(plan_query(&stmt_sql, &database))
                                 },
-                                || !took_plan_read_rows(),
+                                || plan_cacheable(),
                             )
                             .expect("the planner answers every text"),
                         _ => {
@@ -109697,6 +111435,7 @@ fn after_auth(
                             (std::rc::Rc::new(p), std::rc::Rc::new(ps))
                         }
                     });
+                    SEMANTIC_SCAN_ARMED.with(|a| a.set(false));
                     fn_calls = std::rc::Rc::new(FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut())));
                     // A REFUSED STATEMENT FAILS AT PREPARE, which is where
                     // the engine fails an unsupported one too. Answering
