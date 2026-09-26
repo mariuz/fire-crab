@@ -47,6 +47,18 @@
 #      no quote doubling, a CHAR's pad trimmed, DOUBLE `%#.16g`, FLOAT
 #      `%#.8g`.
 #
+#  11. the review of 1-9, each measured: an UPDATE resolves EVERY SET
+#      target before its WHERE and its values; a JOIN's ON sees its own
+#      join tree only, stacked in its own order (the 42702 lists, the
+#      -206 of an earlier comma item); the grammar's own words after USING
+#      / SUB_TYPE / MODE / HASH / ON OVERFLOW and KEY / IV are no column;
+#      an aggregate's FILTER and WITHIN GROUP clauses are aggregated, and
+#      LISTAGG is an aggregate; the implicit INSERT list leaves a COMPUTED
+#      column out; a bare `*` beside another item is Token unknown; a
+#      DECFLOAT literal's own pair of vectors. What the diagnosis cannot
+#      name (the engine answers, or raises a 22009 zone error) stays the
+#      BARE refusal - `bare` cells, which fail on any other vector.
+#
 # RECORDED, not fixed (section 10 - refusals, never a wrong answer): a
 # window over an aggregate, COALESCE of a DATE and a text, DATEADD
 # (WEEKDAY), a UNION of incomparable types (HY004 "UNION"), a numeric
@@ -94,6 +106,8 @@ CREATE TABLE TDOM (P D_POS);
 CREATE TABLE KX (D DATE, V VARCHAR(10), F DOUBLE PRECISION, C CHAR(3), W FLOAT, CONSTRAINT KX_UQ UNIQUE (D, V, F, C, W));
 CREATE TABLE KW (F DOUBLE PRECISION PRIMARY KEY);
 CREATE TABLE KZ (V VARCHAR(5) PRIMARY KEY);
+CREATE TABLE TC (A VARCHAR(5), B COMPUTED BY (A || 'x'));
+CREATE TABLE TT (I INTEGER, TM TIME, TSP TIMESTAMP, DC DECFLOAT(16), DD DECFLOAT(34), DT DATE);
 COMMIT;
 INSERT INTO KX VALUES (DATE '2020-01-02', 'it''s', 1.25e-5, 'ab', 3.14);
 INSERT INTO KW VALUES (1.5);
@@ -161,6 +175,19 @@ refused() { # <label> <script> <engine-output>
     elif [ "${fv#*Statement failed}" = "$fv" ]; then
         echo "FAIL $1 - this server neither agrees nor refuses"; echo "     fc =[$fv]"; fail=1
     else echo "OK   $1 (recorded: the engine [${ev:0:70}], this server refuses)"; fi
+}
+# REFUSED BARE: where the diagnosis cannot name the engine's answer or
+# vector, the refusal stays the bare `42000 / Dynamic SQL Error` - never a
+# wrong vector. The engine's output pinned, this server's the bare one.
+bare() { # <label> <script> <engine-output>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(sess "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2")
+    if [ "$ev" != "$3" ]; then echo "FAIL $1 - THE ENGINE ANSWERS [$ev], not the pinned [$3]"; fail=1
+    elif [ "$ev" = "$fv" ]; then echo "FAIL $1 - THIS SERVER NOW AGREES; promote the cell"; fail=1
+    elif [ "$fv" != 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error' ]; then
+        echo "FAIL $1 - not the bare refusal"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
+    else echo "OK   $1 (bare refusal; the engine [${ev:0:70}])"; fi
 }
 # RECORDED DIVERGENCE: both sides pinned; fails when either moves
 differs() { # <label> <script> <engine-output> <fc-output>
@@ -378,8 +405,88 @@ refused '10 RECORDED an UPDATE'\''s unconvertible literal: the engine raises per
 differs '10 RECORDED the tie order of a UNION ALL under ORDER BY' 'SELECT ID, V FROM T1 UNION ALL SELECT T1ID, S FROM T2 ORDER BY 1;' 'ID V|1 one|1 two|1 apple|2 three|2 banana|3 cherry' 'ID V|1 apple|1 one|1 two|2 banana|2 three|3 cherry'
 
 ran=$((ran + 1))
+echo '--- 11. THE REVIEW OF THE DIAGNOSIS: UPDATE TARGETS FIRST, AN ON'\''S OWN SCOPE, THE GRAMMAR'\''S WORDS, FILTER / WITHIN GROUP, COMPUTED COLUMNS, THE LITERALS'
+pin '11 UPDATE: every SET target first, then the WHERE' 'UPDATE T3 SET NOPE1 = NOPE2 WHERE NOPE3 = 1; ROLLBACK;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE1"|-At line 1, column 15'
+pin '11 UPDATE: a target before the WHERE' 'UPDATE T3 SET NOPE1 = 1 WHERE NOPE3 = 1; ROLLBACK;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE1"|-At line 1, column 15'
+pin '11 UPDATE: the second target before the first value' 'UPDATE T3 SET K = NOPE2, NOPE1 = 1; ROLLBACK;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE1"|-At line 1, column 26'
+pin '11 UPDATE: the second target before the WHERE and the values' 'UPDATE T3 SET K = 1, NOPE1 = NOPE2 WHERE NOPE3 = 1; ROLLBACK;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE1"|-At line 1, column 22'
+pin '11 UPDATE: valid targets - the WHERE before the values' 'UPDATE T3 SET K = NOPE2, NAME = NOPE5 WHERE NOPE3 = 1; ROLLBACK;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE3"|-At line 1, column 45'
+pin '11 UPDATE: a qualified target first too' 'UPDATE T3 SET T3.NOPE1 = 1 WHERE T3.NOPE3 = 1; ROLLBACK;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"T3"."NOPE1"|-At line 1, column 15'
+pin '11 UPDATE: an aliased target first too' 'UPDATE T3 X SET X.NOPE1 = X.NOPE2 WHERE X.NOPE3 = 1; ROLLBACK;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"X"."NOPE1"|-At line 1, column 17'
+pin '11 ON scope: a JOIN'\''s ON lists T1 then T2' 'SELECT T1.ID FROM T1 JOIN T2 ON ID = 1;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T1" and table "PUBLIC"."T2"|-ID'
+pin '11 ON scope: a LEFT JOIN the same' 'SELECT ID FROM T1 LEFT JOIN T2 ON ID = 1;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T1" and table "PUBLIC"."T2"|-ID'
+pin '11 ON scope: the ON before the select list' 'SELECT T1.ID FROM T1 JOIN T2 ON T1ID = ID;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T1" and table "PUBLIC"."T2"|-ID'
+pin '11 ON scope: the ON before the WHERE' 'SELECT 1 FROM T1 JOIN T2 ON ID = 1 WHERE NOPE = 1;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T1" and table "PUBLIC"."T2"|-ID'
+pin '11 ON scope: a RIGHT JOIN lists T2 then T1' 'SELECT T1.ID FROM T1 RIGHT JOIN T2 ON ID = 1;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T2" and table "PUBLIC"."T1"|-ID'
+pin '11 ON scope: a FULL JOIN the same' 'SELECT T1.ID FROM T1 FULL JOIN T2 ON ID = 1;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T2" and table "PUBLIC"."T1"|-ID'
+pin '11 ON scope: an earlier comma item is not in it' 'SELECT T1.ID FROM T1, T2 JOIN VT2 ON ID = 1;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T2" and view "PUBLIC"."VT2"|-ID'
+pin '11 ON scope: the second ON sees the first join as it hands it back' 'SELECT T1.ID FROM T1 JOIN T2 ON 1=1 JOIN VT2 ON ID = 1;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T2" and table "PUBLIC"."T1" and view "PUBLIC"."VT2"|-ID'
+pin '11 ON scope: ...a RIGHT second join puts its side first' 'SELECT T1.ID FROM T1 JOIN T2 ON 1=1 RIGHT JOIN VT2 ON ID = 1;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between view "PUBLIC"."VT2" and table "PUBLIC"."T2" and table "PUBLIC"."T1"|-ID'
+pin '11 ON scope: ...after a RIGHT first join' 'SELECT T1.ID FROM T1 RIGHT JOIN T2 ON 1=1 JOIN VT2 ON ID = 1;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T1" and table "PUBLIC"."T2" and view "PUBLIC"."VT2"|-ID'
+pin '11 ON scope: a column of an earlier comma item is -206' 'SELECT T1.ID FROM T1, T2 JOIN VT2 ON A = 1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"A"|-At line 1, column 38'
+pin '11 ON scope: ...and so is its qualified name' 'SELECT T1.ID FROM T1, T2 JOIN VT2 ON T1.A = 1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"T1"."A"|-At line 1, column 38'
+pin '11 ON scope: ...or a later one' 'SELECT T1.ID FROM T2 JOIN VT2 ON A = 1, T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"A"|-At line 1, column 34'
+pin '11 keyword words: the value after KEY is read' 'SELECT UNICODE_CHAR(65), ENCRYPT(V USING RC4 KEY NOPE) FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 50'
+pin '11 keyword words: ...before a later item' 'SELECT ENCRYPT(V USING RC4 KEY NOPE), UNICODE_CHAR(65) FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 32'
+pin '11 keyword words: a HASH argument is read' 'SELECT UNICODE_CHAR(65), HASH(NOPE USING CRC32) FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 31'
+pin '11 keyword words: a -206 after a cast'\''s CHARACTER SET' 'SELECT UNICODE_CHAR(65), CAST(V AS VARCHAR(10) CHARACTER SET UTF8) FROM T1 WHERE NOPE = 1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 82'
+pin '11 keyword words: an UPDATE'\''s WHERE after a CRYPT_HASH value' 'UPDATE T3 SET NAME = CRYPT_HASH(NAME USING SHA256) WHERE NOPE = 1; ROLLBACK;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 58'
+pin '11 LISTAGG is an aggregate: an ungrouped column beside it' 'SELECT UNICODE_CHAR(65), V, LISTAGG(V) FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)'
+pin '11 LISTAGG is an aggregate: in a WHERE' 'SELECT UNICODE_CHAR(65) FROM T1 WHERE LISTAGG(V) = '\''x'\'';' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Cannot use an aggregate or window function in a WHERE clause, use HAVING (for aggregate only) instead'
+pin '11 FILTER: an ungrouped column outside it is still invalid' 'SELECT UNICODE_CHAR(65), V, SUM(A) FILTER (WHERE B > 1) FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)'
+pin '11 FILTER: a -206 inside it' 'SELECT UNICODE_CHAR(65), SUM(A) FILTER (WHERE NOPE > 1) FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 47'
+pin '11 the implicit INSERT list without its COMPUTED column: two values are 21S01' 'INSERT INTO TC VALUES (UNICODE_CHAR(65), '\''b'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 21S01|Dynamic SQL Error|-SQL error code = -804|-Count of read-write columns does not equal count of values'
+pin '11 a bare * after another item is Token unknown *' 'SELECT UNICODE_CHAR(65), * FROM T1 ORDER BY 12;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 26|-*'
+pin '11 ...before one, Token unknown at the comma' 'SELECT *, UNICODE_CHAR(65) FROM T1 ORDER BY 12;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 9|-,'
+pin '11 ...with no ORDER BY' 'SELECT UNICODE_CHAR(65), * FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 26|-*'
+pin '11 control: X.* beside an item counts its columns' 'SELECT UNICODE_CHAR(65), T1.* FROM T1 ORDER BY 12;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid column position used in the ORDER BY clause'
+ppin '11 phase: a DECFLOAT'\''s conversion error carries its invalid operation' 'INSERT INTO TT (DC) VALUES ('\''abc'\'')' 'PREPARED|EXECUTE ERR: |Decimal float invalid operation. An indeterminant error occurred during an operation. |conversion error from string "abc"'
+ppin '11 phase: ...'\''1,5'\''' 'INSERT INTO TT (DC) VALUES ('\''1,5'\'')' 'PREPARED|EXECUTE ERR: |Decimal float invalid operation. An indeterminant error occurred during an operation. |conversion error from string "1,5"'
+ppin '11 phase: ...an empty string' 'INSERT INTO TT (DD) VALUES ('\'''\'')' 'PREPARED|EXECUTE ERR: |Decimal float invalid operation. An indeterminant error occurred during an operation. |conversion error from string ""'
+ppin '11 phase: a DECFLOAT(16) past its exponent is Decimal float overflow' 'INSERT INTO TT (DC) VALUES ('\''1e385'\'')' 'PREPARED|EXECUTE ERR: |Decimal float overflow. The exponent of a result is greater than the magnitude allowed.'
+ppin '11 phase: ...'\''1e400'\''' 'INSERT INTO TT (DC) VALUES ('\''1e400'\'')' 'PREPARED|EXECUTE ERR: |Decimal float overflow. The exponent of a result is greater than the magnitude allowed.'
+ppin '11 phase: a TIME of digits and colons is 22018' 'INSERT INTO TT (TM) VALUES ('\''25:00'\'')' 'PREPARED|EXECUTE ERR: |conversion error from string "25:00"'
+ppin '11 phase: ...a TIME opening with a letter' 'INSERT INTO TT (TM) VALUES ('\''JAN-1-2020'\'')' 'PREPARED|EXECUTE ERR: |conversion error from string "JAN-1-2020"'
+ppin '11 phase: a TIMESTAMP opening with a time is 22018' 'INSERT INTO TT (TSP) VALUES ('\''10:00 AM'\'')' 'PREPARED|EXECUTE ERR: |conversion error from string "10:00 AM"'
+ppin '11 phase: ...with an offset after the time' 'INSERT INTO TT (TSP) VALUES ('\''10:00:00 +03:00'\'')' 'PREPARED|EXECUTE ERR: |conversion error from string "10:00:00 +03:00"'
+ppin '11 phase: a plain TIMESTAMP that is no date' 'INSERT INTO TT (TSP) VALUES ('\''2020-13-01'\'')' 'PREPARED|EXECUTE ERR: |conversion error from string "2020-13-01"'
+ppin '11 phase: a DATE with a zone suffix is 22018' 'INSERT INTO TT (DT) VALUES ('\''2020-01-01 10:00:00 +03:00'\'')' 'PREPARED|EXECUTE ERR: |conversion error from string "2020-01-01 10:00:00 +03:00"'
+ppin '11 phase: '\''1e999'\'' into an INTEGER is 22003' 'INSERT INTO TT (I) VALUES ('\''1e999'\'')' 'PREPARED|EXECUTE ERR: |arithmetic exception, numeric overflow, or string truncation |numeric value is out of range'
+bare '11 REFUSED BARE (the engine answers): a blob SUB_TYPE TEXT' 'SELECT UNICODE_CHAR(65), CAST(V AS BLOB SUB_TYPE TEXT) FROM T1;' 'UNICODE_CHAR CAST|A 0:1|CAST:|apple|A 0:3|CAST:|banana|A 0:5|CAST:|cherry'
+bare '11 REFUSED BARE: CRYPT_HASH .. USING SHA512' 'SELECT UNICODE_CHAR(65), CRYPT_HASH(V USING SHA512) FROM T1;' 'UNICODE_CHAR CRYPT_HASH|A 844D8779103B94C18F4AA4CC0C3B4474058580A991FBA85D3CA698A0BC9E52C5940FEB7A65A3A290E17E6B23EE943ECC4F73E7490327245B4FE5D5EFB590FEB2|A F8E3183D38E6C51889582CB260AB825252F395B4AC8FB0E6B13E9A71F7C10A80D5301E4A949F2783CB0C20205F1D850F87045F4420AD2271C8FD5F0CD8944BE3|A 22FDC354BD8871C8A5F3B1005071146C076A1530F8EBC239EC657FAC7446517B25DC9612DC16C568E79441A4C2B34AA741DBB3690146CFFB9635A6D9348A8BA8'
+bare '11 REFUSED BARE: HASH .. USING CRC32' 'SELECT UNICODE_CHAR(65), HASH(V USING CRC32) FROM T1;' 'UNICODE_CHAR HASH|A 1355820713|A -815297789|A 948551161'
+bare '11 REFUSED BARE: ...in a WHERE' 'SELECT UNICODE_CHAR(65) FROM T1 WHERE HASH(V USING CRC32) <> 0;' 'UNICODE_CHAR|A|A|A'
+bare '11 REFUSED BARE: ENCRYPT .. USING CHACHA20 KEY .. IV' 'SELECT UNICODE_CHAR(65), ENCRYPT('\''abc'\'' USING CHACHA20 KEY '\''01234567890123456789012345678901'\'' IV '\''01234567'\'') FROM T1;' 'UNICODE_CHAR ENCRYPT|A 0E59F0|A 0E59F0|A 0E59F0'
+bare '11 REFUSED BARE: DECRYPT .. USING AES MODE OFB' 'SELECT UNICODE_CHAR(65), DECRYPT(x'\''903EFD'\'' USING AES MODE OFB KEY '\''0123456701234567'\'' IV '\''0123456789012345'\'') FROM T1;' 'UNICODE_CHAR DECRYPT|A 616263|A 616263|A 616263'
+bare '11 REFUSED BARE: ENCRYPT .. KEY <column>' 'SELECT UNICODE_CHAR(65), ENCRYPT(V USING RC4 KEY V) FROM T1;' 'UNICODE_CHAR ENCRYPT|A 790FA27019|A 36C7029312DE|A 0FC656A82C7F'
+bare '11 REFUSED BARE: LISTAGG .. ON OVERFLOW ERROR' 'SELECT UNICODE_CHAR(65), LISTAGG(V, '\'','\'' ON OVERFLOW ERROR) WITHIN GROUP (ORDER BY V) FROM T1;' 'UNICODE_CHAR LIST|A 0:1|LIST:|apple,banana,cherry'
+bare '11 REFUSED BARE: LISTAGG .. ON OVERFLOW TRUNCATE' 'SELECT UNICODE_CHAR(65), LISTAGG(V, '\'','\'' ON OVERFLOW TRUNCATE '\''...'\'' WITH COUNT) WITHIN GROUP (ORDER BY V) FROM T1;' 'UNICODE_CHAR LIST|A 0:1|LIST:|apple,banana,cherry'
+bare '11 REFUSED BARE: RSA_SIGN_HASH .. KEY .. HASH SHA256' 'SELECT UNICODE_CHAR(65), RSA_SIGN_HASH(V KEY V HASH SHA256) FROM T1;' 'UNICODE_CHAR RSA_SIGN_HASH|Statement failed, SQLSTATE = 22023|TomCrypt library error: Invalid input packet.|-Importing RSA key'
+bare '11 REFUSED BARE: COALESCE of a DATE and a text beside SUB_TYPE TEXT' 'SELECT COALESCE(D, '\''text'\''), CAST(V AS BLOB SUB_TYPE TEXT) FROM T1;' 'COALESCE CAST|2020-01-01 0:1|CAST:|apple|2021-06-15 0:3|CAST:|banana|text 0:5|CAST:|cherry'
+bare '11 REFUSED BARE: a DELETE over CRYPT_HASH' 'DELETE FROM T3 WHERE CRYPT_HASH(NAME USING SHA256) = '\''x'\''; ROLLBACK;' ''
+bare '11 REFUSED BARE: an INSERT of ENCRYPT' 'INSERT INTO T3 (K, NAME) VALUES (1, ENCRYPT('\''abc'\'' USING RC4 KEY '\''0123456701234567'\'')); ROLLBACK;' ''
+bare '11 REFUSED BARE (Token unknown USING): SUBSTRING .. USING CHARACTERS' 'SELECT UNICODE_CHAR(65), SUBSTRING(V FROM 1 USING CHARACTERS) FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 45|-USING'
+bare '11 REFUSED BARE: SUM .. FILTER' 'SELECT UNICODE_CHAR(65), SUM(A) FILTER (WHERE B > 1) FROM T1;' 'UNICODE_CHAR SUM|A 10'
+bare '11 REFUSED BARE: COUNT(*) FILTER beside MAX' 'SELECT UNICODE_CHAR(65), COUNT(*) FILTER (WHERE A > 1), MAX(V) FROM T1;' 'UNICODE_CHAR COUNT MAX|A 2 cherry'
+bare '11 REFUSED BARE: FILTER over a GROUP BY' 'SELECT A, UNICODE_CHAR(65), COUNT(*) FILTER (WHERE B > 1) FROM T1 GROUP BY A;' 'A UNICODE_CHAR COUNT|<null> A 1|10 A 1|20 A 0'
+bare '11 REFUSED BARE: PERCENTILE_CONT WITHIN GROUP' 'SELECT UNICODE_CHAR(65), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY A) FROM T1;' 'UNICODE_CHAR PERCENTILE_CONT|A 15.00000000000000'
+bare '11 REFUSED BARE: PERCENTILE_DISC WITHIN GROUP DESC' 'SELECT UNICODE_CHAR(65), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY A DESC) FROM T1;' 'UNICODE_CHAR PERCENTILE_DISC|A 20'
+bare '11 REFUSED BARE: a HAVING'\''s FILTER' 'SELECT UNICODE_CHAR(65), COUNT(*) FROM T1 GROUP BY A HAVING COUNT(*) FILTER (WHERE B > 0) >= 0;' 'UNICODE_CHAR COUNT|A 1|A 1|A 1'
+bare '11 REFUSED BARE: one value for a table with a COMPUTED column' 'INSERT INTO TC VALUES (UNICODE_CHAR(65)); ROLLBACK;' ''
+bare '11 REFUSED BARE: a TIMESTAMP with an offset' 'INSERT INTO TT (TSP) VALUES ('\''2020-01-01 10:00:00 +03:00'\''); ROLLBACK;' ''
+bare '11 REFUSED BARE: a TIMESTAMP with a region' 'INSERT INTO TT (TSP) VALUES ('\''2020-01-01 10:00 Europe/Paris'\''); ROLLBACK;' ''
+bare '11 REFUSED BARE: a TIMESTAMP with a negative offset' 'INSERT INTO TT (TSP) VALUES ('\''2020-01-01 -03:00'\''); ROLLBACK;' ''
+bare '11 REFUSED BARE: '\''0e999'\'' into an INTEGER stores 0' 'INSERT INTO TT (I) VALUES ('\''0e999'\''); ROLLBACK;' ''
+bare '11 REFUSED BARE: '\''snan'\'' into a DECFLOAT stores sNaN' 'INSERT INTO TT (DC) VALUES ('\''snan'\''); ROLLBACK;' ''
+bare '11 REFUSED BARE (22009 region AM): a TIME with AM' 'INSERT INTO TT (TM) VALUES ('\''10:00 AM'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22009|Invalid time zone region: AM'
+bare '11 REFUSED BARE (22009 region .00): a TIME with dots' 'INSERT INTO TT (TM) VALUES ('\''10.00.00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22009|Invalid time zone region: .00'
+bare '11 REFUSED BARE (22009 offset): a date into a TIME' 'INSERT INTO TT (TM) VALUES ('\''2020-13-01'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22009|Invalid time zone offset: -13-01 - must use format +/-hours:minutes and be between -14:00 and +14:00'
+bare '11 REFUSED BARE (22009 region T10:00:00): an ISO T' 'INSERT INTO TT (TSP) VALUES ('\''2020-01-01T10:00:00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22009|Invalid time zone region: T10:00:00'
+bare '11 REFUSED BARE (22009 region ,10:00): a comma' 'INSERT INTO TT (TSP) VALUES ('\''2020-01-01,10:00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22009|Invalid time zone region: ,10:00'
+bare '11 REFUSED BARE (22009 offset +3): a short offset' 'INSERT INTO TT (TSP) VALUES ('\''2020-01-01 10:00 +3'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22009|Invalid time zone offset: +3 - must use format +/-hours:minutes and be between -14:00 and +14:00'
+
 if grep -aq 'panicked at' "/tmp/fc-serve-errvec-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 else echo "OK   no panic"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 194 ]; then echo "FAIL only $ran checks ran (floor 194)"; fail=1; fi
+if [ "$ran" -lt 272 ]; then echo "FAIL only $ran checks ran (floor 272)"; fail=1; fi
 exit $fail

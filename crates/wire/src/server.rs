@@ -34753,16 +34753,27 @@ fn gen_fit_error(d: &Descriptor, v: i64) -> ExecErr {
 /// truncation), and for a BOOLEAN into anything but text or boolean,
 /// whose string is the word "BOOLEAN"; a string that IS a number out of
 /// the column's range is 22003 (`'70000'`, `'-40000'` into SMALLINT).
-/// None where this law does not reach (a numeric string of more than 22
-/// characters answers the engine's own truncation - left refused).
+/// A DECFLOAT column raises its own pair: `Decimal float invalid
+/// operation` over the conversion error, and `Decimal float overflow`
+/// (22003) for a number past its exponent (`'1e385'` into DECFLOAT(16)).
+/// None where this law does not reach, and the refusal stays bare: a
+/// numeric string of more than 22 characters (the engine's own
+/// truncation), a zero with a huge exponent (`'0e999'` stores 0), a
+/// DECFLOAT's special value (`'snan'` stores sNaN) or a small or long
+/// one, a TIME string with more than digits and colons or a TIMESTAMP
+/// one with a letter, a sign, a comma or a third part - the engine reads
+/// a zone out of those (`'2020-01-01 10:00:00 +03:00'`, `'.. -03:00'`,
+/// `'.. Europe/Paris'` into a TIMESTAMP store; `'10:00 AM'` into a TIME
+/// is 22009 "Invalid time zone region: AM", `'2020-01-01T10:00'` into a
+/// TIMESTAMP "Invalid time zone region: T10:00", `'2020-01-01 10:00 +3'`
+/// 22009 "Invalid time zone offset: +3 ..." - all measured).
 fn insert_literal_error(d: &Descriptor, v: &InsVal) -> Option<EvalErr> {
     if let Some(e) = set_value_fit_error(d, v) {
         return Some(e);
     }
-    let numeric = matches!(
-        d.dtype,
-        dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 | dtype::REAL | dtype::DOUBLE | dtype::DEC64 | dtype::DEC128
-    );
+    let decfloat = matches!(d.dtype, dtype::DEC64 | dtype::DEC128);
+    let numeric = decfloat
+        || matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 | dtype::REAL | dtype::DOUBLE);
     let temporal = matches!(d.dtype, dtype::SQL_DATE | dtype::SQL_TIME | dtype::TIMESTAMP);
     let boolean = d.dtype == dtype::BOOLEAN;
     let text = matches!(d.dtype, dtype::TEXT | dtype::VARYING);
@@ -34773,13 +34784,53 @@ fn insert_literal_error(d: &Descriptor, v: &InsVal) -> Option<EvalErr> {
             let looks_numeric = !n.is_empty()
                 && n.bytes().all(|c| c.is_ascii_digit() || b".eE+-".contains(&c))
                 && n.parse::<f64>().is_ok();
+            // the mantissa and the exponent of an exponent form
+            let (mant, exp) = match n.find(['e', 'E']) {
+                Some(e) => (&n[..e], n[e + 1..].parse::<i64>().ok()),
+                None => (n, None),
+            };
+            let zero = !mant.bytes().any(|c| (b'1'..=b'9').contains(&c));
             if !looks_numeric {
+                let special = n.trim_start_matches(['-', '+']).to_ascii_lowercase();
+                if decfloat && matches!(special.as_str(), "nan" | "snan" | "inf" | "infinity") {
+                    return None;
+                }
+                if decfloat {
+                    return Some(EvalErr::DecfloatConvError(t.clone()));
+                }
                 conv(t.clone())
+            } else if zero && exp.is_some() {
+                None
+            } else if decfloat {
+                exp.is_some_and(|e| e > 0).then_some(EvalErr::DecfloatOverflow)
             } else if t.len() <= 22 {
                 Some(EvalErr::NumericOutOfRange)
             } else {
                 None
             }
+        }
+        // a TIME that does not open with a digit, or is digits and colons
+        // only, fails before any zone is read (`'JAN-1-2020'`, `'- 10'`,
+        // `'25:00'`, `'10::00'`)
+        InsVal::Str(t) if d.dtype == dtype::SQL_TIME => {
+            let n = t.trim();
+            let opens = n.bytes().next().is_some_and(|c| c.is_ascii_digit());
+            (!opens || n.bytes().all(|c| c.is_ascii_digit() || c == b':')).then(|| EvalErr::ConversionError(Some(t.clone())))
+        }
+        // a TIMESTAMP with no digit, one that opens with a time (`'10:00
+        // AM'`, `'10:00:00 +03:00'`), or a plain one of at most a date and
+        // a time with no zone-like part
+        InsVal::Str(t) if d.dtype == dtype::TIMESTAMP => {
+            let n = t.trim();
+            let digits = n.bytes().any(|c| c.is_ascii_digit());
+            let parts: Vec<&str> = n.split_whitespace().collect();
+            let time_first = parts
+                .first()
+                .is_some_and(|p| p.contains(':') && p.bytes().all(|c| c.is_ascii_digit() || c == b':' || c == b'.'));
+            let plain = !n.bytes().any(|c| c.is_ascii_alphabetic() || c == b'+' || c == b',')
+                && parts.len() <= 2
+                && !parts.get(1).is_some_and(|p| p.starts_with('-'));
+            (!digits || time_first || plain).then(|| EvalErr::ConversionError(Some(t.clone())))
         }
         InsVal::Str(t) if temporal || boolean => conv(t.clone()),
         InsVal::Int(n) if temporal || boolean || text => conv(n.to_string()),
@@ -47578,6 +47629,17 @@ fn first_unresolved_qualifier(sql: &str, dbo: &Option<Database>) -> Option<EvalE
 /// character set.
 const QUAL_SKIP_AFTER: [&str; 8] = ["FOR", "AS", "COLLATE", "COLUMN", "INDEX", "ORDER", "OF", "SET"];
 
+/// Words a BARE name may follow without naming a column, read by the
+/// diagnosis only ([diagnose_refusal]): the grammar spells a word of its
+/// own there - the algorithm of `HASH | CRYPT_HASH | ENCRYPT | DECRYPT
+/// (.. USING SHA256 | CRC32 | AES | RC4 | CHACHA20 ..)` and RSA's `HASH
+/// SHA256`, a cipher's `MODE OFB`, a blob's `SUB_TYPE TEXT`, LISTAGG's `ON
+/// OVERFLOW ERROR` (measured on 2182: each of these answers, and was read
+/// as a -206 "SHA512" / "TEXT" / "OVERFLOW" here). SUBSTRING's `USING
+/// CHARACTERS` is the parser's Token unknown at USING; skipped, it keeps
+/// the bare refusal.
+const BARE_SKIP_AFTER: [&str; 6] = ["USING", "SUB_TYPE", "MODE", "HASH", "ON", "OVERFLOW"];
+
 /// Does `s` open a parenthesised subquery - `(SELECT ..`, whitespace
 /// aside?
 fn paren_select(s: &str) -> bool {
@@ -47822,6 +47884,13 @@ impl QualCtx<'_> {
         } else {
             proj
         };
+        // each ON's own scope, by item; usable only where every item bound
+        // a context (an unaliased derived table binds none)
+        let on_orders: Vec<Option<Vec<usize>>> = if quals.len() == items.len() {
+            from_stack_orders(self.up_of(table_s)).1
+        } else {
+            Vec::new()
+        };
         let mut scopes: Vec<Vec<ScopeQual>> = outer.to_vec();
         scopes.push(quals);
         // the FROM: a derived body where it sits, then the step's ON
@@ -47860,7 +47929,26 @@ impl QualCtx<'_> {
             if i >= 1 {
                 let on = joins[i - 1].2;
                 if !on.is_empty() && !on.starts_with('\u{0}') {
-                    match self.boolean(on, &scopes) {
+                    // the ON sees its own join tree only, stacked in its
+                    // own order ([from_stack_orders])
+                    let on_scopes: Vec<Vec<ScopeQual>> = match on_orders.get(i) {
+                        Some(Some(ord)) if on_orders.len() == scopes[scopes.len() - 1].len() => {
+                            let level = &scopes[scopes.len() - 1];
+                            let mut s = outer.to_vec();
+                            s.push(
+                                ord.iter()
+                                    .enumerate()
+                                    .map(|(p, ti)| ScopeQual {
+                                        push: if self.bare { p } else { usize::MAX },
+                                        ..level[*ti].clone()
+                                    })
+                                    .collect(),
+                            );
+                            s
+                        }
+                        _ => scopes.clone(),
+                    };
+                    match self.boolean(on, &on_scopes) {
                         QualScan::Clean => {}
                         other => return other,
                     }
@@ -49068,6 +49156,7 @@ impl QualCtx<'_> {
                     && !star
                     && !is_call
                     && !skipped
+                    && !BARE_SKIP_AFTER.contains(&prev_word.as_str())
                     && prev_word != "OVER"
                     && !(start > 0 && sb[start - 1] == b':')
                     && sb.get(j) != Some(&b'\'')
@@ -49085,7 +49174,10 @@ impl QualCtx<'_> {
                         BareVerdict::Aside => return QualScan::Aside,
                     }
                 }
-                let bare = if parts.len() == 1 && !parts[0].1 { word } else { String::new() };
+                // a call's name is no keyword: `HASH(V ..)` is not the
+                // `HASH <algorithm>` of RSA_SIGN_HASH (`OVER (W ..)` still
+                // names a window)
+                let bare = if parts.len() == 1 && !parts[0].1 && (!is_call || word == "OVER") { word } else { String::new() };
                 prev2 = std::mem::replace(&mut prev_word, bare);
                 continue;
             }
@@ -49213,9 +49305,12 @@ impl QualCtx<'_> {
             .unwrap_or(up.len())
     }
 
-    /// `UPDATE <table> [alias] SET ... [WHERE ...]`: the WHERE first (the
-    /// engine passes it before the assignments - measured), then each
-    /// assignment's value.
+    /// `UPDATE <table> [alias] SET ... [WHERE ...]`: EVERY assignment's
+    /// target first, across the whole list, then the WHERE, then each
+    /// assignment's value (measured on 2182: `SET NOPE1 = NOPE2 WHERE
+    /// NOPE3 = 1` names NOPE1, `SET K = NOPE2, NOPE1 = 1` NOPE1, `SET K =
+    /// NOPE2 WHERE NOPE3 = 1` NOPE3; qualified the same, `SET T3.NOPE1 = 1
+    /// WHERE T3.NOPE3 = 1` names T3.NOPE1).
     fn update(&self, body: &str) -> QualScan {
         let up = self.up_of(body);
         if up["UPDATE".len()..].trim_start().starts_with("OR") {
@@ -49227,15 +49322,25 @@ impl QualCtx<'_> {
         let after = set + "SET".len();
         let end = self.dml_tail(up, after);
         let wh = find_word_depth0(up, "WHERE", after).filter(|w| *w < end);
+        let mut assigns: Vec<(&str, &str)> = Vec::new();
+        for a in split_top_level_commas(&body[after..wh.unwrap_or(end)]) {
+            let Some(eq) = a.find('=') else { return QualScan::Aside };
+            assigns.push((&a[..eq], &a[eq + 1..]));
+        }
+        for (target, _) in &assigns {
+            match self.operand(target, &scopes) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
         if let Some(w) = wh {
             match self.boolean(&body[w + "WHERE".len()..end], &scopes) {
                 QualScan::Clean => {}
                 other => return other,
             }
         }
-        let assigns = &body[after..wh.unwrap_or(end)];
-        for a in split_top_level_commas(assigns) {
-            match self.value(a, &scopes) {
+        for (_, value) in &assigns {
+            match self.value(value, &scopes) {
                 QualScan::Clean => {}
                 other => return other,
             }
@@ -49347,17 +49452,18 @@ const RESERVED_WORDS: &[&str] = &[
 /// an identifier to the parser (measured: `SELECT NAME FROM T1` is -206
 /// "NAME").
 const BARE_GRAMMAR_WORDS: &[&str] = &[
-    "ASC", "ASCENDING", "CONTAINING", "DESC", "DESCENDING", "EXCLUDE", "FIRST", "FOLLOWING", "LAST",
-    "MATCHING", "MILLISECOND", "NAMES", "NEXT", "NULLS", "OTHERS", "PARTITION", "PLACING",
-    "PRECEDING", "QUARTER", "RANGE", "SEGMENT", "SIZE", "SKIP", "STARTING", "SUB_TYPE", "TIES",
-    "TIMEZONE_NAME", "TYPE", "VALUE", "WEEK", "WEEKDAY", "YEARDAY", "ZONE",
+    "ASC", "ASCENDING", "CONTAINING", "COUNTER", "CTR_BIG_ENDIAN", "CTR_LENGTH", "CTR_LITTLE_ENDIAN",
+    "DESC", "DESCENDING", "EXCLUDE", "FIRST", "FOLLOWING", "IV", "KEY", "LAST", "LPARAM", "MATCHING",
+    "HASH", "MILLISECOND", "MODE", "NAMES", "NEXT", "NULLS", "OTHERS", "PARTITION", "PKCS_1_5", "PLACING",
+    "PRECEDING", "QUARTER", "RANGE", "SALT_LENGTH", "SEGMENT", "SIGNATURE", "SIZE", "SKIP", "STARTING",
+    "SUB_TYPE", "TIES", "TIMEZONE_NAME", "TYPE", "VALUE", "WEEK", "WEEKDAY", "YEARDAY", "ZONE",
 ];
 
 /// The aggregate functions - a call of one is an aggregate, or a window
 /// function under an OVER.
 const AGG_FN_NAMES: &[&str] = &[
     "ANY_VALUE", "AVG", "BIN_AND_AGG", "BIN_OR_AGG", "BIN_XOR_AGG", "CORR", "COUNT", "COVAR_POP",
-    "COVAR_SAMP", "LIST", "MAX", "MIN", "PERCENTILE_CONT", "PERCENTILE_DISC", "REGR_AVGX",
+    "COVAR_SAMP", "LIST", "LISTAGG", "MAX", "MIN", "PERCENTILE_CONT", "PERCENTILE_DISC", "REGR_AVGX",
     "REGR_AVGY", "REGR_COUNT", "REGR_INTERCEPT", "REGR_R2", "REGR_SLOPE", "REGR_SXX", "REGR_SXY",
     "REGR_SYY", "STDDEV_POP", "STDDEV_SAMP", "SUM", "VAR_POP", "VAR_SAMP",
 ];
@@ -49448,7 +49554,8 @@ impl AggTok {
                 return false;
             }
         }
-        let skipped = QUAL_SKIP_AFTER.contains(&self.prev.as_str()) && (self.prev != "FOR" || self.prev2 == "VALUE");
+        let skipped = QUAL_SKIP_AFTER.contains(&self.prev.as_str()) && (self.prev != "FOR" || self.prev2 == "VALUE")
+            || BARE_SKIP_AFTER.contains(&self.prev.as_str());
         !skipped && self.prev != "OVER"
     }
 }
@@ -49548,7 +49655,32 @@ fn agg_tokens(text: &str) -> Option<(Vec<AggTok>, bool)> {
             let end = i;
             let j = ws(end);
             let call = b.get(j) == Some(&b'(');
-            let close = if call { matching_paren(b, j)? } else { end };
+            let mut close = if call { matching_paren(b, j)? } else { end };
+            // an aggregate's own clauses are part of it: `WITHIN GROUP
+            // (ORDER BY ..)` and `FILTER (WHERE ..)`, whose columns are
+            // aggregated like the argument's (measured on 2182: `SUM(A)
+            // FILTER (WHERE B > 1)`, `PERCENTILE_CONT(0.5) WITHIN GROUP
+            // (ORDER BY A)` and a HAVING's `COUNT(*) FILTER (WHERE B > 0)`
+            // answer over an ungrouped B / A)
+            let word_at = |k: usize, w: &str| {
+                text.len() >= k + w.len()
+                    && text[k..k + w.len()].eq_ignore_ascii_case(w)
+                    && !b.get(k + w.len()).is_some_and(|c| ident(*c))
+            };
+            while call {
+                let k = ws(close + 1);
+                let o = if word_at(k, "FILTER") {
+                    ws(k + "FILTER".len())
+                } else if word_at(k, "WITHIN") && word_at(ws(k + "WITHIN".len()), "GROUP") {
+                    ws(ws(k + "WITHIN".len()) + "GROUP".len())
+                } else {
+                    break;
+                };
+                if b.get(o) != Some(&b'(') {
+                    break;
+                }
+                close = matching_paren(b, o)?;
+            }
             let mut windowed = false;
             let mut over = None;
             if call {
@@ -49563,7 +49695,7 @@ fn agg_tokens(text: &str) -> Option<(Vec<AggTok>, bool)> {
             }
             let not_ref = star || b.get(j) == Some(&b'\'') || (start > 0 && b[start - 1] == b':');
             let word = match parts.as_slice() {
-                [(w, false)] => w.clone(),
+                [(w, false)] if !call || w == "OVER" => w.clone(),
                 _ => String::new(),
             };
             toks.push(AggTok {
@@ -49670,7 +49802,24 @@ fn strip_select_head(proj: &str) -> Option<&str> {
 /// `T1, T2` is T1, T2; `T1 JOIN T2` T2, T1; `T1 JOIN T2 JOIN E` E, T1,
 /// T2; `T1 RIGHT JOIN T2` T1, T2; `T1 FULL JOIN T2 JOIN E` E, T2, T1.
 fn from_push_order(up_from: &str) -> Option<Vec<usize>> {
+    Some(from_stack_orders(up_from).0)
+}
+
+/// [from_push_order], and beside it each JOIN's ON SCOPE (indexed by the
+/// item the join adds; None for a FROM's first item and a comma item):
+/// the contexts of that join's own tree only, the left side's as they
+/// stand then the right side - the right side first for a RIGHT or FULL
+/// join - which is the stack the engine passes the ON over, before the
+/// join hands it back reversed. Measured on 2182 through the ambiguity
+/// message of a name in the ON: `T1 JOIN T2 ON ID = 1` lists T1, T2 (a
+/// LEFT join the same), `T1 RIGHT JOIN T2` and `FULL` T2, T1, `T1 JOIN
+/// T2 ON 1=1 JOIN VT2 ON ID = 1` T2, T1, VT2, `.. RIGHT JOIN VT2` VT2, T2,
+/// T1, `T1 RIGHT JOIN T2 ON 1=1 JOIN VT2` T1, T2, VT2; and `T1, T2 JOIN
+/// VT2 ON ID = 1` T2, VT2 - an earlier comma item is not in scope at all
+/// (`.. ON A = 1` is -206 "A", `ON T1.A = 1` -206 "T1"."A").
+fn from_stack_orders(up_from: &str) -> (Vec<usize>, Vec<Option<Vec<usize>>>) {
     let mut out: Vec<usize> = Vec::new();
+    let mut on: Vec<Option<Vec<usize>>> = Vec::new();
     let mut base = 0usize;
     for part in split_top_level_commas(up_from) {
         let mut outer_side: Vec<bool> = Vec::new();
@@ -49681,6 +49830,7 @@ fn from_push_order(up_from: &str) -> Option<Vec<usize>> {
             at = j + "JOIN".len();
         }
         let mut cur = vec![base];
+        on.push(None);
         for (k, right_first) in outer_side.iter().enumerate() {
             let next = base + k + 1;
             let mut temp = if *right_first {
@@ -49692,13 +49842,14 @@ fn from_push_order(up_from: &str) -> Option<Vec<usize>> {
                 t.push(next);
                 t
             };
+            on.push(Some(temp.clone()));
             temp.reverse();
             cur = temp;
         }
         base += outer_side.len() + 1;
         out.extend(cur);
     }
-    Some(out)
+    (out, on)
 }
 
 /// The type family of a value as its describe would read it - what the
@@ -50010,9 +50161,38 @@ fn token_unknown_verdict(sql: &str) -> Option<EvalErr> {
             found = Some(found.map_or(at, |f| f.min(at)));
         }
     }
-    let at = found?;
+    let at = match found {
+        Some(at) => at,
+        None => bare_star_token(sql)?,
+    };
     let (line, col) = text_line_col(sql, &sql[at..at + 1])?;
     Some(EvalErr::TokenUnknown { line, col, token: sql[at..at + 1].to_string() })
+}
+
+/// A BARE `*` beside another item of the outermost select list is the
+/// parser's: Token unknown at that `*`, or - the `*` first - at the comma
+/// after it (measured on 2182: `SELECT UNICODE_CHAR(65), * FROM T1` is
+/// Token unknown `*` at column 26, `SELECT *, UNICODE_CHAR(65) ..` `,`
+/// at column 9; `T1.*` is an item like any other). The byte offset in
+/// `sql`.
+fn bare_star_token(sql: &str) -> Option<usize> {
+    let body = sql.trim_start();
+    if !body.get(..6).is_some_and(|h| h.eq_ignore_ascii_case("SELECT")) {
+        return None;
+    }
+    let (proj, ..) = split_query(body)?;
+    let items = split_top_level_commas(strip_select_head(proj)?);
+    if items.len() < 2 {
+        return None;
+    }
+    let base = sql.as_ptr() as usize;
+    let first = items[0];
+    if first.trim() == "*" {
+        let end = first.as_ptr() as usize - base + first.len();
+        return sql[end..].starts_with(',').then_some(end);
+    }
+    let star = items.iter().find(|i| i.trim() == "*")?;
+    Some(star.as_ptr() as usize - base + (star.len() - star.trim_start().len()))
 }
 
 /// THE ENGINE'S VECTOR FOR A STATEMENT THIS SERVER REFUSED BARE - see the
@@ -50154,7 +50334,13 @@ fn insert_verdict(sql: &str, body: &str, dbo: &Option<Database>) -> Option<EvalE
             }
             names.len()
         }
-        None => meta.columns.len(),
+        // the implicit list leaves the COMPUTED columns out (measured:
+        // `INSERT INTO TC VALUES (..)` over `A, B COMPUTED BY (A || 'x')`
+        // stores one value, two are 21S01)
+        None => {
+            let computed = computed_sources(db, &table);
+            meta.columns.iter().filter(|c| !computed.contains_key(&(c.field_id as usize))).count()
+        }
     };
     if ncols != vals.len() {
         return Some(dsql_status(-804, GDS_DSQL_VAR_COUNT_ERR, Vec::new()));
@@ -131299,6 +131485,58 @@ mod tests {
         assert_ne!(state, "00000", "a failed commit must not read as success");
         assert_eq!(GDS_IO_ERROR, 335544344); // isc_io_error
         assert_eq!(GDS_RANDOM, 335544382); // isc_random - "@1"
+    }
+
+    /// A JOIN's ON scope is its own join tree, stacked as the engine
+    /// passes the ON (measured on 2182, see [from_stack_orders]): `T1 JOIN
+    /// T2` T1, T2; RIGHT T2, T1; the second join of a chain sees the
+    /// first handed back reversed; a comma item starts a tree of its own.
+    #[test]
+    fn a_join_s_on_scope_is_its_own_tree() {
+        let (push, on) = from_stack_orders("T1 JOIN T2 ON ID = 1");
+        assert_eq!(push, vec![1, 0]);
+        assert_eq!(on, vec![None, Some(vec![0, 1])]);
+        assert_eq!(from_stack_orders("T1 RIGHT JOIN T2 ON ID = 1").1[1], Some(vec![1, 0]));
+        assert_eq!(from_stack_orders("T1 JOIN T2 ON 1=1 JOIN VT2 ON ID = 1").1[2], Some(vec![1, 0, 2]));
+        assert_eq!(from_stack_orders("T1 JOIN T2 ON 1=1 RIGHT JOIN VT2 ON ID = 1").1[2], Some(vec![2, 1, 0]));
+        assert_eq!(from_stack_orders("T1 RIGHT JOIN T2 ON 1=1 JOIN VT2 ON ID = 1").1[2], Some(vec![0, 1, 2]));
+        let (_, on) = from_stack_orders("T1, T2 JOIN VT2 ON ID = 1");
+        assert_eq!(on, vec![None, None, Some(vec![1, 2])]);
+    }
+
+    /// An aggregate's FILTER and WITHIN GROUP clauses are inside it, so
+    /// their columns are aggregated (measured: `SUM(A) FILTER (WHERE B >
+    /// 1)` answers over an ungrouped B); a call's name is no keyword for
+    /// the word after it.
+    #[test]
+    fn an_aggregate_spans_its_filter_and_within_group() {
+        let text = "SUM(A) FILTER (WHERE B > 1)";
+        let (toks, _) = agg_tokens(text).unwrap();
+        let sum = toks.iter().find(|t| t.is_agg()).unwrap();
+        assert_eq!(sum.close, text.len() - 1);
+        let text = "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY A) + B";
+        let (toks, _) = agg_tokens(text).unwrap();
+        let p = toks.iter().find(|t| t.is_agg()).unwrap();
+        assert_eq!(&text[p.close..p.close + 1], ")");
+        assert!(text[..p.close].ends_with("ORDER BY A"));
+        let b = toks.iter().find(|t| t.name() == Some("B")).unwrap();
+        assert!(b.is_column() && b.start > p.close);
+        // `HASH(V USING CRC32)`: V is a column, CRC32 the grammar's word
+        let (toks, _) = agg_tokens("HASH(V USING CRC32)").unwrap();
+        let cols: Vec<&str> = toks.iter().filter(|t| t.is_column()).filter_map(|t| t.name()).collect();
+        assert_eq!(cols, vec!["V"]);
+    }
+
+    /// A bare `*` beside another select item is the parser's Token
+    /// unknown - at the `*`, or at the comma after a leading one.
+    #[test]
+    fn a_bare_star_beside_an_item_is_a_token() {
+        let sql = "SELECT UNICODE_CHAR(65), * FROM T1";
+        assert_eq!(bare_star_token(sql), Some(25));
+        let sql = "SELECT *, UNICODE_CHAR(65) FROM T1";
+        assert_eq!(bare_star_token(sql), Some(8));
+        assert_eq!(bare_star_token("SELECT * FROM T1"), None);
+        assert_eq!(bare_star_token("SELECT ID, T1.* FROM T1"), None);
     }
 
     /// The DPB items gfix's switches turn into, read out of a dpb.
