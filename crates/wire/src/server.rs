@@ -1860,6 +1860,9 @@ const READ_ONLY_TX_MARK: &str = "attempted update during read-only transaction";
 /// "count of column list and variable list do not match" (JRD 349,
 /// SQLCODE -313) - a static SELECT INTO whose lists disagree
 const GDS_DSQL_COUNT_MISMATCH: i32 = 335544669;
+/// `isc_prc_out_param_mismatch` - "Output parameter mismatch for
+/// procedure @1" (SQLSTATE 07002)
+const GDS_PRC_OUT_PARAM_MISMATCH: i32 = 335544850;
 
 /// "unsuccessful metadata update" - the wrapper every DDL failure
 /// carries (isc_no_meta_update). The middle item is the verb's own
@@ -44114,7 +44117,19 @@ fn parse_call_args(text: &str, allow_placeholder: bool) -> Option<Vec<Option<Val
     parts
         .into_iter()
         .map(|p| {
-            let t = p.trim();
+            let mut t = p.trim();
+            // A PARENTHESISED LITERAL is that literal: `PY((-2))` answers
+            // -2 on the engine. It is also the spelling a body's own
+            // variable arrives in - [subst_literal] brackets a negative
+            // number so `5 - :I` cannot become the comment `5--2` - and
+            // refusing it failed `SELECT R FROM PY(:I) INTO :R` with the
+            // -313 count mismatch whenever I was negative
+            while let Some(inner) = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+                if inner.contains(['(', ')', '\'']) {
+                    break;
+                }
+                t = inner.trim();
+            }
             if t == "?" && allow_placeholder {
                 Some(None)
             } else if t.eq_ignore_ascii_case("NULL") {
@@ -48479,8 +48494,12 @@ fn materialise_procedures(
                     return Ok(true);
                 }
                 BlrProcOutcome::Runtime(e) => {
-                    let e = runtime_with_position(database, &name, &args, ctx, e, false);
-                    *plan = Plan::RefusedEval(e);
+                    let (e, rows) = runtime_with_position_rows(database, &name, &args, ctx, e, false);
+                    *plan = if rows.is_empty() {
+                        Plan::RefusedEval(e)
+                    } else {
+                        Plan::ProcRows { cols, rows: project(&rows), then: Some(e) }
+                    };
                     return Ok(true);
                 }
                 BlrProcOutcome::Outside => {}
@@ -49050,7 +49069,17 @@ fn branch_rows_res(
         }
         return Ok(rows);
     }
-    if let Plan::ProcRows { rows, .. } = plan {
+    if let Plan::ProcRows { rows, then, .. } = plan {
+        // A TRAILING RAISE IS NOT DROPPED by a consumer that reads the
+        // rows as a set - a WHERE, a projection over them. Only the bare
+        // emit and the FIRST/SKIP modifier deliver the rows and then the
+        // raise; everything else raises without them, which is what it
+        // answered before the rows travelled with the error at all
+        // (measured: `SELECT * FROM PE3 WHERE X > 1` is 2 then 22012 on
+        // the engine; reading the rows here answered 2 and no error).
+        if let Some(e) = then {
+            return Err(e.clone());
+        }
         return Ok(rows.clone());
     }
     // ROWS ALREADY IN HAND are a row source. Nothing produced this plan
@@ -61891,6 +61920,14 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(2) // isc_arg_string
                 .bytes(msg.as_bytes());
         }
+        EvalErr::ProcOutParamMismatch(name) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_PRC_OUT_PARAM_MISMATCH)
+                .int(2) // isc_arg_string
+                .bytes(name.as_bytes());
+        }
         EvalErr::DsqlCountMismatch => {
             w.int(1) // isc_arg_gds
                 .int(GDS_DSQL_ERROR)
@@ -64170,8 +64207,13 @@ fn emit_rows_inner(
                         return Ok(());
                     }
                 }
-                // the inner rows' OWN error, not an invented one
-                let mut rows = branch_rows_res(inner, db, args).map_err(EmitErr::Eval)?;
+                // the inner rows' OWN error, not an invented one - and a
+                // procedure's rows READ PAST the raise that follows them,
+                // which is delivered after them below
+                let mut rows = match &**inner {
+                    Plan::ProcRows { rows, .. } => rows.clone(),
+                    _ => branch_rows_res(inner, db, args).map_err(EmitErr::Eval)?,
+                };
                 // DISTINCT compares whole projected rows with NULL equal
                 // to NULL - the same set semantics UNION uses
                 if *distinct {
@@ -75456,6 +75498,13 @@ enum EvalErr {
     /// raises the same vector when the statement runs, the recorded
     /// difference being the MOMENT, not the message
     DsqlCountMismatch,
+    /// an `EXECUTE PROCEDURE` inside a body whose RETURNING_VALUES list
+    /// is not exactly the callee's output count - fewer, more, or none
+    /// at all: `isc_dsql_error` + `isc_prc_out_param_mismatch` naming the
+    /// procedure quoted (SQLSTATE 07002). The engine raises it at
+    /// PREPARE (StmtNodes.cpp, ExecProcedureNode::dsqlPass), so nothing
+    /// of the body has run and no `At block` item is carried.
+    ProcOutParamMismatch(String),
     /// a reader MET a record whose transaction is PREPARED and
     /// unresolved: `isc_rec_in_limbo` naming the transaction (SQLSTATE
     /// HY000, "record from transaction @1 is stuck in limbo"). Walking
@@ -93530,7 +93579,21 @@ impl Thrown {
         match c {
             HandlerCond::Exception(n) => match self {
                 Thrown::User(r) => n.eq_ignore_ascii_case(&r.name),
-                Thrown::Runtime { .. } => false,
+                // A USER EXCEPTION RAISED IN A CALLEE is still that
+                // exception: the call hands it back as the callee's whole
+                // vector, `At procedure` frames wrapped round it, and the
+                // identity is the vector's - measured: `EXECUTE PROCEDURE
+                // PX(0)` raising E_SIMPLE inside PX is caught by the
+                // caller's `WHEN EXCEPTION E_SIMPLE` (and two frames down
+                // too), where only `WHEN ANY` caught it here
+                Thrown::Runtime { err, .. } => {
+                    let mut e = err;
+                    while let EvalErr::AtProcedure { inner, .. } = e {
+                        e = inner;
+                    }
+                    matches!(e, EvalErr::UserException { name, .. }
+                        if name.eq_ignore_ascii_case(&quoted_qualified(n)))
+                }
             },
             HandlerCond::Gds(n) => crate::gdscodes::entry_by_name(n)
                 .is_some_and(|e| codes.first() == Some(&e.gds)),
@@ -96858,13 +96921,22 @@ fn exec_psql_stmt_inner(
                 }
                 psql_plan_rows(&plan, db, ctx, *src_off)?
             };
-            for row in rows {
+            // ROW_COUNT COUNTS THE LOOP'S FETCHES, measured: 0 once the
+            // cursor opens (an UPDATE of 5 rows followed by a FOR over no
+            // rows reads 0), then the running count after each fetch -
+            // `C = C + ROW_COUNT` in the body sums 1+2+3+4+5 = 15, a LEAVE
+            // at the second row leaves 2 - and the fetch that finds the
+            // end leaves it alone (a body whose UPDATE touched 1 row
+            // reads 1 after the loop). This read 0 after any loop.
+            set_row_count(f, 0);
+            for (fetched, row) in rows.into_iter().enumerate() {
                 if row.len() != into.len() {
                     return Err(PsqlStop::Unsupported);
                 }
                 for (slot, v) in into.iter().zip(row.into_iter()) {
                     store_slot(f, *slot as usize, v)?;
                 }
+                set_row_count(f, fetched as i64 + 1);
                 match exec_psql_stmt(body, f, steps, db, ctx) {
                     Ok(()) => {}
                     Err(PsqlStop::Leave(t)) if t.is_none() || t.as_deref() == label.as_deref() => break,
@@ -97234,7 +97306,16 @@ fn exec_psql_stmt_inner(
             if !sink.is_empty() {
                 return Err(PsqlStop::Unsupported); // a `?` this surface cannot bind
             }
-            if output_cols_of(&plan).len() != into.len() {
+            // A PLAN THAT PROJECTS NOTHING IS A MISREAD, not a count: no
+            // SELECT has zero columns, and `SELECT R FROM PY((-2) - 1)`
+            // (a variable spliced into an argument EXPRESSION) was planned
+            // as a relation of that name and answered the -313 mismatch
+            // where the engine answers -3 - refused instead
+            let projected = output_cols_of(&plan).len();
+            if projected == 0 {
+                return Err(PsqlStop::Unsupported);
+            }
+            if projected != into.len() {
                 return Err(psql_raise(EvalErr::DsqlCountMismatch));
             }
             let rows = psql_plan_rows(&plan, db, ctx, *src_off)?;
@@ -97496,6 +97577,37 @@ fn psql_plan_rows(
 
 fn psql_raise(err: EvalErr) -> PsqlStop {
     PsqlStop::Raise(Thrown::Runtime { err, trace: Vec::new() })
+}
+
+/// The first `EXECUTE PROCEDURE` in a body the engine refuses to
+/// PREPARE: one whose RETURNING_VALUES list does not name exactly the
+/// callee's outputs ([EvalErr::ProcOutParamMismatch]), or one naming no
+/// procedure at all ([EvalErr::ProcUnknownBare] - measured, the block
+/// form carries the same `"NOSUCHPROC"` vector as the statement). A
+/// callee that exists but this server cannot load is left to the call
+/// itself, which refuses it in its own words.
+fn body_call_out_mismatch(s: &TrigStmt, db: &Database) -> Option<EvalErr> {
+    match s {
+        TrigStmt::CallProc { name, into, .. } => match load_procedure(db, name) {
+            Some(meta) => (meta.outs.len() != into.len())
+                .then(|| EvalErr::ProcOutParamMismatch(quoted_qualified_pkg(name))),
+            None if !procedure_defined(db, name) => Some(EvalErr::ProcUnknownBare(
+                name.split('.').map(|p| format!("\"{}\"", p)).collect::<Vec<_>>().join("."),
+            )),
+            None => None,
+        },
+        TrigStmt::If { then, otherwise, .. } => body_call_out_mismatch(then, db)
+            .or_else(|| otherwise.as_deref().and_then(|e| body_call_out_mismatch(e, db))),
+        TrigStmt::While { body, .. }
+        | TrigStmt::ForSelect { body, .. }
+        | TrigStmt::ForExecStmt { body, .. }
+        | TrigStmt::Autonomous { body, .. } => body_call_out_mismatch(body, db),
+        TrigStmt::Block { stmts, handlers, .. } => stmts
+            .iter()
+            .find_map(|st| body_call_out_mismatch(st, db))
+            .or_else(|| handlers.iter().find_map(|(_, h)| body_call_out_mismatch(h, db))),
+        _ => None,
+    }
 }
 
 /// Put one projected row into the INTO slots. The engine measures the
@@ -97861,11 +97973,28 @@ fn runtime_with_position(
     e: EvalErr,
     first_only: bool,
 ) -> EvalErr {
+    runtime_with_position_rows(database, name, args, ctx, e, first_only).0
+}
+
+/// [runtime_with_position] with THE ROWS THE BODY SUSPENDED before it
+/// raised, which the same re-run recovers: the BLR executor reports the
+/// raise alone, and a selectable caller owes the client those rows
+/// first (measured: `SELECT * FROM PE3` answers 1 and 2 and then 22012,
+/// where this answered the error alone). Empty when the re-run did not
+/// raise the same error - the BLR error then stands, without rows.
+fn runtime_with_position_rows(
+    database: &mut Option<Database>,
+    name: &str,
+    args: &[Value],
+    ctx: &SessionCtx,
+    e: EvalErr,
+    first_only: bool,
+) -> (EvalErr, Vec<Vec<Value>>) {
     match run_procedure(database, name, args, ctx, first_only) {
-        Err(ProcErr { status: Some(EvalErr::AtProcedure { inner, at }), .. }) if *inner == e => {
-            EvalErr::AtProcedure { inner, at }
+        Err(ProcErr { status: Some(EvalErr::AtProcedure { inner, at }), rows, .. }) if *inner == e => {
+            (EvalErr::AtProcedure { inner, at }, rows)
         }
-        _ => e,
+        _ => (e, Vec::new()),
     }
 }
 
@@ -99449,6 +99578,20 @@ fn run_body_source(
         stmts.push(body);
         TrigStmt::Block { stmts, handlers: Vec::new(), src_off: begin_at }
     };
+    // THE CALLS' OUTPUT COUNTS ARE A PREPARE-TIME CHECK on the engine,
+    // so it is made here, before a statement runs - raised at the call
+    // it let a WHEN ANY around it catch an error the engine never lets
+    // the body reach, and `RETURNING_VALUES :R` over a two-output
+    // procedure bound the first and answered 8 where the engine raises
+    if let Some(dbr) = database.as_ref() {
+        if let Some(err) = body_call_out_mismatch(&body, dbr) {
+            return Err(ProcErr {
+                rows: Vec::new(),
+                text: format!("procedure {}: a call the engine refuses at prepare", name),
+                status: Some(err),
+            });
+        }
+    }
 
     let mut frame = PsqlFrame {
  stop_after: None,
@@ -106436,6 +106579,23 @@ fn after_auth(
                     match run_body_source(&mut database, ANONYMOUS_BLOCK, &meta, &[], &ctx, None) {
                         Ok((_, suspended)) => {
                             plan = std::rc::Rc::new(Plan::ProcRows { cols: bcols, rows: suspended, then: None });
+                            respond(&mut s, &mut enc, resp_tx)?;
+                        }
+                        // a PREPARE-TIME error on the engine fails the
+                        // statement before there is a result set, so it
+                        // answers the execute rather than the fetch
+                        Err(ProcErr {
+                            status: Some(ev @ (EvalErr::ProcOutParamMismatch(_) | EvalErr::ProcUnknownBare(_))),
+                            ..
+                        }) => {
+                            respond_eval_error(&mut s, &mut enc, &ev)?;
+                        }
+                        // WHAT THE BODY SUSPENDED BEFORE IT RAISED is
+                        // delivered, and the raise follows it - measured:
+                        // `X = 1; SUSPEND; X = 1/0;` answers the row 1 and
+                        // then 22012, where this answered the error alone
+                        Err(ProcErr { status: Some(ev), rows, .. }) if !rows.is_empty() => {
+                            plan = std::rc::Rc::new(Plan::ProcRows { cols: bcols, rows, then: Some(ev) });
                             respond(&mut s, &mut enc, resp_tx)?;
                         }
                         Err(e) => match e.status {
