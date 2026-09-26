@@ -11264,7 +11264,15 @@ enum AggSrc {
     /// pad: a plain CHAR column argument's declared (characters, bytes)
     /// - the plain fold pads a value to the CHARACTER count, the
     /// DISTINCT fold to the full BYTE image (both measured)
-    List { arg: Expr, sep: Option<Expr>, distinct: bool, pad: Option<(usize, usize)> },
+    List {
+        arg: Expr,
+        sep: Option<Expr>,
+        distinct: bool,
+        pad: Option<(usize, usize)>,
+        /// the argument's collation ttype (0 = none): DISTINCT sorts the
+        /// values at full strength and dedups at its own ([list_fold])
+        coll: u16,
+    },
 }
 
 /// A scalar-returning aggregate function.
@@ -44286,12 +44294,16 @@ fn plan_join_bound(
         // server has no table for it: `UNICODE_CI` puts 'apple' and
         // 'APPLE' in ONE bucket where the bytes make two. Refuse
         // ([coll_keyable]).
+        // the collation each key buckets by - a REFUSAL when an expression
+        // key reads an ICU column its form cannot name ([keys_coll]); an
+        // explicit `COLLATE` on a key is carried the same way, so the
+        // statement-wide [EXPLICIT_COLL_SEEN] no longer refuses grouping
+        let comb_key_exprs: Vec<Expr> = key_exprs.iter().map(|(_, e)| e.clone()).collect();
+        let Some(comb_key_coll) = keys_coll(&comb_descs, &key_fids, &comb_key_exprs, synth_base) else {
+            return Some(Plan::Refused);
+        };
         if key_fids.iter().any(|f| comb_descs.get(*f).is_some_and(|d| !coll_groupable(d)))
             || agg_needs_unkeyable_coll(&gitems, &comb_descs)
-            // ...but only where the statement actually BUCKETS: a global
-        // aggregate has no keys, so `MIN(S COLLATE X)` over the whole
-        // table decides nothing this cannot key
-        || (!key_fids.is_empty() && EXPLICIT_COLL_SEEN.with(|c| c.get()))
         {
             return Some(Plan::Refused);
         }
@@ -44352,7 +44364,7 @@ fn plan_join_bound(
             base_width: sides[0].descs.len(),
             parts,
             cols,
-            key_coll: coll_key_mask(&comb_descs, &key_fids),
+            key_coll: comb_key_coll,
             gitems,
             key_fids,
             key_exprs: key_exprs.into_iter().map(|(_, e)| e).collect(),
@@ -44561,6 +44573,7 @@ fn plan_join_bound(
                         nulls: NullsAt::Default,
                         coll: 0,
                         coll_explicit: false,
+                        own_coll: 0,
                     }];
                     if let Some(access) =
                         choose_index(db, src.rel, &src.table, &driver_descs, &None, &opt_sql, &nav)
@@ -46172,9 +46185,26 @@ fn plan_over_source(
         // [agg_needs_unkeyable_coll]) - the fold check was missing here
         // and in the join planner above, so a collation with no key
         // reached them and folded by BYTES
+        let src_key_exprs: Vec<Expr> = key_exprs.iter().map(|(_, e)| e.clone()).collect();
+        let Some(src_key_coll) = keys_coll(&descs, &key_fids, &src_key_exprs, synth_base) else {
+            return Some(Plan::Refused);
+        };
+        // a merged group's spelling follows the record order of the
+        // SOURCE's own statement ([coll_groupable_ttype]): a derived
+        // table whose WHERE names a column it does not project (`SELECT S
+        // FROM C2 WHERE ID < 6`) orders its record by that column first,
+        // which the rows here no longer carry - refuse rather than answer
+        // the spelling the projected column alone would pick
+        if src_key_coll.iter().any(|tt| fire_crab_ods::coll::icu_strength_of_ttype(*tt).is_some())
+            && match &src {
+                BoundSrc::Inner(p) => distinct_tie_unknown(p),
+                BoundSrc::Rows(_) => true,
+            }
+        {
+            return Some(Plan::Refused);
+        }
         if key_fids.iter().any(|f| descs.get(*f).is_some_and(|d| !coll_groupable(d)))
             || agg_needs_unkeyable_coll(&gitems, &descs)
-            || (!key_fids.is_empty() && EXPLICIT_COLL_SEEN.with(|c| c.get()))
         {
             return Some(Plan::Refused);
         }
@@ -46183,7 +46213,7 @@ fn plan_over_source(
             base_width: descs.len(),
             parts: Vec::new(),
             cols: gcols,
-            key_coll: coll_key_mask(&descs, &key_fids),
+            key_coll: src_key_coll,
             gitems,
             key_fids,
             key_exprs: key_exprs.into_iter().map(|(_, e)| e).collect(),
@@ -51138,7 +51168,7 @@ fn branch_rows_res(
         }
         if *distinct {
             let oc = output_cols_of(plan);
-            distinct_rows(&mut rows, order_by.is_some(), &coll_cols(&oc), &varying_cols(&oc))?;
+            distinct_rows(&mut rows, order_by.is_some(), &coll_cols(&oc), &varying_cols(&oc), union_tie_unknown(branches))?;
         }
         if let Some(key) = order_by {
             let keys = [key.clone()];
@@ -51210,7 +51240,7 @@ fn branch_rows_res(
         let mut rows = branch_rows_res(inner, db, args)?;
         if *distinct {
             let oc = output_cols_of(inner);
-            distinct_rows(&mut rows, plan_is_ordered(inner), &coll_cols(&oc), &varying_cols(&oc))?;
+            distinct_rows(&mut rows, plan_is_ordered(inner), &plan_coll_cols(inner, &oc), &varying_cols(&oc), distinct_tie_unknown(inner))?;
         }
         return Ok(rows.into_iter().skip(*skip).take(take.unwrap_or(usize::MAX)).collect());
     }
@@ -51255,7 +51285,7 @@ fn branch_rows_res(
             &having,
             order_by,
             true,
-            coll_key_mask(&descs_now, key_fids),
+            keys_coll(&descs_now, key_fids, key_exprs, *synth_base).unwrap_or_default(),
         )
         .rows(db)?;
         return rows
@@ -51277,8 +51307,8 @@ fn branch_rows_res(
         let rows = if windows.is_empty() {
             filtered
         } else {
-            let ties = window_tie_fields(cols, filter.as_ref(), windows, order_by, *win_base);
-            compute_windows(filtered, windows, *win_base, &ties)?
+            let rec = window_record(cols, filter.as_ref(), windows, order_by, *win_base);
+            compute_windows(filtered, windows, *win_base, &rec)?
         };
         let out = RowSource::Sort { input: Box::new(RowSource::Rows(rows)), keys: order_by.clone() }
             .rows(db)?;
@@ -51672,12 +51702,75 @@ fn stamp_group_order_coll(keys: &mut [OrderKey], slot_descs: &[Option<Descriptor
     }
 }
 
-fn coll_key_mask(descs: &[Descriptor], key_fids: &[usize]) -> Vec<u16> {
-    key_fids
-        .iter()
-        .map(|f| match descs.get(*f) {
+/// The collation ttype a GROUPING or PARTITION key's VALUE carries -
+/// what decides which rows are ONE bucket ([coll_groupable_ttype]) and
+/// which order the buckets come back in: a column's own ttype, an
+/// explicit `COLLATE`'s, and the text form's for an expression over an
+/// ICU-collated column (measured on 2182: `UPPER(ci)` and `ci || 'x'`
+/// group case-insensitively - the collation travels into the result -
+/// while `CAST(ci AS VARCHAR(3))` groups by bytes, the cast dropping it).
+/// A result that is NOT TEXT carries no collation at all - `CHAR_LENGTH
+/// (ci)`, `ASCII_VAL(ci)`, `ci = 'abc'`, `ci IS NULL`, a CASE answering
+/// numbers - and keys as a plain value, whatever it read (measured:
+/// `GROUP BY CHAR_LENGTH(s)` over {abc, ABC, Abc, b} is two groups of
+/// 3 and 1 on the engine). `None` when a TEXT result reads such a
+/// column and its form names no collation this server can key:
+/// bucketing that by bytes was a wrong answer (`GROUP BY ci || 'x'`
+/// made eight groups of the engine's three), so the caller refuses -
+/// and so does a key over [icu_blind_fn], whose value this server gets
+/// wrong before any bucketing.
+fn expr_key_coll(e: &Expr, descs: &[Descriptor]) -> Option<u16> {
+    match e {
+        Expr::Collate(_, tt) | Expr::CollKey(_, tt) | Expr::CollCanon(_, tt, _) => Some(*tt),
+        // a CAST to a text type takes the target's charset and its DEFAULT
+        // collation - the source's collation does not survive it
+        Expr::Cast(..) => Some(expr_text_ttype(e, descs).map(|t| t & 0x00FF).unwrap_or(0)),
+        Expr::Col(f) => Some(match descs.get(*f) {
             Some(d) if d.sub_type >= 0 => d.sub_type as u16,
             _ => 0,
+        }),
+        _ if icu_blind_fn(e, descs) => None,
+        _ if expr_is_nontext(e, descs) => Some(0),
+        _ if expr_reads_icu(e, descs) => expr_text_ttype(e, descs)
+            .filter(|t| fire_crab_ods::coll::icu_strength_of_ttype(*t).is_some()),
+        _ => Some(expr_text_ttype(e, descs).unwrap_or(0)),
+    }
+}
+
+/// Does this expression answer something OTHER than text - a number, a
+/// boolean, a date? (An expression this server cannot type answers
+/// false: it keeps whatever the text rules do with it.)
+fn expr_is_nontext(e: &Expr, descs: &[Descriptor]) -> bool {
+    matches!(e.type_of(descs), Some(t) if !matches!(t, ExprType::Text))
+}
+
+/// A `POSITION` or `REPLACE` over an ICU-collated column: the engine
+/// matches the pattern under the collation (`POSITION('b' IN s)` is 2
+/// for 'ABC' under UNICODE_CI, measured 2182) where this server's
+/// evaluation matches bytes (pre-existing, outside the grouping laws).
+/// A grouping or partition KEY built from such a value would bucket a
+/// wrong value, so the key sites refuse it.
+fn icu_blind_fn(e: &Expr, descs: &[Descriptor]) -> bool {
+    matches!(e, Expr::Func(SysFn::Position | SysFn::Replace, _)) && expr_reads_icu(e, descs)
+}
+
+/// [expr_key_coll] over a grouped statement's keys: a real field by its
+/// descriptor, a synthetic expression-key slot (at or past `synth_base`)
+/// by its expression. `None` refuses the statement.
+fn keys_coll(
+    descs: &[Descriptor],
+    key_fids: &[usize],
+    key_exprs: &[Expr],
+    synth_base: usize,
+) -> Option<Vec<u16>> {
+    key_fids
+        .iter()
+        .map(|f| match (key_exprs.is_empty() || *f < synth_base, f.checked_sub(synth_base)) {
+            (true, _) | (_, None) => Some(match descs.get(*f) {
+                Some(d) if d.sub_type >= 0 => d.sub_type as u16,
+                _ => 0,
+            }),
+            (false, Some(i)) => key_exprs.get(i).and_then(|e| expr_key_coll(e, descs)),
         })
         .collect()
 }
@@ -51690,36 +51783,133 @@ fn coll_key_mask(descs: &[Descriptor], key_fids: &[usize]) -> Vec<u16> {
 /// make? A text ProjCol's `sub_type` is the ttype (charset low byte,
 /// collation high); an EXPRESSION column carries a negative sentinel
 /// and is skipped by the range test, as a non-text one is by the wire
-/// form.
+/// form - except a projected `<x> COLLATE <name>`, which dedups by the
+/// named collation ([coll_cols]) and is keyable when that is. Any OTHER
+/// expression column while an explicit `COLLATE` was resolved somewhere
+/// in the statement keeps the statement-wide refusal
+/// ([EXPLICIT_COLL_SEEN]): its result may carry that collation and its
+/// ProjCol cannot say so.
 fn cols_unkeyable_coll(cols: &[ProjCol]) -> bool {
-    if EXPLICIT_COLL_SEEN.with(|c| c.get()) {
-        return true; // see [EXPLICIT_COLL_SEEN]
-    }
-    cols.iter().any(|c| {
-        matches!(c.wire, Wire::Text | Wire::Varying)
-            && (0..=i16::MAX as i32).contains(&c.sub_type)
-            && !coll_groupable_ttype(c.sub_type as u16)
+    let explicit = EXPLICIT_COLL_SEEN.with(|c| c.get());
+    cols.iter().any(|c| match &c.expr {
+        Some(Expr::Collate(_, tt)) => !coll_groupable_ttype(*tt),
+        Some(_) => explicit && matches!(c.wire, Wire::Text | Wire::Varying),
+        None => {
+            matches!(c.wire, Wire::Text | Wire::Varying)
+                && (0..=i16::MAX as i32).contains(&c.sub_type)
+                && !coll_groupable_ttype(c.sub_type as u16)
+        }
     })
+}
+
+/// Does a DISTINCT over this plan's rows have a survivor the projection
+/// alone can name ([distinct_rows])? Only when the statement references
+/// no field the projection does not carry as a bare column - a WHERE on
+/// another column, a projected expression, a window - since the engine's
+/// record orders those fields by field id among the projected ones.
+fn distinct_tie_unknown(plan: &Plan) -> bool {
+    match plan {
+        Plan::Project { cols, filter, windows, .. } => {
+            if !windows.is_empty() {
+                return true;
+            }
+            let mut fids: Vec<usize> = Vec::new();
+            for c in cols {
+                match &c.expr {
+                    None => fids.push(c.field_id),
+                    Some(Expr::Col(f)) => fids.push(*f),
+                    Some(Expr::Collate(inner, _)) if matches!(**inner, Expr::Col(_)) => {
+                        if let Expr::Col(f) = **inner {
+                            fids.push(f);
+                        }
+                    }
+                    Some(_) => return true,
+                }
+            }
+            match filter {
+                None => false,
+                Some(p) => {
+                    let unknown = std::cell::Cell::new(false);
+                    let mark = |f: usize| -> bool {
+                        if !fids.contains(&f) {
+                            unknown.set(true);
+                        }
+                        false
+                    };
+                    for g in &p.groups {
+                        for t in g {
+                            // a term shape the walk does not open reads
+                            // fields it cannot name: unknown
+                            if !collect_term_fids(t, &mark) {
+                                unknown.set(true);
+                            }
+                        }
+                    }
+                    unknown.get()
+                }
+            }
+        }
+        _ => true,
+    }
 }
 
 /// Can this server say which rows are ONE VALUE under this ttype's
 /// collation, AND which SPELLING of them survives?
 ///
 /// The first half is a key ([coll::keyable_ttype] for byte order,
-/// [coll_value_cmp] for a keyed collation). The second half is what
-/// rules out a CASE- or ACCENT-INSENSITIVE collation: it calls two
-/// DIFFERENT strings one value, and the engine's pick between them
-/// follows its own sort's internal order - measured three ways, no rule
-/// between them (`GROUP BY <CI>` over {apple, APPLE} kept whichever was
-/// inserted SECOND; over four spellings it kept one that was neither
-/// first nor last; and `DISTINCT` answers a different survivor from
-/// `GROUP BY` over the same rows). A FULL-STRENGTH collation asks no
-/// such question: strings it calls equal are the same string.
+/// [coll_value_cmp] for a keyed collation). The second half used to
+/// rule out a CASE- or ACCENT-INSENSITIVE collation, whose survivor
+/// looked like "no rule" (measured 2026-08-27 three ways). It IS a rule,
+/// read off the engine's sort record and measured on 2182 (2026-09-26,
+/// `serve-real-collkey`): the group's sort record is the keys (equal at
+/// the collation's own strength - `INTL_KEY_UNIQUE`, the compare
+/// collator), then the referenced fields' NULL flags, then their values
+/// as [group_tie_cmp] compares them - an ICU-collated key is a VOLATILE
+/// key (`SortedStream::hasVolatileKey`), so its own value sits among
+/// those fields at its field position - then the record number. The
+/// aggregate assigns its key columns on EVERY row of the group
+/// (`aggPass`), so the survivor is the LAST row in that order:
+/// `GROUP BY ci` over {abc, ABC, Abc} in any insertion order keeps
+/// 'abc' (the last by [list_text_tie_cmp]); with ID referenced anywhere
+/// in the statement it keeps the highest ID's spelling; `DISTINCT`
+/// (a unique sort, the earlier of two adjacent equals dropped) keeps
+/// the same row. A FULL-STRENGTH collation asks no such question:
+/// strings it calls equal are the same string.
 fn coll_groupable_ttype(ttype: u16) -> bool {
     // (`keyable_ttype` already covers PXW_INTL)
     fire_crab_ods::coll::keyable_ttype(ttype)
-        || fire_crab_ods::coll::icu_strength_of_ttype(ttype)
-            == Some(fire_crab_ods::coll::Strength::Tertiary)
+        || fire_crab_ods::coll::icu_strength_of_ttype(ttype).is_some()
+}
+
+/// [coll_cols] for a DISTINCT over a plan's own output, the EXPRESSION
+/// columns included: an expression takes the collation its text form
+/// carries ([expr_key_coll]) - `s || 'x'` and `SUBSTRING(s FROM 1 FOR
+/// 2)` over a UNICODE_CI column dedup case-insensitively on the engine
+/// (measured on 2182: `abcx, bx` and `ab, b` of {abc, ABC, Abc, b}),
+/// where the bare projection's sentinel said "bytes" and four rows came
+/// back. A Project reads its expressions over the relation's
+/// descriptors, a Derived over the row below it; any other plan keeps
+/// the projection's own reading. Which spelling survives such a merge
+/// is [distinct_tie_unknown]'s question, and an expression column
+/// answers it "unknown": the collision refuses, an expression whose
+/// spellings agree (`UPPER(s)`) answers.
+fn plan_coll_cols(plan: &Plan, oc: &[ProjCol]) -> Vec<u16> {
+    let descs: Vec<Descriptor> = match plan {
+        Plan::Project { formats, .. } => formats
+            .iter()
+            .max_by_key(|(n, _)| *n)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_default(),
+        Plan::Derived { inner, .. } => output_cols_of(inner).iter().map(desc_of_projcol).collect(),
+        _ => return coll_cols(oc),
+    };
+    oc.iter()
+        .zip(coll_cols(oc))
+        .map(|(c, tt)| match &c.expr {
+            Some(Expr::Collate(..)) | None => tt,
+            Some(e) => expr_key_coll(e, &descs).unwrap_or(tt),
+        })
+        .collect()
 }
 
 /// The same for a whole PROJECTION - what a `DISTINCT` or a distinct
@@ -51727,7 +51917,10 @@ fn coll_groupable_ttype(ttype: u16) -> bool {
 fn coll_cols(cols: &[ProjCol]) -> Vec<u16> {
     cols.iter()
         .map(|c| {
-            if (0..=i16::MAX as i32).contains(&c.sub_type) {
+            // `<x> COLLATE <name>` projected: the named collation dedups it
+            if let Some(Expr::Collate(_, tt)) = &c.expr {
+                *tt
+            } else if (0..=i16::MAX as i32).contains(&c.sub_type) {
                 c.sub_type as u16
             } else {
                 0
@@ -51757,16 +51950,32 @@ fn coll_cols(cols: &[ProjCol]) -> Vec<u16> {
 /// answers descending, so `ordered` says whether something else has
 /// already decided the row order; only when nothing has does the set's
 /// own ascending order show through.
+/// WHICH SPELLING SURVIVES A COLLISION - measured on 2182, 2026-09-26
+/// (`serve-real-collkey`), the same record law [coll_groupable_ttype]
+/// states for a group: the unique sort drops the EARLIER of two adjacent
+/// equals (`Sort::sortBuffer`), so the survivor is the LAST row in the
+/// sort record's order - the keys (equal), then the referenced fields'
+/// values in field order, an ICU-collated column's among them as a
+/// volatile key ([list_text_tie_cmp]: 'abc' out of {abc, ABC, Abc} in
+/// any insertion order), a byte-collated column's NOT among them (it is
+/// restored from the key slot: 'abc' and 'abc ' survive as whichever was
+/// FED LAST - a union's later leg, a table's later row), then the record
+/// number. `tie_unknown` says the statement references fields this
+/// projection does not carry (a WHERE on another column), which the
+/// engine's record orders BEFORE the projected ones when their field ids
+/// are lower: a collision of differing spellings then has no survivor
+/// this can name, and refuses rather than answer one.
 fn distinct_rows(
     rows: &mut Vec<Vec<Value>>,
     ordered: bool,
     coll: &[u16],
     varying: &[bool],
+    tie_unknown: bool,
 ) -> Result<(), EvalErr> {
     // SORT, THEN DROP ADJACENT EQUALS (the engine's SORT_unique over a
     // projection) - in place of the quadratic seen-list this was. Each
     // row carries its input position as a trailing key, so the stable
-    // sort keeps the FIRST occurrence of equals and, when something else
+    // sort keeps equals in arrival order and, when something else
     // already decided the order, puts the survivors back in it.
     let width = rows.iter().map(|r| r.len()).max().unwrap_or(0);
     let taken = std::mem::take(rows);
@@ -51792,31 +52001,47 @@ fn distinct_rows(
     };
     let mut kept: Vec<Vec<Value>> = Vec::new();
     for r in sorted {
-        if let Some(last) = kept.last() {
+        if let Some(last) = kept.last_mut() {
             if rows_equal(&last[..width], &r[..width], coll) {
-                // A dedup collision whose survivors differ in TRAILING
-                // BLANKS on a VARYING column has no representative this
-                // server can reproduce: the engine returns whichever
-                // spelling the LAST row fed to its unique-sort carried -
-                // a storage/leg-order artifact (measured: the survivor
-                // flips with union leg order AND with a table's insert
-                // order). Refuse rather than answer a confident wrong
-                // spelling. A CHAR survivor is re-padded to its declared
-                // width by the encoder, so its representative is
-                // invariant and never refused (checked only for
-                // Wire::Varying); a byte-EQUAL collapse (two 'ab's) is
-                // unambiguous and kept. This is the same call
-                // [coll_groupable_ttype] already makes for a CI/AI
-                // collation, here for the default PAD SPACE one and only
-                // when the colliding rows actually differ.
-                for i in 0..width {
-                    if varying.get(i).copied().unwrap_or(false) {
-                        if let (Value::Text(a), Value::Text(b)) = (&last[i], &r[i]) {
-                            if a != b {
-                                return Err(EvalErr::Unsupported);
-                            }
-                        }
+                // A collision of two DIFFERENT spellings: which survives
+                // is the record law in the doc comment. A CHAR survivor
+                // is re-padded to its declared width by the encoder, so
+                // a blank-only difference there is invisible and never
+                // refused (checked only for Wire::Varying); a byte-EQUAL
+                // collapse (two 'ab's) is unambiguous either way.
+                let differs = (0..width).any(|i| match (&last[i], &r[i]) {
+                    (Value::Text(a), Value::Text(b)) => {
+                        a != b
+                            && (varying.get(i).copied().unwrap_or(false)
+                                || fire_crab_ods::coll::icu_strength_of_ttype(
+                                    coll.get(i).copied().unwrap_or(0),
+                                )
+                                .is_some())
                     }
+                    _ => false,
+                });
+                if differs && tie_unknown {
+                    return Err(EvalErr::Unsupported);
+                }
+                // the LATER row in record order survives: an ICU-collated
+                // column's value decides first (its own field position in
+                // the record - the projection's order stands in for it),
+                // then arrival, which the stable sort kept
+                let later = (0..width)
+                    .filter(|i| {
+                        fire_crab_ods::coll::icu_strength_of_ttype(coll.get(*i).copied().unwrap_or(0))
+                            .is_some()
+                    })
+                    .find_map(|i| match (&last[i], &r[i]) {
+                        (Value::Text(a), Value::Text(b)) => match list_text_tie_cmp(a, b) {
+                            std::cmp::Ordering::Equal => None,
+                            o => Some(o),
+                        },
+                        _ => None,
+                    })
+                    .unwrap_or(std::cmp::Ordering::Less);
+                if later != std::cmp::Ordering::Greater {
+                    *last = r;
                 }
                 continue;
             }
@@ -52977,6 +53202,9 @@ fn plan_query_inner_at(
                 if distinct && cols_unkeyable_coll(&mcols) {
                     return Some(Plan::Refused);
                 }
+                if distinct && distinct_order_merged(&mcols, plan_is_ordered(&plan)) {
+                    return Some(Plan::Refused);
+                }
                 return Some(Plan::Modified {
                     inner: Box::new(plan),
                     cols: mcols,
@@ -53176,6 +53404,9 @@ fn plan_query_inner_at(
         }
         // an ICU collation decides a DISTINCT's buckets ([coll_keyable])
         if distinct && cols_unkeyable_coll(&cols) {
+            return Some(Plan::Refused);
+        }
+        if distinct && distinct_order_merged(&cols, plan_is_ordered(&plan)) {
             return Some(Plan::Refused);
         }
         return Some(Plan::Modified { inner: Box::new(plan), cols, distinct, skip, take });
@@ -55919,6 +56150,14 @@ fn desc_of_projcol(c: &ProjCol) -> Descriptor {
     } else {
         (c.sub_type, c.length)
     };
+    // a projected `<x> COLLATE <name>` is a column OF THAT COLLATION to
+    // the query above (measured on 2182: `GROUP BY 1` over a derived
+    // `S COLLATE UNICODE_CI AS S` makes the CI groups; the describe shows
+    // the charset alone, as the engine's does)
+    let c_sub = match &c.expr {
+        Some(Expr::Collate(_, tt)) if matches!(t, 448 | 452) => *tt as i32,
+        _ => c_sub,
+    };
     let (dtype, length) = match t {
         448 => (dtype::VARYING, (c_len + 2) as u16),
         452 => (dtype::TEXT, c_len as u16),
@@ -56123,22 +56362,6 @@ fn resolve_agg_src(
                 }
                 _ => resolve_expr_sink(arg, columns, descs, sink)?,
             };
-            // the engine's DISTINCT dedupes by the argument's
-            // COLLATION key; fc's value_cmp is binary - a
-            // non-binary-collated text argument would dedupe
-            // (and order) WRONG, so it refuses instead
-            // (review-caught; fc's collation-aware ordering
-            // is a recorded server-wide boundary)
-            if *distinct
-                && expr_reads(&a, &|f| {
-                    descs.get(f).is_some_and(|d| {
-                        matches!(d.dtype, dtype::TEXT | dtype::VARYING)
-                            && (d.sub_type as u16) >> 8 != 0
-                    })
-                })
-            {
-                return None;
-            }
             let s = match sep {
                 Some(r) => Some(resolve_expr_sink(r, columns, descs, sink)?),
                 None => None,
@@ -56164,7 +56387,11 @@ fn resolve_agg_src(
                     }),
                 _ => None,
             };
-            (AggSrc::List { arg: a, sep: s, distinct: *distinct, pad }, false)
+            // a DISTINCT fold needs the argument's collation to dedup by; an
+            // argument reading an ICU column through a form that names none
+            // refuses ([expr_key_coll])
+            let coll = if *distinct { expr_key_coll(&a, descs)? } else { 0 };
+            (AggSrc::List { arg: a, sep: s, distinct: *distinct, pad, coll }, false)
         }
     };
     Some(out)
@@ -57749,13 +57976,11 @@ fn plan_group(
     // buckets 'apple' with 'APPLE' where the bytes make two groups - and
     // this server has no table for it ([coll_keyable]); MIN/MAX over
     // such a column picks by that order too
+    // ...and an expression key whose collation its text form cannot name
+    // ([keys_coll]; the row source derives the same mask at fetch)
     if key_fids.iter().any(|f| descs.get(*f).is_some_and(|d| !coll_groupable(d)))
         || agg_needs_unkeyable_coll(&gitems, descs)
-        // ...and an EXPLICIT collation only where the statement
-        // actually BUCKETS: a global aggregate has no keys, so
-        // `MIN(S COLLATE X)` over the whole table decides nothing this
-        // server cannot key ([EXPLICIT_COLL_SEEN])
-        || (!key_fids.is_empty() && EXPLICIT_COLL_SEEN.with(|c| c.get()))
+        || keys_coll(descs, &key_fids, &key_exprs.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(), synth_base).is_none()
     {
         return Some(Plan::Refused);
     }
@@ -58715,6 +58940,39 @@ impl<'a> ReadView<'a> {
         Some(fill_format_defaults(values, newest.len(), defaults))
     }
 
+}
+
+/// Does a distinct UNION's survivor follow the fed order this model
+/// keeps ([distinct_rows]: the later leg's row)? Only when every leg is
+/// a plain projection. A leg that is itself DISTINCT (or grouped, or a
+/// union) delivers through a sort of its own, and the engine's survivor
+/// then came from the FIRST leg where the plain shape keeps the last
+/// (measured, `serve-real-unionrep`: `SELECT DISTINCT c3 .. UNION SELECT
+/// v5 ..` keeps the CHAR leg's 'ab ' - OCTET_LENGTH 3 - where `SELECT c3
+/// .. UNION SELECT v5 ..` keeps the VARCHAR leg's 2) - unknown, refused.
+fn union_tie_unknown(branches: &[Plan]) -> bool {
+    branches.iter().any(|b| !matches!(b, Plan::Project { windows, gen_cols, .. } if windows.is_empty() && gen_cols.is_empty()))
+}
+
+/// A DISTINCT whose ORDER BY the engine folds INTO its unique sort: with
+/// more than one projected column and an ICU-collated one among them,
+/// the rows the collation calls equal come back in the OTHER columns'
+/// order, not the ORDER BY key's full-strength one (measured on 2182:
+/// `SELECT DISTINCT ci, id ... ORDER BY ci` answers ABC 1, Abc 2, abc 3
+/// where a sort by ci alone answers abc, Abc, ABC). This server sorts
+/// twice, so the shape refuses rather than answer the wrong order.
+fn distinct_order_merged(cols: &[ProjCol], ordered: bool) -> bool {
+    ordered
+        && cols.len() > 1
+        && cols.iter().any(|c| {
+            let tt = match &c.expr {
+                Some(Expr::Collate(_, tt)) => *tt,
+                _ if (0..=i16::MAX as i32).contains(&c.sub_type) => c.sub_type as u16,
+                _ => 0,
+            };
+            fire_crab_ods::coll::icu_strength_of_ttype(tt)
+                .is_some_and(|st| st != fire_crab_ods::coll::Strength::Tertiary)
+        })
 }
 
 /// A resumable cursor over a plain full scan: it produces up to `want`
@@ -60522,11 +60780,20 @@ struct OrderKey {
     /// collations (a sort is full strength whatever the column's own
     /// strength is - measured).
     coll: u16,
+    /// The collation's OWN ttype - `UNICODE_CI`'s, not the full-strength
+    /// `UNICODE` a sort reads it at - for the sites where the engine
+    /// COMPARES rather than sorts: a window's PARTITION BY boundary and
+    /// its ORDER BY peer groups (`MOV_compare` at the collation's own
+    /// strength: `DENSE_RANK() OVER (ORDER BY ci)` gives 'abc', 'ABC',
+    /// 'Abc' ONE rank while `ROW_NUMBER()` numbers them in the
+    /// full-strength order, measured on 2182). `0` when the key has no
+    /// collation of its own.
+    own_coll: u16,
 }
 
 impl OrderKey {
     fn field(field: usize, desc: bool, nulls: NullsAt) -> OrderKey {
-        OrderKey { field, expr: None, desc, nulls, coll: 0, coll_explicit: false }
+        OrderKey { field, expr: None, desc, nulls, coll: 0, coll_explicit: false, own_coll: 0 }
     }
     /// This key's value for a decoded row.
     fn value_of(&self, values: &[Value]) -> Result<Value, EvalErr> {
@@ -60550,7 +60817,7 @@ fn spill_sorter(keys: &[OrderKey]) -> crate::extsort::ExternalSort<Box<dyn Fn(&[
     let prefix_keys: Vec<OrderKey> = keys
         .iter()
         .enumerate()
-        .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll, coll_explicit: k.coll_explicit })
+        .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll, coll_explicit: k.coll_explicit, own_coll: k.own_coll })
         .collect();
     let cmp: Box<dyn Fn(&[Value], &[Value]) -> std::cmp::Ordering> =
         Box::new(move |a: &[Value], b: &[Value]| order_cmp(a, b, &prefix_keys));
@@ -60621,7 +60888,7 @@ fn sort_rows_spilling(rows: Vec<Vec<Value>>, keys: &[OrderKey]) -> Result<Vec<Ve
     let prefix_keys: Vec<OrderKey> = keys
         .iter()
         .enumerate()
-        .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll, coll_explicit: k.coll_explicit })
+        .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll, coll_explicit: k.coll_explicit, own_coll: k.own_coll })
         .collect();
     let cmp = move |a: &[Value], b: &[Value]| order_cmp(a, b, &prefix_keys);
     let mut sorter = crate::extsort::ExternalSort::with_budget(cmp, budget);
@@ -60666,7 +60933,7 @@ fn sort_rows(rows: &mut [Vec<Value>], keys: &[OrderKey]) -> Result<(), EvalErr> 
     let flat: Vec<OrderKey> = keys
         .iter()
         .enumerate()
-        .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll, coll_explicit: k.coll_explicit })
+        .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll, coll_explicit: k.coll_explicit, own_coll: k.own_coll })
         .collect();
     decorated.sort_by(|a, b| order_cmp(&a.0, &b.0, &flat));
     for (dst, (_, row)) in rows.iter_mut().zip(decorated.into_iter()) {
@@ -60798,7 +61065,15 @@ fn group_output(
         synth_base,
         having: having.clone(),
         tie_order: true,
-        key_coll: Vec::new(),
+        // the keys' collations, off the latest format ([keys_coll]; the
+        // planner refused any it cannot name)
+        key_coll: keys_coll(
+            formats.last().map(|f| &f.1[..]).unwrap_or(&[]),
+            key_fids,
+            key_exprs,
+            synth_base,
+        )
+        .unwrap_or_default(),
     }
     .rows(db)
 }
@@ -60830,8 +61105,15 @@ fn plan_win_item(
     // key naming no column, or one the resolver
     // refuses, refuses the whole window
     let mut part: Vec<Expr> = Vec::with_capacity(part_raw.len());
+    let mut part_coll: Vec<u16> = Vec::with_capacity(part_raw.len());
     for r in part_raw {
-        part.push(resolve_expr(r, &columns, &descs)?);
+        let e = resolve_expr(r, &columns, &descs)?;
+        // the key's own collation decides the partition boundary
+        // ([compute_windows]); a key that READS an ICU-collated column
+        // through an expression whose result carries no ttype this
+        // server can name refuses rather than partition by bytes
+        part_coll.push(expr_key_coll(&e, &descs)?);
+        part.push(e);
     }
     // the OVER's ORDER BY resolves over the INPUT
     // columns through the SHARED order-by parser (so
@@ -60856,6 +61138,19 @@ fn plan_win_item(
             },
         )?,
     };
+    // an order key sorted at full strength whose PEER strength is
+    // unknown (an expression over an ICU column with no ttype of its
+    // own) would rank its peers by bytes, and one over a function this
+    // server evaluates by bytes ([icu_blind_fn]) would rank by a wrong
+    // value: refuse the window
+    if order.iter().any(|k| {
+        k.coll == fire_crab_ods::coll::TTYPE_UTF8_UNICODE
+            && k.own_coll == 0
+            && k.expr.is_some()
+            || k.expr.as_ref().is_some_and(|e| icu_blind_fn(e, &descs))
+    }) {
+        return None;
+    }
     let (pc, kind) = match func {
         // AN AGGREGATE WINDOW THROUGH THE AGGREGATE
         // MACHINERY: its describe and fold are a bare
@@ -61028,37 +61323,155 @@ fn plan_win_item(
             (pc, WinKind::Val { func: *vf, arg, n: *nn, frame: frame.clone() })
         }
     };
-    Some((pc, WinSpec { kind, part, order }))
+    // the keys the sort restores from the key slot (see [WinSpec])
+    let restored_keys: Vec<usize> = part
+        .iter()
+        .filter_map(|e| match e {
+            Expr::Col(f) => Some(*f),
+            _ => None,
+        })
+        .chain(order.iter().filter(|k| k.expr.is_none()).map(|k| k.field))
+        .filter(|f| descs.get(*f).is_some_and(sort_key_restored))
+        .collect();
+    let order_text = order_raw
+        .as_deref()
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_uppercase())
+        .unwrap_or_default();
+    Some((
+        pc,
+        WinSpec {
+            kind,
+            part,
+            part_coll,
+            order,
+            part_raw: part_raw.to_vec(),
+            order_text,
+            restored_keys,
+        },
+    ))
 }
 
-/// Answer every WINDOW column on every input row (see [WinSpec]). For
-/// each window the rows are bucketed by its PARTITION BY keys - NULLs
-/// bucket together, the way [group_rows] groups. What each bucket produces
-/// depends on the window's kind:
-///   - [WinKind::Agg]: the bucket is folded by the SAME [compute_group]
-///     the grouped path uses and every row in it gets that one value (the
-///     whole-partition frame);
-///   - [WinKind::Rank]: the bucket is sorted by the OVER's ORDER BY and
-///     each row gets its position - ROW_NUMBER sequential, RANK sharing
-///     with gaps, DENSE_RANK sharing without.
-/// Row ORDER is preserved (a window does not reorder the result); the
+/// Does a sort RESTORE this field from its key slot after sorting, so
+/// the field itself rides nowhere in the sort record? Everything but
+/// the keys `SortedStream::hasVolatileKey` names: an international
+/// text (any character set past NONE, OCTETS and ASCII - `IS_INTL_DATA`),
+/// a DECFLOAT and a zoned time keep their field in the record because
+/// their key is computed and cannot be turned back into the value.
+fn sort_key_restored(d: &Descriptor) -> bool {
+    use fire_crab_ods::intl;
+    if matches!(col_kind(d), Some(ColKind::Text)) {
+        return d.sub_type < 0 || intl::byte_carrier(intl::charset_id(d.sub_type));
+    }
+    !matches!(
+        d.dtype,
+        dtype::DEC64
+            | dtype::DEC128
+            | dtype::SQL_TIME_TZ
+            | dtype::TIMESTAMP_TZ
+            | dtype::EX_TIME_TZ
+            | dtype::EX_TIMESTAMP_TZ
+    )
+}
+
+/// Answer every WINDOW column on every input row (see [WinSpec]), the
+/// way the engine's `WindowedStream` does it: EVERY DISTINCT OVER
+/// CLAUSE IS ONE SORT, the clauses run in the order they first appear
+/// in the select list (`OVER ()`, which sorts nothing, first), and each
+/// sort's record decides the ties among its keys:
+///   - the keys - PARTITION BY, then ORDER BY - at FULL strength
+///     (`INTL_KEY_SORT`: 'abc', 'aBC', 'Abc', 'AbC', 'ABC' in that order
+///     under UNICODE_CI);
+///   - the values of every clause sorted BEFORE this one, latest first;
+///     then the `OVER ()` windows' values and the statement's bare
+///     fields ([WinRecord::map]) in the reverse of their first
+///     appearance; then the base record's referenced fields
+///     ([WinRecord::base]) less the keys this sort restores from their
+///     key slot ([WinSpec::restored_keys]) - the streams the sort names,
+///     outermost first, compared as [group_tie_cmp] compares a group's
+///     (NULL flags, then values word by word);
+///   - then the row's position in the sort before it (the outermost
+///     stream's record number): scan order for the first.
+/// Measured on 2182 (`serve-real-collkey` section 9): `SELECT Y, X,
+/// ROW_NUMBER() OVER (ORDER BY G)` numbers a tie by Y, `SELECT X, Y,
+/// ...` by X, `SELECT X + 0 AS XX, Y, ...` by X, a column only in the
+/// WHERE breaks the tie the projected ones leave, and a second clause's
+/// ties fall to the FIRST clause's values (`R2` over `ORDER BY H`
+/// numbers equal H by R1) - swapping the two in the select list swaps
+/// which leads. A running SUM folds in that order too (3, 5, 6, 11, 15
+/// over the reviewer's TQ, where the field-order record gave 6, 3, 1).
+///
+/// What each partition produces depends on the window's kind:
+///   - [WinKind::Agg]: folded by the SAME [compute_group] the grouped
+///     path uses - the whole partition, a running frame, or an
+///     explicit ROWS / RANGE frame over the sorted partition;
+///   - [WinKind::Rank]: the row's position in the ordered partition -
+///     ROW_NUMBER sequential, RANK sharing with gaps, DENSE_RANK
+///     sharing without;
+///   - [WinKind::Nav] / [WinKind::Val]: another frame row's argument.
+/// A partition's BOUNDARY and a peer group are decided at the key's OWN
+/// collation strength ([WinSpec::part_coll], [OrderKey::own_coll]):
+/// `MOV_compare` over the sorted stream, so all five spellings above are
+/// one partition and one peer group while ROW_NUMBER numbers them 1..5.
+///
+/// The rows come back in the LAST sort's order - the order the engine
+/// delivers a windowed statement in when nothing above it sorts again
+/// (measured: `SELECT Y, ROW_NUMBER() OVER (ORDER BY G DESC) FROM TQ4`
+/// answers 3, 4, 1, 2) - or in scan order when no clause sorts; the
 /// values are appended at `win_base`, where the matching ProjCol reads
-/// them. An empty PARTITION BY is one bucket of every row (`OVER ()`). A
-/// per-row evaluation error (a divide by zero in an argument or a key)
-/// aborts the fetch, as it does grouped.
+/// them. A per-row evaluation error (a divide by zero in an argument or
+/// a key) aborts the fetch, as it does grouped.
 fn compute_windows(
-    mut rows: Vec<Vec<Value>>,
+    rows: Vec<Vec<Value>>,
     windows: &[WinSpec],
     win_base: usize,
-    // the fields the statement references, in field order
-    // ([window_tie_fields]) - what a SORTED window's record carries
-    ties: &[usize],
+    rec: &WinRecord,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
     use std::cmp::Ordering::Equal;
     let n = rows.len();
-    // per-row value of each window, filled bucket by bucket
+    // per-row value of each window, filled partition by partition
     let mut vals: Vec<Vec<Value>> = vec![vec![Value::Null; windows.len()]; n];
-    for (wi, spec) in windows.iter().enumerate() {
+    // THE STAGES: the windows grouped by OVER clause, in first-appearance
+    // order, the `OVER ()` clause (which sorts nothing) ahead of the rest
+    let same_clause =
+        |a: &WinSpec, b: &WinSpec| a.part_raw == b.part_raw && a.order_text == b.order_text;
+    let unsorted = |s: &WinSpec| s.part.is_empty() && s.order.is_empty();
+    let mut by_first: Vec<usize> = (0..windows.len()).collect();
+    by_first.sort_by_key(|&wi| rec.first_at.get(wi).copied().unwrap_or(usize::MAX));
+    let mut stages: Vec<Vec<usize>> = Vec::new();
+    for wi in by_first {
+        match stages.iter_mut().find(|s| same_clause(&windows[s[0]], &windows[wi])) {
+            Some(s) => s.push(wi),
+            None => stages.push(vec![wi]),
+        }
+    }
+    stages.sort_by_key(|s| !unsorted(&windows[s[0]]));
+    // the record's streams past the keys, outermost first: an earlier
+    // stage's window values, or the statement's bare fields
+    enum Stream {
+        Wins(Vec<usize>),
+        Map,
+    }
+    let mut chain: Vec<Stream> = Vec::new();
+    {
+        // the unsorted streams in first-appearance order - the bare
+        // fields' at the first bare field - reversed into the chain
+        let mut items: Vec<(usize, Stream)> = stages
+            .iter()
+            .filter(|s| unsorted(&windows[s[0]]))
+            .map(|s| (rec.first_at[s[0]], Stream::Wins(s.clone())))
+            .collect();
+        if !rec.map.is_empty() {
+            items.push((rec.map_at, Stream::Map));
+        }
+        items.sort_by_key(|(at, _)| *at);
+        chain.extend(items.into_iter().rev().map(|(_, s)| s));
+    }
+    // each row's position in the previous sort: scan order to begin with
+    let mut prev_pos: Vec<usize> = (0..n).collect();
+    // the last sort's order, which the rows come back in
+    let mut last_perm: Option<Vec<usize>> = None;
+    for stage in &stages {
+        let spec = &windows[stage[0]];
         // the partition key of each row, evaluated over the ORIGINAL row
         let mut keyrows: Vec<Vec<Value>> = Vec::with_capacity(n);
         for r in &rows {
@@ -61068,8 +61481,27 @@ fn compute_windows(
             }
             keyrows.push(k);
         }
+        // TWO READINGS OF EVERY KEY (measured on 2182, `serve-real-
+        // collkey`): the rows are SORTED by the partition keys and then
+        // the order keys at FULL strength; the partition BOUNDARY and
+        // the peer groups are `MOV_compare` at the collation's OWN
+        // strength. So `FIRST_VALUE(ci) OVER (PARTITION BY ci ORDER BY
+        // id)` is the full-strength FIRST spelling ('abc'), not the
+        // lowest id's, and `COUNT(*) OVER (PARTITION BY ci ORDER BY id)`
+        // runs in that order too.
+        let pkeys_sort: Vec<OrderKey> = (0..spec.part.len())
+            .map(|i| {
+                let mut k = OrderKey::field(i, false, NullsAt::Default);
+                k.coll = order_ttype_of(spec.part_coll.get(i).copied().unwrap_or(0));
+                k
+            })
+            .collect();
         let pkeys: Vec<OrderKey> = (0..spec.part.len())
-            .map(|i| OrderKey::field(i, false, NullsAt::Default))
+            .map(|i| {
+                let mut k = OrderKey::field(i, false, NullsAt::Default);
+                k.coll = spec.part_coll.get(i).copied().unwrap_or(0);
+                k
+            })
             .collect();
         // whenever the OVER carries an ORDER BY - a ranking, or a RUNNING
         // aggregate - the order value of each row, decorated up front so an
@@ -61081,7 +61513,11 @@ fn compute_windows(
             .order
             .iter()
             .enumerate()
-            .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll, coll_explicit: k.coll_explicit })
+            .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll, coll_explicit: k.coll_explicit, own_coll: k.own_coll })
+            .collect();
+        let okeys_peer: Vec<OrderKey> = okeys
+            .iter()
+            .map(|k| OrderKey { coll: if k.own_coll != 0 { k.own_coll } else { k.coll }, ..k.clone() })
             .collect();
         if !spec.order.is_empty() {
             ordrows.reserve(n);
@@ -61093,57 +61529,73 @@ fn compute_windows(
                 ordrows.push(ov);
             }
         }
-        let mut done = vec![false; n];
-        for i in 0..n {
-            if done[i] {
-                continue;
+        // THE SORT: the keys at full strength, then the record, then the
+        // previous sort's position. `OVER ()` keeps scan order.
+        let perm: Vec<usize> = if unsorted(spec) {
+            (0..n).collect()
+        } else {
+            let at = |r: &[Value], f: usize| r.get(f).cloned().unwrap_or(Value::Null);
+            let trec: Vec<Vec<Value>> = (0..n)
+                .map(|i| {
+                    let mut t: Vec<Value> = Vec::new();
+                    for st in &chain {
+                        match st {
+                            Stream::Wins(ws) => t.extend(ws.iter().map(|&w| vals[i][w].clone())),
+                            Stream::Map => t.extend(rec.map.iter().map(|&f| at(&rows[i], f))),
+                        }
+                    }
+                    t.extend(
+                        rec.base
+                            .iter()
+                            .filter(|f| !spec.restored_keys.contains(f))
+                            .map(|&f| at(&rows[i], f)),
+                    );
+                    t
+                })
+                .collect();
+            let tfields: Vec<usize> = (0..trec.first().map_or(0, |t| t.len())).collect();
+            let mut perm: Vec<usize> = (0..n).collect();
+            perm.sort_by(|&a, &b| {
+                order_cmp(&keyrows[a], &keyrows[b], &pkeys_sort)
+                    .then_with(|| {
+                        if ordrows.is_empty() {
+                            Equal
+                        } else {
+                            order_cmp(&ordrows[a], &ordrows[b], &okeys)
+                        }
+                    })
+                    .then_with(|| group_tie_cmp(&trec[a], &trec[b], &[], &tfields))
+                    .then_with(|| prev_pos[a].cmp(&prev_pos[b]))
+            });
+            perm
+        };
+        // THE PARTITIONS: runs of the sorted rows whose keys are equal at
+        // the collation's own strength (an all-NULL key groups with
+        // another all-NULL key, as the grouped bucketing does)
+        let mut start = 0usize;
+        while start < n {
+            let mut end = start + 1;
+            while end < n && order_cmp(&keyrows[perm[start]], &keyrows[perm[end]], &pkeys) == Equal {
+                end += 1;
             }
-            // gather this partition's row indices (order_cmp over the key
-            // rows is the same equality the grouped bucketing uses, so an
-            // all-NULL key groups with another all-NULL key)
-            let mut idxs = vec![i];
-            done[i] = true;
-            for j in (i + 1)..n {
-                if !done[j] && order_cmp(&keyrows[i], &keyrows[j], &pkeys) == Equal {
-                    idxs.push(j);
-                    done[j] = true;
-                }
-            }
+            let idxs: Vec<usize> = perm[start..end].to_vec();
+            start = end;
+            for &wi in stage {
+                let spec = &windows[wi];
             match &spec.kind {
                 WinKind::Agg { func, src, distinct, frame } => {
                     let gi = [GItem::Agg(*func, src.clone(), *distinct)];
-                    // A SORTED WINDOW FOLDS IN ITS SORT RECORD'S ORDER: a
-                    // PARTITION BY or an ORDER BY sorts the rows, and the
-                    // record carries every field the statement references,
-                    // compared as [group_tie_cmp] compares a group's
-                    // (measured: SUM(X) OVER (PARTITION BY G) over -1E16,
-                    // 1, 1 folds the 1s first, -9999999999999998, unless a
-                    // referenced K or ID orders -1E16 first - then
-                    // -10000000000000000; peers under OVER (ORDER BY G) the
-                    // same). OVER () does not sort: scan order.
-                    let sorted = !spec.part.is_empty() || !spec.order.is_empty();
-                    let tie = |a: usize, b: usize| -> std::cmp::Ordering {
-                        if sorted {
-                            group_tie_cmp(&rows[a], &rows[b], &[], ties)
-                        } else {
-                            Equal
-                        }
-                    };
-                    // (stable: the ORDER BY sorts below keep this order
-                    // among their peers)
-                    if sorted {
-                        idxs.sort_by(|&a, &b| tie(a, b));
-                    }
                     if let Some(fr) = frame.as_ref().filter(|f| f.mode == FrameMode::Rows) {
                         // EXPLICIT ROWS FRAME: order the partition, then
                         // each row folds the PHYSICAL rows its frame bounds
                         // select (clamped to the partition; an empty frame
                         // folds no rows - COUNT 0, the rest NULL). Order is
                         // guaranteed non-empty (checked at plan).
-                        let mut perm: Vec<usize> = (0..idxs.len()).collect();
-                        perm.sort_by(|&a, &b| {
-                            order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
-                        });
+                        let perm: Vec<usize> = (0..idxs.len()).collect();
+                        // (the partition is already in the record order - keys at full
+                        // strength, then the referenced fields - so no re-sort by the peer
+                        // keys here: one at the collation's own strength would put
+                        // 'abc' and 'ABC' back in id order; peers are read off adjacency)
                         let len = perm.len() as isize;
                         let at = |b: &FrameBound, pos: isize| -> isize {
                             match b {
@@ -61212,10 +61664,11 @@ fn compute_windows(
                         // agreed while the spelt-out `RANGE BETWEEN
                         // UNBOUNDED PRECEDING AND CURRENT ROW` did not.
                         let desc = spec.order.first().is_some_and(|k| k.desc);
-                        let mut perm: Vec<usize> = (0..idxs.len()).collect();
-                        perm.sort_by(|&a, &b| {
-                            order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
-                        });
+                        let perm: Vec<usize> = (0..idxs.len()).collect();
+                        // (the partition is already in the record order - keys at full
+                        // strength, then the referenced fields - so no re-sort by the peer
+                        // keys here: one at the collation's own strength would put
+                        // 'abc' and 'ABC' back in id order; peers are read off adjacency)
                         let len = perm.len();
                         // the key at a POSITION, None for a NULL key
                         let keyat = |pos: usize| -> Option<i128> {
@@ -61225,7 +61678,7 @@ fn compute_windows(
                             order_cmp(
                                 &ordrows[idxs[perm[a]]],
                                 &ordrows[idxs[perm[b]]],
-                                &okeys,
+                                &okeys_peer,
                             ) == std::cmp::Ordering::Equal
                         };
                         let peer_start = |pos: usize| {
@@ -61339,10 +61792,11 @@ fn compute_windows(
                         // (rows tying on the ORDER BY keys share one value -
                         // probed). One fold per peer group over the growing
                         // prefix; groups are few and buckets small.
-                        let mut perm: Vec<usize> = (0..idxs.len()).collect();
-                        perm.sort_by(|&a, &b| {
-                            order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
-                        });
+                        let perm: Vec<usize> = (0..idxs.len()).collect();
+                        // (the partition is already in the record order - keys at full
+                        // strength, then the referenced fields - so no re-sort by the peer
+                        // keys here: one at the collation's own strength would put
+                        // 'abc' and 'ABC' back in id order; peers are read off adjacency)
                         let mut s = 0usize;
                         while s < perm.len() {
                             let mut e = s;
@@ -61350,7 +61804,7 @@ fn compute_windows(
                                 && order_cmp(
                                     &ordrows[idxs[perm[e + 1]]],
                                     &ordrows[idxs[perm[s]]],
-                                    &okeys,
+                                    &okeys_peer,
                                 ) == Equal
                             {
                                 e += 1;
@@ -61369,18 +61823,17 @@ fn compute_windows(
                     }
                 }
                 WinKind::Rank(rk) => {
-                    // order the bucket by the OVER's ORDER BY - a STABLE
-                    // sort, so rows tying on the keys keep their scan order
-                    // (the only order ROW_NUMBER can give a tie)
-                    let mut perm: Vec<usize> = (0..idxs.len()).collect();
-                    // `OVER ()` has no order: ROW_NUMBER numbers the scan
-                    // order and RANK/DENSE_RANK see ONE peer group (every
-                    // row ranks 1) - there are no order values to compare
-                    if !okeys.is_empty() {
-                        perm.sort_by(|&a, &b| {
-                            order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
-                        });
-                    }
+                    // the partition is already in the record order - the
+                    // OVER's ORDER BY keys at full strength, then the sort
+                    // record (the stage's sort above), which is the only
+                    // order ROW_NUMBER can give a tie - so no re-sort by
+                    // the peer keys here: one at the collation's own
+                    // strength would put 'abc' and 'ABC' back in id order;
+                    // peers are read off adjacency. `OVER ()` has no
+                    // order: ROW_NUMBER numbers the scan order and
+                    // RANK/DENSE_RANK see ONE peer group (every row ranks
+                    // 1) - there are no order values to compare
+                    let perm: Vec<usize> = (0..idxs.len()).collect();
                     // PEER-GROUP EXTENTS, for the two distribution
                     // rankings: `group_end[pos]` is the 1-based position
                     // of the LAST row tying with `pos`. PERCENT_RANK and
@@ -61396,11 +61849,11 @@ fn compute_windows(
                         while i < n {
                             let mut j = i + 1;
                             while j < n
-                                && (okeys.is_empty()
+                                && (okeys_peer.is_empty()
                                     || order_cmp(
                                         &ordrows[idxs[perm[j - 1]]],
                                         &ordrows[idxs[perm[j]]],
-                                        &okeys,
+                                        &okeys_peer,
                                     ) == Equal)
                             {
                                 j += 1;
@@ -61415,10 +61868,10 @@ fn compute_windows(
                     let mut dense = 0i64;
                     for (pos, &p) in perm.iter().enumerate() {
                         let new_group = pos == 0
-                            || !okeys.is_empty() && order_cmp(
+                            || !okeys_peer.is_empty() && order_cmp(
                                 &ordrows[idxs[perm[pos - 1]]],
                                 &ordrows[idxs[p]],
-                                &okeys,
+                                &okeys_peer,
                             ) != Equal;
                         if new_group {
                             rank = pos as i64 + 1;
@@ -61464,13 +61917,14 @@ fn compute_windows(
                     // order the partition, then each row reads the ARGUMENT
                     // from the row `offset` positions back (LAG) or forward
                     // (LEAD); off the ends it is the default (evaluated on
-                    // the CURRENT row) or NULL. Stable sort, so a tie keeps
-                    // scan order - the only order navigation across peers
-                    // can have.
-                    let mut perm: Vec<usize> = (0..idxs.len()).collect();
-                    perm.sort_by(|&a, &b| {
-                        order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
-                    });
+                    // the CURRENT row) or NULL. A tie keeps the record
+                    // order of the stage's sort - the only order navigation
+                    // across peers can have.
+                    let perm: Vec<usize> = (0..idxs.len()).collect();
+                    // (the partition is already in the record order - keys at full
+                    // strength, then the referenced fields - so no re-sort by the peer
+                    // keys here: one at the collation's own strength would put
+                    // 'abc' and 'ABC' back in id order; peers are read off adjacency)
                     let len = perm.len();
                     for (pos, &p) in perm.iter().enumerate() {
                         let cur = idxs[p];
@@ -61494,10 +61948,11 @@ fn compute_windows(
                     // order the partition, mark each row's peer-group END -
                     // the DEFAULT frame runs from the start THROUGH the
                     // current row's last peer (RANGE .. CURRENT ROW)
-                    let mut perm: Vec<usize> = (0..idxs.len()).collect();
-                    perm.sort_by(|&a, &b| {
-                        order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
-                    });
+                    let perm: Vec<usize> = (0..idxs.len()).collect();
+                    // (the partition is already in the record order - keys at full
+                    // strength, then the referenced fields - so no re-sort by the peer
+                    // keys here: one at the collation's own strength would put
+                    // 'abc' and 'ABC' back in id order; peers are read off adjacency)
                     let len = perm.len();
                     let mut peer_end = vec![0usize; len];
                     let mut s = 0usize;
@@ -61507,7 +61962,7 @@ fn compute_windows(
                             && order_cmp(
                                 &ordrows[idxs[perm[e + 1]]],
                                 &ordrows[idxs[perm[s]]],
-                                &okeys,
+                                &okeys_peer,
                             ) == Equal
                         {
                             e += 1;
@@ -61558,13 +62013,27 @@ fn compute_windows(
                     }
                 }
             }
+            }
+        }
+        if !unsorted(spec) {
+            for (p, &i) in perm.iter().enumerate() {
+                prev_pos[i] = p;
+            }
+            chain.insert(0, Stream::Wins(stage.clone()));
+            last_perm = Some(perm);
         }
     }
-    for (i, r) in rows.iter_mut().enumerate() {
+    // the rows in the last sort's order, each with its window values
+    let order: Vec<usize> = last_perm.unwrap_or_else(|| (0..n).collect());
+    let mut slots: Vec<Option<Vec<Value>>> = rows.into_iter().map(Some).collect();
+    let mut out: Vec<Vec<Value>> = Vec::with_capacity(n);
+    for i in order {
+        let mut r = slots[i].take().unwrap_or_default();
         r.resize(win_base, Value::Null);
         r.extend(std::mem::take(&mut vals[i]));
+        out.push(r);
     }
-    Ok(rows)
+    Ok(out)
 }
 
 /// The engine's grouping-sort compare over two rows of one group run:
@@ -61630,29 +62099,84 @@ fn group_tie_cmp(a: &[Value], b: &[Value], keys: &[OrderKey], extra: &[usize]) -
     std::cmp::Ordering::Equal
 }
 
-/// The fields a windowed statement references, in field order - the
-/// non-key part of a sorted window's record ([compute_windows]): every
-/// projected column and expression, the WHERE, every window's PARTITION
-/// BY / ORDER BY / argument, and the statement's ORDER BY. A window
-/// value's own slot (at or past `win_base`) is no record field.
-fn window_tie_fields(
+/// A sorted window's record past its keys - what breaks the ties among
+/// equal keys ([compute_windows]), read off the engine's sort record
+/// (`Optimizer::generateSort` over the streams `findUsedStreams` names,
+/// outermost first, each contributing its REFERENCED fields in field
+/// order; `Sort::sortBuffer` compares the whole record):
+///   - `map`: the bare fields the select list reads, in WRITTEN order
+///     (an expression's fields as it reads them), then the ones only
+///     the outer ORDER BY reads - the engine's map stream, whose field
+///     ids are the positions `PASS1_post_map` posts them at. A window's
+///     own keys and argument are posted nowhere here: measured, `SELECT
+///     FIRST_VALUE(X) OVER (ORDER BY G), Y` breaks a tie by Y, and
+///     `SELECT Y, X, ...` by Y before X;
+///   - `base`: every field the statement references anywhere - the
+///     select list, the WHERE, every window's keys and arguments, the
+///     ORDER BY - in field order: the base stream's referenced fields,
+///     which follow the map's (measured: `SELECT G, FIRST_VALUE(Y) OVER
+///     (ORDER BY G) FROM TQ WHERE X > 0` breaks the tie by X);
+///   - `first_at[w]`: where window `w` first appears in that visit, and
+///     `map_at` where the first bare field does - the order the engine's
+///     window streams are chained in.
+/// A window value's own slot (at or past `win_base`) is no record field.
+struct WinRecord {
+    map: Vec<usize>,
+    base: Vec<usize>,
+    first_at: Vec<usize>,
+    map_at: usize,
+}
+
+fn window_record(
     cols: &[ProjCol],
     filter: Option<&Predicate>,
     windows: &[WinSpec],
     order_by: &[OrderKey],
     win_base: usize,
-) -> Vec<usize> {
-    let refs = std::cell::RefCell::new(Vec::<usize>::new());
-    let mark = |f: usize| -> bool {
-        let mut r = refs.borrow_mut();
-        if f < win_base && !r.contains(&f) {
-            r.push(f);
+) -> WinRecord {
+    let st = std::cell::RefCell::new((
+        WinRecord {
+            map: Vec::new(),
+            base: Vec::new(),
+            first_at: vec![usize::MAX; windows.len()],
+            map_at: usize::MAX,
+        },
+        0usize, // the visit's clock
+    ));
+    // a field the BASE record is read for: a WHERE's, a window key's or
+    // argument's - referenced, never posted
+    let base = |f: usize| -> bool {
+        let mut s = st.borrow_mut();
+        if f < win_base && !s.0.base.contains(&f) {
+            s.0.base.push(f);
         }
         false // never "found": the reads-walk visits every field
     };
-    let key = |k: &OrderKey| match &k.expr {
+    // a field or a window the select list (or the ORDER BY) reads: posted
+    // to the map in visiting order, and referenced
+    let post = |f: usize| -> bool {
+        {
+            let mut s = st.borrow_mut();
+            s.1 += 1;
+            let tick = s.1;
+            if f >= win_base {
+                if let Some(slot) = s.0.first_at.get_mut(f - win_base) {
+                    if *slot == usize::MAX {
+                        *slot = tick;
+                    }
+                }
+            } else if !s.0.map.contains(&f) {
+                s.0.map.push(f);
+                if s.0.map_at == usize::MAX {
+                    s.0.map_at = tick;
+                }
+            }
+        }
+        base(f)
+    };
+    let key = |mark: &dyn Fn(usize) -> bool, k: &OrderKey| match &k.expr {
         Some(e) => {
-            expr_reads(e, &mark);
+            expr_reads(e, mark);
         }
         None => {
             mark(k.field);
@@ -61661,65 +62185,65 @@ fn window_tie_fields(
     for c in cols {
         match &c.expr {
             Some(e) => {
-                expr_reads(e, &mark);
+                expr_reads(e, &post);
             }
             None => {
-                mark(c.field_id);
+                post(c.field_id);
             }
         }
     }
     if let Some(p) = filter {
         for g in &p.groups {
             for t in g {
-                collect_term_fids(t, &mark);
+                collect_term_fids(t, &base);
             }
         }
     }
     for w in windows {
         for e in &w.part {
-            expr_reads(e, &mark);
+            expr_reads(e, &base);
         }
-        w.order.iter().for_each(key);
+        w.order.iter().for_each(|k| key(&base, k));
         match &w.kind {
             WinKind::Agg { src, .. } => match src {
                 AggSrc::Star => {}
                 AggSrc::Field(f) | AggSrc::CollField(f, _) => {
-                    mark(*f);
+                    base(*f);
                 }
                 AggSrc::Expr(e) => {
-                    expr_reads(e, &mark);
+                    expr_reads(e, &base);
                 }
                 AggSrc::Pair(y, x) => {
-                    expr_reads(y, &mark);
-                    expr_reads(x, &mark);
+                    expr_reads(y, &base);
+                    expr_reads(x, &base);
                 }
                 AggSrc::Percentile { frac, order, .. } => {
-                    expr_reads(frac, &mark);
-                    expr_reads(order, &mark);
+                    expr_reads(frac, &base);
+                    expr_reads(order, &base);
                 }
                 AggSrc::List { arg, sep, .. } => {
-                    expr_reads(arg, &mark);
+                    expr_reads(arg, &base);
                     if let Some(s) = sep {
-                        expr_reads(s, &mark);
+                        expr_reads(s, &base);
                     }
                 }
             },
             WinKind::Rank(_) => {}
             WinKind::Nav { arg, default, .. } => {
-                expr_reads(arg, &mark);
+                expr_reads(arg, &base);
                 if let Some(d) = default {
-                    expr_reads(d, &mark);
+                    expr_reads(d, &base);
                 }
             }
             WinKind::Val { arg, .. } => {
-                expr_reads(arg, &mark);
+                expr_reads(arg, &base);
             }
         }
     }
-    order_by.iter().for_each(key);
-    let mut out = refs.into_inner();
-    out.sort_unstable();
-    out
+    order_by.iter().for_each(|k| key(&post, k));
+    let (mut rec, _) = st.into_inner();
+    rec.base.sort_unstable();
+    rec
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -61791,22 +62315,42 @@ fn group_rows(
         // as 1, -5, max and do not overflow; 1, 1, -1E16 grouped fold
         // the two 1s first). So SUM / AVG / VAR / STDDEV and the
         // two-argument folds take the tie sort as LIST does.
+        // an ICU-collated key is a VOLATILE key of the engine's sort
+        // record (SortedStream::hasVolatileKey): its VALUE rides among the
+        // referenced fields at its own field position, where a byte-
+        // collated key is restored from the key slot and rides nowhere
+        // ([coll_groupable_ttype] has the measurement)
+        let volatile_key = |i: usize| {
+            key_coll
+                .get(i)
+                .is_some_and(|tt| fire_crab_ods::coll::icu_strength_of_ttype(*tt).is_some())
+        };
+        // A TEXT key makes the tie order matter with no fold asking for
+        // it: two spellings the collation calls ONE group ('abc' and
+        // 'ABC' under UNICODE_CI; 'abc' and 'abc ' under any PAD SPACE
+        // collation) survive as the LAST row's spelling in that order
+        // ([compute_group]'s Key arm), so the record order is built
+        // whenever a key holds text
+        let text_key = key_fids.iter().any(|f| {
+            input.iter().any(|r| matches!(r.get(*f), Some(Value::Text(_))))
+        });
         let tie_fids = if tie_order
-            && gitems.iter().any(|g| {
-                matches!(
-                    g,
-                    GItem::Agg(
-                        AggFn::List
-                            | AggFn::Sum
-                            | AggFn::Avg
-                            | AggFn::VarPop
-                            | AggFn::VarSamp
-                            | AggFn::StddevPop
-                            | AggFn::StddevSamp,
-                        ..
-                    )
-                ) || matches!(g, GItem::Agg(f, ..) if f.is_statistical2())
-            })
+            && (text_key
+                || gitems.iter().any(|g| {
+                    matches!(
+                        g,
+                        GItem::Agg(
+                            AggFn::List
+                                | AggFn::Sum
+                                | AggFn::Avg
+                                | AggFn::VarPop
+                                | AggFn::VarSamp
+                                | AggFn::StddevPop
+                                | AggFn::StddevSamp,
+                            ..
+                        )
+                    ) || matches!(g, GItem::Agg(f, ..) if f.is_statistical2())
+                }))
         {
             let refs = std::cell::RefCell::new(Vec::<usize>::new());
             let mark = |f: usize| -> bool {
@@ -61847,21 +62391,34 @@ fn group_rows(
             for e in key_exprs {
                 expr_reads(e, &mark);
             }
-            for p in [filter, having.as_ref()].into_iter().flatten() {
+            // (a HAVING term indexes the GROUP ROW's slots, not the record's
+            // fields - its aggregates' sources are marked above, and its key
+            // slots ARE keys - so it adds nothing here; it once marked slot
+            // numbers as field ids, which put ID before a text key it never
+            // named and answered the wrong spelling under `HAVING ci = ...`)
+            for p in [filter].into_iter().flatten() {
                 for g in &p.groups {
                     for t in g {
                         collect_term_fids(t, &mark);
                     }
                 }
             }
+            // a volatile key's value is a referenced field like any other
+            for (i, f) in key_fids.iter().enumerate() {
+                if volatile_key(i) && (key_exprs.is_empty() || *f < synth_base) {
+                    mark(*f);
+                }
+            }
             let mut extra = refs.into_inner();
             extra.sort_unstable(); // the record lays fields out in field order
-            // key fields lead the record already; a synthetic
-            // expression-key slot duplicates fields marked through
-            // key_exprs (synth_base bounds the real slots only when
-            // expression keys exist)
+            // key fields lead the record already (a volatile one rides
+            // twice, as the engine's does); a synthetic expression-key
+            // slot duplicates fields marked through key_exprs
+            // (synth_base bounds the real slots only when expression
+            // keys exist)
             extra.retain(|f| {
-                !key_fids.contains(f) && (key_exprs.is_empty() || *f < synth_base)
+                (!key_fids.contains(f) || key_fids.iter().position(|k| k == f).is_some_and(volatile_key))
+                    && (key_exprs.is_empty() || *f < synth_base)
             });
             Some(extra)
         } else {
@@ -61927,6 +62484,22 @@ fn group_rows(
             {
                 j += 1;
             }
+            // a fold in DELIVERY order (a real join's) has no record order
+            // to pick a merged group's spelling by: two spellings under a
+            // volatile key refuse rather than answer the first-delivered
+            // (the engine's joined record sorts by both streams' fields,
+            // measured: `GROUP BY x.ci` over j1 x JOIN j2 y keeps 'x' of
+            // {x, X} by that order - a later slice)
+            if !tie_order
+                && key_fids.iter().enumerate().any(|(ki, f)| {
+                    volatile_key(ki)
+                        && input[i..j].windows(2).any(|w| {
+                            matches!((w[0].get(*f), w[1].get(*f)), (Some(Value::Text(a)), Some(Value::Text(b))) if a != b)
+                        })
+                })
+            {
+                return Err(EvalErr::Unsupported);
+            }
             out.push(compute_group(&input[i..j], gitems)?);
             i = j;
         }
@@ -61944,7 +62517,8 @@ fn group_rows(
 }
 
 /// One output row for one group of input rows. Key items take the value
-/// from the first row (all rows in the group share it); COUNT(*) counts
+/// from the LAST row (the collation may have merged spellings; the last
+/// in record order is the engine's survivor); COUNT(*) counts
 /// rows, COUNT(col) non-null values; MIN/MAX/SUM fold the non-null
 /// integers, NULL if there are none.
 /// The closed-form value of a two-argument statistical fold from n and the
@@ -62039,6 +62613,42 @@ fn stat2_result(func: AggFn, n: i64, sx: f64, sx2: f64, sy: f64, sy2: f64, sxy: 
 /// The word grouping assumes the string starts word-aligned, the
 /// single-text-driver shape the gates pin; multi-field packing corners
 /// are recorded unpinned.
+/// The engine's DISTINCT-fold sort (`Optimizer::generateAggregateDistinct`
+/// - the `asb` a `COUNT(DISTINCT x)` or `LIST(DISTINCT x)` runs): the
+/// value's KEY, then the VALUE ITSELF byte-ordered, the earlier of two
+/// equal keys dropped. The key merges what the collation calls one value
+/// - an ICU collation at its own strength, a NONE / WIN1252 / UNICODE
+/// text with its trailing blanks stripped - EXCEPT a UTF8 text under its
+/// default collation, whose key is its exact bytes. Measured on 2182
+/// over {'abc ', 'abc', 'xyz'}: COUNT(DISTINCT) is 3 and LIST(DISTINCT)
+/// `abc,abc ,xyz` for a `VARCHAR(10) CHARACTER SET UTF8`, 2 and
+/// `abc ,xyz` (the byte-greatest spelling survives) for NONE, WIN1252
+/// and `UTF8 COLLATE UNICODE`, one value for a CHAR(5) - while the
+/// GROUP BY sort merges the UTF8 pair too (`[abc] 2`).
+fn distinct_fold_key_cmp(a: &Value, b: &Value, tt: u16) -> std::cmp::Ordering {
+    match coll_value_cmp(a, b, tt) {
+        Some(o) => o,
+        None => match (a, b) {
+            (Value::Text(x), Value::Text(y)) if utf8_plain_ttype(tt) => x.as_bytes().cmp(y.as_bytes()),
+            _ => num_cmp(a, b).unwrap_or_else(|| value_cmp(a, b)),
+        },
+    }
+}
+
+/// [distinct_fold_key_cmp], then the value's bytes: the whole sort order.
+fn distinct_fold_cmp(a: &Value, b: &Value, tt: u16) -> std::cmp::Ordering {
+    distinct_fold_key_cmp(a, b, tt).then_with(|| match (a, b) {
+        (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
+        _ => std::cmp::Ordering::Equal,
+    })
+}
+
+/// A UTF8 ttype under the character set's own (byte-ordering) collation.
+fn utf8_plain_ttype(tt: u16) -> bool {
+    fire_crab_ods::intl::charset_id(tt as i16) == fire_crab_ods::intl::CS_UTF8
+        && fire_crab_ods::intl::collation_id(tt as i16) == 0
+}
+
 fn list_text_tie_cmp(x: &str, y: &str) -> std::cmp::Ordering {
     let (xb, yb) = (x.as_bytes(), y.as_bytes());
     let c = xb.len().cmp(&yb.len());
@@ -62081,6 +62691,7 @@ fn list_fold(
     sep: Option<&Expr>,
     distinct: bool,
     pad: Option<(usize, usize)>,
+    coll: u16,
 ) -> Result<Value, EvalErr> {
     // a CHAR argument's value: the plain fold appends it padded to the
     // declared CHARACTER count; the DISTINCT machinery sorts descriptor
@@ -62116,8 +62727,25 @@ fn list_fold(
                 vals.push(v);
             }
         }
-        vals.sort_by(value_cmp);
-        vals.dedup_by(|a, b| value_cmp(a, b) == std::cmp::Ordering::Equal);
+        // a collated argument: the engine's distinct sort (the `asb` of
+        // Optimizer::generateAggregateDistinct) keys the value's
+        // collation key at the collation's OWN strength and then the
+        // VALUE ITSELF as a second, byte-ordered key; the unique sort
+        // drops the earlier of two equals, so of the spellings the
+        // collation calls one the BYTE-GREATEST survives (measured on
+        // 2182: LIST(DISTINCT ci) over {Ab, aB} is 'aB' either way round,
+        // over {ABC, Abc, abc, aBC, AbC} 'abc', over the CI_AI {café,
+        // CAFE, cafe, Café, CAFÉ} 'café' - byte order after the key, not
+        // the full-strength order a plain sort reads)
+        vals.sort_by(|a, b| distinct_fold_cmp(a, b, coll));
+        vals.dedup_by(|a, b| {
+            if distinct_fold_key_cmp(a, b, coll) == std::cmp::Ordering::Equal {
+                std::mem::swap(a, b); // the later spelling is the survivor
+                true
+            } else {
+                false
+            }
+        });
         count = vals.len();
         if count > 0 {
             let sep_bytes = match rows.last() {
@@ -62261,8 +62889,14 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
         .iter()
         .map(|gi| {
             Ok(match gi {
+                // the LAST row's spelling: the engine assigns its key columns
+                // on every row of the group (aggPass), and the rows arrive
+                // in the sort record's order ([group_rows]), so a group
+                // whose spellings a collation merged - 'abc' and 'ABC'
+                // under UNICODE_CI, 'abc' and 'abc ' under PAD SPACE -
+                // answers the last one (measured, [coll_groupable_ttype])
                 GItem::Key(fid) => rows
-                    .first()
+                    .last()
                     .and_then(|r| r.get(*fid))
                     .cloned()
                     .unwrap_or(Value::Null),
@@ -62287,9 +62921,13 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         if matches!(v, Value::Null) {
                             continue;
                         }
-                        let dup = seen
-                            .iter()
-                            .any(|s| fold_cmp(s, &v, src) == std::cmp::Ordering::Equal);
+                        let dup = seen.iter().any(|s| match src {
+                            // a text field's DISTINCT key ([distinct_fold_cmp])
+                            AggSrc::CollField(_, tt) => {
+                                distinct_fold_key_cmp(s, &v, *tt) == std::cmp::Ordering::Equal
+                            }
+                            _ => fold_cmp(s, &v, src) == std::cmp::Ordering::Equal,
+                        });
                         if !dup {
                             seen.push(v);
                         }
@@ -62722,8 +63360,8 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                     }
                 }
                 GItem::Const(v) => v.clone(), // a per-group constant slot
-                GItem::Agg(AggFn::List, AggSrc::List { arg, sep, distinct, pad }, _) => {
-                    list_fold(rows, arg, sep.as_ref(), *distinct, *pad)?
+                GItem::Agg(AggFn::List, AggSrc::List { arg, sep, distinct, pad, coll }, _) => {
+                    list_fold(rows, arg, sep.as_ref(), *distinct, *pad, *coll)?
                 }
                 GItem::Agg(..) => Value::Null, // MIN/MAX/SUM(*): rejected at plan
             })
@@ -63085,7 +63723,7 @@ fn fold_project_windows(
     db: &Database,
     args: &[WireParam],
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
-    let ties = window_tie_fields(cols, filter.as_ref(), windows, order_by, win_base);
+    let rec = window_record(cols, filter.as_ref(), windows, order_by, win_base);
     let filter = bind_filter_eval(filter, args)?;
     let descs_now: Vec<Descriptor> = formats
         .iter()
@@ -63101,7 +63739,7 @@ fn fold_project_windows(
         access,
     )
     .rows(db)?;
-    let mut rows = compute_windows(base, windows, win_base, &ties)?;
+    let mut rows = compute_windows(base, windows, win_base, &rec)?;
     if !order_by.is_empty() {
         sort_rows(&mut rows, order_by)?;
     }
@@ -66445,7 +67083,7 @@ fn subst_params_aggsrc(s: &AggSrc, args: &[WireParam]) -> Option<AggSrc> {
             order: subst_params_expr(order, args)?,
             desc: *desc,
         },
-        AggSrc::List { arg, sep, distinct, pad } => AggSrc::List {
+        AggSrc::List { arg, sep, distinct, pad, coll } => AggSrc::List {
             arg: subst_params_expr(arg, args)?,
             sep: match sep {
                 Some(x) => Some(subst_params_expr(x, args)?),
@@ -66453,6 +67091,7 @@ fn subst_params_aggsrc(s: &AggSrc, args: &[WireParam]) -> Option<AggSrc> {
             },
             distinct: *distinct,
             pad: *pad,
+            coll: *coll,
         },
         other => other.clone(),
     })
@@ -66768,7 +67407,7 @@ fn emit_rows_inner(
                             }
                             rows_v.push(row);
                         }
-                        distinct_rows(&mut rows_v, !order_by.is_empty(), &coll_cols(icols), &varying_cols(icols)).map_err(EmitErr::Eval)?;
+                        distinct_rows(&mut rows_v, !order_by.is_empty(), &plan_coll_cols(inner, icols), &varying_cols(icols), distinct_tie_unknown(inner)).map_err(EmitErr::Eval)?;
                         for r in rows_v.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
                             encode_row(w, cols, r, out)?;
                         }
@@ -66866,7 +67505,7 @@ fn emit_rows_inner(
                 // to NULL - the same set semantics UNION uses
                 if *distinct {
                     let oc = output_cols_of(inner);
-                    distinct_rows(&mut rows, plan_is_ordered(inner), &coll_cols(&oc), &varying_cols(&oc)).map_err(EmitErr::Eval)?;
+                    distinct_rows(&mut rows, plan_is_ordered(inner), &plan_coll_cols(inner, &oc), &varying_cols(&oc), distinct_tie_unknown(inner)).map_err(EmitErr::Eval)?;
                 }
                 for r in rows.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
                     encode_row(w, cols, r, out)?;
@@ -66947,7 +67586,7 @@ fn emit_rows_inner(
                 // duplicates of each other here (SQL's set semantics),
                 // unlike `= NULL` in a predicate.
                 if *distinct {
-                    distinct_rows(&mut rows, order_by.is_some(), &coll_cols(cols), &varying_cols(cols)).map_err(EmitErr::Eval)?;
+                    distinct_rows(&mut rows, order_by.is_some(), &coll_cols(cols), &varying_cols(cols), union_tie_unknown(branches)).map_err(EmitErr::Eval)?;
                 }
                 if let Some(key) = order_by {
                     let keys = [key.clone()];
@@ -67061,7 +67700,7 @@ fn emit_rows_inner(
                         .map_err(EmitErr::Eval)?,
                         windows,
                         *win_base,
-                        &window_tie_fields(cols, filter.as_ref(), windows, order_by, *win_base),
+                        &window_record(cols, filter.as_ref(), windows, order_by, *win_base),
                     )
                     .map_err(EmitErr::Eval)?;
                     if !order_by.is_empty() {
@@ -67228,7 +67867,7 @@ fn emit_rows_inner(
                             filtered,
                             windows,
                             *win_base,
-                            &window_tie_fields(cols, filter.as_ref(), windows, order_by, *win_base),
+                            &window_record(cols, filter.as_ref(), windows, order_by, *win_base),
                         )
                         .map_err(EmitErr::Eval)?;
                     if !order_by.is_empty() {
@@ -67294,6 +67933,7 @@ fn emit_rows_inner(
                                         nulls: k.nulls,
                                         coll: k.coll,
                                         coll_explicit: k.coll_explicit,
+                                        own_coll: k.own_coll,
                                     })
                                 })
                                 .collect()
@@ -67479,7 +68119,7 @@ fn emit_rows_inner(
                     &having,
                     order_by,
                     true,
-                    coll_key_mask(&descs_now, key_fids),
+                    keys_coll(&descs_now, key_fids, key_exprs, *synth_base).unwrap_or_default(),
                 )
                 .rows(db)
                 .map_err(EmitErr::Eval)?;
@@ -69849,9 +70489,28 @@ struct GenCol {
 struct WinSpec {
     kind: WinKind,
     part: Vec<Expr>,
+    /// each partition key's own collation ttype (0 = none): the boundary
+    /// is decided at that strength while the sort reads the key at full
+    /// strength ([compute_windows])
+    part_coll: Vec<u16>,
     /// the OVER's ORDER BY, resolved over the INPUT columns. Empty for a
     /// whole-partition aggregate; the ranking key for a [WinKind::Rank].
     order: Vec<OrderKey>,
+    /// the OVER clause as written - its PARTITION BY items and its ORDER
+    /// BY text, case-folded - which is the engine's identity of a
+    /// window: two functions over one clause share one sort, and every
+    /// distinct clause is a sort of its own ([compute_windows]'s
+    /// stages; `dsql_ctx::getWindowMap` matches the clause node)
+    part_raw: Vec<RawExpr>,
+    order_text: String,
+    /// the plain-field keys of this clause whose value the sort RESTORES
+    /// from the key slot - an integer, a NONE/OCTETS/ASCII text - so
+    /// they ride nowhere in the sort record; an international text, a
+    /// DECFLOAT or a zoned time is a VOLATILE key whose field stays in
+    /// the record (`Optimizer::generateSort`, `SortedStream::
+    /// hasVolatileKey`). What [compute_windows] leaves out of the base
+    /// fields that break this sort's ties.
+    restored_keys: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -93412,17 +94071,29 @@ fn parse_order_by_expr(
             None => {
                 if let Some(d) = descs.get(k.field) {
                     k.coll = order_key_ttype(d);
+                    k.own_coll = coll_key_ttype(d).unwrap_or(0);
                 }
             }
             // an EXPRESSION key sorts binary when its RESULT is binary
             Some(e) => {
                 if expr_is_octets(e, descs) {
                     k.coll = fire_crab_ods::intl::CS_OCTETS as u16;
-                } else if expr_reads_icu(e, descs) {
+                } else if expr_reads_icu(e, descs) && !expr_is_nontext(e, descs) {
                     // the collation travels into the result -
                     // `ORDER BY CI || 'x'` is the collation's order -
-                    // and a sort reads it at full strength
+                    // and a sort reads it at full strength; the
+                    // collation's OWN strength is the one its text form
+                    // carries (an explicit `COLLATE` names it outright),
+                    // and stays 0 - unknown - when the form has none. A
+                    // result that is not text (`CHAR_LENGTH(ci)`) carries
+                    // no collation and sorts as the plain value
                     k.coll = fire_crab_ods::coll::TTYPE_UTF8_UNICODE;
+                    k.own_coll = match e {
+                        Expr::Collate(_, tt) => *tt,
+                        _ => expr_text_ttype(e, descs)
+                            .filter(|t| fire_crab_ods::coll::icu_strength_of_ttype(*t).is_some())
+                            .unwrap_or(0),
+                    };
                 }
             }
         }
@@ -93518,7 +94189,7 @@ fn parse_order_by_expr(
             // EXPRESSION key, computed per row
             match resolve_expression(head) {
                 Some(e) => {
-                    keys.push(stamp(OrderKey { field: 0, expr: Some(e), desc, nulls, coll: 0, coll_explicit: false }));
+                    keys.push(stamp(OrderKey { field: 0, expr: Some(e), desc, nulls, coll: 0, coll_explicit: false, own_coll: 0 }));
                     continue;
                 }
                 None => return None,
@@ -93539,7 +94210,7 @@ fn parse_order_by_expr(
             // `sort_rows`. This used to refuse, which was right only
             // while nothing evaluated expression keys.
             if let Some(e) = &cols[ord - 1].expr {
-                keys.push(stamp(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls, coll: 0, coll_explicit: false }));
+                keys.push(stamp(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls, coll: 0, coll_explicit: false, own_coll: 0 }));
                 continue;
             }
             cols[ord - 1].field_id
@@ -93562,7 +94233,7 @@ fn parse_order_by_expr(
                     // an aliased EXPRESSION sorts by the expression it
                     // names, as the ordinal form above does
                     if let Some(e) = &c.expr {
-                        keys.push(stamp(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls, coll: 0, coll_explicit: false }));
+                        keys.push(stamp(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls, coll: 0, coll_explicit: false, own_coll: 0 }));
                         continue;
                     }
                     c.field_id
@@ -93576,7 +94247,7 @@ fn parse_order_by_expr(
                     // None here too and refuses
                     None => {
                         let e = resolve_expression(name)?;
-                        keys.push(stamp(OrderKey { field: 0, expr: Some(e), desc, nulls, coll: 0, coll_explicit: false }));
+                        keys.push(stamp(OrderKey { field: 0, expr: Some(e), desc, nulls, coll: 0, coll_explicit: false, own_coll: 0 }));
                         continue;
                     }
                 },
@@ -93608,6 +94279,7 @@ fn parse_order_by_expr(
             };
             k.coll = order_ttype_of(tt);
             k.coll_explicit = true;
+            k.own_coll = tt;
         }
     }
     Some(keys)
@@ -104977,11 +105649,20 @@ fn split_qualified_parts(s: &str, max: usize) -> Option<Vec<String>> {
 /// [agg_needs_unkeyable_coll] refuses the statement before the fold
 /// ever runs.
 fn agg_field_src(fid: usize, descs: &[Descriptor]) -> AggSrc {
-    match descs.get(fid).and_then(coll_key_ttype) {
+    let d = descs.get(fid);
+    match d.and_then(coll_key_ttype) {
         Some(tt) if fire_crab_ods::intl::collation_id(tt as i16) != 0 => {
             AggSrc::CollField(fid, tt)
         }
-        _ => AggSrc::Field(fid),
+        // a UTF8 column under its default collation carries its ttype
+        // too: its DISTINCT fold keys the exact bytes ([distinct_fold_cmp])
+        // while every compare the fold makes stays the plain one
+        // ([coll_value_cmp] has no key for it)
+        _ => match d {
+            Some(d) if matches!(col_kind(d), Some(ColKind::Text)) && d.sub_type >= 0
+                && utf8_plain_ttype(d.sub_type as u16) => AggSrc::CollField(fid, d.sub_type as u16),
+            _ => AggSrc::Field(fid),
+        },
     }
 }
 
@@ -107122,8 +107803,17 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             let (lhs, rhs) = {
                 use fire_crab_ods::intl;
                 let att = CURRENT_ATT_CS.with(|c| c.get());
+                // ...and an EXPLICIT `COLLATE` over a plain column is a
+                // collated side just the same: `s COLLATE UNICODE_CI =
+                // 'abc'` over a UTF8 column takes 'ABC' and 'Abc' from a
+                // NONE attachment too (measured on 2182: 4 rows, where
+                // the byte-space branch below took the 2 exact
+                // spellings - the one wrong answer this server gave from
+                // isql's default attachment while a UTF8 one was right)
                 let collated_cs = |e: &Expr| -> Option<u8> {
-                    if !expr_reads_coll(e, descs) {
+                    let explicit = matches!(e, Expr::Collate(_, tt)
+                        if intl::collation_id(*tt as i16) != 0);
+                    if !explicit && !expr_reads_coll(e, descs) {
                         return None;
                     }
                     let cs = cmp_text_charset(e, descs)?;
@@ -119089,6 +119779,7 @@ mod tests {
             nulls: NullsAt::Default,
             coll: 0,
                     coll_explicit: false,
+            own_coll: 0,
         };
         sort_rows(&mut rows, &[key]).unwrap();
         let ids: Vec<i64> = rows
@@ -121133,7 +121824,7 @@ mod tests {
             vec![Value::Int(20)],
             vec![Value::Null],
         ];
-        distinct_rows(&mut rows, false, &[], &[]).unwrap();
+        distinct_rows(&mut rows, false, &[], &[], false).unwrap();
         assert_eq!(
             rows,
             vec![
@@ -121150,7 +121841,7 @@ mod tests {
             vec![Value::Int(2), Value::Int(1)],
             vec![Value::Int(1), Value::Int(5)],
         ];
-        distinct_rows(&mut two, false, &[], &[]).unwrap();
+        distinct_rows(&mut two, false, &[], &[], false).unwrap();
         assert_eq!(
             two,
             vec![
@@ -121173,7 +121864,7 @@ mod tests {
             vec![Value::Int(20)],
             vec![Value::Int(10)],
         ];
-        distinct_rows(&mut rows, true, &[], &[]).unwrap();
+        distinct_rows(&mut rows, true, &[], &[], false).unwrap();
         assert_eq!(
             rows,
             vec![vec![Value::Int(30)], vec![Value::Int(20)], vec![Value::Int(10)]]
@@ -121977,7 +122668,7 @@ mod tests {
         let cols = vec![col("ID", 0, None)];
         let plan = project(
             cols.clone(),
-            vec![WinSpec { kind: WinKind::Rank(RankFn::RowNumber), part: Vec::new(), order: Vec::new() }],
+            vec![WinSpec { kind: WinKind::Rank(RankFn::RowNumber), part: Vec::new(), part_coll: Vec::new(), order: Vec::new(), part_raw: Vec::new(), order_text: String::new(), restored_keys: Vec::new() }],
         );
         assert_eq!(side_base_fids(Some(&plan), &cols), vec![None]);
         // a side whose rows are NOT a plain projection of one relation -
@@ -122062,7 +122753,7 @@ mod tests {
         let win = derived(
             inner.clone(),
             win_cols.clone(),
-            vec![WinSpec { kind: WinKind::Rank(RankFn::RowNumber), part: Vec::new(), order: Vec::new() }],
+            vec![WinSpec { kind: WinKind::Rank(RankFn::RowNumber), part: Vec::new(), part_coll: Vec::new(), order: Vec::new(), part_raw: Vec::new(), order_text: String::new(), restored_keys: Vec::new() }],
             2,
         );
         assert_eq!(side_base_fids(Some(&win), &win_cols), vec![Some(1), None]);
@@ -131150,7 +131841,7 @@ mod tests {
         // NAVIGATION removes the Sort - and only navigation does. A
         // sort dropped wrongly does not lose rows; it hands back the
         // right rows in an order the engine did not choose.
-        let keys = vec![OrderKey { field: 0, expr: None, desc: false, nulls: NullsAt::Default, coll: 0, coll_explicit: false }];
+        let keys = vec![OrderKey { field: 0, expr: None, desc: false, nulls: NullsAt::Default, coll: 0, coll_explicit: false, own_coll: 0 }];
         let sorted = RowSource::scan_filter_sort(
             128,
             Vec::new(),

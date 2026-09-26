@@ -348,7 +348,9 @@ recorded "10 UPPER(ci) = 'abc': refused here, not a byte compare" \
 # groups as abc, abd). The domain column meets that rule now that it
 # carries its collation; before, it was a byte-compared NONE column and
 # answered two groups where the engine has one.
-recorded "10 GROUP BY a CI column: refused (which spelling survives has no rule)" \
+# PROMOTED 2026-09-26 (serve-real-collkey): the surviving spelling follows
+# the engine's sort record order and this server answers it now
+pin  "10 GROUP BY a CI column: the surviving spelling follows the record order" \
      "SELECT A FROM TCD2 GROUP BY A;" "A|abc|abd"
 
 echo "--- 11. A NONE CONNECTION'S NON-ASCII TEXT INTO A UTF8 COLUMN IS COUNTED IN UTF8 CHARACTERS (rddlmeta13)"
