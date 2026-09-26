@@ -48999,7 +48999,7 @@ fn branch_rows_res(
     {
         if !windows.is_empty() {
             let records = fold_project_windows(
-                *rel, formats, filter, order_by, index, defer, windows, *win_base, db, args,
+                *rel, formats, cols, filter, order_by, index, defer, windows, *win_base, db, args,
             )?;
             return records
                 .iter()
@@ -49166,7 +49166,8 @@ fn branch_rows_res(
         let rows = if windows.is_empty() {
             filtered
         } else {
-            compute_windows(filtered, windows, *win_base)?
+            let ties = window_tie_fields(cols, filter.as_ref(), windows, order_by, *win_base);
+            compute_windows(filtered, windows, *win_base, &ties)?
         };
         let out = RowSource::Sort { input: Box::new(RowSource::Rows(rows)), keys: order_by.clone() }
             .rows(db)?;
@@ -54138,6 +54139,10 @@ fn agg_result_desc(
             AggFn::Count => Some(int64(0)),
             AggFn::Sum => Some(dec(true)),
             AggFn::Avg | AggFn::Min | AggFn::Max => Some(dec(wide)),
+            // VAR / STDDEV fold in decimal128: DECFLOAT(34) either width
+            AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp => {
+                Some(dec(true))
+            }
             _ => None,
         };
     }
@@ -54291,7 +54296,22 @@ fn agg_result_desc(
             if !operand_numericish(target)? {
                 return None;
             }
-            double_d()
+            // ...but an INT128-backed operand folds in decimal128 and
+            // answers DECFLOAT(34) (the engine's isDecOrInt128, measured)
+            let i128_src = match target {
+                AggTarget::Col(n) => col_desc(n)?.dtype == dtype::INT128,
+                AggTarget::Expr(raw) => {
+                    let e = resolve_expr_sink(raw, columns, descs, &mut Vec::new())?;
+                    !matches!(e.type_of(descs)?, ExprType::Approx)
+                        && e.rank_of(descs) == Some(NumRank::I128)
+                }
+                _ => false,
+            };
+            if i128_src {
+                Descriptor { dtype: dtype::DEC128, scale: 0, length: 16, sub_type: 0, flags: 0, offset: 1 }
+            } else {
+                double_d()
+            }
         }
         // the two-argument folds: both operands numeric-ish;
         // REGR_COUNT is a BIGINT, the rest DOUBLE
@@ -54310,6 +54330,16 @@ fn agg_result_desc(
             let AggTarget::Pair(y, x) = target else { return None };
             for raw in [y, x] {
                 if !numericish_expr(raw)? {
+                    return None;
+                }
+            }
+            // an INT128-backed first argument: the engine's DECFLOAT(34)
+            // fold, not modelled - refused (see the select-item arm)
+            if !matches!(func, AggFn::RegrCount) {
+                let ye = resolve_expr_sink(y, columns, descs, &mut Vec::new())?;
+                if !matches!(ye.type_of(descs), Some(ExprType::Approx))
+                    && ye.rank_of(descs) == Some(NumRank::I128)
+                {
                     return None;
                 }
             }
@@ -54651,7 +54681,7 @@ fn build_group_items(
                 }
                 // the item's OWN slot holds its first aggregate; any
                 // further ones are appended after the loop
-                gitems.push(GItem::Agg(f, src, distinct));
+                gitems.push(GItem::Agg(f, stat_dec_src(f, src, d.dtype == dtype::DEC128), distinct));
                 slot_descs.push(Some(d));
                 deferred.push((out_idx, raw.clone(), name.clone()));
                 cols.push(ProjCol {
@@ -54948,6 +54978,13 @@ fn build_group_items(
                 // decfloat source stays refused. (df_wide computed above.)
                 let df_tuple = df_wide.or(df_expr).and_then(|wide| match func {
                     AggFn::Sum => Some((Wire::Dec34, 32762, 16, 0, 0)),
+                    // VAR / STDDEV over a DECFLOAT column: DECFLOAT(34),
+                    // NOT nullable, either width (measured - this refused)
+                    AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp
+                        if df_wide.is_some() =>
+                    {
+                        Some((Wire::Dec34, 32762, 16, 0, 0))
+                    }
                     AggFn::Avg | AggFn::Min | AggFn::Max => Some(if wide {
                         (Wire::Dec34, 32762, 16, 0, 0)
                     } else {
@@ -55090,11 +55127,18 @@ fn build_group_items(
                         // nullable (like COUNT): 0 over an empty, single-row
                         // or all-NULL group, never NULL. Refuse a non-numeric
                         // source the way SUM/AVG does.
-                        let (t, _sc, _rank) = src_shape?;
+                        let (t, _sc, rank) = src_shape?;
                         if !matches!(t, ExprType::Int | ExprType::Numeric | ExprType::Approx) {
                             return None;
                         }
-                        (Wire::Double, 480, 8, 0, 0)
+                        // an INT128-backed source (INT128, NUMERIC(38,s),
+                        // SUM(BIGINT), H + 0) is the engine's isDecOrInt128:
+                        // DECFLOAT(34), still NOT nullable (measured: 32762)
+                        if rank == NumRank::I128 && !matches!(t, ExprType::Approx) {
+                            (Wire::Dec34, 32762, 16, 0, 0)
+                        } else {
+                            (Wire::Double, 480, 8, 0, 0)
+                        }
                     }
                     // the two-argument folds: REGR_COUNT is a BIGINT, the
                     // rest a DOUBLE, and the engine describes ALL of them
@@ -55122,6 +55166,18 @@ fn build_group_items(
                                 ) {
                                     return None;
                                 }
+                            }
+                            // an INT128-backed FIRST argument makes the
+                            // engine fold in decimal128 and answer
+                            // DECFLOAT(34) (measured: CORR(H, ID) is
+                            // 0.7843266893787232114218613551766932) - not
+                            // modelled here, so refused rather than
+                            // answered as the DOUBLE it is not
+                            if !matches!(func, AggFn::RegrCount)
+                                && !matches!(y.type_of(descs), Some(ExprType::Approx))
+                                && y.rank_of(descs) == Some(NumRank::I128)
+                            {
+                                return None;
                             }
                         }
                         if matches!(func, AggFn::RegrCount) {
@@ -55194,7 +55250,7 @@ fn build_group_items(
                     sub_type,
                     expr: None,
                 });
-                gitems.push(GItem::Agg(*func, src, distinct));
+                gitems.push(GItem::Agg(*func, stat_dec_src(*func, src, sql_type == 32762), distinct));
                 // KEEP slot_descs PARALLEL to gitems: a bare aggregate is a
                 // group-row slot like any other, and the second pass reads
                 // slot_descs BY SLOT INDEX to build the synthetic group-row
@@ -55236,7 +55292,7 @@ fn build_group_items(
                     if distinct && !matches!(f, AggFn::Count) {
                         return None;
                     }
-                    gitems.push(GItem::Agg(*f, src, distinct));
+                    gitems.push(GItem::Agg(*f, stat_dec_src(*f, src, d.dtype == dtype::DEC128), distinct));
                     slot_descs.push(Some(d));
                     gitems.len() - 1
                 };
@@ -55485,7 +55541,7 @@ fn plan_group(
                     if distinct && !matches!(f, AggFn::Count) {
                         return None;
                     }
-                    gitems.push(GItem::Agg(*f, src, distinct));
+                    gitems.push(GItem::Agg(*f, stat_dec_src(*f, src, d.dtype == dtype::DEC128), distinct));
                     slot_descs.push(Some(d));
                     names.push((*f, t.clone(), agg_slot_name(gitems.len() - 1)));
                 }
@@ -58755,6 +58811,9 @@ fn compute_windows(
     mut rows: Vec<Vec<Value>>,
     windows: &[WinSpec],
     win_base: usize,
+    // the fields the statement references, in field order
+    // ([window_tie_fields]) - what a SORTED window's record carries
+    ties: &[usize],
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
     use std::cmp::Ordering::Equal;
     let n = rows.len();
@@ -58814,6 +58873,28 @@ fn compute_windows(
             match &spec.kind {
                 WinKind::Agg { func, src, distinct, frame } => {
                     let gi = [GItem::Agg(*func, src.clone(), *distinct)];
+                    // A SORTED WINDOW FOLDS IN ITS SORT RECORD'S ORDER: a
+                    // PARTITION BY or an ORDER BY sorts the rows, and the
+                    // record carries every field the statement references,
+                    // compared as [group_tie_cmp] compares a group's
+                    // (measured: SUM(X) OVER (PARTITION BY G) over -1E16,
+                    // 1, 1 folds the 1s first, -9999999999999998, unless a
+                    // referenced K or ID orders -1E16 first - then
+                    // -10000000000000000; peers under OVER (ORDER BY G) the
+                    // same). OVER () does not sort: scan order.
+                    let sorted = !spec.part.is_empty() || !spec.order.is_empty();
+                    let tie = |a: usize, b: usize| -> std::cmp::Ordering {
+                        if sorted {
+                            group_tie_cmp(&rows[a], &rows[b], &[], ties)
+                        } else {
+                            Equal
+                        }
+                    };
+                    // (stable: the ORDER BY sorts below keep this order
+                    // among their peers)
+                    if sorted {
+                        idxs.sort_by(|&a, &b| tie(a, b));
+                    }
                     if let Some(fr) = frame.as_ref().filter(|f| f.mode == FrameMode::Rows) {
                         // EXPLICIT ROWS FRAME: order the partition, then
                         // each row folds the PHYSICAL rows its frame bounds
@@ -59247,6 +59328,161 @@ fn compute_windows(
     Ok(rows)
 }
 
+/// The engine's grouping-sort compare over two rows of one group run:
+/// the group keys, then the referenced fields' NULL flags, then their
+/// values word by word ([group_rows] explains the record; the value arms
+/// below are the measured ones).
+fn group_tie_cmp(a: &[Value], b: &[Value], keys: &[OrderKey], extra: &[usize]) -> std::cmp::Ordering {
+    let c = order_cmp(a, b, keys);
+    if c != std::cmp::Ordering::Equal {
+        return c;
+    }
+    for &f in extra {
+        let na = matches!(a.get(f), Some(Value::Null) | None);
+        let nb = matches!(b.get(f), Some(Value::Null) | None);
+        if na != nb {
+            return na.cmp(&nb); // non-null first
+        }
+    }
+    // a value's native little-endian 32-bit words, LOW word first
+    let words64 = |x: u64| (x as u32, (x >> 32) as u32);
+    let words128 = |x: i128| {
+        let u = x as u128;
+        (u as u32, (u >> 32) as u32, (u >> 64) as u32, (u >> 96) as u32)
+    };
+    for &f in extra {
+        let c = match (a.get(f), b.get(f)) {
+            (Some(Value::Text(x)), Some(Value::Text(y))) => list_text_tie_cmp(x, y),
+            // an INTEGER-family value compares as its native little-endian
+            // words, UNSIGNED, LOW word first (measured: 1, 256, -5 in that
+            // order; an INTEGER column has only the low word, a BIGINT's
+            // high word breaks its low word's ties); a scaled NUMERIC by
+            // its raw words the same way, temporals by their day/fraction
+            // words, a BOOLEAN by its byte
+            (Some(Value::Int(x)), Some(Value::Int(y))) => words64(*x as u64).cmp(&words64(*y as u64)),
+            (Some(Value::Scaled(x, sx)), Some(Value::Scaled(y, sy))) if sx == sy => {
+                words64(*x as u64).cmp(&words64(*y as u64))
+            }
+            // an INT128 (and a NUMERIC(38,s)) by its four words, low first
+            // (measured: 0, 2^64, 2^32, -2^32, 1, -(2^127-1), 2, 3, 256,
+            // -256, -1); a DOUBLE by the two words of its IEEE bits (0,
+            // 0.5, 1, 2, 3, -0.5, -1, 123.456, 1E16, -1E16, 1E-5 - the
+            // low word leads, so 1.0's zero low word sorts before any
+            // value with mantissa bits there); a FLOAT by its one word
+            (Some(Value::Int128(x, sx)), Some(Value::Int128(y, sy))) if sx == sy => {
+                words128(*x).cmp(&words128(*y))
+            }
+            (Some(Value::Double(x)), Some(Value::Double(y))) => {
+                words64(x.to_bits()).cmp(&words64(y.to_bits()))
+            }
+            (Some(Value::Float(x)), Some(Value::Float(y))) => x.to_bits().cmp(&y.to_bits()),
+            (Some(Value::Date(x)), Some(Value::Date(y))) => (*x as u32).cmp(&(*y as u32)),
+            (Some(Value::Time(x)), Some(Value::Time(y))) => x.cmp(y),
+            (Some(Value::Timestamp(xd, xt)), Some(Value::Timestamp(yd, yt))) => {
+                (*xd as u32, *xt).cmp(&(*yd as u32, *yt))
+            }
+            (Some(Value::Bool(x)), Some(Value::Bool(y))) => x.cmp(y),
+            _ => std::cmp::Ordering::Equal,
+        };
+        if c != std::cmp::Ordering::Equal {
+            return c;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// The fields a windowed statement references, in field order - the
+/// non-key part of a sorted window's record ([compute_windows]): every
+/// projected column and expression, the WHERE, every window's PARTITION
+/// BY / ORDER BY / argument, and the statement's ORDER BY. A window
+/// value's own slot (at or past `win_base`) is no record field.
+fn window_tie_fields(
+    cols: &[ProjCol],
+    filter: Option<&Predicate>,
+    windows: &[WinSpec],
+    order_by: &[OrderKey],
+    win_base: usize,
+) -> Vec<usize> {
+    let refs = std::cell::RefCell::new(Vec::<usize>::new());
+    let mark = |f: usize| -> bool {
+        let mut r = refs.borrow_mut();
+        if f < win_base && !r.contains(&f) {
+            r.push(f);
+        }
+        false // never "found": the reads-walk visits every field
+    };
+    let key = |k: &OrderKey| match &k.expr {
+        Some(e) => {
+            expr_reads(e, &mark);
+        }
+        None => {
+            mark(k.field);
+        }
+    };
+    for c in cols {
+        match &c.expr {
+            Some(e) => {
+                expr_reads(e, &mark);
+            }
+            None => {
+                mark(c.field_id);
+            }
+        }
+    }
+    if let Some(p) = filter {
+        for g in &p.groups {
+            for t in g {
+                collect_term_fids(t, &mark);
+            }
+        }
+    }
+    for w in windows {
+        for e in &w.part {
+            expr_reads(e, &mark);
+        }
+        w.order.iter().for_each(key);
+        match &w.kind {
+            WinKind::Agg { src, .. } => match src {
+                AggSrc::Star => {}
+                AggSrc::Field(f) | AggSrc::CollField(f, _) => {
+                    mark(*f);
+                }
+                AggSrc::Expr(e) => {
+                    expr_reads(e, &mark);
+                }
+                AggSrc::Pair(y, x) => {
+                    expr_reads(y, &mark);
+                    expr_reads(x, &mark);
+                }
+                AggSrc::Percentile { frac, order, .. } => {
+                    expr_reads(frac, &mark);
+                    expr_reads(order, &mark);
+                }
+                AggSrc::List { arg, sep, .. } => {
+                    expr_reads(arg, &mark);
+                    if let Some(s) = sep {
+                        expr_reads(s, &mark);
+                    }
+                }
+            },
+            WinKind::Rank(_) => {}
+            WinKind::Nav { arg, default, .. } => {
+                expr_reads(arg, &mark);
+                if let Some(d) = default {
+                    expr_reads(d, &mark);
+                }
+            }
+            WinKind::Val { arg, .. } => {
+                expr_reads(arg, &mark);
+            }
+        }
+    }
+    order_by.iter().for_each(key);
+    let mut out = refs.into_inner();
+    out.sort_unstable();
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn group_rows(
     mut input: Vec<Vec<Value>>,
@@ -59306,10 +59542,32 @@ fn group_rows(
         // and PERCENTILE sorts its own values. (A tie broken only
         // through a BLOB column's id is unpinned - fc orders by the
         // id's rendered form, the engine by its id bytes.)
+        //
+        // THE NUMERIC FOLDS ARE ORDER-SENSITIVE TOO: a double SUM rounds
+        // and an INT128 SUM overflows by the order it meets its rows in,
+        // and inside a sorted group that order is this same record
+        // compare (measured: grouped SUM(D) over 1E155, -1E155, 1 is 0 -
+        // the record puts 1.0, whose low word is 0, first - while the
+        // ungrouped scan-order fold is 1; INT128 max, 1, -5 grouped fold
+        // as 1, -5, max and do not overflow; 1, 1, -1E16 grouped fold
+        // the two 1s first). So SUM / AVG / VAR / STDDEV and the
+        // two-argument folds take the tie sort as LIST does.
         let tie_fids = if tie_order
-            && gitems
-                .iter()
-                .any(|g| matches!(g, GItem::Agg(AggFn::List, ..)))
+            && gitems.iter().any(|g| {
+                matches!(
+                    g,
+                    GItem::Agg(
+                        AggFn::List
+                            | AggFn::Sum
+                            | AggFn::Avg
+                            | AggFn::VarPop
+                            | AggFn::VarSamp
+                            | AggFn::StddevPop
+                            | AggFn::StddevSamp,
+                        ..
+                    )
+                ) || matches!(g, GItem::Agg(f, ..) if f.is_statistical2())
+            })
         {
             let refs = std::cell::RefCell::new(Vec::<usize>::new());
             let mark = |f: usize| -> bool {
@@ -59385,60 +59643,40 @@ fn group_rows(
             // not drive (measured: they ride word-compared too, but at
             // offsets the common shapes leave undecided - unpinned).
             Some(extra) => {
-                let mut rows = std::mem::take(&mut input);
-                rows.sort_by(|a, b| {
-                    let c = order_cmp(a, b, &keys);
-                    if c != std::cmp::Ordering::Equal {
-                        return c;
+                let rows = std::mem::take(&mut input);
+                let budget = crate::extsort::budget();
+                let est: usize = rows.iter().map(|r| crate::extsort::row_bytes(r)).sum();
+                if est <= budget {
+                    let mut rows = rows;
+                    rows.sort_by(|a, b| group_tie_cmp(a, b, &keys, &extra));
+                    rows
+                } else {
+                    // past the memory budget the same compare spills; a
+                    // tie it leaves open is two rows whose referenced
+                    // fields are all equal, which no fold can tell apart
+                    let mut sorter = crate::extsort::ExternalSort::with_budget(
+                        |a: &[Value], b: &[Value]| group_tie_cmp(a, b, &keys, &extra),
+                        budget,
+                    );
+                    for r in rows {
+                        sorter.put(r).map_err(|e| {
+                            eprintln!("[srv] sort spill: {}", e);
+                            EvalErr::Unsupported
+                        })?;
                     }
-                    for &f in &extra {
-                        let na = matches!(a.get(f), Some(Value::Null) | None);
-                        let nb = matches!(b.get(f), Some(Value::Null) | None);
-                        if na != nb {
-                            return na.cmp(&nb); // non-null first
-                        }
+                    let mut cursor = sorter.finish().map_err(|e| {
+                        eprintln!("[srv] sort spill: {}", e);
+                        EvalErr::Unsupported
+                    })?;
+                    let mut out = Vec::new();
+                    while let Some(r) = cursor.next().map_err(|e| {
+                        eprintln!("[srv] sort spill: {}", e);
+                        EvalErr::Unsupported
+                    })? {
+                        out.push(r);
                     }
-                    for &f in &extra {
-                        let c = match (a.get(f), b.get(f)) {
-                            (Some(Value::Text(x)), Some(Value::Text(y))) => {
-                                list_text_tie_cmp(x, y)
-                            }
-                            // an INTEGER-family value compares as its
-                            // native little-endian words, UNSIGNED, LOW
-                            // word first (measured: 1, 256, -5 in that
-                            // order; an INTEGER column has only the low
-                            // word, a BIGINT's high word breaks its low
-                            // word's ties); a scaled NUMERIC by its raw
-                            // words the same way, temporals by their
-                            // day/fraction words, a BOOLEAN by its byte
-                            (Some(Value::Int(x)), Some(Value::Int(y))) => {
-                                (*x as u32, (*x >> 32) as u32)
-                                    .cmp(&(*y as u32, (*y >> 32) as u32))
-                            }
-                            (Some(Value::Scaled(x, sx)), Some(Value::Scaled(y, sy)))
-                                if sx == sy =>
-                            {
-                                (*x as u32, (*x >> 32) as u32)
-                                    .cmp(&(*y as u32, (*y >> 32) as u32))
-                            }
-                            (Some(Value::Date(x)), Some(Value::Date(y))) => {
-                                (*x as u32).cmp(&(*y as u32))
-                            }
-                            (Some(Value::Time(x)), Some(Value::Time(y))) => x.cmp(y),
-                            (
-                                Some(Value::Timestamp(xd, xt)),
-                                Some(Value::Timestamp(yd, yt)),
-                            ) => (*xd as u32, *xt).cmp(&(*yd as u32, *yt)),
-                            (Some(Value::Bool(x)), Some(Value::Bool(y))) => x.cmp(y),
-                            _ => std::cmp::Ordering::Equal,
-                        };
-                        if c != std::cmp::Ordering::Equal {
-                            return c;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-                rows
+                    out
+                }
             }
             None => sort_rows_spilling(std::mem::take(&mut input), &keys)?,
         };
@@ -59831,6 +60069,18 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         }
                         best = Some(match best {
                             None => v,
+                            // a NaN on either side: the engine's double
+                            // compare is `==` then `>`, else LESS, so the
+                            // new value is "less" than the kept one - MIN
+                            // takes it, MAX keeps its own (measured: NaN
+                            // then 1 is MIN 1 / MAX NaN, 1 then NaN is
+                            // MIN NaN / MAX 1; this answered NaN/NaN, 1/1)
+                            Some(b)
+                                if approx_of(&b).is_some_and(f64::is_nan)
+                                    || approx_of(&v).is_some_and(f64::is_nan) =>
+                            {
+                                if matches!(func, AggFn::Min) { v } else { b }
+                            }
                             Some(b) => {
                                 let ord = fold_cmp(&b, &v, src);
                                 let keep_b = if matches!(func, AggFn::Min) {
@@ -60036,9 +60286,74 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                     // measured live: the engine answers -1). STDDEV is
                     // the square root, clamped at 0 so f64 cancellation
                     // cannot sqrt a tiny negative (a NaN is not clamped).
+                    //
+                    // AN INT128 / NUMERIC(38,s) / DECFLOAT SOURCE FOLDS IN
+                    // DECIMAL128 (StdDevAggNode's FLAG_DECFLOAT path: the
+                    // source isDecOrInt128) and answers DECFLOAT(34):
+                    // Sx by add, Sxx by ONE-ROUNDING fma, then the same
+                    // formula in decimal, HALF-UP at 34 digits. The
+                    // engine's execute takes the square root for
+                    // STDDEV_SAMP only - its STDDEV_POP arm tests for
+                    // SAMP, so STDDEV_POP answers the VARIANCE (measured:
+                    // STDDEV_POP = VAR_POP = 10.55555555555555555555555555555555
+                    // over an INT128 column). This folded in f64 and
+                    // answered a DOUBLE, a different type and value.
+                    let vals: Vec<Value> = rows
+                        .iter()
+                        .map(|r| src_value(src, r))
+                        .collect::<Result<_, _>>()?;
+                    if vals.iter().any(|v| {
+                        matches!(v, Value::Int128(..) | Value::DecFloat16(_) | Value::DecFloat34(_))
+                    }) {
+                        use fire_crab_ods::decfloat::{self as dfl, Dec};
+                        let zero = Dec::Finite { neg: false, coeff: 0, exp: 0 };
+                        let fin = |d: &Dec| matches!(d, Dec::Finite { .. });
+                        // a finite step reaching Infinity is the overflow
+                        // trap, a non-NaN step reaching NaN the invalid one
+                        let trap = |before: &[&Dec], after: &Dec| -> Result<(), EvalErr> {
+                            if matches!(after, Dec::Infinity { .. }) && before.iter().all(|d| fin(d)) {
+                                return Err(EvalErr::DecfloatOverflow);
+                            }
+                            if matches!(after, Dec::Nan) && !before.iter().any(|d| matches!(d, Dec::Nan)) {
+                                return Err(EvalErr::DecfloatInvalidOperation);
+                            }
+                            Ok(())
+                        };
+                        let (mut n, mut x, mut x2) = (0i64, zero, zero);
+                        for v in &vals {
+                            let Some(d) = value_as_dec(v) else { continue };
+                            let nx = dfl::add(&x, &d);
+                            trap(&[&x, &d], &nx)?;
+                            let nx2 = dfl::fma(&d, &d, &x2);
+                            trap(&[&x2, &d], &nx2)?;
+                            (x, x2, n) = (nx, nx2, n + 1);
+                        }
+                        let sample = matches!(func, AggFn::VarSamp | AggFn::StddevSamp);
+                        if n == 0 || (sample && n < 2) {
+                            Value::Null
+                        } else {
+                            let cnt = Dec::Finite { neg: false, coeff: n as u128, exp: 0 };
+                            let div_by = if sample {
+                                Dec::Finite { neg: false, coeff: (n - 1) as u128, exp: 0 }
+                            } else {
+                                cnt
+                            };
+                            let sq = dfl::mul(&x, &x);
+                            trap(&[&x], &sq)?;
+                            let mean_sq = dfl::div(&sq, &cnt);
+                            let ssd = dfl::sub(&x2, &mean_sq);
+                            trap(&[&x2, &mean_sq], &ssd)?;
+                            let mut var = dfl::div(&ssd, &div_by);
+                            if matches!(func, AggFn::StddevSamp) {
+                                let root = dfl::sqrt(&var);
+                                trap(&[&var], &root)?;
+                                var = root;
+                            }
+                            Value::DecFloat34(dfl::dec_to_bits(&var))
+                        }
+                    } else {
                     let (mut n, mut sx, mut sxx) = (0i64, 0f64, 0f64);
-                    for r in rows {
-                        let v = src_value(src, r)?;
+                    for v in vals {
                         // exact_to_f64 DIVIDES by the positive power for
                         // a scaled value - one correctly-rounded step,
                         // the engine's CVT_get_double (review-caught:
@@ -60074,6 +60389,7 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                             _ if var.is_nan() => var,
                             _ => var.max(0.0).sqrt(),
                         })
+                    }
                     }
                 }
                 // the two-argument CORR / COVAR / REGR folds: n + the five
@@ -60520,6 +60836,7 @@ fn cast_target_of_col(pc: &ProjCol) -> Option<CastTarget> {
 fn fold_project_windows(
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
+    cols: &[ProjCol],
     filter: &Option<Predicate>,
     order_by: &[OrderKey],
     index: &Option<IndexAccess>,
@@ -60529,6 +60846,7 @@ fn fold_project_windows(
     db: &Database,
     args: &[WireParam],
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
+    let ties = window_tie_fields(cols, filter.as_ref(), windows, order_by, win_base);
     let filter = bind_filter_eval(filter, args)?;
     let descs_now: Vec<Descriptor> = formats
         .iter()
@@ -60544,7 +60862,7 @@ fn fold_project_windows(
         access,
     )
     .rows(db)?;
-    let mut rows = compute_windows(base, windows, win_base)?;
+    let mut rows = compute_windows(base, windows, win_base, &ties)?;
     if !order_by.is_empty() {
         sort_rows(&mut rows, order_by)?;
     }
@@ -64369,6 +64687,7 @@ fn emit_rows_inner(
                         .map_err(EmitErr::Eval)?,
                         windows,
                         *win_base,
+                        &window_tie_fields(cols, filter.as_ref(), windows, order_by, *win_base),
                     )
                     .map_err(EmitErr::Eval)?;
                     if !order_by.is_empty() {
@@ -64531,7 +64850,13 @@ fn emit_rows_inner(
                         .rows(db)
                         .map_err(EmitErr::Eval)?;
                     let mut rows =
-                        compute_windows(filtered, windows, *win_base).map_err(EmitErr::Eval)?;
+                        compute_windows(
+                            filtered,
+                            windows,
+                            *win_base,
+                            &window_tie_fields(cols, filter.as_ref(), windows, order_by, *win_base),
+                        )
+                        .map_err(EmitErr::Eval)?;
                     if !order_by.is_empty() {
                         sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
                     }
@@ -82752,6 +83077,15 @@ impl Expr {
                             Ok(Value::Float(f))
                         };
                         match &v {
+                            // an INFINITE double narrows to the single's
+                            // infinity (measured: CAST(<a VAR_POP that
+                            // overflowed> AS FLOAT) is Infinity, of its
+                            // negation -Infinity; this raised 22003, so a
+                            // SUM over it posted the wrong message) - only
+                            // a FINITE double past the range raises
+                            v if approx_of(v).is_some_and(f64::is_infinite) => {
+                                Value::Float(approx_of(v).unwrap_or(0.0) as f32)
+                            }
                             v if approx_of(v).is_some() => narrow(approx_of(v).unwrap_or(0.0))?,
                             Value::Text(t) => match text_number(t) {
                                 None | Some(TextNum::Hex { .. }) => {
@@ -87223,7 +87557,11 @@ fn build_correlated_lookup(
             let absent = match func {
                 AggFn::Count => Value::Int(0),
                 // VAR/STDDEV over a key with no rows is 0, not NULL
-                AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp => {
+                // (the decimal128 fold's NULL rides as NULL: its zero
+                // is the 0E-6176 of all-zero bits, not a 0 of its own)
+                AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp
+                    if d.dtype != dtype::DEC128 =>
+                {
                     Value::Double(0.0)
                 }
                 _ => Value::Null,
@@ -89482,7 +89820,18 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
             return parse_agg_item(&rewritten);
         }
         let then = if arg == "*" { "1" } else { arg };
-        let rewritten = format!("{}(CASE WHEN ({}) THEN {} END)", fname, cond, then);
+        // `SUM(ALL x) FILTER (...)`: the quantifier stays OUTSIDE the
+        // CASE (measured: 26, as the unquantified fold)
+        let (q, then) = match then
+            .get(..3)
+            .filter(|w| w.eq_ignore_ascii_case("ALL"))
+            .and(then.get(3..))
+            .filter(|r| r.starts_with(|c: char| c.is_whitespace() || c == '('))
+        {
+            Some(r) => ("ALL ", r.trim()),
+            None => ("", then),
+        };
+        let rewritten = format!("{}({}CASE WHEN ({}) THEN {} END)", fname, q, cond, then);
         return parse_agg_item(&rewritten);
     }
     let open = t.find('(')?;
@@ -89571,6 +89920,28 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
             AggTarget::Pair(parse_raw_expr_any(a.trim())?, parse_raw_expr_any(b.trim())?),
         ));
     }
+    // `SUM|AVG|COUNT|MIN|MAX(ALL x)` is the explicit spelling of the
+    // plain fold (measured: 36 / 4 / 8 / 1 / 8, grouped, windowed and
+    // FILTERed alike; this refused them). The statistical folds take no
+    // quantifier (STDDEV_POP(ALL x) is the engine's -104 Token unknown),
+    // nor does COUNT(ALL *).
+    let arg = match arg
+        .get(..3)
+        .filter(|w| w.eq_ignore_ascii_case("ALL"))
+        .and(arg.get(3..))
+        .filter(|r| r.starts_with(|c: char| c.is_whitespace() || c == '('))
+        .map(str::trim)
+    {
+        Some(rest)
+            if matches!(func, AggFn::Sum | AggFn::Avg | AggFn::Count | AggFn::Min | AggFn::Max)
+                && !rest.is_empty()
+                && rest != "*"
+                && !rest.get(..8).is_some_and(|w| w.eq_ignore_ascii_case("DISTINCT")) =>
+        {
+            rest
+        }
+        _ => arg,
+    };
     // COUNT(DISTINCT col) - the keyword must stand as its own word
     if let Some(rest) = arg
         .get(..8)
@@ -94470,6 +94841,23 @@ fn insert_select(
                     if let Value::Rounded(r, sc) = v {
                         bound.push(WireParam::Int(*r, *sc));
                         return Some("?".to_string());
+                    }
+                    // a NaN / an infinity has no literal at all, so it
+                    // binds as the runtime double it is (measured: the
+                    // engine stores `SELECT STDDEV_POP(X)` over a NaN
+                    // variance as NaN, a VAR_POP that overflowed as
+                    // Infinity, into a DOUBLE and a FLOAT alike - this
+                    // refused the row with a bare Dynamic SQL Error)
+                    match v {
+                        Value::Double(x) if !x.is_finite() => {
+                            bound.push(WireParam::Double(*x));
+                            return Some("?".to_string());
+                        }
+                        Value::Float(f) if !f.is_finite() => {
+                            bound.push(WireParam::Single(*f));
+                            return Some("?".to_string());
+                        }
+                        _ => {}
                     }
                     // a DOUBLE has no literal spelling that keeps its
                     // type - it travels as a cast over its shortest
@@ -99933,6 +100321,23 @@ fn agg_field_src(fid: usize, descs: &[Descriptor]) -> AggSrc {
 /// answer is the byte minimum ('APPLE' where the engine answers
 /// 'apple'). A collation written on anything but a bare COLUMN, or one
 /// this server cannot key, refuses.
+/// A VAR / STDDEV source the engine folds in DECIMAL128 (an INT128-backed
+/// expression - `H + 0`, `CAST(.. AS NUMERIC(38,3)) / 7`) whose values
+/// can still arrive as small exact [Value]s: wrapped in the CAST TO
+/// DECFLOAT(34) that is the engine's own MOV_get_dec128 of each value,
+/// so the fold ([compute_group]) takes the decimal path its describe
+/// (DECFLOAT(34)) announced. Every other source passes through.
+fn stat_dec_src(func: AggFn, src: AggSrc, decimal: bool) -> AggSrc {
+    match src {
+        AggSrc::Expr(e) if decimal && func.is_statistical() => AggSrc::Expr(Expr::Cast(
+            Box::new(e),
+            CastTarget::DecFloat { wide: true },
+            fire_crab_ods::intl::CS_UTF8,
+        )),
+        other => other,
+    }
+}
+
 fn agg_expr_src(e: Expr) -> Option<AggSrc> {
     match e {
         Expr::Collate(inner, tt) => match *inner {
@@ -103448,7 +103853,7 @@ fn resolve_having(
                         if distinct && !matches!(f, AggFn::Count) {
                             return None;
                         }
-                        gitems.push(GItem::Agg(*f, src, distinct));
+                        gitems.push(GItem::Agg(*f, stat_dec_src(*f, src, d.dtype == dtype::DEC128), distinct));
                         // the synthetic view's slot carries the engine's
                         // nullability for a `?` typed from it (COUNT NOT
                         // NULL, the folds Nullable - [agg_param_flags])
@@ -107378,7 +107783,7 @@ fn after_auth(
                     {
                         if !windows.is_empty() {
                             if let Ok(records) = fold_project_windows(
-                                *rel, formats, filter, order_by, index, defer, windows,
+                                *rel, formats, cols, filter, order_by, index, defer, windows,
                                 *win_base, db, &bound_args,
                             ) {
                                 // the fold hands back RECORDS - the window
@@ -124233,6 +124638,42 @@ mod tests {
         for f in [AggFn::StddevPop, AggFn::StddevSamp] {
             assert!(matches!(compute_group(&nan, &gi(f)).unwrap()[0], Value::Double(v) if v.is_nan()));
         }
+    }
+
+    #[test]
+    fn decimal_stddev_nan_minmax_and_the_group_record_order() {
+        use fire_crab_ods::format::Value;
+        let gi = |f: AggFn| vec![GItem::Agg(f, AggSrc::Field(0), false)];
+        let render = |v: &Value| match v {
+            Value::DecFloat34(b) => fire_crab_ods::decfloat::to_string(&fire_crab_ods::decfloat::decode_dec128(*b)),
+            _ => panic!("not a DECFLOAT(34)"),
+        };
+        // an INT128 source folds in decimal128; the engine's STDDEV_POP is
+        // its VAR_POP, STDDEV_SAMP the root of VAR_SAMP (measured)
+        let h: Vec<Vec<Value>> = [1i128, 2, 4, 10, 7, 8].iter().map(|&v| vec![Value::Int128(v, 0)]).collect();
+        let one = |f| compute_group(&h, &gi(f)).unwrap().pop().unwrap();
+        assert_eq!(render(&one(AggFn::StddevPop)), "10.55555555555555555555555555555555");
+        assert_eq!(render(&one(AggFn::VarPop)), "10.55555555555555555555555555555555");
+        assert_eq!(render(&one(AggFn::StddevSamp)), "3.559026084010437070270507988531903");
+        assert_eq!(render(&one(AggFn::VarSamp)), "12.66666666666666666666666666666666");
+        // MIN/MAX meeting a NaN: the new value is "less" either way
+        let nan_first = vec![vec![Value::Double(f64::NAN)], vec![Value::Double(1.0)]];
+        let one_first = vec![vec![Value::Double(1.0)], vec![Value::Double(f64::NAN)]];
+        let mm = |rows: &Vec<Vec<Value>>, f| match compute_group(rows, &gi(f)).unwrap()[0] {
+            Value::Double(d) => d,
+            _ => panic!(),
+        };
+        assert_eq!(mm(&nan_first, AggFn::Min), 1.0);
+        assert!(mm(&nan_first, AggFn::Max).is_nan());
+        assert!(mm(&one_first, AggFn::Min).is_nan());
+        assert_eq!(mm(&one_first, AggFn::Max), 1.0);
+        // the grouping record compares a double by its low word first
+        // (measured: 0, 0.5, 1, 2, 3, -0.5, -1, 123.456, 1E16, -1E16, 1E-5)
+        let want = [0.0, 0.5, 1.0, 2.0, 3.0, -0.5, -1.0, 123.456, 1e16, -1e16, 1e-5];
+        let mut rows: Vec<Vec<Value>> = want.iter().rev().map(|&d| vec![Value::Double(d)]).collect();
+        rows.sort_by(|a, b| group_tie_cmp(a, b, &[], &[0]));
+        let got: Vec<f64> = rows.iter().map(|r| match r[0] { Value::Double(d) => d, _ => 0.0 }).collect();
+        assert_eq!(got, want);
     }
 
     /// Engine-DUMPED golden bytes: a DOMAIN CHECK compiles to the bare
