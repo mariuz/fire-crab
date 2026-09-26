@@ -1009,7 +1009,7 @@ both "WHERE IIF(BI = ?, 1, 0) = 1 ['8.5'] -> none"   "SELECT ID FROM T WHERE IIF
 both "SELECT IIF(? = 2.5, 1, 0) ['2.45'] -> 0;0;0"   "SELECT IIF(? = 2.5, 1, 0) AS X FROM T" '["2.45"]'
 both "SELECT IIF(ID = ?, 1, 0) ['2.4'] -> 0;0;0"     "SELECT IIF(ID = ?, 1, 0) AS X FROM T" '["2.4"]'
 # (the simple CASE's output nullability is the pre-existing gap recorded below)
-desc_differs "SELECT CASE ID WHEN ? THEN 1 ELSE 0 END ['2.4'] -> 0;0;0" "SELECT CASE ID WHEN ? THEN 1 ELSE 0 END AS X FROM T" '["2.4"]'
+both "SELECT CASE ID WHEN ? THEN 1 ELSE 0 END ['2.4'] -> 0;0;0 (the describe agreed on 2026-09-26)" "SELECT CASE ID WHEN ? THEN 1 ELSE 0 END AS X FROM T" '["2.4"]'
 both "ORDER BY IIF(ID = ?, 0, 1) ['2.4'] -> 1;2;3"   "SELECT ID FROM T ORDER BY IIF(ID = ?, 0, 1), ID" '["2.4"]'
 both "SUM(IIF(ID = ?, 1, 0)) ['2.4'] -> 0"           "SELECT SUM(IIF(ID = ?, 1, 0)) AS X FROM T" '["2.4"]'
 eng_only "IIF(ID = ?, ?, 0) = 7 ['1.4', '6.5'] -> none (round 10: refuses - a comparison '?' the previous binary refused MIXED with an implicit integer cast over a '?' (plan_unmixed); the previous binary refuses it too)" "SELECT ID FROM T WHERE IIF(ID = ?, ?, 0) = 7" '["1.4","6.5"]'
@@ -1038,9 +1038,9 @@ eng_only "IIF(NN = ?, ?, 0) - the same (round 10: refuses - a comparison '?' the
 # PRE-EXISTING (identical on c34c1c8): a text-branch IIF's OUTPUT width
 # is announced 32765 where the engine says the sibling column's 10
 eng_only "R12 cap: K1: IIF(ID = ?, S, ?) - the text output width"        "SELECT IIF(ID = ?, S, ?) AS X FROM T" '[2,"zz"]'
-# PRE-EXISTING (identical on c34c1c8, and with no parameter at all): the
-# engine announces a simple CASE's output Nullable, this server NOT NULL
-desc_differs "CASE ID WHEN ? THEN 1 ELSE 0 END - the simple CASE's output nullability" \
+# Until 2026-09-26 (identical on c34c1c8, and with no parameter at all) the
+# engine announced a simple CASE's output Nullable and this server NOT NULL
+both "CASE ID WHEN ? THEN 1 ELSE 0 END - the simple CASE's output nullability (Nullable on both since 2026-09-26)" \
      "SELECT CASE ID WHEN ? THEN 1 ELSE 0 END AS X FROM T" '[3]'
 # the two DML statements: the row is written by ONE statement and read
 # back on both servers (RETURNING, or a SELECT after an INSERT)
@@ -3013,7 +3013,7 @@ dml_rb_eng_only "R12 K3 DELETE FROM T WHERE ? + 0e0 = ID" "DELETE FROM T WHERE ?
 both "R12 K3 control (whole side) SELECT IIF(D = ?, 1, 0) FROM T ORDER BY ID" "SELECT IIF(D = ?, 1, 0) FROM T ORDER BY ID" '["1.5"]'
 both "R12 K3 control (whole side) SELECT ID FROM T WHERE (?) = D ORDER BY ID" "SELECT ID FROM T WHERE (?) = D ORDER BY ID" '["2.5"]'
 both "R12 K3 control (whole side) SELECT IIF(? = 1e0, 1, 0) FROM RDB\$DATABASE" "SELECT IIF(? = 1e0, 1, 0) FROM RDB\$DATABASE" '["0.9999999999999999"]'
-desc_differs "R12 (recorded describe gap: the CASE-operand nullability the gate records elsewhere) K3 control (whole side) SELECT CASE D WHEN ? THEN 1 ELSE 0 END FROM T ORDER BY ID" "SELECT CASE D WHEN ? THEN 1 ELSE 0 END FROM T ORDER BY ID" '["1.5"]'
+both "R12 (the CASE-operand nullability agreed on 2026-09-26) K3 control (whole side) SELECT CASE D WHEN ? THEN 1 ELSE 0 END FROM T ORDER BY ID" "SELECT CASE D WHEN ? THEN 1 ELSE 0 END FROM T ORDER BY ID" '["1.5"]'
 eng_only "R12 K4 SELECT ID FROM T WHERE IIF(ID = 2, TRIM(?), 'a') = 'b' ORDER BY ID" "SELECT ID FROM T WHERE IIF(ID = 2, TRIM(?), 'a') = 'b' ORDER BY ID" '["b "]'
 eng_only "R12 K4 SELECT ID FROM T WHERE COALESCE(TRIM(?), 'a') = 'b' ORDER BY ID" "SELECT ID FROM T WHERE COALESCE(TRIM(?), 'a') = 'b' ORDER BY ID" '["bbbb"]'
 eng_only "R12 K4 SELECT IIF(ID = 2, TRIM(?), 'a') AS X FROM T ORDER BY ID" "SELECT IIF(ID = 2, TRIM(?), 'a') AS X FROM T ORDER BY ID" '["b"]'

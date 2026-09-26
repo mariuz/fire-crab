@@ -78300,6 +78300,23 @@ fn strfn_result_cs(f: SysFn, args: &[Expr], descs: &[Descriptor]) -> Option<TfCs
 /// synthetic pad wrap ([pad_conditional]) in its operand's.
 fn value_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
     let (v, w, c) = text_form(e, descs)?;
+    // the run-time set descends the operands, and each level's
+    // [text_form] walks its whole subtree, so a chain of 2000 `||` or
+    // 390 nested UPPERs (serve-real-deepexpr) went cubic and timed out;
+    // past a depth no real statement reaches the describe's set stands
+    // for the value's, as it did before the run-time set was modelled
+    thread_local! { static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+    if DEPTH.with(|d| d.get()) >= 48 {
+        return Some((v, w, c));
+    }
+    DEPTH.with(|d| d.set(d.get() + 1));
+    let _g = Guard;
     let run = match e {
         Expr::Func(f, args) => match f {
             SysFn::Lpad | SysFn::Rpad | SysFn::Replace | SysFn::Trim(_) => {
