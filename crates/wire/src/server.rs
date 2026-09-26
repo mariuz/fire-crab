@@ -1901,6 +1901,16 @@ fn ddl_relation_target(plan: &Plan) -> Option<&str> {
     }
 }
 
+/// The relation an `ALTER TABLE` statement names, for every ALTER TABLE
+/// form this server plans.
+fn alter_table_target(plan: &Plan) -> Option<&str> {
+    match plan {
+        Plan::DropTable { .. } => None,
+        Plan::AlterColumnDropIdentity { table, .. } | Plan::AlterColumnPosition { table, .. } => Some(table),
+        _ => ddl_relation_target(plan),
+    }
+}
+
 fn ddl_dup_codes(plan: &Plan) -> Option<(i32, i32, String)> {
     // RELATIONS carry a CANONICAL name by now ([canon_ident] at the
     // planner): print it as stored, or `CREATE TABLE "tq"` beside TQ
@@ -1944,6 +1954,7 @@ fn respond_ddl_meta(
     let verb_of = |plan: &Plan| -> Option<(i32, String)> {
         match plan {
             Plan::CreateTable { name, .. } => Some((336397286, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
+            Plan::CreateView { name, .. } => Some((336397298, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
             Plan::Recreate(inner) => match inner.as_ref() {
                 Plan::CreateTable { name, .. } => Some((336397289, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
                 Plan::CreateView { name, .. } => Some((336397301, format!("\"PUBLIC\".\"{}\"", name.trim_end()))),
@@ -2379,6 +2390,35 @@ fn respond_ddl_meta(
         // (measured). The writer spells the kind the engine names - TABLE
         // whenever a VIEW is among the dependents, else the relation's
         // own kind (dfw.epp delete_relation) - and carries N.
+        // DROP / RECREATE of an EXCEPTION or a SEQUENCE something uses
+        // (measured): "cannot delete / EXCEPTION @1 | GENERATOR @1 /
+        // there are N dependencies"
+        let other: Option<(&str, i32)> = match plan {
+            Plan::DropException { name } => Some((name, 335544610)), // isc_exception_name
+            Plan::DropSequence { name } => Some((name, 335544815)), // isc_generator_name
+            Plan::Recreate(inner) => match inner.as_ref() {
+                Plan::CreateException { name, .. } => Some((name, 335544610)),
+                Plan::CreateSequence { name, .. } => Some((name, 335544815)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((name, kind)) = other {
+            let n: i32 = err_text
+                .split_whitespace()
+                .find_map(|w| w.parse::<i32>().ok())
+                .unwrap_or(1);
+            let qn = q(name);
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(335544673) // isc_no_delete - "cannot delete"
+                .int(1).int(kind).int(2).bytes(qn.as_bytes())
+                .int(1).int(335544630).int(4).int(n) // isc_dependency
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
         let dropped: Option<&str> = match plan {
             Plan::DropTable { name } | Plan::DropView { name } => Some(name),
             Plan::Recreate(inner) => match inner.as_ref() {
@@ -2456,6 +2496,24 @@ fn respond_ddl_meta(
                 .int(1).int(335544436).int(4).int(-607)
                 .int(1).int(335544570)
                 .int(1).int(336397207) // isc_dsql_view_not_found
+                .int(2).bytes(qn.as_bytes())
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+        // ALTER TABLE over a view or a missing name: the DROP TABLE
+        // vector below under the ALTER verb (measured)
+        let alter_gone = alter_table_target(plan).filter(|_| lc.ends_with(": table does not exist"));
+        if let Some(name) = alter_gone {
+            let qn = format!("\"PUBLIC\".\"{}\"", name.trim_end()); // canonical, as stored
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(ALTER_TABLE_FAILED)
+                .int(2).bytes(qn.as_bytes())
+                .int(1).int(335544436).int(4).int(-607) // isc_sqlerr
+                .int(1).int(335544570) // isc_dsql_command_err
+                .int(1).int(336397206) // isc_dsql_table_not_found, 42S02
                 .int(2).bytes(qn.as_bytes())
                 .int(0);
             w.send(s, enc)?;
@@ -2601,7 +2659,14 @@ fn respond_ddl_meta(
         return Ok(true);
     }
     // (verb-failed code, qualified name, reason code, reason-carries-name)
-    let parts: Option<(i32, String, i32, bool)> = if lc.contains("already exists") {
+    let parts: Option<(i32, String, i32, bool)> = if lc.starts_with("procedure ") && lc.ends_with(" already exists") {
+        // a relation named like a plain procedure: the relation verb and
+        // isc "Procedure @1 already exists" (measured, 42000)
+        verb_of(plan).map(|(f, qn)| (f, qn, 336068743, true))
+    } else if let (true, Plan::CreateProcedure { name, .. }) = (lc.starts_with("table ") && lc.ends_with(" already exists"), plan) {
+        // ...and the mirror: a procedure named like a relation
+        Some((336397265, q(name), 336068740, true))
+    } else if lc.contains("already exists") {
         // a DUPLICATE create - uniform across every object type
         ddl_dup_codes(plan).map(|(f, r, qn)| (f, qn, r, true))
     } else if lc.contains("not found") || lc.contains("is not defined") {
@@ -38169,6 +38234,18 @@ fn execute_dml_collecting_inner(
     if let Plan::RefusedEval(e) = plan {
         return Err(ExecErr::Eval(e.clone()));
     }
+    // ALTER TABLE OF A NAME THAT IS NOT A TABLE: a VIEW (or a name the
+    // catalog does not hold) is the -607 "Table @1 does not exist"
+    // (42S02) for EVERY form - ADD, DROP, ALTER TYPE, POSITION, TO,
+    // ADD/DROP CONSTRAINT - and the view keeps its columns (measured on
+    // 2182). `ALTER TABLE V1 ADD X` / `DROP N` rewrote the view's
+    // RDB$RELATION_FIELDS here, and `SELECT * FROM V1` then answered the
+    // old N value under the name X.
+    if let (Some(t), Some(d)) = (alter_table_target(plan), database.as_ref()) {
+        if !matches!(fire_crab_ods::ddl::relation_type_of(&d.bytes(), d.page_size, t), Some(k) if k != 1) {
+            return Err(ExecErr::Text(format!("alter table {}: table does not exist", t.trim_end())));
+        }
+    }
     // REASSIGNABLE: a statement that fires a trigger body needing the
     // database hands its working copy back for the length of the body
     // ([fire_triggers_published]) and takes this borrow again after
@@ -38393,6 +38470,11 @@ fn execute_dml_collecting_inner(
         }
         Plan::AlterView { name, blr, source, fields, contexts } => {
             fire_crab_ods::ddl::alter_view(&mut work, db.page_size, name, blr, source, fields, contexts)?;
+            // the redefinition's own rows: alter_view deleted the old
+            // ones with the old definition, and the engine records the new
+            // body's (measured on 2182: CREATE OR ALTER VIEW V1 moved from
+            // T1 to T2 lists V1 -> T2 NULL / V1 -> T2 ID; none was left)
+            fire_crab_ods::ddl::store_dependencies_deferred(&mut work, db.page_size, 1, name)?;
             (0, 0, 0)
         }
         Plan::DropView { name } => {

@@ -2560,6 +2560,20 @@ pub fn drop_domain(file: &mut crate::Image, page_size: usize, name: &str) -> Res
     delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
         text_eq(v.get(rn_f), &dn) && matches!(v.get(ot_f), Some(Value::Int(9)))
     })?;
+    // the rows the domain's CHECK recorded (type 4, a CHECK reading a
+    // table: `CHECK (VALUE IN (SELECT ID FROM T1))` is two rows on T1) and
+    // a computed domain's (type 3) go with it - MET_delete_dependencies
+    // for obj_validation. Measured on 2182: after DROP DOMAIN D1 none is
+    // left and DROP TABLE T1 passes; left behind here they refused it
+    // "TABLE T1 / there are 1 dependencies"
+    if crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES").is_some() {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let dn = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            text_eq(v.get(dn_f), &dn) && (int_eq(v.get(dt_f), 3) || int_eq(v.get(dt_f), 4))
+        })?;
+    }
     advance_oldest_transactions(file, page_size)
 }
 
@@ -3265,6 +3279,23 @@ pub fn alter_table_drop_column(
     let rf_slot = find_sys_row_slot(file, page_size, "RDB$RELATION_FIELDS", 5, matches_col)
         .ok_or("RDB$RELATION_FIELDS row not found")?;
     dml::delete_records(file, page_size, 5, &[rf_slot])?;
+    // ONLY an auto-domain (RDB$<n>) dies with its column: a column
+    // declared over a named domain leaves the domain (measured on 2182:
+    // `ALTER TABLE CE DROP X` over `X DD` keeps DD's RDB$FIELDS row -
+    // this deleted it). A computed column's auto-domain takes the
+    // type-3 RDB$DEPENDENCIES rows its expression recorded (measured:
+    // after `ALTER TABLE CB DROP CNT` over `CNT COMPUTED BY ((SELECT
+    // COUNT(*) FROM CA))` the engine holds no RDB$3 row and DROP TABLE
+    // CA passes; left behind here they refused it "1 dependencies")
+    let domain = domain.filter(|d| d.strip_prefix("RDB$").is_some_and(|x| x.parse::<u64>().is_ok()));
+    if let Some(dom) = &domain {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let d = dom.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            int_eq(v.get(dt_f), 3) && text_is(v.get(dn_f), &d)
+        })?;
+    }
     if let Some(dom) = &domain {
         let dom_pred = |vals: &[Value]| {
             let f_fid = relation_columns(file, page_size, "RDB$FIELDS")
@@ -4556,6 +4587,9 @@ pub fn create_table(
     {
         return Err(format!("table {} already exists", name));
     }
+    if plain_procedure_exists(file, page_size, &name) {
+        return Err(format!("Procedure {} already exists", name));
+    }
     let rel_id_u16 = next_relation_id(file, page_size, &rels)?;
     let rel_id = rel_id_u16 as i64;
 
@@ -5404,6 +5438,9 @@ pub fn create_view(
     if crate::resolve_relation(file, page_size, &want).is_some() {
         return Err(format!("relation {} already exists", want));
     }
+    if plain_procedure_exists(file, page_size, &want) {
+        return Err(format!("Procedure {} already exists", want));
+    }
     create_view_impl(file, page_size, name, view_blr, view_source, fields, contexts, None)
 }
 
@@ -5612,6 +5649,12 @@ fn drop_view_rows(file: &mut crate::Image, page_size: usize, name: &str, check_d
         let fid = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$VIEW_NAME")?;
         let n = name.clone();
         delete_catalog_rows(file, page_size, "RDB$VIEW_RELATIONS", move |v| text_is(v.get(fid), &n))?;
+    }
+    // a real DROP (and RECREATE) takes the view's own triggers; an ALTER
+    // keeps the relation and them (measured: V1_BI still fires after
+    // ALTER VIEW V1 on 2182)
+    if check_deps {
+        delete_relation_triggers(file, page_size, &name)?;
     }
     // the view's OWN dependency rows go with it (the engine's
     // MET_delete_dependencies for obj_view, and obj_computed for its
@@ -7462,6 +7505,96 @@ fn triggers_of_relation(file: &crate::Image, page_size: usize, name: &str) -> Ve
     out
 }
 
+/// Whether a PLAIN (unpackaged) procedure holds the name. Relations and
+/// procedures share one namespace on the engine: `CREATE TABLE PR`,
+/// `CREATE VIEW PR`, `RECREATE VIEW PR` and `CREATE OR ALTER VIEW PR`
+/// over a procedure PR are each "<VERB> @1 failed / Procedure @1 already
+/// exists" (42000, measured on 2182), and nothing is written.
+fn plain_procedure_exists(file: &crate::Image, page_size: usize, name: &str) -> bool {
+    let (Some(rel), Some(fmts)) = (
+        crate::resolve_relation(file, page_size, "RDB$PROCEDURES"),
+        system_relation_formats(file, page_size, "RDB$PROCEDURES"),
+    ) else { return false };
+    let Some((_, descs)) = fmts.iter().max_by_key(|(n, _)| *n) else { return false };
+    let cols = relation_columns(file, page_size, "RDB$PROCEDURES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let Some(name_f) = fid("RDB$PROCEDURE_NAME") else { return false };
+    let pkg_f = fid("RDB$PACKAGE_NAME");
+    let mut found = false;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_is(v.get(name_f), name) && pkg_f.map_or(true, |i| matches!(v.get(i), None | Some(Value::Null))) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// The distinct (dependent name, dependent type) pairs RDB$DEPENDENCIES
+/// records against an object of the given depended-on type - the
+/// engine's `check_dependencies` count for a DROP of an exception (7) or
+/// a sequence (14). Measured on 2182: a procedure raising EX1 makes
+/// `DROP EXCEPTION EX1` and `RECREATE EXCEPTION EX1` "cannot delete /
+/// EXCEPTION "PUBLIC"."EX1" / there are 1 dependencies", a trigger
+/// drawing NEXT VALUE FOR SQ1 the same with GENERATOR, and nothing is
+/// written (the trigger keeps drawing from the old SQ1).
+fn object_dependents(file: &crate::Image, page_size: usize, name: &str, on_type: i64) -> usize {
+    let (Some(rel), Some(fmts)) = (
+        crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES"),
+        system_relation_formats(file, page_size, "RDB$DEPENDENCIES"),
+    ) else { return 0 };
+    let Some((_, descs)) = fmts.iter().max_by_key(|(n, _)| *n) else { return 0 };
+    let cols = relation_columns(file, page_size, "RDB$DEPENDENCIES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(dn_f), Some(dt_f), Some(don_f), Some(dot_f)) = (
+        fid("RDB$DEPENDENT_NAME"),
+        fid("RDB$DEPENDENT_TYPE"),
+        fid("RDB$DEPENDED_ON_NAME"),
+        fid("RDB$DEPENDED_ON_TYPE"),
+    ) else { return 0 };
+    let mut seen: Vec<(String, i64)> = Vec::new();
+    walk_rows(file, page_size, rel, descs, |v| {
+        if !text_is(v.get(don_f), name) || !int_eq(v.get(dot_f), on_type) {
+            return;
+        }
+        let (Some(Value::Text(t)), Some(Value::Int(dt))) = (v.get(dn_f), v.get(dt_f)) else { return };
+        let key = (t.trim_end().to_string(), *dt);
+        if !seen.contains(&key) {
+            seen.push(key);
+        }
+    });
+    seen.len()
+}
+
+/// A dropped relation's OWN triggers go with it - their RDB$TRIGGERS rows
+/// and the type-2 RDB$DEPENDENCIES rows they recorded (dfw.epp
+/// `delete_relation` phase 2 erases every trigger whose RDB$RELATION_NAME
+/// is the relation, and `MET_delete_dependencies` their rows). Measured
+/// on 2182: after `DROP TABLE T2` / `DROP VIEW V1` no TR2 / V1_BI row is
+/// left, so `DROP TABLE T1` that either read passes, and a `RECREATE
+/// TABLE T1` / `RECREATE VIEW V1` starts with NO trigger (an insert
+/// stores the value as given). Left behind here, the orphan counted
+/// against the table it read and re-attached BY NAME to a relation
+/// re-created under the same name.
+fn delete_relation_triggers(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
+    let triggers = triggers_of_relation(file, page_size, name);
+    if triggers.is_empty() {
+        return Ok(());
+    }
+    {
+        let rn_f = sys_fid(file, page_size, "RDB$TRIGGERS", "RDB$RELATION_NAME")?;
+        let n = name.to_string();
+        delete_catalog_rows(file, page_size, "RDB$TRIGGERS", move |v| text_is(v.get(rn_f), &n))?;
+    }
+    if crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES").is_some() {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            int_eq(v.get(dt_f), 2) && triggers.iter().any(|t| text_is(v.get(dn_f), t))
+        })?;
+    }
+    Ok(())
+}
+
 /// The foreign key (if any) whose RDB$REF_CONSTRAINTS row names this
 /// unique/primary constraint as its partner.
 fn foreign_key_referencing(file: &crate::Image, page_size: usize, cname: &str) -> Option<String> {
@@ -9200,6 +9333,9 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
             }
         }
     }
+
+    // ...and the table's own user triggers, with their rows
+    delete_relation_triggers(file, page_size, &name)?;
 
     let mut domain_names: Vec<String> = Vec::new();
     {
@@ -12464,6 +12600,10 @@ pub fn drop_sequence(file: &mut crate::Image, page_size: usize, name: &str) -> R
     if system != 0 {
         return Err(format!("Cannot delete system generator {}", want));
     }
+    let n = object_dependents(file, page_size, &want, 14);
+    if n > 0 {
+        return Err(format!("cannot delete GENERATOR {} - there are {} dependencies", want, n));
+    }
     let name_f = sys_fid(file, page_size, "RDB$GENERATORS", "RDB$GENERATOR_NAME")?;
     {
         let want = want.clone();
@@ -12851,6 +12991,13 @@ pub fn create_procedure_with_id(
         if dup {
             return Err(format!("Procedure {} already exists", want));
         }
+    }
+    // ...and a plain procedure does not take a RELATION's name (one
+    // namespace, [plain_procedure_exists]): `CREATE PROCEDURE T1` over a
+    // table T1 is "CREATE PROCEDURE @1 failed / Table @1 already exists"
+    // (42S01, measured on 2182)
+    if package.is_none() && crate::resolve_relation(file, page_size, &want).is_some() {
+        return Err(format!("Table {} already exists", want));
     }
     let id = match keep_id {
         Some(id) => id,
@@ -14569,6 +14716,10 @@ pub fn drop_exception(file: &mut crate::Image, page_size: usize, name: &str) -> 
         .ok_or_else(|| format!("Exception {} not found", want))?;
     if system != 0 {
         return Err(format!("Cannot delete system exception {}", want));
+    }
+    let n = object_dependents(file, page_size, &want, 7);
+    if n > 0 {
+        return Err(format!("cannot delete EXCEPTION {} - there are {} dependencies", want, n));
     }
     let name_f = sys_fid(file, page_size, "RDB$EXCEPTIONS", "RDB$EXCEPTION_NAME")?;
     {

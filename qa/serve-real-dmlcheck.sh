@@ -58,6 +58,23 @@
 #     non-view "View @1 not found", RECREATE VIEW over a table the
 #     missing-view -607 "View @1 does not exist" (42S02).
 #
+#   * THE THIRD ROUND (sections 16-17, red on the integration binary
+#     6ec54c8): what a DROP leaves behind must not count. The widened
+#     dependency count met catalog rows the drops never deleted - a
+#     dropped computed column's domain rows, a dropped table's or view's
+#     OWN triggers (which also re-attached by name to a RECREATEd
+#     relation and fired their old bodies), a dropped domain's CHECK rows
+#     - and refused DROP TABLE where the engine drops. Each drop now
+#     takes its own rows; ALTER VIEW / CREATE OR ALTER VIEW record the
+#     new body's rows and keep the view's trigger; ALTER TABLE DROP of a
+#     column over a NAMED domain keeps the domain. Beside them: ALTER
+#     TABLE of a view (or a missing name) is the -607 "Table @1 does not
+#     exist" for every form (it rewrote the view's columns); a relation
+#     and a plain procedure share one namespace ("Procedure @1 already
+#     exists" / "Table @1 already exists"); DROP / RECREATE of an
+#     exception or a sequence a procedure or trigger uses is "cannot
+#     delete / EXCEPTION|GENERATOR @1 / there are N dependencies".
+#
 # CONTROLS from neighbouring fixes, green before this slice: ALTER TABLE
 # DROP of a column a view reads, ALTER TABLE ADD ... IDENTITY over rows.
 #
@@ -112,7 +129,28 @@ CREATE GLOBAL TEMPORARY TABLE GP (ID INTEGER PRIMARY KEY) ON COMMIT PRESERVE ROW
 CREATE GLOBAL TEMPORARY TABLE GD (ID INTEGER PRIMARY KEY) ON COMMIT DELETE ROWS;
 CREATE GLOBAL TEMPORARY TABLE G8 (A INTEGER);
 CREATE TABLE PA (A INTEGER);
+CREATE TABLE KA (ID INTEGER PRIMARY KEY);
+CREATE TABLE KB (ID INTEGER, CNT COMPUTED BY ((SELECT COUNT(*) FROM KA)));
+CREATE DOMAIN DKD INTEGER;
+CREATE TABLE KE (ID INTEGER, X DKD);
+CREATE TABLE GT1 (ID INTEGER, N INTEGER);
+CREATE TABLE GT2 (ID INTEGER);
+CREATE TABLE GT3 (ID INTEGER, N INTEGER);
+CREATE TABLE GT4 (ID INTEGER, N INTEGER);
+CREATE TABLE GT5 (ID INTEGER, N INTEGER);
+CREATE TABLE GT6A (ID INTEGER);
+CREATE TABLE GT6B (ID INTEGER);
+CREATE TABLE DT1 (ID INTEGER PRIMARY KEY);
+CREATE EXCEPTION EXQ 'boo';
+CREATE SEQUENCE SQQ;
+CREATE TABLE SQT (ID INTEGER);
 COMMIT;
+CREATE VIEW VKA AS SELECT ID FROM KA;
+CREATE TABLE KC (ID INTEGER, CNT COMPUTED BY ((SELECT COUNT(*) FROM VKA)));
+CREATE VIEW GV4 AS SELECT ID, N FROM GT4;
+CREATE VIEW GV5 AS SELECT ID, N FROM GT5;
+CREATE VIEW GV6 AS SELECT ID FROM GT6A;
+CREATE DOMAIN DD1 INTEGER CHECK (VALUE IN (SELECT ID FROM DT1));
 CREATE VIEW V1 AS SELECT ID, N, S FROM T1;
 CREATE VIEW VD AS SELECT ID, N FROM T1;
 CREATE VIEW VDEP AS SELECT ID, N FROM VD;
@@ -159,6 +197,13 @@ CREATE PACKAGE PK2 AS BEGIN PROCEDURE PP RETURNS (X INTEGER); END^
 CREATE PACKAGE BODY PK2 AS BEGIN PROCEDURE PP RETURNS (X INTEGER) AS BEGIN SELECT COUNT(*) FROM VPKC INTO X; SUSPEND; END END^
 CREATE PACKAGE PK3 AS BEGIN PROCEDURE PP RETURNS (X INTEGER); END^
 CREATE PACKAGE BODY PK3 AS BEGIN PROCEDURE PP RETURNS (X INTEGER) AS BEGIN SELECT COUNT(*) FROM PKC INTO X; SUSPEND; END END^
+CREATE TRIGGER GTR2 FOR GT2 BEFORE INSERT AS DECLARE X INTEGER; BEGIN SELECT COUNT(*) FROM GT1 INTO X; END^
+CREATE TRIGGER GT3_BI FOR GT3 BEFORE INSERT AS BEGIN NEW.N = NEW.N + 1000; END^
+CREATE TRIGGER GV4_BI FOR GV4 BEFORE INSERT AS BEGIN INSERT INTO GT4 (ID, N) VALUES (NEW.ID, NEW.N + 99); END^
+CREATE TRIGGER GV5_BI FOR GV5 BEFORE INSERT AS BEGIN INSERT INTO GT5 (ID, N) VALUES (NEW.ID, NEW.N + 99); END^
+CREATE PROCEDURE PRQ RETURNS (X INTEGER) AS BEGIN X = 1; SUSPEND; END^
+CREATE PROCEDURE PEXQ AS BEGIN EXCEPTION EXQ; END^
+CREATE TRIGGER SQT_BI FOR SQT BEFORE INSERT AS BEGIN NEW.ID = NEXT VALUE FOR SQQ; END^
 SET TERM ;^
 COMMIT;
 SQL
@@ -418,7 +463,7 @@ pin "7b ALTER TABLE ADD referencing a missing table" "ALTER TABLE PA ADD CONSTRA
 pin "7b a foreign key to a VIEW" "CREATE TABLE PV (A INTEGER REFERENCES V1(ID));" "$META|-CREATE TABLE \"PUBLIC\".\"PV\" failed|-attempt to reference a view (\"PUBLIC\".\"V1\") in a foreign key"
 refused "7b RECORDED ...through ALTER TABLE ADD <column> REFERENCES (the inline form)" "ALTER TABLE PA ADD B INTEGER REFERENCES V1(ID);" "$META|-ALTER TABLE \"PUBLIC\".\"PA\" failed|-attempt to reference a view (\"PUBLIC\".\"V1\") in a foreign key"
 pin "7b a GTT whose key column is not a key: the partner check comes first" "CREATE GLOBAL TEMPORARY TABLE GU (A INTEGER REFERENCES T2(ID), B INTEGER REFERENCES TP(ID));" "$(gttp GU 'global temporary table "PUBLIC"."GU" of type ON COMMIT DELETE ROWS cannot reference persistent table "PUBLIC"."T2"')"
-differs "7b RECORDED a refused statement draws no INTEG_n here (the engine's did)" "CREATE TABLE PN (A INTEGER, UNIQUE (A)); COMMIT; SELECT RDB\$CONSTRAINT_NAME FROM RDB\$RELATION_CONSTRAINTS WHERE RDB\$RELATION_NAME = 'PN';" "RDB\$CONSTRAINT_NAME|INTEG_56" "RDB\$CONSTRAINT_NAME|INTEG_44"
+differs "7b RECORDED a refused statement draws no INTEG_n here (the engine's did)" "CREATE TABLE PN (A INTEGER, UNIQUE (A)); COMMIT; SELECT RDB\$CONSTRAINT_NAME FROM RDB\$RELATION_CONSTRAINTS WHERE RDB\$RELATION_NAME = 'PN';" "RDB\$CONSTRAINT_NAME|INTEG_60" "RDB\$CONSTRAINT_NAME|INTEG_48"
 
 echo "--- 8. ALTER PROCEDURE / CREATE OR ALTER PROCEDURE KEEP THE BODY'S DEPENDENCY ROWS"
 DEPS='SELECT RDB$DEPENDENT_NAME, RDB$DEPENDED_ON_NAME FROM RDB$DEPENDENCIES WHERE RDB$DEPENDENT_NAME = '
@@ -498,6 +543,47 @@ pin "14 two CHECK triggers and another table's computed column: 3" "DROP TABLE C
 pin "14 the CHECK's table gone: the computed column still holds" "DROP TABLE CC; COMMIT; DROP TABLE CA;" "$META$DEP""TABLE \"PUBLIC\".\"CA\"|-there are 1 dependencies"
 pin "14 the computed column's table gone: CA drops" "DROP TABLE CB; COMMIT; DROP TABLE CA; COMMIT; SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME IN ('CA', 'CB', 'CC');" "COUNT|0"
 
+echo "--- 16. WHAT A DROP LEAVES BEHIND MUST NOT COUNT: A DROPPED COLUMN'S, TABLE'S, VIEW'S AND DOMAIN'S OWN ROWS GO"
+DEPQ='SELECT COUNT(*) FROM RDB$DEPENDENCIES WHERE RDB$DEPENDENT_NAME = '
+TRGQ='SELECT COUNT(*) FROM RDB$TRIGGERS WHERE RDB$TRIGGER_NAME = '
+RELQ='SELECT COUNT(*) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = '
+pin "16 control: another table's computed column holds KA" "DROP TABLE KA;" "Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-cannot delete|-TABLE \"PUBLIC\".\"KA\"|-there are 1 dependencies"
+pin "16 ALTER TABLE DROP of that computed column takes its domain's rows" "ALTER TABLE KB DROP CNT; COMMIT; SELECT COUNT(*) FROM RDB\$DEPENDENCIES WHERE RDB\$DEPENDED_ON_NAME = 'KA' AND RDB\$DEPENDENT_TYPE = 3;" "COUNT|0"
+pin "16 ...so KA's view is all that holds it" "DROP TABLE KA;" "Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-cannot delete|-TABLE \"PUBLIC\".\"KA\"|-there are 1 dependencies"
+pin "16 a computed column reading a VIEW: dropped, the view drops" "ALTER TABLE KC DROP CNT; COMMIT; DROP VIEW VKA; COMMIT; DROP TABLE KA; COMMIT; $RELQ'VKA'; $RELQ'KA';" "COUNT|0|COUNT|0"
+pin "16 a column over a NAMED domain leaves the domain" "ALTER TABLE KE DROP X; COMMIT; SELECT RDB\$FIELD_NAME FROM RDB\$FIELDS WHERE RDB\$FIELD_NAME = 'DKD';" "RDB\$FIELD_NAME|DKD"
+pin "16 control: a trigger on GT2 reading GT1 holds GT1" "DROP TABLE GT1;" "Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-cannot delete|-TABLE \"PUBLIC\".\"GT1\"|-there are 1 dependencies"
+pin "16 DROP TABLE takes its OWN triggers and their rows" "DROP TABLE GT2; COMMIT; $TRGQ'GTR2'; $DEPQ'GTR2';" "COUNT|0|COUNT|0"
+pin "16 ...so GT1 drops" "DROP TABLE GT1; COMMIT; $RELQ'GT1';" "COUNT|0"
+pin "16 RECREATE TABLE starts with no trigger (the old one added 1000)" "RECREATE TABLE GT3 (ID INTEGER, N INTEGER); COMMIT; INSERT INTO GT3 VALUES (1, 1); SELECT * FROM GT3; $TRGQ'GT3_BI'; ROLLBACK;" "ID N|1 1|COUNT|0"
+pin "16 ALTER VIEW keeps the view's trigger (it adds 99)" "ALTER VIEW GV4 AS SELECT ID, N FROM GT4; COMMIT; INSERT INTO GV4 VALUES (1, 1); SELECT * FROM GT4; ROLLBACK;" "ID N|1 100"
+pin "16 ...and records the new body's rows" "SELECT RDB\$DEPENDED_ON_NAME, RDB\$FIELD_NAME FROM RDB\$DEPENDENCIES WHERE RDB\$DEPENDENT_NAME = 'GV4' ORDER BY 1, 2;" "RDB\$DEPENDED_ON_NAME RDB\$FIELD_NAME|GT4 <null>|GT4 ID|GT4 N"
+pin "16 RECREATE VIEW takes the view's trigger" "RECREATE VIEW GV4 AS SELECT ID, N FROM GT4; COMMIT; INSERT INTO GV4 VALUES (2, 1); SELECT * FROM GT4; $TRGQ'GV4_BI'; ROLLBACK;" "ID N|2 1|COUNT|0"
+pin "16 DROP VIEW takes the view's trigger and its rows, so the table it wrote drops" "DROP VIEW GV5; COMMIT; $TRGQ'GV5_BI'; $DEPQ'GV5_BI'; DROP TABLE GT5; COMMIT; $RELQ'GT5';" "COUNT|0|COUNT|0|COUNT|0"
+pin "16 CREATE OR ALTER VIEW onto another table records the new rows" "CREATE OR ALTER VIEW GV6 AS SELECT ID FROM GT6B; COMMIT; SELECT RDB\$DEPENDED_ON_NAME, RDB\$FIELD_NAME FROM RDB\$DEPENDENCIES WHERE RDB\$DEPENDENT_NAME = 'GV6' ORDER BY 1, 2;" "RDB\$DEPENDED_ON_NAME RDB\$FIELD_NAME|GT6B <null>|GT6B ID"
+pin "16 ...and the old table is free" "DROP TABLE GT6A; COMMIT; $RELQ'GT6A';" "COUNT|0"
+pin "16 control: a domain's CHECK reading DT1 holds it" "DROP TABLE DT1;" "Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-cannot delete|-TABLE \"PUBLIC\".\"DT1\"|-there are 1 dependencies"
+pin "16 DROP DOMAIN takes its CHECK's rows, so DT1 drops" "DROP DOMAIN DD1; COMMIT; $DEPQ'DD1'; DROP TABLE DT1; COMMIT; $RELQ'DT1';" "COUNT|0|COUNT|0"
+
+echo "--- 17. ALTER TABLE OF A VIEW; A RELATION AND A PROCEDURE SHARE ONE NAMESPACE; A USED EXCEPTION OR SEQUENCE STAYS"
+pin "17 ALTER TABLE ADD over a view" "ALTER TABLE V1 ADD X INTEGER;" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-ALTER TABLE \"PUBLIC\".\"V1\" failed|-SQL error code = -607|-Invalid command|-Table \"PUBLIC\".\"V1\" does not exist"
+pin "17 ALTER TABLE DROP over a view" "ALTER TABLE V1 DROP N;" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-ALTER TABLE \"PUBLIC\".\"V1\" failed|-SQL error code = -607|-Invalid command|-Table \"PUBLIC\".\"V1\" does not exist"
+pin "17 ALTER TABLE ALTER TYPE over a view" "ALTER TABLE V1 ALTER N TYPE BIGINT;" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-ALTER TABLE \"PUBLIC\".\"V1\" failed|-SQL error code = -607|-Invalid command|-Table \"PUBLIC\".\"V1\" does not exist"
+pin "17 ALTER TABLE ADD CONSTRAINT over a view" "ALTER TABLE V1 ADD CONSTRAINT PKV1 PRIMARY KEY (ID);" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-ALTER TABLE \"PUBLIC\".\"V1\" failed|-SQL error code = -607|-Invalid command|-Table \"PUBLIC\".\"V1\" does not exist"
+pin "17 ALTER TABLE of a missing name" "ALTER TABLE NOSUCH ADD X INTEGER;" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-ALTER TABLE \"PUBLIC\".\"NOSUCH\" failed|-SQL error code = -607|-Invalid command|-Table \"PUBLIC\".\"NOSUCH\" does not exist"
+pin "17 the view kept its columns" "$VF'V1' ORDER BY RDB\$FIELD_POSITION;" "RDB\$FIELD_NAME|ID|N|S"
+pin "17 CREATE VIEW over a procedure's name" "CREATE VIEW PRQ AS SELECT ID FROM T1;" "Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-CREATE VIEW \"PUBLIC\".\"PRQ\" failed|-Procedure \"PUBLIC\".\"PRQ\" already exists"
+pin "17 CREATE TABLE over a procedure's name" "CREATE TABLE PRQ (ID INTEGER);" "Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-CREATE TABLE \"PUBLIC\".\"PRQ\" failed|-Procedure \"PUBLIC\".\"PRQ\" already exists"
+pin "17 RECREATE VIEW over a procedure's name" "RECREATE VIEW PRQ AS SELECT ID FROM T1;" "Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-RECREATE VIEW \"PUBLIC\".\"PRQ\" failed|-Procedure \"PUBLIC\".\"PRQ\" already exists"
+pin "17 RECREATE TABLE over a procedure's name" "RECREATE TABLE PRQ (ID INTEGER);" "Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-RECREATE TABLE \"PUBLIC\".\"PRQ\" failed|-Procedure \"PUBLIC\".\"PRQ\" already exists"
+pin "17 nothing was written" "$RELQ'PRQ';" "COUNT|0"
+pin "17 CREATE PROCEDURE over a table's name" "SET TERM ^; CREATE PROCEDURE T1 RETURNS (X INTEGER) AS BEGIN X = 1; SUSPEND; END^ SET TERM ;^ SELECT COUNT(*) FROM RDB\$PROCEDURES WHERE RDB\$PROCEDURE_NAME = 'T1';" "Statement failed, SQLSTATE = 42S01|unsuccessful metadata update|-CREATE PROCEDURE \"PUBLIC\".\"T1\" failed|-Table \"PUBLIC\".\"T1\" already exists|COUNT|0"
+pin "17 RECREATE EXCEPTION a procedure raises" "RECREATE EXCEPTION EXQ 'new'; COMMIT; SELECT RDB\$MESSAGE FROM RDB\$EXCEPTIONS WHERE RDB\$EXCEPTION_NAME = 'EXQ';" "Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-cannot delete|-EXCEPTION \"PUBLIC\".\"EXQ\"|-there are 1 dependencies|RDB\$MESSAGE|boo"
+pin "17 RECREATE SEQUENCE a trigger draws: the old one keeps counting" "RECREATE SEQUENCE SQQ START WITH 10; COMMIT; INSERT INTO SQT VALUES (NULL); SELECT * FROM SQT; ROLLBACK;" "Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-cannot delete|-GENERATOR \"PUBLIC\".\"SQQ\"|-there are 1 dependencies|ID|1"
+pin "17 DROP EXCEPTION of a used exception" "DROP EXCEPTION EXQ;" "Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-cannot delete|-EXCEPTION \"PUBLIC\".\"EXQ\"|-there are 1 dependencies"
+pin "17 DROP SEQUENCE of a used sequence" "DROP SEQUENCE SQQ;" "Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-cannot delete|-GENERATOR \"PUBLIC\".\"SQQ\"|-there are 1 dependencies"
+pin "17 their users gone, both drop" "DROP PROCEDURE PEXQ; DROP TRIGGER SQT_BI; COMMIT; DROP EXCEPTION EXQ; DROP SEQUENCE SQQ; COMMIT; SELECT COUNT(*) FROM RDB\$EXCEPTIONS WHERE RDB\$EXCEPTION_NAME = 'EXQ'; SELECT COUNT(*) FROM RDB\$GENERATORS WHERE RDB\$GENERATOR_NAME = 'SQQ';" "COUNT|0|COUNT|0"
+
 echo "--- 15. THE FILE AFTER ALL OF IT"
 # a put-back image is a whole image: gfix validates fc's file, and the
 # ENGINE reads the tables the refused RECREATEs left
@@ -515,5 +601,5 @@ ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-dmlcheck-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 else echo "OK   no panic"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 175 ]; then echo "FAIL only $ran checks ran (floor 175)"; fail=1; fi
+if [ "$ran" -lt 209 ]; then echo "FAIL only $ran checks ran (floor 209)"; fail=1; fi
 exit $fail
