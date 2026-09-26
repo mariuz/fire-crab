@@ -192,7 +192,7 @@ refused() { # <label> <charset> <script>
     local ev fv
     ev=$(sess "127.0.0.1/$REAL:$ENG" "$2" "$3"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2" "$3")
     if [ "${ev#*SQLSTATE}" != "$ev" ]; then echo "FAIL $1 [$2] - the engine raises now [$ev]"; fail=1
-    elif [ "$ev" = "$fv" ]; then echo "FAIL $1 [$2] - IT AGREES NOW; promote the cell"; fail=1
+    elif [ "$ev" = "$fv" ]; then echo "FAIL $1 [$2] - IT AGREES NOW [$ev]; promote the cell"; fail=1
     elif [ "${fv#*SQLSTATE}" = "$fv" ]; then echo "FAIL $1 [$2] - A WRONG ANSWER, not a refusal"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
     else echo "OK   $1 [$2] (recorded: engine [${ev:0:60}], this server refuses)"; fi
 }
@@ -203,7 +203,7 @@ differs() { # <label> <charset> <script>
     ev=$(sess "127.0.0.1/$REAL:$ENG" "$2" "$3"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2" "$3")
     if [ "${ev#*SQLSTATE}" = "$ev" ]; then echo "FAIL $1 [$2] - the engine answers now [$ev]"; fail=1
     elif [ "${fv#*SQLSTATE}" = "$fv" ]; then echo "FAIL $1 [$2] - A WRONG ANSWER, not an error"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
-    elif [ "$ev" = "$fv" ]; then echo "FAIL $1 [$2] - IT AGREES NOW; promote the cell"; fail=1
+    elif [ "$ev" = "$fv" ]; then echo "FAIL $1 [$2] - IT AGREES NOW [$ev]; promote the cell"; fail=1
     else echo "OK   $1 [$2] (recorded: both raise, engine [${ev:0:70}])"; fi
 }
 # the session must SURVIVE a cell: the same connection answers again
@@ -480,12 +480,12 @@ dpin "7 COALESCE(A, 'x') describes ASCII under NONE" NONE "SELECT COALESCE(A, 'x
 dpin "7 CONTROL REPLACE(N, 'É', 'e') still describes the negotiated set" UTF8 "SELECT REPLACE(N, 'É', 'e') R FROM TU;" "01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 80 charset: 4 SYSTEM.UTF8"
 dpin "7 CONTROL LPAD(REPLACE(N, 'É', 'e'), 8, 'x') describes it too" UTF8 "SELECT LPAD(REPLACE(N, 'É', 'e'), 8, 'x') R FROM TU;" "01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 32 charset: 4 SYSTEM.UTF8"
 
-echo "--- 8. RECORDED: refused, never answered wrong"
-refused "8 HASH(_WIN1252 'ab') - the introducer" NONE "SET LIST ON; SELECT HASH(_WIN1252 'ab') H FROM RDB\$DATABASE;"
-refused "8 HASH(_UTF8 'ÀÉ')" WIN1252 "SET LIST ON; SELECT HASH(_UTF8 'ÀÉ') H FROM RDB\$DATABASE;"
-refused "8 LOWER(_WIN1252 'ÄÖÜ')" UTF8 "SET LIST ON; SELECT LOWER(_WIN1252 'ÄÖÜ') L FROM RDB\$DATABASE;"
-refused "8 UPPER(_NONE 'äöü')" NONE "SET LIST ON; SELECT UPPER(_NONE 'äöü') L FROM RDB\$DATABASE;"
-refused "8 POSITION(_WIN1252 'É' IN W1)" UTF8 "SET LIST ON; SELECT ID, POSITION(_WIN1252 'É' IN W1) P FROM TU ORDER BY ID;"
+echo "--- 8. RECORDED: refused, never answered wrong (the five introducer cells were promoted on 2026-09-26, when the introducer began to be respelled)"
+pin "8 HASH(_WIN1252 'ab') - the introducer (answers since the introducer rewrite of 2026-09-26)" NONE "SET LIST ON; SELECT HASH(_WIN1252 'ab') H FROM RDB\$DATABASE;" "H 1650"
+pin "8 HASH(_UTF8 'ÀÉ')" WIN1252 "SET LIST ON; SELECT HASH(_UTF8 'ÀÉ') H FROM RDB\$DATABASE;" "H 834745"
+pin "8 LOWER(_WIN1252 'ÄÖÜ') - the UTF8 bytes read as WIN1252 chars, lowered, shipped as UTF8" UTF8 "SET LIST ON; SELECT LOWER(_WIN1252 'ÄÖÜ') L FROM RDB\$DATABASE;" "L <c3><a3><e2><80><9e><c3><a3><e2><80><93><c3><a3><c5><93>"
+pin "8 UPPER(_NONE 'äöü') - NONE cases ASCII only" NONE "SET LIST ON; SELECT UPPER(_NONE 'äöü') L FROM RDB\$DATABASE;" "L <c3><a4><c3><b6><c3><bc>"
+pin "8 POSITION(_WIN1252 'É' IN W1)" UTF8 "SET LIST ON; SELECT ID, POSITION(_WIN1252 'É' IN W1) P FROM TU ORDER BY ID;" "ID 1|P 0|ID 2|P 3|ID 3|P 0|ID 4|P <null>"
 differs "8 HASH('a', 'b') is the engine's syntax error, a bare 42000 here" NONE "SET LIST ON; SELECT HASH('a', 'b') H FROM RDB\$DATABASE;"
 differs "8 HASH() likewise" NONE "SET LIST ON; SELECT HASH() H FROM RDB\$DATABASE;"
 differs "8 HASH('abc' USING) - no algorithm at all - is the engine's syntax error, a bare 42000 here" NONE "SET LIST ON; SELECT HASH('abc' USING) H FROM RDB\$DATABASE;"
