@@ -63994,7 +63994,12 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
             && (matches!(a, Value::Float(_)) || matches!(b, Value::Float(_))) =>
         {
             match (single_cmp_f32(a), single_cmp_f32(b)) {
-                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Equal),
+                // a NaN has no partial order: it takes its place in the
+                // engine's sort key, IEEE totalOrder with the sign
+                // ([f64_total_key]) - `Equal` merged it with its
+                // neighbour, and SELECT DISTINCT D / COUNT(DISTINCT D)
+                // over {NaN, +Inf, ...} dropped the infinity
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or_else(|| f64_total_key(x as f64).cmp(&f64_total_key(y as f64))),
                 _ => a.render().cmp(&b.render()),
             }
         }
@@ -64010,7 +64015,12 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
                     .or_else(|| numeric_parts(v).map(|(raw, sc)| exact_to_f64(raw, sc as i32)))
             };
             match (f(a), f(b)) {
-                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Equal),
+                // a NaN has no partial order: it takes its place in the
+                // engine's sort key, IEEE totalOrder with the sign
+                // ([f64_total_key]) - `Equal` merged it with its
+                // neighbour, and SELECT DISTINCT D / COUNT(DISTINCT D)
+                // over {NaN, +Inf, ...} dropped the infinity
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or_else(|| f64_total_key(x).cmp(&f64_total_key(y))),
                 _ => a.render().cmp(&b.render()),
             }
         }
@@ -65818,10 +65828,23 @@ fn group_rows(
             }
             None => sort_rows_spilling(std::mem::take(&mut input), &keys)?,
         };
+        // a NaN key is a group of its own: the sort puts the NaN rows
+        // together (their total-order key), but the boundary is the
+        // engine's MOV_compare, and a NaN equals nothing - not even the
+        // same NaN (serve-real-nanrow: GROUP BY D over two +NaN rows is
+        // 8 groups where DISTINCT D is 7 values)
+        let key_nan = |r: &[Value]| {
+            keys.iter().any(|k| match r.get(k.field) {
+                Some(Value::Double(x)) => x.is_nan(),
+                Some(Value::Float(x)) => x.is_nan(),
+                _ => false,
+            })
+        };
         let mut i = 0;
         while i < input.len() {
             let mut j = i + 1;
             while j < input.len()
+                && !key_nan(&input[i])
                 && order_cmp(&input[i], &input[j], &keys) == std::cmp::Ordering::Equal
             {
                 j += 1;

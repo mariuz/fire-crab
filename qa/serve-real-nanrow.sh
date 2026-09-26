@@ -370,13 +370,13 @@ dml_rb_both_err  "3c CONTROL a duplicate 1.5 STILL raises (engine dml=ERR, the t
 dml_rb_both_err  "3c CONTROL a duplicate +Inf STILL raises - an infinity is an ordinary value (engine dml=ERR)" "INSERT INTO UD (D, V) VALUES (?, 9)" '["#Inf"]' "SELECT V AS A, CAST(D AS VARCHAR(25)) AS B FROM UD ORDER BY V"
 dml_rb           "3c CONTROL a NEW finite key inserts (engine dml=(none) rb=...;9,7.500000000000000)" "INSERT INTO UD (D, V) VALUES (?, 9)" '[7.5]' "SELECT V AS A, CAST(D AS VARCHAR(25)) AS B FROM UD ORDER BY V"
 
-echo "-- 4. WHAT THIS CHUNK DOES NOT FIX, pinned so it cannot be mistaken for agreement --"
+echo "-- 4. THE SORT / DISTINCT / GROUP surfaces (recorded divergences until 2026-09-26; a NaN now sorts by its total-order key, dedups by it, and groups alone) --"
 # Each of these is a DIFFERENT rule from the equality one above, each
 # measured, and each still divergent here.  A wrong answer cannot be a
 # green cell, so they are recorded with BOTH answers rather than hidden.
-divergence       "4 ORDER BY D - the engine sorts by IEEE totalOrder and puts +NaN ABOVE +Inf; this server does not" "SELECT ID FROM M ORDER BY D, ID" '[]' "4;3;6;7;5;2;1;8" "4;1;3;6;7;5;2;8"
-divergence       "4 COUNT of DISTINCT D - the engine dedups BY THE SORT KEY, so the two +NaN rows COLLAPSE" "SELECT COUNT(*) A FROM (SELECT DISTINCT D FROM M) X" '[]' "7" "2"
-divergence       "4 COUNT of the GROUP BY groups - and GROUP BY uses EQUALITY instead, so the same two rows do NOT collapse" "SELECT COUNT(*) A FROM (SELECT D FROM M GROUP BY D) X" '[]' "8" "2"
+both             "4 ORDER BY D - IEEE totalOrder with the sign: +NaN ABOVE +Inf (this server agreed on 2026-09-26, when a NaN took its total-order key in the value compare)" "SELECT ID FROM M ORDER BY D, ID"
+both             "4 COUNT of DISTINCT D - the engine dedups BY THE SORT KEY, so the two +NaN rows COLLAPSE (agreed 2026-09-26)" "SELECT COUNT(*) A FROM (SELECT DISTINCT D FROM M) X"
+both             "4 COUNT of the GROUP BY groups - GROUP BY uses EQUALITY instead, so the same two rows do NOT collapse (agreed 2026-09-26: a NaN key is its own group)" "SELECT COUNT(*) A FROM (SELECT D FROM M GROUP BY D) X"
 
 # the server's stderr log is the ONE place a PANIC shows
 panic_free() {
