@@ -9907,6 +9907,9 @@ enum Plan {
         branches: Vec<Plan>,
         distinct: bool,
         order_by: Option<OrderKey>,
+        /// the ORDER BY keys after the first (`ORDER BY 1, 2`), applied
+        /// in order when the ones before them tie; empty for one key
+        then_by: Vec<OrderKey>,
     },
     /// A statement this server will not answer, kept as a plan so it
     /// raises a SQL ERROR. Falling back to the fixed-answer plan would
@@ -42654,6 +42657,22 @@ fn parse_from(
     // a comma at DEPTH 0 makes a comma list; one inside a derived
     // table's own select list is that query's, not this FROM's - which
     // is why the test is the depth-aware split rather than `contains`
+    // A WHOLE FROM IN PARENTHESES that holds a join - `FROM (T1 JOIN T2
+    // ON ..)` - is that join (measured on 2182: the rows of the bare
+    // form). A parenthesised join as ONE OPERAND of another join is not
+    // read here and stays refused.
+    {
+        let t = from_s.trim();
+        if t.starts_with('(') && matching_paren(t.as_bytes(), 0) == Some(t.len() - 1) {
+            let inner = t[1..t.len() - 1].trim();
+            let iu = mask_literals(&inner.to_ascii_uppercase());
+            let head = iu.trim_start_matches(|c: char| c == '(' || c.is_whitespace());
+            let is_query = find_word(head, "SELECT", 0) == Some(0) || find_word(head, "WITH", 0) == Some(0);
+            if !is_query && (find_word_depth0(&iu, "JOIN", 0).is_some() || iu.starts_with('(')) {
+                return parse_from(inner);
+            }
+        }
+    }
     let comma_parts: Vec<&str> = split_top_level_commas(from_s);
     if comma_parts.len() > 1 {
         let parts = comma_parts;
@@ -42733,9 +42752,9 @@ fn parse_from(
                 _ => return None,
             };
             let after = jp + "JOIN".len();
-            let on = find_word(&up_tail, "ON", after)?;
+            let (on, on_s) = join_condition(tail, &up_tail, after)?;
             let right = parse_table_ref(&tail[after..on])?;
-            steps.push((kind, right, tail[on + "ON".len()..].trim(), 0));
+            steps.push((kind, right, on_s, 0));
             return Some((base, steps));
         }
     }
@@ -42816,10 +42835,86 @@ fn parse_from(
     left_end = left_end.min(jp);
     let left = parse_table_ref(&from_s[..left_end])?;
     let after = jp + "JOIN".len();
-    let on = find_word(&up, "ON", after)?;
+    let (on, on_s) = join_condition(from_s, &up, after)?;
     let right = parse_table_ref(&from_s[after..on])?;
-    let on_s = from_s[on + "ON".len()..].trim();
     Some((left, vec![(kind, right, on_s, 0)]))
+}
+
+/// Does the statement being planned use `key` as a QUALIFIER anywhere -
+/// `KEY.` in its text, literals masked? True too when that cannot be
+/// told (no statement text, a key that is not plain upper case), so a
+/// caller relying on "no qualifier" stays on the refusing side.
+fn stmt_qualifies_by(key: &str) -> bool {
+    if key.is_empty() || key.chars().any(|c| c.is_ascii_lowercase() || c == '"') {
+        return true;
+    }
+    STMT_TEXT.with(|t| {
+        let t = t.borrow();
+        let Some((_, full)) = t.as_ref() else {
+            return true;
+        };
+        let up = mask_literals(&full.to_ascii_uppercase());
+        let mut from = 0;
+        while let Some(p) = find_word(&up, key, from) {
+            from = p + key.len();
+            if up[from..].trim_start().starts_with('.') {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Where a join step's joined table ends and what its condition is:
+/// `ON <cond>` gives the condition text, `USING (<cols>)` gives the
+/// whole `USING (...)` text, which [using_columns] reads once the sides
+/// are known. An ON condition can never start with the word USING, so
+/// the two cannot be confused downstream. Whichever keyword comes FIRST
+/// after the table wins - an `ON` inside a later subquery is not this
+/// step's.
+fn join_condition<'a>(text: &'a str, up: &str, after: usize) -> Option<(usize, &'a str)> {
+    let masked = mask_literals(up);
+    let using = find_word_depth0(&masked, "USING", after);
+    let on = find_word(up, "ON", after);
+    match (using, on) {
+        (Some(u), o) if o.is_none_or(|o| u < o) => Some((u, text[u..].trim())),
+        (_, Some(o)) => Some((o, text[o + "ON".len()..].trim())),
+        _ => None,
+    }
+}
+
+/// A step's `USING (<col>, ...)` condition, read: None when the text is
+/// an ordinary ON condition; `Some(None)` when it is a USING that does
+/// not parse (refused); otherwise each column's canonical name beside
+/// its span in the text, which is where the engine's -206 points.
+fn using_columns(on_s: &str) -> Option<Option<Vec<(String, &str)>>> {
+    let t = on_s.trim();
+    let head = t.get(..5)?;
+    if !head.eq_ignore_ascii_case("USING")
+        || t[5..].chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    {
+        return None;
+    }
+    let rest = t[5..].trim_start();
+    let open = t.len() - rest.len();
+    if !rest.starts_with('(') {
+        return Some(None);
+    }
+    let Some(close) = matching_paren(t.as_bytes(), open) else {
+        return Some(None);
+    };
+    if !t[close + 1..].trim().is_empty() {
+        return Some(None);
+    }
+    let mut out = Vec::new();
+    for part in split_top_level_commas(&t[open + 1..close]) {
+        let raw = part.trim();
+        let Some(name) = canon_ident(raw) else {
+            return Some(None);
+        };
+        out.push((name, raw));
+    }
+    Some(Some(out))
 }
 
 /// Split a column reference into (schema, relation-or-alias, column).
@@ -42922,6 +43017,14 @@ struct JoinSide {
     /// but a bare name means the other side's, and `*` emits the pair
     /// once
     merged_away: Vec<u16>,
+    /// columns of THIS side a RIGHT or FULL NATURAL/USING join merged
+    /// with a later side's: the merged column is then COALESCE(this,
+    /// that) - the engine shows the joined side's value on a row this
+    /// side padded (measured on 2182: `T3 A FULL JOIN (..) B USING (K)`
+    /// answers K = 5 where A.K is NULL). A bare name reaching one is
+    /// answered only as a select item ([plan_join_bound]); anywhere else
+    /// it refuses rather than read this side's NULL.
+    merged_outer: Vec<u16>,
     /// what an index probe of this side would need ([ProbeSrc]), which
     /// `JoinPart` used to drop. Only a PLAIN RELATION has one.
     probe_src: Option<ProbeSrc>,
@@ -42946,6 +43049,7 @@ fn resolve_join_col<'a>(
             c.name == col
                 // a merged-away column answers only to its qualifier
                 && (qual.is_some() || !side.merged_away.contains(&c.field_id))
+                && (qual.is_some() || !side.merged_outer.contains(&c.field_id))
         })?;
         // a computed column has no record bytes in the joined row
         if is_computed_fid(&side.descs, rc.field_id as usize) {
@@ -43102,7 +43206,7 @@ fn combined_view(sides: &[JoinSide]) -> (Vec<RelationColumn>, Vec<Descriptor>) {
             // a merged-away column is not a second column of that name -
             // a NATURAL join made the pair ONE - so it does not make the
             // bare name ambiguous
-            if side.merged_away.contains(&rc.field_id) {
+            if side.merged_away.contains(&rc.field_id) || side.merged_outer.contains(&rc.field_id) {
                 continue;
             }
             if let Some(prev) = comb_cols
@@ -43376,14 +43480,32 @@ fn parse_lateral_from(table_s: &str) -> Option<(&str, String, String, String, bo
     let lat = find_word_depth0(&up, "LATERAL", 0)?;
     let before = t[..lat].trim_end();
     let bu = before.to_ascii_uppercase();
-    let (base_s, left) = if before.ends_with(',') {
-        (before[..before.len() - 1].trim(), false)
-    } else if bu.ends_with(" LEFT JOIN") {
-        (before[..before.len() - " LEFT JOIN".len()].trim(), true)
-    } else if bu.ends_with(" LEFT OUTER JOIN") {
-        (before[..before.len() - " LEFT OUTER JOIN".len()].trim(), true)
+    // `CROSS JOIN LATERAL` is the comma form spelled as a join, and
+    // `[INNER] JOIN LATERAL ... ON TRUE` the same inner lateral with its
+    // (trivial) condition written out - measured on 2182, all three
+    // answer the comma form's rows, an empty subquery dropping the outer
+    // row in each. `on_true` says the tail must carry that ON TRUE.
+    let strip = |w: &str| -> Option<&str> {
+        (bu.len() > w.len() && bu.ends_with(w)).then(|| before[..before.len() - w.len()].trim())
+    };
+    let (base_s, left, on_true) = if before.ends_with(',') {
+        (before[..before.len() - 1].trim(), false, false)
+    } else if let Some(b) = strip(" LEFT JOIN") {
+        (b, true, true)
+    } else if let Some(b) = strip(" LEFT OUTER JOIN") {
+        (b, true, true)
+    } else if let Some(b) = strip(" CROSS JOIN") {
+        (b, false, false)
+    } else if let Some(b) = strip(" INNER JOIN") {
+        (b, false, true)
+    } else if let Some(b) = strip(" JOIN").filter(|b| {
+        // a bare JOIN, not the tail of RIGHT / FULL [OUTER] JOIN
+        let w = b.rsplit(char::is_whitespace).next().unwrap_or("").to_ascii_uppercase();
+        !matches!(w.as_str(), "RIGHT" | "FULL" | "OUTER" | "LEFT" | "CROSS" | "INNER")
+    }) {
+        (b, false, true)
     } else {
-        return None; // CROSS/INNER/RIGHT/FULL JOIN LATERAL: later slices
+        return None; // RIGHT/FULL JOIN LATERAL: the engine's own refusal
     };
     // after LATERAL: `(<sub>) <alias> [ON TRUE]`
     let after = t[lat + "LATERAL".len()..].trim_start();
@@ -43399,12 +43521,13 @@ fn parse_lateral_from(table_s: &str) -> Option<(&str, String, String, String, bo
         return None;
     }
     let tail = rest[alias_end..].trim();
-    if left {
-        if !tail.eq_ignore_ascii_case("ON TRUE") {
-            return None; // only ON TRUE for LEFT JOIN LATERAL in this slice
+    if on_true {
+        let tu = tail.to_ascii_uppercase();
+        if tu.split_whitespace().collect::<Vec<_>>() != ["ON", "TRUE"] {
+            return None; // only ON TRUE for a JOIN LATERAL in this slice
         }
     } else if !tail.is_empty() {
-        return None; // the comma form takes nothing after the alias
+        return None; // the comma / CROSS form takes nothing after the alias
     }
     // the base must be ONE real table (no further join / comma / lateral)
     let bmask = mask_literals(&base_s.to_ascii_uppercase());
@@ -44323,6 +44446,7 @@ fn plan_join_bound(
                     .collect(),
                 rel_alias: tr.alias.clone(),
                 merged_away: Vec::new(),
+                merged_outer: Vec::new(),
                 probe_src: None,
                 flatten,
             });
@@ -44365,6 +44489,7 @@ fn plan_join_bound(
                     .collect(),
                 rel_alias: tr.alias.clone(),
                 merged_away: Vec::new(),
+                merged_outer: Vec::new(),
                 probe_src: None,
                 flatten,
             });
@@ -44403,6 +44528,7 @@ fn plan_join_bound(
                         .collect(),
                     rel_alias: Some(tr.key().to_string()),
                     merged_away: Vec::new(),
+                    merged_outer: Vec::new(),
                     probe_src: None,
                     flatten: None,
                 });
@@ -44482,6 +44608,7 @@ fn plan_join_bound(
             base_fids,
             rel_alias: tr.alias.clone(),
             merged_away: Vec::new(),
+            merged_outer: Vec::new(),
             probe_src,
             flatten: None,
         });
@@ -44509,7 +44636,16 @@ fn plan_join_bound(
                         sides[j].key
                     ))));
                 }
-                return None;
+                // TWO UNALIASED MENTIONS answer while nothing QUALIFIES
+                // by the shared name (measured on 2182: `T1 JOIN T1 ON
+                // 1=1` counts 36, `T1 NATURAL JOIN T1` and `T1 JOIN T1
+                // USING (ID)` answer through the merged bare names, and
+                // `T1.ID` over either is the -204 ambiguity). A qualifier
+                // anywhere in the statement would reach the first side
+                // here, so that shape stays refused.
+                if sides[i].rel_alias.is_some() || sides[j].rel_alias.is_some() || stmt_qualifies_by(&sides[j].key) {
+                    return None;
+                }
             }
         }
     }
@@ -44557,6 +44693,59 @@ fn plan_join_bound(
             } else {
                 Predicate::dnf(vec![terms])
             }
+        } else if let Some(spec) = using_columns(on_s) {
+            // `USING (<cols>)` IS A NATURAL JOIN OVER THE NAMED COLUMNS
+            // ONLY - the same derived equality, the same merge (the
+            // right side's copy hidden, `*` showing the pair once at the
+            // LEFT side's position). Measured on 2182: `SELECT * FROM T3
+            // A JOIN T3 B USING (NAME)` is K, NAME, K. A column twice in
+            // the list is the -104 isc_dsql_col_more_than_once_using; a
+            // column the left sides do not have is the -206 `<left side
+            // of USING>."X"` and one the joined side lacks `<right side
+            // of USING>."X"`, left checked first, each at the column's
+            // own position in the list (`USING (S)` with S only on the
+            // right is the LEFT one). A bare merged name over a RIGHT or
+            // FULL step is the pair's COALESCE ([JoinSide::merged_outer]).
+            let names = spec?;
+            let mut terms: Vec<Term> = Vec::new();
+            let mut shared: Vec<String> = Vec::new();
+            // column by column, in list order: `USING (X, X)` with no X
+            // on the left is the -206 at the first X, not the -104
+            for (i, (n, raw)) in names.iter().enumerate() {
+                if names[..i].iter().any(|(m, _)| m == n) {
+                    return Some(Plan::RefusedEval(EvalErr::UsingColTwice(n.clone())));
+                }
+                let unknown = |side: &str| -> Option<Plan> {
+                    let (line, col) = text_line_col(on_s, raw)?;
+                    Some(Plan::RefusedEval(EvalErr::ColumnUnknown {
+                        name: format!("<{} side of USING>.\"{}\"", side, n),
+                        line,
+                        col,
+                    }))
+                };
+                let left_has = sides[*vis..=k].iter().any(|sd| sd.columns.iter().any(|c| &c.name == n));
+                if !left_has {
+                    return unknown("left");
+                }
+                // on the left more than once (and not merged): ambiguous,
+                // which this server does not name - refused
+                let (li, _, _) = resolve_join_col(&sides[*vis..=k], n)?;
+                let Some(rc) = sides[k + 1].columns.iter().find(|c| &c.name == n) else {
+                    return unknown("right");
+                };
+                if is_computed_fid(&sides[k + 1].descs, rc.field_id as usize) {
+                    return None;
+                }
+                let ri = sides[k + 1].offset + rc.field_id as usize;
+                terms.push(Term::ExprCond(Box::new(Cond2::Cmp(
+                    Box::new(Expr::Col(li)),
+                    Cmp::Eq,
+                    Box::new(Expr::Col(ri)),
+                ))));
+                shared.push(n.clone());
+            }
+            natural_shared.push(shared);
+            Predicate::dnf(vec![terms])
         } else {
             natural_shared.push(Vec::new());
             parse_on(on_s, visible, &mut on_np, params)?
@@ -44616,6 +44805,14 @@ fn plan_join_bound(
                     let idx = sides[k + 1].offset + fid as usize;
                     sides[k + 1].merged_away.push(fid);
                     merged.push((li, idx));
+                    if matches!(joins[k].0, JoinKind::Right | JoinKind::Full) {
+                        if let Some(ls) = sides[..=k]
+                            .iter_mut()
+                            .find(|s| li >= s.offset && li < s.offset + s.descs.len())
+                        {
+                            ls.merged_outer.push((li - ls.offset) as u16);
+                        }
+                    }
                 }
             }
         }
@@ -44631,6 +44828,7 @@ fn plan_join_bound(
         Some(ws) => Some(
             tokenize(ws)
                 .and_then(|t| parse_predicate(&t, &mut next_param))
+                .or_else(|| cond_where_fallback(ws))
                 .and_then(|raw| resolve_join_predicate(raw, &sides, params))?,
         ),
     };
@@ -45050,6 +45248,38 @@ fn plan_join_bound(
                     }
                     _ => return None, // aggregates over a join: fall back
                 };
+                // a BARE name of a column an outer NATURAL/USING join
+                // merged is the pair's COALESCE ([JoinSide::merged_outer])
+                let outer_merged = (!name.contains('.'))
+                    .then(|| {
+                        sides.iter().find_map(|s| {
+                            let rc = s.columns.iter().find(|c| c.name == *name)?;
+                            s.merged_outer
+                                .contains(&rc.field_id)
+                                .then(|| (s, rc, s.offset + rc.field_id as usize))
+                        })
+                    })
+                    .flatten();
+                if let Some((side, rc, li)) = outer_merged {
+                    let &(_, ri) = merged.iter().find(|(l, _)| *l == li)?;
+                    let d = side.descs.get(rc.field_id as usize)?;
+                    let (wire, sql_type, length, scale, sub_type) = wire_for(d);
+                    cols.push(ProjCol {
+                        name: alias.clone().unwrap_or_else(|| rc.name.clone()),
+                        fname: side.fnames.get(rc.field_id as usize).cloned().flatten().or_else(|| Some(rc.name.clone())),
+                        relation: side.rels.get(rc.field_id as usize).cloned().flatten(),
+                        rel_alias: side.rel_alias.clone(),
+                        field_id: li,
+                        wire,
+                        sql_type: nullable(sql_type),
+                        length,
+                        oct_length: length,
+                        scale,
+                        sub_type,
+                        expr: Some(Expr::Coalesce(vec![Expr::Col(li), Expr::Col(ri)])),
+                    });
+                    continue;
+                }
                 let (idx, d, colname) = resolve_join_col(&sides, name)?;
                 let (wire, sql_type, length, scale, sub_type) = wire_for(d);
                 // the combined index maps back to the side it landed
@@ -49767,6 +49997,451 @@ fn splice_ctes(sql: &str, ctes: &[(String, ViewDef)]) -> Option<String> {
         out = format!("{}{}{}", &out[..at], text, &out[at + len..]);
     }
     Some(out)
+}
+
+/// [splice_ctes] at EVERY query level of `sql`, not only its own FROM:
+/// a CTE is in scope for the whole statement - a scalar subquery, an
+/// IN / EXISTS body, a derived table, each UNION member - and the engine
+/// resolves it there (measured on 2182: `WITH C AS (..) SELECT (SELECT
+/// COUNT(*) FROM C) ..` answers 6, `.. SELECT ID FROM C UNION ALL SELECT
+/// ID FROM T2 ..` answers both members, a CTE whose body is a UNION over
+/// an earlier CTE answers). A `WITH` opening a parenthesised query - a
+/// derived table's own CTEs - is folded the same way, its names
+/// SHADOWING the outer ones inside it. A nested `WITH RECURSIVE` is not
+/// a substitution and refuses (None), as does anything unbalanced.
+/// The select list with every QUALIFIED STAR item written out as that
+/// FROM item's columns, each under the qualifier as written - or None
+/// when there is no such item or one cannot be expanded (the caller
+/// then plans the text as it is, which refuses as before).
+///
+/// Measured on 2182: `T2.*` over a join is T2's columns in declared
+/// order; `D.*` over a derived table is its output names; a side a
+/// NATURAL / USING join merged is still WHOLE under its own qualifier
+/// (`SELECT B.* FROM T3 A JOIN T3 B USING (K)` is K, NAME with B's K,
+/// and over a FULL join `A.*` shows A's own NULL on a padded row, not
+/// the merged value); `T3.*, T3.K` over one table is K, NAME, K. A
+/// qualifier naming no FROM item, or one that is ambiguous, is left for
+/// the resolver's refusal.
+fn expand_qualified_stars(proj_s: &str, table_s: &str, db: &Database, db_opt: &Option<Database>) -> Option<String> {
+    let items = split_top_level_commas(proj_s);
+    let is_qstar = |it: &str| {
+        let t = it.trim();
+        t.len() > 2 && t.ends_with(".*") && !t.ends_with("..*")
+    };
+    if !items.iter().any(|it| is_qstar(it)) {
+        return None;
+    }
+    let (base, joins) = parse_from(table_s)?;
+    // a LONE `T.*` over a lone FROM item is the plain star, which the
+    // single-relation path already reads ([unqualify_single])
+    if items.len() == 1 && joins.is_empty() {
+        return None;
+    }
+    let trs: Vec<&TableRef<'_>> = std::iter::once(&base).chain(joins.iter().map(|(_, r, _, _)| r)).collect();
+    let mut out: Vec<String> = Vec::with_capacity(items.len());
+    for it in &items {
+        if !is_qstar(it) {
+            out.push(it.trim().to_string());
+            continue;
+        }
+        let t = it.trim();
+        let prefix = t[..t.len() - 2].trim_end();
+        let (parts, span) = split_name_parts(prefix, 2)?;
+        if span != prefix.len() {
+            return None;
+        }
+        let canon = |p: &NamePart<'_>| if p.1 { p.0.replace("\"\"", "\"") } else { p.0.to_ascii_uppercase() };
+        let (schema, key) = match parts.as_slice() {
+            [q] => (None, canon(q)),
+            [sc, q] => (Some(canon(sc)), canon(q)),
+            _ => return None,
+        };
+        let hits: Vec<&&TableRef<'_>> = trs
+            .iter()
+            .filter(|tr| {
+                tr.key() == key
+                    && match &schema {
+                        None => true,
+                        Some(sc) => {
+                            tr.alias.is_none()
+                                && !tr.table.starts_with('(')
+                                && relation_schema(db, &tr.table).as_deref() == Some(sc.as_str())
+                        }
+                    }
+            })
+            .collect();
+        let [tr] = hits.as_slice() else {
+            return None;
+        };
+        let cols: Vec<String> = if tr.table.starts_with('(') {
+            let (inner, _, declared) = parse_derived_table(&tr.table)?;
+            if !declared.is_empty() {
+                declared
+            } else {
+                let mut ps: Vec<Option<Descriptor>> = Vec::new();
+                let plan = plan_query_inner(inner, db_opt, &mut ps)?;
+                if !ps.is_empty() || matches!(plan, Plan::Refused | Plan::RefusedEval(_)) {
+                    return None;
+                }
+                output_cols_of(&plan).into_iter().map(|c| c.name).collect()
+            }
+        } else if let Some(v) = view_of(db, &tr.table) {
+            v.cols
+        } else {
+            db.columns(&tr.table).iter().map(|c| c.name.clone()).collect()
+        };
+        if cols.is_empty() || cols.iter().any(|c| c.is_empty() || c.contains('.')) {
+            return None;
+        }
+        for c in cols {
+            out.push(format!("{}.{}", prefix, render_canon_ref(&c)));
+        }
+    }
+    Some(out.join(", "))
+}
+
+/// A select-list SUBQUERY PREDICATE - `<x> [NOT] IN (<subq>)` or `<x>
+/// <op> ALL | ANY | SOME (<subq>)`, the subquery already lifted to
+/// `mark` - rewritten over the rows an UNCORRELATED subquery answers.
+/// None when the marker is not such a predicate's (the caller goes on
+/// to EXISTS / the scalar reading); `Some(None)` to refuse.
+///
+/// THE VALUE IS TWO-VALUED. Measured on 2182: projected, `A IN (SELECT
+/// X FROM T2)` is FALSE - not NULL - for a NULL A and for an A matching
+/// nothing while T2 holds a NULL X, and `A NOT IN (..)` over that T2 is
+/// FALSE for every row; `A > ALL (SELECT K FROM T3)` with a NULL K is
+/// FALSE for every row, and `IS UNKNOWN` never holds of one (where a
+/// literal list `A IN (10, NULL)` stays three-valued, <null>). So the
+/// predicate is its three-valued self read as `IS TRUE` - spelled here
+/// over the literal list (IN) or the AND / OR chain of comparisons (ALL
+/// / ANY), and an EMPTY set is FALSE for IN / ANY and TRUE for NOT IN /
+/// ALL, whatever x is (measured).
+///
+/// Under a NOT the engine turns the quantifier over (NOT IN is `<> ALL`,
+/// still two-valued), which this reading does not model - an item
+/// holding any other NOT refuses. So does a correlated subquery, a `?`
+/// in the left operand (it would be written twice) and a left operand
+/// the backward scan cannot delimit.
+fn subq_pred_value(
+    text: &str,
+    mark: &str,
+    sub: &str,
+    is_corr: bool,
+    dbr: &Database,
+    db: &Option<Database>,
+) -> Option<Option<String>> {
+    let up = mask_literals(&text.to_ascii_uppercase());
+    // the marker itself - `FC$SUBQ1` is a prefix of `FC$SUBQ10`
+    let at = {
+        let mut from = 0;
+        loop {
+            let p = from + up[from..].find(mark)?;
+            if !up[p + mark.len()..].starts_with(|c: char| c.is_ascii_digit()) {
+                break p;
+            }
+            from = p + mark.len();
+        }
+    };
+    let is_id = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let b = up.as_bytes();
+    // the word ending at `end` (whitespace before it skipped), if any
+    let word_before = |end: usize| -> (usize, &str) {
+        let t = up[..end].trim_end();
+        let mut st = t.len();
+        while st > 0 && is_id(b[st - 1]) {
+            st -= 1;
+        }
+        (st, &t[st..])
+    };
+    let (ws, w) = word_before(at);
+    enum Kind {
+        In(bool),
+        Quant(String, bool),
+    }
+    let (kind, lhs_end) = match w {
+        "IN" => {
+            let (ns, nw) = word_before(ws);
+            if nw == "NOT" { (Kind::In(true), ns) } else { (Kind::In(false), ws) }
+        }
+        "ALL" | "ANY" | "SOME" => {
+            let t = up[..ws].trim_end();
+            let op_start = t.len() - t.bytes().rev().take_while(|c| b"<>=!^~".contains(c)).count();
+            let op = &t[op_start..];
+            let op = match op {
+                "=" | "<>" | "<" | "<=" | ">" | ">=" => op.to_string(),
+                "!=" | "^=" | "~=" => "<>".to_string(),
+                "!<" | "^<" | "~<" => ">=".to_string(),
+                "!>" | "^>" | "~>" => "<=".to_string(),
+                _ => return None,
+            };
+            (Kind::Quant(op, w == "ALL"), op_start)
+        }
+        _ => return None,
+    };
+    if is_corr {
+        return Some(None);
+    }
+    // the LEFT OPERAND: back over operands and the operators that bind
+    // tighter than a comparison, to the first thing that does not
+    let stop_words = [
+        "AND", "OR", "NOT", "WHEN", "THEN", "ELSE", "CASE", "END", "SELECT", "IS", "BETWEEN", "LIKE", "IN",
+        "ANY", "ALL", "SOME", "DISTINCT", "AS", "ESCAPE", "CONTAINING", "STARTING", "SIMILAR", "FROM",
+    ];
+    let mut i = up[..lhs_end].trim_end().len();
+    let lhs_stop = loop {
+        if i == 0 {
+            break 0;
+        }
+        let c = b[i - 1];
+        if c.is_ascii_whitespace() {
+            i -= 1;
+        } else if c == b')' {
+            // back to the matching open paren, then over a function name
+            let mut depth = 0i32;
+            let mut j = i;
+            loop {
+                if j == 0 {
+                    return Some(None);
+                }
+                j -= 1;
+                match b[j] {
+                    b')' => depth += 1,
+                    b'(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i = j;
+            let (st, w) = word_before(i);
+            if !w.is_empty() && !stop_words.contains(&w) && up[st..i].trim_end().len() == i - st {
+                i = st;
+            }
+        } else if is_id(c) || c == b'.' {
+            let (st, w) = word_before(i);
+            let st = if w.is_empty() { i - 1 } else { st };
+            if stop_words.contains(&&up[st..i]) {
+                break i;
+            }
+            i = st;
+        } else if b"+-*/|".contains(&c) {
+            i -= 1;
+        } else {
+            // `(`, `,`, a comparison: the operand ends here
+            break i;
+        }
+    };
+    let lhs = text[lhs_stop..up[..lhs_end].trim_end().len()].trim();
+    if lhs.is_empty() || lhs.contains('?') || lhs.contains(SUBQ_MARK) {
+        return Some(None);
+    }
+    // any other NOT in the ITEM turns a quantifier over - not modelled
+    let own_not = matches!(kind, Kind::In(true)).then_some(lhs_end);
+    let depth0_comma = |p: usize| b[p] == b',' && paren_depth_at(&up, p) == 0;
+    let item_start = (0..at).rev().find(|&p| depth0_comma(p)).map_or(0, |p| p + 1);
+    let item_end = (at..b.len()).find(|&p| depth0_comma(p)).unwrap_or(b.len());
+    // (a NOT that is another predicate's own - `NOT IN`, `IS NOT NULL`,
+    // `NOT LIKE` - negates nothing around this one)
+    let mut from = item_start;
+    while let Some(n) = find_word(&up[..item_end], "NOT", from) {
+        from = n + 3;
+        let (_, before) = word_before(n);
+        let after = up[n + 3..].trim_start();
+        let next = &after[..after.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(after.len())];
+        let own_kind = before == "IS"
+            || matches!(next, "IN" | "LIKE" | "BETWEEN" | "CONTAINING" | "STARTING" | "SIMILAR" | "DISTINCT");
+        if Some(n) != own_not && !own_kind {
+            return Some(None);
+        }
+    }
+    // one column, uncorrelated, its rows in hand
+    let mut ps: Vec<Option<Descriptor>> = Vec::new();
+    let plan = plan_query_inner(sub, db, &mut ps)?;
+    if !ps.is_empty() || output_cols_of(&plan).len() != 1 {
+        return Some(None);
+    }
+    let Some(rows) = eval_subquery(sub, dbr, db, None, None, false) else {
+        return Some(None);
+    };
+    let has_null = rows.values.iter().any(|v| matches!(v, Value::Null));
+    let mut lits: Vec<String> = Vec::with_capacity(rows.values.len());
+    for v in rows.values.iter().filter(|v| !matches!(v, Value::Null)) {
+        match subq_text_literal(v, sub, db).or_else(|| value_literal(v)) {
+            Some(l) => lits.push(l),
+            None => return Some(None),
+        }
+    }
+    // Two-valued throughout, spelled so the three-valued evaluator can
+    // never reach UNKNOWN: the left operand is tested NOT NULL first, and
+    // only the NON-NULL members are listed. A NULL member cannot make a
+    // match, so for IN / ANY it drops out; for NOT IN / ALL it makes
+    // every non-empty verdict FALSE.
+    let empty = rows.values.is_empty();
+    let all_like = matches!(kind, Kind::In(true) | Kind::Quant(_, true));
+    let pred = if empty {
+        (if all_like { "TRUE" } else { "FALSE" }).to_string()
+    } else if (all_like && has_null) || (!all_like && lits.is_empty()) {
+        "FALSE".to_string()
+    } else {
+        let body = match &kind {
+            Kind::In(neg) => format!("{} {}IN ({})", lhs, if *neg { "NOT " } else { "" }, lits.join(", ")),
+            Kind::Quant(op, all) => {
+                let joint = if *all { " AND " } else { " OR " };
+                lits.iter().map(|l| format!("{} {} {}", lhs, op, l)).collect::<Vec<_>>().join(joint)
+            }
+        };
+        format!("{} IS NOT NULL AND ({})", lhs, body)
+    };
+    // a WHOLE item is named BOOL, as every boolean-valued item is
+    // (matched on the squashed text: [split_alias] would read the
+    // trailing MARKER as a bare alias)
+    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let span = squash(&text[lhs_stop..at + mark.len()]);
+    let alone = split_top_level_commas(text).iter().any(|item| squash(item) == span);
+    let repl = if alone { format!("({}) AS BOOL", pred) } else { format!("({})", pred) };
+    Some(Some(format!("{}{}{}", &text[..lhs_stop], repl, &text[at + mark.len()..])))
+}
+
+/// A WHERE the token grammar cannot read, read instead as ONE BOOLEAN
+/// VALUE by the expression grammar - which knows a parenthesised
+/// predicate as an operand: `WHERE (A > 15) IS TRUE`, `WHERE (A > 15)
+/// IS UNKNOWN`, `WHERE BO = (A > 15)` (measured on 2182: 2,5,6 / 3 / 6).
+/// The row passes when the value is TRUE, which is what a search
+/// condition means. Only a text with no `?` and no subquery: those are
+/// numbered and folded by the token path, which has already declined.
+fn cond_where_fallback(ws: &str) -> Option<(Vec<Vec<RawTerm>>, Vec<Vec<u32>>)> {
+    let up = mask_literals(&ws.to_ascii_uppercase());
+    if up.contains('?') || find_word(&up, "SELECT", 0).is_some() {
+        return None;
+    }
+    let RawExpr::Cond(c) = parse_raw_expr_any(ws.trim())? else {
+        return None;
+    };
+    // ONLY for a predicate used as a VALUE somewhere in it - the shape
+    // the token grammar lacks. Anything else it declined stays declined:
+    // its refusals are laws of their own (a pattern's operand
+    // conversion, a key's grammar) this reading does not re-check
+    if !raw_cond_any(&c, &|e| matches!(e, RawExpr::Cond(_))) {
+        return None;
+    }
+    let term = RawTerm {
+        lhs: RawLhs::Expr(RawExpr::Cond(c)),
+        kind: RawKind::CmpExpr(Cmp::Eq, RawExpr::BareTrue),
+        mirrored: false,
+        in_list: None,
+    };
+    Some((vec![vec![term]], vec![vec![0]]))
+}
+
+/// Does `sql` hold a `(` directly followed by the word WITH - a query
+/// in parentheses that opens with its own CTEs?
+fn nested_with_at(sql: &str) -> bool {
+    let up = mask_literals(&sql.to_ascii_uppercase());
+    let mut from = 0;
+    while let Some(w) = find_word(&up, "WITH", from) {
+        from = w + "WITH".len();
+        if up[..w].trim_end().ends_with('(') {
+            return true;
+        }
+    }
+    false
+}
+
+///
+/// A WITH NESTED WHILE CTEs ARE IN SCOPE is the engine's -104 "WITH
+/// clause can't be nested" (addCTEs; measured on 2182: `WITH C AS (..)
+/// SELECT * FROM (WITH C AS (..) ..)` refuses so, where the derived WITH
+/// alone answers) - posted as the prepare refusal. `in_with` says a
+/// statement-level WITH is being expanded: its CTEs are in scope in
+/// every body and in the main query.
+fn splice_ctes_deep(sql: &str, ctes: &[(String, ViewDef)], in_with: bool) -> Option<String> {
+    splice_cte_scope(sql, ctes, true, in_with)
+}
+
+fn splice_cte_scope(text: &str, ctes: &[(String, ViewDef)], is_query: bool, in_with: bool) -> Option<String> {
+    let up = mask_literals(&text.to_ascii_uppercase());
+    let b = up.as_bytes();
+    let starts_word = |s: &str, w: &str| {
+        s.starts_with(w) && !s[w.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    };
+    // every parenthesised group at this level, innermost first by
+    // recursion; the group's own text is replaced, the parens kept
+    let mut out = String::with_capacity(text.len());
+    let (mut last, mut i) = (0usize, 0usize);
+    while i < b.len() {
+        if b[i] != b'(' {
+            i += 1;
+            continue;
+        }
+        let close = matching_paren(b, i)?;
+        let iu = up[i + 1..close].trim_start();
+        let inner = &text[i + 1..close];
+        let replaced = if starts_word(iu, "WITH") {
+            if in_with {
+                PREPARE_REFUSAL.with(|r| *r.borrow_mut() = Some(EvalErr::CteNestedWith));
+                return None;
+            }
+            let (ictes, imain, recursive) = parse_with(inner)?;
+            if recursive {
+                return None;
+            }
+            // an UNUSED inner CTE (a duplicate name is one) is passed by
+            // the engine's end-of-query check with its warning and its
+            // alias rules ([unused_ctes_verdict]), which this fold does
+            // not run - refused rather than answered without them
+            if cte_used(&ictes, &imain).iter().any(|u| !u) {
+                return None;
+            }
+            let mut scope: Vec<(String, ViewDef)> =
+                ctes.iter().map(|(n, d)| (n.clone(), ViewDef { source: d.source.clone(), cols: d.cols.clone() })).collect();
+            for (n, d) in ictes {
+                let source = splice_cte_scope(&d.source, &scope, true, true)?;
+                // the inner name SHADOWS: [splice_ctes] takes the first match
+                scope.insert(0, (n, ViewDef { source, cols: d.cols }));
+            }
+            splice_cte_scope(&imain, &scope, true, true)?
+        } else {
+            let q = starts_word(iu, "SELECT") || iu.starts_with('(');
+            splice_cte_scope(inner, ctes, q, in_with)?
+        };
+        out.push_str(&text[last..=i]);
+        out.push_str(&replaced);
+        last = close;
+        i = close + 1;
+    }
+    out.push_str(&text[last..]);
+    if !is_query || ctes.is_empty() {
+        return Some(out);
+    }
+    // this level's own FROM items, member by member of a UNION chain
+    let up = mask_literals(&out.to_ascii_uppercase());
+    let mut members: Vec<(usize, usize)> = Vec::new();
+    let (mut start, mut at) = (0usize, 0usize);
+    while let Some(u) = find_word_depth0(&up, "UNION", at) {
+        members.push((start, u));
+        let mut next = u + "UNION".len();
+        let rest = up[next..].trim_start();
+        for w in ["ALL", "DISTINCT"] {
+            if starts_word(rest, w) {
+                next = up.len() - rest.len() + w.len();
+            }
+        }
+        start = next;
+        at = next;
+    }
+    members.push((start, out.len()));
+    let mut res = String::with_capacity(out.len());
+    let mut prev = 0usize;
+    for (a, z) in members {
+        res.push_str(&out[prev..a]);
+        res.push_str(&splice_ctes(&out[a..z], ctes)?);
+        prev = z;
+    }
+    res.push_str(&out[prev..]);
+    Some(res)
 }
 
 /// A VIEW as a ROW SOURCE: its stored SELECT is planned on its own, and
@@ -55136,7 +55811,7 @@ fn materialise_laterals(
                 defer: defer.clone(),
             })
         }
-        Plan::Union { cols, branches, distinct, order_by } => {
+        Plan::Union { cols, branches, distinct, order_by, then_by } => {
             // only rebuild if SOME branch carried one; a union of plain
             // branches must stay exactly as it was
             let done: Vec<Option<Plan>> =
@@ -55154,6 +55829,7 @@ fn materialise_laterals(
                 branches,
                 distinct: *distinct,
                 order_by: order_by.clone(),
+                then_by: then_by.clone(),
             })
         }
         _ => None,
@@ -55368,7 +56044,7 @@ fn branch_rows_res(
     // recurses. Everything that materialises rows (INSERT ... SELECT, a
     // FOR SELECT loop, a union branch) goes through here, so they all
     // gain the same sources at once.
-    if let Plan::Union { branches, distinct, order_by, cols } = plan {
+    if let Plan::Union { branches, distinct, order_by, cols, then_by } = plan {
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for b in branches {
             let mut got = branch_rows_res(b, db, args)?;
@@ -55388,7 +56064,8 @@ fn branch_rows_res(
             let oc = output_cols_of(plan);
             distinct_rows(&mut rows, order_by.is_some(), &union_coll_cols(branches, &oc), &varying_cols(&oc), union_tie_unknown(branches))?;
         }
-        if let Some(key) = order_by {
+        let mut keys: Vec<OrderKey> = Vec::new();
+        for key in order_by.iter().chain(then_by.iter()) {
             let mut key = key.clone();
             // the union's column orders by its COLLATION: `SELECT ci ...
             // UNION ALL SELECT ci ... ORDER BY 1` is the UCA order under
@@ -55412,11 +56089,10 @@ fn branch_rows_res(
                     }
                 }
             }
-            let keys = [key];
-            rows.sort_by(|a, b| {
-                let o = order_cmp(a, b, &keys);
-                o
-            });
+            keys.push(key);
+        }
+        if !keys.is_empty() {
+            rows.sort_by(|a, b| order_cmp(a, b, &keys));
         }
         return Ok(rows);
     }
@@ -56358,6 +57034,53 @@ fn plan_is_ordered(plan: &Plan) -> bool {
     }
 }
 
+/// The query inside a WHOLLY parenthesised member - `(SELECT ..)` -
+/// or None when the text is not one.
+fn paren_query_body(p: &str) -> Option<String> {
+    let t = p.trim();
+    if !t.starts_with('(') || matching_paren(t.as_bytes(), 0) != Some(t.len() - 1) {
+        return None;
+    }
+    let inner = t[1..t.len() - 1].trim();
+    let iu = mask_literals(&inner.to_ascii_uppercase());
+    let head = iu.trim_start_matches(|c: char| c == '(' || c.is_whitespace());
+    (find_word(head, "SELECT", 0) == Some(0) || find_word(head, "WITH", 0) == Some(0)).then(|| inner.to_string())
+}
+
+/// A depth-0 UNION chain that MIXES `UNION` and `UNION ALL`, rewritten
+/// left-grouped (see the caller): `SELECT * FROM (<head>) <op> <rest>`.
+/// None when the chain is not mixed.
+fn fold_mixed_union(sql: &str) -> Option<String> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = mask_literals(&s.to_ascii_uppercase());
+    let word_at = |at: usize, w: &str| {
+        let rest = up[at..].trim_start();
+        (rest.starts_with(w) && !rest[w.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+            .then(|| up.len() - rest.len() + w.len())
+    };
+    // (keyword start, operator end, is ALL)
+    let mut ops: Vec<(usize, usize, bool)> = Vec::new();
+    let mut at = 0usize;
+    while let Some(u) = find_word_depth0(&up, "UNION", at) {
+        let after = u + "UNION".len();
+        let (end, all) = match (word_at(after, "ALL"), word_at(after, "DISTINCT")) {
+            (Some(e), _) => (e, true),
+            (None, Some(e)) => (e, false),
+            (None, None) => (after, false),
+        };
+        ops.push((u, end, all));
+        at = end;
+    }
+    let last_all = ops.last()?.2;
+    if ops.iter().all(|o| o.2 == last_all) {
+        return None;
+    }
+    // the last operator of the other kind closes the head
+    let j = ops.iter().rposition(|o| o.2 != last_all)?;
+    let head_end = ops[j + 1].0;
+    Some(format!("SELECT * FROM ({}) {}", s[..head_end].trim(), s[head_end..].trim()))
+}
+
 /// Plan `<select> UNION [ALL] <select> [...] [ORDER BY <n>]`.
 fn plan_union(
     sql: &str,
@@ -56368,48 +57091,67 @@ fn plan_union(
     // a trailing ORDER BY belongs to the WHOLE union, not the last branch
     let last = parts.pop()?;
     let up = mask_literals(&last.to_ascii_uppercase());
-    let mut order_ordinal: Option<OrderKey> = None;
+    // THE ORDER BY LIST: one key or several, each an ORDINAL with its own
+    // direction and NULLS placement (measured on 2182: `.. UNION ALL ..
+    // ORDER BY 1, 2` and `ORDER BY 2 DESC, 1` sort by both keys). A key
+    // that is not an ordinal - a column NAME, the first member's ALIAS,
+    // an expression - or an ordinal past the last column is the -104
+    // "invalid ORDER BY clause" ([EvalErr::UnionOrderBy]), raised once
+    // the members have planned.
+    let mut order_raw: Vec<(Result<usize, ()>, bool, NullsAt)> = Vec::new();
     let last_body = match find_kw_by(&up, "ORDER") {
         Some((kw, cols_at)) => {
-            let spec = last[cols_at..].trim();
-            let mut it = spec.split_whitespace();
-            let n: usize = it.next()?.parse().ok()?;
-            let mut next = it.next();
-            let desc = match next {
-                None => false,
-                Some(w) if w.eq_ignore_ascii_case("DESC") => {
-                    next = it.next();
-                    true
-                }
-                Some(w) if w.eq_ignore_ascii_case("ASC") => {
-                    next = it.next();
-                    false
-                }
-                Some(w) if w.eq_ignore_ascii_case("NULLS") => false,
-                _ => return None,
-            };
-            // ... [ASC|DESC] [NULLS FIRST|LAST], the same two independent
-            // clauses a plain SELECT's ORDER BY takes
-            let nulls = match next {
-                None => NullsAt::Default,
-                Some(w) if w.eq_ignore_ascii_case("NULLS") => {
-                    match it.next().map(|p| p.to_ascii_uppercase()) {
+            for key in split_top_level_commas(last[cols_at..].trim()) {
+                let mut it = key.split_whitespace();
+                let head = it.next()?;
+                let target = match head.parse::<usize>() {
+                    Ok(0) => return None,
+                    Ok(n) => Ok(n - 1),
+                    Err(_) => Err(()),
+                };
+                let mut next = it.next();
+                let desc = match next {
+                    None => false,
+                    Some(w) if w.eq_ignore_ascii_case("DESC") || w.eq_ignore_ascii_case("DESCENDING") => {
+                        next = it.next();
+                        true
+                    }
+                    Some(w) if w.eq_ignore_ascii_case("ASC") || w.eq_ignore_ascii_case("ASCENDING") => {
+                        next = it.next();
+                        false
+                    }
+                    Some(w) if w.eq_ignore_ascii_case("NULLS") => false,
+                    _ => return None,
+                };
+                let nulls = match next {
+                    None => NullsAt::Default,
+                    Some(w) if w.eq_ignore_ascii_case("NULLS") => match it.next().map(|p| p.to_ascii_uppercase()) {
                         Some(p) if p == "FIRST" => NullsAt::First,
                         Some(p) if p == "LAST" => NullsAt::Last,
                         _ => return None,
-                    }
+                    },
+                    _ => return None,
+                };
+                if it.next().is_some() {
+                    return None;
                 }
-                _ => return None,
-            };
-            if it.next().is_some() || n == 0 {
+                order_raw.push((target, desc, nulls));
+            }
+            if order_raw.is_empty() {
                 return None;
             }
-            order_ordinal = Some(OrderKey::field(n - 1, desc, nulls));
             last[..kw].trim().to_string()
         }
         None => last.clone(),
     };
     parts.push(last_body);
+    // A PARENTHESISED MEMBER is its query: `(SELECT .. ) UNION ALL
+    // (SELECT ..) ORDER BY 1` (measured on 2182: the bare members' rows)
+    for p in parts.iter_mut() {
+        while let Some(inner) = paren_query_body(p) {
+            *p = inner;
+        }
+    }
 
     let mut branches: Vec<Plan> = Vec::new();
     for p in &parts {
@@ -56506,11 +57248,17 @@ fn plan_union(
             }
         })
         .collect();
-    if let Some(OrderKey { field: idx, .. }) = order_ordinal {
-        if idx >= cols.len() {
-            return None;
+    // each key to its output column: an ordinal in range
+    let mut order_keys: Vec<OrderKey> = Vec::with_capacity(order_raw.len());
+    for (target, desc, nulls) in &order_raw {
+        match target {
+            Ok(idx) if *idx < cols.len() => order_keys.push(OrderKey::field(*idx, *desc, *nulls)),
+            _ => return Some(Plan::RefusedEval(EvalErr::UnionOrderBy)),
         }
     }
+    let mut order_keys = order_keys.into_iter();
+    let order_ordinal = order_keys.next();
+    let then_by: Vec<OrderKey> = order_keys.collect();
     // NO `params.clear()` HERE. It stood here while a branch could not
     // claim a slot - the guard above refused one that did, so emptying
     // the sink was housekeeping over something already known to be
@@ -56805,7 +57553,7 @@ fn plan_union(
             c.rel_alias = None;
         }
     }
-    Some(Plan::Union { cols, branches, distinct: !all, order_by: order_ordinal })
+    Some(Plan::Union { cols, branches, distinct: !all, order_by: order_ordinal, then_by })
 }
 
 /// A union branch's columns as its select list PROJECTS them: under the
@@ -57130,6 +57878,21 @@ fn plan_query_inner_at_body(
     // joins and all - and the expanded statement is re-planned. Done
     // before anything else looks at the text, since every later stage
     // expects a FROM naming things that exist.
+    // A WITH OPENING A PARENTHESISED QUERY - a derived table's or a
+    // subquery's own CTEs - where the statement itself has none: folded
+    // into derived tables ([splice_ctes_deep]) and the result re-planned.
+    // Measured on 2182: `SELECT * FROM (WITH C AS (SELECT ID FROM T1
+    // WHERE ID = 2) SELECT * FROM C)` answers 2, where this read the
+    // whole parenthesis as a table name (-204).
+    if db.is_some() && parse_with(sql).is_none() && nested_with_at(sql) {
+        let Some(rw) = splice_ctes_deep(sql, &[], false) else {
+            return Some(Plan::Refused);
+        };
+        if trace {
+            eprintln!("[srv] plan: nested WITH folded to {:?}", rw);
+        }
+        return plan_query_inner(&rw, db, params).map(downgrade_rewritten);
+    }
     if let Some(dbr) = db.as_ref() {
         if let Some((ctes, main, recursive)) = parse_with(sql) {
             // A RECURSIVE CTE is a FIXPOINT, not a substitution: the seed
@@ -57513,7 +58276,11 @@ fn plan_query_inner_at_body(
             // the modifiers are put back below as a HEAD, which on a
             // union is its first member's and would limit only that
             // member ([strip_modifiers])
-            let stripped = if split_union(&main).is_some() { None } else { strip_modifiers(&main) };
+            let stripped = if split_union(&main).is_some() || fold_mixed_union(&main).is_some() {
+                None
+            } else {
+                strip_modifiers(&main)
+            };
             let (mut cur, modifiers) = match stripped {
                 Some((inner, distinct, skip, take, bad)) if !bad => {
                     (inner, Some((distinct, skip, take)))
@@ -57526,9 +58293,11 @@ fn plan_query_inner_at_body(
             // this, every CTE name that appears anywhere stands for a
             // derived table whose inner query names only real relations.
             let mut ctes = ctes;
-            for i in 1..ctes.len() {
+            // (from the FIRST body: it names no earlier CTE, but a WITH
+            // nested in it is the -104 all the same)
+            for i in 0..ctes.len() {
                 let (earlier, rest) = ctes.split_at_mut(i);
-                rest[0].1.source = splice_ctes(&rest[0].1.source, earlier)?;
+                rest[0].1.source = splice_ctes_deep(&rest[0].1.source, earlier, true)?;
             }
             let ctes = ctes;
             // A CTE NAME STILL IN THE FROM was not expanded - its body
@@ -57547,14 +58316,14 @@ fn plan_query_inner_at_body(
             // be one side of a join now that a derived table can be.
             // The splices are applied in DESCENDING offset order so an
             // earlier one does not move a later one's position.
-            cur = splice_ctes(&cur, &ctes)?;
+            cur = splice_ctes_deep(&cur, &ctes, true)?;
             if trace {
                 eprintln!("[srv] plan: CTEs materialised as {:?}", cur);
             }
             // Anything still naming a CTE names NO RELATION - falling
             // through would reach the fixed-answer fallback and reply
             // 4242 to a query over real tables.
-            let names_cte = split_query(&cur)
+            let names_cte_in = |cur: &str| split_query(cur)
                 .and_then(|(_, t, _, _, _, _)| parse_from(t))
                 .map(|(from, join)| {
                     // a QUALIFIED item names a BASE RELATION even when a
@@ -57570,12 +58339,23 @@ fn plan_query_inner_at_body(
                 })
                 .unwrap_or(false)
                 || parse_derived_table(
-                    split_query(&cur).map(|(_, t, _, _, _, _)| t).unwrap_or(""),
+                    split_query(cur).map(|(_, t, _, _, _, _)| t).unwrap_or(""),
                 )
                 .is_none()
-                    && split_query(&cur)
+                    && split_query(cur)
                         .and_then(|(_, t, _, _, _, _)| parse_from(t))
                         .is_none();
+            // a UNION main is judged member by member - its members are
+            // what carry FROM clauses ([splice_ctes_deep] spliced each)
+            let members = union_members(&cur);
+            let names_cte = if members.len() > 1 {
+                members.iter().any(|(m, _)| {
+                    let body = paren_query_body(m).unwrap_or_else(|| m.clone());
+                    names_cte_in(body.as_str())
+                })
+            } else {
+                names_cte_in(&cur)
+            };
             if names_cte {
                 if trace {
                     eprintln!("[srv] plan: a CTE could not be expanded in {:?}", cur);
@@ -57630,6 +58410,24 @@ fn plan_query_inner_at_body(
         }
     }
 
+    // A CHAIN MIXING UNION AND UNION ALL groups from the LEFT: `A UNION
+    // B UNION ALL C` is `(A UNION B) UNION ALL C` - measured on 2182, 12
+    // rows there (8 distinct from A and B, all 4 of C) and 10 for `A
+    // UNION ALL B UNION C` (every row deduplicated). The head up to the
+    // last change of operator becomes a derived table - unnamed, so no
+    // alias rides the describe - and the rest is an unmixed chain over
+    // it; a head that is itself mixed folds the same way when it plans.
+    // BEFORE the modifiers are stripped: a first member's FIRST is that
+    // member's, and read as the statement's head it cut the whole chain
+    // (`SELECT FIRST 2 A FROM T1 UNION .. UNION ALL ..` answered 2 rows)
+    if split_union(sql).is_none() {
+        if let Some(rw) = fold_mixed_union(sql) {
+            if trace {
+                eprintln!("[srv] plan: mixed UNION chain folded to {:?}", rw);
+            }
+            return plan_query_inner_at_body(&rw, db, params, in_view, base).map(downgrade_rewritten);
+        }
+    }
     // A WINDOWED SELECT OVER A GROUPED, JOINED, DISTINCT OR LIMITED
     // QUERY, or one ordered by a window, is re-planned as the three
     // levels the engine composes ([rewrite_windowed_select]); the plain
@@ -57870,6 +58668,23 @@ fn plan_query_inner_at_body(
             "[srv] plan: proj={:?} table={:?} where={:?} group={:?} having={:?} order={:?}",
             proj_s, table_s, where_s, group_s, having_s, order_s
         );
+    }
+    // A QUALIFIED STAR (`T2.*`, `D.*`, `PUBLIC.T2.*`) beside other items
+    // or over a join is that FROM item's columns, spelled out
+    // ([expand_qualified_stars]) - the statement is re-planned over the
+    // explicit list, which every later stage already knows
+    if let Some(dbr) = db.as_ref() {
+        if let Some(expanded) = expand_qualified_stars(proj_s, table_s, dbr, db) {
+            let (h, p) = (sql.as_ptr() as usize, proj_s.as_ptr() as usize);
+            if p >= h && p + proj_s.len() <= h + sql.len() {
+                let at = p - h;
+                let rw = format!("{}{}{}", &sql[..at], expanded, &sql[at + proj_s.len()..]);
+                if trace {
+                    eprintln!("[srv] plan: qualified star expanded to {:?}", rw);
+                }
+                return plan_query_inner_at_body(&rw, db, params, in_view, base).map(downgrade_rewritten);
+            }
+        }
     }
     // A DERIVED TABLE - `SELECT ... FROM (SELECT ...) X`. The inner
     // query is planned on its own; its ANNOUNCED output columns are what
@@ -58374,6 +59189,19 @@ fn plan_query_inner_at_body(
                         return Some(Plan::Refused);
                     }
                     let is_corr = scan.as_ref().is_some_and(|s| !s.refs.is_empty());
+                    // `<x> [NOT] IN (SELECT ..)` and `<x> <op> ALL | ANY |
+                    // SOME (SELECT ..)` lift as a subquery too, and are a
+                    // SET, never a scalar ([subq_pred_value])
+                    if let Some(done) = subq_pred_value(&proj_out, &mark, sub, is_corr, dbr, db) {
+                        let Some(text) = done else {
+                            if trace {
+                                eprintln!("[srv] plan: select-list subquery predicate {:?} not answerable", sub);
+                            }
+                            return Some(Plan::Refused);
+                        };
+                        proj_out = text;
+                        continue;
+                    }
                     // `EXISTS (SELECT ...)` lifts as a subquery too - the
                     // paren belongs to EXISTS, not to a scalar - so the
                     // marker is preceded by the keyword. It asks only
@@ -59581,6 +60409,7 @@ fn plan_query_inner_at_body(
                 }
             })
             .and_then(|t| parse_predicate(&t, &mut next_param))
+            .or_else(|| cond_where_fallback(ws))
             .and_then(|raw| resolve_predicate(raw, &columns, &descs, params))
             // the engine's own keyable columns: an unconvertible literal
             // on one of them raises at OPEN
@@ -70606,6 +71435,8 @@ const GDS_DSQL_PROCEDURE_ERR: i32 = 335544581;
 /// emitted by the DDL paths inline; named here because the derived-table
 /// column check needs the same shape.
 const GDS_DSQL_COMMAND_ERR: i32 = 335544570;
+/// isc_order_by_err: "invalid ORDER BY clause"
+const GDS_ORDER_BY_ERR: i32 = 335544617;
 /// `isc_dsql_derived_field_unnamed` (336397220, sqlcode -104, SQLSTATE
 /// 42000 - see [crate::gdscodes]): "no column name specified for column
 /// number @1 in derived table @2".
@@ -70745,6 +71576,11 @@ const GDS_DSQL_CTE_MULT_REFERENCES: i32 = 336397228;
 const GDS_DSQL_CTE_WRONG_REFERENCE: i32 = 336397225;
 const GDS_DSQL_CTE_WRONG_CLAUSE: i32 = 336397231;
 const GDS_DSQL_CTE_UNION_ALL: i32 = 336397232;
+/// isc_dsql_cte_nested_with (SQLERR 946): "WITH clause can't be nested"
+const GDS_DSQL_CTE_NESTED_WITH: i32 = 336397234;
+/// isc_dsql_col_more_than_once_using (SQLERR 947): "column @1 appears
+/// more than once in USING clause"
+const GDS_DSQL_COL_MORE_THAN_ONCE_USING: i32 = 336397235;
 const GDS_DSQL_CTE_NONRECURS_AFTER_RECURS: i32 = 336397230;
 const GDS_DSQL_CTE_RECURSIVE_AGGREGATE: i32 = 336397321;
 const GDS_RANDOM: i32 = 335544382;
@@ -71502,6 +72338,18 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(2) // isc_arg_string - @2 the derived table's alias
                 .bytes(table.as_bytes());
         }
+        EvalErr::UnionOrderBy => {
+            w.int(1) // isc_arg_gds - Dynamic SQL Error
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds - isc_sqlerr
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1) // isc_arg_gds - "Invalid command"
+                .int(GDS_DSQL_COMMAND_ERR)
+                .int(1) // isc_arg_gds - "invalid ORDER BY clause"
+                .int(GDS_ORDER_BY_ERR);
+        }
         EvalErr::DerivedColumnCount { table, more } => {
             w.int(1) // isc_arg_gds - Dynamic SQL Error
                 .int(GDS_DSQL_ERROR)
@@ -71580,6 +72428,8 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
         | EvalErr::CteWrongReference(_)
         | EvalErr::CteWrongClause { .. }
         | EvalErr::CteUnionAll(_)
+        | EvalErr::UsingColTwice(_)
+        | EvalErr::CteNestedWith
         | EvalErr::CteNonRecursAfterRecurs(_) => {
             w.int(1)
                 .int(GDS_DSQL_ERROR)
@@ -71613,6 +72463,14 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 EvalErr::CteUnionAll(name) => {
                     w.int(GDS_DSQL_CTE_UNION_ALL)
                         .int(2) // isc_arg_string - @1 bare: the template parenthesises
+                        .bytes(name.as_bytes());
+                }
+                EvalErr::CteNestedWith => {
+                    w.int(GDS_DSQL_CTE_NESTED_WITH);
+                }
+                EvalErr::UsingColTwice(name) => {
+                    w.int(GDS_DSQL_COL_MORE_THAN_ONCE_USING)
+                        .int(2) // isc_arg_string - @1 bare
                         .bytes(name.as_bytes());
                 }
                 EvalErr::CteNonRecursAfterRecurs(name) => {
@@ -73758,7 +74616,7 @@ fn emit_rows_inner(
                 return Err(EmitErr::Eval(e.clone()));
             }
         }
-        Plan::Union { cols, branches, distinct, order_by } => {
+        Plan::Union { cols, branches, distinct, order_by, then_by } => {
             if let Some(db) = db {
                 // UNION ALL WITHOUT AN ORDER BY IS A PIPELINE OF
                 // PIPELINES: the engine delivers every row of branch 1,
@@ -73804,11 +74662,8 @@ fn emit_rows_inner(
                     distinct_rows(&mut rows, order_by.is_some(), &union_coll_cols(branches, cols), &varying_cols(cols), union_tie_unknown(branches)).map_err(EmitErr::Eval)?;
                 }
                 if let Some(key) = order_by {
-                    let keys = [key.clone()];
-                    rows.sort_by(|a, b| {
-                        let o = order_cmp(a, b, &keys);
-                        o
-                    });
+                    let keys: Vec<OrderKey> = std::iter::once(key).chain(then_by.iter()).cloned().collect();
+                    rows.sort_by(|a, b| order_cmp(a, b, &keys));
                 }
                 for r in &rows {
                     encode_row(w, cols, r, out)?;
@@ -77531,7 +78386,11 @@ fn parse_cond_unary(b: &[char], pos: &mut usize) -> Option<RawCond> {
                 // parses as a boolean condition on its own
                 let mut p3 = p2 + 1;
                 skip_ws(b, &mut p3);
-                if !matches!(b.get(p3), Some('=' | '<' | '>' | '!')) {
+                // ...and so does an IS after it: `(A > 15) IS TRUE` tests
+                // the group's VALUE ([expr_atom_bare] reads it as one)
+                let mut p4 = p3;
+                let is_follows = take_keyword(b, &mut p4, "IS");
+                if !matches!(b.get(p3), Some('=' | '<' | '>' | '!')) && !is_follows {
                     *pos = p2 + 1;
                     return Some(c);
                 }
@@ -77828,6 +78687,23 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
                     _ => return None,
                 }
             }
+            // the list's ONE type ([retype_mixed_in_lists]): text and
+            // number literals together are text
+            let lit_num = |e: &RawExpr| matches!(e, RawExpr::Int(n) if *n >= 0) || matches!(e, RawExpr::Dec(r, _) if *r >= 0);
+            let vals: Vec<&RawExpr> = items.iter().filter_map(|c| match c { RawCond::Cmp(_, _, v) => Some(&**v), _ => None }).collect();
+            let lits_only = vals.iter().all(|v| lit_num(v) || matches!(v, RawExpr::Str(_) | RawExpr::Null));
+            if lits_only && vals.iter().any(|v| matches!(v, RawExpr::Str(_))) && vals.iter().any(|v| lit_num(v)) {
+                for c in items.iter_mut() {
+                    if let RawCond::Cmp(_, _, v) = c {
+                        let t = match &**v {
+                            RawExpr::Int(n) => exact_lit_text(*n, 0),
+                            RawExpr::Dec(r, sc) => exact_lit_text(*r, *sc),
+                            _ => continue,
+                        };
+                        *v = Box::new(RawExpr::Str(t?));
+                    }
+                }
+            }
             // the BETWEEN rule again: a `?` tested side cloned into more
             // than one leaf would number once per leaf (`IIF(? IN (1, 2),
             // ..)` - engine one slot, LONG NOT NULL from the reconciled
@@ -77875,8 +78751,22 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
     // UNKNOWN` both take the ELSE): the constant UNKNOWN condition,
     // spelled as `NULL = TRUE` so the Cmp arm evaluates it to UNKNOWN
     // per row with no new machinery.
-    if matches!(left, RawExpr::Col(_) | RawExpr::Bool(_) | RawExpr::Null)
-        && !matches!(b.get(*pos), Some('=' | '<' | '>' | '!'))
+    // ... and so is a BOOLEAN-VALUED operand that is no arithmetic: a
+    // parenthesised predicate, a conditional, a COALESCE / NULLIF, a
+    // CAST to BOOLEAN (`SELECT COALESCE(BO, FALSE) AND A > 1`, `CASE WHEN
+    // IIF(..) THEN ..`) - the BARE marker again decides the type
+    if matches!(
+        left,
+        RawExpr::Col(_)
+            | RawExpr::Bool(_)
+            | RawExpr::Null
+            | RawExpr::Cond(_)
+            | RawExpr::Coalesce(_)
+            | RawExpr::NullIf(..)
+            | RawExpr::Iif(..)
+            | RawExpr::Case(..)
+            | RawExpr::Cast(_, CastTarget::Bool)
+    ) && !matches!(b.get(*pos), Some('=' | '<' | '>' | '!'))
     {
         if matches!(left, RawExpr::Null) {
             return Some(RawCond::Cmp(
@@ -78077,6 +78967,25 @@ fn parse_raw_expr_any(s: &str) -> Option<RawExpr> {
     if pos != b.len() {
         return None;
     }
+    Some(RawExpr::Cond(Box::new(c)))
+}
+
+/// One argument of COALESCE / NULLIF: an expression, or - when that
+/// does not end the argument - a PREDICATE, which is a BOOLEAN value
+/// there (measured on 2182: `COALESCE(A > 15, FALSE)` is FALSE for a
+/// NULL A, `COALESCE(A IN (10, NULL), FALSE)` FALSE where the IN is
+/// UNKNOWN).
+fn expr_or_cond_arg(b: &[char], pos: &mut usize) -> Option<RawExpr> {
+    let start = *pos;
+    if let Some(e) = expr_add(b, pos) {
+        let mut p = *pos;
+        skip_ws(b, &mut p);
+        if matches!(b.get(p), Some(',' | ')')) {
+            return Some(e);
+        }
+    }
+    *pos = start;
+    let c = parse_cond_or(b, pos)?;
     Some(RawExpr::Cond(Box::new(c)))
 }
 
@@ -78366,13 +79275,25 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
         }
         '(' => {
             *pos += 1;
-            let e = expr_add(b, pos)?;
+            let start = *pos;
+            if let Some(e) = expr_add(b, pos) {
+                skip_ws(b, pos);
+                if b.get(*pos) == Some(&')') {
+                    *pos += 1;
+                    return Some(e);
+                }
+            }
+            // A PARENTHESISED PREDICATE IS A BOOLEAN OPERAND: `(A > 15)
+            // IS TRUE`, `BO = (A > 15)`, `(A = 10) = TRUE` (measured on
+            // 2182: each a BOOLEAN value, three-valued - NULL where A is)
+            *pos = start;
+            let c = parse_cond_or(b, pos)?;
             skip_ws(b, pos);
             if b.get(*pos) != Some(&')') {
                 return None;
             }
             *pos += 1;
-            Some(e)
+            Some(RawExpr::Cond(Box::new(c)))
         }
         '\'' => {
             *pos += 1;
@@ -78693,14 +79614,14 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                     }
                     RawExpr::Iif(Box::new(cond), Box::new(a), Box::new(c))
                 } else {
-                    let mut args = vec![expr_add(b, pos)?];
+                    let mut args = vec![expr_or_cond_arg(b, pos)?];
                     loop {
                         skip_ws(b, pos);
                         if b.get(*pos) != Some(&',') {
                             break;
                         }
                         *pos += 1;
-                        args.push(expr_add(b, pos)?);
+                        args.push(expr_or_cond_arg(b, pos)?);
                     }
                     if up == "NULLIF" {
                         if args.len() != 2 {
@@ -86832,6 +87753,19 @@ enum EvalErr {
     CteWrongClause { name: String, clause: &'static str },
     /// a recursive member linked to the one before it by a bare UNION
     CteUnionAll(String),
+    /// `JOIN ... USING (C, C)` - isc_dsql_col_more_than_once_using under
+    /// the -104 wrapper, @1 the bare column name (measured on 2182: no
+    /// line/column item)
+    UsingColTwice(String),
+    /// a WITH inside a query while CTEs are in scope -
+    /// isc_dsql_cte_nested_with under the -104 wrapper, "WITH clause
+    /// can't be nested" (measured on 2182)
+    CteNestedWith,
+    /// a UNION's ORDER BY key that is not an ordinal of its columns -
+    /// isc_dsql_command_err + isc_order_by_err under the -104 wrapper,
+    /// "Invalid command / invalid ORDER BY clause" (measured on 2182 for
+    /// a name, an alias, `ID + 0` and an ordinal past the last column)
+    UnionOrderBy,
     /// a member that does not name the CTE, after one that does
     CteNonRecursAfterRecurs(String),
     /// an aggregate or window function in a recursive member's select
@@ -101681,8 +102615,31 @@ fn resolve_subqueries(
                     if negated {
                         out.pop();
                     }
-                    // drop the LHS column token this IN belonged to
-                    if matches!(out.last(), Some(Tok::Ident(_))) {
+                    // drop the LHS operand this IN belonged to: a column,
+                    // or a LITERAL - `1 NOT IN (SELECT ID FROM E)` over an
+                    // empty E is TRUE on 2182 and `1 IN (..)` FALSE, and so
+                    // is `NULL NOT IN (..)` (measured: the verdict does not
+                    // read the left side at all). One token, standing
+                    // alone - a `?` keeps its slot, and the last token of
+                    // an expression is not its whole operand, so both
+                    // still refuse
+                    let single = matches!(
+                        out.last(),
+                        Some(
+                            Tok::Ident(_)
+                                | Tok::Int(_)
+                                | Tok::Int128(_)
+                                | Tok::Dec(..)
+                                | Tok::DecFloat34(_)
+                                | Tok::Str(_)
+                                | Tok::StrKey(_)
+                                | Tok::Null
+                        )
+                    ) && matches!(
+                        out.len().checked_sub(2).map(|k| &out[k]),
+                        None | Some(Tok::LParen | Tok::And | Tok::Or | Tok::Not)
+                    );
+                    if single {
                         out.pop();
                     } else {
                         return None;
@@ -104938,6 +105895,8 @@ fn parse_predicate(
     toks: &[Tok],
     next_param: &mut usize,
 ) -> Option<(Vec<Vec<RawTerm>>, Vec<Vec<u32>>)> {
+    let retyped = retype_mixed_in_lists(toks);
+    let toks = retyped.as_deref().unwrap_or(toks);
     let mut pos = 0usize;
     let ast = parse_or(toks, &mut pos, next_param)?;
     if pos != toks.len() {
@@ -104992,6 +105951,81 @@ fn parse_predicate(
     Some((groups, tags))
 }
 
+/// The text a non-negative exact numeric literal CASTs to: `1`, `1.50`.
+fn exact_lit_text(raw: i64, scale: i8) -> Option<String> {
+    if raw < 0 || scale > 0 {
+        return None;
+    }
+    let digits = raw.to_string();
+    let frac = (-scale) as usize;
+    if frac == 0 {
+        return Some(digits);
+    }
+    let padded = format!("{:0>w$}", digits, w = frac + 1);
+    let (i, f) = padded.split_at(padded.len() - frac);
+    Some(format!("{}.{}", i, f))
+}
+
+/// AN IN LIST IS ONE TYPE: the engine derives the list's common type
+/// from its items the way a UNION does (InListBoolNode::dsqlPass,
+/// DsqlDescMaker::fromList) and CASTs every item to it before any item
+/// meets the tested value. A list mixing TEXT and NUMBER literals is
+/// therefore a list of TEXT - measured on 2182: `V IN (1, 'apple')` over
+/// a VARCHAR finds the 'apple' row where the item-by-item compare raised
+/// 22018 converting 'banana' to a number, and so does `NOT IN`, and
+/// `V IN (1, 2)` - no text item - still raises. So the number literals
+/// of such a list are rewritten as the text they cast to. Only a list of
+/// plain literals is read (a column or `?` item, or a `?` tested side,
+/// keeps today's path), and a negative number leaves the list alone.
+fn retype_mixed_in_lists(toks: &[Tok]) -> Option<Vec<Tok>> {
+    let mut out: Option<Vec<Tok>> = None;
+    let mut i = 0usize;
+    while i + 1 < toks.len() {
+        if !(matches!(toks[i], Tok::In) && matches!(toks[i + 1], Tok::LParen)) {
+            i += 1;
+            continue;
+        }
+        let start = i + 2;
+        let Some(len) = toks[start..].iter().position(|t| matches!(t, Tok::RParen)) else {
+            break;
+        };
+        let items = &toks[start..start + len];
+        // literal, comma, literal, ...
+        let lits_only = items.iter().enumerate().all(|(k, t)| {
+            if k % 2 == 1 {
+                matches!(t, Tok::Comma)
+            } else {
+                matches!(t, Tok::Int(_) | Tok::Dec(..) | Tok::Str(_) | Tok::StrKey(_) | Tok::Null)
+            }
+        }) && len % 2 == 1;
+        let has_text = items.iter().any(|t| matches!(t, Tok::Str(_) | Tok::StrKey(_)));
+        let has_num = items.iter().any(|t| matches!(t, Tok::Int(_) | Tok::Dec(..)));
+        // a `?` TESTED side is typed from the list, a law of its own this
+        // leaves alone (`? IN (1, 'a')` keeps its refusal)
+        let tested_param = match i.checked_sub(1).map(|k| &toks[k]) {
+            Some(Tok::Param) => true,
+            Some(Tok::Not) => matches!(i.checked_sub(2).map(|k| &toks[k]), Some(Tok::Param)),
+            _ => false,
+        };
+        if lits_only && has_text && has_num && !tested_param {
+            let o = out.get_or_insert_with(|| toks.to_vec());
+            for k in start..start + len {
+                let text = match &toks[k] {
+                    Tok::Int(n) => exact_lit_text(*n, 0),
+                    Tok::Dec(raw, scale) => exact_lit_text(*raw, *scale),
+                    _ => continue,
+                };
+                match text {
+                    Some(t) => o[k] = Tok::Str(t),
+                    None => return None,
+                }
+            }
+        }
+        i = start + len;
+    }
+    out
+}
+
 fn parse_or(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
     let mut parts = vec![parse_and(t, pos, np)?];
     while matches!(t.get(*pos), Some(Tok::Or)) {
@@ -105024,7 +106058,13 @@ fn parse_unary(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                 let mut p2 = *pos + 1;
                 let mut np2 = *np;
                 if let Some(inner) = parse_or(t, &mut p2, &mut np2) {
-                    if matches!(t.get(p2), Some(Tok::RParen)) {
+                    // ...and only when the group ENDS a boolean operand:
+                    // `(COALESCE(A, 0)) * 2 = 20` reads its paren as a
+                    // bare-boolean group otherwise, and leaves `* 2 = 20`
+                    // unparsed
+                    if matches!(t.get(p2), Some(Tok::RParen))
+                        && matches!(t.get(p2 + 1), None | Some(Tok::And | Tok::Or | Tok::RParen))
+                    {
                         *pos = p2 + 1;
                         *np = np2;
                         return Some(inner);
@@ -105837,11 +106877,25 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
     // ... and so is a CAST to BOOLEAN (`WHERE CAST(S AS BOOLEAN)`,
     // probed: the engine tests it as the boolean it is), the type gate
     // again deciding
+    // ... and so is a CONDITIONAL or COALESCE / NULLIF whose value is
+    // BOOLEAN - `WHERE COALESCE(BO, FALSE)`, `WHERE IIF(A > 15, TRUE,
+    // FALSE)`, `WHERE CASE WHEN .. THEN TRUE ELSE FALSE END` (measured on
+    // 2182: 1,4,6 / 2,5,6 / 2,5,6). These are function calls, never an
+    // arithmetic group, so the `(A + 8) * 2` trap above cannot reach
+    // them; a non-boolean one is the same prepare-time 22000
     if !negated
         && matches!(
             lhs,
             RawLhs::Col(_)
-                | RawLhs::Expr(RawExpr::Bool(_) | RawExpr::Null | RawExpr::Cast(_, CastTarget::Bool))
+                | RawLhs::Expr(
+                    RawExpr::Bool(_)
+                        | RawExpr::Null
+                        | RawExpr::Cast(_, CastTarget::Bool)
+                        | RawExpr::Coalesce(_)
+                        | RawExpr::NullIf(..)
+                        | RawExpr::Iif(..)
+                        | RawExpr::Case(..)
+                )
         )
         && matches!(t.get(*pos), None | Some(Tok::And | Tok::Or | Tok::RParen))
     {
@@ -132858,6 +133912,7 @@ mod tests {
                 fnames: vec![None; 3],
                 rel_alias: Some("E".into()),
                 merged_away: Vec::new(),
+                merged_outer: Vec::new(),
                 probe_src: None,
                 flatten: None,
             },
@@ -132876,6 +133931,7 @@ mod tests {
                 fnames: vec![None; 2],
                 rel_alias: Some("D".into()),
                 merged_away: Vec::new(),
+                merged_outer: Vec::new(),
                 probe_src: None,
                 flatten: None,
             },
