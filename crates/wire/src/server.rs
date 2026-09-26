@@ -3092,12 +3092,20 @@ fn take_repeat_warnings(db: &Option<Database>, text: &str) {
     if PREPARE_WARNINGS.with(|p| p.borrow().is_empty()) {
         return;
     }
+    // ...AND A COMMITTED DDL PURGES THAT CACHE, this attachment's or
+    // another's (measured: `WITH A AS (..) SELECT 1 FROM RDB$DATABASE`,
+    // then `CREATE TABLE ZZ (I INT)` / `ALTER TABLE T3 ADD Q INT` and a
+    // COMMIT - here or in a second session - then the same text warns
+    // again; a COMMIT, a ROLLBACK or a SET TRANSACTION alone does not).
+    // The metadata generation every DDL moves is the purge: a text is
+    // remembered under the generation it warned in.
+    let gen = db.meta.generation();
     let mut warned = db.warned_texts.borrow_mut();
     // bounded the way the engine's cache is: a full one starts over
     if warned.len() >= 4096 {
         warned.clear();
     }
-    if !warned.insert(text.to_string()) {
+    if !warned.insert((gen, text.to_string())) {
         PREPARE_WARNINGS.with(|p| p.borrow_mut().clear());
     }
 }
@@ -3388,7 +3396,7 @@ struct Database {
     /// the statement texts whose prepare WARNINGS this attachment has
     /// already been given - the engine's statement cache serves a
     /// repeated text without them ([take_repeat_warnings])
-    warned_texts: std::cell::RefCell<std::collections::HashSet<String>>,
+    warned_texts: std::cell::RefCell<std::collections::HashSet<(u64, String)>>,
     /// the event names this transaction has posted, so its commit can
     /// say what the counters became - the only thing observable about an
     /// event until the auxiliary connection carries deliveries.
@@ -20100,6 +20108,16 @@ fn line_col_of(before: &str) -> (i64, i64) {
     // measures the whole text before it (probed: `SELECT *<CR>FROM
     // PNOOUT` is line 2 column 6, and `SELECT *<CR><LF>FROM PNOOUT` is
     // the SAME line 2 column 6, not line 3).
+    //
+    // A COLUMN IS COUNTED IN BYTES OF THE TEXT AS SENT (measured on 2182
+    // under a UTF8 attachment: `SELECT 'ăâî', T.ID FROM T1 T WHERE T1.ID
+    // = 1` is column 39, three more than its characters; under NONE the
+    // same text is 39 too, one byte per character). This server's text
+    // is the decoded statement: under UTF8 / UNICODE_FSS a character's
+    // wire bytes are its UTF-8 bytes, under a byte carrier or a
+    // single-byte set it was one byte, and the other multi-byte sets
+    // keep the character count they always had.
+    let utf8_att = matches!(CURRENT_ATT_CS.with(|c| c.get()), 3 | 4);
     let (mut line, mut col) = (1i64, 1i64);
     let mut after_cr = false;
     for c in before.chars() {
@@ -20107,6 +20125,7 @@ fn line_col_of(before: &str) -> (i64, i64) {
             '\r' => (line, col) = (line + 1, 1),
             '\n' if after_cr => {}
             '\n' => (line, col) = (line + 1, 1),
+            _ if utf8_att => col += c.len_utf8() as i64,
             _ => col += 1,
         }
         after_cr = c == '\r';
@@ -32286,7 +32305,7 @@ fn wrap_returning(
                     new_rel.qual_only = true;
                     scope.rels.push(new_rel);
                 }
-                lifted = lift_corr_text(body, &scope, dbr, db, false)?;
+                lifted = lift_corr_text(body, &scope, dbr, db, None)?;
                 lifted.as_str()
             } else {
                 body
@@ -36737,7 +36756,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 let rhs = if rhs.contains('(')
                     && find_word(&mask_literals(&rhs.to_ascii_uppercase()), "SELECT", 0).is_some()
                 {
-                    rhs_lifted = lift_corr_text(rhs, &set_scope, db, db_outer, false)?;
+                    rhs_lifted = lift_corr_text(rhs, &set_scope, db, db_outer, None)?;
                     if trace_on() {
                         eprintln!("[srv] update SET per-row sub {:?}", rhs_lifted);
                     }
@@ -46204,8 +46223,14 @@ fn derived_columns_verdict(
         }
     } else if let Some(at) = inner_cols.iter().position(|c| {
         // the DESCRIBE-slot test the unnamed check has always used: an
-        // unaliased expression carries its kind-name in both slots
-        let plain = c.expr.is_none() && c.relation.is_some() && c.fname.is_some();
+        // unaliased expression carries its kind-name in both slots, and
+        // a column with a source RELATION is a field. A whole-item
+        // subquery over a plain field is one too, though it plans as its
+        // folded literal (measured: `SELECT * FROM (SELECT (SELECT X.X
+        // FROM T2 X WHERE X.ID = 2) FROM T1 T) D` answers X - describe
+        // `name: X table: T2` - where `(SELECT MAX(X.X) ..)` is unnamed);
+        // keying on the missing `expr` called it unnamed
+        let plain = c.relation.is_some() && c.fname.is_some();
         !plain && c.fname.as_deref().unwrap_or(c.name.as_str()) == c.name.as_str()
     }) {
         return Some(EvalErr::DerivedFieldUnnamed { pos: at as i32 + 1, table });
@@ -46827,9 +46852,57 @@ impl QualCtx<'_> {
     /// One query: its FROM binds the level's names, then the clauses are
     /// read in the engine's order.
     fn member(&self, text: &str, outer: &[Vec<ScopeQual>]) -> QualScan {
-        let Some((proj, table_s, wh, group, having, order)) = split_query(text) else {
+        let Some((proj, mut table_s, mut wh, mut group, mut having, order)) = split_query(text) else {
             return QualScan::Aside;
         };
+        // A NAMED WINDOW CLAUSE sits after HAVING and before ORDER BY, and
+        // the splitter leaves it on the tail of whichever clause precedes
+        // it: cut there, and keep its definitions for their turn below
+        let mut windows: Vec<&str> = Vec::new();
+        if let Some(wpos) = find_word_depth0(self.up_of(text), "WINDOW", 0) {
+            let at = self.off_of(text) + wpos;
+            let covers = |c: &str| {
+                let o = self.off_of(c);
+                o <= at && at < o + c.len()
+            };
+            fn cut<'t>(c: &mut &'t str, rel: usize) -> &'t str {
+                let (head, tail) = c.split_at(rel);
+                *c = head;
+                tail
+            }
+            let tail: &str = if covers(table_s) {
+                let rel = at - self.off_of(table_s);
+                cut(&mut table_s, rel)
+            } else if let Some(c) = wh.as_mut().filter(|c| covers(c)) {
+                let rel = at - self.off_of(c);
+                cut(c, rel)
+            } else if let Some(c) = group.as_mut().filter(|c| covers(c)) {
+                let rel = at - self.off_of(c);
+                cut(c, rel)
+            } else if let Some(c) = having.as_mut().filter(|c| covers(c)) {
+                let rel = at - self.off_of(c);
+                cut(c, rel)
+            } else {
+                return QualScan::Aside;
+            };
+            for def in split_top_level_commas(&tail["WINDOW".len()..]) {
+                let open = def.find('(');
+                let spec = open.and_then(|o| {
+                    let close = matching_paren(def.as_bytes(), o)?;
+                    Some(&def[o + 1..close])
+                });
+                let Some(spec) = spec else { return QualScan::Aside };
+                // a definition over ANOTHER window has laws of its own
+                // the engine checks first (measured: `W2 AS (W PARTITION
+                // BY T1.B)` is -204 "Cannot use PARTITION BY clause while
+                // overriding the window W"), which the planner refuses
+                let first = self.up_of(spec).split_whitespace().next().unwrap_or("");
+                if !first.is_empty() && !matches!(first, "PARTITION" | "ORDER" | "ROWS" | "RANGE") {
+                    return QualScan::Aside;
+                }
+                windows.push(spec);
+            }
+        }
         let Some((from, joins)) = parse_from(table_s) else {
             return QualScan::Aside;
         };
@@ -46919,7 +46992,28 @@ impl QualCtx<'_> {
                 other => return other,
             }
         }
-        match self.list(proj, &scopes, true) {
+        // the select list's PLAIN FIELD items, then the WINDOW clause's
+        // definitions in declaration order, read or not, then the rest of
+        // the list (measured on 2182: `SELECT T1.B, SUM(T.A) OVER W .. WINDOW
+        // W AS (ORDER BY T1.ID)` names T1.B, `SELECT T.B + T1.B, SUM(T.A)
+        // OVER W ..` names T1.ID, and so does a subquery item's T1.A beside
+        // it, `SUM(T1.A) OVER W` and an unread W; GROUP BY, HAVING and
+        // ORDER BY come after; `WINDOW W1 AS (.. T1.A), W2 AS (.. T1.B)`
+        // names T1.A whichever the list reads first). The planner rewrites
+        // the clause away, and this scanner stood aside for it: `SUM(T.A)
+        // OVER W FROM T1 T WINDOW W AS (ORDER BY T1.ID)` answered a
+        // running sum where the engine raises -206
+        match self.select_items(proj, &scopes, true) {
+            QualScan::Clean => {}
+            other => return other,
+        }
+        for w in windows {
+            match self.window(w, &scopes) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        match self.select_items(proj, &scopes, false) {
             QualScan::Clean => {}
             other => return other,
         }
@@ -47005,6 +47099,22 @@ impl QualCtx<'_> {
     /// CAST(T1.A AS INTEGER), T1.B FROM T1 T` names T1.B, `UPPER(T1.V),
     /// T1.A AS X` names T1.V, `(SELECT T1.A ..), UPPER(T1.V)` names T1.A,
     /// `(SELECT T1.B ..), UPPER(T1.V), T1.A` names T1.A).
+    /// One of the select list's two passes: its plain field items
+    /// (`plain`), or every other item in text order.
+    fn select_items(&self, text: &str, scopes: &[Vec<ScopeQual>], plain: bool) -> QualScan {
+        for item in split_top_level_commas(text) {
+            if self.is_plain_field(item) != plain {
+                continue;
+            }
+            let r = if plain { self.refs(item, scopes) } else { self.boolean(item, scopes) };
+            match r {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
+        QualScan::Clean
+    }
+
     fn list(&self, text: &str, scopes: &[Vec<ScopeQual>], select_list: bool) -> QualScan {
         let items = split_top_level_commas(text);
         if select_list {
@@ -49205,29 +49315,39 @@ fn plan_over_source(
     // the source's own columns ([lift_corr_text]); a correlated one names
     // the source by its binding alias
     let corr_scope = CorrScope::single(alias, None, None, &columns, &descs);
-    let lift = |t: &str, sel: bool| -> Option<String> {
+    let lift = |t: &str, names: Option<&mut Vec<(usize, String)>>| -> Option<String> {
         match db.as_ref() {
             Some(dbr)
                 if t.contains('(')
                     && find_word(&mask_literals(&t.to_ascii_uppercase()), "SELECT", 0).is_some() =>
             {
-                lift_corr_text(t, &corr_scope, dbr, db, sel)
+                lift_corr_text(t, &corr_scope, dbr, db, names)
             }
             _ => Some(t.to_string()),
         }
     };
-    let proj_l = lift(proj_s, true)?;
+    // (select-list position, name) of each whole-item subquery: laid on
+    // the planned column once ORDER BY has resolved without it
+    let mut sub_names: Vec<(usize, String)> = Vec::new();
+    let proj_l = lift(proj_s, Some(&mut sub_names))?;
     let where_l = match where_s {
-        Some(w) => Some(lift(w, false)?),
+        Some(w) => Some(lift(w, None)?),
         None => None,
     };
     let having_l = match having_s {
-        Some(h) => Some(lift(h, false)?),
+        Some(h) => Some(lift(h, None)?),
         None => None,
     };
     let order_l = match order_s {
-        Some(o) => Some(lift(o, false)?),
+        Some(o) => Some(lift(o, None)?),
         None => None,
+    };
+    let name_subs = |cols: &mut [ProjCol]| {
+        for (i, n) in &sub_names {
+            if let Some(c) = cols.get_mut(*i) {
+                c.name = n.clone();
+            }
+        }
     };
     let proj_s = proj_l.as_str();
     let where_s = where_l.as_deref();
@@ -49355,6 +49475,7 @@ fn plan_over_source(
             })?,
         };
         stamp_group_order_coll(&mut order_by, &slot_descs);
+        name_subs(&mut gcols);
         // a collation decides which rows are one group, and which value
         // a MIN/MAX or a COUNT(DISTINCT) folds to ([coll_groupable],
         // [agg_needs_unkeyable_coll]) - the fold check was missing here
@@ -49553,6 +49674,8 @@ fn plan_over_source(
         )?,
     };
     drop(params_cell);
+    let mut out_cols = out_cols;
+    name_subs(&mut out_cols);
     Some(Plan::Derived {
         inner: Box::new(src.into_plan(cols)),
         cols: out_cols,
@@ -49564,11 +49687,26 @@ fn plan_over_source(
 }
 
 /// Every UNQUALIFIED relation name a statement names after `FROM` or
-/// `JOIN`, ANYWHERE in it - a subquery, a derived table's body, either
-/// branch of a union, an `IN`/`EXISTS` body. Modelled on
+/// `JOIN` - or after a COMMA of a FROM clause, the older spelling of a
+/// cross join - ANYWHERE in it: a subquery, a derived table's body,
+/// either branch of a union, an `IN`/`EXISTS` body. Modelled on
 /// [first_unknown_relation], which walks the same two keywords for the
 /// same reason; this one collects the names instead of checking them
 /// against the catalog.
+///
+/// THE COMMA ITEMS COUNT (measured on 2182: `WITH A AS (..), B AS (..)
+/// SELECT * FROM A, B` answers `1 2` with no warning, `FROM T1 T, A, B`
+/// and `FROM T1 JOIN T2 ON .., A` read A and B too, and `FROM T1, A`
+/// warns only the B it leaves unread). Reading the word after FROM and
+/// JOIN alone judged every CTE read as a second or later comma item
+/// UNUSED, and the unused-CTE pass then refused the statement as an
+/// alias conflict with the reference - a regression of `06ba249` over
+/// statements this server had answered. A comma belongs to the FROM
+/// clause when it sits at the FROM keyword's own depth, before that
+/// clause ends (a depth-0 WHERE / GROUP / HAVING / ORDER / UNION / PLAN
+/// / ROWS / FETCH / OFFSET / WINDOW / WITH / FOR / RETURNING, or the
+/// paren that closes the query); a FROM that is a function's operand
+/// (`SUBSTRING(S FROM 2)`) has no list.
 ///
 /// [bound_refs] cannot serve here: it reads ONE query's top-level FROM
 /// and joins, while the engine's cycle check reaches a self-reference
@@ -49587,44 +49725,83 @@ fn from_names(sql: &str) -> Vec<String> {
     let b = masked.as_bytes();
     let sb = up.as_bytes();
     let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    // the relation name that starts at `at` (whitespace skipped), if one
+    // does: not a derived table's paren, not a qualified name
+    let name_at = |at: usize| -> Option<String> {
+        let mut i = at;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() || b[i] == b'(' {
+            return None;
+        }
+        let (start, end, after);
+        if sb[i] == b'"' {
+            start = i + 1;
+            let mut j = start;
+            while j < sb.len() && sb[j] != b'"' {
+                j += 1;
+            }
+            end = j;
+            after = (j + 1).min(sb.len());
+        } else {
+            start = i;
+            let mut j = i;
+            while j < b.len() && is_ident(b[j]) {
+                j += 1;
+            }
+            end = j;
+            after = j;
+        }
+        if end <= start {
+            return None;
+        }
+        // `PUBLIC.C1` names the TABLE, never the CTE
+        if sb.get(after) == Some(&b'.') {
+            return None;
+        }
+        Some(up[start..end].to_string())
+    };
     let mut out: Vec<String> = Vec::new();
     for kw in ["FROM", "JOIN"] {
         let mut at = 0;
         while let Some(k) = find_word(&masked, kw, at) {
             at = k + kw.len();
+            if kw == "FROM" && from_is_operand(b, k) {
+                continue;
+            }
+            out.extend(name_at(at));
+            if kw != "FROM" {
+                continue;
+            }
+            // the clause's depth-level commas, up to its end
+            let mut depth = 0i32;
             let mut i = at;
-            while i < b.len() && b[i].is_ascii_whitespace() {
+            while i < b.len() {
+                match b[i] {
+                    b'(' => depth += 1,
+                    b')' if depth == 0 => break,
+                    b')' => depth -= 1,
+                    b',' if depth == 0 => out.extend(name_at(i + 1)),
+                    c if depth == 0 && c.is_ascii_alphabetic() && (i == 0 || !is_ident(b[i - 1])) => {
+                        let mut j = i;
+                        while j < b.len() && is_ident(b[j]) {
+                            j += 1;
+                        }
+                        if matches!(
+                            &masked[i..j],
+                            "WHERE" | "GROUP" | "HAVING" | "ORDER" | "UNION" | "PLAN" | "ROWS"
+                                | "FETCH" | "OFFSET" | "WINDOW" | "WITH" | "FOR" | "RETURNING"
+                        ) {
+                            break;
+                        }
+                        i = j;
+                        continue;
+                    }
+                    _ => {}
+                }
                 i += 1;
             }
-            if i >= b.len() || b[i] == b'(' {
-                continue;
-            }
-            let (start, end, after);
-            if sb[i] == b'"' {
-                start = i + 1;
-                let mut j = start;
-                while j < sb.len() && sb[j] != b'"' {
-                    j += 1;
-                }
-                end = j;
-                after = (j + 1).min(sb.len());
-            } else {
-                start = i;
-                let mut j = i;
-                while j < b.len() && is_ident(b[j]) {
-                    j += 1;
-                }
-                end = j;
-                after = j;
-            }
-            if end <= start {
-                continue;
-            }
-            // `PUBLIC.C1` names the TABLE, never the CTE
-            if sb.get(after) == Some(&b'.') {
-                continue;
-            }
-            out.push(up[start..end].to_string());
         }
     }
     out
@@ -49680,46 +49857,53 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
     if find_word(&up, "WITH", 0) != Some(0) {
         return None;
     }
-    let b: Vec<char> = t.chars().collect();
+    // BYTE offsets throughout: [matching_paren] answers one, and this
+    // walked a `Vec<char>` and mixed the two - a body holding a
+    // multi-byte character (`WITH C AS (SELECT 'ă' X FROM RDB$DATABASE)`
+    // under a UTF8 attachment) closed one character late, spliced as
+    // `(SELECT 'ă' X FROM RDB$DATABASE))` and refused, where the engine
+    // answers `ă` (and, unused, answers the main query with the warning)
+    let b = t.as_bytes();
+    let is_name = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
     let mut i = "WITH".len();
-    let skip_ws = |b: &[char], i: &mut usize| {
-        while *i < b.len() && b[*i].is_whitespace() {
+    let skip_ws = |b: &[u8], i: &mut usize| {
+        while *i < b.len() && b[*i].is_ascii_whitespace() {
             *i += 1;
         }
     };
     let mut ctes: Vec<(String, ViewDef)> = Vec::new();
     let mut recursive = false;
     loop {
-        skip_ws(&b, &mut i);
+        skip_ws(b, &mut i);
         // the name
         let start = i;
-        while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+        while i < b.len() && is_name(b[i]) {
             i += 1;
         }
         if i == start {
             return None;
         }
-        let mut name: String = b[start..i].iter().collect();
+        let mut name: String = t[start..i].to_string();
         // `WITH RECURSIVE` marks the whole list; the name follows it
         if name.eq_ignore_ascii_case("RECURSIVE") {
             recursive = true;
-            skip_ws(&b, &mut i);
+            skip_ws(b, &mut i);
             let start = i;
-            while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+            while i < b.len() && is_name(b[i]) {
                 i += 1;
             }
             if i == start {
                 return None;
             }
-            name = b[start..i].iter().collect();
-            skip_ws(&b, &mut i);
+            name = t[start..i].to_string();
+            skip_ws(b, &mut i);
         }
-        skip_ws(&b, &mut i);
+        skip_ws(b, &mut i);
         // an optional column list, which RENAMES the query's columns
         let mut cols: Vec<String> = Vec::new();
-        if b.get(i) == Some(&'(') {
-            let close = matching_paren(t.as_bytes(), i)?;
-            let inner: String = b[i + 1..close].iter().collect();
+        if b.get(i) == Some(&b'(') {
+            let close = matching_paren(b, i)?;
+            let inner: String = t[i + 1..close].to_string();
             for c in inner.split(',') {
                 let c = c.trim().trim_matches('"');
                 if !ident_ok(c) {
@@ -49728,20 +49912,19 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
                 cols.push(c.to_ascii_uppercase());
             }
             i = close + 1;
-            skip_ws(&b, &mut i);
+            skip_ws(b, &mut i);
         }
         // AS ( ... )
-        let kw: String = b[i..(i + 2).min(b.len())].iter().collect();
-        if !kw.eq_ignore_ascii_case("AS") {
+        if !b[i..(i + 2).min(b.len())].eq_ignore_ascii_case(b"AS") {
             return None;
         }
         i += 2;
-        skip_ws(&b, &mut i);
-        if b.get(i) != Some(&'(') {
+        skip_ws(b, &mut i);
+        if b.get(i) != Some(&b'(') {
             return None;
         }
-        let close = matching_paren(t.as_bytes(), i)?;
-        let source: String = b[i + 1..close].iter().collect();
+        let close = matching_paren(b, i)?;
+        let source: String = t[i + 1..close].to_string();
         i = close + 1;
         // the column names: the explicit list, else the query's own
         // The CTE's column names, when they can be read off its body -
@@ -49783,14 +49966,14 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
             cols
         };
         ctes.push((name.to_ascii_uppercase(), ViewDef { source: source.trim().to_string(), cols }));
-        skip_ws(&b, &mut i);
-        if b.get(i) == Some(&',') {
+        skip_ws(b, &mut i);
+        if b.get(i) == Some(&b',') {
             i += 1;
             continue;
         }
         break;
     }
-    let main: String = b[i..].iter().collect();
+    let main: String = t[i..].to_string();
     let main = main.trim().to_string();
     if main.is_empty() || ctes.is_empty() {
         return None;
@@ -57073,7 +57256,7 @@ fn plan_query_inner_at_body(
         let on_sub = parsed.as_ref().is_some_and(|(_, j)| j.iter().any(|(_, _, on_s, _)| has_sub(Some(on_s))));
         if has_sub(order_s) || has_sub(having_s) || (joined && has_sub(where_s)) || on_sub {
             if let Some(scope) = CorrScope::of_from(table_s, dbr, db) {
-                let lift = |t: &str| lift_corr_text(t, &scope, dbr, db, false);
+                let lift = |t: &str| lift_corr_text(t, &scope, dbr, db, None);
                 // ON conditions, spliced back into the FROM text from the
                 // end so earlier offsets stay valid
                 let mut from_out = table_s.to_string();
@@ -57142,8 +57325,12 @@ fn plan_query_inner_at_body(
                     let (p, _, _, _, _, _) = split_query(sub)?;
                     match parse_projection(p)? {
                         Proj::Items(items) => match items.first()? {
+                            // an alias comes canonical from the parse
+                            // (a quoted `"q"` keeps its case, measured on
+                            // 2182: `q`); a column is folded here
                             SelItem::Col(c, alias) => Some(alias.clone().unwrap_or_else(|| {
-                                c.rsplit('.').next().unwrap_or(c).to_string()
+                                let bare = c.rsplit('.').next().unwrap_or(c);
+                                canon_ident(bare).unwrap_or_else(|| bare.to_string())
                             })),
                             SelItem::Agg(f, _, alias) => Some(alias.clone().unwrap_or_else(|| {
                                 f.name()
@@ -57336,6 +57523,9 @@ fn plan_query_inner_at_body(
                 // marker the projection builder resolves.
                 #[allow(clippy::type_complexity)]
                 let mut correlated: Vec<(usize, String, Expr, Descriptor)> = Vec::new();
+                // (select-list position, name) of each whole-item folded
+                // or per-row subquery - its describe name, never an alias
+                let mut name_patches: Vec<(usize, String)> = Vec::new();
                 for (i, sub) in subs.iter().enumerate() {
                     let mark = format!("{}{}", SUBQ_MARK, i);
                     let scan = scope.as_ref().and_then(|sc| corr_scan(sub, sc, dbr, db));
@@ -57490,8 +57680,20 @@ fn plan_query_inner_at_body(
                             }
                             return Some(Plan::Refused);
                         };
-                        let repl = match (alone.get(i), subq_name(sub)) {
-                            (Some(true), Some(n)) => format!("FC$CORR({}) AS \"{}\"", id, n.replace('"', "\"\"")),
+                        // the name is NO ALIAS here either (the law at
+                        // the fold below): spliced as `FC$CORR(<id>) AS
+                        // <name>` it made `.. GROUP BY T.ID` over an
+                        // ID-named subquery an alias-shadowed refusal and
+                        // `ORDER BY A` sort by the subquery, where the
+                        // engine sorts by T.A (measured on 2182)
+                        if let (Some(true), Some(n)) = (alone.get(i), subq_name(sub)) {
+                            let pos = split_top_level_commas(&folded).iter().position(|item| item.trim() == mark);
+                            if let Some(pos) = pos {
+                                name_patches.push((pos, n));
+                            }
+                        }
+                        let repl = match alone.get(i) {
+                            Some(true) => corr_unnamed_item(id),
                             _ => format!("FC$CORR({})", id),
                         };
                         proj_out = proj_out.replace(&mark, &repl);
@@ -57510,11 +57712,27 @@ fn plan_query_inner_at_body(
                             None => return Some(Plan::Refused),
                         },
                     };
-                    let repl = match (alone.get(i), subq_name(sub)) {
-                        (Some(true), Some(n)) => format!("{} AS {}", lit, n),
-                        _ => lit,
-                    };
-                    proj_out = proj_out.replace(&format!("{}{}", SUBQ_MARK, i), &repl);
+                    // THE SUBQUERY's NAME IS NO ALIAS: the engine
+                    // describes a whole-item subquery by its inner item's
+                    // name, but ORDER BY / GROUP BY never resolve to it
+                    // (measured on 2182: `SELECT (SELECT X.X FROM T2 X
+                    // WHERE X.ID = 2) FROM T1 T ORDER BY X` is -206 "X",
+                    // `.. GROUP BY ID` over an ID-named one groups by
+                    // T.ID - six rows - and `.. ORDER BY T.ID` answers).
+                    // Spliced as `<lit> AS <name>` it WAS an alias: the
+                    // bare keys answered through it (one group for six)
+                    // and the qualified key over its name was refused as
+                    // alias-shadowed. The name is laid on the planned
+                    // column afterwards, like the field name.
+                    if let (Some(true), Some(n)) = (alone.get(i), subq_name(sub)) {
+                        let pos = split_top_level_commas(&folded)
+                            .iter()
+                            .position(|item| item.trim() == format!("{}{}", SUBQ_MARK, i));
+                        if let Some(pos) = pos {
+                            name_patches.push((pos, n));
+                        }
+                    }
+                    proj_out = proj_out.replace(&format!("{}{}", SUBQ_MARK, i), &lit);
                 }
                 // GROUP BY over a per-row subquery item - by its ordinal,
                 // its alias or its text - is the engine's -104 (probed;
@@ -57569,9 +57787,19 @@ fn plan_query_inner_at_body(
                             correlated.len()
                         );
                     }
-                    return plan_correlated_select(
+                    let mut plan = plan_correlated_select(
                         &proj_out, &correlated, table_s, where_s, order_s, dbr, params, trace,
                     );
+                    // a per-row subquery beside the lookup one carries its
+                    // placeholder name until here ([corr_unnamed_item])
+                    if let Some(Plan::Project { cols, .. }) = plan.as_mut() {
+                        for (idx, n) in &name_patches {
+                            if let Some(c) = cols.get_mut(*idx) {
+                                c.name = n.clone();
+                            }
+                        }
+                    }
+                    return plan;
                 }
                 if trace {
                     eprintln!("[srv] plan: select-list subqueries folded to {:?}", out);
@@ -57609,6 +57837,20 @@ fn plan_query_inner_at_body(
                             if let Some(c) = cols.get_mut(*i) {
                                 c.sql_type = nullable(c.sql_type);
                             }
+                        }
+                    }
+                }
+                for (idx, n) in &name_patches {
+                    if let Plan::Project { cols, .. }
+                    | Plan::Join { cols, .. }
+                    | Plan::JoinGroup { cols, .. }
+                    | Plan::Group { cols, .. }
+                    | Plan::Union { cols, .. }
+                    | Plan::Derived { cols, .. }
+                    | Plan::Rows { cols, .. } = &mut plan
+                    {
+                        if let Some(c) = cols.get_mut(*idx) {
+                            c.name = n.clone();
                         }
                     }
                 }
@@ -97636,8 +97878,13 @@ fn corr_cmp_before(text: &str, at: usize) -> Option<(usize, Cmp)> {
 /// ANY|SOME|ALL (...)` - become `FC$CORR(<id>) = TRUE`, the three-valued
 /// result compared as a BOOLEAN so a NOT around it still works.
 ///
-/// `select_list`: a subquery standing alone as a select item is named by
-/// its own item (`... AS <name>`), the way the constant fold names one.
+/// `names`: the text is a select list, and a subquery standing alone as a
+/// select item is named by its own item - a NAME, never an alias (measured
+/// on 2182: `SELECT (SELECT X.A FROM T1 X WHERE X.ID = 7 - D.ID) FROM
+/// (SELECT ID, A FROM T1) D ORDER BY A` sorts by D.A, and `.. ORDER BY X`
+/// over an X-named one is -206 "X"). Its (item position, name) is pushed
+/// for the caller to lay on the planned column; a list holding a star,
+/// whose positions the expansion shifts, keeps the `AS <name>` splice.
 /// The text comes back unchanged when it holds no subquery; None when one
 /// cannot be lifted (the statement then keeps its refusal).
 fn lift_corr_text(
@@ -97645,12 +97892,18 @@ fn lift_corr_text(
     scope: &CorrScope,
     db: &Database,
     db_opt: &Option<Database>,
-    select_list: bool,
+    mut names: Option<&mut Vec<(usize, String)>>,
 ) -> Option<String> {
+    let select_list = names.is_some();
     let (folded, subs) = extract_subqueries(text)?;
     if subs.is_empty() {
         return Some(text.to_string());
     }
+    let items = split_top_level_commas(&folded);
+    let starred = items.iter().any(|it| {
+        let t = it.trim();
+        t == "*" || t.ends_with(".*")
+    });
     // which markers stand alone (no alias) as a select item
     let alone: Vec<bool> = if select_list {
         (0..subs.len())
@@ -97664,6 +97917,7 @@ fn lift_corr_text(
     } else {
         vec![false; subs.len()]
     };
+    let items: Vec<String> = items.iter().map(|it| it.to_string()).collect();
     let mut out = folded;
     for (i, sub) in subs.iter().enumerate().rev() {
         let mark = format!("{}{}", SUBQ_MARK, i);
@@ -97750,9 +98004,15 @@ fn lift_corr_text(
         }
         let repl = if wrap {
             format!("FC$CORR({}) = TRUE", id)
-        } else if select_list && alone[i] {
+        } else if select_list && alone[i] && starred {
             let name = corr_template(id)?.desc.name;
             format!("FC$CORR({}) AS \"{}\"", id, name.replace('"', "\"\""))
+        } else if select_list && alone[i] {
+            let name = corr_template(id)?.desc.name;
+            if let Some(pos) = items.iter().position(|it| it.trim() == mark) {
+                names.as_deref_mut()?.push((pos, name));
+            }
+            corr_unnamed_item(id)
         } else {
             format!("FC$CORR({})", id)
         };
@@ -97762,6 +98022,16 @@ fn lift_corr_text(
         }
     }
     Some(out)
+}
+
+/// A whole select item standing for per-row subquery `id`, spelled so the
+/// planner gives it NO name a statement can write: bare, `FC$CORR(<id>)`
+/// takes the inner item's name ([default_expr_name]) and an ORDER BY or
+/// GROUP BY key of that name resolved to it - a key the engine resolves
+/// to the FROM's column or refuses -206 (measured on 2182). The caller
+/// lays the real name on the planned column afterwards.
+fn corr_unnamed_item(id: usize) -> String {
+    format!("FC$CORR({}) AS \"FC$ITEM{}\"", id, id)
 }
 
 /// How a per-row subquery is used, operands resolved.
@@ -98485,12 +98755,21 @@ fn plan_correlated_select(
     // build the output columns: the marker becomes the lookup, every
     // other item is an ordinary select item
     let mut cols: Vec<ProjCol> = Vec::new();
+    // the lookup columns that carry only the INNER item's name: that name
+    // describes the column but is no alias an ORDER BY resolves to
+    // (measured on 2182: `SELECT (SELECT X.A FROM T1 X WHERE X.ID = T.ID)
+    // FROM T1 T ORDER BY A` sorts by T.A, `.. ORDER BY X` over an X-named
+    // one is -206 "X")
+    let mut unaliased: Vec<usize> = Vec::new();
     for item in split_top_level_commas(proj_marked) {
         let (body, alias) = split_alias(item);
         if let Some((_, lookup, result_desc, (ifname, iname), (irel, iralias))) = lookups
             .iter()
             .find(|(m, _, _, _, _)| body.trim() == format!("{}{}", SUBQ_MARK, m))
         {
+            if alias.is_none() {
+                unaliased.push(cols.len());
+            }
             let (wire, sql_type, length, scale, sub_type) = wire_for(result_desc);
             cols.push(ProjCol {
                 // the subquery DELEGATES naming to its inner item: the
@@ -98545,18 +98824,24 @@ fn plan_correlated_select(
     }
     let order_by = match order_s {
         None => Vec::new(),
-        Some(os) => parse_order_by_expr(
-            &unq(os),
-            &cols,
-            &descs,
-            |n| {
-                columns
-                    .iter()
-                    .find(|c| col_name_is(&c.name, n))
-                    .map(|c| c.field_id as usize)
-            },
-            |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
-        )?,
+        Some(os) => {
+            let mut order_cols = cols.clone();
+            for i in &unaliased {
+                order_cols[*i].name.clear();
+            }
+            parse_order_by_expr(
+                &unq(os),
+                &order_cols,
+                &descs,
+                |n| {
+                    columns
+                        .iter()
+                        .find(|c| col_name_is(&c.name, n))
+                        .map(|c| c.field_id as usize)
+                },
+                |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+            )?
+        }
     };
     // The OUTER retrieval's access path, chosen the way every other
     // single-relation retrieval chooses one. Gated on a WHERE existing
@@ -128832,6 +129117,26 @@ mod tests {
         assert_eq!(ctes[0].1.cols, vec!["X", "Y"]);
         // and an ordinary statement is not a WITH
         assert!(parse_with("SELECT ID FROM EMP").is_none());
+    }
+
+    #[test]
+    fn parse_with_closes_a_multibyte_body_where_it_ends() {
+        // byte offsets throughout: the body ends at its own paren, not
+        // one character later (it was `(SELECT 'ă' X FROM T))`)
+        let (ctes, main, _) =
+            parse_with("WITH C AS (SELECT 'ă' X FROM T), D AS (SELECT 'î' Y FROM T) SELECT Y FROM D").unwrap();
+        assert_eq!(ctes[0].1.source, "SELECT 'ă' X FROM T");
+        assert_eq!(ctes[1].1.source, "SELECT 'î' Y FROM T");
+        assert_eq!(main, "SELECT Y FROM D");
+    }
+
+    #[test]
+    fn from_names_reads_the_comma_items_of_a_from_clause() {
+        assert_eq!(from_names("SELECT * FROM A, B"), vec!["A", "B"]);
+        assert_eq!(from_names("SELECT * FROM T1 T, A, (SELECT 1 FROM R) D, B WHERE X IN (1, 2)"), vec!["T1", "A", "B", "R"]);
+        assert_eq!(from_names("SELECT * FROM T1 JOIN T2 ON T2.K = T1.K, A ORDER BY 1, 2"), vec!["T1", "A", "T2"]);
+        // a qualified item is the table, a function's FROM has no list
+        assert_eq!(from_names("SELECT SUBSTRING(V FROM 1 FOR 2), X FROM T, PUBLIC.A"), vec!["T"]);
     }
 
     #[test]
