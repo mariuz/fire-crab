@@ -2147,6 +2147,46 @@ fn respond_ddl_meta(
             return Ok(true);
         }
     }
+    // A NOT NULL FIELD OVER NULLS - the engine's deferred check at the
+    // DDL's commit: "unsuccessful metadata update / Cannot make field
+    // @1 of table @2 NOT NULL because there are NULLs present" (22006,
+    // isc_cannot_make_not_null, measured for ALTER TABLE ADD ... NOT
+    // NULL / ADD ... IDENTITY over a populated table and for ALTER
+    // COLUMN SET NOT NULL) - no "ALTER TABLE failed" item between
+    // ALTER SEQUENCE ... INCREMENT BY 0 (measured): "unsuccessful
+    // metadata update / ALTER SEQUENCE @1 failed / INCREMENT BY 0 is an
+    // illegal option for sequence @1"
+    if lc.contains("increment by 0 is an illegal option") {
+        if let Plan::SetGenerator { name, .. } = plan {
+            let qn = format!("\"PUBLIC\".\"{}\"", name.trim());
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397323).int(2).bytes(qn.as_bytes()) // isc_dsql_alter_sequence_failed
+                .int(1).int(336068896).int(2).bytes(qn.as_bytes()) // isc_dyn_cant_use_zero_increment
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
+    if lc.contains("because there are nulls present") {
+        let names = match plan {
+            Plan::AlterTableAdd { table, col } => Some((col.name.clone(), table.clone())),
+            Plan::AlterColumnNull { table, column, .. } => Some((column.trim().to_string(), table.clone())),
+            _ => None,
+        };
+        if let Some((f, t)) = names {
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(335544989) // isc_cannot_make_not_null
+                .int(2).bytes(format!("\"{}\"", f).as_bytes())
+                .int(2).bytes(format!("\"PUBLIC\".\"{}\"", t.trim_end()).as_bytes())
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
     if lc.contains("cannot delete primary key") {
         // DROP TABLE whose PRIMARY KEY / UNIQUE is referenced by a FOREIGN
         // KEY in another table: "unsuccessful metadata update / DROP TABLE @1
@@ -2164,7 +2204,43 @@ fn respond_ddl_meta(
             return Ok(true);
         }
     }
+    if lc.contains("is referenced in view") {
+        if let Plan::AlterTableDrop { table, column } = plan {
+            let view = err_text.rsplit(' ').next().unwrap_or("").trim();
+            let qt = format!("\"PUBLIC\".\"{}\"", table.trim_end());
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(ALTER_TABLE_FAILED).int(2).bytes(qt.as_bytes())
+                .int(1).int(336068660) // DYN 52
+                .int(2).bytes(format!("\"{}\"", column.trim()).as_bytes())
+                .int(2).bytes(qt.as_bytes())
+                .int(2).bytes(format!("\"PUBLIC\".\"{}\"", view).as_bytes())
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
     if lc.contains("there are") && lc.contains("dependencies") {
+        // ALTER TABLE DROP of a column another object reads (measured):
+        // "unsuccessful metadata update / cannot delete / COLUMN
+        // "PUBLIC"."T"."B" / there are N dependencies"
+        if let Plan::AlterTableDrop { table, column } = plan {
+            let n: i32 = err_text
+                .split_whitespace()
+                .find_map(|w| w.parse::<i32>().ok())
+                .unwrap_or(1);
+            let qn = format!("\"PUBLIC\".\"{}\".\"{}\"", table.trim_end(), column.trim());
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(335544673) // isc_no_delete - "cannot delete"
+                .int(1).int(335544611).int(2).bytes(qn.as_bytes()) // isc_field_name - "COLUMN @1"
+                .int(1).int(335544630).int(4).int(n) // isc_dependency
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
         // DROP TABLE (or RECREATE TABLE) refused because a VIEW reads the
         // table: "unsuccessful metadata update / cannot delete / TABLE @1 /
         // there are N dependencies" (probed). N is carried in the message.
@@ -4395,6 +4471,16 @@ impl Database {
         // engine's own no-undo path). Recorded divergence, gstat-only.
         fire_crab_ods::dml::update_oldest(&mut work, self.page_size, false)?;
         self.flush_and_install(work)?;
+        // A ROLLBACK OF DDL TAKES THE SCHEMA BACK, so what was cached
+        // about the schema it made is stale - the commit's rule, which
+        // the rollback lacked. Measured with AUTODDL OFF: `alter table
+        // tq add c ...; insert ...; select * from tq; rollback; insert
+        // ...; select * from tq` answers A B on the engine; here the
+        // second SELECT reused the plan the first one compiled against
+        // the uncommitted C, and answered A B C with C NULL.
+        if self.did_ddl {
+            self.invalidate_meta();
+        }
         Ok(())
     }
 
@@ -10889,6 +10975,12 @@ fn join_scan_rows<'a>(
 enum GenWrite {
     Absolute(i64),
     Restart(i64),
+    /// `ALTER SEQUENCE <g> [RESTART [WITH n]] [INCREMENT [BY] k]` in any
+    /// other shape than a bare RESTART WITH: a new step lands on the
+    /// RDB$GENERATORS row, and a RESTART (WITH n, or with no value: the
+    /// row's RDB$INITIAL_VALUE) sets `value - step` by the NEW step
+    /// (CreateAlterSequenceNode::executeAlter, DdlNodes.epp:6541-6560)
+    Alter { restart: Option<Option<i64>>, step: Option<i64> },
 }
 
 /// One UPDATE SET value: encoded at prepare (literal - `None` inside =
@@ -14828,7 +14920,7 @@ fn not_null_fids_uncached(db: &Database, table: &str) -> Vec<usize> {
     // DS)` refuses an omitted S with isc_not_valid on "TS"."S")
     let mut by_source: Vec<(usize, String)> = Vec::new();
     let fmts = vec![(0u8, descs.clone())];
-    for_each_record(db, 5, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, 5, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_fid), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
@@ -14849,7 +14941,7 @@ fn not_null_fids_uncached(db: &Database, table: &str) -> Vec<usize> {
                 let ffid = |name: &str| fcols.iter().find(|c| c.name == name).map(|c| c.field_id as usize);
                 if let (Some(fname), Some(fnn)) = (ffid("RDB$FIELD_NAME"), ffid("RDB$NULL_FLAG")) {
                     let ffmts = vec![(0u8, fdescs.clone())];
-                    for_each_record(db, 2, &ffmts, usize::MAX, |values| {
+                    for_each_catalog_record(db, 2, &ffmts, usize::MAX, |values| {
                         if !matches!(values.get(fnn), Some(Value::Int(1))) {
                             return;
                         }
@@ -14917,7 +15009,7 @@ fn identity_columns_uncached(db: &Database, table: &str) -> Vec<(usize, String, 
     };
     let mut out = Vec::new();
     let fmts = vec![(0u8, descs.clone())];
-    for_each_record(db, 5, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, 5, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_fid), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
@@ -14981,7 +15073,7 @@ fn computed_sources_uncached(
     // (field id, field source) of the table's columns
     let mut members: Vec<(usize, String)> = Vec::new();
     let fmts = vec![(0u8, rf_descs.clone())];
-    for_each_record(db, 5, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, 5, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
@@ -15012,7 +15104,7 @@ fn computed_sources_uncached(
     };
     let mut blobs: Vec<(usize, u16, u64)> = Vec::new();
     let fmts2 = vec![(0u8, f_descs.clone())];
-    for_each_record(db, 2, &fmts2, usize::MAX, |values| {
+    for_each_catalog_record(db, 2, &fmts2, usize::MAX, |values| {
         let Some(Value::Text(fname)) = values.get(name_f) else { return };
         let fname = fname.trim_end();
         for (id, src) in &members {
@@ -15077,7 +15169,7 @@ fn fk_trigger_parent_cols(db: &Database, table: &str, trigs: &[String]) -> Optio
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$DEPENDENCIES")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut out: Vec<String> = Vec::new();
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         let Some(Value::Text(dep)) = values.get(dep_f) else { return };
         if !trigs.iter().any(|t| t.eq_ignore_ascii_case(dep.trim_end())) {
             return;
@@ -15104,6 +15196,18 @@ enum DefaultVal {
     /// (the engine stores `DEFAULT 1.5` as `blr_long` scale -1 value 15,
     /// `DEFAULT -3` as a negative literal, no negate node - probed)
     Int(i64, i8),
+    /// an exact literal PAST the i64 range: the engine stores it as
+    /// `blr_int128` with a scale byte and the literal's own TEXT
+    /// (measured: `INT128 DEFAULT -99999999999999999999` is 05 15 1A 00
+    /// 1500 '-99999999999999999999' 4C, `NUMERIC(38,2) DEFAULT
+    /// 12345678901234567890.12` 1A FE and the text with its point)
+    Int128(i128, i8),
+    /// an approximate literal - one with an exponent: `blr_double` and
+    /// the literal's TEXT (measured: `DEFAULT 1e2` is 05 15 1B 0300
+    /// '1e2' 4C), converted into the column when it is bound
+    Double(f64),
+    /// `DEFAULT TRUE` / `FALSE`: `blr_bool` literal (05 15 17 01 4C)
+    Bool(bool),
     /// a text literal (`blr_text`/`blr_text2`)
     Text(String),
     /// `DEFAULT NULL` - stored explicitly, applied as the NULL the
@@ -15113,8 +15217,17 @@ enum DefaultVal {
     /// from the system clock at execute (LOCAL* forms map here too;
     /// this server's locale is the box's UTC)
     CurrentDate,
-    CurrentTime,
-    CurrentTimestamp,
+    /// ...each at its fractional-second PRECISION, which the stored BLR
+    /// names: a bare `CURRENT_TIME` (blr_current_time) is precision 0
+    /// and a bare `CURRENT_TIMESTAMP` 3, while `CURRENT_TIME(2)` /
+    /// `CURRENT_TIMESTAMP(0)` are blr_current_time2 / _timestamp2 with
+    /// a precision byte, as LOCALTIME / LOCALTIMESTAMP always carry one
+    /// (measured, the engine's RDB$DEFAULT_VALUE: 05A24C, 05A9024C,
+    /// 05A8004C, 05D7004C, and 05A14C for CURRENT_TIMESTAMP(3)). The
+    /// precision was dropped here, and a `TIME DEFAULT CURRENT_TIME`
+    /// column stored milliseconds where the engine stores whole seconds.
+    CurrentTime(u8),
+    CurrentTimestamp(u8),
     /// `DEFAULT USER` / `CURRENT_USER` (blr_user_name) - the
     /// attachment's validated login, upper-cased as the engine stores it
     User,
@@ -15160,6 +15273,30 @@ fn decode_default_blr(b: &[u8]) -> Option<DefaultVal> {
                 i64::from_le_bytes(b.get(4..12)?.try_into().ok()?),
                 *b.get(3)? as i8,
             ),
+            // blr_int128: a scale byte, u16 length, the literal's text
+            26 => {
+                let n = u16::from_le_bytes(b.get(4..6)?.try_into().ok()?) as usize;
+                let text = std::str::from_utf8(b.get(6..6 + n)?).ok()?;
+                let scale = *b.get(3)? as i8;
+                // the text's own fraction digits are the scale's: the
+                // digits without the point are the mantissa
+                let frac = text.split_once('.').map_or(0, |(_, f)| f.len());
+                if -(frac as i32) != scale as i32 {
+                    return None;
+                }
+                DefaultVal::Int128(text.replace('.', "").parse().ok()?, scale)
+            }
+            // blr_double: u16 length, the literal's text
+            27 => {
+                let n = u16::from_le_bytes(b.get(3..5)?.try_into().ok()?) as usize;
+                let text = std::str::from_utf8(b.get(5..5 + n)?).ok()?;
+                DefaultVal::Double(text.parse().ok().filter(|f: &f64| f.is_finite())?)
+            }
+            23 => DefaultVal::Bool(match *b.get(3)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            }),
             // blr_text: u16 length + bytes
             14 => {
                 let n = u16::from_le_bytes(b.get(3..5)?.try_into().ok()?) as usize;
@@ -15173,11 +15310,16 @@ fn decode_default_blr(b: &[u8]) -> Option<DefaultVal> {
             _ => return None,
         },
         45 => DefaultVal::Null,
+        // `DEFAULT UNKNOWN`: blr_cast to BOOLEAN of blr_null (measured
+        // 05 83 17 2D 4C) - a NULL
+        131 if b.get(2..5)? == [23, 45, 76] => DefaultVal::Null,
         160 => DefaultVal::CurrentDate,
-        161 => DefaultVal::CurrentTimestamp,
-        162 => DefaultVal::CurrentTime,
-        214 => DefaultVal::CurrentTimestamp, // LOCALTIMESTAMP <precision>
-        215 => DefaultVal::CurrentTime,      // LOCALTIME <precision>
+        161 => DefaultVal::CurrentTimestamp(3),
+        162 => DefaultVal::CurrentTime(0),
+        // CURRENT_TIMESTAMP(p) / CURRENT_TIME(p), then LOCALTIMESTAMP(p)
+        // / LOCALTIME(p): a precision byte each
+        168 | 214 => DefaultVal::CurrentTimestamp(clock_precision(*b.get(2)?)?),
+        169 | 215 => DefaultVal::CurrentTime(clock_precision(*b.get(2)?)?),
         44 => DefaultVal::User,              // blr_user_name
         174 => DefaultVal::Role,             // blr_current_role
         // blr_internal_info with a blr_long literal info code:
@@ -15192,6 +15334,88 @@ fn decode_default_blr(b: &[u8]) -> Option<DefaultVal> {
         },
         _ => return None,
     })
+}
+
+/// THE VALUE A NOT NULL COLUMN ADDED OVER EXISTING ROWS GIVES THEM: its
+/// DEFAULT, evaluated once at the ALTER, as the (descriptor, bytes) the
+/// new format's default section stores - see
+/// [fire_crab_ods::format::parse_format_defaults]. Measured on 2182, the
+/// section of `alter table p add ... not null` over a one-row table:
+///
+/// ```text
+/// NUMERIC(9,2)  DEFAULT 1.25   LONG  -2 len 4 sub 0   7D000000   (the literal's own)
+/// NUMERIC(18,4) DEFAULT 3      INT64 -4 len 8 sub 1   30750000.. (the field's)
+/// SMALLINT      DEFAULT 7      SHORT     len 2        0700       (the field's)
+/// CHAR(4)       DEFAULT 'ab'   TEXT      len 4 sub 0  'ab  '     (padded)
+/// CHAR(3) UTF8  DEFAULT 'q'    TEXT      len 12 sub 4 'q' + 11 blanks
+/// VARCHAR(5) UTF8 DEFAULT 'xy' TEXT      len 2 sub 4  'xy'       (TEXT, as long as the value)
+/// VARCHAR(10)   DEFAULT USER   TEXT      len 6 sub 0  'SYSDBA'
+/// DATE DEFAULT CURRENT_DATE, BOOLEAN, DOUBLE: the field's descriptor
+/// ```
+///
+/// A literal whose type and scale ARE the field's is kept as it is
+/// (sub_type 0); anything else is converted into the field. `None` for
+/// no default or `DEFAULT NULL` (the ALTER then fails on the rows'
+/// NULLs, as the engine's does); a default of a DOMAIN column, of a
+/// BLOB, or one this server cannot evaluate here refuses the statement.
+fn add_column_format_default(
+    col: &fire_crab_ods::ddl::ColumnDef,
+    ctx: &SessionCtx,
+) -> Result<Option<(Descriptor, Vec<u8>)>, String> {
+    const OUT: &str = "this NOT NULL column's DEFAULT is outside this server's ALTER TABLE ADD surface";
+    if col.domain.is_some() {
+        return Err(OUT.into());
+    }
+    let Some(def) = &col.default else { return Ok(None) };
+    let dv = decode_default_blr(&def.value_blr).ok_or(OUT)?;
+    if dv == DefaultVal::Null {
+        return Ok(None);
+    }
+    let fd = fire_crab_ods::ddl::column_descriptor(col);
+    if fd.dtype == dtype::BLOB || fd.dtype == dtype::ARRAY {
+        return Err(OUT.into());
+    }
+    let wp = default_wire_param(&dv, ctx).ok_or(OUT)?;
+    // an exact literal already of the field's type and scale stays the
+    // literal (blr_long when it fits 32 bits, else blr_int64)
+    if let DefaultVal::Int(v, sc) = dv {
+        let lit = if i32::try_from(v).is_ok() { dtype::LONG } else { dtype::INT64 };
+        if lit == fd.dtype && sc == fd.scale {
+            let bytes = if lit == dtype::LONG {
+                (v as i32).to_le_bytes().to_vec()
+            } else {
+                v.to_le_bytes().to_vec()
+            };
+            let d = Descriptor { dtype: lit, scale: sc, length: bytes.len() as u16, sub_type: 0, flags: 0, offset: 0 };
+            return Ok(Some((d, bytes)));
+        }
+    }
+    let bytes = encode_wire_value(&fd, &wp).ok_or(OUT)?.ok_or(OUT)?;
+    if fd.dtype == dtype::VARYING {
+        // a VARCHAR's default is TEXT, as long as the value itself
+        let n = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        let v = bytes.get(2..2 + n).ok_or(OUT)?.to_vec();
+        let d = Descriptor { dtype: dtype::TEXT, scale: 0, length: n as u16, sub_type: fd.sub_type, flags: 0, offset: 0 };
+        return Ok(Some((d, v)));
+    }
+    Ok(Some((fd, bytes)))
+}
+
+/// A clock default's precision byte: 0..=3 fractional digits of a
+/// second (the engine's own range for CURRENT_TIME(p)); anything else
+/// is a shape this server does not know, and the default is refused.
+fn clock_precision(p: u8) -> Option<u8> {
+    (p <= 3).then_some(p)
+}
+
+/// The session's wall-clock TIME and TIMESTAMP a clock DEFAULT stores,
+/// truncated to its precision as the engine truncates it.
+fn default_clock_time(p: u8) -> u32 {
+    trunc_time_units(session_now().1, p)
+}
+fn default_clock_timestamp(p: u8) -> (i32, u32) {
+    let (d, t) = session_now();
+    (d, trunc_time_units(t, p))
 }
 
 /// The system clock as engine values: the Modified-Julian day number
@@ -15302,7 +15526,7 @@ fn table_defaults(
     let rf_fmts = vec![(0u8, rf_descs.clone())];
     // (fid, column default blob, domain source name)
     let mut omitted: Vec<(usize, Option<(u16, u64)>, String)> = Vec::new();
-    for_each_record(db, 5, &rf_fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, 5, &rf_fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
@@ -15356,7 +15580,7 @@ fn table_defaults(
         let (fname_f, fdef_f) = (ffid("RDB$FIELD_NAME")?, ffid("RDB$DEFAULT_VALUE")?);
         let f_fmts = vec![(0u8, f_descs.clone())];
         let mut blobs: Vec<(usize, u16, u64)> = Vec::new();
-        for_each_record(db, 2, &f_fmts, usize::MAX, |values| {
+        for_each_catalog_record(db, 2, &f_fmts, usize::MAX, |values| {
             let Some(Value::Text(fname)) = values.get(fname_f) else { return };
             let fname = fname.trim_end();
             for (fid, src) in &pending {
@@ -15538,7 +15762,7 @@ fn ref_constraint_rules(db: &Database) -> Vec<(String, RefAction, RefAction)> {
     };
     let fmts = vec![(0u8, descs.clone())];
     let mut out: Vec<(String, RefAction, RefAction)> = Vec::new();
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         let Some(Value::Text(cn)) = values.get(cn_f) else { return };
         let rule = |f: usize| match values.get(f) {
             Some(Value::Text(t)) => RefAction::from_rule(t),
@@ -15574,7 +15798,7 @@ fn fk_partners_uncached(
     // `RDB$INDEX_ID - 1`, the address of the tree and of the segment
     // descriptors that outlive a deferred drop)
     let mut rows: Vec<(String, String, Option<String>, Option<u8>)> = Vec::new();
-    for_each_record(db, irel, &ifmts, usize::MAX, |values| {
+    for_each_catalog_record(db, irel, &ifmts, usize::MAX, |values| {
         let Some(Value::Text(ix)) = values.get(ix_f) else { return };
         let Some(Value::Text(rn)) = values.get(rn_f) else { return };
         let fk = match values.get(fk_f) {
@@ -15616,7 +15840,7 @@ fn fk_partners_uncached(
     let srel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$INDEX_SEGMENTS")?;
     let sfmts = vec![(0u8, s_descs.clone())];
     let mut segrows: Vec<(String, i64, String)> = Vec::new();
-    for_each_record(db, srel, &sfmts, usize::MAX, |values| {
+    for_each_catalog_record(db, srel, &sfmts, usize::MAX, |values| {
         let Some(Value::Text(ix)) = values.get(sn_f) else { return };
         let Some(Value::Text(col)) = values.get(sc_f) else { return };
         let pos = match values.get(sp_f) {
@@ -16511,12 +16735,15 @@ fn default_as_value(d: &DefaultVal, ctx: &SessionCtx) -> Option<Value> {
     Some(match d {
         DefaultVal::Int(v, 0) => Value::Int(*v),
         DefaultVal::Int(v, s) => Value::Scaled(*v, *s),
+        DefaultVal::Int128(v, s) => Value::Int128(*v, *s),
+        DefaultVal::Double(f) => Value::Double(*f),
+        DefaultVal::Bool(b) => Value::Bool(*b),
         DefaultVal::Text(t) => Value::Text(t.clone()),
         DefaultVal::Null => Value::Null,
         DefaultVal::CurrentDate => Value::Date(session_now().0),
-        DefaultVal::CurrentTime => Value::Time(session_now().1),
-        DefaultVal::CurrentTimestamp => {
-            let (d, t) = session_now();
+        DefaultVal::CurrentTime(p) => Value::Time(default_clock_time(*p)),
+        DefaultVal::CurrentTimestamp(p) => {
+            let (d, t) = default_clock_timestamp(*p);
             Value::Timestamp(d, t)
         }
         DefaultVal::User => Value::Text(ctx.user.to_ascii_uppercase()),
@@ -16642,12 +16869,15 @@ fn fk_child_default(db: &Database, fk: &FkPartner, k: usize) -> Option<Option<De
 fn default_wire_param(d: &DefaultVal, ctx: &SessionCtx) -> Option<WireParam> {
     Some(match d {
         DefaultVal::Int(v, s) => WireParam::Int(*v, *s),
+        DefaultVal::Int128(v, s) => WireParam::Int128(*v, *s),
+        DefaultVal::Double(f) => WireParam::Double(*f),
+        DefaultVal::Bool(b) => WireParam::Bool(*b),
         DefaultVal::Text(t) => WireParam::Text(t.clone()),
         DefaultVal::Null => WireParam::Null,
         DefaultVal::CurrentDate => WireParam::Date(session_now().0),
-        DefaultVal::CurrentTime => WireParam::Time(session_now().1),
-        DefaultVal::CurrentTimestamp => {
-            let (d, t) = session_now();
+        DefaultVal::CurrentTime(p) => WireParam::Time(default_clock_time(*p)),
+        DefaultVal::CurrentTimestamp(p) => {
+            let (d, t) = default_clock_timestamp(*p);
             WireParam::Timestamp(d, t)
         }
         DefaultVal::User => WireParam::Text(ctx.user.to_ascii_uppercase()),
@@ -16752,7 +16982,7 @@ fn fk_action_trigger_name(db: &Database, constraint: &str, is_update: bool) -> O
         let trel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$TRIGGERS")?;
         let fmts = vec![(0u8, descs.clone())];
         let mut found: Option<String> = None;
-        for_each_record(db, trel, &fmts, usize::MAX, |values| {
+        for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
             if found.is_some() {
                 return;
             }
@@ -17236,7 +17466,7 @@ fn db_triggers(db: &Database, event: i64) -> Option<Vec<TrigDef>> {
     let fmts = vec![(0u8, t_descs.clone())];
     let mut out: Vec<TrigDef> = Vec::new();
     let mut refuse = false;
-    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
         if refuse {
             return;
         }
@@ -17391,7 +17621,7 @@ fn ddl_triggers(db: &Database, event: u32, before: bool) -> Option<Vec<TrigDef>>
     let fmts = vec![(0u8, t_descs.clone())];
     let mut out: Vec<TrigDef> = Vec::new();
     let mut refuse = false;
-    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
         if refuse
             || !matches!(values.get(rel_f), Some(Value::Null) | None)
             || !matches!(values.get(sys_f), Some(Value::Int(0)))
@@ -17938,7 +18168,7 @@ fn db_ddl_triggers_present(db: &Database) -> bool {
     };
     let fmts = vec![(0u8, t_descs.clone())];
     let mut found = false;
-    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
         if found
             || !matches!(values.get(rel_f), Some(Value::Null) | None)
             || !matches!(values.get(sys_f), Some(Value::Int(0)))
@@ -17980,7 +18210,7 @@ fn db_triggers_present(db: &Database, event: i64) -> bool {
     };
     let fmts = vec![(0u8, t_descs.clone())];
     let mut found = false;
-    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
         if found
             || !matches!(values.get(rel_f), Some(Value::Null) | None)
             || !matches!(values.get(sys_f), Some(Value::Int(0)))
@@ -18229,7 +18459,7 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
     let fmts = vec![(0u8, t_descs.clone())];
     let mut out: Vec<TrigDef> = Vec::new();
     let mut refuse = false;
-    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
         if refuse {
             return;
         }
@@ -18610,7 +18840,7 @@ fn check_predicates_uncached(
     let mut fk_unknown = false;
     let mut fk_update_trigs: Vec<String> = Vec::new();
     let fmts = vec![(0u8, t_descs.clone())];
-    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
@@ -18875,7 +19105,7 @@ fn domain_check_predicates_uncached(
     );
     let mut by_source: Vec<(usize, String)> = Vec::new(); // (fid, field source)
     let fmts = vec![(0u8, rf_descs.clone())];
-    for_each_record(db, 5, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, 5, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
@@ -18906,7 +19136,7 @@ fn domain_check_predicates_uncached(
     // domain's name verbatim, and "dm2" and DM2 are DIFFERENT domains -
     // a case-blind find bound the wrong domain's check (review-caught:
     // fc stored rows the engine refuses)
-    for_each_record(db, 2, &ffmts, usize::MAX, |values| {
+    for_each_catalog_record(db, 2, &ffmts, usize::MAX, |values| {
         let Some(Value::Text(n)) = values.get(fname_f) else { return };
         let n = n.trim_end();
         if !by_source.iter().any(|(_, s)| s == n) {
@@ -19101,7 +19331,7 @@ fn check_constraint_names(db: &Database) -> Option<Vec<(String, String)>> {
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$CHECK_CONSTRAINTS")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut out = Vec::new();
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         if let (Some(Value::Text(t)), Some(Value::Text(c))) = (values.get(tn_f), values.get(cn_f)) {
             out.push((t.trim_end().to_string(), c.trim_end().to_string()));
         }
@@ -19126,7 +19356,7 @@ fn constraint_for_index(db: &Database, index_name: &str) -> Option<String> {
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$RELATION_CONSTRAINTS")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut found: Option<String> = None;
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         if found.is_some() {
             return;
         }
@@ -25816,7 +26046,7 @@ fn exception_identity(db: &Database, name: &str) -> Option<(i64, String)> {
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$EXCEPTIONS")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut found = None;
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         let is_it = matches!(values.get(name_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !is_it {
@@ -25860,7 +26090,7 @@ fn exception_exists(db: &Database, name: &str) -> bool {
     };
     let fmts = vec![(0u8, descs.clone())];
     let mut found = false;
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         if matches!(values.get(name_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name)) {
             found = true;
         }
@@ -27140,6 +27370,100 @@ fn num_literal_default_blr(lit: &str) -> Option<Vec<u8>> {
     Some(fire_crab_ods::ddl::num_default_blr(mantissa, scale))
 }
 
+/// A numeric DEFAULT literal past what [num_literal_default_blr] writes,
+/// in the engine's own forms (measured on 2182, RDB$DEFAULT_VALUE read
+/// back as hex):
+///
+/// ```text
+/// BIGINT        DEFAULT 9000000000             05 15 10 00 001A711802000000 4C
+/// NUMERIC(18,2) DEFAULT 123456789012.34        05 15 10 FE F22FCE733A0B0000 4C
+/// INT128        DEFAULT -99999999999999999999  05 15 1A 00 1500 '-9999...' 4C
+/// NUMERIC(38,2) DEFAULT 12345678901234567890.12  05 15 1A FE 1700 '1234...0.12' 4C
+/// NUMERIC(9,2)  DEFAULT 1e2                    05 15 1B 0300 '1e2' 4C
+/// ```
+///
+/// A mantissa past i32 is `blr_int64` with the literal's scale; past
+/// i64 it is `blr_int128` carrying the literal's TEXT; a literal with an
+/// exponent is `blr_double` carrying its text. These refused, in CREATE
+/// TABLE and ALTER TABLE ADD alike, with a bare 42000.
+fn wide_literal_default_blr(lit: &str) -> Option<Vec<u8>> {
+    let body = lit.strip_prefix('-').or_else(|| lit.strip_prefix('+')).unwrap_or(lit);
+    if let Some((m, e)) = body.split_once(['e', 'E']) {
+        // an approximate literal: digits[.digits] e [+-]digits
+        let (mi, mf) = m.split_once('.').unwrap_or((m, ""));
+        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        if (mi.is_empty() && mf.is_empty())
+            || !mi.bytes().chain(mf.bytes()).all(|c| c.is_ascii_digit())
+            || e.is_empty()
+            || !e.bytes().all(|c| c.is_ascii_digit())
+            || !lit.parse::<f64>().ok()?.is_finite()
+        {
+            return None;
+        }
+        let mut b = vec![5u8, 21, 27];
+        b.extend_from_slice(&u16::try_from(lit.len()).ok()?.to_le_bytes());
+        b.extend_from_slice(lit.as_bytes());
+        b.push(76);
+        return Some(b);
+    }
+    let neg = lit.starts_with('-');
+    let (int_part, frac) = body.split_once('.').unwrap_or((body, ""));
+    if (int_part.is_empty() && frac.is_empty())
+        || !int_part.bytes().chain(frac.bytes()).all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let scale = i8::try_from(frac.len()).ok()?.checked_neg()?;
+    let mag: i128 = format!("{}{}", int_part, frac).parse().ok()?;
+    let mantissa = if neg { -mag } else { mag };
+    if let Ok(v) = i64::try_from(mantissa) {
+        let mut b = vec![5u8, 21, 16, scale as u8];
+        b.extend_from_slice(&v.to_le_bytes());
+        b.push(76);
+        return Some(b);
+    }
+    // INT128: the literal's own text, a leading '+' dropped (never
+    // measured with one - the engine's lexer takes the sign apart)
+    if lit.starts_with('+') {
+        return None;
+    }
+    let mut b = vec![5u8, 21, 26, scale as u8];
+    b.extend_from_slice(&u16::try_from(lit.len()).ok()?.to_le_bytes());
+    b.extend_from_slice(lit.as_bytes());
+    b.push(76);
+    Some(b)
+}
+
+/// `CURRENT_TIME(p)` / `CURRENT_TIMESTAMP(p)` / `LOCALTIME(p)` /
+/// `LOCALTIMESTAMP(p)` at the head of a DEFAULT clause: the stored BLR,
+/// the upper-cased spelling for the source, and the text after it.
+fn clock_default_with_precision(after: &str) -> Option<(Vec<u8>, String, &str)> {
+    let up = after.to_ascii_uppercase();
+    for kw in ["CURRENT_TIMESTAMP", "CURRENT_TIME", "LOCALTIMESTAMP", "LOCALTIME"] {
+        let Some(tail) = up.strip_prefix(kw) else { continue };
+        let open = tail.trim_start();
+        if !open.starts_with('(') {
+            return None;
+        }
+        let close = open.find(')')?;
+        let p: u8 = open[1..close].trim().parse().ok()?;
+        if p > 3 {
+            return None;
+        }
+        let blr = match (kw, p) {
+            ("CURRENT_TIMESTAMP", 3) => vec![5, 161, 76],
+            ("CURRENT_TIMESTAMP", p) => vec![5, 168, p, 76],
+            ("CURRENT_TIME", 0) => vec![5, 162, 76],
+            ("CURRENT_TIME", p) => vec![5, 169, p, 76],
+            ("LOCALTIMESTAMP", p) => vec![5, 214, p, 76],
+            (_, p) => vec![5, 215, p, 76],
+        };
+        let consumed = after.len() - open.len() + close + 1;
+        return Some((blr, format!("{}({})", kw, p), after[consumed..].trim_start()));
+    }
+    None
+}
+
 /// The engine's keyword BLR for a session/clock CONTEXT default, but ONLY
 /// the forms `eval_ctx_default` can resolve at a call - the login, role,
 /// connection id and the clock. CURRENT_TRANSACTION (whose id this fill
@@ -28145,6 +28469,19 @@ fn parse_default_clause(
         let end = after.find(char::is_whitespace).unwrap_or(after.len());
         (&after[..end], after[end..].trim_start())
     };
+    // a CLOCK keyword with a precision, `CURRENT_TIME(2)` (or with a
+    // blank before the parenthesis): the engine writes the
+    // precision-carrying verb unless the precision is the keyword's own
+    // default (measured: CURRENT_TIME(0) 05A24C, CURRENT_TIME(2)
+    // 05A9024C, CURRENT_TIMESTAMP(3) 05A14C, CURRENT_TIMESTAMP(0)
+    // 05A8004C, LOCALTIME(3) 05D7034C, LOCALTIMESTAMP(1) 05D6014C). A
+    // precision past 3 is the engine's error, refused here.
+    if let Some((value_blr, spelled, rest)) = clock_default_with_precision(after) {
+        return Some((
+            fire_crab_ods::ddl::ColumnDefault { source: format!("DEFAULT {}", spelled), value_blr },
+            rest,
+        ));
+    }
     // a context-value keyword default (CURRENT_DATE, ...) canonicalises its
     // source to the uppercase keyword, as the engine stores it
     if let Some(value_blr) = fire_crab_ods::ddl::keyword_default_blr(lit) {
@@ -28160,8 +28497,14 @@ fn parse_default_clause(
         fire_crab_ods::ddl::str_default_blr(&parse_string_literal(lit)?)
     } else if lit.eq_ignore_ascii_case("NULL") {
         fire_crab_ods::ddl::null_default_blr()
+    } else if lit.eq_ignore_ascii_case("TRUE") || lit.eq_ignore_ascii_case("FALSE") {
+        // blr_literal blr_bool (measured: DEFAULT TRUE 05 15 17 01 4C)
+        vec![5, 21, 23, lit.eq_ignore_ascii_case("TRUE") as u8, 76]
+    } else if lit.eq_ignore_ascii_case("UNKNOWN") {
+        // CAST(NULL AS BOOLEAN) (measured: 05 83 17 2D 4C)
+        vec![5, 131, 23, 45, 76]
     } else {
-        num_literal_default_blr(lit)?
+        num_literal_default_blr(lit).or_else(|| wide_literal_default_blr(lit))?
     };
     Some((
         fire_crab_ods::ddl::ColumnDefault {
@@ -29739,7 +30082,18 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         ));
     }
     let (col, col_key) = parse_column_def(&s[add_kw + "ADD".len()..])?;
-    if col_key.is_some() || col.not_null {
+    // a NOT NULL column is carried ([fire_crab_ods::ddl::alter_table_add_column]:
+    // its default fills the rows already there, or rows present refuse
+    // it as the engine does); a PRIMARY KEY / UNIQUE on it is not
+    if col_key.is_some() {
+        return None;
+    }
+    // `DEFAULT NULL NOT NULL` is the engine's own prepare-time error
+    // ("can not define a not null column with NULL as default value",
+    // measured) - refused here, never created
+    if col.not_null
+        && col.default.as_ref().is_some_and(|d| d.value_blr == fire_crab_ods::ddl::null_default_blr())
+    {
         return None;
     }
     Some((
@@ -30237,6 +30591,9 @@ fn plan_set_generator(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
 fn plan_alter_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';');
     let toks: Vec<&str> = s.split_whitespace().collect();
+    if let Some(p) = plan_alter_sequence_options(&toks) {
+        return Some(p);
+    }
     if toks.len() != 6
         || !toks[0].eq_ignore_ascii_case("ALTER")
         || !(toks[1].eq_ignore_ascii_case("SEQUENCE") || toks[1].eq_ignore_ascii_case("GENERATOR"))
@@ -30255,6 +30612,88 @@ fn plan_alter_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         },
         Vec::new(),
     ))
+}
+
+/// `ALTER SEQUENCE <g>` with an INCREMENT, or a RESTART with no WITH -
+/// the options the engine's grammar takes in any order, each at most
+/// once (parse.y alter_sequence_options). Measured on 2182 over `start
+/// with 10 increment by 5`: `increment by 100` then NEXT VALUE is 105
+/// (the stored value stays, the step changes); over `start with 1`,
+/// `restart with 50 increment by 2` is 50, a bare `restart` is 1 again,
+/// `increment 7` (BY is noise) is 8. These were a bare 42000 here, and
+/// a NEXT VALUE after one answered the old step.
+fn plan_alter_sequence_options(toks: &[&str]) -> Option<(Plan, Vec<Descriptor>)> {
+    if toks.len() < 4
+        || !toks[0].eq_ignore_ascii_case("ALTER")
+        || !(toks[1].eq_ignore_ascii_case("SEQUENCE") || toks[1].eq_ignore_ascii_case("GENERATOR"))
+    {
+        return None;
+    }
+    let name = generator_ident(toks[2])?;
+    let mut restart: Option<Option<i64>> = None;
+    let mut step: Option<i64> = None;
+    let mut i = 3;
+    while i < toks.len() {
+        if toks[i].eq_ignore_ascii_case("RESTART") && restart.is_none() {
+            i += 1;
+            if toks.get(i).is_some_and(|t| t.eq_ignore_ascii_case("WITH")) {
+                restart = Some(Some(toks.get(i + 1)?.parse().ok()?));
+                i += 2;
+            } else {
+                restart = Some(None);
+            }
+        } else if toks[i].eq_ignore_ascii_case("INCREMENT") && step.is_none() {
+            i += 1;
+            if toks.get(i).is_some_and(|t| t.eq_ignore_ascii_case("BY")) {
+                i += 1;
+            }
+            // a signed_long_integer: 32 bits
+            step = Some(toks.get(i)?.parse::<i32>().ok()? as i64);
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+    // the bare `RESTART WITH n` keeps its own plan ([GenWrite::Restart])
+    if step.is_none() && matches!(restart, Some(Some(_))) {
+        return None;
+    }
+    if step.is_none() && restart.is_none() {
+        return None;
+    }
+    Some((
+        Plan::SetGenerator {
+            name,
+            mode: GenWrite::Alter { restart, step },
+            stmt_type: 5, // isc_info_sql_stmt_ddl
+        },
+        Vec::new(),
+    ))
+}
+
+/// A generator's `RDB$INITIAL_VALUE` - where a bare `RESTART` goes back
+/// to (0 when NULL, as the engine reads it).
+fn generator_initial(db: &Database, name: &str) -> Option<i64> {
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$GENERATORS")?;
+    let formats = select_formats(db, "RDB$GENERATORS", rel);
+    let cols = relation_columns(&db.bytes(), db.page_size, "RDB$GENERATORS");
+    let field = |n: &str| cols.iter().find(|c| c.name.eq_ignore_ascii_case(n)).map(|c| c.field_id as usize);
+    let (name_fid, init_fid) = (field("RDB$GENERATOR_NAME")?, field("RDB$INITIAL_VALUE")?);
+    let want = name.trim();
+    let mut found = None;
+    for_each_catalog_record(db, rel, &formats, usize::MAX, |row| {
+        if found.is_none() {
+            if let Some(Value::Text(n)) = row.get(name_fid) {
+                if n.trim_end_matches(' ').eq_ignore_ascii_case(want) {
+                    found = Some(match row.get(init_fid) {
+                        Some(Value::Int(v)) => *v,
+                        _ => 0,
+                    });
+                }
+            }
+        }
+    });
+    found
 }
 
 /// Parse `INSERT INTO <t> [(col, ...)] VALUES (val, ...)` - single row,
@@ -36643,7 +37082,14 @@ fn execute_dml_collecting_inner(
         // transaction started from can undo it. A generator is the
         // exception: its undo is a value written FORWARD by the
         // generator windows, which is why it does not ask for one.
-        Plan::SetGenerator { .. } => (db.work_copy()?, None),
+        //
+        // ...except a new STEP: that is a catalog row, written under the
+        // transaction like any other DDL, so a ROLLBACK takes it back
+        // (measured with AUTODDL OFF: `alter sequence s3 increment by
+        // 50; rollback;` leaves NEXT VALUE at 1 and the row at 1)
+        Plan::SetGenerator { mode, .. } if !matches!(mode, GenWrite::Alter { step: Some(_), .. }) => {
+            (db.work_copy()?, None)
+        }
         _ => {
             // A DDL STATEMENT IS THE TRANSACTION'S: its catalog rows are
             // written under the window's own id (Image::ddl_tx), so a
@@ -37105,7 +37551,12 @@ fn execute_dml_collecting_inner(
         Plan::AlterTableAdd { table, col } => {
             let mut col = col.clone();
             apply_db_charset(std::slice::from_mut(&mut col), db_default_charset(&work, db.page_size));
-            fire_crab_ods::ddl::alter_table_add_column(&mut work, db.page_size, table, &col)?;
+            let fmt_default = if col.not_null && col.identity.is_none() {
+                add_column_format_default(&col, ctx)?
+            } else {
+                None
+            };
+            fire_crab_ods::ddl::alter_table_add_column(&mut work, db.page_size, table, &col, fmt_default)?;
             (0, 0, 0)
         }
         Plan::AlterTableAddFk { table, fk } => {
@@ -37403,12 +37854,15 @@ fn execute_dml_collecting_inner(
                 let d = descs.get(*fid).ok_or("field beyond format")?;
                 let wp = match dv {
                     DefaultVal::Int(v, s) => WireParam::Int(*v, *s),
+                    DefaultVal::Int128(v, s) => WireParam::Int128(*v, *s),
+                    DefaultVal::Double(f) => WireParam::Double(*f),
+                    DefaultVal::Bool(b) => WireParam::Bool(*b),
                     DefaultVal::Text(t) => WireParam::Text(t.clone()),
                     DefaultVal::Null => continue,
                     DefaultVal::CurrentDate => WireParam::Date(session_now().0),
-                    DefaultVal::CurrentTime => WireParam::Time(session_now().1),
-                    DefaultVal::CurrentTimestamp => {
-                        let (dd, tt) = session_now();
+                    DefaultVal::CurrentTime(p) => WireParam::Time(default_clock_time(*p)),
+                    DefaultVal::CurrentTimestamp(p) => {
+                        let (dd, tt) = default_clock_timestamp(*p);
                         WireParam::Timestamp(dd, tt)
                     }
                     DefaultVal::User => WireParam::Text(ctx.user.to_ascii_uppercase()),
@@ -37426,6 +37880,24 @@ fn execute_dml_collecting_inner(
                         0,
                     ),
                 };
+                // A TEXT DEFAULT OF A BLOB COLUMN is a blob of this
+                // relation, made per row the way a literal in VALUES is:
+                // the stored literal's octets (a NONE literal - byte
+                // copied into the column's charset, as the engine moves
+                // NONE). Measured, `add xk blob sub_type text default
+                // 'bl'` then `insert into t (k) values (2)` stores XK
+                // 'bl' on the engine; this refused every INSERT that
+                // omitted the column with a bare 42000 (CREATE TABLE's
+                // blob default too), once ALTER TABLE ADD stored it.
+                if d.dtype == fire_crab_ods::format::dtype::BLOB {
+                    if let WireParam::Text(t) = &wp {
+                        let id = store_blob_literal(db, &mut work, *rel, d, t.as_bytes(), 1)?;
+                        let at = d.offset as usize;
+                        image[at..at + 8].copy_from_slice(&id);
+                        image[fid / 8] &= !(1 << (fid % 8));
+                        continue;
+                    }
+                }
                 match encode_wire_value(d, &wp)
                     .ok_or_else(|| fit_or(d, &wp, "default value does not fit its column"))?
                 {
@@ -38643,14 +39115,34 @@ fn execute_dml_collecting_inner(
             // next GEN_ID yields n) - both read from RDB$GENERATORS
             let (_id, incr) = generator_info(db, name).ok_or("no such generator")?;
             let value = match mode {
-                GenWrite::Absolute(n) => *n,
-                GenWrite::Restart(n) => n - incr,
+                GenWrite::Absolute(n) => Some(*n),
+                GenWrite::Restart(n) => Some(n - incr),
+                GenWrite::Alter { restart, step } => {
+                    let mut incr = incr;
+                    if let Some(st) = step {
+                        if *st == 0 {
+                            return Err("INCREMENT BY 0 is an illegal option for sequence".into());
+                        }
+                        // the new step is a catalog write of this
+                        // transaction's, as the engine MODIFYs the row
+                        if *st != incr {
+                            work.ddl_tx = stmt_tx.map(u64::from);
+                            fire_crab_ods::ddl::alter_sequence_increment(&mut work, db.page_size, name, *st)?;
+                            incr = *st;
+                        }
+                    }
+                    // a RESTART sets by the NEW step; no RESTART moves
+                    // no value
+                    match restart {
+                        None => None,
+                        Some(Some(n)) => Some(n - incr),
+                        Some(None) => Some(generator_initial(db, name).ok_or("no such generator")? - incr),
+                    }
+                }
             };
-            // an absolute set NEVER touches the page: it lands in the
-            // transaction cache and posts a dfw_set_generator into the
-            // current window; COMMIT applies the survivors - see
-            // [GenWindow]
-            post_generator_set(db, name, value);
+            if let Some(value) = value {
+                post_generator_set(db, name, value);
+            }
             (0, 0, 0)
         }
         _ => return Err("not a DML plan".into()),
@@ -39028,8 +39520,26 @@ fn text_bytes_for_r(
     // which is why five two-byte characters into a VARCHAR(5) NONE
     // report 10 and seven of them into a VARCHAR(5) UTF8 report 7.
     let expected = fire_crab_ods::intl::char_length(d.dtype, flen as u16, d.sub_type);
-    if text.chars().count() > expected {
-        return Err(TextFit::TooLong { expected, actual: text.chars().count() });
+    // THE CHARACTERS ARE THE DESTINATION'S: a byte-carrier source (a NONE
+    // attachment's literal) lands its octets verbatim, and a real
+    // destination charset counts them in ITS characters. Counting the
+    // carrier's (one per byte) made 'é' sent as C3 A9 on a NONE
+    // connection two characters: 22001 "expected length 1, actual 2"
+    // into a CHAR(1) CHARACTER SET UTF8, where the engine stores it
+    // (measured, OCTET_LENGTH 2).
+    let actual = if fire_crab_ods::intl::byte_carrier(src_cs)
+        && !fire_crab_ods::intl::byte_carrier(dest_cs)
+    {
+        match std::str::from_utf8(b) {
+            Ok(u) if dest_cs == fire_crab_ods::intl::CS_UTF8 => u.chars().count(),
+            _ => fire_crab_ods::intl::decode_text(dest_cs, b)
+                .map_or(text.chars().count(), |t| t.chars().count()),
+        }
+    } else {
+        text.chars().count()
+    };
+    if actual > expected {
+        return Err(TextFit::TooLong { expected, actual });
     }
     match d.dtype {
         dtype::VARYING => {
@@ -40302,7 +40812,7 @@ fn index_error_names(db: &Database, table: &str, index_id: u8) -> Option<(String
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$INDICES")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut found: Option<String> = None;
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         if found.is_some() {
             return;
         }
@@ -45255,7 +45765,7 @@ fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
     // the name is RESOLVED once: the first row that carries it is the
     // relation, and whether THAT row has a view source is the answer
     let mut resolved = false;
-    for_each_record(db, 6, &fmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 6, &fmts, usize::MAX, |v| {
         let row_name = match v.get(name_f) {
             Some(Value::Text(t)) => Some(t.as_str()),
             _ => None,
@@ -45611,7 +46121,7 @@ fn view_field_bases(db: &Database, view: &str) -> Option<Vec<(String, Option<Str
     );
     let fmts = vec![(0u8, descs)];
     let mut out: Vec<(i64, String, Option<String>)> = Vec::new();
-    for_each_record(db, 5, &fmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 5, &fmts, usize::MAX, |v| {
         let is_rel = matches!(v.get(rel_f),
             Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
@@ -45649,7 +46159,7 @@ fn view_check_triggers(db: &Database, view: &str) -> Option<(Option<String>, Opt
     let fmts = vec![(0u8, descs)];
     let mut upd: Option<String> = None;
     let mut ins: Option<String> = None;
-    for_each_record(db, trel, &fmts, usize::MAX, |v| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |v| {
         let is_rel = matches!(v.get(rel_f),
             Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel || !matches!(v.get(sys_f), Some(Value::Int(5))) {
@@ -47762,7 +48272,7 @@ fn relation_schema(db: &Database, name: &str) -> Option<String> {
     let flag_f = fid("RDB$SYSTEM_FLAG");
     let fmts = vec![(0u8, rdescs)];
     let mut found: Option<String> = None;
-    for_each_record(db, 6, &fmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 6, &fmts, usize::MAX, |v| {
         let hit = matches!(v.get(name_f),
             Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !hit || found.is_some() {
@@ -57202,13 +57712,16 @@ struct ReadView<'a> {
 
 impl<'a> ReadView<'a> {
     fn of(db: &Database, image: &'a fire_crab_ods::Image) -> ReadView<'a> {
+        let catalog = CATALOG_WALK.with(|c| c.get());
         ReadView {
             tips: fire_crab_ods::tra::TipChain::read(image, db.page_size),
             own: db.own_tx(),
-            // isolation snapshot if it has one, else the statement view
-            snapshot: db.view_snapshot(),
+            // isolation snapshot if it has one, else the statement view -
+            // except for a catalog walk, which reads the latest committed
+            // schema (see [for_each_catalog_record])
+            snapshot: if catalog { None } else { db.view_snapshot() },
             // only a concurrency snapshot makes a write conflict
-            is_isolation: db.snapshot.is_some(),
+            is_isolation: !catalog && db.snapshot.is_some(),
             limbo: std::cell::Cell::new(0),
             decode_len: usize::MAX,
         }
@@ -58485,6 +58998,59 @@ fn count_visible_records(db: &Database, rel: u16) -> Result<i64, u64> {
         }
     }
     Ok(n)
+}
+
+thread_local! {
+    /// Set while [for_each_catalog_record] walks: [ReadView::of] then
+    /// leaves the transaction's snapshot out. See there for why.
+    static CATALOG_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A walk of a SYSTEM relation that the server makes FOR ITSELF - to
+/// learn a table's defaults, a domain's collation, a procedure's body,
+/// which relations are GTTs - reads the LATEST COMMITTED catalog (and
+/// this attachment's own uncommitted DDL), never the transaction's
+/// isolation snapshot. The engine's metadata is not MVCC-bound: it
+/// resolves names through its metadata cache, which a committed DDL
+/// updates for every attachment at once. Measured, isql's AUTODDL runs
+/// each DDL in a transaction of its own and commits it, while the
+/// statements after it run in the SNAPSHOT transaction isql opened
+/// before the DDL:
+///
+/// ```text
+///   create procedure p0 ...;  select * from p0        -> X 1 (engine)
+///   create table tnew ...;    select count(*) from rdb$relations
+///                             where rdb$relation_name = 'TNEW'  -> 0
+/// ```
+///
+/// - the new object is USABLE at once while a user SELECT of the
+/// catalog still honours the snapshot and does not see its row. These
+/// walks took the snapshot and answered what the transaction's start
+/// knew: a procedure unknown (42000), a GTT ON COMMIT DELETE ROWS the
+/// COMMIT purge did not know of (and [gtt_relations] then held that
+/// empty answer in the SHARED cache, for every attachment, until the
+/// next DDL). A user query of RDB$ tables does not come here and reads
+/// under its snapshot - which hides a new TABLE's or PROCEDURE's row
+/// as the engine does, but not every DDL's: measured, such a SELECT
+/// here already misses a column dropped after the snapshot began and
+/// sees a domain or sequence created after it, where the engine's
+/// snapshot still answers the old catalog (recorded, not fixed).
+fn for_each_catalog_record<F: FnMut(&[Value])>(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    decode_len: usize,
+    f: F,
+) -> u64 {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let was = self.0;
+            CATALOG_WALK.with(|c| c.set(was));
+        }
+    }
+    let _reset = Reset(CATALOG_WALK.with(|c| c.replace(true)));
+    for_each_record(db, rel, formats, decode_len, f)
 }
 
 /// Returns the LIMBO transaction the walk stopped on, 0 when none -
@@ -77793,6 +78359,22 @@ fn refuse_literal_conv(text: &str, overflow: bool) -> Option<Term> {
 /// the error arrived from inside the fetch - `serve-real-absround.sh`'s
 /// red cell. `None` refuses the statement through [refuse_literal_conv].
 fn nullif_dec_literal(a: Expr, b: Expr, descs: &[Descriptor]) -> Option<Expr> {
+    // A COLLATED NULLIF compares under the collation, as every other
+    // comparison does: the pair goes through [cmp_sides], and when that
+    // keys it the node is `IIF(a = b, NULL, a)` over the keys - the
+    // first operand, untouched, is still what comes through. Measured:
+    // `NULLIF(a, 'abc')` over a UNICODE_CI 'AbC' is NULL on the engine,
+    // where the plain value compare here answered 'AbC'.
+    if expr_reads_coll(&a, descs) || expr_reads_coll(&b, descs) {
+        let (l, r) = cmp_sides(a.clone(), b.clone(), descs)?;
+        if matches!(l, Expr::CollKey(..)) || matches!(r, Expr::CollKey(..)) {
+            return Some(Expr::Iif(
+                Box::new(Cond2::Cmp(Box::new(l), Cmp::Eq, Box::new(r))),
+                Box::new(Expr::Null),
+                Box::new(a),
+            ));
+        }
+    }
     let width = |e: &Expr| -> Option<bool> {
         match e {
             Expr::Col(fid) => match descs.get(*fid)?.dtype {
@@ -94642,7 +95224,7 @@ fn procedure_defined(db: &Database, name: &str) -> bool {
     let (schema_f, pkg_f) = (fid("RDB$SCHEMA_NAME"), fid("RDB$PACKAGE_NAME"));
     let fmts = vec![(0u8, descs)];
     let mut found = false;
-    for_each_record(db, 26, &fmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 26, &fmts, usize::MAX, |v| {
         if found {
             return;
         }
@@ -94695,6 +95277,11 @@ fn default_val_to_value(d: DefaultVal) -> Option<Value> {
 fn split_default(dv: Option<DefaultVal>) -> (Option<Value>, Option<DefaultVal>) {
     match dv {
         None => (None, None),
+        // the wide / approximate / boolean literals a COLUMN default
+        // decodes to are not a parameter default this fill evaluates:
+        // they stay what they were before [decode_default_blr] read
+        // them - no default carried
+        Some(DefaultVal::Int128(..) | DefaultVal::Double(_) | DefaultVal::Bool(_)) => (None, None),
         Some(d) => match default_val_to_value(d.clone()) {
             Some(v) => (Some(v), None),
             None => (None, Some(d)),
@@ -94763,7 +95350,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     // type for the body this one read
     let mut found = false;
     let mut found_schema: Option<String> = None;
-    for_each_record(db, 26, &pfmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 26, &pfmts, usize::MAX, |v| {
         let hit = matches!(v.get(name_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || found || !row_visible(v, schema_f, pkg_f) {
@@ -94848,7 +95435,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     // relation, and merging them in was the probed arity error
     let (cschema_f, cpkg_f) = (cfid("RDB$SCHEMA_NAME"), cfid("RDB$PACKAGE_NAME"));
     let cfmts = vec![(0u8, cdescs)];
-    for_each_record(db, 27, &cfmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 27, &cfmts, usize::MAX, |v| {
         let hit = matches!(v.get(pn_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || !row_visible(v, cschema_f, cpkg_f) {
@@ -94982,7 +95569,7 @@ fn package_body_source(db: &Database, schema: &str, pkg: &str) -> Option<String>
     let fmts = vec![(0u8, descs)];
     let mut body: Option<String> = None;
     let mut found = false;
-    for_each_record(db, rel, &fmts, usize::MAX, |v| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |v| {
         if found {
             return;
         }
@@ -96142,7 +96729,7 @@ fn gtt_relations(db: &Database) -> std::sync::Arc<Vec<(u16, i64)>> {
         };
         let fmts = vec![(0u8, rdescs)];
         let mut out: Vec<(u16, i64)> = Vec::new();
-        for_each_record(db, 6, &fmts, usize::MAX, |v| {
+        for_each_catalog_record(db, 6, &fmts, usize::MAX, |v| {
             let ty = match v.get(ty_f) {
                 Some(Value::Int(t)) => *t,
                 _ => return,
@@ -100314,9 +100901,9 @@ fn eval_ctx_default(dv: &DefaultVal, ctx: &SessionCtx) -> Option<Value> {
         DefaultVal::Role => Value::Text("NONE".into()),
         DefaultVal::Connection => Value::Int(ctx.attach_id as i64),
         DefaultVal::CurrentDate => Value::Date(session_now().0),
-        DefaultVal::CurrentTime => Value::Time(session_now().1),
-        DefaultVal::CurrentTimestamp => {
-            let (d, t) = session_now();
+        DefaultVal::CurrentTime(p) => Value::Time(default_clock_time(*p)),
+        DefaultVal::CurrentTimestamp(p) => {
+            let (d, t) = default_clock_timestamp(*p);
             Value::Timestamp(d, t)
         }
         _ => return None,
@@ -100743,7 +101330,7 @@ fn user_function_sigs(db: &Database) -> std::collections::HashMap<String, (Descr
     // path spelling) and `SCHEMA.PKG.FF` (fully qualified), each mapping
     // to the same signature - and load_function resolves either.
     let mut keys: Vec<(String, String)> = Vec::new();
-    for_each_record(db, 14, &ffmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 14, &ffmts, usize::MAX, |v| {
         if matches!(sys_f.and_then(|i| v.get(i)), Some(Value::Int(n)) if *n != 0) {
             return;
         }
@@ -100932,7 +101519,7 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     let mut body_at: Option<(usize, usize)> = None;
     let mut found = false;
     let mut found_schema: Option<String> = None;
-    for_each_record(db, 14, &ffmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 14, &ffmts, usize::MAX, |v| {
         let hit = matches!(v.get(name_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || found || !row_visible(v, schema_f, pkg_f) {
             return;
@@ -100976,7 +101563,7 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     let (aschema_f, apkg_f) = (afid("RDB$SCHEMA_NAME"), afid("RDB$PACKAGE_NAME"));
     let afmts = vec![(0u8, adescs)];
     let mut raw: Vec<(i64, String, String, Option<DefaultVal>)> = Vec::new();
-    for_each_record(db, 15, &afmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 15, &afmts, usize::MAX, |v| {
         let hit = matches!(v.get(an_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || !row_visible(v, aschema_f, apkg_f) {
             return;
@@ -104289,6 +104876,53 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             }
         }
         (ExprType::Text, ExprType::Text) => {
+            // A CARRIER LITERAL AGAINST A COLLATED SIDE takes the
+            // collation: the literal's octets are read AS the collated
+            // side's charset, exactly as a WHERE term reads them
+            // ([adopt_carrier_literal]), and the comparison then goes
+            // down the collation path below. Measured on 2182 from a
+            // NONE attachment, over a UTF8 UNICODE_CI column holding
+            // 'AbC': `IIF(a = 'abc', 1, 0)`, `CASE WHEN`, `a = 'abc'` as
+            // a value, `a IN ('abc')`, `DECODE`, `NULLIF`, `IS NOT
+            // DISTINCT FROM` and a correlated EXISTS all answer the
+            // case-insensitive 1 / TRUE / NULL. The byte-space branch
+            // below compared the octets and answered 0 / FALSE / 'AbC'
+            // - a silent wrong answer, while `WHERE a = 'abc'` found the
+            // row. An EXPRESSION over the collated column adopts too, so
+            // it reaches the collation branch's refusal rather than the
+            // octet compare. Bytes that do not spell the charset stay a
+            // carrier (no match, no raise, as the engine does).
+            let mut adopted = false;
+            let (lhs, rhs) = {
+                use fire_crab_ods::intl;
+                let att = CURRENT_ATT_CS.with(|c| c.get());
+                let collated_cs = |e: &Expr| -> Option<u8> {
+                    if !expr_reads_coll(e, descs) {
+                        return None;
+                    }
+                    let cs = cmp_text_charset(e, descs)?;
+                    (!intl::byte_carrier(cs)).then_some(cs)
+                };
+                let adopt = |lit: Expr, cs: u8| match lit {
+                    Expr::Str(v) => match transcode_text(att, cs, v.clone()) {
+                        Ok(t) => Expr::Str(t),
+                        Err(_) => Expr::Str(v),
+                    },
+                    other => other,
+                };
+                if !intl::byte_carrier(att) {
+                    (lhs, rhs)
+                } else if let (Expr::Str(_), Some(cs)) = (&lhs, collated_cs(&rhs)) {
+                    adopted = true;
+                    (adopt(lhs, cs), rhs)
+                } else if let (Some(cs), Expr::Str(_)) = (collated_cs(&lhs), &rhs) {
+                    adopted = true;
+                    let r = adopt(rhs, cs);
+                    (lhs, r)
+                } else {
+                    (lhs, rhs)
+                }
+            };
             // BYTE-SPACE reconciliation: when EXACTLY ONE operand is a
             // byte carrier (NONE/OCTETS/hex, or a literal under a
             // byte-carrier attachment) and the other a real charset, the
@@ -104300,8 +104934,8 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             // collation branches (a byte-carrier side bypasses collation
             // in the engine too). Two real charsets, or two byte
             // carriers, fall through to the existing paths unchanged.
-            if let (Some(ca), Some(cb)) =
-                (cmp_text_charset(&lhs, descs), cmp_text_charset(&rhs, descs))
+            if let (false, Some(ca), Some(cb)) =
+                (adopted, cmp_text_charset(&lhs, descs), cmp_text_charset(&rhs, descs))
             {
                 use fire_crab_ods::intl::{byte_carrier, CS_OCTETS};
                 if byte_carrier(ca) != byte_carrier(cb) {
@@ -114253,7 +114887,7 @@ fn generator_info(db: &Database, name: &str) -> Option<(i64, i64)> {
     let incr_fid = field("RDB$GENERATOR_INCREMENT")?;
     let want = name.trim();
     let mut found = None;
-    for_each_record(db, rel, &formats, usize::MAX, |row| {
+    for_each_catalog_record(db, rel, &formats, usize::MAX, |row| {
         if found.is_some() {
             return;
         }
@@ -115176,8 +115810,8 @@ mod tests {
             DefaultVal::Text("x".into()),
             DefaultVal::Null,
             DefaultVal::CurrentDate,
-            DefaultVal::CurrentTime,
-            DefaultVal::CurrentTimestamp,
+            DefaultVal::CurrentTime(0),
+            DefaultVal::CurrentTimestamp(3),
             DefaultVal::User,
             DefaultVal::Role,
             DefaultVal::Connection,
@@ -120502,8 +121136,15 @@ mod tests {
         );
         assert_eq!(decode_default_blr(&[5, 45, 76]), Some(DefaultVal::Null));
         assert_eq!(decode_default_blr(&[5, 160, 76]), Some(DefaultVal::CurrentDate));
-        assert_eq!(decode_default_blr(&[5, 214, 3, 76]), Some(DefaultVal::CurrentTimestamp));
-        assert_eq!(decode_default_blr(&[5, 215, 0, 76]), Some(DefaultVal::CurrentTime));
+        assert_eq!(decode_default_blr(&[5, 214, 3, 76]), Some(DefaultVal::CurrentTimestamp(3)));
+        assert_eq!(decode_default_blr(&[5, 215, 0, 76]), Some(DefaultVal::CurrentTime(0)));
+        // the engine's own bytes (measured): a bare CURRENT_TIME is
+        // precision 0, CURRENT_TIME(2) / CURRENT_TIMESTAMP(0) carry theirs
+        assert_eq!(decode_default_blr(&[5, 162, 76]), Some(DefaultVal::CurrentTime(0)));
+        assert_eq!(decode_default_blr(&[5, 161, 76]), Some(DefaultVal::CurrentTimestamp(3)));
+        assert_eq!(decode_default_blr(&[5, 169, 2, 76]), Some(DefaultVal::CurrentTime(2)));
+        assert_eq!(decode_default_blr(&[5, 168, 0, 76]), Some(DefaultVal::CurrentTimestamp(0)));
+        assert_eq!(decode_default_blr(&[5, 169, 9, 76]), None);
         // session-dependent defaults evaluate from the attachment
         assert_eq!(decode_default_blr(&[5, 44, 76]), Some(DefaultVal::User));
         assert_eq!(decode_default_blr(&[5, 174, 76]), Some(DefaultVal::Role));
@@ -128066,7 +128707,48 @@ mod tests {
         ));
         // other ALTER forms are not generator restarts
         assert!(plan_alter_sequence("ALTER TABLE T ADD C INT").is_none());
-        assert!(plan_alter_sequence("ALTER SEQUENCE SEQ_A RESTART").is_none());
+        // a bare RESTART goes back to RDB$INITIAL_VALUE, and INCREMENT
+        // [BY] sets a new step (measured on 2182 - these were refused)
+        assert!(matches!(
+            plan_alter_sequence("ALTER SEQUENCE SEQ_A RESTART"),
+            Some((Plan::SetGenerator { mode: GenWrite::Alter { restart: Some(None), step: None }, .. }, _))
+        ));
+        assert!(matches!(
+            plan_alter_sequence("ALTER SEQUENCE SEQ_A RESTART WITH 50 INCREMENT BY 2"),
+            Some((Plan::SetGenerator { mode: GenWrite::Alter { restart: Some(Some(50)), step: Some(2) }, .. }, _))
+        ));
+        assert!(matches!(
+            plan_alter_sequence("ALTER SEQUENCE SEQ_A INCREMENT 7"),
+            Some((Plan::SetGenerator { mode: GenWrite::Alter { restart: None, step: Some(7) }, .. }, _))
+        ));
+        // an option twice, or a word that is not one, still refuses
+        assert!(plan_alter_sequence("ALTER SEQUENCE SEQ_A INCREMENT BY 2 INCREMENT BY 3").is_none());
+        assert!(plan_alter_sequence("ALTER SEQUENCE SEQ_A START WITH 3").is_none());
+    }
+
+    #[test]
+    fn wide_and_clock_defaults_write_the_engines_blr() {
+        // measured RDB$DEFAULT_VALUE bytes on 2182
+        assert_eq!(
+            wide_literal_default_blr("9000000000"),
+            Some(vec![5, 21, 16, 0, 0x00, 0x1A, 0x71, 0x18, 0x02, 0, 0, 0, 76])
+        );
+        let mut i128_blr = vec![5u8, 21, 26, 0, 21, 0];
+        i128_blr.extend_from_slice(b"-99999999999999999999");
+        i128_blr.push(76);
+        assert_eq!(wide_literal_default_blr("-99999999999999999999"), Some(i128_blr));
+        assert_eq!(wide_literal_default_blr("1e2"), Some(vec![5, 21, 27, 3, 0, b'1', b'e', b'2', 76]));
+        assert_eq!(wide_literal_default_blr("1e"), None);
+        assert_eq!(
+            clock_default_with_precision("CURRENT_TIME(2) NOT NULL").map(|(b, _, r)| (b, r.to_string())),
+            Some((vec![5, 169, 2, 76], "NOT NULL".to_string()))
+        );
+        assert_eq!(clock_default_with_precision("current_timestamp (3)").map(|(b, ..)| b), Some(vec![5, 161, 76]));
+        assert_eq!(clock_default_with_precision("CURRENT_TIME(0)").map(|(b, ..)| b), Some(vec![5, 162, 76]));
+        assert_eq!(clock_default_with_precision("LOCALTIME(9)"), None);
+        assert_eq!(decode_default_blr(&[5, 21, 23, 1, 76]), Some(DefaultVal::Bool(true)));
+        assert_eq!(decode_default_blr(&[5, 131, 23, 45, 76]), Some(DefaultVal::Null));
+        assert_eq!(decode_default_blr(&[5, 21, 27, 3, 0, b'1', b'e', b'2', 76]), Some(DefaultVal::Double(100.0)));
     }
 
     #[test]

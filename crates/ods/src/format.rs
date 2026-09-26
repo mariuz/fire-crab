@@ -870,6 +870,69 @@ pub fn relation_format_defaults(
         .collect()
 }
 
+/// The NEWEST format's default section, RAW: (field index, the
+/// default's own descriptor, its value bytes) - what an ALTER that
+/// mints the next format must carry forward, since a record stored
+/// before a defaulted NOT NULL field existed reads that field from the
+/// newest format's section, whatever else changed since (measured: the
+/// engine's format 4 of `P` still lists the defaults format 2 and 3
+/// added, after a nullable `ADD W` that contributed none).
+pub fn newest_format_default_section(
+    file: &crate::Image,
+    page_size: usize,
+    relation: u16,
+) -> Vec<(u16, Descriptor, Vec<u8>)> {
+    let sys = formats_table_format();
+    let tips = crate::tra::TipChain::read(file, page_size);
+    let mut best: Option<(i64, Vec<u8>)> = None;
+    for dp_no in relation_data_pages(file, page_size, REL_FORMATS) {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
+            continue;
+        };
+        for r in dp.records() {
+            let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else {
+                continue;
+            };
+            let row = decode_record(&image, &sys);
+            let (Value::Int(rel_id), Value::Int(fmt_no), Value::Blob(_, blob_recno)) =
+                (&row[0], &row[1], &row[2])
+            else {
+                continue;
+            };
+            if *rel_id as u16 != relation || best.as_ref().is_some_and(|(n, _)| *n >= *fmt_no) {
+                continue;
+            }
+            if let Some(blob) = read_blob(file, page_size, REL_FORMATS, *blob_recno, true) {
+                best = Some((*fmt_no, blob));
+            }
+        }
+    }
+    let Some((_, b)) = best else { return Vec::new() };
+    let mut out = Vec::new();
+    if b.len() < 2 {
+        return out;
+    }
+    let mut at = 2 + u16_at(&b, 0) as usize * 12;
+    if b.len() < at + 2 {
+        return out;
+    }
+    let n = u16_at(&b, at) as usize;
+    at += 2;
+    for _ in 0..n {
+        let Some(desc) = b.get(at + 2..at + 14).and_then(Descriptor::decode) else {
+            return out;
+        };
+        let field = u16_at(&b, at);
+        at += 14;
+        let Some(v) = b.get(at..at + desc.length as usize) else {
+            return out;
+        };
+        at += desc.length as usize;
+        out.push((field, desc, v.to_vec()));
+    }
+    out
+}
+
 pub fn relation_formats(
     file: &crate::Image,
     page_size: usize,
