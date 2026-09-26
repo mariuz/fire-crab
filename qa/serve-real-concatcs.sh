@@ -192,8 +192,9 @@ echo "--- 5. the CONCAT double-encode: VALUE diverges, DESCRIBE agrees ------"
 # vs 64, while values stayed byte-identical).
 #
 # The two NONE-attachment cells are FIXED (the literal is decoded into
-# the column's set, its describe still measured in octets); the other
-# three stay recorded. Recorded rather than fixed: three widths meet one join rule here (a
+# the column's set, its describe still measured in octets), and so, since
+# the literal was given the attachment's REAL set in the join, are the
+# other three. Recorded rather than fixed: three widths meet one join rule here (a
 # literal carries a character count AND an octet count, resolve_text_cs
 # picks between them by the ATTACHMENT), and the divergences pull in
 # OPPOSITE directions. A rule that predicts all eighteen cells has not
@@ -229,9 +230,14 @@ same_len() { # <label> <expr> [flags]
 }
 same_len "literal || UTF8 col, NONE attachment (it doubled)" "'é' || U" "-ch NONE"
 same_len "UTF8 col || literal, NONE attachment (it doubled)" "U || 'é'" "-ch NONE"
-known_len_diff "literal || UTF8 col, WIN1252 attachment" "'é' || U" "-ch WIN1252"
-known_len_diff "literal || WIN1252 col, UTF8 attachment" "'é' || W" "-ch UTF8"
-known_len_diff "literal || OCTETS col, UTF8 attachment"  "'é' || O" "-ch UTF8"
+# PROMOTED (qa/serve-real-psqlassign.sh 9a): under a REAL attachment the
+# literal IS that set, so of two real sets the first operand's wins and
+# OCTETS still absorbs - and the literal moves into the result set like
+# any operand ([cs_join], [recode_concat]). The rule that predicts all
+# of them was the join's, not the widths'.
+same_len "literal || UTF8 col, WIN1252 attachment" "'é' || U" "-ch WIN1252"
+same_len "literal || WIN1252 col, UTF8 attachment (it was 3 / 3)" "'é' || W" "-ch UTF8"
+same_len "literal || OCTETS col, UTF8 attachment (it was 3 / 3)"  "'é' || O" "-ch UTF8"
 # ...and the cells that must NOT move: every column||column pair agrees
 # today, and the withdrawn attempt is exactly what broke them.
 both "column || column stays right (UTF8||WIN1252)" "SELECT U || W AS R FROM TX WHERE ID=1"
