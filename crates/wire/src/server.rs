@@ -13973,6 +13973,42 @@ impl Term {
 /// `POSITION(N IN V)`) there is nothing to reinterpret at prepare - the
 /// values must meet in byte space at EVAL, which is a separate measured
 /// slice and is recorded rather than answered here.
+/// `<a> || <b>` - and the same byte-space law [carrier_fn_args] applies
+/// to a function's arguments. Under a byte-carrier attachment a LITERAL
+/// is its octets, and concatenated with a REAL-charset operand those
+/// octets are read AS that set: measured under the default NONE
+/// attachment against a UTF8 column holding 'é', `C || 'é'` and `'é' ||
+/// C` are both 'éé' - CHAR_LENGTH 2, OCTET_LENGTH 4 - where this server
+/// glued the carrier chars on and answered 'éÃ©' (3 and 6). The same
+/// holds for a UTF8 CAST, which is how a PSQL body's typed variable
+/// reaches the planner ([psql_slot_literal]). A WIN1252 operand already
+/// agreed (the carrier IS its codepage spelling of those bytes), and two
+/// carriers need no reconciliation.
+///
+/// The literal is WRAPPED ([Expr::CarrierDec]) rather than re-spelled:
+/// the describe still measures it in its own octets - `C || 'é'` over a
+/// UTF8 VARCHAR(20) announces 88 bytes, (20 + 2) x 4, measured - which a
+/// re-spelled one-character literal announced as 84.
+fn concat_operands(l: Expr, r: Expr, descs: &[Descriptor]) -> Expr {
+    use fire_crab_ods::intl::byte_carrier;
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    let real_of = |e: &Expr| {
+        (!matches!(e, Expr::Str(_)))
+            .then(|| cmp_text_charset(e, descs))
+            .flatten()
+            .filter(|cs| !byte_carrier(*cs))
+    };
+    let (lr, rr) = (real_of(&l), real_of(&r));
+    let adopt = |e: Expr, other: Option<u8>| match (e, other) {
+        (Expr::Str(s), Some(cs)) if byte_carrier(att) && !s.is_ascii() => {
+            Expr::CarrierDec(Box::new(Expr::Str(s)), att, cs)
+        }
+        (e, _) => e,
+    };
+    let (l, r) = (adopt(l, rr), adopt(r, lr));
+    Expr::Concat(Box::new(l), Box::new(r))
+}
+
 fn carrier_fn_args(resolved: &mut [Expr], descs: &[Descriptor]) {
     use fire_crab_ods::intl;
     let att = CURRENT_ATT_CS.with(|c| c.get());
@@ -15416,6 +15452,53 @@ fn default_clock_time(p: u8) -> u32 {
 fn default_clock_timestamp(p: u8) -> (i32, u32) {
     let (d, t) = session_now();
     (d, trunc_time_units(t, p))
+}
+
+/// [decode_default_blr] for a PROCEDURE or FUNCTION parameter's default,
+/// with the character set its text is in.
+///
+/// A parameter's text default is a literal compiled in the attachment's
+/// set at CREATE time, and the BLR records which (`blr_text2`'s ttype).
+/// Measured: `X VARCHAR(10) CHARACTER SET UTF8 = 'é'` created by a UTF8
+/// isql stores ttype 4 and C3 A9; called with the default under a NONE
+/// attachment it is 'é'. The default moves from THAT set into the
+/// parameter's - not from the calling attachment's, which read C3 A9's
+/// characters as NONE octets and raised *Malformed string* (22000).
+/// So the text is decoded here in its own set's representation: a byte
+/// carrier's octets one char each, a tabled set through its table, UTF8
+/// as UTF-8. A non-ASCII default of any other set has
+/// no known set (`None`) and its call refuses in [bind_proc_args].
+fn decode_param_default_blr(b: &[u8]) -> Option<(DefaultVal, SrcCs)> {
+    use fire_crab_ods::intl;
+    let dv = decode_default_blr(b);
+    let text2 = b.first() == Some(&5) && b.get(1) == Some(&21) && b.get(2) == Some(&15);
+    let text1 = b.first() == Some(&5) && b.get(1) == Some(&21) && b.get(2) == Some(&14);
+    if !(text1 || text2) {
+        return dv.map(|d| (d, None));
+    }
+    let (cs, bytes) = if text2 {
+        let tt = i16::from_le_bytes(b.get(3..5)?.try_into().ok()?);
+        let n = u16::from_le_bytes(b.get(5..7)?.try_into().ok()?) as usize;
+        (intl::charset_id(tt), b.get(7..7 + n)?)
+    } else {
+        // blr_text carries no ttype: NONE
+        let n = u16::from_le_bytes(b.get(3..5)?.try_into().ok()?) as usize;
+        (intl::CS_NONE, b.get(5..5 + n)?)
+    };
+    if bytes.is_ascii() {
+        let t = String::from_utf8(bytes.to_vec()).ok()?;
+        return Some((DefaultVal::Text(t), Some(cs)));
+    }
+    let t = if intl::byte_carrier(cs) {
+        intl::carrier_decode(bytes)
+    } else if intl::tabled(cs) {
+        intl::decode_text(cs, bytes)?
+    } else if cs == intl::CS_UTF8 {
+        String::from_utf8(bytes.to_vec()).ok()?
+    } else {
+        return dv.map(|d| (d, None));
+    };
+    Some((DefaultVal::Text(t), Some(cs)))
 }
 
 /// The system clock as engine values: the Modified-Julian day number
@@ -17395,6 +17478,9 @@ struct TrigDef {
     /// the same characters from `BEGIN` on - so this anchor plus the
     /// offset the interpreter tracks gives the engine's own numbers.
     anchor: Option<(u32, u32)>,
+    /// the set the body's non-ASCII literals were compiled in, off its
+    /// RDB$TRIGGER_BLR ([stored_lit_cs])
+    lit_cs: SrcCs,
 }
 
 /// The `(line, col)` of the FIRST source entry in a `RDB$DEBUG_INFO`
@@ -17452,6 +17538,7 @@ fn db_triggers(db: &Database, event: i64) -> Option<Vec<TrigDef>> {
     let (_, t_descs) = t_formats.iter().max_by_key(|(n, _)| *n)?;
     let tcols = relation_columns(&db.bytes(), db.page_size, "RDB$TRIGGERS");
     let tfid = |n: &str| tcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let blr_f = tfid("RDB$TRIGGER_BLR");
     let (rel_f, src_f, sys_f, name_f, typ_f, seq_f, inact_f, dbg_f) = (
         tfid("RDB$RELATION_NAME")?,
         tfid("RDB$TRIGGER_SOURCE")?,
@@ -17495,7 +17582,14 @@ fn db_triggers(db: &Database, event: i64) -> Option<Vec<TrigDef>> {
             refuse = true;
             return;
         };
+        // a body whose stored source lost a literal is not the body the
+        // engine runs ([source_literals_lost]) - refused, whole
+        if trig_source_lost(db, values, blr_f, &source) {
+            refuse = true;
+            return;
+        }
         out.push(TrigDef {
+            lit_cs: trig_lit_cs(db, values, blr_f, &source),
             name: name.trim_end().to_string(),
             before: false,
             seq: match values.get(seq_f) {
@@ -17607,6 +17701,7 @@ fn ddl_triggers(db: &Database, event: u32, before: bool) -> Option<Vec<TrigDef>>
     let (_, t_descs) = t_formats.iter().max_by_key(|(n, _)| *n)?;
     let tcols = relation_columns(&db.bytes(), db.page_size, "RDB$TRIGGERS");
     let tfid = |n: &str| tcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let blr_f = tfid("RDB$TRIGGER_BLR");
     let (rel_f, src_f, sys_f, name_f, typ_f, seq_f, inact_f, dbg_f) = (
         tfid("RDB$RELATION_NAME")?,
         tfid("RDB$TRIGGER_SOURCE")?,
@@ -17645,7 +17740,14 @@ fn ddl_triggers(db: &Database, event: u32, before: bool) -> Option<Vec<TrigDef>>
             refuse = true;
             return;
         };
+        // a body whose stored source lost a literal is not the body the
+        // engine runs ([source_literals_lost]) - refused, whole
+        if trig_source_lost(db, values, blr_f, &source) {
+            refuse = true;
+            return;
+        }
         out.push(TrigDef {
+            lit_cs: trig_lit_cs(db, values, blr_f, &source),
             name: name.trim_end().to_string(),
             before,
             seq: match values.get(seq_f) {
@@ -17933,6 +18035,7 @@ fn fire_ddl_triggers(
             let mut frame = PsqlFrame {
  stop_after: None,
             types: trig_slot_types(&d.source),
+            lit_cs: d.lit_cs,
                 vars: vec![Value::Null; names.len()],
                 out_at: names.len(),
                 out_len: 0,
@@ -18034,6 +18137,7 @@ fn fire_db_triggers(
         let mut frame = PsqlFrame {
  stop_after: None,
             types: trig_slot_types(&d.source),
+            lit_cs: d.lit_cs,
             vars: vec![Value::Null; names.len()],
             out_at: names.len(),
             out_len: 0,
@@ -18445,6 +18549,7 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
     let (_, t_descs) = t_formats.iter().max_by_key(|(n, _)| *n)?;
     let tcols = relation_columns(&db.bytes(), db.page_size, "RDB$TRIGGERS");
     let tfid = |n: &str| tcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let blr_f = tfid("RDB$TRIGGER_BLR");
     let (rel_f, src_f, sys_f, name_f, typ_f, seq_f, inact_f, dbg_f) = (
         tfid("RDB$RELATION_NAME")?,
         tfid("RDB$TRIGGER_SOURCE")?,
@@ -18502,7 +18607,14 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
             refuse = true;
             return;
         };
+        // a body whose stored source lost a literal is not the body the
+        // engine runs ([source_literals_lost]) - refused, whole
+        if trig_source_lost(db, values, blr_f, &source) {
+            refuse = true;
+            return;
+        }
         out.push(TrigDef {
+            lit_cs: trig_lit_cs(db, values, blr_f, &source),
             name: name.trim_end().to_string(),
             before,
             seq: match values.get(seq_f) {
@@ -20093,6 +20205,15 @@ fn cs_join(a: TfCs, b: TfCs) -> TfCs {
         (0, _) => b,
         (_, 0) => a,
         (ASCII, _) => b,
+        // THE LITERAL IS OF THE ATTACHMENT'S SET, and that set is known
+        // here ([CURRENT_ATT_CS] is set before planning). Under a NONE
+        // attachment it is NONE and yields, as above. Under a real set
+        // it is a real set, so of two different real sets the FIRST
+        // operand wins. Measured on engine 2182 with a UTF8 attachment:
+        // `OCTET_LENGTH('é' || CAST(x'E9' AS VARCHAR(1) CHARACTER SET
+        // WIN1252))` is 4 and `'ab' || <that>` is 4, both UTF8. Yielding
+        // here typed them WIN1252 and answered 2 and 3.
+        (-1, _) if CURRENT_ATT_CS.with(|c| c.get()) != 0 => a,
         (-1, _) => b,
         (_, -1) => a,
         _ => a,
@@ -22885,11 +23006,36 @@ fn colon_clean(text: &str, vars: &[String]) -> Option<(String, Vec<String>)> {
             cleaned.push_str(&slot.to_string());
             i = j;
         } else {
-            cleaned.push(bytes[i] as char);
-            i += 1;
+            i = push_char_at(&mut cleaned, text, i);
         }
     }
     Some((cleaned, marked))
+}
+
+/// Copy the CHARACTER that starts at byte `i` of `text` onto `out` and
+/// answer the byte index after it. The statement-text rewriters walk
+/// their text byte by byte because every delimiter they look for is
+/// ASCII - but pushing `b as char` for the bytes in between re-spells
+/// each octet of a non-ASCII character as a char of its own: the two
+/// octets of 'é' became 'Ã' and '©', so a PSQL body's `LPAD(X, 3, 'é')`
+/// reached the planner as a four-octet pad, and an EXECUTE BLOCK's
+/// `R = 'é'` stored four characters where the engine stores two octets
+/// (measured under a NONE attachment: CHAR_LENGTH 4 for the engine's 2,
+/// and `REPLACE('abc', 'b', 'é')` a -204 *Table unknown* out of the
+/// mangled text). A character is copied whole.
+fn push_char_at(out: &mut String, text: &str, i: usize) -> usize {
+    match text.get(i..).and_then(|t| t.chars().next()) {
+        Some(c) => {
+            out.push(c);
+            i + c.len_utf8()
+        }
+        // not a char boundary - never reached from an ASCII delimiter
+        // walk, but the byte is not dropped
+        None => {
+            out.push(text.as_bytes()[i] as char);
+            i + 1
+        }
+    }
 }
 
 /// A WHERE condition inside an embedded UPDATE/DELETE: the same colon
@@ -24081,6 +24227,12 @@ fn parse_trig_stmt(
         let (cond, raw) = match parse_body_cond(&cond_text, vars) {
             Some(c) => (c.normalized(), None),
             None => {
+                // a BARE declared variable is that variable here as it is
+                // in an assignment's value ([colon_bare_vars]) - measured:
+                // `WHILE (I < CHAR_LENGTH(X)) DO` and `IF (UPPER(X) = X)`
+                // both answer on the engine, and both refused here once
+                // the planner read X as a column of RDB$DATABASE
+                let cond_text = colon_bare_vars(&cond_text, vars);
                 let mut binds: Vec<(String, u16)> = Vec::new();
                 for name in named_refs(&cond_text) {
                     let slot = vars.iter().position(|v| *v == name)? as u16;
@@ -24593,10 +24745,43 @@ fn parse_trig_stmt(
     // NEW.<col> = <expr>  or  <var> = <expr>
     if find_word(&up, "RETURN", 0) == Some(0) {
         let rhs = text["RETURN".len()..].trim();
-        return match parse_body_expr(rhs, vars) {
-            Some(e) => Some(TrigStmt::Return { expr: e, src_off: start }),
-            None => Some(TrigStmt::ReturnText { text: parse_dyn_text(rhs, vars)?, src_off: start }),
-        };
+        if let Some(e) = parse_body_expr(rhs, vars) {
+            return Some(TrigStmt::Return { expr: e, src_off: start });
+        }
+        if let Some(text) = parse_dyn_text(rhs, vars) {
+            return Some(TrigStmt::ReturnText { text, src_off: start });
+        }
+        // A RETURN VALUE THE ARITHMETIC GRAMMAR CANNOT HOLD - `UPPER(X)
+        // || '!'`, `CHAR_LENGTH(X)` - is the raw assignment an output
+        // takes (see below), into the function's RETURN slot, and then
+        // the body ends. The BLR executor answered these, but it carries
+        // no character sets and is taken only over ASCII text
+        // ([text_not_ascii]); this is the path that moves a non-ASCII
+        // value between sets. Measured: `FL(C)` over a UTF8 column
+        // holding 'aéb' is 3 and `FU('é')` is 'É!' under a NONE or a
+        // UTF8 attachment.
+        let slot = vars.iter().position(|v| v == "RETURN")? as u16;
+        let rhs_text = colon_bare_vars(rhs, vars);
+        let mut binds: Vec<(String, u16)> = Vec::new();
+        for name in named_refs(&rhs_text) {
+            let s = vars.iter().position(|v| *v == name)? as u16;
+            if !binds.iter().any(|(n, _)| *n == name) {
+                binds.push((name, s));
+            }
+        }
+        return Some(TrigStmt::Block {
+            stmts: vec![
+                TrigStmt::Assign {
+                    target: TrigTarget::Var(slot),
+                    expr: fire_crab_ods::expr::Expr::NullLiteral,
+                    raw: Some((rhs_text, binds)),
+                    src_off: start,
+                },
+                TrigStmt::Exit { src_off: start },
+            ],
+            handlers: Vec::new(),
+            src_off: start,
+        });
     }
     let eq = text.find('=')?;
     let lhs = text[..eq].trim();
@@ -24688,8 +24873,7 @@ fn colon_bare_vars(rhs: &str, vars: &[String]) -> String {
         let word_start = (c.is_ascii_alphabetic() || c == b'_')
             && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || matches!(b[i - 1], b'_' | b'$' | b'.' | b':')));
         if !word_start {
-            out.push(c as char);
-            i += 1;
+            i = push_char_at(&mut out, rhs, i);
             continue;
         }
         let mut j = i;
@@ -43952,6 +44136,34 @@ fn is_cte_name(masked_up: &str, name: &str) -> bool {
     false
 }
 
+/// Does the FROM at byte `k` of the (upper-cased, literal-masked) text
+/// sit directly inside the operand list of SUBSTRING, OVERLAY, TRIM or
+/// EXTRACT - the functions whose grammar spells an operand with FROM?
+fn from_is_operand(b: &[u8], k: usize) -> bool {
+    let mut depth = 0i32;
+    let mut i = k;
+    while i > 0 {
+        i -= 1;
+        match b[i] {
+            b')' => depth += 1,
+            b'(' if depth > 0 => depth -= 1,
+            b'(' => {
+                let mut e = i;
+                while e > 0 && b[e - 1].is_ascii_whitespace() {
+                    e -= 1;
+                }
+                let mut st = e;
+                while st > 0 && (b[st - 1].is_ascii_alphanumeric() || b[st - 1] == b'_') {
+                    st -= 1;
+                }
+                return matches!(&b[st..e], b"SUBSTRING" | b"OVERLAY" | b"TRIM" | b"EXTRACT");
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The first FROM/JOIN item in `sql` naming a relation the catalog does
 /// not have - not a table, view, procedure or CTE. It is the fallback
 /// that lets a query refused generically still answer the engine's -204
@@ -43970,6 +44182,16 @@ fn first_unknown_relation(sql: &str, db: &Database) -> Option<(usize, usize, boo
         let mut from = 0;
         while let Some(k) = find_word(&masked, kw, from) {
             from = k + kw.len();
+            // THE FROM OF A FUNCTION'S OPERAND LIST IS NOT A CLAUSE:
+            // `SUBSTRING(S FROM 2 FOR 1)`, `OVERLAY(S PLACING 'x' FROM
+            // 2)`, `TRIM(LEADING 'a' FROM S)`, `EXTRACT(YEAR FROM D)`.
+            // Read as one, a refused EXECUTE BLOCK assigning
+            // `OVERLAY('abc' PLACING 'x' FROM 2 FOR 1)` answered -204
+            // *Table unknown "2"* where the engine answers 'axc'
+            // (measured) - a wrong error, not a refusal.
+            if kw == "FROM" && from_is_operand(b, k) {
+                continue;
+            }
             let mut i = from;
             while i < b.len() && b[i].is_ascii_whitespace() {
                 i += 1;
@@ -43979,6 +44201,10 @@ fn first_unknown_relation(sql: &str, db: &Database) -> Option<(usize, usize, boo
             }
             // a derived table / subquery, not a name
             if b[i] == b'(' {
+                continue;
+            }
+            // nor is a number - no unquoted name starts with a digit
+            if b[i].is_ascii_digit() {
                 continue;
             }
             // the quotes are read off the ORIGINAL bytes: the masked copy
@@ -53484,7 +53710,7 @@ fn plan_query_inner_at(
                     // and is filled at EXECUTE (run_body_source, which has the
                     // ctx), so it is left short here - accepted as long as
                     // every remaining trailing parameter carries SOME default.
-                    let args = with_proc_defaults(&meta, &args, None);
+                    let args = with_proc_defaults_as_args(&meta, &args);
                     // ARITY beats the not-selectable refusal (probed:
                     // `SELECT * FROM P2_RET(1)` and `SELECT * FROM
                     // PSELP` with one declared input answer this, for
@@ -72620,9 +72846,21 @@ fn recode_concat(e: Expr, descs: &[Descriptor]) -> Expr {
     if !(byte_carrier(dst) || fire_crab_ods::intl::tabled(dst) || dst == fire_crab_ods::intl::CS_UTF8) {
         return Expr::Concat(a, b);
     }
+    // A LITERAL MOVES TOO, under a real attachment set: it is a value of
+    // that set ([cs_join]), and the other side can outrank it - OCTETS
+    // from either side, or a different real set in front of it. Left
+    // unwrapped, its characters were glued to octets as they stood:
+    // `OCTET_LENGTH(<UTF8 'é'> || <OCTETS 'ab'>)` answered 3 where the
+    // engine (UTF8 attachment) answers 4 - C3 A9 61 62. Under a NONE
+    // attachment the literal is NONE, which yields its tag and keeps
+    // its bytes, as it always did here.
+    let att = CURRENT_ATT_CS.with(|c| c.get());
     let wrap = |x: Box<Expr>, c: TfCs, w: i32| -> Box<Expr> {
-        let TfCs::Ttype(t) = c else { return x };
-        let src = charset_id(t as i16);
+        let src = match c {
+            TfCs::Ttype(t) => charset_id(t as i16),
+            TfCs::Att if att != 0 => att,
+            TfCs::Att => return x,
+        };
         if src == dst {
             return x;
         }
@@ -76016,9 +76254,10 @@ fn resolve_proj_expr(
             {
                 return None;
             }
-            Expr::Concat(
-                Box::new(resolve_proj_expr(a, columns, descs, sink)?),
-                Box::new(resolve_proj_expr(b, columns, descs, sink)?),
+            concat_operands(
+                resolve_proj_expr(a, columns, descs, sink)?,
+                resolve_proj_expr(b, columns, descs, sink)?,
+                descs,
             )
         }
         // A CONDITIONAL TYPES ITS PARAMETER FROM ITS SIBLINGS HERE TOO -
@@ -76290,9 +76529,10 @@ fn resolve_expr_inner(
             *op,
             Box::new(resolve_expr(b, columns, descs)?),
         ),
-        RawExpr::Concat(a, b) => Expr::Concat(
-            Box::new(resolve_expr(a, columns, descs)?),
-            Box::new(resolve_expr(b, columns, descs)?),
+        RawExpr::Concat(a, b) => concat_operands(
+            resolve_expr(a, columns, descs)?,
+            resolve_expr(b, columns, descs)?,
+            descs,
         ),
         RawExpr::Cast(e, t) => {
             if let Some(fid) = blob_col_cast(e, t, columns, descs) {
@@ -76599,7 +76839,10 @@ fn resolve_expr_inner(
                 c.set(v.wrapping_add(1));
                 v
             });
-            FN_CALLS.with(|l| l.borrow_mut().push(FnCall { id, name: name.clone(), args: resolved.clone() }));
+            let arg_cs = resolved.iter().map(|a| cmp_text_charset(a, descs)).collect();
+            FN_CALLS.with(|l| {
+                l.borrow_mut().push(FnCall { id, name: name.clone(), args: resolved.clone(), arg_cs })
+            });
             Expr::UserFn { name: name.clone(), args: resolved, ret, id }
         }
         RawExpr::Case(branches, else_, _) => Expr::Case(
@@ -95128,6 +95371,10 @@ struct ProcParam {
     /// (with_proc_defaults evaluates it against the SessionCtx / clock).
     /// A parameter has a default when EITHER field is Some.
     default_ctx: Option<DefaultVal>,
+    /// the set a literal TEXT `default` is spelled in - the set the
+    /// engine compiled it in ([decode_param_default_blr]); `None` when
+    /// that is not known
+    default_cs: SrcCs,
 }
 
 /// A procedure as the catalog describes it.
@@ -95420,7 +95667,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     );
     // (parameter type 0=in/1=out, number, name, field source, defaulted,
     //  decoded default value, declared NOT NULL)
-    let mut raw: Vec<(i64, i64, String, String, bool, Option<DefaultVal>, bool)> = Vec::new();
+    let mut raw: Vec<(i64, i64, String, String, bool, Option<(DefaultVal, SrcCs)>, bool)> = Vec::new();
     let pname_f = cfid("RDB$PARAMETER_NAME")?;
     // RDB$NULL_FLAG on the PARAMETER row: the engine announces a
     // declared-NOT NULL argument's slot as NOT NULL, exactly as it does
@@ -95455,7 +95702,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
             // session default decodes to None and the omit refuses)
             let defval = match cdefval_f.and_then(|i| v.get(i)) {
                 Some(Value::Blob(r, n)) => fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)
-                    .and_then(|b| decode_default_blr(&b)),
+                    .and_then(|b| decode_param_default_blr(&b)),
                 _ => None,
             };
             let not_null = matches!(cnull_f.and_then(|i| v.get(i)), Some(Value::Int(1)));
@@ -95543,8 +95790,9 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         if col_kind(&desc).is_none() && !is_numeric_col(&desc) {
             return None;
         }
-        let (default, default_ctx) = split_default(defval);
-        let p = ProcParam { name: pnm, desc, default, default_ctx };
+        let default_cs = defval.as_ref().and_then(|(_, c)| *c);
+        let (default, default_ctx) = split_default(defval.map(|(d, _)| d));
+        let p = ProcParam { name: pnm, desc, default, default_ctx, default_cs };
         if typ == 0 {
             ins.push(p)
         } else {
@@ -95823,6 +96071,16 @@ struct PsqlFrame {
     /// engine raises 22003, and a VARCHAR(3) local held 'abcdef' where
     /// the engine raises 22001. See [coerce_to_slot].
     types: Vec<Option<CastTarget>>,
+    /// THE CHARACTER SET THE BODY'S OWN LITERALS ARE SPELLED IN, when it
+    /// is known. An EXECUTE BLOCK's text is the client's statement, so
+    /// its literals are the attachment's - under NONE, 'é' is the octets
+    /// C3 A9. A STORED body's is `None`: its source text is not what the
+    /// engine compiled - which set a non-ASCII literal was typed in at
+    /// CREATE time is recorded only in the BLR, and under a NONE
+    /// attachment the engine writes a '?' into the source for every
+    /// octet it could not transliterate ([source_literals_lost]) - so a
+    /// non-ASCII literal there is a value this server does not know.
+    lit_cs: SrcCs,
     /// where the output parameters start in `vars` (inputs come first)
     out_at: usize,
     /// how many output parameters there are
@@ -95961,6 +96219,9 @@ struct CursorState {
     query: String,
     rows: Option<Vec<Vec<Value>>>,
     at: usize,
+    /// the character set each column of `rows` is spelled in
+    /// ([plan_out_cs]), for the FETCH that stores them
+    cs: Vec<SrcCs>,
 }
 
 /// A raised user exception, with the identity the client is owed: the
@@ -98790,12 +99051,167 @@ fn named_refs(sql: &str) -> Vec<String> {
 /// spell) refuses rather than being dropped or guessed at, and so does
 /// a `NEW.`/`OLD.` reference the row has no column for.
 fn subst_body_query(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> Option<String> {
+    if !body_text_known(sql, f) {
+        return None;
+    }
+    subst_typed(|| subst_body_query_pass(sql, binds, f))
+}
+
+/// Can this body text go to the planner as written? Only where its own
+/// literals' character set is known ([PsqlFrame::lit_cs]) or it has
+/// none that are not ASCII: a stored body's non-ASCII text is refused,
+/// since the set the engine typed it in at CREATE time is not recorded
+/// anywhere this server reads - and the text is read in the
+/// attachment's set, which is right only by chance.
+fn body_text_known(text: &str, f: &PsqlFrame) -> bool {
+    text.is_ascii() || f.lit_cs.is_some()
+}
+
+thread_local! {
+    /// Set while [subst_typed] builds its second, TYPED spelling - see
+    /// [psql_slot_literal].
+    static TYPED_TEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set whenever [typed_text_literal] spells a value, so [subst_typed]
+    /// knows its plain pass already carried a set.
+    static SLOT_TYPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Build a statement text with the frame's values written in - PLAIN
+/// first, and again with every text variable of a set other than the
+/// attachment's written TYPED ([psql_slot_literal]) when the plain text
+/// is not all ASCII. Where the whole statement is ASCII no set can show
+/// (every set spells ASCII the same), and the plain text is the one
+/// every path already parses; where it is not, the sets decide the
+/// answer: `LPAD(<UTF8 'ab'>, 5, 'é')` under a NONE attachment pads in
+/// UTF8 characters ('éééab'), while the plain `LPAD('ab', 5, 'é')` pads
+/// in octets and the engine raises *Malformed string* storing that into
+/// a UTF8 slot (measured, both).
+///
+/// A plain text that is all ASCII only because a value in it was ALREADY
+/// written typed (the typed form is itself ASCII: `CAST(x'..' AS ...)`)
+/// is built typed too. The set of one operand decides the set of the
+/// expression around it, so the other variables have to carry theirs:
+/// `OCTET_LENGTH(X || Y)` with a UTF8 `X = 'ab'` and a WIN1252 `Y = 'é'`
+/// under a NONE attachment is 6 on the engine (UTF8 first, Y's two NONE
+/// octets 'Ã©' become four UTF8 ones), and the plain `'ab'` - a NONE
+/// literal, which yields its set - typed it WIN1252 and answered 4.
+fn subst_typed(build: impl Fn() -> Option<String>) -> Option<String> {
+    let outer = SLOT_TYPED.with(|c| c.replace(false));
+    let plain = build();
+    let typed_seen = SLOT_TYPED.with(|c| c.replace(outer));
+    let plain = plain?;
+    if plain.is_ascii() && !typed_seen {
+        return Some(plain);
+    }
+    let was = TYPED_TEXT.with(|c| c.replace(true));
+    let typed = build();
+    TYPED_TEXT.with(|c| c.set(was));
+    typed
+}
+
+/// A frame slot's value written into statement text.
+///
+/// Statement text is read in the ATTACHMENT's set, so a text variable
+/// of another set is written TYPED - `CAST(x'<its octets>' AS
+/// VARCHAR(<n>) CHARACTER SET <its set>)` - whenever its value is not
+/// ASCII, or the statement is being built typed ([subst_typed]). The
+/// plain literal would hand the planner a value of the wrong set: a
+/// UTF8 variable holding 'é' written as 'é' into a NONE attachment's
+/// text is the one octet E9 there, and its UPPER, its CHAR_LENGTH and
+/// its concatenations were all answered in the wrong set. A slot whose
+/// set is the attachment's, or not known, is written as it always was.
+/// Anything else is spelled by `plain` - the caller's own literal rule.
+fn psql_slot_literal(
+    f: &PsqlFrame,
+    slot: usize,
+    plain: fn(&Value) -> Option<String>,
+) -> Option<String> {
+    let v = f.vars.get(slot).unwrap_or(&Value::Null);
+    if let (Value::Text(t), Some(Some(CastTarget::Text { len, pad, cs: Some(cs), .. }))) =
+        (v, f.types.get(slot))
+    {
+        let att = CURRENT_ATT_CS.with(|c| c.get());
+        if *cs != att && (!t.is_ascii() || TYPED_TEXT.with(|c| c.get())) {
+            return typed_text_literal(t, *cs, *len, *pad);
+        }
+    }
+    plain(v)
+}
+
+/// `t`, a value of set `cs`, spelled as a typed text expression the
+/// planner reads back as exactly that value in exactly that set: its
+/// octets as a binary literal, CAST into the set (an OCTETS source moves
+/// by its bytes - [transcode_text]).
+fn typed_text_literal(t: &str, cs: u8, len: usize, pad: bool) -> Option<String> {
+    use fire_crab_ods::intl;
+    SLOT_TYPED.with(|c| c.set(true));
+    let octets = if intl::byte_carrier(cs) {
+        intl::carrier_encode(t)?
+    } else {
+        match intl::encode_text(cs, t) {
+            Ok(Some(b)) => b,
+            Ok(None) => t.as_bytes().to_vec(),
+            Err(_) => return None,
+        }
+    };
+    let name = charset_id_name(cs)?;
+    let kind = if pad { "CHAR" } else { "VARCHAR" };
+    let len = len.max(t.chars().count()).max(1);
+    Some(if octets.is_empty() {
+        format!("CAST('' AS {}({}) CHARACTER SET {})", kind, len, name)
+    } else {
+        let hex: String = octets.iter().map(|b| format!("{:02X}", b)).collect();
+        format!("CAST(x'{}' AS {}({}) CHARACTER SET {})", hex, kind, len, name)
+    })
+}
+
+/// One spelling of [subst_body_query]'s text.
+fn subst_body_query_pass(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> Option<String> {
     let b = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 16);
     let mut in_str = false;
     let mut i = 0usize;
+    let att = CURRENT_ATT_CS.with(|c| c.get());
     while i < b.len() {
         let c = b[i];
+        // A STORED BODY'S LITERAL IS OF THE SET IT WAS COMPILED IN
+        // ([PsqlFrame::lit_cs], read off its BLR), and this text is read
+        // in the CALLER's attachment set. Where the two differ a
+        // non-ASCII literal is written typed, `CAST(x'<octets>' AS
+        // CHAR(n) CHARACTER SET <its set>)`, the form of a literal of
+        // that set. Measured: `FOR SELECT W || 'é' FROM TU` created by a
+        // UTF8 isql answers 'éé' and 'übé' under a NONE attachment too.
+        if !in_str && c == b'\'' {
+            let mut j = i + 1;
+            let mut tok = String::new();
+            let mut closed = false;
+            while j < b.len() {
+                if b[j] == b'\'' {
+                    if b.get(j + 1) == Some(&b'\'') {
+                        tok.push('\'');
+                        j += 2;
+                        continue;
+                    }
+                    closed = true;
+                    break;
+                }
+                j = push_char_at(&mut tok, sql, j);
+            }
+            if closed && !tok.is_ascii() {
+                match f.lit_cs {
+                    Some(cs) if cs == att => {}
+                    // an introducer or a prefix in front names its own
+                    // set, which this spelling would lose
+                    Some(_) if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') => return None,
+                    Some(cs) => {
+                        out.push_str(&typed_text_literal(&tok, cs, tok.chars().count(), true)?);
+                        i = j + 1;
+                        continue;
+                    }
+                    None => return None,
+                }
+            }
+        }
         if c == b'\'' {
             in_str = !in_str;
             out.push('\'');
@@ -98812,9 +99228,7 @@ fn subst_body_query(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> Option
             let name = sql[start..j].to_ascii_uppercase();
             match binds.iter().find(|(n, _)| *n == name) {
                 Some((_, slot)) => {
-                    out.push_str(&subst_literal(
-                        f.vars.get(*slot as usize).unwrap_or(&Value::Null),
-                    )?);
+                    out.push_str(&psql_slot_literal(f, *slot as usize, subst_literal)?)
                 }
                 // NOT THIS ARM'S TO SUBSTITUTE. A `FOR SELECT`'s and a
                 // cursor's variables are marked by the PARSER instead
@@ -98860,8 +99274,7 @@ fn subst_body_query(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> Option
             i = j;
             continue;
         }
-        out.push(c as char);
-        i += 1;
+        i = push_char_at(&mut out, sql, i);
     }
     if in_str {
         return None;
@@ -98970,6 +99383,20 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
     // an arithmetic expression may not. `VALUES (:FROM + :K)` becomes
     // `VALUES (24)`, which is exactly what the interpreter would compute.
     if let Ok(v) = eval_psql_expr(e, f) {
+        // a non-ASCII text value is written in its OWN set
+        // ([psql_slot_literal]), or refused where that is not known
+        if let Value::Text(t) = &v {
+            if !t.is_ascii() {
+                let att = CURRENT_ATT_CS.with(|c| c.get());
+                return match psql_expr_cs(e, f) {
+                    Ok(Some(cs)) if cs != att => {
+                        typed_text_literal(t, cs, t.chars().count(), false)
+                    }
+                    Ok(_) => psql_literal(&v),
+                    Err(()) => None,
+                };
+            }
+        }
         if let Some(lit) = psql_literal(&v) {
             return Some(lit);
         }
@@ -98988,11 +99415,17 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
         E::GenId { name, step } => {
             format!("GEN_ID({}, {})", name, render_psql_expr(step, f)?)
         }
-        // re-quoted the way the lexer unquoted it
+        // re-quoted the way the lexer unquoted it - in its own set where
+        // that is not the attachment's, as [subst_body_query_pass] does
+        E::TextLiteral(t) if !t.is_ascii() => match f.lit_cs {
+            Some(cs) if cs == CURRENT_ATT_CS.with(|c| c.get()) => format!("'{}'", t.replace('\'', "''")),
+            Some(cs) => typed_text_literal(t, cs, t.chars().count(), true)?,
+            None => return None,
+        },
         E::TextLiteral(t) => format!("'{}'", t.replace('\'', "''")),
         E::Int64Literal(v) => v.to_string(),
         E::NullLiteral => "NULL".to_string(),
-        E::Variable(n) => psql_literal(f.vars.get(*n as usize).unwrap_or(&Value::Null))?,
+        E::Variable(n) => psql_slot_literal(f, *n as usize, psql_literal)?,
         // AN UNQUALIFIED COLUMN IS THE NESTED STATEMENT'S OWN, and
         // rendering it as itself is the whole point: `UPDATE LG SET V =
         // V + 1` has to reach LG's planner with `V` still in it, so the
@@ -99266,13 +99699,14 @@ fn exec_psql_stmt_inner(
             // shape is taken - a zero-step read as the whole right-hand
             // side; a draw, or a read folded into a larger expression,
             // keeps the refusal it always had.
-            let v = match raw {
+            let (v, src) = match raw {
                 // a value the arithmetic grammar could not hold - answered
                 // by the planner (COALESCE/CASE/NULLIF/CAST/scalar
                 // subquery, incl. over a system table or after a DML) -
                 // then assigned to the target exactly like the parsed form
                 Some((text, binds)) => eval_raw_scalar(text, binds, f, db)?,
-                None => match expr {
+                None => {
+                    let v = match expr {
                 fire_crab_ods::expr::Expr::GenId { name, step }
                     if matches!(
                         **step,
@@ -99288,10 +99722,12 @@ fn exec_psql_stmt_inner(
                     )
                 }
                 _ => eval_psql_expr(expr, f)?,
-                },
+                    };
+                    (v, psql_expr_src(expr, f))
+                }
             };
             match target {
-                TrigTarget::Var(n) => store_slot(f, *n as usize, v),
+                TrigTarget::Var(n) => store_slot_cs(f, *n as usize, v, src),
                 // `NEW.<col> = <value>` in a BEFORE trigger changes
                 // what is stored. OLD is read-only, and NEW is
                 // read-only in an AFTER trigger (the row is written) -
@@ -99418,25 +99854,33 @@ fn exec_psql_stmt_inner(
         // subqueries, expressions - for free.
         TrigStmt::ForSelect { query, into, body, label, src_off, .. } => {
             // put each variable's current value into the query text
-            let mut q = query.clone();
-            for (i, v) in f.vars.iter().enumerate().rev() {
-                let mark = format!("{}{}", PSQL_VAR_MARK, i);
-                if q.contains(&mark) {
-                    let lit = psql_literal(v).ok_or(PsqlStop::Unsupported)?;
-                    q = q.replace(&mark, &lit);
-                }
-            }
             // ...and the ROW the trigger fired over, for a loop query
             // that reads by it (`FOR SELECT ... WHERE K = NEW.K`)
-            let q = subst_body_query(&q, &[], f).ok_or(PsqlStop::Unsupported)?;
-            let rows = {
+            if !body_text_known(query, f) {
+                return Err(PsqlStop::Unsupported);
+            }
+            let q = subst_typed(|| {
+                // the body's own text first - its literals are respelled
+                // in their compiled set there - and the variables after,
+                // so a variable's value is never taken for a body literal
+                let mut q = subst_body_query_pass(query, &[], f)?;
+                for i in (0..f.vars.len()).rev() {
+                    let mark = format!("{}{}", PSQL_VAR_MARK, i);
+                    if q.contains(&mark) {
+                        q = q.replace(&mark, &psql_slot_literal(f, i, psql_literal)?);
+                    }
+                }
+                Some(q)
+            })
+            .ok_or(PsqlStop::Unsupported)?;
+            let (rows, cs) = {
                 let mut sink: Vec<Option<Descriptor>> = Vec::new();
                 let plan = plan_query_inner(&q, &*db, &mut sink)
                     .ok_or(PsqlStop::Unsupported)?;
                 if !sink.is_empty() {
                     return Err(PsqlStop::Unsupported); // a `?` in a loop query
                 }
-                psql_plan_rows_then(&plan, db, ctx, *src_off)?
+                (psql_plan_rows_then(&plan, db, ctx, *src_off)?, plan_out_cs(&plan))
             };
             let (rows, then) = rows;
             // ROW_COUNT COUNTS THE LOOP'S FETCHES, measured: 0 once the
@@ -99452,8 +99896,8 @@ fn exec_psql_stmt_inner(
                 if row.len() != into.len() {
                     return Err(PsqlStop::Unsupported);
                 }
-                for (slot, v) in into.iter().zip(row.into_iter()) {
-                    store_slot(f, *slot as usize, v)?;
+                for (i, (slot, v)) in into.iter().zip(row.into_iter()).enumerate() {
+                    store_slot_cs(f, *slot as usize, v, cs.get(i).copied().flatten())?;
                 }
                 set_row_count(f, fetched as i64 + 1);
                 match exec_psql_stmt(body, f, steps, db, ctx) {
@@ -99522,7 +99966,7 @@ fn exec_psql_stmt_inner(
             }
             let query = state.query.clone();
             let query = subst_body_query(&query, &[], f).ok_or(PsqlStop::Unsupported)?;
-            let rows = {
+            let (rows, cs) = {
                 let mut sink: Vec<Option<Descriptor>> = Vec::new();
                 let plan = plan_query_inner(&query, &*db, &mut sink)
                     .ok_or(PsqlStop::Unsupported)?;
@@ -99530,10 +99974,11 @@ fn exec_psql_stmt_inner(
                     return Err(PsqlStop::Unsupported); // a `?` in a cursor query
                 }
                 let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
-                branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?
+                (branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?, plan_out_cs(&plan))
             };
             let state = f.cursors.get_mut(cursor).ok_or(PsqlStop::Unsupported)?;
             state.rows = Some(rows);
+            state.cs = cs;
             state.at = 0;
             Ok(())
         }
@@ -99549,6 +99994,7 @@ fn exec_psql_stmt_inner(
                 return Err(PsqlStop::Unsupported); // fetch from a closed cursor
             };
             let row = rows.get(state.at).cloned();
+            let cs = state.cs.clone();
             if row.is_some() {
                 state.at += 1;
             }
@@ -99557,8 +100003,8 @@ fn exec_psql_stmt_inner(
                     if r.len() != into.len() {
                         return Err(PsqlStop::Unsupported);
                     }
-                    for (slot, v) in into.iter().zip(r.into_iter()) {
-                        store_slot(f, *slot as usize, v)?;
+                    for (i, (slot, v)) in into.iter().zip(r.into_iter()).enumerate() {
+                        store_slot_cs(f, *slot as usize, v, cs.get(i).copied().flatten())?;
                     }
                     1
                 }
@@ -99599,11 +100045,21 @@ fn exec_psql_stmt_inner(
                 .iter()
                 .map(|e| eval_psql_expr(e, f))
                 .collect::<Result<Vec<_>, _>>()?;
-            let out = psql_depth_guard(|| run_procedure(db, name, &vals, ctx, true))?;
+            // the arguments are the frame's values, each in its own set
+            let arg_cs: Vec<SrcCs> = args.iter().map(|e| psql_expr_src(e, f)).collect();
+            // ...and the outputs come back in the callee's declared sets
+            let out_cs: Vec<SrcCs> = db
+                .as_ref()
+                .and_then(|d| load_procedure(d, name))
+                .map(|m| m.outs.iter().map(|p| param_text_cs(&p.desc)).collect())
+                .unwrap_or_default();
+            let out = psql_depth_guard(|| {
+                with_call_arg_cs(Some(arg_cs), || run_procedure(db, name, &vals, ctx, true))
+            })?;
             match out {
                 Ok((values, _rows)) => {
-                    for (slot, v) in into.iter().zip(values.into_iter()) {
-                        store_slot(f, *slot as usize, v)?;
+                    for (i, (slot, v)) in into.iter().zip(values.into_iter()).enumerate() {
+                        store_slot_cs(f, *slot as usize, v, out_cs.get(i).copied().flatten())?;
                     }
                     Ok(())
                 }
@@ -99622,7 +100078,8 @@ fn exec_psql_stmt_inner(
         TrigStmt::Return { expr, .. } => {
             // a FUNCTION's RETURN: output 0 takes the value, the body ends
             let v = eval_psql_expr(expr, f)?;
-            store_slot(f, f.out_at, v)?;
+            let src = psql_expr_src(expr, f);
+            store_slot_cs(f, f.out_at, v, src)?;
             Err(PsqlStop::Exit)
         }
         // a BEGIN..END block - which every body is, and which nests.
@@ -99753,12 +100210,14 @@ fn exec_psql_stmt_inner(
         // to run
         TrigStmt::ReturnText { text, .. } => {
             let v = render_dyn_text(text, f)?;
-            store_slot(f, f.out_at, v.map_or(Value::Null, Value::Text))?;
+            let src = dyn_text_src(text, f);
+            store_slot_cs(f, f.out_at, v.map_or(Value::Null, Value::Text), src)?;
             Err(PsqlStop::Exit)
         }
         TrigStmt::AssignText { slot, text, .. } => {
             let v = render_dyn_text(text, f)?;
-            store_slot(f, *slot as usize, v.map_or(Value::Null, Value::Text))
+            let src = dyn_text_src(text, f);
+            store_slot_cs(f, *slot as usize, v.map_or(Value::Null, Value::Text), src)
         }
         // IN AUTONOMOUS TRANSACTION: the block runs under a transaction
         // of its OWN, which commits when the block finishes and dies if
@@ -99781,21 +100240,21 @@ fn exec_psql_stmt_inner(
             // a NULL text is the engine's -104 exactly as an empty one
             // is, because concatenation with NULL is NULL and both reach
             // the parser with nothing to read (probed)
-            let sql = render_dyn_text(text, f)?.unwrap_or_default();
+            let sql = dyn_statement_text(text, f)?;
             let sql = if params.is_empty() {
                 sql
             } else if params[0].0.is_some() {
                 // named `:name` binding
                 let mut binds = Vec::with_capacity(params.len());
                 for (n, e) in params {
-                    binds.push((n.clone().unwrap_or_default(), eval_psql_expr(e, f)?));
+                    binds.push((n.clone().unwrap_or_default(), dyn_param_value(e, f)?));
                 }
                 bind_dyn_named(&sql, &binds).ok_or(PsqlStop::Unsupported)?
             } else {
                 // positional `?` binding
                 let mut vals = Vec::with_capacity(params.len());
                 for (_, e) in params {
-                    vals.push(eval_psql_expr(e, f)?);
+                    vals.push(dyn_param_value(e, f)?);
                 }
                 bind_dyn_params(&sql, &vals).ok_or(PsqlStop::Unsupported)?
             };
@@ -99815,7 +100274,7 @@ fn exec_psql_stmt_inner(
                         // PAST THE END THE SLOTS ARE LEFT ALONE, exactly
                         // as a FETCH that found nothing leaves them
                         None => Ok(()),
-                        Some(row) => assign_into(f, into, row),
+                        Some(row) => assign_into(f, into, row, &[]),
                     }
                 }
             }
@@ -99847,6 +100306,7 @@ fn exec_psql_stmt_inner(
                 return Err(psql_raise(EvalErr::DsqlCountMismatch));
             }
             let rows = psql_plan_rows(&plan, db, ctx, *src_off)?;
+            let cs = plan_out_cs(&plan);
             if rows.len() > 1 {
                 // taking the first row would be a wrong answer
                 return Err(psql_raise(EvalErr::SingletonSelect));
@@ -99859,7 +100319,7 @@ fn exec_psql_stmt_inner(
                     Ok(())
                 }
                 Some(row) => {
-                    assign_into(f, into, row)?;
+                    assign_into(f, into, row, &cs)?;
                     set_row_count(f, 1);
                     Ok(())
                 }
@@ -99868,11 +100328,11 @@ fn exec_psql_stmt_inner(
         // FOR EXECUTE STATEMENT: the same loop the static FOR SELECT
         // runs, over a query built at runtime - LEAVE included.
         TrigStmt::ForExecStmt { text, into, body, label, .. } => {
-            let sql = render_dyn_text(text, f)?.unwrap_or_default();
+            let sql = dyn_statement_text(text, f)?;
             let rows = run_dyn_statement(&sql, db, ctx)?
                 .ok_or_else(|| psql_raise(EvalErr::OutputParamsMismatch))?;
             for row in rows {
-                assign_into(f, into, row)?;
+                assign_into(f, into, row, &[])?;
                 match exec_psql_stmt(body, f, steps, db, ctx) {
                     Ok(()) => {}
                     Err(PsqlStop::Leave(t)) if t.is_none() || t.as_deref() == label.as_deref() => break,
@@ -100162,15 +100622,70 @@ fn body_call_out_mismatch(s: &TrigStmt, db: &Database) -> Option<EvalErr> {
     }
 }
 
+thread_local! {
+    /// THE CHARACTER SET EACH ARGUMENT OF THE CALL BEING BOUND IS SPELLED
+    /// IN, for [bind_proc_args]. `None` - the default - is the
+    /// ATTACHMENT's: an argument parsed out of statement text (a literal,
+    /// or a PSQL variable a body wrote into that text - [psql_slot_literal]
+    /// writes a plain literal only where that is its representation) or
+    /// bound to a `?` ([wire_text_param]) is in the attachment's set. A
+    /// caller that evaluated its arguments instead - a stored function
+    /// over a column, a body's `EXECUTE PROCEDURE P(:X)` - names each
+    /// one's set, `None` among them where it is not known.
+    static CALL_ARG_CS: std::cell::RefCell<Option<Vec<SrcCs>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The set argument `i` of the call being bound is spelled in - see
+/// [CALL_ARG_CS].
+fn call_arg_cs(i: usize) -> SrcCs {
+    CALL_ARG_CS.with(|c| match &*c.borrow() {
+        None => Some(CURRENT_ATT_CS.with(|a| a.get())),
+        Some(v) => v.get(i).copied().flatten(),
+    })
+}
+
+/// [CALL_ARG_CS] back to its default for as long as this lives - a body
+/// that is about to run, whose nested calls are not the call just bound.
+struct CallArgCsReset(Option<Vec<SrcCs>>);
+
+impl CallArgCsReset {
+    fn new() -> Self {
+        CallArgCsReset(CALL_ARG_CS.with(|c| c.replace(None)))
+    }
+}
+
+impl Drop for CallArgCsReset {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        CALL_ARG_CS.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// Run `f` with [CALL_ARG_CS] set to `cs`, restoring what was there.
+fn with_call_arg_cs<T>(cs: Option<Vec<SrcCs>>, f: impl FnOnce() -> T) -> T {
+    let prev = CALL_ARG_CS.with(|c| c.replace(cs));
+    let out = f();
+    CALL_ARG_CS.with(|c| *c.borrow_mut() = prev);
+    out
+}
+
 /// Put one projected row into the INTO slots. The engine measures the
 /// two counts and raises "Output parameters mismatch" when they differ,
 /// rather than filling what it can.
-fn assign_into(f: &mut PsqlFrame, into: &[u16], row: Vec<Value>) -> Result<(), PsqlStop> {
+/// `cs` is the set each column is spelled in ([plan_out_cs]) - empty
+/// where that is not known.
+fn assign_into(
+    f: &mut PsqlFrame,
+    into: &[u16],
+    row: Vec<Value>,
+    cs: &[SrcCs],
+) -> Result<(), PsqlStop> {
     if row.len() != into.len() {
         return Err(psql_raise(EvalErr::OutputParamsMismatch));
     }
-    for (slot, v) in into.iter().zip(row.into_iter()) {
-        store_slot(f, *slot as usize, v)?;
+    for (i, (slot, v)) in into.iter().zip(row.into_iter()).enumerate() {
+        store_slot_cs(f, *slot as usize, v, cs.get(i).copied().flatten())?;
     }
     Ok(())
 }
@@ -100186,17 +100701,29 @@ fn assign_into(f: &mut PsqlFrame, into: &[u16], row: Vec<Value>) -> Result<(), P
 ///
 /// `None` for a type this server has not measured the move into - a
 /// BLOB, a WITH TIME ZONE value, a BOOLEAN - which keeps the untyped
-/// store it always had rather than guessing at a conversion. The text
-/// target is SYNTHETIC: a variable's text keeps the character set it
-/// arrived in (the row encoder transliterates at the edge), where a
-/// user CAST would move it into the attachment's.
+/// store it always had rather than guessing at a conversion.
+///
+/// A TEXT slot carries its DECLARED CHARACTER SET, and the slot holds
+/// its value in that set's representation - the characters for a real
+/// set (UTF8, WIN1252), one char per octet for a byte carrier (NONE,
+/// OCTETS). A value arriving from another set is MOVED into it first
+/// ([coerce_to_slot]), as the engine's MOV_move transliterates: under
+/// a NONE attachment the literal 'é' is the octets C3 A9, which a UTF8
+/// parameter reads as 'é' (UPPER 'É', CHAR_LENGTH 1), a WIN1252 one as
+/// 'Ã©' (CHAR_LENGTH 2), and a UTF8 'Ω' into a WIN1252 output is the
+/// 22018 transliteration error at the assignment (all measured). Before
+/// this the slot kept the carrier spelling whatever it was declared as,
+/// and every one of those answered the octets as characters: UPPER of
+/// the UTF8 parameter 'é' was 'Ã©', its CHAR_LENGTH 2, `X || '-' || X`
+/// 'Ã©-Ã©'. The cast stays SYNTHETIC: the set is the slot's own, never
+/// the attachment's a user CAST would name.
 fn slot_cast_target(d: &Descriptor) -> Option<CastTarget> {
     match d.dtype {
         dtype::TEXT | dtype::VARYING => Some(CastTarget::Text {
             len: fire_crab_ods::intl::char_length(d.dtype, d.length, d.sub_type),
             pad: d.dtype == dtype::TEXT,
             synthetic: true,
-            cs: None,
+            cs: Some(fire_crab_ods::intl::charset_id(d.sub_type)),
         }),
         dtype::SQL_DATE => Some(CastTarget::Temporal(TKind::Date)),
         dtype::SQL_TIME => Some(CastTarget::Temporal(TKind::Time)),
@@ -100234,30 +100761,284 @@ fn declared_type_target(type_text: &str) -> Option<CastTarget> {
         | CastTarget::Float
         | CastTarget::DecFloat { .. }
         | CastTarget::Temporal(TKind::Date | TKind::Time | TKind::Timestamp) => Some(t),
-        CastTarget::Text { len, pad, cs: None, .. } => {
-            Some(CastTarget::Text { len, pad, synthetic: true, cs: None })
+        // a named CHARACTER SET is the slot's own; an unnamed one is the
+        // DATABASE default, which the caller fills in ([fill_default_cs])
+        // - `None` left here is a set nobody resolved, and such a slot
+        // keeps the charset-blind store it always had
+        CastTarget::Text { len, pad, cs, .. } => {
+            Some(CastTarget::Text { len, pad, synthetic: true, cs })
         }
         _ => None,
     }
 }
+
+/// A DECLAREd text local that named no CHARACTER SET is in the
+/// database's default set (NONE in a database created without one) -
+/// the engine resolves it at compile time exactly as it does a column's.
+fn fill_default_cs(types: &mut [Option<CastTarget>], db_cs: u8) {
+    for t in types.iter_mut() {
+        if let Some(CastTarget::Text { cs: cs @ None, .. }) = t {
+            *cs = Some(db_cs);
+        }
+    }
+}
+
+/// Does a STORED body's source text hold a string literal (or a quoted
+/// name) that is not what the engine compiled?
+///
+/// The engine keeps two copies of a body: the BLR it runs and the
+/// source text it shows. Under a NONE attachment the source is
+/// transliterated into the catalogue's UTF8 and every octet with no
+/// image becomes '?' - measured: `R = LPAD(X, L, 'é')` created by a
+/// default isql reads back from RDB$PROCEDURE_SOURCE as `LPAD(X, L,
+/// '??')`, while the BLR literal is the two octets C3 A9 and the call
+/// answers 'éééab'. So a quoted token carrying a '?' is trusted only
+/// where the BLR carries exactly those bytes - a genuine `'what?'` is
+/// there verbatim; a lost one is not. No BLR to compare against (a
+/// packaged member) trusts nothing that has a '?'.
+fn source_literals_lost(source: &str, blr: Option<&[u8]>) -> bool {
+    let b = source.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            // comments carry nothing that runs
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i += 2;
+            }
+            q @ (b'\'' | b'"') => {
+                // the token, its doubled quotes undone
+                let mut tok: Vec<u8> = Vec::new();
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if b.get(i + 1) == Some(&q) {
+                            tok.push(q);
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    tok.push(b[i]);
+                    i += 1;
+                }
+                i += 1;
+                if tok.contains(&b'?') {
+                    let kept = blr.is_some_and(|blr| {
+                        !tok.is_empty() && blr.windows(tok.len()).any(|w| w == tok.as_slice())
+                    });
+                    if !kept {
+                        return true;
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// THE SET A STORED BODY'S NON-ASCII LITERALS WERE COMPILED IN, read off
+/// its BLR, or `None` where that cannot be told.
+///
+/// The engine compiles a literal in the attachment's set at CREATE time
+/// and writes that set into the BLR (`blr_literal blr_text2 <ttype>
+/// <len> <octets>`); the source text keeps only the characters. Measured
+/// on engine 2182: a body created by a UTF8 isql with `R = 'é'`, `DECLARE
+/// V ... = 'éa'`, `FOR SELECT W || 'é'` or `RETURN X || 'é'` has ttype 4
+/// and C3 A9 in its BLR, and answers the same under a NONE or a UTF8
+/// attachment - the caller's set plays no part. So every non-ASCII
+/// quoted token in the source must be found among the BLR's text
+/// literals, decoded in THEIR set, and every non-ASCII BLR literal must
+/// be of ONE set (an introducer can type one differently). Only a real
+/// set qualifies: a NONE-compiled body's source lost its octets already
+/// ([source_literals_lost]), and a set this server has no table for
+/// cannot be decoded.
+fn stored_lit_cs(source: &str, blr: Option<&[u8]>) -> SrcCs {
+    use fire_crab_ods::intl;
+    let blr = blr?;
+    // the source's non-ASCII string tokens, their doubled quotes undone
+    let b = source.as_bytes();
+    let mut toks: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i += 2;
+            }
+            q @ (b'\'' | b'"') => {
+                let mut tok = String::new();
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if b.get(i + 1) == Some(&q) {
+                            tok.push(q as char);
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i = push_char_at(&mut tok, source, i);
+                }
+                i += 1;
+                if q == b'\'' && !tok.is_ascii() {
+                    toks.push(tok);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    if toks.is_empty() {
+        return None;
+    }
+    // the BLR's non-ASCII text literals, decoded in their own sets
+    let mut lits: Vec<(u8, Option<String>)> = Vec::new();
+    let mut k = 0usize;
+    while k + 7 <= blr.len() {
+        if blr[k] == 21 && blr[k + 1] == 15 {
+            let tt = i16::from_le_bytes([blr[k + 2], blr[k + 3]]);
+            let n = u16::from_le_bytes([blr[k + 4], blr[k + 5]]) as usize;
+            if let Some(bytes) = blr.get(k + 6..k + 6 + n) {
+                if !bytes.is_ascii() {
+                    let cs = intl::charset_id(tt);
+                    let text = if cs == intl::CS_UTF8 {
+                        String::from_utf8(bytes.to_vec()).ok()
+                    } else if intl::tabled(cs) {
+                        intl::decode_text(cs, bytes)
+                    } else {
+                        None
+                    };
+                    lits.push((cs, text));
+                }
+            }
+        }
+        k += 1;
+    }
+    let first = lits.first()?.0;
+    if lits.iter().any(|(cs, t)| *cs != first || t.is_none()) {
+        return None;
+    }
+    toks.iter()
+        .all(|t| lits.iter().any(|(_, l)| l.as_deref() == Some(t.as_str())))
+        .then_some(first)
+}
+
+/// [source_literals_lost] for a trigger's catalogue row, against its
+/// RDB$TRIGGER_BLR.
+fn trig_source_lost(
+    db: &Database,
+    values: &[fire_crab_ods::format::Value],
+    blr_f: Option<usize>,
+    source: &str,
+) -> bool {
+    let blr = match blr_f.and_then(|i| values.get(i)) {
+        Some(fire_crab_ods::format::Value::Blob(r, n)) => {
+            fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)
+        }
+        _ => None,
+    };
+    source_literals_lost(source, blr.as_deref())
+}
+
+/// [stored_lit_cs] for a trigger's catalogue row, against its
+/// RDB$TRIGGER_BLR.
+fn trig_lit_cs(
+    db: &Database,
+    values: &[fire_crab_ods::format::Value],
+    blr_f: Option<usize>,
+    source: &str,
+) -> SrcCs {
+    if source.is_ascii() {
+        return None;
+    }
+    let blr = match blr_f.and_then(|i| values.get(i)) {
+        Some(fire_crab_ods::format::Value::Blob(r, n)) => {
+            fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)
+        }
+        _ => None,
+    };
+    stored_lit_cs(source, blr.as_deref())
+}
+
+/// The set a text parameter is declared in; `None` for any other type.
+fn param_text_cs(d: &Descriptor) -> SrcCs {
+    matches!(d.dtype, dtype::TEXT | dtype::VARYING).then(|| fire_crab_ods::intl::charset_id(d.sub_type))
+}
+
+/// The character set a text slot is declared in, when it is known.
+fn slot_text_cs(f: &PsqlFrame, n: usize) -> Option<u8> {
+    match f.types.get(n) {
+        Some(Some(CastTarget::Text { cs, .. })) => *cs,
+        _ => None,
+    }
+}
+
+/// Where a value about to be stored in a slot CAME FROM, as far as its
+/// character set goes: `Some(cs)` - it is spelled in `cs`'s
+/// representation; `None` - nobody knows, and then only an ASCII value
+/// (identical in every set) may be stored into a text slot that has a
+/// declared set; a non-ASCII one refuses rather than be read in the
+/// wrong representation.
+type SrcCs = Option<u8>;
 
 /// Convert `v` into slot `n`'s declared type - see [slot_cast_target].
 /// A slot with no declared type takes the value as it is. The error is
 /// the CAST's own vector, raised with an empty trace so [exec_psql_stmt]
 /// stamps it with the ASSIGNMENT's position, which is where the engine
 /// reports it (`-At block line: 1, col: 44` for `R = 3000000000`).
-fn coerce_to_slot(f: &PsqlFrame, n: usize, v: Value) -> Result<Value, PsqlStop> {
+///
+/// A TEXT value into a text slot with a declared set moves into that set
+/// FIRST ([transcode_text] from `src`, the set the value is spelled in),
+/// then the width is checked in the slot's characters - the order the
+/// engine's CVT_move takes (a UTF8 VARCHAR(3) takes the NONE literal
+/// 'éé', four octets, as two characters; a NONE VARCHAR(3) raises 22001
+/// *expected length 3, actual 4* - measured). With no known source a
+/// non-ASCII value refuses: which octets its characters stand for is
+/// exactly what is not known.
+fn coerce_to_slot(f: &PsqlFrame, n: usize, v: Value, src: SrcCs) -> Result<Value, PsqlStop> {
     let Some(Some(t)) = f.types.get(n) else { return Ok(v) };
     if matches!(v, Value::Null) {
         return Ok(v);
     }
-    let e = Expr::Cast(Box::new(Expr::Col(0)), *t, fire_crab_ods::intl::CS_UTF8);
+    let mut from = fire_crab_ods::intl::CS_UTF8;
+    let v = match (t, v) {
+        (CastTarget::Text { cs: Some(dst), .. }, Value::Text(s)) => {
+            let s = match src {
+                Some(src) => transcode_text(src, *dst, s).map_err(psql_raise)?,
+                None if s.is_ascii() => s,
+                None => return Err(PsqlStop::Unsupported),
+            };
+            // already in the slot's set: the cast below only fits it
+            from = *dst;
+            Value::Text(s)
+        }
+        (_, v) => v,
+    };
+    let e = Expr::Cast(Box::new(Expr::Col(0)), *t, from);
     e.eval(&[v]).map_err(psql_raise)
 }
 
-/// Write `v` into slot `n` through its declared type ([coerce_to_slot]).
-fn store_slot(f: &mut PsqlFrame, n: usize, v: Value) -> Result<(), PsqlStop> {
-    let v = coerce_to_slot(f, n, v)?;
+/// Write `v`, spelled in `src`'s representation, into slot `n` through
+/// its declared type ([coerce_to_slot]).
+fn store_slot_cs(f: &mut PsqlFrame, n: usize, v: Value, src: SrcCs) -> Result<(), PsqlStop> {
+    let v = coerce_to_slot(f, n, v, src)?;
     if n >= f.vars.len() {
         f.vars.resize(n + 1, Value::Null);
     }
@@ -100310,7 +101091,7 @@ fn eval_raw_scalar(
     binds: &[(String, u16)],
     f: &PsqlFrame,
     db: &mut Option<Database>,
-) -> Result<Value, PsqlStop> {
+) -> Result<(Value, SrcCs), PsqlStop> {
     let expr = subst_body_query(text, binds, f).ok_or(PsqlStop::Unsupported)?;
     let sql = format!("SELECT {} FROM RDB$DATABASE", expr);
     let mut sink: Vec<Option<Descriptor>> = Vec::new();
@@ -100318,12 +101099,157 @@ fn eval_raw_scalar(
     if !sink.is_empty() {
         return Err(PsqlStop::Unsupported); // a `?` parameter - not from a body
     }
+    // the value comes back in the set the planner typed it in
+    let cs = plan_out_cs(&plan).first().copied().flatten();
     let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
     let rows = branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?;
     rows.into_iter()
         .next()
         .and_then(|mut r| (!r.is_empty()).then(|| r.swap_remove(0)))
+        .map(|v| (v, cs))
         .ok_or(PsqlStop::Unsupported)
+}
+
+/// The character set each projected column of a plan is spelled in -
+/// the set the VALUE is in, before the describe re-announces it. A
+/// literal is the attachment's; an expression of a real set is that set
+/// ([enc_real_cs]); a column is its own. `None` for a column that is
+/// not text.
+///
+/// NOT the set the describe resolves to ([resolve_text_cs]): under a
+/// real attachment that is the attachment's for every real-set column,
+/// but the planner hands back the column's own characters and the
+/// change of set happens only on the wire. Taking the describe's set as
+/// the source skipped the move: a UTF8 'Ωx' fetched into a WIN1252
+/// local under a WIN1252 attachment was stored as if already WIN1252,
+/// where the engine raises 22018 at the FOR SELECT, and the row then
+/// could not be written and the fetch hung.
+fn plan_out_cs(plan: &Plan) -> Vec<SrcCs> {
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    output_cols_of(plan)
+        .iter()
+        .map(|c| match c.wire {
+            Wire::Text | Wire::Varying => Some(if c.sub_type == ATT_SUBTYPE {
+                att
+            } else if c.sub_type <= -2 {
+                (-2 - c.sub_type) as u8
+            } else {
+                fire_crab_ods::intl::charset_id(c.sub_type as i16)
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The set a body expression's value is spelled in: `Ok(Some(cs))`;
+/// `Ok(None)` for a value that has no set to speak of (a number, NULL,
+/// an ASCII literal - ASCII in every set alike); `Err` where it is not
+/// known.
+fn psql_expr_cs(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Option<u8>, ()> {
+    use fire_crab_ods::expr::Expr as E;
+    match e {
+        E::Variable(n) => var_text_cs(f, *n as usize),
+        E::TextLiteral(t) if t.is_ascii() => Ok(None),
+        E::TextLiteral(_) => f.lit_cs.map(Some).ok_or(()),
+        E::Concat(a, b) => join_text_cs(psql_expr_cs(a, f)?, psql_expr_cs(b, f)?),
+        E::IntLiteral(_)
+        | E::Int64Literal(_)
+        | E::NullLiteral
+        | E::Add(..)
+        | E::Subtract(..)
+        | E::Multiply(..)
+        | E::Divide(..)
+        | E::GenId { .. }
+        | E::GenId2 { .. } => Ok(None),
+        _ => Err(()),
+    }
+}
+
+/// [psql_expr_cs] for a slot: its declared set; a slot with none (not
+/// text, or undeclared) says nothing unless it holds non-ASCII text.
+fn var_text_cs(f: &PsqlFrame, n: usize) -> Result<Option<u8>, ()> {
+    if let Some(cs) = slot_text_cs(f, n) {
+        return Ok(Some(cs));
+    }
+    match f.vars.get(n) {
+        Some(Value::Text(t)) if !t.is_ascii() => Err(()),
+        _ => Ok(None),
+    }
+}
+
+/// The set a concatenation of two spelled values is in. Two REAL sets
+/// hold characters alike, so the pair is still characters; a byte
+/// carrier beside a real set is octets beside characters - glued as
+/// Rust text that is neither, and not known.
+fn join_text_cs(a: Option<u8>, b: Option<u8>) -> Result<Option<u8>, ()> {
+    use fire_crab_ods::intl::byte_carrier;
+    match (a, b) {
+        (None, x) | (x, None) => Ok(x),
+        (Some(p), Some(q)) if p == q || (!byte_carrier(p) && !byte_carrier(q)) => Ok(Some(p)),
+        _ => Err(()),
+    }
+}
+
+/// [psql_expr_cs] as the source a store moves from ([SrcCs]).
+fn psql_expr_src(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> SrcCs {
+    text_cs_src(psql_expr_cs(e, f))
+}
+
+fn text_cs_src(r: Result<Option<u8>, ()>) -> SrcCs {
+    match r {
+        Ok(Some(cs)) => Some(cs),
+        // nothing but ASCII: the attachment's set spells it as well as any
+        Ok(None) => Some(CURRENT_ATT_CS.with(|c| c.get())),
+        Err(()) => None,
+    }
+}
+
+/// The set a literal-and-variable text ([DynPart]) is spelled in.
+fn dyn_text_src(parts: &[DynPart], f: &PsqlFrame) -> SrcCs {
+    let mut acc: Result<Option<u8>, ()> = Ok(None);
+    for p in parts {
+        let one = match p {
+            DynPart::Lit(t) if t.is_ascii() => Ok(None),
+            DynPart::Lit(_) => f.lit_cs.map(Some).ok_or(()),
+            DynPart::Var(n) => var_text_cs(f, *n as usize),
+            // a trigger row's column: its set is not carried here
+            DynPart::Row(ctx, col) => match f.trig.as_ref().and_then(|t| t.read(*ctx, col)) {
+                Some(Value::Text(t)) if !t.is_ascii() => Err(()),
+                _ => Ok(None),
+            },
+        };
+        acc = match (acc, one) {
+            (Ok(a), Ok(b)) => join_text_cs(a, b),
+            _ => Err(()),
+        };
+    }
+    text_cs_src(acc)
+}
+
+/// The text of an EXECUTE STATEMENT, which is prepared in the
+/// ATTACHMENT's set like any statement: a text built from values of
+/// another set (a UTF8 variable under a NONE attachment) is not the
+/// statement those characters would spell there, and refuses when that
+/// can show - when it is not all ASCII.
+fn dyn_statement_text(parts: &[DynPart], f: &PsqlFrame) -> Result<String, PsqlStop> {
+    let sql = render_dyn_text(parts, f)?.unwrap_or_default();
+    if !sql.is_ascii() && dyn_text_src(parts, f) != Some(CURRENT_ATT_CS.with(|c| c.get())) {
+        return Err(PsqlStop::Unsupported);
+    }
+    Ok(sql)
+}
+
+/// An EXECUTE STATEMENT argument's value - written into the statement
+/// as a literal of the attachment's set, so a non-ASCII one of another
+/// set refuses (see [dyn_statement_text]).
+fn dyn_param_value(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value, PsqlStop> {
+    let v = eval_psql_expr(e, f)?;
+    if let Value::Text(t) = &v {
+        if !t.is_ascii() && psql_expr_src(e, f) != Some(CURRENT_ATT_CS.with(|c| c.get())) {
+            return Err(PsqlStop::Unsupported);
+        }
+    }
+    Ok(v)
 }
 
 fn render_dyn_text(parts: &[DynPart], f: &PsqlFrame) -> Result<Option<String>, PsqlStop> {
@@ -100630,6 +101556,9 @@ fn try_procedure_blr(
     if *db.meta_memo("blrcoll-proc", name, || blr_reads_collated_relation(db, &blr)) {
         return BlrProcOutcome::Outside; // a COLLATION decides in there
     }
+    if blr_has_non_ascii_literal(&blr) {
+        return BlrProcOutcome::Outside;
+    }
     // THE SAME BINDING AS THE SOURCE PATH, or the two disagree about
     // one call: the truncation raise is typed, everything else falls
     // to the source interpreter to refuse in its own words
@@ -100643,7 +101572,8 @@ fn try_procedure_blr(
             if filled.len() != meta.ins.len() {
                 return BlrProcOutcome::Outside;
             }
-            match bind_proc_args(name, &meta, &filled) {
+            match bind_proc_args(name, &meta, &filled, args.len()) {
+                Ok(b) if text_not_ascii(&b, &meta.ins) => return BlrProcOutcome::Outside,
                 Ok(b) => b,
                 Err(ProcErr { status: Some(ev), .. }) => return BlrProcOutcome::Runtime(ev),
                 Err(_) => return BlrProcOutcome::Outside,
@@ -100733,7 +101663,7 @@ fn try_procedure_blr(
         if rows
             .iter()
             .chain(std::iter::once(&finals))
-            .any(|r| text_in_nontext_output(r, &meta.outs))
+            .any(|r| text_in_nontext_output(r, &meta.outs) || text_not_ascii(r, &meta.outs))
         {
             return BlrProcOutcome::Outside;
         }
@@ -100764,6 +101694,9 @@ fn try_function_blr(database: &Option<Database>, name: &str, args: &[Value]) -> 
     if *db.meta_memo("blrcoll-fn", name, || blr_reads_collated_relation(db, &blr)) {
         return FnBlrOutcome::Outside; // a COLLATION decides in there
     }
+    if blr_has_non_ascii_literal(&blr) {
+        return FnBlrOutcome::Outside;
+    }
     let Some(meta) = load_function(db, name) else {
         return FnBlrOutcome::Outside;
     };
@@ -100773,9 +101706,11 @@ fn try_function_blr(database: &Option<Database>, name: &str, args: &[Value]) -> 
     if filled.len() != meta.ins.len() {
         return FnBlrOutcome::Outside;
     }
+    let given = args.len();
     let args = &filled[..];
     // the SAME argument binding as the source path (typed CVT errors surface)
-    let bound_args = match bind_proc_args(name, &meta, args) {
+    let bound_args = match bind_proc_args(name, &meta, args, given) {
+        Ok(b) if text_not_ascii(&b, &meta.ins) => return FnBlrOutcome::Outside,
         Ok(b) => b,
         Err(ProcErr { status: Some(ev), .. }) => return FnBlrOutcome::Runtime(ev),
         Err(_) => return FnBlrOutcome::Outside,
@@ -100840,12 +101775,59 @@ fn try_function_blr(database: &Option<Database>, name: &str, args: &[Value]) -> 
     // exactly as try_procedure_blr does
     if matches!(v, Value::Text(_)) {
         if let Some(o) = meta.outs.first() {
-            if text_in_nontext_output(std::slice::from_ref(&v), std::slice::from_ref(o)) {
+            if text_in_nontext_output(std::slice::from_ref(&v), std::slice::from_ref(o))
+                || text_not_ascii(std::slice::from_ref(&v), std::slice::from_ref(o))
+            {
                 return FnBlrOutcome::Outside;
             }
         }
     }
     FnBlrOutcome::Value(v)
+}
+
+/// Does this BLR hold a non-ASCII text literal? The executor reads one
+/// as bare text with its set dropped, so it compares and measures it in
+/// the wrong set. Measured: `SELECT COUNT(*) FROM TW WHERE W = 'é'` in a
+/// body compiled under NONE is 1 on the engine (the literal is NONE
+/// C3 A9, the WIN1252 column holds the same two octets), and 0 from the
+/// executor; compiled under WIN1252 it answered 0 for the engine's 1
+/// too. Such a body goes to the source interpreter, which knows the
+/// literal's set ([stored_lit_cs]) or refuses. The scan is the one
+/// [stored_lit_cs] makes: `blr_literal blr_text2 <ttype> <len>`, and a
+/// false match only sends a body to the slower path.
+fn blr_has_non_ascii_literal(blr: &[u8]) -> bool {
+    let mut k = 0usize;
+    while k + 6 <= blr.len() {
+        if blr[k] == 21 && blr[k + 1] == 15 {
+            let n = u16::from_le_bytes([blr[k + 4], blr[k + 5]]) as usize;
+            if blr.get(k + 6..k + 6 + n).is_some_and(|b| !b.is_ascii()) {
+                return true;
+            }
+        }
+        k += 1;
+    }
+    false
+}
+
+/// Does a non-ASCII text value cross the BLR executor? The executor
+/// carries text as bare strings - no character set, no transliteration,
+/// no octets - so it is right about text only where every set spells it
+/// alike, which is ASCII. Anything else goes to the source interpreter,
+/// which moves each value between sets as the engine does. Measured, all
+/// answered wrongly by the executor: a UTF8 'Ω' copied into a WIN1252
+/// output is the 22018 transliteration error at the assignment (it
+/// answered a row the encoder then could not write, and the connection
+/// dropped); `OCTET_LENGTH` of a WIN1252 local holding 'é' is 1 (it
+/// answered 2); a UTF8 column fetched into a NONE output is the octets
+/// C3 A9 (it answered the one octet E9); a NONE column fetched into a
+/// UTF8 output under a UTF8 attachment is 'é' (it answered 'Ã©'); and
+/// 'éé' into a NONE VARCHAR(3) local is 22001 *expected length 3, actual
+/// 4* (it answered 'éé'). The executor's answer is taken only where
+/// every text argument and output is ASCII.
+fn text_not_ascii(values: &[Value], params: &[ProcParam]) -> bool {
+    values.iter().zip(params.iter()).any(|(v, p)| {
+        matches!(v, Value::Text(t) if !t.is_ascii()) && param_text_cs(&p.desc).is_some()
+    })
 }
 
 /// Would this row put a TEXT value where the procedure declares
@@ -100934,6 +101916,46 @@ fn with_proc_defaults(meta: &ProcMeta, args: &[Value], ctx: Option<&SessionCtx>)
     out
 }
 
+/// [with_proc_defaults] for a call whose filled list is kept AS ITS
+/// ARGUMENTS - the SELECT planner stores it, and the binder later reads
+/// every one of them as spelled in the call's set ([call_arg_cs]). So a
+/// text default is moved into that set here, from its own
+/// ([ProcParam::default_cs]) - but only where that detour lands on the
+/// same value as the engine's DIRECT move from the default's set into
+/// the parameter's. It often does not: a UTF8-compiled 'é' default of a
+/// WIN1252 parameter is 'é' on the engine under a NONE attachment, and
+/// through NONE it is the octets C3 A9, which WIN1252 reads as 'Ã©'. A
+/// default that would change on the way is left unfilled, with every
+/// one after it: the run-time fill then supplies it by position and the
+/// binder moves it straight into its parameter, as the engine does. The
+/// arity check already accepts a tail of defaulted parameters.
+fn with_proc_defaults_as_args(meta: &ProcMeta, args: &[Value]) -> Vec<Value> {
+    let mut out = with_proc_defaults(meta, args, None);
+    for i in args.len()..out.len() {
+        let p = &meta.ins[i];
+        let Value::Text(t) = &out[i] else { continue };
+        if t.is_ascii() {
+            continue;
+        }
+        let pcs = fire_crab_ods::intl::charset_id(p.desc.sub_type);
+        let moved = match (p.default_cs, call_arg_cs(i)) {
+            (Some(d), Some(a)) => transcode_text(d, a, t.clone()).ok().filter(|via| {
+                let direct = transcode_text(d, pcs, t.clone()).ok();
+                direct.is_some() && transcode_text(a, pcs, via.clone()).ok() == direct
+            }),
+            _ => None,
+        };
+        match moved {
+            Some(m) => out[i] = Value::Text(m),
+            None => {
+                out.truncate(i);
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Bind a call's arguments to the DECLARED parameters - the same rules
 /// on BOTH executor paths (stored BLR and the source interpreter), or
 /// the two would disagree about the same call. Measured: a CHAR input
@@ -100955,13 +101977,47 @@ fn int_fits_param(d: &Descriptor, n: i64) -> bool {
     }
 }
 
-fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Value>, ProcErr> {
+/// `given` is how many of `args` the caller supplied; the rest are the
+/// parameters' defaults ([with_proc_defaults]), which move from their
+/// own set ([ProcParam::default_cs]) rather than the call's.
+fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value], given: usize) -> Result<Vec<Value>, ProcErr> {
     let mut bound: Vec<Value> = Vec::with_capacity(args.len());
-    for (arg, param) in args.iter().zip(meta.ins.iter()) {
+    for (i, (arg, param)) in args.iter().zip(meta.ins.iter()).enumerate() {
         let d = &param.desc;
-        let declared_chars = match d.dtype {
-            fire_crab_ods::format::dtype::VARYING => (d.length as usize).saturating_sub(2),
-            _ => d.length as usize,
+        // THE WIDTH IS IN CHARACTERS of the parameter's own set: a UTF8
+        // VARCHAR(10) is 42 bytes on disk and still takes ten characters
+        // (measured: an eleven-character argument is the locationless
+        // 22001 *expected length 10, actual 11*, which the byte count
+        // let through as forty)
+        let declared_chars = fire_crab_ods::intl::char_length(d.dtype, d.length, d.sub_type);
+        // ...and a text argument MOVES INTO that set first, from the set
+        // it is spelled in ([call_arg_cs])
+        let moved;
+        let arg = match (arg, col_kind(d)) {
+            (Value::Text(t), Some(ColKind::Text)) => {
+                let pcs = fire_crab_ods::intl::charset_id(d.sub_type);
+                let src = if i >= given && param.default.is_some() {
+                    param.default_cs
+                } else {
+                    call_arg_cs(i)
+                };
+                moved = Value::Text(match src {
+                    Some(src) => transcode_text(src, pcs, t.clone()).map_err(|e| ProcErr {
+                        rows: Vec::new(),
+                        text: format!("procedure {}: argument {} does not move into its set", name, param.name),
+                        status: Some(e),
+                    })?,
+                    None if t.is_ascii() => t.clone(),
+                    None => {
+                        return Err(ProcErr::from(format!(
+                            "procedure {}: argument {} is text of an unknown character set",
+                            name, param.name
+                        )))
+                    }
+                });
+                &moved
+            }
+            _ => arg,
         };
         bound.push(match (arg, col_kind(d)) {
             (Value::Null, _) => Value::Null,
@@ -101261,6 +102317,10 @@ struct FnCall {
     id: u32,
     name: String,
     args: Vec<Expr>,
+    /// the character set each argument's value is spelled in, read off
+    /// its type at prepare ([cmp_text_charset]) - what the call's text
+    /// arguments move into their parameters' sets FROM ([CALL_ARG_CS])
+    arg_cs: Vec<SrcCs>,
 }
 
 /// Is this upper-cased word one the ENGINE has a meaning for before a
@@ -101410,13 +102470,20 @@ fn materialise_user_fn_rows(
             }
             // the BLR executor first (the full expression surface), then
             // the arithmetic-only source interpreter for what it declines
-            let v = match try_function_blr(database, &c.name, &argv) {
+            let v = match with_call_arg_cs(Some(c.arg_cs.clone()), || {
+                try_function_blr(database, &c.name, &argv)
+            }) {
                 FnBlrOutcome::Value(v) => v,
                 FnBlrOutcome::Runtime(ev) => {
-                    return Err(fn_runtime_with_position(database, &c.name, &argv, ctx, ev))
+                    return Err(with_call_arg_cs(Some(c.arg_cs.clone()), || {
+                        fn_runtime_with_position(database, &c.name, &argv, ctx, ev)
+                    }))
                 }
                 FnBlrOutcome::Outside => {
-                    run_function(database, &c.name, &argv, ctx).map_err(|e| {
+                    with_call_arg_cs(Some(c.arg_cs.clone()), || {
+                        run_function(database, &c.name, &argv, ctx)
+                    })
+                    .map_err(|e| {
                         if std::env::var("FC_SRV_TRACE").is_ok() {
                             eprintln!("[srv] user function {}({:?}) failed: {}", c.name, argv, e);
                         }
@@ -101562,7 +102629,7 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     let adefval_f = afid("RDB$DEFAULT_VALUE");
     let (aschema_f, apkg_f) = (afid("RDB$SCHEMA_NAME"), afid("RDB$PACKAGE_NAME"));
     let afmts = vec![(0u8, adescs)];
-    let mut raw: Vec<(i64, String, String, Option<DefaultVal>)> = Vec::new();
+    let mut raw: Vec<(i64, String, String, Option<(DefaultVal, SrcCs)>)> = Vec::new();
     for_each_catalog_record(db, 15, &afmts, usize::MAX, |v| {
         let hit = matches!(v.get(an_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || !row_visible(v, aschema_f, apkg_f) {
@@ -101575,7 +102642,7 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
             };
             let defval = match adefval_f.and_then(|i| v.get(i)) {
                 Some(Value::Blob(r, n)) => fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)
-                    .and_then(|b| decode_default_blr(&b)),
+                    .and_then(|b| decode_param_default_blr(&b)),
                 _ => None,
             };
             raw.push((*pos, pname, fs.trim_end().to_string(), defval));
@@ -101625,10 +102692,11 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
             return None;
         }
         if pos == 0 {
-            outs.push(ProcParam { name: "RETURN".into(), desc, default: None, default_ctx: None });
+            outs.push(ProcParam { name: "RETURN".into(), desc, default: None, default_ctx: None, default_cs: None });
         } else {
-            let (default, default_ctx) = split_default(defval);
-            ins.push(ProcParam { name: pname, desc, default, default_ctx });
+            let default_cs = defval.as_ref().and_then(|(_, c)| *c);
+            let (default, default_ctx) = split_default(defval.map(|(d, _)| d));
+            ins.push(ProcParam { name: pname, desc, default, default_ctx, default_cs });
         }
     }
     if outs.len() != 1 {
@@ -101821,7 +102889,7 @@ fn trig_cursor_states(source: &str) -> std::collections::HashMap<String, CursorS
     };
     declared_cursors(&source[..begin_at])
         .into_iter()
-        .map(|(name, query)| (name, CursorState { query, rows: None, at: 0 }))
+        .map(|(name, query)| (name, CursorState { query, rows: None, at: 0, cs: Vec::new() }))
         .collect()
 }
 
@@ -101917,6 +102985,7 @@ fn fire_triggers(
         let mut frame = PsqlFrame {
  stop_after: None,
             types: trig_slot_types(&d.source),
+            lit_cs: d.lit_cs,
             vars: vec![Value::Null; names.len()],
             out_at: names.len(),
             out_len: 0,
@@ -101951,6 +103020,7 @@ fn fire_triggers(
             let mut scout = PsqlFrame {
  stop_after: None,
             types: trig_slot_types(&d.source),
+            lit_cs: d.lit_cs,
                 vars: vec![Value::Null; names.len()],
                 out_at: names.len(),
                 out_len: 0,
@@ -102109,6 +103179,7 @@ fn run_body_source(
     stop_after: Option<BodyCap>,
 ) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
     // omitted trailing arguments take their parameters' DEFAULTs
+    let given = args.len();
     let args = with_proc_defaults(meta, args, Some(ctx));
     let args = &args[..];
     if args.len() != meta.ins.len() {
@@ -102137,7 +103208,11 @@ fn run_body_source(
     let locals = declared_vars(&meta.source[..begin_at]);
     let mut types: Vec<Option<CastTarget>> =
         meta.ins.iter().chain(meta.outs.iter()).map(|p| slot_cast_target(&p.desc)).collect();
+    let params_at = types.len();
     types.extend(locals.iter().map(|(_, t)| *t));
+    if let Some(dbr) = database.as_ref() {
+        fill_default_cs(&mut types[params_at..], db_default_charset(&dbr.bytes(), dbr.page_size));
+    }
     names.extend(locals.into_iter().map(|(n, _)| n));
     // THE CURSORS the header declares, and ROW_COUNT.
     //
@@ -102158,7 +103233,7 @@ fn run_body_source(
     };
     let cursor_states: std::collections::HashMap<String, CursorState> = cursors
         .into_iter()
-        .map(|(name, query)| (name, CursorState { query, rows: None, at: 0 }))
+        .map(|(name, query)| (name, CursorState { query, rows: None, at: 0, cs: Vec::new() }))
         .collect();
     let body = parse_trigger_body(&meta.source, begin_at, meta.source.trim_end().len(), &names)
         .ok_or_else(|| format!("procedure {}'s body is outside this server's PSQL surface", name))?;
@@ -102187,9 +103262,54 @@ fn run_body_source(
         }
     }
 
+    // A STORED BODY WHOSE SOURCE LOST ITS LITERALS IS NOT ITS BODY. See
+    // [source_literals_lost]: the engine answers from the BLR, where the
+    // literal is whole, and the source this interpreter reads has a '?'
+    // in its place - `LPAD(X, L, 'é')` created under a NONE attachment
+    // is stored as `LPAD(X, L, '??')`, and interpreting that answered
+    // '???ab' for the engine's 'éééab'. Refused, not guessed at.
+    if name != ANONYMOUS_BLOCK {
+        if let Some(dbr) = database.as_ref() {
+            let kind = if meta.is_function { "srclost-fn" } else { "srclost-proc" };
+            let lost = *dbr.meta_memo(kind, name, || {
+                let img = dbr.bytes();
+                let blr = if meta.is_function {
+                    fire_crab_exe::function_blr(&img, dbr.page_size, name)
+                } else {
+                    fire_crab_exe::procedure_blr(&img, dbr.page_size, name)
+                };
+                source_literals_lost(&meta.source, blr.ok().as_deref())
+            });
+            if lost {
+                return Err(ProcErr::from(format!(
+                    "{}'s stored source lost a literal the BLR still has",
+                    name
+                )));
+            }
+        }
+    }
+    // an EXECUTE BLOCK's literals are the attachment's; a stored body's
+    // are the set its BLR recorded ([stored_lit_cs])
+    let lit_cs: SrcCs = if name == ANONYMOUS_BLOCK {
+        Some(CURRENT_ATT_CS.with(|c| c.get()))
+    } else {
+        database.as_ref().and_then(|dbr| {
+            let kind = if meta.is_function { "srclit-fn" } else { "srclit-proc" };
+            *dbr.meta_memo(kind, name, || {
+                let img = dbr.bytes();
+                let blr = if meta.is_function {
+                    fire_crab_exe::function_blr(&img, dbr.page_size, name)
+                } else {
+                    fire_crab_exe::procedure_blr(&img, dbr.page_size, name)
+                };
+                stored_lit_cs(&meta.source, blr.ok().as_deref())
+            })
+        })
+    };
     let mut frame = PsqlFrame {
  stop_after: None,
             types,
+            lit_cs,
         vars: Vec::new(),
         out_at: meta.ins.len(),
         out_len: meta.outs.len(),
@@ -102201,7 +103321,10 @@ fn run_body_source(
         gen: Default::default(),
         trig_excs: Vec::new(),
     };
-    let bound = bind_proc_args(name, meta, args)?;
+    let bound = bind_proc_args(name, meta, args, given)?;
+    // the calls the BODY makes spell their own arguments: the default
+    // again (statement text), whatever this call's caller had set
+    let _args_reset = CallArgCsReset::new();
     frame.vars.extend(bound);
     frame.vars.resize(names.len(), Value::Null);
     // ROW_COUNT BEFORE ANY STATEMENT IS 0, NOT NULL (probed: a body
@@ -109293,7 +110416,7 @@ fn after_auth(
                         outs: out_names
                             .iter()
                             .zip(out_descs.iter())
-                            .map(|(n, d)| ProcParam { name: n.clone(), desc: *d, default: None, default_ctx: None })
+                            .map(|(n, d)| ProcParam { name: n.clone(), desc: *d, default: None, default_ctx: None, default_cs: None })
                             .collect(),
                         source,
                         body_at: Some(body_at),
@@ -116417,6 +117540,15 @@ mod tests {
         assert_eq!(cs_join(TfCs::Ttype(53), TfCs::Ttype(4)), TfCs::Ttype(53));
         assert_eq!(cs_join(TfCs::Att, TfCs::Ttype(4)), TfCs::Ttype(4));
         assert_eq!(cs_join(TfCs::Ttype(0), TfCs::Att), TfCs::Att);
+        // ...but under a REAL attachment the literal IS that set, and of
+        // two real sets the first wins (`'é' || <WIN1252>` is UTF8 under
+        // UTF8, measured 4 octets)
+        let was = CURRENT_ATT_CS.with(|c| c.replace(4));
+        assert_eq!(cs_join(TfCs::Att, TfCs::Ttype(53)), TfCs::Att);
+        assert_eq!(cs_join(TfCs::Ttype(53), TfCs::Att), TfCs::Ttype(53));
+        assert_eq!(cs_join(TfCs::Att, TfCs::Ttype(1)), TfCs::Ttype(1));
+        assert_eq!(cs_join(TfCs::Att, TfCs::Ttype(0)), TfCs::Att);
+        CURRENT_ATT_CS.with(|c| c.set(was));
         // the emission law (probed): a real-charset expression resolves
         // to the ATTACHMENT charset when the attachment names a real
         // one, and keeps its own under a NONE attachment
@@ -125141,6 +126273,40 @@ mod tests {
     /// The EXECUTE STATEMENT text operand: what it reads, and - the half
     /// that matters - what it refuses, since a form read WRONG would run
     /// a statement the body did not write.
+    /// A stored body's literal set is read off its BLR: `blr_literal
+    /// blr_text2 <ttype> <len> <octets>` decoded in that set must spell
+    /// every non-ASCII token of the source, and every non-ASCII BLR
+    /// literal must be of the one set.
+    #[test]
+    fn stored_lit_cs_reads_the_blr_literal_set() {
+        let lit = |tt: u16, b: &[u8]| {
+            let mut v = vec![21u8, 15];
+            v.extend_from_slice(&tt.to_le_bytes());
+            v.extend_from_slice(&(b.len() as u16).to_le_bytes());
+            v.extend_from_slice(b);
+            v
+        };
+        let src = "BEGIN R = LPAD(X, L, 'é'); END";
+        // compiled under UTF8: C3 A9, ttype 4
+        assert_eq!(stored_lit_cs(src, Some(&lit(4, &[0xC3, 0xA9]))), Some(4));
+        // compiled under WIN1252 from a UTF-8 file: the source reads 'Ã©'
+        assert_eq!(stored_lit_cs("BEGIN R = 'Ã©'; END", Some(&lit(53, &[0xC3, 0xA9]))), Some(53));
+        // ...and a WIN1252 E9 spells 'é'
+        assert_eq!(stored_lit_cs(src, Some(&lit(53, &[0xE9]))), Some(53));
+        // compiled under NONE: not a real set, not known
+        assert_eq!(stored_lit_cs(src, Some(&lit(0, &[0xC3, 0xA9]))), None);
+        // a token the BLR does not hold, and two sets: not known
+        assert_eq!(stored_lit_cs(src, Some(&lit(4, &[0xC3, 0xA8]))), None);
+        let mut two = lit(4, &[0xC3, 0xA9]);
+        two.extend(lit(53, &[0xE9]));
+        assert_eq!(stored_lit_cs(src, Some(&two)), None);
+        // no non-ASCII token, or no BLR: nothing to say
+        assert_eq!(stored_lit_cs("BEGIN R = 'a'; END", Some(&lit(4, &[0xC3, 0xA9]))), None);
+        assert_eq!(stored_lit_cs(src, None), None);
+        assert!(blr_has_non_ascii_literal(&lit(4, &[0xC3, 0xA9])));
+        assert!(!blr_has_non_ascii_literal(&lit(4, b"ab")));
+    }
+
     #[test]
     fn dyn_text_reads_literals_variables_and_concatenations() {
         let vars = vec!["K".to_string(), "S".to_string()];
@@ -125149,6 +126315,7 @@ mod tests {
             let f = PsqlFrame {
  stop_after: None,
             types: Vec::new(),
+            lit_cs: None,
                 vars: vec![k, s],
                 out_at: 0,
                 out_len: 0,

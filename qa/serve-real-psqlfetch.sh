@@ -43,9 +43,10 @@
 # RECORDED, not fixed: an EXECUTE BLOCK the procedure compiler (the
 # fire-crab-dsql crate) refuses at PREPARE still refuses - a call to a
 # stored function in the body, an INT128 or NUMERIC(19..38) output or
-# local, a scaled literal past 32 bits, IIF; `EXTRACT(DAY FROM D)` over a
-# local is refused there with a -204 Table unknown "D" (the engine
-# answers 26). A WHERE over a procedure that raises after suspending
+# local, a scaled literal past 32 bits, IIF, `EXTRACT(DAY FROM D)` over a
+# local (the engine answers 26 - this used to be a WRONG error, -204 Table
+# unknown "D", the FROM of EXTRACT read as a clause; it is a plain refusal
+# since qa/serve-real-psqlassign.sh section 8). A WHERE over a procedure that raises after suspending
 # raises without the row the engine delivers first (the rows are read
 # as a set there), and a UNION ALL over it refuses. `EXECUTE PROCEDURE PY0 ()` answers where
 # the engine raises -104 on the empty list. All pinned below.
@@ -242,7 +243,7 @@ refused "7 an INT128 local" "$(eb 'EXECUTE BLOCK RETURNS (R INT128) AS DECLARE A
 refused "7 a NUMERIC(38,2) output" "$(eb 'EXECUTE BLOCK RETURNS (R NUMERIC(38,2)) AS DECLARE A NUMERIC(18,2); BEGIN A = 1.01; R = A; SUSPEND; END')" "R|1.01"
 refused "7 a scaled literal past 32 bits" "$(eb 'EXECUTE BLOCK RETURNS (R NUMERIC(18,2)) AS DECLARE A NUMERIC(18,2); BEGIN A = 92233720368547758.07; R = A; SUSPEND; END')" "R|92233720368547758.07"
 refused "7 IIF over a local" "$(eb 'EXECUTE BLOCK RETURNS (R INTEGER) AS DECLARE X INTEGER = 3; BEGIN R = IIF(X > 2, X * 10, 0); SUSPEND; END')" "R|30"
-differs "7 EXTRACT(DAY FROM D) over a local: the compiler's -204" "$(eb "EXECUTE BLOCK RETURNS (R INTEGER) AS DECLARE D DATE; BEGIN D = DATE '2026-09-26'; R = EXTRACT(DAY FROM D); SUSPEND; END")" "R|26" "Statement failed, SQLSTATE = 42S02|Dynamic SQL Error|-SQL error code = -204|-Table unknown|-\"D\"|-At line 1, column 104"
+refused "7 EXTRACT(DAY FROM D) over a local (it was a wrong -204 Table unknown \"D\")" "$(eb "EXECUTE BLOCK RETURNS (R INTEGER) AS DECLARE D DATE; BEGIN D = DATE '2026-09-26'; R = EXTRACT(DAY FROM D); SUSPEND; END")" "R|26"
 differs "7 a WHERE over a procedure raising after a passing row" "SELECT * FROM PE5(40) WHERE X > 0;" "X|40|$AR|-At procedure \"PUBLIC\".\"PE5\" line: 1, col: 80" "X|$AR|-At procedure \"PUBLIC\".\"PE5\" line: 1, col: 80"
 refused "7 UNION ALL over it" "SELECT X FROM PE5(40) UNION ALL SELECT 7 FROM RDB\$DATABASE;" "X|40|$AR|-At procedure \"PUBLIC\".\"PE5\" line: 1, col: 80"
 differs "7 EXECUTE PROCEDURE with an empty argument list" "EXECUTE PROCEDURE PY0 ();" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 24|-)" "R|7"
