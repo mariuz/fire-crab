@@ -17,13 +17,14 @@
 # DECFLOAT display rounding; the overflow rows materialize the value so
 # the trap actually fires.
 #
-# DEFERRED, asserted as a KNOWN divergence (fire-crab refuses, engine
-# answers): a bare compile-time-constant approximate literal cast to
-# DECFLOAT is a prepare-time decimal fold on the literal TEXT
-# (CAST(0.1e0 AS DECFLOAT(34)) -> 0.1), which fire-crab cannot yet
-# reproduce, so it refuses rather than ship the 17-sig runtime value. An
-# intervening CAST(.. AS DOUBLE) defeats the fold and fire-crab MUST then
-# answer the runtime expansion - the pair pins the split.
+# A bare compile-time-constant approximate literal cast to DECFLOAT is a
+# prepare-time decimal fold on the literal TEXT (CAST(0.1e0 AS
+# DECFLOAT(34)) -> 0.1, the engine's LiteralNode::pass2), which fire-crab
+# reproduces from the recorded spelling since the widenum review round;
+# a constant TREE (0.1e0+0.0e0) stays DEFERRED, asserted as a KNOWN
+# divergence (fire-crab refuses, engine answers). An intervening CAST(..
+# AS DOUBLE) defeats the fold and fire-crab MUST then answer the runtime
+# expansion - the cells pin the split.
 #
 # Usage: qa/serve-real-castintodecfloat.sh [port]   (default 4164)
 set -u
@@ -95,8 +96,8 @@ agree "1.5e308 col -> df16 (value)" "select $(vc "cast(cast(1.5e308 as double pr
 echo "-- rounding ties (spot-check half-even at the 18th digit) --"
 agree "0.12345678901234568 -> df16" "select $(vc "$(dbl 0.12345678901234568 x 16)") x from t;"
 agree "0.30000000000000004 -> df34" "select $(vc "$(dbl 0.30000000000000004 x 34)") x from t;"
-echo "-- constant-literal fold: DEFERRED (fc refuses; engine answers 0.1) --"
-refuses_fc "CAST(0.1e0 AS DECFLOAT(34))" "select cast(0.1e0 as decfloat(34)) x from t;"
+echo "-- constant-literal fold: a BARE literal re-reads its text (0.1); a constant TREE is still DEFERRED --"
+agree "CAST(0.1e0 AS DECFLOAT(34)) - the text fold" "select cast(0.1e0 as decfloat(34)) x from t;"
 refuses_fc "CAST(0.1e0+0.0e0 AS DECFLOAT(34))" "select cast(0.1e0+0.0e0 as decfloat(34)) x from t;"
 echo "-- contrast: an intervening CAST-to-DOUBLE defeats the fold -> runtime --"
 agree "CAST(CAST(0.1e0 AS DOUBLE) AS DF34)" "select $(vc "cast(cast(0.1e0 as double precision) as decfloat(34))") x from t;"

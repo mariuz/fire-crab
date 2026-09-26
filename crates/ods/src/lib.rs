@@ -32,6 +32,7 @@ pub mod coll;
 pub mod data;
 pub mod ddl;
 pub mod decfloat;
+pub mod decmath;
 pub mod dml;
 pub mod expr;
 pub mod format;
