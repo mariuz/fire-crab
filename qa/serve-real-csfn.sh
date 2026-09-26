@@ -31,20 +31,52 @@
 #     SHA512 / FOO raise *Invalid HASH algorithm X* at prepare.
 #   * BIT_LENGTH is eight times OCTET_LENGTH (INTEGER; BIGINT over a
 #     blob) - it was *Function unknown* here.
-#   * LPAD / RPAD / REPLACE / TRIM / POSITION CONVERT EVERY OPERAND INTO
-#     THE RESULT'S SET before they run (each evl* MOV_make_string2's into
-#     it): LPAD/RPAD and TRIM keep their VALUE's set, POSITION runs in
-#     the SEARCHED string's, REPLACE negotiates its three
-#     (getResultTextType).  So `LPAD(N, 8, 'Ä')` over a NONE column is
-#     NONE with the literal's OCTETS as the pad - C3 84 - under a UTF8
-#     attachment; this server padded with the carrier char C4, and under
-#     a WIN1252 attachment ('„' has no carrier image) it DROPPED THE
-#     CONNECTION (08006) mid-row.  `REPLACE(N, 'É', 'e')` under UTF8 is
-#     a UTF8 result (NONE yields), so N is READ AS UTF8: 'ÀeÎ' for a row
-#     of valid octets and *Malformed string* (22000) for a lone E9; this
-#     server answered the carrier chars re-encoded (C3 83 C2 80 ...) and
-#     C3 A9 for the row the engine refuses.  `POSITION(<NONE C3 89> IN
-#     U)` is 2 - the octets read as the UTF8 'É' - not the byte offset 3.
+#   * LPAD / RPAD / REPLACE / TRIM / POSITION CONVERT EVERY OTHER OPERAND
+#     INTO THE SET THE FUNCTION RUNS IN (each evl* MOV_make_string2's
+#     into it): LPAD/RPAD and TRIM run in their VALUE's set, POSITION and
+#     REPLACE in the SEARCHED string's (evlReplace: values[0]'s text
+#     type; only REPLACE's DESCRIBE negotiates its three).  So `LPAD(N,
+#     8, 'Ä')` over a NONE column is NONE with the literal's OCTETS as
+#     the pad - C3 84 - under a UTF8 attachment; this server padded with
+#     the carrier char C4, and under a WIN1252 attachment ('„' has no
+#     carrier image) it DROPPED THE CONNECTION (08006) mid-row.
+#     `POSITION(<NONE C3 89> IN U)` is 2 - the octets read as the UTF8
+#     'É' - not the byte offset 3.
+#   * A VALUE CAN BE IN A SET ITS DESCRIBE DOES NOT NAME, and the engine
+#     keeps the two apart: `REPLACE(N, 'É', 'e')` RUNS IN NONE (the
+#     literal's octets byte-copied into it) and describes the negotiated
+#     UTF8 / WIN1252.  Every consumer that reads the value's type at run
+#     time sees NONE - `CHAR_LENGTH` is 5 / 1 for the two rows, `HASH`
+#     hashes the NONE bytes (233 for the E9 row), `LOWER` cases ASCII
+#     only (C3 80 65 C3 8E), `= N` is a byte compare (rows 2 and 3 - and
+#     `<> N` row 1), a nested LPAD pads BYTES, SUBSTRING cuts them - and
+#     only DELIVERY moves the value into the announced set, a byte copy
+#     that validates: `C3 80 65 C3 8E` arrives, the E9 row is *Malformed
+#     string* (22000) under a UTF8 attachment and the E9 itself under
+#     WIN1252.  A concatenation negotiates its run-time set from its
+#     operands' run-time sets (`REPLACE(N, 'É', 'e') || W1` under UTF8
+#     is a WIN1252 value, delivered as C3 83 E2 82 AC 65 ...); a
+#     conditional MOVES the chosen branch into its negotiated set
+#     (`COALESCE(N, 'ÄÖÜ')` under UTF8 delivers the NONE column's
+#     letters, `OCTET_LENGTH` of it 6, `HASH(COALESCE(N, W1))` the same
+#     bytes 213697982; `IIF(ID = 1, W1, 'Ω')` is 22018 for the row that
+#     takes the literal); an unqualified CAST moves a NONE source into
+#     the attachment's set; MAX and a GROUP BY key fold in the announced
+#     set.  This server first ran the REPLACE in byte space and shipped
+#     the carrier chars' UTF-8 spelling (C3 83 C2 80 65 ...), then read
+#     N AS UTF8 (`CHAR_LENGTH` 3 for the engine's 5, *Malformed string*
+#     for every consumer of the E9 row); `COALESCE(N, 'ÄÖÜ')` and
+#     `LOWER(CAST(N AS VARCHAR(10)))` under WIN1252 DROPPED THE CONNECTION
+#     (08006).  ASCII is a real set in the engine: `REPLACE(A, 'É', 'e')`
+#     is 22018 under a real attachment and *Malformed string* under NONE,
+#     and `A || 'x'` / `COALESCE(A, 'x')` under NONE describe ASCII (the
+#     NONE literal yields to it).  Under a NONE attachment a literal that
+#     is the VALUE operand names the set the call runs in, and the real
+#     operand is byte-copied into it: `LPAD('ab', 5, W1)` is C3 80 C3 ab
+#     over a WIN1252 column holding UTF-8 octets, `TRIM(W1 FROM 'ÀÉÎx')`
+#     the literal unchanged - this server re-spelled the literal into the
+#     real set and answered its characters re-encoded, then dropped the
+#     connection on the LPAD.
 #   * A LITERAL's DESCRIBED WIDTH under a tabled single-byte attachment
 #     (WIN1252, ISO8859_1) is its octet count: 'Ä' is TEXT(2), 'ÄÖÜ'
 #     TEXT(6).  This server counted the UTF-8 spelling of the DECODED
@@ -53,9 +85,9 @@
 #
 # RECORDED, not fixed: the `_WIN1252 'x'` / `_UTF8 'x'` INTRODUCER on a
 # literal refuses to prepare (a bare Dynamic SQL Error), in HASH, LOWER
-# and POSITION alike - never a wrong value.  `HASH('a', 'b')` and
-# `HASH()` refuse with a bare 42000 where the engine spells its syntax
-# error (`Token unknown - line 1, column 16`).
+# and POSITION alike - never a wrong value.  `HASH('a', 'b')`, `HASH()`,
+# `HASH('abc' USING)` and `HASH('abc' USING 'CRC32')` refuse with a bare
+# 42000 where the engine spells its syntax error (`Token unknown`).
 #
 # Usage: qa/serve-real-csfn.sh [port]   (default 5830)
 set -u
@@ -355,14 +387,109 @@ dpin "6 CONTROL 'abc' is TEXT(3)" ISO8859_1 "SELECT 'abc' A FROM RDB\$DATABASE;"
 dpin "6 CONTROL 'ÄÖÜ' under UTF8 is TEXT(12) - three characters" UTF8 "SELECT 'ÄÖÜ' A FROM RDB\$DATABASE;" "01: sqltype: 452 TEXT scale: 0 subtype: 0 len: 12 charset: 4 SYSTEM.UTF8"
 dpin "6 CONTROL 'ÄÖÜ' under NONE is TEXT(6)" NONE "SELECT 'ÄÖÜ' A FROM RDB\$DATABASE;" "01: sqltype: 452 TEXT scale: 0 subtype: 0 len: 6 charset: 0 SYSTEM.NONE"
 
-echo "--- 7. RECORDED: refused, never answered wrong"
-refused "7 HASH(_WIN1252 'ab') - the introducer" NONE "SET LIST ON; SELECT HASH(_WIN1252 'ab') H FROM RDB\$DATABASE;"
-refused "7 HASH(_UTF8 'ÀÉ')" WIN1252 "SET LIST ON; SELECT HASH(_UTF8 'ÀÉ') H FROM RDB\$DATABASE;"
-refused "7 LOWER(_WIN1252 'ÄÖÜ')" UTF8 "SET LIST ON; SELECT LOWER(_WIN1252 'ÄÖÜ') L FROM RDB\$DATABASE;"
-refused "7 UPPER(_NONE 'äöü')" NONE "SET LIST ON; SELECT UPPER(_NONE 'äöü') L FROM RDB\$DATABASE;"
-refused "7 POSITION(_WIN1252 'É' IN W1)" UTF8 "SET LIST ON; SELECT ID, POSITION(_WIN1252 'É' IN W1) P FROM TU ORDER BY ID;"
-differs "7 HASH('a', 'b') is the engine's syntax error, a bare 42000 here" NONE "SET LIST ON; SELECT HASH('a', 'b') H FROM RDB\$DATABASE;"
-differs "7 HASH() likewise" NONE "SET LIST ON; SELECT HASH() H FROM RDB\$DATABASE;"
+echo "--- 7. REPLACE RUNS IN ITS SEARCHED STRING'S SET; a value is delivered in the set its describe announces"
+pin "7 CHAR_LENGTH / OCTET_LENGTH / BIT_LENGTH of REPLACE(N, 'É', 'e') count the NONE bytes" NONE "SET LIST ON; SELECT ID, CHAR_LENGTH(REPLACE(N, 'É', 'e')) C, OCTET_LENGTH(REPLACE(N, 'É', 'e')) O, BIT_LENGTH(REPLACE(N, 'É', 'e')) B FROM TU WHERE ID IN (1, 2) ORDER BY ID;" "ID 1|C 5|O 5|B 40|ID 2|C 1|O 1|B 8"
+pin "7 CHAR_LENGTH / OCTET_LENGTH / BIT_LENGTH of REPLACE(N, 'É', 'e') count the NONE bytes" UTF8 "SET LIST ON; SELECT ID, CHAR_LENGTH(REPLACE(N, 'É', 'e')) C, OCTET_LENGTH(REPLACE(N, 'É', 'e')) O, BIT_LENGTH(REPLACE(N, 'É', 'e')) B FROM TU WHERE ID IN (1, 2) ORDER BY ID;" "ID 1|C 5|O 5|B 40|ID 2|C 1|O 1|B 8"
+pin "7 CHAR_LENGTH / OCTET_LENGTH / BIT_LENGTH of REPLACE(N, 'É', 'e') count the NONE bytes" WIN1252 "SET LIST ON; SELECT ID, CHAR_LENGTH(REPLACE(N, 'É', 'e')) C, OCTET_LENGTH(REPLACE(N, 'É', 'e')) O, BIT_LENGTH(REPLACE(N, 'É', 'e')) B FROM TU WHERE ID IN (1, 2) ORDER BY ID;" "ID 1|C 5|O 5|B 40|ID 2|C 1|O 1|B 8"
+pin "7 LOWER / UPPER of it case ASCII only" NONE "SET LIST ON; SELECT LOWER(REPLACE(N, 'É', 'e')) L, UPPER(REPLACE(N, 'É', 'e')) U FROM TU WHERE ID = 1;" "L <c3><80>e<c3><8e>|U <c3><80>E<c3><8e>"
+pin "7 LOWER / UPPER of it case ASCII only" UTF8 "SET LIST ON; SELECT LOWER(REPLACE(N, 'É', 'e')) L, UPPER(REPLACE(N, 'É', 'e')) U FROM TU WHERE ID = 1;" "L <c3><80>e<c3><8e>|U <c3><80>E<c3><8e>"
+pin "7 LOWER / UPPER of it case ASCII only" WIN1252 "SET LIST ON; SELECT LOWER(REPLACE(N, 'É', 'e')) L, UPPER(REPLACE(N, 'É', 'e')) U FROM TU WHERE ID = 1;" "L <c3><80>e<c3><8e>|U <c3><80>E<c3><8e>"
+pin "7 REPLACE(N, 'É', 'e') = N is a byte compare" NONE "SET LIST ON; SELECT ID FROM TU WHERE REPLACE(N, 'É', 'e') = N ORDER BY ID; SELECT ID FROM TU WHERE REPLACE(N, 'É', 'e') <> N ORDER BY ID;" "ID 2|ID 3|ID 1"
+pin "7 REPLACE(N, 'É', 'e') = N is a byte compare" UTF8 "SET LIST ON; SELECT ID FROM TU WHERE REPLACE(N, 'É', 'e') = N ORDER BY ID; SELECT ID FROM TU WHERE REPLACE(N, 'É', 'e') <> N ORDER BY ID;" "ID 2|ID 3|ID 1"
+pin "7 REPLACE(N, 'É', 'e') = N is a byte compare" WIN1252 "SET LIST ON; SELECT ID FROM TU WHERE REPLACE(N, 'É', 'e') = N ORDER BY ID; SELECT ID FROM TU WHERE REPLACE(N, 'É', 'e') <> N ORDER BY ID;" "ID 2|ID 3|ID 1"
+pin "7 HASH of it hashes the NONE bytes" NONE "SET LIST ON; SELECT ID, HASH(REPLACE(N, 'É', 'e')) H FROM TU WHERE ID IN (1, 2) ORDER BY ID;" "ID 1|H 13332926|ID 2|H 233"
+pin "7 HASH of it hashes the NONE bytes" UTF8 "SET LIST ON; SELECT ID, HASH(REPLACE(N, 'É', 'e')) H FROM TU WHERE ID IN (1, 2) ORDER BY ID;" "ID 1|H 13332926|ID 2|H 233"
+pin "7 HASH of it hashes the NONE bytes" WIN1252 "SET LIST ON; SELECT ID, HASH(REPLACE(N, 'É', 'e')) H FROM TU WHERE ID IN (1, 2) ORDER BY ID;" "ID 1|H 13332926|ID 2|H 233"
+pin "7 REPLACE(N, W1, 'x'): W1 byte-copied into NONE; the E9 row through the announced set" NONE "SET LIST ON; SELECT REPLACE(N, W1, 'x') R FROM TU WHERE ID = 1; SELECT REPLACE(N, W1, 'x') R FROM TU WHERE ID = 2;" "R <c3><80><c3><89><c3><8e>|R <e9>"
+pin "7 REPLACE(N, W1, 'x'): W1 byte-copied into NONE; the E9 row through the announced set" UTF8 "SET LIST ON; SELECT REPLACE(N, W1, 'x') R FROM TU WHERE ID = 1; SELECT REPLACE(N, W1, 'x') R FROM TU WHERE ID = 2;" "R <c3><80><c3><89><c3><8e>|Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 REPLACE(N, W1, 'x'): W1 byte-copied into NONE; the E9 row through the announced set" WIN1252 "SET LIST ON; SELECT REPLACE(N, W1, 'x') R FROM TU WHERE ID = 1; SELECT REPLACE(N, W1, 'x') R FROM TU WHERE ID = 2;" "R <c3><80><c3><89><c3><8e>|R <e9>"
+pin "7 REPLACE(N, U, 'x') likewise" NONE "SET LIST ON; SELECT REPLACE(N, U, 'x') R FROM TU WHERE ID = 1; SELECT REPLACE(N, U, 'x') R FROM TU WHERE ID = 2;" "R x|Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 REPLACE(N, U, 'x') likewise" UTF8 "SET LIST ON; SELECT REPLACE(N, U, 'x') R FROM TU WHERE ID = 1; SELECT REPLACE(N, U, 'x') R FROM TU WHERE ID = 2;" "R x|Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 REPLACE(N, U, 'x') likewise" WIN1252 "SET LIST ON; SELECT REPLACE(N, U, 'x') R FROM TU WHERE ID = 1; SELECT REPLACE(N, U, 'x') R FROM TU WHERE ID = 2;" "R x|R <e9>"
+pin "7 REPLACE(N, 'É', U) / REPLACE(N, 'É', W1): the replacement's bytes" NONE "SET LIST ON; SELECT REPLACE(N, 'É', U) R1, REPLACE(N, 'É', W1) R2 FROM TU WHERE ID = 1;" "R1 <c3><80><c3><80><c3><89><c3><8e><c3><8e>|R2 <c3><80><c0><c9><ce><c3><8e>"
+pin "7 REPLACE(N, 'É', U) / REPLACE(N, 'É', W1): the replacement's bytes" UTF8 "SET LIST ON; SELECT REPLACE(N, 'É', U) R1, REPLACE(N, 'É', W1) R2 FROM TU WHERE ID = 1;" "Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 REPLACE(N, 'É', U) / REPLACE(N, 'É', W1): the replacement's bytes" WIN1252 "SET LIST ON; SELECT REPLACE(N, 'É', U) R1, REPLACE(N, 'É', W1) R2 FROM TU WHERE ID = 1;" "R1 <c3><80><c3><80><c3><89><c3><8e><c3><8e>|R2 <c3><80><c0><c9><ce><c3><8e>"
+pin "7 LPAD over it pads BYTES, and HASH / OCTET_LENGTH see them" NONE "SET LIST ON; SELECT ID, LPAD(REPLACE(N, 'É', 'e'), 8, 'x') L, OCTET_LENGTH(LPAD(REPLACE(N, 'É', 'e'), 8, 'x')) O, HASH(LPAD(REPLACE(N, 'É', 'e'), 8, 'x')) H FROM TU WHERE ID = 1;" "ID 1|L xxx<c3><80>e<c3><8e>|O 8|H 34364682686"
+pin "7 LPAD over it pads BYTES, and HASH / OCTET_LENGTH see them" UTF8 "SET LIST ON; SELECT ID, LPAD(REPLACE(N, 'É', 'e'), 8, 'x') L, OCTET_LENGTH(LPAD(REPLACE(N, 'É', 'e'), 8, 'x')) O, HASH(LPAD(REPLACE(N, 'É', 'e'), 8, 'x')) H FROM TU WHERE ID = 1;" "ID 1|L xxx<c3><80>e<c3><8e>|O 8|H 34364682686"
+pin "7 LPAD over it pads BYTES, and HASH / OCTET_LENGTH see them" WIN1252 "SET LIST ON; SELECT ID, LPAD(REPLACE(N, 'É', 'e'), 8, 'x') L, OCTET_LENGTH(LPAD(REPLACE(N, 'É', 'e'), 8, 'x')) O, HASH(LPAD(REPLACE(N, 'É', 'e'), 8, 'x')) H FROM TU WHERE ID = 1;" "ID 1|L xxx<c3><80>e<c3><8e>|O 8|H 34364682686"
+pin "7 SUBSTRING over it cuts bytes" NONE "SET LIST ON; SELECT SUBSTRING(REPLACE(N, 'É', 'e') FROM 2) S FROM TU WHERE ID = 1;" "S <80>e<c3><8e>"
+pin "7 SUBSTRING over it cuts bytes" UTF8 "SET LIST ON; SELECT SUBSTRING(REPLACE(N, 'É', 'e') FROM 2) S FROM TU WHERE ID = 1;" "Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 SUBSTRING over it cuts bytes" WIN1252 "SET LIST ON; SELECT SUBSTRING(REPLACE(N, 'É', 'e') FROM 2) S FROM TU WHERE ID = 1;" "S <80>e<c3><8e>"
+pin "7 POSITION in it is a byte offset" NONE "SET LIST ON; SELECT POSITION('e' IN REPLACE(N, 'É', 'e')) P FROM TU WHERE ID = 1;" "P 3"
+pin "7 POSITION in it is a byte offset" UTF8 "SET LIST ON; SELECT POSITION('e' IN REPLACE(N, 'É', 'e')) P FROM TU WHERE ID = 1;" "P 3"
+pin "7 POSITION in it is a byte offset" WIN1252 "SET LIST ON; SELECT POSITION('e' IN REPLACE(N, 'É', 'e')) P FROM TU WHERE ID = 1;" "P 3"
+pin "7 CAST of it to an unqualified VARCHAR converts the NONE bytes into the attachment's set" NONE "SET LIST ON; SELECT CAST(REPLACE(N, 'É', 'e') AS VARCHAR(10)) C FROM TU WHERE ID = 1; SELECT CAST(REPLACE(N, 'É', 'e') AS VARCHAR(10)) C FROM TU WHERE ID = 2;" "C <c3><80>e<c3><8e>|C <e9>"
+pin "7 CAST of it to an unqualified VARCHAR converts the NONE bytes into the attachment's set" UTF8 "SET LIST ON; SELECT CAST(REPLACE(N, 'É', 'e') AS VARCHAR(10)) C FROM TU WHERE ID = 1; SELECT CAST(REPLACE(N, 'É', 'e') AS VARCHAR(10)) C FROM TU WHERE ID = 2;" "C <c3><80>e<c3><8e>|Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 CAST of it to an unqualified VARCHAR converts the NONE bytes into the attachment's set" WIN1252 "SET LIST ON; SELECT CAST(REPLACE(N, 'É', 'e') AS VARCHAR(10)) C FROM TU WHERE ID = 1; SELECT CAST(REPLACE(N, 'É', 'e') AS VARCHAR(10)) C FROM TU WHERE ID = 2;" "C <c3><80>e<c3><8e>|C <e9>"
+pin "7 ...and to CHARACTER SET NONE keeps them" NONE "SET LIST ON; SELECT ID, CAST(REPLACE(N, 'É', 'e') AS VARCHAR(10) CHARACTER SET NONE) C FROM TU WHERE ID IN (1, 2) ORDER BY ID;" "ID 1|C <c3><80>e<c3><8e>|ID 2|C <e9>"
+pin "7 ...and to CHARACTER SET NONE keeps them" UTF8 "SET LIST ON; SELECT ID, CAST(REPLACE(N, 'É', 'e') AS VARCHAR(10) CHARACTER SET NONE) C FROM TU WHERE ID IN (1, 2) ORDER BY ID;" "ID 1|C <c3><80>e<c3><8e>|ID 2|C <e9>"
+pin "7 ...and to CHARACTER SET NONE keeps them" WIN1252 "SET LIST ON; SELECT ID, CAST(REPLACE(N, 'É', 'e') AS VARCHAR(10) CHARACTER SET NONE) C FROM TU WHERE ID IN (1, 2) ORDER BY ID;" "ID 1|C <c3><80>e<c3><8e>|ID 2|C <e9>"
+pin "7 COALESCE / NULLIF over it" NONE "SET LIST ON; SELECT ID, COALESCE(REPLACE(N, 'É', 'e'), 'q') C, NULLIF(REPLACE(N, 'É', 'e'), 'q') N FROM TU WHERE ID IN (1, 4) ORDER BY ID; SELECT COALESCE(REPLACE(N, 'É', 'e'), 'q') C FROM TU WHERE ID = 2; SELECT NULLIF(REPLACE(N, 'É', 'e'), 'q') N FROM TU WHERE ID = 2;" "ID 1|C <c3><80>e<c3><8e>|N <c3><80>e<c3><8e>|ID 4|C q|N <null>|C <e9>|N <e9>"
+pin "7 COALESCE / NULLIF over it" UTF8 "SET LIST ON; SELECT ID, COALESCE(REPLACE(N, 'É', 'e'), 'q') C, NULLIF(REPLACE(N, 'É', 'e'), 'q') N FROM TU WHERE ID IN (1, 4) ORDER BY ID; SELECT COALESCE(REPLACE(N, 'É', 'e'), 'q') C FROM TU WHERE ID = 2; SELECT NULLIF(REPLACE(N, 'É', 'e'), 'q') N FROM TU WHERE ID = 2;" "ID 1|C <c3><80>e<c3><8e>|N <c3><80>e<c3><8e>|ID 4|C q|N <null>|Statement failed, SQLSTATE = 22000|Malformed string|Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 COALESCE / NULLIF over it" WIN1252 "SET LIST ON; SELECT ID, COALESCE(REPLACE(N, 'É', 'e'), 'q') C, NULLIF(REPLACE(N, 'É', 'e'), 'q') N FROM TU WHERE ID IN (1, 4) ORDER BY ID; SELECT COALESCE(REPLACE(N, 'É', 'e'), 'q') C FROM TU WHERE ID = 2; SELECT NULLIF(REPLACE(N, 'É', 'e'), 'q') N FROM TU WHERE ID = 2;" "ID 1|C <c3><80>e<c3><8e>|N <c3><80>e<c3><8e>|ID 4|C q|N <null>|C <e9>|N <e9>"
+alive "7 ...and the session survives it" NONE "SELECT COALESCE(REPLACE(N, 'É', 'e'), 'q') C, NULLIF(REPLACE(N, 'É', 'e'), 'q') N FROM TU WHERE ID = 2;"
+alive "7 ...and the session survives it" UTF8 "SELECT COALESCE(REPLACE(N, 'É', 'e'), 'q') C, NULLIF(REPLACE(N, 'É', 'e'), 'q') N FROM TU WHERE ID = 2;"
+alive "7 ...and the session survives it" WIN1252 "SELECT COALESCE(REPLACE(N, 'É', 'e'), 'q') C, NULLIF(REPLACE(N, 'É', 'e'), 'q') N FROM TU WHERE ID = 2;"
+pin "7 REPLACE(N, 'É', 'e') || W1 negotiates its run-time set from the VALUES" NONE "SET LIST ON; SELECT REPLACE(N, 'É', 'e') || W1 C FROM TU WHERE ID = 1;" "C <c3><80>e<c3><8e><c0><c9><ce>"
+pin "7 REPLACE(N, 'É', 'e') || W1 negotiates its run-time set from the VALUES" UTF8 "SET LIST ON; SELECT REPLACE(N, 'É', 'e') || W1 C FROM TU WHERE ID = 1;" "C <c3><83><e2><82><ac>e<c3><83><c5><bd><c3><80><c3><89><c3><8e>"
+pin "7 REPLACE(N, 'É', 'e') || W1 negotiates its run-time set from the VALUES" WIN1252 "SET LIST ON; SELECT REPLACE(N, 'É', 'e') || W1 C FROM TU WHERE ID = 1;" "C <c3><80>e<c3><8e><c0><c9><ce>"
+pin "7 MAX over it folds in the announced set" NONE "SET LIST ON; SELECT MAX(REPLACE(N, 'É', 'e')) M FROM TU WHERE ID IN (1, 2);" "M <e9>"
+pin "7 MAX over it folds in the announced set" UTF8 "SET LIST ON; SELECT MAX(REPLACE(N, 'É', 'e')) M FROM TU WHERE ID IN (1, 2);" "Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 MAX over it folds in the announced set" WIN1252 "SET LIST ON; SELECT MAX(REPLACE(N, 'É', 'e')) M FROM TU WHERE ID IN (1, 2);" "M <e9>"
+pin "7 GROUP BY it keys in the announced set" NONE "SET LIST ON; SELECT COUNT(*) C FROM TU WHERE ID IN (1, 2, 3) GROUP BY REPLACE(N, 'É', 'e');" "C 1|C 1|C 1"
+pin "7 GROUP BY it keys in the announced set" UTF8 "SET LIST ON; SELECT COUNT(*) C FROM TU WHERE ID IN (1, 2, 3) GROUP BY REPLACE(N, 'É', 'e');" "Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 GROUP BY it keys in the announced set" WIN1252 "SET LIST ON; SELECT COUNT(*) C FROM TU WHERE ID IN (1, 2, 3) GROUP BY REPLACE(N, 'É', 'e');" "C 1|C 1|C 1"
+pin "7 REPLACE(A, 'É', 'e'): a high byte into ASCII" NONE "SET LIST ON; SELECT REPLACE(A, 'É', 'e') R FROM TU WHERE ID = 1;" "Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 REPLACE(A, 'É', 'e'): a high byte into ASCII" UTF8 "SET LIST ON; SELECT REPLACE(A, 'É', 'e') R FROM TU WHERE ID = 1;" "Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets"
+pin "7 REPLACE(A, 'É', 'e'): a high byte into ASCII" WIN1252 "SET LIST ON; SELECT REPLACE(A, 'É', 'e') R FROM TU WHERE ID = 1;" "Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets"
+pin "7 REPLACE(U, O, 'x'): the OCTETS operand must spell UTF8" NONE "SET LIST ON; SELECT REPLACE(U, O, 'x') R FROM TU WHERE ID = 1; SELECT REPLACE(U, O, 'x') R FROM TU WHERE ID = 2;" "R 78|Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 REPLACE(U, O, 'x'): the OCTETS operand must spell UTF8" UTF8 "SET LIST ON; SELECT REPLACE(U, O, 'x') R FROM TU WHERE ID = 1; SELECT REPLACE(U, O, 'x') R FROM TU WHERE ID = 2;" "R 78|Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 REPLACE(U, O, 'x'): the OCTETS operand must spell UTF8" WIN1252 "SET LIST ON; SELECT REPLACE(U, O, 'x') R FROM TU WHERE ID = 1; SELECT REPLACE(U, O, 'x') R FROM TU WHERE ID = 2;" "R 78|Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 a conditional moves its branch into the negotiated set" NONE "SET LIST ON; SELECT OCTET_LENGTH(COALESCE(N, 'ÄÖÜ')) O1, BIT_LENGTH(COALESCE(N, 'ÄÖÜ')) B1, HASH(CASE ID WHEN 1 THEN N ELSE W1 END) H1, HASH(COALESCE(N, W1)) H2, HASH(IIF(ID = 1, N, 'q')) H3 FROM TU WHERE ID = 1;" "O1 6|B1 48|H1 213697982|H2 213697982|H3 213697982"
+pin "7 a conditional moves its branch into the negotiated set" UTF8 "SET LIST ON; SELECT OCTET_LENGTH(COALESCE(N, 'ÄÖÜ')) O1, BIT_LENGTH(COALESCE(N, 'ÄÖÜ')) B1, HASH(CASE ID WHEN 1 THEN N ELSE W1 END) H1, HASH(COALESCE(N, W1)) H2, HASH(IIF(ID = 1, N, 'q')) H3 FROM TU WHERE ID = 1;" "O1 6|B1 48|H1 213697982|H2 213697982|H3 213697982"
+pin "7 a conditional moves its branch into the negotiated set" WIN1252 "SET LIST ON; SELECT OCTET_LENGTH(COALESCE(N, 'ÄÖÜ')) O1, BIT_LENGTH(COALESCE(N, 'ÄÖÜ')) B1, HASH(CASE ID WHEN 1 THEN N ELSE W1 END) H1, HASH(COALESCE(N, W1)) H2, HASH(IIF(ID = 1, N, 'q')) H3 FROM TU WHERE ID = 1;" "O1 6|B1 48|H1 213697982|H2 213697982|H3 213697982"
+pin "7 COALESCE(N, 'ÄÖÜ') delivers the NONE bytes" NONE "SET LIST ON; SELECT ID, COALESCE(N, 'ÄÖÜ') V FROM TU WHERE ID IN (1, 2, 4) ORDER BY ID;" "ID 1|V <c3><80><c3><89><c3><8e>|ID 2|V <e9>|ID 4|V <c3><84><c3><96><c3><9c>"
+pin "7 COALESCE(N, 'ÄÖÜ') delivers the NONE bytes" UTF8 "SET LIST ON; SELECT ID, COALESCE(N, 'ÄÖÜ') V FROM TU WHERE ID IN (1, 2, 4) ORDER BY ID;" "ID 1|V <c3><80><c3><89><c3><8e>|Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 COALESCE(N, 'ÄÖÜ') delivers the NONE bytes" WIN1252 "SET LIST ON; SELECT ID, COALESCE(N, 'ÄÖÜ') V FROM TU WHERE ID IN (1, 2, 4) ORDER BY ID;" "ID 1|V <c3><80><c3><89><c3><8e>|ID 2|V <e9>|ID 4|V <c3><84><c3><96><c3><9c>"
+alive "7 ...and the session survives it" NONE "SELECT ID, COALESCE(N, 'ÄÖÜ') V FROM TU WHERE ID IN (1, 2, 4) ORDER BY ID;"
+alive "7 ...and the session survives it" UTF8 "SELECT ID, COALESCE(N, 'ÄÖÜ') V FROM TU WHERE ID IN (1, 2, 4) ORDER BY ID;"
+alive "7 ...and the session survives it" WIN1252 "SELECT ID, COALESCE(N, 'ÄÖÜ') V FROM TU WHERE ID IN (1, 2, 4) ORDER BY ID;"
+pin "7 HASH(COALESCE(N, 'q')) for the E9 row" NONE "SET LIST ON; SELECT HASH(COALESCE(N, 'q')) H FROM TU WHERE ID = 2;" "H 233"
+pin "7 HASH(COALESCE(N, 'q')) for the E9 row" UTF8 "SET LIST ON; SELECT HASH(COALESCE(N, 'q')) H FROM TU WHERE ID = 2;" "Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 HASH(COALESCE(N, 'q')) for the E9 row" WIN1252 "SET LIST ON; SELECT HASH(COALESCE(N, 'q')) H FROM TU WHERE ID = 2;" "H 233"
+pin "7 IIF(ID = 1, W1, 'Ω'): the literal into WIN1252" NONE "SET LIST ON; SELECT IIF(ID = 1, W1, 'Ω') V FROM TU WHERE ID = 2;" "V <ce><a9>"
+pin "7 IIF(ID = 1, W1, 'Ω'): the literal into WIN1252" UTF8 "SET LIST ON; SELECT IIF(ID = 1, W1, 'Ω') V FROM TU WHERE ID = 2;" "Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets"
+pin "7 IIF(ID = 1, W1, 'Ω'): the literal into WIN1252" WIN1252 "SET LIST ON; SELECT IIF(ID = 1, W1, 'Ω') V FROM TU WHERE ID = 2;" "V <ce><a9>"
+pin "7 LOWER(CAST(N AS VARCHAR(10)))" NONE "SET LIST ON; SELECT LOWER(CAST(N AS VARCHAR(10))) L FROM TU WHERE ID = 1; SELECT LOWER(CAST(N AS VARCHAR(10))) L FROM TU WHERE ID = 2;" "L <c3><80><c3><89><c3><8e>|L <e9>"
+pin "7 LOWER(CAST(N AS VARCHAR(10)))" UTF8 "SET LIST ON; SELECT LOWER(CAST(N AS VARCHAR(10))) L FROM TU WHERE ID = 1; SELECT LOWER(CAST(N AS VARCHAR(10))) L FROM TU WHERE ID = 2;" "L <c3><a0><c3><a9><c3><ae>|Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 LOWER(CAST(N AS VARCHAR(10)))" WIN1252 "SET LIST ON; SELECT LOWER(CAST(N AS VARCHAR(10))) L FROM TU WHERE ID = 1; SELECT LOWER(CAST(N AS VARCHAR(10))) L FROM TU WHERE ID = 2;" "L <e3><80><e3><89><e3><9e>|L <e9>"
+alive "7 ...and the session survives it" NONE "SELECT LOWER(CAST(N AS VARCHAR(10))) L FROM TU WHERE ID IN (1, 2) ORDER BY ID;"
+alive "7 ...and the session survives it" UTF8 "SELECT LOWER(CAST(N AS VARCHAR(10))) L FROM TU WHERE ID IN (1, 2) ORDER BY ID;"
+alive "7 ...and the session survives it" WIN1252 "SELECT LOWER(CAST(N AS VARCHAR(10))) L FROM TU WHERE ID IN (1, 2) ORDER BY ID;"
+pin "7 CONTROL (N || 'x') || U and N || 'x' || U" NONE "SET LIST ON; SELECT (N || 'x') || U C1 FROM TU WHERE ID = 1; SELECT N || 'x' || U C2 FROM TU WHERE ID = 2;" "C1 <c3><80><c3><89><c3><8e>x<c3><80><c3><89><c3><8e>|Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 CONTROL (N || 'x') || U and N || 'x' || U" UTF8 "SET LIST ON; SELECT (N || 'x') || U C1 FROM TU WHERE ID = 1; SELECT N || 'x' || U C2 FROM TU WHERE ID = 2;" "C1 <c3><80><c3><89><c3><8e>x<c3><80><c3><89><c3><8e>|Statement failed, SQLSTATE = 22000|Malformed string"
+pin "7 CONTROL (N || 'x') || U and N || 'x' || U" WIN1252 "SET LIST ON; SELECT (N || 'x') || U C1 FROM TU WHERE ID = 1; SELECT N || 'x' || U C2 FROM TU WHERE ID = 2;" "C1 <c3><80><c3><89><c3><8e>x<c0><c9><ce>|C2 <e9>xabc"
+pin "7 REPLACE('aÉb', U, 'x') / REPLACE('aÉb', W1, 'x'): a NONE literal delivered through the negotiated set" NONE "SET LIST ON; SELECT ID, REPLACE('aÉb', U, 'x') R1, REPLACE('aÉb', W1, 'x') R2 FROM TU WHERE ID IN (1, 2) ORDER BY ID;" "ID 1|R1 a<c3><89>b|R2 a<c3><89>b|ID 2|R1 a<c3><89>b|R2 a<c3><89>b"
+alive "7 ...and the session survives it" NONE "SELECT ID, REPLACE('aÉb', U, 'x') R1, REPLACE('aÉb', W1, 'x') R2 FROM TU WHERE ID IN (1, 2) ORDER BY ID;"
+pin "7 TRIM(W1 FROM 'ÀÉÎx') / TRIM(U FROM 'ÀÉÎx'): the real operand byte-copied into the literal's NONE" NONE "SET LIST ON; SELECT ID, TRIM(W1 FROM 'ÀÉÎx') T1, TRIM(U FROM 'ÀÉÎx') T2 FROM TU WHERE ID IN (1, 2) ORDER BY ID;" "ID 1|T1 <c3><80><c3><89><c3><8e>x|T2 x|ID 2|T1 x|T2 <c3><80><c3><89><c3><8e>x"
+pin "7 LPAD('ab', 5, W1) / LPAD('ab', 5, U) pad with the real operand's BYTES" NONE "SET LIST ON; SELECT ID, LPAD('ab', 5, W1) L1, LPAD('ab', 5, U) L2 FROM TU WHERE ID IN (1, 2, 3) ORDER BY ID;" "ID 1|L1 <c0><c9><ce>ab|L2 <c3><80><c3>ab|ID 2|L1 <c3><80><c3>ab|L2 abcab|ID 3|L1 <9f><83><9f>ab|L2 <c3><9f><c3>ab"
+alive "7 ...and the session survives it" NONE "SELECT ID, LPAD('ab', 5, W1) L1, LPAD('ab', 5, U) L2 FROM TU WHERE ID IN (1, 2, 3) ORDER BY ID;"
+pin "7 ASCII outranks the NONE literal: A || 'É' and COALESCE(A, 'É')" NONE "SET LIST ON; SELECT A || 'x' C1, COALESCE(A, 'x') C2 FROM TU WHERE ID = 1; SELECT A || 'É' C3 FROM TU WHERE ID = 1; SELECT COALESCE(A, 'É') C4 FROM TU WHERE ID = 4;" "C1 AbCx|C2 AbC|Statement failed, SQLSTATE = 22000|Malformed string|Statement failed, SQLSTATE = 22000|Malformed string"
+dpin "7 A || 'x' describes ASCII under NONE" NONE "SELECT A || 'x' C FROM TU;" "01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 21 charset: 2 SYSTEM.ASCII"
+dpin "7 COALESCE(A, 'x') describes ASCII under NONE" NONE "SELECT COALESCE(A, 'x') C FROM TU;" "01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 20 charset: 2 SYSTEM.ASCII"
+dpin "7 CONTROL REPLACE(N, 'É', 'e') still describes the negotiated set" UTF8 "SELECT REPLACE(N, 'É', 'e') R FROM TU;" "01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 80 charset: 4 SYSTEM.UTF8"
+dpin "7 CONTROL LPAD(REPLACE(N, 'É', 'e'), 8, 'x') describes it too" UTF8 "SELECT LPAD(REPLACE(N, 'É', 'e'), 8, 'x') R FROM TU;" "01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 32 charset: 4 SYSTEM.UTF8"
+
+echo "--- 8. RECORDED: refused, never answered wrong"
+refused "8 HASH(_WIN1252 'ab') - the introducer" NONE "SET LIST ON; SELECT HASH(_WIN1252 'ab') H FROM RDB\$DATABASE;"
+refused "8 HASH(_UTF8 'ÀÉ')" WIN1252 "SET LIST ON; SELECT HASH(_UTF8 'ÀÉ') H FROM RDB\$DATABASE;"
+refused "8 LOWER(_WIN1252 'ÄÖÜ')" UTF8 "SET LIST ON; SELECT LOWER(_WIN1252 'ÄÖÜ') L FROM RDB\$DATABASE;"
+refused "8 UPPER(_NONE 'äöü')" NONE "SET LIST ON; SELECT UPPER(_NONE 'äöü') L FROM RDB\$DATABASE;"
+refused "8 POSITION(_WIN1252 'É' IN W1)" UTF8 "SET LIST ON; SELECT ID, POSITION(_WIN1252 'É' IN W1) P FROM TU ORDER BY ID;"
+differs "8 HASH('a', 'b') is the engine's syntax error, a bare 42000 here" NONE "SET LIST ON; SELECT HASH('a', 'b') H FROM RDB\$DATABASE;"
+differs "8 HASH() likewise" NONE "SET LIST ON; SELECT HASH() H FROM RDB\$DATABASE;"
+differs "8 HASH('abc' USING) - no algorithm at all - is the engine's syntax error, a bare 42000 here" NONE "SET LIST ON; SELECT HASH('abc' USING) H FROM RDB\$DATABASE;"
+differs "8 HASH('abc' USING 'CRC32') - a string, not a name - likewise" NONE "SET LIST ON; SELECT HASH('abc' USING 'CRC32') H FROM RDB\$DATABASE;"
 
 echo "--- panic check"
 ran=$((ran + 1))
@@ -370,5 +497,5 @@ if grep -aq 'panicked at' "/tmp/fc-serve-csfn-$PORT.log"; then echo "FAIL the se
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 164 ]; then echo "FAIL only $ran checks ran (floor 164)"; fail=1; fi
+if [ "$ran" -lt 257 ]; then echo "FAIL only $ran checks ran (floor 257)"; fail=1; fi
 exit $fail
