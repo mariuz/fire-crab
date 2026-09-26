@@ -33402,7 +33402,27 @@ fn plan_insert_select(
     // (probed: `... SELECT X, Y FROM SRC WHERE X = ? AND Y = ?` ->
     // `496 LONG`, then `448 VARYING len 10`).
     let mut sink: Vec<Option<Descriptor>> = Vec::new();
-    let src = plan_query_inner(s[sel..].trim(), db, &mut sink)?;
+    // each select item is ASSIGNED TO ITS TARGET COLUMN, whose type
+    // decides the literal fold ([ItemFold]): `INSERT INTO T (DBL) SELECT
+    // CAST(0.4e0 + 0.4e0 AS INT128) ..` stores 1, into an INT128 0
+    if let Some(Proj::Items(items)) = split_query(s[sel..].trim()).and_then(|(p, ..)| parse_projection(p)) {
+        let folds: Vec<(RawExpr, ItemFold)> = items
+            .iter()
+            .zip(&listed)
+            .filter_map(|(it, fid)| {
+                let raw = match it {
+                    SelItem::Col(c, _) => RawExpr::Col(c.clone()),
+                    SelItem::Expr(raw, ..) => raw.clone(),
+                    _ => return None,
+                };
+                Some((raw, dest_item_fold(descs.get(*fid)?)))
+            })
+            .collect();
+        PENDING_ITEM_FOLDS.with(|p| *p.borrow_mut() = Some(folds));
+    }
+    let src = plan_query_inner(s[sel..].trim(), db, &mut sink);
+    PENDING_ITEM_FOLDS.with(|p| p.borrow_mut().take());
+    let src = src?;
     // A SOURCE THE PLANNER REFUSED refuses the INSERT at prepare too. A
     // derived-table source whose outer clauses do not resolve comes back
     // as [Plan::Refused] (not None), and carried into the INSERT it
@@ -33580,7 +33600,30 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         if parts.len() != count_top_commas(inner) + 1 {
             return None;
         }
-        for part_text in parts {
+        // each value is ASSIGNED TO ITS COLUMN, whose type decides the
+        // literal fold ([ItemFold]): the destination per position, read
+        // ahead of the target-list resolution below
+        let dest_folds: Vec<ItemFold> = db
+            .as_ref()
+            .and_then(|dbr| {
+                let meta = dbr.relation_meta(table)?;
+                let (_, descs) = meta.formats.iter().max_by_key(|(n, _)| *n)?;
+                let fids: Vec<usize> = match &collist {
+                    Some(names) => names
+                        .iter()
+                        .map(|n| find_col(&meta.columns, n).map(|rc| rc.field_id as usize))
+                        .collect::<Option<_>>()?,
+                    None => meta
+                        .columns
+                        .iter()
+                        .map(|c| c.field_id as usize)
+                        .filter(|f| !is_computed_fid(descs, *f))
+                        .collect(),
+                };
+                fids.iter().map(|f| descs.get(*f).map(dest_item_fold)).collect()
+            })
+            .unwrap_or_default();
+        for (part_no, part_text) in parts.into_iter().enumerate() {
             let toks = tokenize(&part_text)?;
             vals.push(match &toks[..] {
                 [Tok::Int(n)] => InsVal::Int(*n),
@@ -33659,8 +33702,10 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                     // REAL value, and a TYPED fold answering NULL (a
                     // CASE whose ELSE is NULL types None but folds its
                     // date arm; CAST(NULL AS ..)), both stay accepted.
-                    let e = parse_raw_expr_any(part_text.trim())
-                        .and_then(|r| resolve_expr(&r, &[], &[]))?;
+                    let e = parse_raw_expr_any(part_text.trim()).and_then(|r| match dest_folds.get(part_no) {
+                        Some(f) => resolve_item_folded(&r, *f, || resolve_expr(&r, &[], &[])),
+                        None => resolve_expr(&r, &[], &[]),
+                    })?;
                     let typed = e.type_of(&[]).is_some();
                     // A CONSTANT TREE WHOSE DOUBLE FOLD OVERFLOWS is not a
                     // refusal yet: its value may be perfectly representable
@@ -36621,7 +36666,9 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                     continue;
                 }
                 let raw = raw;
-                let e = resolve_expr(&raw, &columns, descs)?;
+                // the value is assigned to its column ([ItemFold])
+                let fold = dest_item_fold(descs.get(fid0)?);
+                let e = resolve_item_folded(&raw, fold, || resolve_expr(&raw, &columns, descs))?;
                 // A BARE NUMERIC LITERAL aimed at a DECFLOAT column is read
                 // as DECIMAL FROM ITS OWN SPELLING, not from the double it
                 // folded to - the INSERT arm's twin ([InsVal::ApproxConst]),
@@ -44023,7 +44070,18 @@ fn plan_join_bound(
             if multi_on_param {
                 return None;
             }
-            let inner = plan_query_inner_at(&inner_sql, db_opt, params, false, sbase)?;
+            // the side's items fold by what the join does with them
+            // ([derived_item_folds]): every ON reads them too
+            let others: Vec<&str> = [where_s, having_s]
+                .into_iter()
+                .flatten()
+                .chain(joins.iter().map(|(_, _, on_s, _)| *on_s))
+                .collect();
+            let folds = derived_item_folds(&inner_sql, &declared, proj, group_s, &others);
+            PENDING_ITEM_FOLDS.with(|p| *p.borrow_mut() = Some(folds));
+            let inner = plan_query_inner_at(&inner_sql, db_opt, params, false, sbase);
+            PENDING_ITEM_FOLDS.with(|p| p.borrow_mut().take());
+            let inner = inner?;
             // An inner PROJECTION `?` on a derived SIDE is bound now:
             // the side's rows are a `RowSource::PlanRows`, and
             // [materialise_bound_src] binds that plan's projection
@@ -55781,6 +55839,27 @@ fn plan_query_inner_at(
     in_view: bool,
     base: usize,
 ) -> Option<Plan> {
+    // the item folds a caller set for THIS query ([PENDING_ITEM_FOLDS])
+    // are its own while it plans; without any, it keeps the enclosing
+    // ones (a rewrite re-planning the same select list)
+    match PENDING_ITEM_FOLDS.with(|p| p.borrow_mut().take()) {
+        None => plan_query_inner_at_body(sql, db, params, in_view, base),
+        Some(folds) => {
+            let prev = ITEM_FOLDS.with(|t| std::mem::replace(&mut *t.borrow_mut(), folds));
+            let out = plan_query_inner_at_body(sql, db, params, in_view, base);
+            ITEM_FOLDS.with(|t| *t.borrow_mut() = prev);
+            out
+        }
+    }
+}
+
+fn plan_query_inner_at_body(
+    sql: &str,
+    db: &Option<Database>,
+    params: &mut Vec<Option<Descriptor>>,
+    in_view: bool,
+    base: usize,
+) -> Option<Plan> {
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
     {
         let up = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
@@ -56614,7 +56693,16 @@ fn plan_query_inner_at(
                 }
                 mask_literals(&sql[..q - h]).matches('?').count()
             };
-            let Some(inner) = plan_query_inner_at(&inner_sql, db, params, false, dbase) else {
+            // the inner items fold by what this query does with them
+            // ([derived_item_folds])
+            if let Some(outer) = parse_projection(proj_s) {
+                let others: Vec<&str> = [where_s, having_s].into_iter().flatten().collect();
+                let folds = derived_item_folds(inner_sql, &declared, &outer, group_s, &others);
+                PENDING_ITEM_FOLDS.with(|p| *p.borrow_mut() = Some(folds));
+            }
+            let inner = plan_query_inner_at(&inner_sql, db, params, false, dbase);
+            PENDING_ITEM_FOLDS.with(|p| p.borrow_mut().take());
+            let Some(inner) = inner else {
                 if trace {
                     eprintln!("[srv] plan: derived table {:?} not planned", inner_sql);
                 }
@@ -57156,7 +57244,21 @@ fn plan_query_inner_at(
                     }
                     // `corr: None` - a subquery naming the outer row is
                     // never read as a constant ([corr_scan] decides)
-                    let folded_v = if is_corr { None } else { eval_subquery(sub, dbr, db, None, None, false) };
+                    // a subquery INSIDE an expression is no assignment
+                    // to its own type: its literals stay doubles
+                    // ([ItemFold]; `(SELECT CAST(0.4e0 + 0.4e0 AS INT128)
+                    // ..) || ''` is 1 on 2182, the whole item 0)
+                    let whole_item = split_top_level_commas(&folded).iter().any(|item| {
+                        let (body, _) = split_alias(item);
+                        body.trim() == mark
+                    });
+                    let folded_v = if is_corr {
+                        None
+                    } else if whole_item {
+                        eval_subquery(sub, dbr, db, None, None, false)
+                    } else {
+                        with_runtime_double_casts(|| eval_subquery(sub, dbr, db, None, None, false))
+                    };
                     let Some(rows) = folded_v else {
                         let whole = split_top_level_commas(&folded).iter().any(|item| {
                             let (body, _) = split_alias(item);
@@ -60761,9 +60863,13 @@ fn build_group_items(
                             // describe (a FLOAT column stays 482/len4;
                             // the fold keeps the winning Value verbatim,
                             // so a Value::Float survives)
-                            ExprType::Approx => match field_desc {
-                                Some(d) => wire_for(d),
-                                None => (Wire::Double, 480, 8, 0, 0),
+                            // ...and a FLOAT EXPRESSION stays FLOAT too
+                            // (`MAX(COALESCE(I, F))`, `MAX(COALESCE(F,
+                            // 0))`: 482 FLOAT len 4 on 2182, measured)
+                            ExprType::Approx => match (field_desc, &src) {
+                                (Some(d), _) => wire_for(d),
+                                (None, AggSrc::Expr(e)) if approx_expr_single(e, descs) => (Wire::Float, 482, 4, 0, 0),
+                                (None, _) => (Wire::Double, 480, 8, 0, 0),
                             },
                             ExprType::Bool => (Wire::Bool, 32764, 1, 0, 0),
                             ExprType::Temporal(TKind::Date) => (Wire::Date, 570, 4, 0, 0),
@@ -78052,6 +78158,18 @@ fn resolve_expr(
     descs: &[Descriptor],
 ) -> Option<Expr> {
     let _depth = ResolveDepth::enter();
+    // an ITEM: resolved under what it is assigned to ([ItemFold])
+    if let Some(fold) = item_fold_of(raw) {
+        return resolve_item_folded(raw, fold, || resolve_expr_body(raw, columns, descs));
+    }
+    resolve_expr_body(raw, columns, descs)
+}
+
+fn resolve_expr_body(
+    raw: &RawExpr,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Expr> {
     // every level of resolution goes through here, so a CHAR-formed
     // conditional is padded - and a scaled one ALIGNED - wherever it
     // appears: inside a concatenation, a comparison, an aggregate's
@@ -81782,6 +81900,18 @@ fn resolve_proj_expr(
         return resolve_expr(raw, columns, descs);
     }
     let _depth = ResolveDepth::enter();
+    if let Some(fold) = item_fold_of(raw) {
+        return resolve_item_folded(raw, fold, || resolve_proj_expr_body(raw, columns, descs, sink));
+    }
+    resolve_proj_expr_body(raw, columns, descs, sink)
+}
+
+fn resolve_proj_expr_body(
+    raw: &RawExpr,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    sink: &mut Vec<Option<Descriptor>>,
+) -> Option<Expr> {
     // K4 (round 12): a TRIM over a bare `?` inside a conditional's value
     // arm refuses at prepare ([raw_cond_arm_trim_param])
     if raw_cond_arm_trim_param(raw) {
@@ -81841,7 +81971,7 @@ fn resolve_proj_expr(
                         return None;
                     }
                     let cs = cast_source_charset(&e, t, descs);
-                    Expr::Cast(Box::new(assignment_literal_fold(runtime_double_cast(e, t, cs), t)), *t, cs)
+                    Expr::Cast(Box::new(assignment_literal_fold(runtime_double_cast(e, t, cs), t)?), *t, cs)
                 }
             }
         }
@@ -82168,7 +82298,7 @@ fn resolve_expr_inner(
                 return None;
             }
             let cs = cast_source_charset(&inner, t, descs);
-            Expr::Cast(Box::new(assignment_literal_fold(runtime_double_cast(inner, t, cs), t)), *t, cs)
+            Expr::Cast(Box::new(assignment_literal_fold(runtime_double_cast(inner, t, cs), t)?), *t, cs)
         }
         RawExpr::Coalesce(args) => Expr::Coalesce(
             args.iter()
@@ -84176,7 +84306,34 @@ fn float_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
         _ => false,
     };
     if !widen_needed {
-        return e;
+        // ...and an EXACT branch beside a FLOAT one, when the whole
+        // conditional is FLOAT (no DOUBLE branch): the same MOV_get_double
+        // reads every branch value, which is where a raw INT128 / NUMERIC
+        // / BIGINT one reached the fold beside Floats - VAR_POP(IIF(ID =
+        // 1, I, F)) answered 0 (engine 1.555555555555556), STDDEV_POP /
+        // CORR / PERCENTILE_CONT(COALESCE(I, F)) 0, AVG 0 (2.333333333333333),
+        // SUM(COALESCE(B, F)) 0 (7.000000000000000), MAX / MIN(COALESCE(I,
+        // F)) 22003 (4 / 1), all measured on 2182
+        let single_exact = e.type_of(descs) == Some(ExprType::Approx) && approx_expr_single(&e, descs);
+        if !single_exact {
+            return e;
+        }
+        let widen = |b: Expr| -> Expr {
+            if matches!(b.type_of(descs), Some(ExprType::Int | ExprType::Numeric)) {
+                Expr::Cast(Box::new(b), CastTarget::Float, fire_crab_ods::intl::CS_UTF8)
+            } else {
+                b
+            }
+        };
+        return match e {
+            Expr::Coalesce(v) => Expr::Coalesce(v.into_iter().map(widen).collect()),
+            Expr::Iif(c, a, b) => Expr::Iif(c, Box::new(widen(*a)), Box::new(widen(*b))),
+            Expr::Case(arms, els) => Expr::Case(
+                arms.into_iter().map(|(c, t)| (c, widen(t))).collect(),
+                els.map(|b| Box::new(widen(*b))),
+            ),
+            other => other,
+        };
     }
     // an EXACT branch beside a DOUBLE one converts too, when the whole
     // conditional is DOUBLE: the engine's consumers read the node's
@@ -85260,8 +85417,9 @@ thread_local! {
     /// How deep the resolvers are: [resolve_expr], [resolve_proj_expr]
     /// (past its no-parameter hand-off) and the condition resolvers each
     /// count one. [assignment_literal_fold] acts only at depth 1 - a CAST
-    /// that IS the item being resolved, so the item's type is the CAST's
-    /// target, the engine's `csb_preferredDesc`. A cast under a
+    /// that IS the item being resolved, so a top-level item's type is the
+    /// CAST's target, the engine's `csb_preferredDesc` (an item assigned
+    /// elsewhere takes its target from [ItemFold]). A cast under a
     /// concatenation, a comparison or any other operator is not the
     /// assignment's target (`CAST(CAST(1e37 AS DOUBLE PRECISION) AS
     /// NUMERIC(38,0)) || ''` is VARCHAR, and the engine's literal there is
@@ -85283,6 +85441,208 @@ impl Drop for ResolveDepth {
     fn drop(&mut self) {
         RESOLVE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     }
+}
+
+/// WHAT AN ITEM IS ASSIGNED TO, for [assignment_literal_fold]: the
+/// engine's `csb_preferredDesc` is the descriptor of the ASSIGNMENT's
+/// target, and only an INT128-backed or DECFLOAT one re-reads a double
+/// literal from its text. A top-level select item's target is its own
+/// message slot - the item's type, so a CAST that IS the item names it
+/// ([ItemFold::Own]). A DML value's is its COLUMN and a derived table's,
+/// CTE's or scalar subquery's item's is the OUTER item that reads it
+/// ([ItemFold::To] or, for any other type, [ItemFold::Runtime]: no fold
+/// anywhere in the item, cvt.cpp's double). Measured on 2182 with
+/// `CAST(0.4e0 + 0.4e0 AS INT128)` (0 folded, 1 not): into an INT128 or
+/// NUMERIC(38,0) column 0, into DOUBLE / VARCHAR / SMALLINT / BIGINT /
+/// NUMERIC(18,2) 1, into a DECFLOAT(34) column 1 (the literals are
+/// decimal 0.4 there, 0.8 rounds to 1); through `(SELECT .. X ..)` read
+/// as `SELECT X` 0 and as `X || ''`, `CAST(X AS DOUBLE PRECISION)`,
+/// `MAX(X)`, `X * 1.0` 1, `CAST(X AS INT128)` 0 and `CAST(X AS
+/// DECFLOAT(34))` 1; `(SELECT ..)` as the whole item 0, under `|| ''` 1.
+#[derive(Clone, Copy, PartialEq)]
+enum ItemFold {
+    /// the item's own type is the target: a CAST that is the item folds
+    /// by its own target
+    Own,
+    /// the target is no INT128 / DECFLOAT: no literal in the item folds
+    Runtime,
+    /// the target is this INT128 / DECFLOAT type, whatever the item's own
+    To(CastTarget),
+    /// two consumers disagree (`SELECT X, X || ''` over one derived
+    /// column: the engine evaluates the inlined expression once per
+    /// consumer, 0 and 1) - one materialised value cannot be both
+    Conflict,
+}
+
+thread_local! {
+    /// the fold of the item being resolved at [RESOLVE_DEPTH] 1
+    static CUR_ITEM_FOLD: std::cell::Cell<ItemFold> = const { std::cell::Cell::new(ItemFold::Own) };
+    /// the folds of the select list being planned, by its items' raw
+    /// expressions (a bare column as `RawExpr::Col`): read by the depth-1
+    /// resolvers and by a derived table's planning ([derived_item_folds])
+    static ITEM_FOLDS: std::cell::RefCell<Vec<(RawExpr, ItemFold)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// the folds the NEXT [plan_query_inner_at] takes as its own
+    /// [ITEM_FOLDS] - set by a caller that knows what the planned
+    /// query's items are assigned to (a derived table, INSERT .. SELECT)
+    /// set while a cast to DOUBLE / FLOAT evaluates its DECFLOAT cast
+    /// operand: a signalling or negative NaN text may take the quiet
+    /// NaN's form there, whose conversion raises the same 22000
+    static SNAN_TO_APPROX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PENDING_ITEM_FOLDS: std::cell::RefCell<Option<Vec<(RawExpr, ItemFold)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The fold an assignment to a column of this descriptor gives.
+fn dest_item_fold(d: &Descriptor) -> ItemFold {
+    match d.dtype {
+        dtype::INT128 => ItemFold::To(CastTarget::Numeric { scale: d.scale, bytes: 16, sub_type: d.sub_type }),
+        dtype::DEC128 => ItemFold::To(CastTarget::DecFloat { wide: true }),
+        dtype::DEC64 => ItemFold::To(CastTarget::DecFloat { wide: false }),
+        _ => ItemFold::Runtime,
+    }
+}
+
+/// Resolve one item under `fold` ([ItemFold]). `None` for a conflict over
+/// an item that holds a double literal (its value depends on which
+/// consumer reads it); a conflict over one without is harmless.
+fn resolve_item_folded<T>(raw: &RawExpr, fold: ItemFold, f: impl FnOnce() -> Option<T>) -> Option<T> {
+    match fold {
+        ItemFold::Runtime => with_runtime_double_casts(f),
+        ItemFold::Conflict if raw_any(raw, &|e| matches!(e, RawExpr::Double(_))) => None,
+        ItemFold::Conflict => f(),
+        _ => {
+            let prev = CUR_ITEM_FOLD.with(|c| c.replace(fold));
+            let out = f();
+            CUR_ITEM_FOLD.with(|c| c.set(prev));
+            out
+        }
+    }
+}
+
+/// At [RESOLVE_DEPTH] 1: the fold [ITEM_FOLDS] names for this raw item.
+fn item_fold_of(raw: &RawExpr) -> Option<ItemFold> {
+    if RESOLVE_DEPTH.with(|d| d.get()) != 1 || RUNTIME_DOUBLE_CASTS.with(|c| c.get()) {
+        return None;
+    }
+    ITEM_FOLDS.with(|t| {
+        let t = t.borrow();
+        let mut found = t.iter().filter(|(r, _)| r == raw).map(|(_, f)| *f);
+        let first = found.next()?;
+        Some(if found.all(|f| f == first) { first } else { ItemFold::Conflict })
+    })
+}
+
+/// An output-column name as the outer query spells it: a quoted one
+/// keeps its case, anything else folds to upper.
+fn fold_col_name(s: &str) -> String {
+    let s = s.trim();
+    let last = s.rsplit('.').next().unwrap_or(s).trim();
+    match last.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        Some(q) => q.to_string(),
+        None => last.to_ascii_uppercase(),
+    }
+}
+
+/// THE FOLDS OF A DERIVED TABLE's (or CTE's) ITEMS, from what the OUTER
+/// query does with each column: a bare column item passes its own fold
+/// on (so `SELECT X` over it folds as the item's type, and an outer that
+/// is itself a derived table or an INSERT .. SELECT source hands on what
+/// IT is assigned to); `CAST(X AS <t>)` folds as `t` when that is INT128
+/// / DECFLOAT; every other use - an operator, a function, an aggregate,
+/// a WHERE / ON / GROUP BY / HAVING condition - is no assignment
+/// ([ItemFold::Runtime]). The engine inlines the derived expression into
+/// each consumer, so two consumers that disagree are a
+/// [ItemFold::Conflict]. Measured on 2182 (see [ItemFold]); `SELECT 'W'
+/// FROM (..) WHERE X = 1` finds the row (X is 1 there), while `SELECT X
+/// .. WHERE X = 1` answers X = 0 - both consumers at once.
+///
+/// A column the outer GROUP BY names is read as its GROUP KEY, which is
+/// no assignment either: `SELECT X, COUNT(*) FROM (..) GROUP BY X` is X
+/// = 1 on 2182 - the bare item does not fold it.
+fn derived_item_folds(
+    inner_sql: &str,
+    declared: &[String],
+    outer: &Proj,
+    group: Option<&str>,
+    others: &[&str],
+) -> Vec<(RawExpr, ItemFold)> {
+    let Some(Proj::Items(items)) = split_query(inner_sql).and_then(|(p, ..)| parse_projection(p)) else {
+        return Vec::new();
+    };
+    let keyed: Vec<(RawExpr, String)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(j, it)| {
+            let (raw, name) = match it {
+                SelItem::Col(c, alias) => (RawExpr::Col(c.clone()), alias.clone().unwrap_or_else(|| c.clone())),
+                SelItem::Expr(raw, name, _) => (raw.clone(), name.clone()),
+                _ => return None,
+            };
+            let name = declared.get(j).cloned().unwrap_or(name);
+            Some((raw, fold_col_name(&name)))
+        })
+        .collect();
+    let outer_fold = |raw: &RawExpr| {
+        ITEM_FOLDS.with(|t| t.borrow().iter().find(|(r, _)| r == raw).map(|(_, f)| *f)).unwrap_or(ItemFold::Own)
+    };
+    let foldable = |t: &CastTarget| matches!(t, CastTarget::Numeric { bytes: 16, .. } | CastTarget::DecFloat { .. });
+    let mut consumers: Vec<Vec<ItemFold>> = vec![Vec::new(); keyed.len()];
+    let mut consume = |name: Option<&str>, f: ItemFold| {
+        for (j, (_, n)) in keyed.iter().enumerate() {
+            if name.is_none_or(|x| x == n) {
+                consumers[j].push(f);
+            }
+        }
+    };
+    match outer {
+        Proj::Star => consume(None, ItemFold::Own),
+        Proj::Items(outs) => {
+            for it in outs {
+                match it {
+                    SelItem::Col(c, _) if c.trim().ends_with('*') => consume(None, ItemFold::Own),
+                    SelItem::Col(c, _) => consume(Some(&fold_col_name(c)), outer_fold(&RawExpr::Col(c.clone()))),
+                    SelItem::Expr(RawExpr::Cast(x, t), ..) if matches!(&**x, RawExpr::Col(_)) => {
+                        let RawExpr::Col(c) = &**x else { unreachable!() };
+                        let f = match outer_fold(&RawExpr::Cast(x.clone(), *t)) {
+                            ItemFold::Own if foldable(t) => ItemFold::To(*t),
+                            ItemFold::Own => ItemFold::Runtime,
+                            f => f,
+                        };
+                        consume(Some(&fold_col_name(c)), f);
+                    }
+                    SelItem::Expr(raw, ..) | SelItem::WinExpr(raw, ..) => {
+                        for (_, n) in keyed.clone() {
+                            if raw_any(raw, &|e| matches!(e, RawExpr::Col(c) if fold_col_name(c) == n)) {
+                                consume(Some(&n), ItemFold::Runtime);
+                            }
+                        }
+                    }
+                    // an aggregate, a window, a generator: whatever it
+                    // reads is no assignment
+                    _ => consume(None, ItemFold::Runtime),
+                }
+            }
+        }
+    }
+    let named = |text: &str, n: &str| find_word(&mask_literals(&text.to_ascii_uppercase()), &n.to_ascii_uppercase(), 0).is_some();
+    for (j, (_, n)) in keyed.iter().enumerate() {
+        if group.is_some_and(|g| named(g, n)) {
+            consumers[j] = vec![ItemFold::Runtime];
+        } else if others.iter().any(|t| named(t, n)) {
+            consumers[j].push(ItemFold::Runtime);
+        }
+    }
+    keyed
+        .into_iter()
+        .zip(consumers)
+        .map(|((raw, _), cs)| {
+            let f = match cs.split_first() {
+                None => ItemFold::Runtime,
+                Some((first, rest)) if rest.iter().all(|f| f == first) => *first,
+                _ => ItemFold::Conflict,
+            };
+            (raw, f)
+        })
+        .collect()
 }
 
 /// THE LITERAL FOLD IS NOT THE CAST's, IT IS THE ASSIGNMENT's: the
@@ -85309,13 +85669,23 @@ impl Drop for ResolveDepth {
 /// fold; every literal deeper in the operand is wrapped in an implicit
 /// cast to `t` ([CS_LIT_FOLD]), an inner INT128 / DECFLOAT cast's wraps
 /// re-targeted to this, the outer one.
-fn assignment_literal_fold(inner: Expr, t: &CastTarget) -> Expr {
-    if RUNTIME_DOUBLE_CASTS.with(|c| c.get())
-        || RESOLVE_DEPTH.with(|d| d.get()) != 1
-        || !matches!(t, CastTarget::Numeric { bytes: 16, .. } | CastTarget::DecFloat { .. })
-    {
-        return inner;
+///
+/// The target is the ASSIGNMENT's ([ItemFold]): a CAST that is a top-level
+/// item folds by its own target, one whose item is assigned elsewhere by
+/// that target (`INSERT INTO T (D34) VALUES (CAST(0.4e0 + 0.4e0 AS
+/// INT128))` reads the literals as DECFLOAT 0.4 and stores 1), and one
+/// assigned to anything else not at all - its item resolved under
+/// [RUNTIME_DOUBLE_CASTS], which never reaches here.
+fn assignment_literal_fold(inner: Expr, t: &CastTarget) -> Option<Expr> {
+    if RUNTIME_DOUBLE_CASTS.with(|c| c.get()) || RESOLVE_DEPTH.with(|d| d.get()) != 1 {
+        return Some(inner);
     }
+    let own = matches!(t, CastTarget::Numeric { bytes: 16, .. } | CastTarget::DecFloat { .. });
+    let t = &match CUR_ITEM_FOLD.with(|c| c.get()) {
+        ItemFold::To(u) => u,
+        ItemFold::Own if own => *t,
+        _ => return Some(inner),
+    };
     fn is_lit(e: &Expr) -> bool {
         match e {
             Expr::Double(_) => true,
@@ -85323,28 +85693,46 @@ fn assignment_literal_fold(inner: Expr, t: &CastTarget) -> Expr {
             _ => false,
         }
     }
-    fn walk(e: Expr, t: &CastTarget) -> Expr {
-        let w = |x: Box<Expr>| Box::new(walk(*x, t));
+    // a literal whose spelling the fold cannot pick ([double_literal_text];
+    // an INT128 target reads spellings by value) clears `ok`, and the
+    // item refuses here, at prepare
+    fn walk(e: Expr, t: &CastTarget, ok: &std::cell::Cell<bool>) -> Expr {
+        let w = |x: Box<Expr>| Box::new(walk(*x, t, ok));
         match e {
-            e if is_lit(&e) => Expr::Cast(Box::new(e), *t, CS_LIT_FOLD),
+            e if is_lit(&e) => {
+                let d = match &e {
+                    Expr::Neg(x) => match **x {
+                        Expr::Double(d) => -d,
+                        _ => 0.0,
+                    },
+                    Expr::Double(d) => *d,
+                    _ => 0.0,
+                };
+                if double_literal_text(d, !matches!(t, CastTarget::DecFloat { .. })).is_none() {
+                    ok.set(false);
+                }
+                Expr::Cast(Box::new(e), *t, CS_LIT_FOLD)
+            }
             Expr::Cast(x, _, CS_LIT_FOLD) => Expr::Cast(x, *t, CS_LIT_FOLD),
             Expr::Cast(x, tt, cs) => Expr::Cast(w(x), tt, cs),
             Expr::Neg(x) => Expr::Neg(w(x)),
             Expr::Bin(a, op, b) => Expr::Bin(w(a), op, w(b)),
-            Expr::Coalesce(v) => Expr::Coalesce(v.into_iter().map(|x| walk(x, t)).collect()),
+            Expr::Coalesce(v) => Expr::Coalesce(v.into_iter().map(|x| walk(x, t, ok)).collect()),
             Expr::NullIf(a, b) => Expr::NullIf(w(a), w(b)),
             Expr::Iif(c, a, b) => Expr::Iif(c, w(a), w(b)),
             Expr::Case(arms, els) => {
-                Expr::Case(arms.into_iter().map(|(c, x)| (c, walk(x, t))).collect(), els.map(w))
+                Expr::Case(arms.into_iter().map(|(c, x)| (c, walk(x, t, ok))).collect(), els.map(w))
             }
-            Expr::Func(f, args) => Expr::Func(f, args.into_iter().map(|x| walk(x, t)).collect()),
+            Expr::Func(f, args) => Expr::Func(f, args.into_iter().map(|x| walk(x, t, ok)).collect()),
             other => other,
         }
     }
-    if is_lit(&inner) {
-        return inner;
+    if is_lit(&inner) && own && CUR_ITEM_FOLD.with(|c| c.get()) == ItemFold::Own {
+        return Some(inner);
     }
-    walk(inner, t)
+    let ok = std::cell::Cell::new(true);
+    let out = walk(inner, t, &ok);
+    ok.get().then_some(out)
 }
 
 /// A double LITERAL under a CAST to DECFLOAT folds from its spelling
@@ -85352,8 +85740,19 @@ fn assignment_literal_fold(inner: Expr, t: &CastTarget) -> Expr {
 /// statement read to different decimals the fold cannot pick, and the
 /// statement refuses HERE, at prepare, rather than at fetch. Every other
 /// shape passes.
+///
+/// An INT128-backed target reads the spellings BY VALUE: `1e37` beside
+/// `1.0e37` (or `10e36` in a predicate) is one decimal 10^37 whichever
+/// is read (`CAST(1e37 AS INT128), CAST(1.0e37 AS INT128)` is 10^37
+/// twice, and `CAST(-1e37 AS INT128) .. WHERE 1e0 < 10e36` -10^37, on
+/// 2182), where the bit-for-bit reading declined and the cast fell to
+/// cvt.cpp's runtime double, 10000000000000000719354278919532445696 - a
+/// silent wrong value. Two different VALUES of one double still decline,
+/// and refuse.
 fn dec_literal_cast_spelled(inner: &Expr, t: &CastTarget) -> bool {
-    if !matches!(t, CastTarget::DecFloat { .. }) || RUNTIME_DOUBLE_CASTS.with(|c| c.get()) {
+    if !matches!(t, CastTarget::DecFloat { .. } | CastTarget::Numeric { bytes: 16, .. })
+        || RUNTIME_DOUBLE_CASTS.with(|c| c.get())
+    {
         return true;
     }
     let lit = match inner {
@@ -85364,7 +85763,8 @@ fn dec_literal_cast_spelled(inner: &Expr, t: &CastTarget) -> bool {
         },
         _ => None,
     };
-    lit.is_none_or(|d| double_literal_text(d).is_some())
+    let by_value = !matches!(t, CastTarget::DecFloat { .. });
+    lit.is_none_or(|d| double_literal_text(d, by_value).is_some())
 }
 
 /// Run `f` with [RUNTIME_DOUBLE_CASTS] set, restoring the previous state.
@@ -85778,14 +86178,36 @@ fn classify_exp_literal(text: &str) -> Option<ExpLit> {
 /// spelling, so a double with no spelling of its own takes its
 /// negation's, minus prefixed - where this fell to the shortest decimal
 /// of the one-ULP-off double (-10000000000000001000000000000000000000).
-fn double_literal_text(d: f64) -> Option<String> {
+///
+/// `by_value` (an INT128-backed target) takes two spellings as one when
+/// they are the same NUMBER (`1e37`, `1.0e37`, `10e36`): the fold rounds
+/// the exact value to the target's scale, which the trailing zeros of a
+/// coefficient do not change. A DECFLOAT target keeps them apart - its
+/// value carries the exponent (`1.5e0` is 1.5, `1.50e0` 1.50).
+fn double_literal_text(d: f64, by_value: bool) -> Option<String> {
+    let key = |s: &str| -> Option<(bool, u128, i32)> {
+        let bits = text_to_dec128_clamped(s).ok()?;
+        if !by_value {
+            return Some((false, bits, 0));
+        }
+        match fire_crab_ods::decfloat::decode_dec128(bits) {
+            fire_crab_ods::decfloat::Dec::Finite { coeff: 0, .. } => Some((false, 0, 0)),
+            fire_crab_ods::decfloat::Dec::Finite { neg, mut coeff, mut exp } => {
+                while coeff % 10 == 0 {
+                    coeff /= 10;
+                    exp += 1;
+                }
+                Some((neg, coeff, exp))
+            }
+            _ => None,
+        }
+    };
     let spelled = |d: f64| -> Option<Option<String>> {
         DOUBLE_LITERAL_TEXT.with(|t| {
             let t = t.borrow();
             let mut spellings = t.iter().filter(|(b, _)| *b == d.to_bits()).map(|(_, s)| s);
             let first = spellings.next()?.clone();
-            let bits_of = |s: &str| text_to_dec128_clamped(s).ok();
-            Some(spellings.all(|s| bits_of(s) == bits_of(&first)).then_some(first))
+            Some(spellings.all(|s| key(s) == key(&first)).then_some(first))
         })
     };
     match spelled(d) {
@@ -91020,7 +91442,20 @@ impl Expr {
                 }
             },
             Expr::Cast(e, t, cs) => {
-                let v = e.eval(values)?;
+                // [SNAN_TO_APPROX]: taken by the first cast evaluated
+                // under it, which is the DECFLOAT operand of a cast to
+                // DOUBLE / FLOAT
+                let snan_ok = SNAN_TO_APPROX.with(|c| c.replace(false));
+                let v = if matches!(t, CastTarget::Approx | CastTarget::Float)
+                    && matches!(**e, Expr::Cast(_, CastTarget::DecFloat { .. }, _))
+                {
+                    SNAN_TO_APPROX.with(|c| c.set(true));
+                    let v = e.eval(values);
+                    SNAN_TO_APPROX.with(|c| c.set(false));
+                    v?
+                } else {
+                    e.eval(values)?
+                };
                 if matches!(v, Value::Null) {
                     return Ok(Value::Null); // NULL casts to NULL of any type
                 }
@@ -91212,8 +91647,12 @@ impl Expr {
                         // 2182: CEILING / FLOOR / TRUNC / EXP / POWER of
                         // 'sNaN' raise 22000, SIGN('-NaN') is -1, and
                         // the casts themselves print sNaN / -NaN) - the
-                        // cast refuses rather than answer the wrong one
-                        if let Value::Text(s) = &v {
+                        // cast refuses rather than answer the wrong one.
+                        // Straight into a cast to DOUBLE / FLOAT the two
+                        // agree - any NaN is the conversion's 22000 there
+                        // (`CAST(CAST('sNaN' AS DECFLOAT(34)) AS DOUBLE
+                        // PRECISION)`, measured; castdfnonfinite's cells)
+                        if let (false, Value::Text(s)) = (snan_ok, &v) {
                             let t = s.to_ascii_lowercase();
                             if dec_special_text(s) && (t.trim_start_matches(['+', '-']).starts_with("snan") || (t.starts_with('-') && t.contains("nan"))) {
                                 return Err(EvalErr::Unsupported);
@@ -91261,7 +91700,7 @@ impl Expr {
                                 _ => (false, None),
                             };
                             let bits = lit
-                                .and_then(double_literal_text)
+                                .and_then(|d| double_literal_text(d, false))
                                 .and_then(|t| text_to_dec128_clamped(&t).ok())
                                 .ok_or(EvalErr::ConversionError(None))?;
                             // the minus is part of the re-read TEXT, so
@@ -91888,7 +92327,7 @@ impl Expr {
                                     {
                                         return Err(EvalErr::NumericOutOfRange);
                                     }
-                                    match double_literal_text(d).and_then(|t| text_number(&t)) {
+                                    match double_literal_text(d, true).and_then(|t| text_number(&t)) {
                                         Some(TextNum::Dec { mantissa, exp })
                                             if i8::try_from(exp).is_ok() =>
                                         {

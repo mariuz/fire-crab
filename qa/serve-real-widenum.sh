@@ -53,18 +53,29 @@
 #     at E-6176 (it clamped at E-6143); POWER / EXP / LOG / TRUNC of an
 #     Infinity and SQRT / LN / LOG10 / LOG of a NaN are decNumber's.
 #
+#   * (its review) the literal fold is the ASSIGNMENT TARGET's: a DML
+#     value's column, a derived table's / CTE's / subquery's outer item -
+#     no fold into a DOUBLE / VARCHAR / SMALLINT column or under an
+#     operator, a CAST TO DOUBLE, an aggregate, a WHERE / ON / GROUP BY,
+#     and a DECFLOAT column folds its literals as DECFLOAT (the cast's
+#     own target folded them everywhere at depth 1: a silent 0 for 1); a
+#     FLOAT conditional's exact branch converts too, and MAX over it
+#     describes FLOAT; two spellings of one value (1e37, 1.0e37, 10e36)
+#     fold as that value under an INT128 target (cvt.cpp's double).
+#
 # RECORDED, not fixed: a windowed decimal fold (`VAR_POP(I) OVER ()`), a
 # DECFLOAT / INT128 percentile fraction, DECODE with a mistyped search
 # value (the engine describes and raises at fetch; this refuses), a
-# VIEW's literal cast and a derived table's under an aggregate (the
-# engine runs the double conversion there), a decfloat beside a DOUBLE
-# LITERAL (the same assignment fold), GROUP BY a decfloat expression,
+# VIEW's literal cast (the engine runs the double conversion there), a
+# decfloat beside a DOUBLE LITERAL (the same assignment fold), GROUP BY a
+# decfloat expression,
 # COVAR_POP(NULL, ..)'s TEXT NULL, and the sign of a decimal zero through
 # minus / multiply / TRUNC; a DECFLOAT scalar subquery in the select
 # list, a non-finite DECFLOAT folded into an IN list, a signalling or
 # negative NaN (neither has a form here: the CAST refuses), and a bare
 # literal cast under a VARCHAR item (it still folds by the CAST's
-# target).
+# target); one derived column read by two consumers that disagree
+# (refused), and an INT128 item that is not a CAST (no fold here).
 #
 # Usage: qa/serve-real-widenum.sh [port]   (default 5890)
 set -u
@@ -104,6 +115,12 @@ INSERT INTO DD VALUES (14, 2.5, 2.5);
 INSERT INTO DD VALUES (17, 18446744073709555712, 18446744073709555712);
 INSERT INTO DD VALUES (21, -1e25, -1e25);
 INSERT INTO DD VALUES (26, NULL, NULL);
+CREATE TABLE BIG3 (ID INTEGER, M NUMERIC(38,0), I INT128, B BIGINT, DBL DOUBLE PRECISION, F FLOAT);
+INSERT INTO BIG3 VALUES (1, 1, 1, 1, 1.0, 1.0);
+INSERT INTO BIG3 VALUES (2, 2, 2, 2, 2.0, 2.0);
+INSERT INTO BIG3 VALUES (3, 4, 4, 4, 4.0, 4.0);
+INSERT INTO BIG3 VALUES (4, NULL, NULL, NULL, NULL, NULL);
+CREATE TABLE T3 (ID INTEGER, DBL DOUBLE PRECISION, V VARCHAR(40), S SMALLINT, N18 NUMERIC(18,2), D34 DECFLOAT(34), I INT128, M NUMERIC(38,0), N382 NUMERIC(38,2));
 CREATE VIEW V1 AS SELECT CAST(1e30 AS NUMERIC(38,6)) X FROM RDB$DATABASE;
 COMMIT;
 SQL
@@ -327,7 +344,7 @@ echo "--- 10. RECORDED (the review round): the engine answers, this server refus
 refused "10 a decfloat beside a DOUBLE LITERAL - the assignment fold under a DECFLOAT output, the runtime double elsewhere" "SELECT SQRT(I) * 1.5e0, D34 + 0.1e0 FROM FX WHERE ID = 1;" "MULTIPLY ADD|3.354101966249684544613760503096914 2.1"
 refused "10 GROUP BY a decfloat expression" "SELECT SQRT(I), COUNT(*) FROM FX GROUP BY 1 ORDER BY 1;" "SQRT COUNT|<null> 1|2.236067977499789696409173668731276 1"
 refused "10 a TEXT places count (the exact family refuses it too)" "SELECT ROUND(CAST('1.5' AS DECFLOAT(34)), '2') $DUAL;" "ROUND|1.50"
-differs "10 a derived table's literal cast under an AGGREGATE runs the double conversion on the engine" "SELECT SUM(X) FROM (SELECT CAST(1e30 AS NUMERIC(38,6)) X $DUAL);" "SUM|1000000000000000042420637374017.961984" "SUM|1000000000000000000000000000000.000000"
+pin  "10 a derived table's literal cast under an AGGREGATE runs the double conversion (recorded; the assignment's fold agrees now)" "SELECT SUM(X) FROM (SELECT CAST(1e30 AS NUMERIC(38,6)) X $DUAL);" "SUM|1000000000000000042420637374017.961984"
 differs "10 COVAR_POP(NULL, I) is a TEXT NULL on the engine" "SELECT COVAR_POP(NULL, I) FROM BIG2;" "COVAR_POP|<null>" "COVAR_POP|0.000000000000000"
 differs "10 the sign of a decimal ZERO through multiply and TRUNC (decNumber keeps it)" "SELECT CAST('-1' AS DECFLOAT(34)) * 0, TRUNC(CAST('-0.0012345' AS DECFLOAT(34)), 2) $DUAL;" "MULTIPLY TRUNC|-0 -0" "MULTIPLY TRUNC|0 0"
 
@@ -365,6 +382,25 @@ refused "12 a non-finite DECFLOAT folded into an IN list" "SELECT COUNT(*) FROM 
 refused "12 a SIGNALLING NaN has no form here (its CAST refuses; FLOOR / CEILING / EXP of it trap on the engine)" "SELECT CEILING(CAST('sNaN' AS DECFLOAT(34))) $DUAL;" "CEILING|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation."
 refused "12 nor a NEGATIVE NaN (the engine's SIGN of it is -1)" "SELECT SIGN(CAST('-NaN' AS DECFLOAT(34))), CAST('-NaN' AS DECFLOAT(34)) $DUAL;" "SIGN CAST|-1 -NaN"
 differs "12 a bare literal cast under a VARCHAR item still folds here (the engine converts cvt.cpp's double)" "SELECT CAST(1e37 AS NUMERIC(38,0)) || '' $DUAL;" "CONCATENATION|10000000000000000719354278919532445696" "CONCATENATION|10000000000000000000000000000000000000"
+
+echo "--- 13. THE FOLD IS THE ASSIGNMENT'S TARGET's: a DML column, the outer item over a derived table / CTE / subquery; a FLOAT conditional's exact branch; a literal's two spellings"
+pin  "13 a DML value folds by its COLUMN: no fold into DOUBLE / VARCHAR / SMALLINT / NUMERIC(18,2), DECFLOAT's own into DECFLOAT (this answered 0)" "INSERT INTO T3 (ID, DBL) VALUES (1, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING DBL; INSERT INTO T3 (ID, V) VALUES (2, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING V; INSERT INTO T3 (ID, S) VALUES (3, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING S; INSERT INTO T3 (ID, N18) VALUES (4, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING N18; INSERT INTO T3 (ID, D34) VALUES (5, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING D34; ROLLBACK;" "DBL|1.000000000000000|V|1|S|1|N18|1.00|D34|1"
+pin  "13 ...an INT128-backed column folds at ITS type and scale, whatever the cast's" "INSERT INTO T3 (ID, I) VALUES (1, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING I; INSERT INTO T3 (ID, M) VALUES (2, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING M; INSERT INTO T3 (ID, I) VALUES (3, CAST(0.4e0 + 0.4e0 AS BIGINT)) RETURNING I; INSERT INTO T3 (ID, N382) VALUES (4, CAST(CAST(1.24951e0 AS DOUBLE PRECISION) AS NUMERIC(38,1))) RETURNING N382; INSERT INTO T3 (ID, M) VALUES (5, CAST(CAST(0.45e0 AS DOUBLE PRECISION) AS NUMERIC(38,1))) RETURNING M; ROLLBACK;" "I|0|M|0|I|0|N382|1.30|M|0"
+pin  "13 ...INSERT .. SELECT, UPDATE and UPDATE OR INSERT the same" "INSERT INTO T3 (ID, DBL) SELECT 1, CAST(0.4e0 + 0.4e0 AS INT128) $DUAL RETURNING DBL; INSERT INTO T3 (ID, I) SELECT 2, CAST(0.4e0 + 0.4e0 AS INT128) $DUAL RETURNING I; INSERT INTO T3 (ID, DBL) VALUES (3, 5); UPDATE T3 SET DBL = CAST(0.4e0 + 0.4e0 AS INT128) WHERE ID = 3 RETURNING DBL; UPDATE T3 SET I = CAST(0.4e0 + 0.4e0 AS INT128) WHERE ID = 3 RETURNING I; UPDATE OR INSERT INTO T3 (ID, V) VALUES (3, CAST(0.4e0 + 0.4e0 AS INT128)) MATCHING (ID) RETURNING V; ROLLBACK;" "DBL|1.000000000000000|I|0|DBL|1.000000000000000|I|0|V|1"
+pin  "13 ...a DECFLOAT / INT128 cast into a VARCHAR column is cvt.cpp's double (0.3 and 10^37 here)" "INSERT INTO T3 (ID, V) VALUES (1, CAST(0.1e0 + 0.2e0 AS DECFLOAT(34))) RETURNING V; INSERT INTO T3 (ID, V) VALUES (2, CAST(1e37 AS INT128)) RETURNING V; INSERT INTO T3 (ID, V) VALUES (3, CAST(CAST(1e37 AS DOUBLE PRECISION) AS INT128)) RETURNING V; INSERT INTO T3 (ID, D34) VALUES (4, CAST(0.1e0 + 0.2e0 AS DECFLOAT(34))) RETURNING D34; ROLLBACK;" "V|0.30000000000000004|V|10000000000000000719354278919532445696|V|10000000000000000719354278919532445696|D34|0.3"
+pin  "13 a derived table's / CTE's item under an operator, a CAST TO DOUBLE, an aggregate is no assignment (this answered 0)" "SELECT X || '' FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); SELECT CAST(X AS DOUBLE PRECISION) FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); SELECT MAX(X) FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); SELECT A.X * 1.0 FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL) A; WITH C AS (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL) SELECT X || 'a' FROM C;" "CONCATENATION|1|CAST|1.000000000000000|MAX|1|MULTIPLY|1.0|CONCATENATION|1a"
+pin  "13 ...the literal there is cvt.cpp's double, through a nested cast, a bare literal, a DECFLOAT, two derived levels" "SELECT X || '' FROM (SELECT CAST(CAST(1e37 AS DOUBLE PRECISION) AS INT128) X $DUAL); SELECT CAST(X AS VARCHAR(40)) FROM (SELECT CAST(CAST(0.4999999999999999e0 AS DOUBLE PRECISION) AS INT128) X $DUAL); SELECT X || '' FROM (SELECT CAST(1e30 AS NUMERIC(38,6)) X $DUAL); SELECT X || '' FROM (SELECT CAST(0.1e0 + 0.2e0 AS DECFLOAT(34)) X $DUAL); SELECT Y || '' FROM (SELECT X Y FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL));" "CONCATENATION|10000000000000000719354278919532445696|CAST|1|CONCATENATION|1000000000000000042420637374017.961984|CONCATENATION|0.30000000000000004|CONCATENATION|1"
+pin  "13 ...a scalar subquery inside an expression too; the whole item folds" "SELECT (SELECT CAST(0.4e0 + 0.4e0 AS INT128) $DUAL) || '' $DUAL; SELECT (SELECT CAST(1e37 AS INT128) $DUAL) || '' $DUAL; SELECT (SELECT CAST(0.4e0 + 0.4e0 AS INT128) $DUAL) $DUAL;" "CONCATENATION|1|CONCATENATION|10000000000000000719354278919532445696|CAST|0"
+pin  "13 ...a WHERE, an ON and a GROUP BY read the unfolded value (no row, and X 0, before)" "SELECT 'W' FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL) WHERE X = 1; SELECT 'J' FROM RDB\$DATABASE A JOIN (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL) B ON B.X = 1; SELECT X, COUNT(*) FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL) GROUP BY X;" "CONSTANT|W|CONSTANT|J|X COUNT|1 1"
+pin  "13 CONTROL: read bare, through *, a rename, CAST AS INT128, a CTE - the outer item's type - it folds; CAST AS DECFLOAT folds as DECFLOAT" "SELECT X FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); SELECT * FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); SELECT Y FROM (SELECT X Y FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL)); SELECT CAST(X AS INT128) FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); SELECT CAST(X AS DECFLOAT(34)) FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); WITH C AS (SELECT CAST(1e37 AS INT128) X $DUAL) SELECT X FROM C; SELECT X FROM (SELECT CAST(CAST(1e37 AS DOUBLE PRECISION) AS INT128) X $DUAL);" "X|0|X|0|Y|0|CAST|0|CAST|1|X|10000000000000000000000000000000000000|X|9999999999999999538762658202121142272"
+pin  "13 an EXACT branch beside a FLOAT one converts too (VAR_POP / STDDEV / CORR / PERCENTILE_CONT read 0)" "SELECT VAR_POP(IIF(ID = 1, I, F)), VAR_POP(IIF(ID = 1, M, F)), VAR_POP(IIF(ID = 1, I, CAST(DBL AS FLOAT))), VAR_POP(IIF(ID = 1, I, CAST(1.5 AS FLOAT))) FROM BIG3; SELECT STDDEV_POP(COALESCE(I, F)), CORR(COALESCE(I, F), ID), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(I, F)) FROM BIG3;" "VAR_POP VAR_POP VAR_POP VAR_POP|1.555555555555556 1.555555555555556 1.555555555555556 0.04687500000000000|STDDEV_POP CORR PERCENTILE_CONT|1.247219128924647 0.9819805060619656 2.000000000000000"
+pin  "13 ...SUM / AVG / MAX / MIN over it, a BIGINT branch included (0 and 22003 before)" "SELECT AVG(COALESCE(I, F)), SUM(COALESCE(B, F)), SUM(IIF(ID = 1, I, CAST(DBL AS FLOAT))), MAX(COALESCE(I, F)), MIN(COALESCE(I, F)), MAX(COALESCE(M, F)) FROM BIG3;" "AVG SUM SUM MAX MIN MAX|2.333333333333333 7.000000000000000 7.000000000000000 4.0000000 1.0000000 4.0000000"
+dpin "13 ...and MAX over a FLOAT expression describes FLOAT (DOUBLE here)" "SELECT MAX(COALESCE(I, F)), MAX(COALESCE(F, 0)) FROM BIG3;" "01: sqltype: 482 FLOAT Nullable scale: 0 subtype: 0 len: 4|02: sqltype: 482 FLOAT Nullable scale: 0 subtype: 0 len: 4"
+pin  "13 two spellings of one VALUE fold as that value under an INT128 target (cvt.cpp's double before)" "SELECT CAST(-1e37 AS INT128), CAST(-1.0e37 AS INT128) $DUAL; SELECT CAST(1e37 AS INT128), CAST(1.0e37 AS INT128), CAST(10e36 AS NUMERIC(38,0)) $DUAL; SELECT CAST(-1e37 AS INT128) $DUAL WHERE 1e0 < 10e36; SELECT CAST(-1e37 AS INT128) FROM BIG3 WHERE DBL < 10e36 AND ID = 1;" "CAST CAST|-10000000000000000000000000000000000000 -10000000000000000000000000000000000000|CAST CAST CAST|10000000000000000000000000000000000000 10000000000000000000000000000000000000 10000000000000000000000000000000000000|CAST|-10000000000000000000000000000000000000|CAST|-10000000000000000000000000000000000000"
+
+echo "--- 14. RECORDED (the fold's target): the engine answers, this server refuses or differs"
+refused "14 one derived column read by two consumers that disagree (the engine inlines it per consumer)" "SELECT X, X || '' FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL);" "X CONCATENATION|0 1"
+differs "14 an INT128 item that is not a CAST folds its literals on the engine" "SELECT CAST(0.4e0 + 0.4e0 AS INT128) + 1, IIF(1 = 1, CAST(0.4e0 + 0.4e0 AS INT128), 5), COALESCE(CAST(0.4e0 + 0.4e0 AS INT128), 5) $DUAL;" "ADD CASE COALESCE|1 0 0" "ADD CASE COALESCE|2 1 1"
 
 echo "--- panic check"
 ran=$((ran + 1))
