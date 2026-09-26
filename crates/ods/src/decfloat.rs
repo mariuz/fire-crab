@@ -721,6 +721,139 @@ pub fn mul(a: &Dec, b: &Dec) -> Dec {
     finite(na != nb, kept, ea + eb + drop)
 }
 
+/// `a * b + c` ROUNDED ONCE, to 34 significant digits HALF-UP - the
+/// engine's `Decimal128::fma` (decQuadFMA), which its STDDEV / VAR fold
+/// uses for the running sum of squares. The exact product joins the
+/// addend before any rounding, so it can differ from `add(mul(a, b), c)`
+/// in the last digit. A special operand takes the two-step route, whose
+/// NaN / Infinity propagation is the same.
+pub fn fma(a: &Dec, b: &Dec, c: &Dec) -> Dec {
+    let fin = |d: &Dec| matches!(d, Dec::Finite { .. });
+    if !(fin(a) && fin(b) && fin(c)) {
+        return add(&mul(a, b), c);
+    }
+    let (na, ca, ea) = parts(a);
+    let (nb, cb, eb) = parts(b);
+    let (nc, cc, ec) = parts(c);
+    let p = umul(&ca, &cb);
+    let e = (ea + eb).min(ec);
+    let mut dp = p;
+    dp.extend(std::iter::repeat(b'0').take((ea + eb - e) as usize));
+    let mut dc = cc;
+    dc.extend(std::iter::repeat(b'0').take((ec - e) as usize));
+    let (dp, dc) = (strip0(dp), strip0(dc));
+    let np = na != nb;
+    let (sign, mag) = if np == nc {
+        (np, uadd(&dp, &dc))
+    } else {
+        match ucmp(&dp, &dc) {
+            std::cmp::Ordering::Greater => (np, usub(&dp, &dc)),
+            std::cmp::Ordering::Less => (nc, usub(&dc, &dp)),
+            std::cmp::Ordering::Equal => (false, vec![b'0']),
+        }
+    };
+    let (kept, drop) = round34(&mag);
+    finite(sign, kept, e + drop)
+}
+
+/// The integer square root (floor) of MSD-first digits, digit pair by
+/// digit pair.
+fn uisqrt(n: &[u8]) -> Vec<u8> {
+    let mut digs = n.to_vec();
+    if digs.len() % 2 == 1 {
+        digs.insert(0, b'0');
+    }
+    let mut rem: Vec<u8> = vec![b'0'];
+    let mut p: Vec<u8> = vec![b'0'];
+    for pair in digs.chunks(2) {
+        let mut r = rem;
+        r.extend_from_slice(pair);
+        let r = strip0(r);
+        let p20 = umul(&p, b"20");
+        let (mut d, mut take) = (0u8, vec![b'0']);
+        for cand in (1..=9u8).rev() {
+            let t = umul(&uadd(&p20, &[b'0' + cand]), &[b'0' + cand]);
+            if ucmp(&t, &r) != std::cmp::Ordering::Greater {
+                d = cand;
+                take = t;
+                break;
+            }
+        }
+        rem = usub(&r, &take);
+        p.push(b'0' + d);
+        p = strip0(p);
+    }
+    p
+}
+
+/// The square root, as decNumberSquareRoot answers it at 34 digits: the
+/// CORRECTLY ROUNDED root, HALF-EVEN whatever the context's rounding (the
+/// routine rounds its approximation under its own DEC_ROUND_HALF_EVEN
+/// context), a full 34 digits when inexact. An EXACT root drops trailing
+/// zeros down to the ideal exponent floor(e/2) - but only when the trimmed
+/// root is short enough that its square fits the working precision
+/// (2 * digits - 1 <= max(35, operand digits)); a longer exact root keeps
+/// all 34 digits, as decNumber's exactness test never runs for it. A zero
+/// keeps its sign at the ideal exponent; a negative operand (and
+/// -Infinity) is the invalid operation, answered as NaN for the caller to
+/// trap; +Infinity and NaN propagate.
+pub fn sqrt(a: &Dec) -> Dec {
+    match a {
+        Dec::Nan => return Dec::Nan,
+        Dec::Infinity { neg: false } => return *a,
+        Dec::Infinity { neg: true } => return Dec::Nan,
+        Dec::Finite { .. } => {}
+    }
+    let (neg, c, e) = parts(a);
+    let ideal = e.div_euclid(2);
+    if c == b"0" {
+        return Dec::Finite { neg, coeff: 0, exp: ideal.clamp(-6176, 6111) as i32 };
+    }
+    if neg {
+        return Dec::Nan;
+    }
+    let l = c.len() as i64;
+    // widen to at least 70 digits (a root of at least 35) at an even
+    // exponent, so the root carries a rounding digit
+    let mut t = (70 - l).max(0);
+    if (e - t).rem_euclid(2) != 0 {
+        t += 1;
+    }
+    let mut n = c.clone();
+    n.extend(std::iter::repeat(b'0').take(t as usize));
+    let s = uisqrt(&n);
+    let exact_root = umul(&s, &s) == n;
+    let mut exp = (e - t) / 2;
+    let drop = s.len() - 34;
+    let mut kept = s[..34].to_vec();
+    let dropped = &s[34..];
+    let first = dropped[0];
+    let sticky = dropped[1..].iter().any(|&d| d != b'0') || !exact_root;
+    let odd = (kept[33] - b'0') % 2 == 1;
+    if first > b'5' || (first == b'5' && (sticky || odd)) {
+        kept = uadd(&kept, b"1");
+        if kept.len() > 34 {
+            kept.truncate(34);
+            exp += 1;
+        }
+    }
+    exp += drop as i64;
+    let exact = exact_root && dropped.iter().all(|&d| d == b'0');
+    if exact {
+        let tz = kept.iter().rev().take_while(|&&d| d == b'0').count() as i64;
+        let trimmed = 34 - tz;
+        let workp = 35.max(l);
+        if trimmed * 2 - 1 <= workp {
+            let todrop = (ideal - exp).min(tz);
+            if todrop > 0 {
+                kept.truncate((34 - todrop) as usize);
+                exp += todrop;
+            }
+        }
+    }
+    finite(false, kept, exp)
+}
+
 /// The decimal128 bits of a SPECIAL value: `±Infinity` or `NaN`, the
 /// forms decNumber's string grammar accepts as `inf`/`infinity`/`nan`/
 /// `snan`. The combination field alone carries them - `11110` is infinity,
@@ -925,6 +1058,29 @@ mod tests {
         // specials
         assert!(matches!(decode_dec64(0x7800000000000000), Dec::Infinity { neg: false }));
         assert!(matches!(decode_dec64(0x7C00000000000000), Dec::Nan));
+    }
+
+    #[test]
+    fn sqrt_and_fma_as_the_engine_answers() {
+        let fin = |coeff: u128, exp| Dec::Finite { neg: false, coeff, exp };
+        let s = |d: Dec| to_string(&sqrt(&d));
+        // engine STDDEV_SAMP values (measured on 2182)
+        assert_eq!(s(fin(5, -1)), "0.7071067811865475244008443621048490");
+        assert_eq!(
+            s(fin(1266666666666666666666666666666666, -32)),
+            "3.559026084010437070270507988531903"
+        );
+        // exact roots trim to the ideal exponent floor(e/2)
+        assert_eq!(s(fin(25, -2)), "0.5");
+        assert_eq!(s(fin(2500, -4)), "0.50");
+        assert_eq!(s(fin(4, 0)), "2");
+        assert_eq!(s(fin(0, -3)), "0.00");
+        assert!(matches!(sqrt(&Dec::Finite { neg: true, coeff: 4, exp: 0 }), Dec::Nan));
+        // one rounding: 1.000..01 (34 digits) squared + -1 keeps the tail
+        let a = fin(1000000000000000000000000000000001, -33);
+        let m1 = Dec::Finite { neg: true, coeff: 1, exp: 0 };
+        assert_eq!(to_string(&fma(&a, &a, &m1)), "2.000000000000000000000000000000001E-33");
+        assert_eq!(to_string(&add(&mul(&a, &a), &m1)), "2E-33");
     }
 
     #[test]
