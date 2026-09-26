@@ -21,9 +21,10 @@
 # prepare-time decimal fold on the literal TEXT (CAST(0.1e0 AS
 # DECFLOAT(34)) -> 0.1, the engine's LiteralNode::pass2), which fire-crab
 # reproduces from the recorded spelling since the widenum review round;
-# a constant TREE (0.1e0+0.0e0) stays DEFERRED, asserted as a KNOWN
-# divergence (fire-crab refuses, engine answers). An intervening CAST(..
-# AS DOUBLE) defeats the fold and fire-crab MUST then answer the runtime
+# a constant TREE (0.1e0+0.0e0) folds each literal before the add since
+# the merged-binary review (the fold is the ASSIGNMENT's, over every
+# literal of the item). A CAST(.. AS DOUBLE) in between is the exact
+# value's nearest double, which for these literals is the runtime
 # expansion - the cells pin the split.
 #
 # Usage: qa/serve-real-castintodecfloat.sh [port]   (default 4164)
@@ -96,9 +97,9 @@ agree "1.5e308 col -> df16 (value)" "select $(vc "cast(cast(1.5e308 as double pr
 echo "-- rounding ties (spot-check half-even at the 18th digit) --"
 agree "0.12345678901234568 -> df16" "select $(vc "$(dbl 0.12345678901234568 x 16)") x from t;"
 agree "0.30000000000000004 -> df34" "select $(vc "$(dbl 0.30000000000000004 x 34)") x from t;"
-echo "-- constant-literal fold: a BARE literal re-reads its text (0.1); a constant TREE is still DEFERRED --"
+echo "-- constant-literal fold: a BARE literal re-reads its text (0.1); so does every literal of a constant TREE --"
 agree "CAST(0.1e0 AS DECFLOAT(34)) - the text fold" "select cast(0.1e0 as decfloat(34)) x from t;"
-refuses_fc "CAST(0.1e0+0.0e0 AS DECFLOAT(34))" "select cast(0.1e0+0.0e0 as decfloat(34)) x from t;"
+agree "CAST(0.1e0+0.0e0 AS DECFLOAT(34)) - each literal folds before the add (a refusal until the merged-binary review)" "select cast(0.1e0+0.0e0 as decfloat(34)) x from t;"
 echo "-- contrast: an intervening CAST-to-DOUBLE defeats the fold -> runtime --"
 agree "CAST(CAST(0.1e0 AS DOUBLE) AS DF34)" "select $(vc "cast(cast(0.1e0 as double precision) as decfloat(34))") x from t;"
 echo "-- control: exact numeric literal still folds correctly (unchanged path) --"
