@@ -17699,6 +17699,7 @@ fn fire_ddl_triggers(
             })?;
             let mut frame = PsqlFrame {
  stop_after: None,
+            types: Vec::new(),
                 vars: vec![Value::Null; names.len()],
                 out_at: names.len(),
                 out_len: 0,
@@ -17799,6 +17800,7 @@ fn fire_db_triggers(
             .ok_or_else(|| ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name)))?;
         let mut frame = PsqlFrame {
  stop_after: None,
+            types: Vec::new(),
             vars: vec![Value::Null; names.len()],
             out_at: names.len(),
             out_len: 0,
@@ -51065,6 +51067,15 @@ fn plan_query_inner_at(
             if trace {
                 eprintln!("[srv] plan: no such procedure {:?}", pname);
             }
+            // NO SUCH PROCEDURE AT ALL is the engine's -204, where one
+            // that exists but is outside this server's surface keeps the
+            // generic refusal (measured: `EXECUTE PROCEDURE NOSUCHPROC`
+            // is -204 Procedure unknown "NOSUCHPROC", which this answered
+            // as a bare Dynamic SQL Error)
+            if !procedure_defined(db, &pname) {
+                let name = parts.iter().map(|p| format!("\"{}\"", p)).collect::<Vec<_>>().join(".");
+                return Some(Plan::RefusedEval(EvalErr::ProcUnknownBare(name)));
+            }
             return Some(Plan::Refused);
         };
         // one output column per declared output parameter, named after it
@@ -62314,6 +62325,20 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(*line as i32)
                 .int(ISC_ARG_NUMBER)
                 .int(*col as i32);
+        }
+        EvalErr::ProcUnknownBare(name) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-204)
+                .int(1) // isc_arg_gds
+                .int(GDS_DSQL_PROCEDURE_ERR)
+                .int(1) // isc_arg_gds
+                .int(GDS_RANDOM)
+                .int(2) // isc_arg_string - PRE-QUOTED as written
+                .bytes(name.as_bytes());
         }
         EvalErr::ProcUnknown { name, line, col } => {
             w.int(1) // isc_arg_gds
@@ -75650,6 +75675,12 @@ enum EvalErr {
     /// no procedure: the engine's -204 "Procedure unknown". The name is
     /// pre-quoted as written (`"PUBLIC"."NOSUCHPROC"`).
     ProcUnknown { name: String, line: i64, col: i64 },
+    /// `EXECUTE PROCEDURE NAME` naming no procedure: the same -204
+    /// "Procedure unknown" WITHOUT the line/column item, the name quoted
+    /// part by part as written (measured: `NOSUCHPROC` is
+    /// `"NOSUCHPROC"`, `PUBLIC.NOSUCHPROC` `"PUBLIC"."NOSUCHPROC"`,
+    /// `"nosuchproc"` `"nosuchproc"`)
+    ProcUnknownBare(String),
     /// a wrong argument count in a FROM-item procedure call:
     /// `isc_dsql_error` + `isc_prcmismat` (SQLCODE -902, SQLSTATE
     /// 07001). Fires BEFORE both of the above, for selectable and
@@ -92589,6 +92620,10 @@ struct ProcMeta {
     /// absent-column tolerance [catalog_row_public] applies - refusing
     /// on a missing column would start refusing valid procedures.
     prc_type: Option<i64>,
+    /// a stored FUNCTION's body rather than a procedure's: its stack
+    /// item reads `At function "PUBLIC"."G6F" line: L, col: C` (measured
+    /// - the procedure spelling there named the wrong kind of object)
+    is_function: bool,
 }
 
 /// Read one system relation's (columns, newest descriptors) pair - the
@@ -92967,7 +93002,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
             outs.push(p)
         }
     }
-    Some(ProcMeta { ins, outs, source, prc_type, body_at })
+    Some(ProcMeta { ins, outs, source, prc_type, body_at, is_function: false })
 }
 
 /// The BODY source of a package, off its RDB$PACKAGES row - the one
@@ -93227,6 +93262,18 @@ struct BodyCap {
 
 struct PsqlFrame {
     vars: Vec<Value>,
+    /// THE DECLARED TYPE OF EVERY SLOT, as the conversion a write into
+    /// it goes through - parallel to `vars`, `None` (or past the end)
+    /// for a slot with no declared type to honour (a trigger's, the
+    /// ROW_COUNT slot). The engine's assignment is MOV_move into the
+    /// target's descriptor, the very move a CAST makes, and a frame of
+    /// bare `Value`s had no descriptor to move into - measured: `R = 3`
+    /// into a NUMERIC(10,2) output answered 0.03 (the integer went out
+    /// as the raw of a scale-2 slot), `R = 2.5` into an INTEGER 25,
+    /// `R = 3000000000` into an INTEGER wrapped to -1294967296 where the
+    /// engine raises 22003, and a VARCHAR(3) local held 'abcdef' where
+    /// the engine raises 22001. See [coerce_to_slot].
+    types: Vec<Option<CastTarget>>,
     /// where the output parameters start in `vars` (inputs come first)
     out_at: usize,
     /// how many output parameters there are
@@ -96664,14 +96711,7 @@ fn exec_psql_stmt_inner(
                 },
             };
             match target {
-                TrigTarget::Var(n) => {
-                    let n = *n as usize;
-                    if n >= f.vars.len() {
-                        f.vars.resize(n + 1, Value::Null);
-                    }
-                    f.vars[n] = v;
-                    Ok(())
-                }
+                TrigTarget::Var(n) => store_slot(f, *n as usize, v),
                 // `NEW.<col> = <value>` in a BEFORE trigger changes
                 // what is stored. OLD is read-only, and NEW is
                 // read-only in an AFTER trigger (the row is written) -
@@ -96823,11 +96863,7 @@ fn exec_psql_stmt_inner(
                     return Err(PsqlStop::Unsupported);
                 }
                 for (slot, v) in into.iter().zip(row.into_iter()) {
-                    let n = *slot as usize;
-                    if n >= f.vars.len() {
-                        f.vars.resize(n + 1, Value::Null);
-                    }
-                    f.vars[n] = v;
+                    store_slot(f, *slot as usize, v)?;
                 }
                 match exec_psql_stmt(body, f, steps, db, ctx) {
                     Ok(()) => {}
@@ -96922,11 +96958,7 @@ fn exec_psql_stmt_inner(
                         return Err(PsqlStop::Unsupported);
                     }
                     for (slot, v) in into.iter().zip(r.into_iter()) {
-                        let n = *slot as usize;
-                        if n >= f.vars.len() {
-                            f.vars.resize(n + 1, Value::Null);
-                        }
-                        f.vars[n] = v;
+                        store_slot(f, *slot as usize, v)?;
                     }
                     1
                 }
@@ -96971,11 +97003,7 @@ fn exec_psql_stmt_inner(
             match out {
                 Ok((values, _rows)) => {
                     for (slot, v) in into.iter().zip(values.into_iter()) {
-                        let at = *slot as usize;
-                        if at >= f.vars.len() {
-                            f.vars.resize(at + 1, Value::Null);
-                        }
-                        f.vars[at] = v;
+                        store_slot(f, *slot as usize, v)?;
                     }
                     Ok(())
                 }
@@ -96994,11 +97022,7 @@ fn exec_psql_stmt_inner(
         TrigStmt::Return { expr, .. } => {
             // a FUNCTION's RETURN: output 0 takes the value, the body ends
             let v = eval_psql_expr(expr, f)?;
-            let n = f.out_at;
-            if n >= f.vars.len() {
-                f.vars.resize(n + 1, Value::Null);
-            }
-            f.vars[n] = v;
+            store_slot(f, f.out_at, v)?;
             Err(PsqlStop::Exit)
         }
         // a BEGIN..END block - which every body is, and which nests.
@@ -97129,21 +97153,12 @@ fn exec_psql_stmt_inner(
         // to run
         TrigStmt::ReturnText { text, .. } => {
             let v = render_dyn_text(text, f)?;
-            let n = f.out_at;
-            if n >= f.vars.len() {
-                f.vars.resize(n + 1, Value::Null);
-            }
-            f.vars[n] = v.map_or(Value::Null, Value::Text);
+            store_slot(f, f.out_at, v.map_or(Value::Null, Value::Text))?;
             Err(PsqlStop::Exit)
         }
         TrigStmt::AssignText { slot, text, .. } => {
             let v = render_dyn_text(text, f)?;
-            let n = *slot as usize;
-            if n >= f.vars.len() {
-                f.vars.resize(n + 1, Value::Null);
-            }
-            f.vars[n] = v.map_or(Value::Null, Value::Text);
-            Ok(())
+            store_slot(f, *slot as usize, v.map_or(Value::Null, Value::Text))
         }
         // IN AUTONOMOUS TRANSACTION: the block runs under a transaction
         // of its OWN, which commits when the block finishes and dies if
@@ -97491,12 +97506,98 @@ fn assign_into(f: &mut PsqlFrame, into: &[u16], row: Vec<Value>) -> Result<(), P
         return Err(psql_raise(EvalErr::OutputParamsMismatch));
     }
     for (slot, v) in into.iter().zip(row.into_iter()) {
-        let n = *slot as usize;
-        if n >= f.vars.len() {
-            f.vars.resize(n + 1, Value::Null);
-        }
-        f.vars[n] = v;
+        store_slot(f, *slot as usize, v)?;
     }
+    Ok(())
+}
+
+/// The conversion a write into a slot of this DECLARED type goes
+/// through - the CAST to that descriptor, because the engine's PSQL
+/// assignment is MOV_move into the target's descriptor, which is the
+/// move a CAST makes (measured, one CAST beside one assignment: 1.005
+/// into NUMERIC(10,2) is 1.01 both ways, 2.5 into INTEGER 3, 3000000000
+/// into INTEGER 22003, 'abcdef' into VARCHAR(3) 22001 expected 3 actual
+/// 6, 123456 into VARCHAR(5) the 22018 conversion error, 'ab' into
+/// CHAR(5) 'ab   ').
+///
+/// `None` for a type this server has not measured the move into - a
+/// BLOB, a WITH TIME ZONE value, a BOOLEAN - which keeps the untyped
+/// store it always had rather than guessing at a conversion. The text
+/// target is SYNTHETIC: a variable's text keeps the character set it
+/// arrived in (the row encoder transliterates at the edge), where a
+/// user CAST would move it into the attachment's.
+fn slot_cast_target(d: &Descriptor) -> Option<CastTarget> {
+    match d.dtype {
+        dtype::TEXT | dtype::VARYING => Some(CastTarget::Text {
+            len: fire_crab_ods::intl::char_length(d.dtype, d.length, d.sub_type),
+            pad: d.dtype == dtype::TEXT,
+            synthetic: true,
+            cs: None,
+        }),
+        dtype::SQL_DATE => Some(CastTarget::Temporal(TKind::Date)),
+        dtype::SQL_TIME => Some(CastTarget::Temporal(TKind::Time)),
+        dtype::TIMESTAMP => Some(CastTarget::Temporal(TKind::Timestamp)),
+        _ => dest_cast_target(d),
+    }
+}
+
+/// A slot's declared type, from the type text of a `DECLARE <name>
+/// <type>` - the same reader a CAST's target goes through, so NUMERIC,
+/// DECIMAL, the integer family, CHAR/VARCHAR and the temporal names all
+/// resolve as they do there. Anything else (a domain, `TYPE OF`, a
+/// BLOB, a CHARACTER SET clause the reader stops short of) is `None`:
+/// the untyped store, not a guess.
+fn declared_type_target(type_text: &str) -> Option<CastTarget> {
+    let chars: Vec<char> = type_text.chars().collect();
+    let mut pos = 0usize;
+    let t = parse_cast_target(&chars, &mut pos)?;
+    // what follows the type may only be the initialiser or NOT NULL;
+    // a CHARACTER SET / COLLATE clause is a type this reader did not
+    // take whole, so the slot stays untyped
+    let rest: String = chars[pos..].iter().collect::<String>().to_ascii_uppercase();
+    let rest = rest.trim_start();
+    if !(rest.is_empty()
+        || rest.starts_with('=')
+        || find_word(rest, "DEFAULT", 0) == Some(0)
+        || find_word(rest, "NOT", 0) == Some(0))
+    {
+        return None;
+    }
+    match t {
+        CastTarget::Int { .. }
+        | CastTarget::Numeric { .. }
+        | CastTarget::Approx
+        | CastTarget::Float
+        | CastTarget::DecFloat { .. }
+        | CastTarget::Temporal(TKind::Date | TKind::Time | TKind::Timestamp) => Some(t),
+        CastTarget::Text { len, pad, cs: None, .. } => {
+            Some(CastTarget::Text { len, pad, synthetic: true, cs: None })
+        }
+        _ => None,
+    }
+}
+
+/// Convert `v` into slot `n`'s declared type - see [slot_cast_target].
+/// A slot with no declared type takes the value as it is. The error is
+/// the CAST's own vector, raised with an empty trace so [exec_psql_stmt]
+/// stamps it with the ASSIGNMENT's position, which is where the engine
+/// reports it (`-At block line: 1, col: 44` for `R = 3000000000`).
+fn coerce_to_slot(f: &PsqlFrame, n: usize, v: Value) -> Result<Value, PsqlStop> {
+    let Some(Some(t)) = f.types.get(n) else { return Ok(v) };
+    if matches!(v, Value::Null) {
+        return Ok(v);
+    }
+    let e = Expr::Cast(Box::new(Expr::Col(0)), *t, fire_crab_ods::intl::CS_UTF8);
+    e.eval(&[v]).map_err(psql_raise)
+}
+
+/// Write `v` into slot `n` through its declared type ([coerce_to_slot]).
+fn store_slot(f: &mut PsqlFrame, n: usize, v: Value) -> Result<(), PsqlStop> {
+    let v = coerce_to_slot(f, n, v)?;
+    if n >= f.vars.len() {
+        f.vars.resize(n + 1, Value::Null);
+    }
+    f.vars[n] = v;
     Ok(())
 }
 
@@ -98172,7 +98273,28 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
         };
         bound.push(match (arg, col_kind(d)) {
             (Value::Null, _) => Value::Null,
-            (Value::Int(n), Some(ColKind::Int)) => Value::Int(*n),
+            // AN INTEGER THAT DOES NOT FIT THE PARAMETER'S WIDTH is the
+            // engine's LOCATIONLESS 22003 - the conversion happens at the
+            // call boundary, before the body has a line to name
+            // (measured: `SELECT * FROM Q5(70000)` into a SMALLINT
+            // parameter raises *numeric value is out of range* with no
+            // `At procedure` item, where this bound 70000 and answered it)
+            (Value::Int(n), Some(ColKind::Int)) => {
+                use fire_crab_ods::format::dtype as dt;
+                let fits = match d.dtype {
+                    dt::SHORT => i16::try_from(*n).is_ok(),
+                    dt::LONG => i32::try_from(*n).is_ok(),
+                    _ => true,
+                };
+                if !fits {
+                    return Err(ProcErr {
+                        rows: Vec::new(),
+                        text: format!("procedure {}: {} out of range for {}", name, n, param.name),
+                        status: Some(EvalErr::NumericOutOfRange),
+                    });
+                }
+                Value::Int(*n)
+            }
             (Value::Text(t), Some(ColKind::Text)) => {
                 if t.chars().count() > declared_chars {
                     return Err(ProcErr {
@@ -98789,7 +98911,7 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     if outs.len() != 1 {
         return None;
     }
-    Some(ProcMeta { ins, outs, source, body_at, prc_type: None })
+    Some(ProcMeta { ins, outs, source, body_at, prc_type: None, is_function: true })
 }
 
 /// Run a PSQL FUNCTION from its source: the one output is its answer.
@@ -99071,6 +99193,7 @@ fn fire_triggers(
         })?;
         let mut frame = PsqlFrame {
  stop_after: None,
+            types: Vec::new(),
             vars: vec![Value::Null; names.len()],
             out_at: names.len(),
             out_len: 0,
@@ -99104,6 +99227,7 @@ fn fire_triggers(
             };
             let mut scout = PsqlFrame {
  stop_after: None,
+            types: Vec::new(),
                 vars: vec![Value::Null; names.len()],
                 out_at: names.len(),
                 out_len: 0,
@@ -99239,6 +99363,7 @@ fn run_execute_block(
         source: source.to_string(),
         body_at: Some(body_at),
         prc_type: None,
+        is_function: false,
     };
     run_body_source(database, ANONYMOUS_BLOCK, &meta, &[], ctx, None).map(|_| ())
 }
@@ -99284,7 +99409,13 @@ fn run_body_source(
     // (a trigger declares them inside it), so they are collected here and
     // appended to the name list: the parser numbers variables by their
     // position in that list, and the frame is indexed the same way.
-    names.extend(declared_var_names(&meta.source[..begin_at]));
+    // ...and every slot's DECLARED TYPE, in the same order: what a write
+    // into it converts through ([coerce_to_slot])
+    let locals = declared_vars(&meta.source[..begin_at]);
+    let mut types: Vec<Option<CastTarget>> =
+        meta.ins.iter().chain(meta.outs.iter()).map(|p| slot_cast_target(&p.desc)).collect();
+    types.extend(locals.iter().map(|(_, t)| *t));
+    names.extend(locals.into_iter().map(|(n, _)| n));
     // THE CURSORS the header declares, and ROW_COUNT.
     //
     // ROW_COUNT is not a variable the body declares, but it reads
@@ -99321,6 +99452,7 @@ fn run_body_source(
 
     let mut frame = PsqlFrame {
  stop_after: None,
+            types,
         vars: Vec::new(),
         out_at: meta.ins.len(),
         out_len: meta.outs.len(),
@@ -99420,7 +99552,8 @@ fn run_body_source(
                         format!("At block line: {}, col: {}", line, col)
                     } else {
                         format!(
-                            "At procedure {} line: {}, col: {}",
+                            "At {} {} line: {}, col: {}",
+                            if meta.is_function { "function" } else { "procedure" },
                             quoted_qualified_pkg(name),
                             line,
                             col
@@ -99550,6 +99683,13 @@ fn declared_cursors(header: &str) -> Vec<(String, String)> {
 /// declares, in order. Anything that is not a DECLARE is skipped, so a
 /// comment or blank line between them is harmless.
 fn declared_var_names(header: &str) -> Vec<String> {
+    declared_vars(header).into_iter().map(|(n, _)| n).collect()
+}
+
+/// [declared_var_names] with each variable's DECLARED TYPE beside its
+/// name ([declared_type_target]), in the same order - what the frame's
+/// [PsqlFrame::types] is filled from for the local slots.
+fn declared_vars(header: &str) -> Vec<(String, Option<CastTarget>)> {
     let mut out = Vec::new();
     let up = header.to_ascii_uppercase();
     let mut at = 0usize;
@@ -99576,7 +99716,23 @@ fn declared_var_names(header: &str) -> Vec<String> {
             .unwrap_or(rest.len());
         let name = canonical_var_name(rest[..end].trim());
         if !name.is_empty() {
-            out.push(name);
+            // the type runs from the name to the declaration's top-level
+            // `;` (a type's own parentheses nest nothing of ours)
+            let tail = &rest[end..];
+            let mut depth = 0i32;
+            let mut stop = tail.len();
+            for (i, c) in tail.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    ';' if depth == 0 => {
+                        stop = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            out.push((name, declared_type_target(tail[..stop].trim())));
         }
         at = d + "DECLARE".len();
     }
@@ -106275,6 +106431,7 @@ fn after_auth(
                         source,
                         body_at: Some(body_at),
                         prc_type: None,
+                        is_function: false,
                     };
                     match run_body_source(&mut database, ANONYMOUS_BLOCK, &meta, &[], &ctx, None) {
                         Ok((_, suspended)) => {
@@ -121986,6 +122143,7 @@ mod tests {
         let render = |parts: &[DynPart], k: Value, s: Value| {
             let f = PsqlFrame {
  stop_after: None,
+            types: Vec::new(),
                 vars: vec![k, s],
                 out_at: 0,
                 out_len: 0,

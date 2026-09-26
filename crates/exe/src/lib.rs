@@ -163,6 +163,10 @@ pub struct MsgSlot {
     pub length: u16,
     #[allow(dead_code)]
     pub scale: i8,
+    /// a text slot's ttype (the charset-carrying twins' u16; 0 = NONE
+    /// for the plain forms) - what turns `length`, a BYTE count, into
+    /// the character count an assignment is measured against
+    pub ttype: u16,
 }
 
 /// A value expression the looper can evaluate - the slice-1 subset of
@@ -513,21 +517,18 @@ impl<'a> P<'a> {
                 dtype,
                 length: 0,
                 scale: self.u8()? as i8,
+                ttype: 0,
             },
             blr::DT_TEXT | blr::DT_VARYING => MsgSlot {
                 dtype,
                 length: self.u16()?,
                 scale: 0,
+                ttype: 0,
             },
-            // the charset-carrying twins: u16 charset, then length
+            // the charset-carrying twins: u16 ttype, then the length
             blr::DT_TEXT2 | blr::DT_VARYING2 => {
-                let _charset = self.u16()?;
-                MsgSlot { dtype, length: self.u16()?, scale: 0 }
-            }
-            // the charset-carrying twins: u16 charset, then the length
-            blr::DT_TEXT2 | blr::DT_VARYING2 => {
-                let _charset = self.u16()?;
-                MsgSlot { dtype, length: self.u16()?, scale: 0 }
+                let ttype = self.u16()?;
+                MsgSlot { dtype, length: self.u16()?, scale: 0, ttype }
             }
             other => return Err(format!("message dtype {} unconverted", other)),
         })
@@ -1406,6 +1407,47 @@ fn coerce_arg(v: Value, slot: &MsgSlot) -> Result<Value, String> {
     Ok(v)
 }
 
+/// An assignment into a TEXT variable or output: the engine's MOV_move
+/// into the slot's descriptor. A text value that fits is kept - blanks
+/// past the width dropped, a CHAR padded to it (measured: `X = 'ab'`
+/// into a CHAR(5) local makes `X || '|'` 'ab   |', where this answered
+/// 'ab|'). Everything else - a non-blank overflow (the engine's 22001,
+/// whose vector names both lengths), a non-text value (a number
+/// rendered into text is the 22018 conversion error when it does not
+/// fit) - is NOT this executor's to convert: it refuses, and the source
+/// interpreter, which casts into the declared type and knows the
+/// statement's position, answers it.
+fn coerce_text(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
+    let Some(slot) = slot else { return Ok(v) };
+    let (pad, bytes) = match slot.dtype {
+        blr::DT_TEXT | blr::DT_TEXT2 => (true, slot.length as usize),
+        blr::DT_VARYING | blr::DT_VARYING2 => (false, slot.length as usize),
+        _ => return Ok(v),
+    };
+    let t = match v {
+        Value::Null => return Ok(v),
+        Value::Text(t) => t,
+        _ => return Err("text assignment outside this executor".into()),
+    };
+    let bpc = fire_crab_ods::intl::bytes_per_char(fire_crab_ods::intl::charset_id(slot.ttype as i16))
+        .max(1) as usize;
+    let width = bytes / bpc;
+    let chars: Vec<char> = t.chars().collect();
+    let mut out: String = if chars.len() > width {
+        if chars[width..].iter().any(|&c| c != ' ') {
+            return Err("text assignment outside this executor".into());
+        }
+        chars[..width].iter().collect()
+    } else {
+        t
+    };
+    if pad {
+        let n = out.chars().count();
+        out.extend(std::iter::repeat_n(' ', width.saturating_sub(n)));
+    }
+    Ok(Value::Text(out))
+}
+
 fn coerce_num(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
     let (raw, from) = match num_parts(&v) {
         Some(p) => p,
@@ -1763,6 +1805,7 @@ impl<'a> Exec<'a> {
                         .cloned(),
                 };
                 let v = coerce_num(v, tslot.as_ref())?;
+                let v = coerce_text(v, tslot.as_ref())?;
                 match to {
                     Target::Variable(n) => {
                         let slot = self
