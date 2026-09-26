@@ -177,7 +177,7 @@ eng_only() {
     if [ "$ev" = CONN_ERR ] || [ "$fv" = CONN_ERR ]; then
         echo "FAIL $1 [CONN_ERR - the cell never ran]"; fail=1
     elif [ "$ev" = ERR ]; then echo "FAIL $1 - the ENGINE no longer answers; the boundary moved"; fail=1
-    elif [ "$fv" != ERR ]; then echo "FAIL $1 - THIS SERVER ANSWERS [$fv] where it must refuse"; fail=1
+    elif [ "$fv" != ERR ]; then echo "FAIL $1 - THIS SERVER ANSWERS [$fv] where it must refuse (engine [$ev])"; fail=1
     else echo "OK   $1 (engine [$ev], this server refuses - recorded)"; fi
 }
 
@@ -312,7 +312,7 @@ eng_only "6 B LIKE ? ['F_LSE']"         "SELECT ID FROM T WHERE B LIKE ? ORDER B
 echo "--- 7. RECORDED BOUNDARIES (the engine answers or raises, this server refuses)"
 eng_only    "7 (B OR FALSE) LIKE 'T%'   - a boolean-valued PREDICATE as the operand" "SELECT ID FROM T WHERE (B OR FALSE) LIKE 'T%' ORDER BY ID"
 eng_only    "7 (ID = 1) LIKE 'T%'"                                                  "SELECT ID FROM T WHERE (ID = 1) LIKE 'T%' ORDER BY ID"
-eng_only    "7 HASH(B)"                                                             "SELECT ID, HASH(B) FROM T ORDER BY ID"
+both_is     "7 HASH(B) - answered since the charset-aware HASH of 2026-09-26: the hash of the TRUE / FALSE text" "SELECT ID, HASH(B) FROM T ORDER BY ID" "1,366485;2,4874613;3,NULL;4,366485"
 both_is     "7 CONTROL CAST(B AS CHAR(5)) - padded, as the engine pads" "SELECT ID, CAST(B AS CHAR(5)) || '|' FROM T ORDER BY ID" "1,TRUE |;2,FALSE|;3,NULL;4,TRUE |"
 both_is     "7 CONTROL CHAR_LENGTH(CAST(B AS CHAR(6)))" "SELECT ID, CHAR_LENGTH(CAST(B AS CHAR(6))) FROM T ORDER BY ID" "1,6;2,6;3,NULL;4,6"
 eng_only    "7 OVERLAY(B PLACING 'xx' FROM 2) - OVERLAY is not converted"           "SELECT ID, OVERLAY(B PLACING 'xx' FROM 2) FROM T ORDER BY ID"

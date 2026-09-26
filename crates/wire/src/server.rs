@@ -24618,6 +24618,14 @@ fn introduced_literal_at(sql: &str, i: usize, enc: Option<u8>) -> Option<(String
         j += 1;
     }
     let cs = charset_name_id(&sql[i + 1..j])?;
+    // a BINARY introducer is left as written: it names no text set to
+    // move the octets into, and the blob writer reads `_octets '...'`
+    // itself as a sub_type 0 literal (serve-real-blobfilter: `INSERT
+    // ... VALUES (5, _octets 'abc')` landed as a text blob once this
+    // respelled it as a CAST)
+    if fire_crab_ods::intl::byte_carrier(cs) && cs != fire_crab_ods::intl::CS_NONE {
+        return None;
+    }
     let mut k = j;
     while k < b.len() && b[k].is_ascii_whitespace() {
         k += 1;
@@ -66099,6 +66107,14 @@ fn distinct_fold_key_cmp(a: &Value, b: &Value, tt: u16) -> std::cmp::Ordering {
         Some(o) => o,
         None => match (a, b) {
             (Value::Text(x), Value::Text(y)) if utf8_plain_ttype(tt) => x.as_bytes().cmp(y.as_bytes()),
+            // a DOUBLE's key is its sort key - IEEE totalOrder with the
+            // sign bit, so two +NaN rows are ONE value and a -NaN another
+            // (serve-real-nanrow: COUNT(*) over DISTINCT D is 7 for the
+            // engine's 8 rows with two +NaN); a numeric compare has no
+            // answer for a NaN and fell to a value compare that merged it
+            (Value::Double(x), Value::Double(y)) if x.is_nan() || y.is_nan() => {
+                f64_total_key(*x).cmp(&f64_total_key(*y))
+            }
             _ => num_cmp(a, b).unwrap_or_else(|| value_cmp(a, b)),
         },
     }
@@ -66110,6 +66126,14 @@ fn distinct_fold_cmp(a: &Value, b: &Value, tt: u16) -> std::cmp::Ordering {
         (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
         _ => std::cmp::Ordering::Equal,
     })
+}
+
+/// The IEEE-754 totalOrder key of a double as an unsigned word: a
+/// negative's bits inverted, a positive's sign bit set - so -NaN < -Inf
+/// < ... < +Inf < +NaN, with equal bits one key.
+fn f64_total_key(f: f64) -> u64 {
+    let b = f.to_bits();
+    if b >> 63 == 1 { !b } else { b | (1u64 << 63) }
 }
 
 /// A UTF8 ttype under the character set's own (byte-ordering) collation.
