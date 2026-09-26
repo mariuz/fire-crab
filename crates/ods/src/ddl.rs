@@ -5467,6 +5467,14 @@ pub fn alter_view(
     // does not block it (measured: ALTER VIEW VD under VDEP passes where
     // DROP VIEW VD is refused)
     drop_view_rows(file, page_size, &want, false)?;
+    // ...but NOT its CHECK OPTION: the CHECK_n system triggers
+    // (RDB$SYSTEM_FLAG 5) belong to the old definition and go with it,
+    // with their type-2 rows. Measured on 2182: after `ALTER VIEW VC AS
+    // SELECT ID, N FROM T2` over `... FROM T1 WHERE ID > 0 WITH CHECK
+    // OPTION` VC has no trigger and no CHECK_n row is left, so DROP TABLE
+    // T1 passes; kept here, CHECK_1 -> T1 refused it. A user trigger
+    // stays ([drop_view_rows])
+    delete_relation_triggers_where(file, page_size, &want, Some(5))?;
     create_view_impl(file, page_size, name, view_blr, view_source, fields, contexts, Some(old_id))
 }
 
@@ -7426,7 +7434,7 @@ fn relation_dependents(file: &crate::Image, page_size: usize, name: &str, is_vie
         return Some(("TABLE", view_rows));
     }
     // 2. the recorded dependents of the relation's own kind
-    let own_triggers = triggers_of_relation(file, page_size, name);
+    let own_triggers = triggers_of_relation(file, page_size, name, None);
     let own_domains = relation_field_sources(file, page_size, name);
     let drel = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES")?;
     let dfmts = system_relation_formats(file, page_size, "RDB$DEPENDENCIES")?;
@@ -7485,7 +7493,7 @@ fn relation_field_sources(file: &crate::Image, page_size: usize, name: &str) -> 
 }
 
 /// The names of a relation's own triggers (its RDB$TRIGGERS rows).
-fn triggers_of_relation(file: &crate::Image, page_size: usize, name: &str) -> Vec<String> {
+fn triggers_of_relation(file: &crate::Image, page_size: usize, name: &str, system_flag: Option<i64>) -> Vec<String> {
     let mut out = Vec::new();
     let (Some(rel), Some(fmts)) = (
         crate::resolve_relation(file, page_size, "RDB$TRIGGERS"),
@@ -7495,8 +7503,10 @@ fn triggers_of_relation(file: &crate::Image, page_size: usize, name: &str) -> Ve
     let cols = relation_columns(file, page_size, "RDB$TRIGGERS");
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (Some(tn_f), Some(rn_f)) = (fid("RDB$TRIGGER_NAME"), fid("RDB$RELATION_NAME")) else { return out };
+    let sf_f = fid("RDB$SYSTEM_FLAG");
     walk_rows(file, page_size, rel, descs, |v| {
-        if text_is(v.get(rn_f), name) {
+        let flag_ok = system_flag.map_or(true, |f| sf_f.is_some_and(|i| int_eq(v.get(i), f)));
+        if text_is(v.get(rn_f), name) && flag_ok {
             if let Some(Value::Text(t)) = v.get(tn_f) {
                 out.push(t.trim_end().to_string());
             }
@@ -7532,11 +7542,12 @@ fn plain_procedure_exists(file: &crate::Image, page_size: usize, name: &str) -> 
 /// The distinct (dependent name, dependent type) pairs RDB$DEPENDENCIES
 /// records against an object of the given depended-on type - the
 /// engine's `check_dependencies` count for a DROP of an exception (7) or
-/// a sequence (14). Measured on 2182: a procedure raising EX1 makes
-/// `DROP EXCEPTION EX1` and `RECREATE EXCEPTION EX1` "cannot delete /
-/// EXCEPTION "PUBLIC"."EX1" / there are 1 dependencies", a trigger
-/// drawing NEXT VALUE FOR SQ1 the same with GENERATOR, and nothing is
-/// written (the trigger keeps drawing from the old SQ1).
+/// a sequence (14), taken at COMMIT ([refused_drop]). Measured on 2182: a
+/// procedure raising EX1 makes `DROP EXCEPTION EX1` and `RECREATE
+/// EXCEPTION EX1` "cannot delete / EXCEPTION "PUBLIC"."EX1" / there are
+/// 1 dependencies", a trigger drawing NEXT VALUE FOR SQ1 the same with
+/// GENERATOR, and nothing is written (the trigger keeps drawing from the
+/// old SQ1).
 fn object_dependents(file: &crate::Image, page_size: usize, name: &str, on_type: i64) -> usize {
     let (Some(rel), Some(fmts)) = (
         crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES"),
@@ -7565,6 +7576,24 @@ fn object_dependents(file: &crate::Image, page_size: usize, name: &str, on_type:
     seen.len()
 }
 
+/// The first pending [crate::DdlDeferred::CheckDependents] something
+/// still uses, as (name, depended-on type, dependents) - the refusal a
+/// COMMIT answers before it writes anything. Counted on the image the
+/// transaction sees, so a user it dropped itself no longer counts.
+pub fn refused_drop<'a>(
+    file: &crate::Image,
+    page_size: usize,
+    deferred: impl IntoIterator<Item = &'a crate::DdlDeferred>,
+) -> Option<(String, i64, usize)> {
+    deferred.into_iter().find_map(|d| match d {
+        crate::DdlDeferred::CheckDependents { name, on_type } => {
+            let n = object_dependents(file, page_size, name, *on_type);
+            (n > 0).then(|| (name.clone(), *on_type, n))
+        }
+        _ => None,
+    })
+}
+
 /// A dropped relation's OWN triggers go with it - their RDB$TRIGGERS rows
 /// and the type-2 RDB$DEPENDENCIES rows they recorded (dfw.epp
 /// `delete_relation` phase 2 erases every trigger whose RDB$RELATION_NAME
@@ -7576,14 +7605,29 @@ fn object_dependents(file: &crate::Image, page_size: usize, name: &str, on_type:
 /// against the table it read and re-attached BY NAME to a relation
 /// re-created under the same name.
 fn delete_relation_triggers(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
-    let triggers = triggers_of_relation(file, page_size, name);
+    delete_relation_triggers_where(file, page_size, name, None)
+}
+
+/// [delete_relation_triggers], narrowed to the triggers of one
+/// RDB$SYSTEM_FLAG when `system_flag` is given.
+fn delete_relation_triggers_where(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    system_flag: Option<i64>,
+) -> Result<(), String> {
+    let triggers = triggers_of_relation(file, page_size, name, system_flag);
     if triggers.is_empty() {
         return Ok(());
     }
     {
+        let tn_f = sys_fid(file, page_size, "RDB$TRIGGERS", "RDB$TRIGGER_NAME")?;
         let rn_f = sys_fid(file, page_size, "RDB$TRIGGERS", "RDB$RELATION_NAME")?;
         let n = name.to_string();
-        delete_catalog_rows(file, page_size, "RDB$TRIGGERS", move |v| text_is(v.get(rn_f), &n))?;
+        let t = triggers.clone();
+        delete_catalog_rows(file, page_size, "RDB$TRIGGERS", move |v| {
+            text_is(v.get(rn_f), &n) && t.iter().any(|x| text_is(v.get(tn_f), x))
+        })?;
     }
     if crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES").is_some() {
         let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
@@ -10384,8 +10428,22 @@ fn patch_sys_row(
         // COMMENT ON and 92 DROP INDEX statements on an ordinary restored
         // database - see [dml::patch_head_in_place] for why the head is
         // enough and what happens when it is not.
-        let img = crate::data::assembled_image(file, page_size, &r).ok_or("no row image")?;
-        (img, r.format, frag)
+        // A DEAD DELETE STUB at the head (a rolled-back DROP) carries no
+        // data: the row is the version behind it, which is what the
+        // patch starts from ([dml::update_records] links the new head
+        // past the stub). Read off the stub, the image was empty and the
+        // patch "image shorter than its format" - `ALTER EXCEPTION E1`
+        // after a rolled-back `DROP EXCEPTION E1` refused where 2182
+        // alters (measured)
+        if r.flags & crate::data::flags::DELETED != 0 {
+            let tips = crate::tra::TipChain::read(file, page_size).ok_or("no TIP")?;
+            let v = crate::tra::visible_version(file, page_size, &r, &tips, &crate::tra::OwnTx::catalog())
+                .ok_or("no row image")?;
+            (v.image, v.format, false)
+        } else {
+            let img = crate::data::assembled_image(file, page_size, &r).ok_or("no row image")?;
+            (img, r.format, frag)
+        }
     };
     let descs = formats
         .iter()
@@ -12600,10 +12658,8 @@ pub fn drop_sequence(file: &mut crate::Image, page_size: usize, name: &str) -> R
     if system != 0 {
         return Err(format!("Cannot delete system generator {}", want));
     }
-    let n = object_dependents(file, page_size, &want, 14);
-    if n > 0 {
-        return Err(format!("cannot delete GENERATOR {} - there are {} dependencies", want, n));
-    }
+    // whether anything uses it is asked at COMMIT ([crate::DdlDeferred::CheckDependents])
+    file.ddl_deferred.push(crate::DdlDeferred::CheckDependents { name: want.clone(), on_type: 14 });
     let name_f = sys_fid(file, page_size, "RDB$GENERATORS", "RDB$GENERATOR_NAME")?;
     {
         let want = want.clone();
@@ -13291,6 +13347,20 @@ pub fn alter_domain_check(
                     ("RDB$VALIDATION_SOURCE", SysVal::Null),
                 ],
             )?;
+            // ...and the rows the dropped CHECK recorded (type 4), as
+            // DROP DOMAIN takes them. Measured on 2182: after `ALTER
+            // DOMAIN D1 DROP CONSTRAINT` over `CHECK (VALUE IN (SELECT ID
+            // FROM T1))` no D1 row is left and DROP TABLE T1 passes; left
+            // behind here they refused it "TABLE T1 / there are 1
+            // dependencies"
+            if crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES").is_some() {
+                let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+                let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+                let dn = want.clone();
+                delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+                    text_eq(v.get(dn_f), &dn) && int_eq(v.get(dt_f), 4)
+                })?;
+            }
         }
     }
     // the tables whose columns use the domain, for the summary rebuild
@@ -14717,10 +14787,8 @@ pub fn drop_exception(file: &mut crate::Image, page_size: usize, name: &str) -> 
     if system != 0 {
         return Err(format!("Cannot delete system exception {}", want));
     }
-    let n = object_dependents(file, page_size, &want, 7);
-    if n > 0 {
-        return Err(format!("cannot delete EXCEPTION {} - there are {} dependencies", want, n));
-    }
+    // whether anything uses it is asked at COMMIT ([crate::DdlDeferred::CheckDependents])
+    file.ddl_deferred.push(crate::DdlDeferred::CheckDependents { name: want.clone(), on_type: 7 });
     let name_f = sys_fid(file, page_size, "RDB$EXCEPTIONS", "RDB$EXCEPTION_NAME")?;
     {
         let want = want.clone();

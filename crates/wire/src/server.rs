@@ -1911,6 +1911,45 @@ fn alter_table_target(plan: &Plan) -> Option<&str> {
     }
 }
 
+/// A COMMIT refused because a dropped exception (7) or sequence (14) is
+/// still used ([fire_crab_ods::ddl::refused_drop]): "unsuccessful
+/// metadata update / cannot delete / EXCEPTION @1 | GENERATOR @1 / there
+/// are N dependencies" (42000, measured on 2182 - the commit's answer
+/// under AUTODDL OFF, and under isql's AUTODDL the DDL statement's).
+fn respond_drop_refused(
+    s: &mut TcpStream,
+    enc: &mut Option<Rc4>,
+    name: &str,
+    on_type: i64,
+    n: usize,
+) -> std::io::Result<()> {
+    let kind = if on_type == 7 { 335544610 } else { 335544815 }; // isc_exception_name / isc_generator_name
+    let qn = format!("\"PUBLIC\".\"{}\"", name.trim_end());
+    let mut w = W::default();
+    w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+    w.int(1).int(GDS_NO_META_UPDATE)
+        .int(1).int(335544673) // isc_no_delete - "cannot delete"
+        .int(1).int(kind).int(2).bytes(qn.as_bytes())
+        .int(1).int(335544630).int(4).int(n as i32) // isc_dependency
+        .int(0);
+    w.send(s, enc)
+}
+
+/// The refusal a COMMIT owes before it writes anything: a pending
+/// [fire_crab_ods::DdlDeferred::CheckDependents] whose object something
+/// still uses, counted on the image this transaction sees. The
+/// transaction stays ACTIVE when it answers (measured on 2182: the
+/// dropped exception is still invisible to it afterwards, a DROP of its
+/// user and a second COMMIT pass, a ROLLBACK brings it back).
+fn commit_refusal(database: &Option<Database>) -> Option<(String, i64, usize)> {
+    let db = database.as_ref()?;
+    let pending = db.ddl_deferred.iter().chain(db.windows.iter().flat_map(|w| w.deferred.iter()));
+    if !pending.clone().any(|d| matches!(d, fire_crab_ods::DdlDeferred::CheckDependents { .. })) {
+        return None;
+    }
+    fire_crab_ods::ddl::refused_drop(&db.bytes(), db.page_size, pending)
+}
+
 fn ddl_dup_codes(plan: &Plan) -> Option<(i32, i32, String)> {
     // RELATIONS carry a CANONICAL name by now ([canon_ident] at the
     // planner): print it as stored, or `CREATE TABLE "tq"` beside TQ
@@ -2390,35 +2429,6 @@ fn respond_ddl_meta(
         // (measured). The writer spells the kind the engine names - TABLE
         // whenever a VIEW is among the dependents, else the relation's
         // own kind (dfw.epp delete_relation) - and carries N.
-        // DROP / RECREATE of an EXCEPTION or a SEQUENCE something uses
-        // (measured): "cannot delete / EXCEPTION @1 | GENERATOR @1 /
-        // there are N dependencies"
-        let other: Option<(&str, i32)> = match plan {
-            Plan::DropException { name } => Some((name, 335544610)), // isc_exception_name
-            Plan::DropSequence { name } => Some((name, 335544815)), // isc_generator_name
-            Plan::Recreate(inner) => match inner.as_ref() {
-                Plan::CreateException { name, .. } => Some((name, 335544610)),
-                Plan::CreateSequence { name, .. } => Some((name, 335544815)),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some((name, kind)) = other {
-            let n: i32 = err_text
-                .split_whitespace()
-                .find_map(|w| w.parse::<i32>().ok())
-                .unwrap_or(1);
-            let qn = q(name);
-            let mut w = W::default();
-            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
-            w.int(1).int(GDS_NO_META_UPDATE)
-                .int(1).int(335544673) // isc_no_delete - "cannot delete"
-                .int(1).int(kind).int(2).bytes(qn.as_bytes())
-                .int(1).int(335544630).int(4).int(n) // isc_dependency
-                .int(0);
-            w.send(s, enc)?;
-            return Ok(true);
-        }
         let dropped: Option<&str> = match plan {
             Plan::DropTable { name } | Plan::DropView { name } => Some(name),
             Plan::Recreate(inner) => match inner.as_ref() {
@@ -2659,10 +2669,16 @@ fn respond_ddl_meta(
         return Ok(true);
     }
     // (verb-failed code, qualified name, reason code, reason-carries-name)
-    let parts: Option<(i32, String, i32, bool)> = if lc.starts_with("procedure ") && lc.ends_with(" already exists") {
+    let relation_verb = verb_of(plan);
+    let parts: Option<(i32, String, i32, bool)> = if let (true, Some((f, qn))) =
+        (lc.starts_with("procedure ") && lc.ends_with(" already exists"), relation_verb)
+    {
         // a relation named like a plain procedure: the relation verb and
-        // isc "Procedure @1 already exists" (measured, 42000)
-        verb_of(plan).map(|(f, qn)| (f, qn, 336068743, true))
+        // isc "Procedure @1 already exists" (measured, 42000). A RELATION
+        // verb only: a duplicate CREATE PROCEDURE says the same words and
+        // takes the uniform duplicate arm below (review-caught: it lost
+        // its "CREATE PROCEDURE @1 failed" line to a bare Dynamic SQL Error)
+        Some((f, qn, 336068743, true))
     } else if let (true, Plan::CreateProcedure { name, .. }) = (lc.starts_with("table ") && lc.ends_with(" already exists"), plan) {
         // ...and the mirror: a procedure named like a relation
         Some((336397265, q(name), 336068740, true))
@@ -117928,6 +117944,14 @@ fn after_auth(
                         } else {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
+                    } else if let Some((name, on_type, n)) = match &*plan {
+                        Plan::TxControl { rollback: false, .. } => commit_refusal(&database),
+                        _ => None,
+                    } {
+                        // a COMMIT the deferred dependency check refuses:
+                        // nothing is written and the transaction goes on
+                        last_dml = (0, 0, 0);
+                        respond_drop_refused(&mut s, &mut enc, &name, on_type, n)?;
                     } else if let Plan::TxControl { rollback, retain } = &*plan {
                         // ending the transaction discards every mark
                         if let Some(d) = database.as_mut() { d.savepoints.clear(); }
@@ -119931,6 +119955,16 @@ fn after_auth(
                         // a ROLLBACK cannot be refused - everything the
                         // body did goes back with the transaction anyway
                         Err(_) => {}
+                    }
+                }
+                // ...and so does the deferred work's dependency check
+                // (tra.cpp: the commit triggers, then DFW_perform_work):
+                // a dropped exception or sequence still in use refuses
+                // the commit and the transaction stays open
+                if !rollback {
+                    if let Some((name, on_type, n)) = commit_refusal(&database) {
+                        respond_drop_refused(&mut s, &mut enc, &name, on_type, n)?;
+                        continue;
                     }
                 }
                 if let Some(d) = database.as_mut() { d.prepared = false; }

@@ -1077,6 +1077,8 @@ pub fn apply_ddl_deferred(
             crate::DdlDeferred::PurgeRowChain { rel: _, page, slot } => {
                 crate::gc::purge_row_chain(file, page_size, page, slot);
             }
+            // asked before the commit got here ([crate::ddl::refused_drop])
+            crate::DdlDeferred::CheckDependents { .. } => {}
         }
     }
     Ok(())

@@ -75,6 +75,18 @@
 #     exception or a sequence a procedure or trigger uses is "cannot
 #     delete / EXCEPTION|GENERATOR @1 / there are N dependencies".
 #
+#   * THE FOURTH ROUND (section 18, red on the third round's 75adf26):
+#     whether a dropped exception or sequence is still used is the
+#     COMMIT's question (dfw.epp check_dependencies) - under AUTODDL OFF
+#     the DROP passes, the COMMIT refuses and the transaction goes on, and
+#     dropping the user before that COMMIT lets both go (the third round
+#     refused at EXECUTE, and the object survived); a duplicate CREATE
+#     PROCEDURE keeps its "CREATE PROCEDURE @1 failed" words (the new
+#     namespace arm swallowed them); ALTER EXCEPTION after a rolled-back
+#     DROP EXCEPTION alters (the patch read the dead stub); ALTER DOMAIN
+#     DROP CONSTRAINT takes the CHECK's rows, ALTER VIEW the old body's
+#     CHECK OPTION triggers and theirs, so the table either read drops.
+#
 # CONTROLS from neighbouring fixes, green before this slice: ALTER TABLE
 # DROP of a column a view reads, ALTER TABLE ADD ... IDENTITY over rows.
 #
@@ -95,7 +107,12 @@
 # does not plan; a refused RECREATE inside the user transaction (AUTODDL
 # OFF) leaves the engine bugchecking on the next read or write of the table
 # in that transaction (XX000 dpm.cpp "pointer page vanished" / "missing
-# pointer page", measured) where this server answers the row - not a cell.
+# pointer page", measured) where this server answers the row - not a cell;
+# ALTER DOMAIN ADD CHECK (and a CREATE DOMAIN here) records no type-4
+# RDB$DEPENDENCIES row, so a table only such a CHECK reads drops here where
+# the engine refuses; under AUTODDL OFF `DROP TABLE PR` then `CREATE
+# PROCEDURE PR` in one transaction refuses generically here (the dropped
+# relation still holds the name until COMMIT).
 #
 # Usage: qa/serve-real-dmlcheck.sh [port]   (default 5710)
 set -u
@@ -144,6 +161,12 @@ CREATE TABLE DT1 (ID INTEGER PRIMARY KEY);
 CREATE EXCEPTION EXQ 'boo';
 CREATE SEQUENCE SQQ;
 CREATE TABLE SQT (ID INTEGER);
+CREATE TABLE DT2 (ID INTEGER);
+CREATE EXCEPTION EXR 'r';
+CREATE EXCEPTION EXU 'u';
+CREATE SEQUENCE SQR;
+CREATE TABLE GT7A (ID INTEGER, N INTEGER);
+CREATE TABLE GT7B (ID INTEGER, N INTEGER);
 COMMIT;
 CREATE VIEW VKA AS SELECT ID FROM KA;
 CREATE TABLE KC (ID INTEGER, CNT COMPUTED BY ((SELECT COUNT(*) FROM VKA)));
@@ -184,6 +207,8 @@ CREATE VIEW VPKC AS SELECT ID FROM PKC;
 CREATE TABLE CA (ID INTEGER PRIMARY KEY);
 CREATE TABLE CB (ID INTEGER, CNT COMPUTED BY ((SELECT COUNT(*) FROM CA)));
 CREATE TABLE CC (ID INTEGER, CHECK (ID IN (SELECT ID FROM CA)));
+CREATE DOMAIN DD2 INTEGER CHECK (VALUE IN (SELECT ID FROM DT2));
+CREATE VIEW GV7 AS SELECT ID, N FROM GT7A WHERE ID > 0 WITH CHECK OPTION;
 COMMIT;
 SET TERM ^;
 CREATE PROCEDURE PR RETURNS (S INTEGER) AS BEGIN SELECT SUM(ID) FROM VP INTO :S; SUSPEND; END^
@@ -204,6 +229,8 @@ CREATE TRIGGER GV5_BI FOR GV5 BEFORE INSERT AS BEGIN INSERT INTO GT5 (ID, N) VAL
 CREATE PROCEDURE PRQ RETURNS (X INTEGER) AS BEGIN X = 1; SUSPEND; END^
 CREATE PROCEDURE PEXQ AS BEGIN EXCEPTION EXQ; END^
 CREATE TRIGGER SQT_BI FOR SQT BEFORE INSERT AS BEGIN NEW.ID = NEXT VALUE FOR SQQ; END^
+CREATE PROCEDURE PEXR AS BEGIN EXCEPTION EXR; END^
+CREATE PROCEDURE PSQR AS DECLARE X INTEGER; BEGIN X = NEXT VALUE FOR SQR; END^
 SET TERM ;^
 COMMIT;
 SQL
@@ -584,6 +611,18 @@ pin "17 DROP EXCEPTION of a used exception" "DROP EXCEPTION EXQ;" "Statement fai
 pin "17 DROP SEQUENCE of a used sequence" "DROP SEQUENCE SQQ;" "Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-cannot delete|-GENERATOR \"PUBLIC\".\"SQQ\"|-there are 1 dependencies"
 pin "17 their users gone, both drop" "DROP PROCEDURE PEXQ; DROP TRIGGER SQT_BI; COMMIT; DROP EXCEPTION EXQ; DROP SEQUENCE SQQ; COMMIT; SELECT COUNT(*) FROM RDB\$EXCEPTIONS WHERE RDB\$EXCEPTION_NAME = 'EXQ'; SELECT COUNT(*) FROM RDB\$GENERATORS WHERE RDB\$GENERATOR_NAME = 'SQQ';" "COUNT|0|COUNT|0"
 
+echo "--- 18. A USED EXCEPTION OR SEQUENCE IS THE COMMIT'S QUESTION; WHAT AN ALTER DROPS GOES"
+EXQ1='SELECT COUNT(*) FROM RDB$EXCEPTIONS WHERE RDB$EXCEPTION_NAME = '
+pin "18 a duplicate CREATE PROCEDURE keeps its own words" "SET TERM ^; CREATE PROCEDURE PRQ RETURNS (X INTEGER) AS BEGIN X = 2; SUSPEND; END^ SET TERM ;^" "$META|-CREATE PROCEDURE \"PUBLIC\".\"PRQ\" failed|-Procedure \"PUBLIC\".\"PRQ\" already exists"
+pin "18 ...and twice in one transaction" "SET AUTODDL OFF; SET TERM ^; CREATE PROCEDURE P8 (A INTEGER) AS DECLARE Z INTEGER; BEGIN Z = A; END^ CREATE PROCEDURE P8 (A INTEGER) AS DECLARE Z INTEGER; BEGIN Z = A; END^ SET TERM ;^ ROLLBACK;" "$META|-CREATE PROCEDURE \"PUBLIC\".\"P8\" failed|-Procedure \"PUBLIC\".\"P8\" already exists"
+pin "18 AUTODDL OFF: the DROP passes, the COMMIT refuses and the transaction goes on" "SET AUTODDL OFF; DROP EXCEPTION EXR; COMMIT; $EXQ1'EXR'; ROLLBACK; $EXQ1'EXR';" "$META|-cannot delete|-EXCEPTION \"PUBLIC\".\"EXR\"|-there are 1 dependencies|COUNT|0|COUNT|1"
+pin "18 AUTODDL OFF: the object first, its user second, one COMMIT - both go" "SET AUTODDL OFF; DROP EXCEPTION EXR; DROP PROCEDURE PEXR; COMMIT; DROP SEQUENCE SQR; DROP PROCEDURE PSQR; COMMIT; $EXQ1'EXR'; SELECT COUNT(*) FROM RDB\$GENERATORS WHERE RDB\$GENERATOR_NAME = 'SQR';" "COUNT|0|COUNT|0"
+pin "18 ALTER EXCEPTION after a rolled-back DROP EXCEPTION" "SET AUTODDL OFF; DROP EXCEPTION EXU; ROLLBACK; ALTER EXCEPTION EXU 'changed'; COMMIT; SELECT RDB\$MESSAGE FROM RDB\$EXCEPTIONS WHERE RDB\$EXCEPTION_NAME = 'EXU';" "RDB\$MESSAGE|changed"
+pin "18 control: a domain's CHECK reading DT2 holds it" "DROP TABLE DT2;" "$META|-cannot delete|-TABLE \"PUBLIC\".\"DT2\"|-there are 1 dependencies"
+pin "18 ALTER DOMAIN DROP CONSTRAINT takes the CHECK's rows, so DT2 drops" "ALTER DOMAIN DD2 DROP CONSTRAINT; COMMIT; $DEPQ'DD2'; DROP TABLE DT2; COMMIT; $RELQ'DT2';" "COUNT|0|COUNT|0"
+pin "18 ALTER VIEW takes the old CHECK OPTION's triggers and their rows" "ALTER VIEW GV7 AS SELECT ID, N FROM GT7B; COMMIT; SELECT COUNT(*) FROM RDB\$TRIGGERS WHERE RDB\$RELATION_NAME = 'GV7'; SELECT COUNT(*) FROM RDB\$DEPENDENCIES WHERE RDB\$DEPENDED_ON_NAME = 'GT7A';" "COUNT|0|COUNT|0"
+pin "18 ...so the table the old body read drops" "DROP TABLE GT7A; COMMIT; $RELQ'GT7A';" "COUNT|0"
+
 echo "--- 15. THE FILE AFTER ALL OF IT"
 # a put-back image is a whole image: gfix validates fc's file, and the
 # ENGINE reads the tables the refused RECREATEs left
@@ -601,5 +640,5 @@ ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-dmlcheck-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 else echo "OK   no panic"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 209 ]; then echo "FAIL only $ran checks ran (floor 209)"; fail=1; fi
+if [ "$ran" -lt 218 ]; then echo "FAIL only $ran checks ran (floor 218)"; fail=1; fi
 exit $fail
