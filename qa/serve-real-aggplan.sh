@@ -91,11 +91,13 @@
 # key; a fractional or column frame offset; a frame with no ORDER BY;
 # LIST and PERCENTILE_CONT as windows; MIN and COUNT(DISTINCT) over a
 # BLOB; CREATE VIEW ... WITH CHECK OPTION; DISTINCT in an ordered window (the engine's 0A000, a generic
-# refusal here); a bare column under a lone HAVING or in the ORDER BY of
-# an implicit group (the engine's specific -104, a generic refusal here);
-# a qualified GROUP BY / ORDER BY key whose bare name a select-list alias
-# shadows (the column on the engine - answered or refused with -104 - a
-# generic refusal here); an illegal frame inside EXECUTE BLOCK.
+# refusal here); a qualified GROUP BY / ORDER BY key whose bare name a
+# select-list alias shadows where the engine ANSWERS (a generic refusal
+# here); an illegal frame inside EXECUTE BLOCK. (The bare column under a
+# lone HAVING or in the ORDER BY of an implicit group, and the alias-shadow
+# cells the engine refuses with -104 / -206, were recorded here as generic
+# refusals; the refusal diagnosis of qa/serve-real-errvec.sh names their
+# vectors now, and they are pins.)
 #
 # Usage: qa/serve-real-aggplan.sh [port]   (default 6010)
 set -u
@@ -257,8 +259,8 @@ pin  "2 ...with HAVING too" "SELECT COUNT(*) FROM W HAVING COUNT(*) > 1 ORDER BY
 pin  "2 ...over an empty table" "SELECT COUNT(*) FROM E ORDER BY SUM(ID);" "COUNT|0"
 dpin "2 describe: the constant under HAVING" "SELECT 1 FROM W HAVING COUNT(*) > 1;" "01: sqltype: 496 LONG scale: 0 subtype: 0 len: 4|: name: CONSTANT alias: CONSTANT|: table: schema: owner: "
 dpin "2 describe: COUNT ordered by SUM" "SELECT COUNT(*) FROM W ORDER BY SUM(ID);" "01: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8|: name: COUNT alias: COUNT|: table: schema: owner: "
-differs "2 RECORDED a bare column under HAVING alone (engine: invalid expression)" "SELECT ID FROM W HAVING COUNT(*) > 1;"
-differs "2 RECORDED ORDER BY a bare column on the implicit group" "SELECT COUNT(*) FROM W ORDER BY ID;"
+pin "2 a bare column under HAVING alone (engine: invalid expression)" "SELECT ID FROM W HAVING COUNT(*) > 1;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)"
+pin "2 ORDER BY a bare column on the implicit group" "SELECT COUNT(*) FROM W ORDER BY ID;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the ORDER BY clause (not contained in either an aggregate function or the GROUP BY clause)"
 
 echo "--- 3. A BARE WINDOW BESIDE A WINDOW INSIDE AN EXPRESSION"
 pin  "3 bare window first, expression second" "SELECT ROW_NUMBER() OVER (ORDER BY ID), ROW_NUMBER() OVER (ORDER BY ID) + 1 FROM W ORDER BY 1;" "ROW_NUMBER ADD|1 2|2 3|3 4|4 5|5 6"
@@ -448,11 +450,11 @@ pin  "14 windowed: an alias that shadows nothing" "SELECT GRP G, COUNT(*) C, RAN
 pin  "14 CONTROL: the windowless alias" "SELECT GRP G, COUNT(*) C FROM W GROUP BY G ORDER BY G;" "G C|<null> 1|A 2|B 2"
 differs "14 RECORDED the window's ORDER BY names the column (engine -104)" "SELECT VAL ID, ROW_NUMBER() OVER (ORDER BY ID) FROM W GROUP BY VAL, ID ORDER BY ID;"
 differs "14 RECORDED PARTITION BY the shadowed name (engine -104)" "SELECT VAL ID, RANK() OVER (PARTITION BY ID ORDER BY COUNT(*)) FROM W GROUP BY VAL, ID;"
-differs "14 RECORDED a qualified key is the column (engine -104)" "SELECT VAL ID, COUNT(*) FROM W GROUP BY W.ID;"
+pin "14 a qualified key is the column (engine -104)" "SELECT VAL ID, COUNT(*) FROM W GROUP BY W.ID;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)"
 refused "14 RECORDED ...beside the alias (engine groups five ways)" "SELECT VAL ID, COUNT(*) FROM W GROUP BY ID, W.ID;"
-differs "14 RECORDED ORDER BY the qualified column (engine -104)" "SELECT VAL ID, COUNT(*) FROM W GROUP BY VAL, ID ORDER BY W.ID;"
-differs "14 RECORDED HAVING the alias is the column (engine -104)" "SELECT VAL ID, COUNT(*) FROM W GROUP BY ID HAVING ID > 5;"
-differs "14 RECORDED HAVING an alias that shadows nothing (engine -206)" "SELECT VAL X, COUNT(*) FROM W GROUP BY X HAVING X > 5;"
+pin "14 ORDER BY the qualified column (engine -104)" "SELECT VAL ID, COUNT(*) FROM W GROUP BY VAL, ID ORDER BY W.ID;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the ORDER BY clause (not contained in either an aggregate function or the GROUP BY clause)"
+pin "14 HAVING the alias is the column (engine -104)" "SELECT VAL ID, COUNT(*) FROM W GROUP BY ID HAVING ID > 5;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the HAVING clause (neither an aggregate function nor a part of the GROUP BY clause)"
+pin "14 HAVING an alias that shadows nothing (engine -206)" "SELECT VAL X, COUNT(*) FROM W GROUP BY X HAVING X > 5;" "Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-\"X\"|-At line 1, column 49"
 
 echo "--- 15. FRAME BOUNDS IN A NAMED WINDOW AND INSIDE DML"
 pin  "15 named window: FOLLOWING then CURRENT ROW" "SELECT ID, SUM(VAL) OVER WIN FROM W WINDOW WIN AS (ORDER BY ID ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW);" "Statement failed, SQLSTATE = 42000|If <window frame bound 1> specifies FOLLOWING, then <window frame bound 2> shall not specify PRECEDING or CURRENT ROW"
