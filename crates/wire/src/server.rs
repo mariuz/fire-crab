@@ -18106,25 +18106,9 @@ thread_local! {
     /// planner threads its database handle through 49 signatures already,
     /// and this is one connection-wide fact, not a per-call argument.
     static CURRENT_ATT_CS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-    /// set by [build_expr_col] for the one [resolve_expr] call that
-    /// resolves a SELECT ITEM, and cleared by that call on entry: the
-    /// item is DELIVERED into the client's field, which a simple CASE
-    /// moves each branch into from its own set ([resolve_expr])
-    static DELIVER_ITEM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// raised by [resolve_expr] when it resolves a simple CASE whose
-    /// branches are in different sets; a comparison over one refuses
-    /// ([compare_refusing_mixed_case])
-    static MIXED_SIMPLE_CASE: std::cell::RefCell<Vec<MixedCase>> = const { std::cell::RefCell::new(Vec::new()) };
     /// set while [simple_case_mixed] resolves a CASE's branches: no
     /// distribution is attempted inside ([push_into_simple_case])
     static PUSH_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// how many [plan_query_inner_at] calls are open: 1 while the
-    /// client's own statement is planned, more inside it
-    static PLAN_NESTING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// the raw branch nodes of a simple CASE being DELIVERED
-    /// ([with_delivered_branches]): a simple CASE among them is
-    /// delivered branch by branch as well
-    static DELIVER_BRANCHES: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Decode STATEMENT TEXT by the attachment character set.
@@ -21259,13 +21243,8 @@ fn build_expr_col(
     columns: &[RelationColumn],
     descs: &[Descriptor],
 ) -> Option<ProjCol> {
-    // only the outermost query's items reach the client's fields: a
-    // nested query's column is read by the query above in the set its
-    // descriptor names, which a per-branch delivery would not match
-    DELIVER_ITEM.with(|d| d.set(PLAN_NESTING.with(|n| n.get()) <= 1));
-    let e = resolve_expr(raw, columns, descs);
-    DELIVER_ITEM.with(|d| d.set(false));
-    build_expr_col_from(e?, name, descs)
+    let e = resolve_expr(raw, columns, descs)?;
+    build_expr_col_from(e, name, descs)
 }
 
 /// [build_expr_col] over an already-resolved expression - the describe
@@ -21294,15 +21273,7 @@ fn deliver_in_announced_set(e: Expr, descs: &[Descriptor]) -> Expr {
     }
     let Some((_, w, run)) = value_form(&e, descs) else { return e };
     let att = CURRENT_ATT_CS.with(|c| c.get());
-    let sub_type = text_sub_type(&e, descs);
-    let announced = if sub_type == ATT_SUBTYPE {
-        att
-    } else if sub_type <= -2 {
-        let cs = (-2 - sub_type) as u8;
-        if att != 0 { att } else { cs }
-    } else {
-        charset_id(sub_type as i16)
-    };
+    let announced = announced_set(text_sub_type(&e, descs));
     // a literal under a NONE attachment is a NONE value like any other
     // here - `REPLACE('aÉb', U, 'x')` is one, delivered through the
     // UTF8 its describe negotiated (the bytes validated, measured)
@@ -33453,6 +33424,29 @@ fn plan_insert_select(
         Plan::RefusedEval(e) => return Some((Plan::RefusedEval(e), Vec::new())),
         other => other,
     };
+    // A SIMPLE CASE's branch is stored from its own set: each moves into
+    // the target column's ([deliver_simple_case]), not into the CASE's
+    // negotiated set first
+    if let Plan::Project { formats: sf, cols: scols, .. } = &mut src {
+        let sdescs = sf.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.clone()).unwrap_or_default();
+        for (c, fid) in scols.iter_mut().zip(listed.iter()) {
+            let Some(t) = descs.get(*fid) else { continue };
+            if !matches!(t.dtype, dtype::TEXT | dtype::VARYING) {
+                continue;
+            }
+            let tcs = fire_crab_ods::intl::charset_id(t.sub_type);
+            if !(fire_crab_ods::intl::byte_carrier(tcs)
+                || fire_crab_ods::intl::tabled(tcs)
+                || tcs == fire_crab_ods::intl::CS_UTF8)
+            {
+                continue;
+            }
+            if let Some(d) = c.expr.as_ref().and_then(|e| deliver_simple_case(e, tcs, Some(&sdescs))) {
+                c.expr = Some(d);
+                c.sub_type = tcs as i32;
+            }
+        }
+    }
     peel_delivery_wrap(&mut src);
     // an approximate source that is not a RUNTIME double - a literal,
     // ROUND / TRUNC, a conditional - into a DECFLOAT column refuses: the
@@ -48338,6 +48332,12 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
         },
         None => plan_query_outer(sql, db),
     };
+    // the client's own statement, whole: its select items reach the
+    // client's fields ([deliver_plan_items])
+    let mut out = out;
+    if armed {
+        deliver_plan_items(&mut out.0);
+    }
     if outermost {
         STMT_TEXT.with(|t| *t.borrow_mut() = None);
     }
@@ -55817,17 +55817,6 @@ fn plan_query_inner_at(
     in_view: bool,
     base: usize,
 ) -> Option<Plan> {
-    // a query planned inside another - a derived table, a view, a CTE, a
-    // UNION branch, a subquery - hands its rows to the query above, not
-    // to the client ([build_expr_col])
-    PLAN_NESTING.with(|d| d.set(d.get() + 1));
-    struct Nesting;
-    impl Drop for Nesting {
-        fn drop(&mut self) {
-            PLAN_NESTING.with(|d| d.set(d.get() - 1));
-        }
-    }
-    let _nesting = Nesting;
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
     {
         let up = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
@@ -77807,74 +77796,113 @@ fn resolve_raw_cond(
     columns: &[RelationColumn],
     descs: &[Descriptor],
 ) -> Option<Cond2> {
-    if !matches!(c, RawCond::Cmp(..)) {
-        return resolve_raw_cond_body(c, columns, descs);
+    if let RawCond::Cmp(a, op, b) = c {
+        if let Some(d) = distribute_cmp(a, *op, b, columns, descs) {
+            return resolve_distributed(&d, columns, descs);
+        }
     }
-    compare_refusing_mixed_case(
-        || resolve_raw_cond_body(c, columns, descs),
-        |r| match r {
-            Cond2::Cmp(l, op, r) => Some((&**l, *op, &**r)),
-            _ => None,
-        },
-        descs,
-    )
+    resolve_raw_cond_body(c, columns, descs)
 }
 
-/// A COMPARISON over a simple CASE / DECODE whose branches are in
-/// different sets is REFUSED (a bare 42000) unless reading the CASE in
-/// its negotiated set cannot change the answer. The engine compares the
-/// chosen branch's value as it is, in its own set
-/// ([push_into_simple_case]); this server reads the CASE in its
-/// negotiated set - the engine's for a fold or a sort, not for a
-/// compare. The two agree
-///   * when every branch and both sides are in that set or a byte
-///     carrier, whose compare is a byte compare either way: `CASE ID
-///     WHEN 2 THEN N ELSE W1 END = 'é'` under WIN1252 or NONE counts 0
-///     on both;
-///   * for `=` / `<>` between real sets alone: equality survives a
-///     conversion (`CASE ID WHEN 1 THEN W1 ELSE 'q' END = 'q'` under
-///     UTF8 finds rows 2 to 4 on both), where an order does not - it is
-///     the set's collation.
-/// Measured on 2182 under UTF8, where the literal is UTF8: `CASE ID
-/// WHEN 2 THEN N ELSE W1 END = 'é'` counts 0 (the NONE `E9` against the
-/// UTF8 'é' is a byte compare, as `N = 'é'` is), and the negotiated
-/// reading moved the `E9` into WIN1252 as 'é' and counted 1.
-fn compare_refusing_mixed_case<T>(
-    resolve: impl FnOnce() -> Option<T>,
-    sides: impl Fn(&T) -> Option<(&Expr, Cmp, &Expr)>,
-    descs: &[Descriptor],
-) -> Option<T> {
-    let outer = MIXED_SIMPLE_CASE.with(|m| std::mem::take(&mut *m.borrow_mut()));
-    let r = resolve();
-    let mixed = MIXED_SIMPLE_CASE.with(|m| std::mem::replace(&mut *m.borrow_mut(), outer));
-    if mixed.is_empty() {
-        return r;
+/// [distribute_cmp]'s condition, resolved - and each branch's comparison
+/// of a UTF8 value with one of a single-byte set MOVES the UTF8 side into
+/// that set first, as CVT2_compare does: measured on 2182 under UTF8,
+/// `CASE ID WHEN 1 THEN W1 ELSE 'Ω' END = 'Ω'` is 22018 (the literal
+/// has no WIN1252 image) where `CASE ID WHEN 1 THEN W1 ELSE 'q' END =
+/// 'q'` counts 3, and so are `W1 = 'Ω'` and `'Ω' = W1` alone - which
+/// this server answers 0 (recorded, outside this seam). Where the
+/// negotiated reading moved the branch into WIN1252 it raised too.
+fn resolve_distributed(d: &RawCond, columns: &[RelationColumn], descs: &[Descriptor]) -> Option<Cond2> {
+    fn walk(c: Cond2, descs: &[Descriptor]) -> Cond2 {
+        use fire_crab_ods::intl::{tabled, CS_UTF8};
+        match c {
+            Cond2::And(v) => Cond2::And(v.into_iter().map(|x| walk(x, descs)).collect()),
+            Cond2::Or(v) => Cond2::Or(v.into_iter().map(|x| walk(x, descs)).collect()),
+            Cond2::Cmp(l, op, r) => {
+                let (cl, cr) = (cmp_text_charset(&l, descs), cmp_text_charset(&r, descs));
+                let into = |x: Box<Expr>, dst: u8| match value_form(&x, descs) {
+                    Some((_, w, _)) => transcode_cast(x, CS_UTF8, w, dst),
+                    None => x,
+                };
+                match (cl, cr) {
+                    (Some(CS_UTF8), Some(t)) if t != CS_UTF8 && tabled(t) => Cond2::Cmp(into(l, t), op, r),
+                    (Some(t), Some(CS_UTF8)) if t != CS_UTF8 && tabled(t) => Cond2::Cmp(l, op, into(r, t)),
+                    _ => Cond2::Cmp(l, op, r),
+                }
+            }
+            other => other,
+        }
     }
-    let r = r?;
-    let agree = sides(&r).is_some_and(|(l, op, rr)| {
-        let Some(side_sets) = [l, rr].iter().map(|x| cmp_text_charset(x, descs)).collect::<Option<Vec<u8>>>()
-        else {
-            return false;
-        };
-        mixed.iter().all(|m| {
-            let equality = matches!(op, Cmp::Eq | Cmp::Ne);
-            (equality && !m.carrier && !side_sets.iter().any(|&c| carrier_cmp_set(c)))
-                || (m.within && side_sets.iter().all(|&c| c == m.joined || carrier_cmp_set(c)))
-        })
-    });
-    if !agree {
-        cap_note("a comparison over a simple CASE whose branches are in different sets");
+    Some(walk(resolve_raw_cond(d, columns, descs)?, descs))
+}
+
+/// A COMPARISON OVER A SIMPLE CASE / DECODE WHOSE BRANCHES ARE IN
+/// DIFFERENT SETS compares the chosen branch's value as it is, in its
+/// own set ([push_into_simple_case]: DecodeNode has no cast), so it is
+/// resolved per branch - `CASE x WHEN a THEN v1 ELSE v2 END < s` as
+/// `(sel = 1 AND v1 < s) OR (sel = 0 AND v2 < s)`, where `sel` is the
+/// same CASE answering which branch it takes (never NULL, so exactly one
+/// disjunct is live and it carries the three-valued answer). Each `vi <
+/// s` then takes the law a comparison of that set already has. Measured
+/// on 2182 over the csfn fixture: under UTF8 `CASE ID WHEN 2 THEN N ELSE
+/// W1 END = 'é'` counts 0 (the NONE `E9` against the UTF8 'é' is a byte
+/// compare, as `N = 'é'` is), `CASE ID WHEN 2 THEN W1 ELSE U END = N`
+/// counts 1 under NONE, UTF8 and WIN1252, `CASE ID WHEN 1 THEN W1 ELSE
+/// 'q' END < 'r'` counts 3; reading the CASE in its negotiated set
+/// counted 1 and 0 for the first two. A side with a parameter, a
+/// subquery or a stored function call keeps the negotiated reading.
+fn distribute_cmp(
+    a: &RawExpr,
+    op: Cmp,
+    b: &RawExpr,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<RawCond> {
+    if PUSH_PROBE.with(|p| p.get()) {
         return None;
     }
-    MIXED_SIMPLE_CASE.with(|m| {
-        let mut m = m.borrow_mut();
-        for x in mixed {
-            if !m.contains(&x) {
-                m.push(x);
+    let opaque = |x: &RawExpr| {
+        raw_any(x, &|y| matches!(y, RawExpr::Param(_) | RawExpr::Subq(_) | RawExpr::UserFn(..) | RawExpr::BareTrue))
+    };
+    if opaque(a) || opaque(b) {
+        return None;
+    }
+    for left in [true, false] {
+        let side = if left { a } else { b };
+        let (branches, else_) = match side {
+            RawExpr::Case(br, el, true) => {
+                if !simple_case_mixed(br, el.as_deref(), columns, descs) {
+                    continue;
+                }
+                (br.clone(), el.clone())
             }
+            other => match push_into_simple_case(other, columns, descs) {
+                Some(RawExpr::Case(br, el, true)) => (br, el),
+                _ => continue,
+            },
+        };
+        let other = if left { b } else { a };
+        let sel = RawExpr::Case(
+            branches.iter().enumerate().map(|(k, (c, _))| (c.clone(), RawExpr::Int(k as i64 + 1))).collect(),
+            Some(Box::new(RawExpr::Int(0))),
+            false,
+        );
+        let arm = |k: usize, v: RawExpr| {
+            let cmp = if left {
+                RawCond::Cmp(Box::new(v), op, Box::new(other.clone()))
+            } else {
+                RawCond::Cmp(Box::new(other.clone()), op, Box::new(v))
+            };
+            RawCond::And(vec![RawCond::Cmp(Box::new(sel.clone()), Cmp::Eq, Box::new(RawExpr::Int(k as i64))), cmp])
+        };
+        let mut arms: Vec<RawCond> = Vec::with_capacity(branches.len() + 1);
+        for (k, (_, v)) in branches.into_iter().enumerate() {
+            arms.push(arm(k + 1, v));
         }
-    });
-    Some(r)
+        arms.push(arm(0, else_.map(|v| *v).unwrap_or(RawExpr::Null)));
+        return Some(RawCond::Or(arms));
+    }
+    None
 }
 
 fn resolve_raw_cond_body(
@@ -78144,11 +78172,10 @@ fn resolve_raw_cond_sink_body(
                 }
                 return resolve_raw_cond(c, columns, descs);
             }
-            let (l, r) = compare_refusing_mixed_case(
-                || resolve_cmp_pair(a, b, columns, descs, sink),
-                |(l, r)| Some((l, *op, r)),
-                descs,
-            )?;
+            if let Some(d) = distribute_cmp(a, *op, b, columns, descs) {
+                return resolve_distributed(&d, columns, descs);
+            }
+            let (l, r) = resolve_cmp_pair(a, b, columns, descs, sink)?;
             Cond2::Cmp(Box::new(l), *op, Box::new(r))
         }
         RawCond::Not(inner) => {
@@ -78177,60 +78204,22 @@ fn resolve_expr(
     columns: &[RelationColumn],
     descs: &[Descriptor],
 ) -> Option<Expr> {
-    // the select item itself ([build_expr_col]) - nothing below it is
-    // delivered - or a branch of a simple CASE delivered as one
-    let top = DELIVER_ITEM.with(|d| d.replace(false));
-    let deliver = top || DELIVER_BRANCHES.with(|v| v.borrow().contains(&(raw as *const RawExpr as usize)));
+    // a function that reads its operand's set, over a simple CASE whose
+    // branches are in different sets, runs per branch
     if let Some(pushed) = push_into_simple_case(raw, columns, descs) {
-        DELIVER_ITEM.with(|d| d.set(top));
-        if deliver && !top {
-            // the distributed CASE stands where the branch stood
-            return with_delivered_branches(&[&pushed], || resolve_expr(&pushed, columns, descs));
-        }
         return resolve_expr(&pushed, columns, descs);
     }
-    // A SIMPLE CASE / DECODE never converts its branch (DecodeNode has
-    // no cast - [push_into_simple_case]); DELIVERED as a select item,
-    // each branch moves from its own set into the client's field
-    // ([deliver_simple_case]) - and a simple CASE that IS such a branch
-    // is delivered the same way, branch by branch, not first moved into
-    // its own negotiated set. Anywhere else a simple CASE keeps the
-    // negotiated set, which is the type the engine folds and sorts it in
-    // (`MAX(DECODE(ID, 1, W1, 'Ω'))` under UTF8 is 22018 - the literal
-    // into WIN1252, measured).
-    let simple_delivered = deliver && matches!(raw, RawExpr::Case(_, _, true));
-    let inner = if simple_delivered {
-        let RawExpr::Case(branches, else_, _) = raw else { unreachable!() };
-        let values: Vec<&RawExpr> = branches.iter().map(|(_, v)| v).chain(else_.as_deref()).collect();
-        with_delivered_branches(&values, || resolve_expr_inner(raw, columns, descs))
-    } else {
-        resolve_expr_inner(raw, columns, descs)
-    };
     // every level of resolution goes through here, so a CHAR-formed
     // conditional is padded - and a scaled one ALIGNED - wherever it
     // appears: inside a concatenation, a comparison, an aggregate's
-    // source or the select list
-    let e = align_conditional(inner?, descs);
-    let e = recode_concat(e, descs);
-    if matches!(raw, RawExpr::Case(_, _, true)) && !simple_delivered {
-        if let Some(m) = case_branches_mixed(&e, descs) {
-            // one entry per (set, verdict): outside a comparison nothing
-            // takes them back, and a session must not grow the list
-            MIXED_SIMPLE_CASE.with(|v| {
-                let mut v = v.borrow_mut();
-                if !v.contains(&m) {
-                    v.push(m);
-                }
-            });
-        }
-    }
-    let e = if !simple_delivered {
-        recode_conditional(e, descs)
-    } else if top {
-        deliver_simple_case(e, descs)
-    } else {
-        e
-    };
+    // source or the select list. A simple CASE's branches move into its
+    // negotiated set here too: that is the type the engine folds, sorts
+    // and groups it in (`MAX(DECODE(ID, 1, W1, 'Ω'))` under UTF8 is
+    // 22018, the literal into WIN1252, measured), and where its value is
+    // DELIVERED or STORED as it is the moves are redone per branch into
+    // the field's set ([deliver_simple_case])
+    let e = align_conditional(resolve_expr_inner(raw, columns, descs)?, descs);
+    let e = recode_conditional(recode_concat(e, descs), descs);
     let e = pad_conditional(e, descs);
     let e = recode_strfn(e, descs);
     // a FLOAT branch beside a DOUBLE one widens to the common DOUBLE
@@ -78706,7 +78695,6 @@ fn recode_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
     if !matches!(e, Expr::Case(..) | Expr::Coalesce(_) | Expr::Iif(..)) {
         return e;
     }
-    let att = CURRENT_ATT_CS.with(|c| c.get());
     let Some((_, _, joined)) = text_form(&e, descs) else { return e };
     // AND UNDER A REAL ATTACHMENT TOO: there the LITERAL is of the
     // attachment's set and it is the CARRIER branch - a NONE column, a
@@ -78752,6 +78740,11 @@ fn recode_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
         other => other,
     }
 }
+
+/// How many simple CASEs a `||` or a many-operand function may carry
+/// and still be distributed ([push_into_simple_case]): the resolution is
+/// a product of their branch counts.
+const PUSH_CASES: usize = 4;
 
 /// A SIMPLE CASE / DECODE RETURNS ITS CHOSEN BRANCH AS IT IS, IN THE
 /// BRANCH's OWN SET - so a function over it runs, per row, over a value
@@ -78862,6 +78855,29 @@ fn push_into_simple_case(raw: &RawExpr, columns: &[RelationColumn], descs: &[Des
             },
         };
         let (branches, else_) = case;
+        // distributing copies the node's OTHER operands into every branch, and
+        // each copy distributes again over a simple CASE of its own: n
+        // concatenated DECODEs resolved about 2^n branches (16 took 35 s to
+        // prepare, 18 ran past 100 s at 3.9 GB). A node with more than
+        // [PUSH_CASES] simple CASEs under it keeps the negotiated set; a
+        // one-operand function copies nothing and is not counted here.
+        let operands = match raw {
+            RawExpr::Func(_, args) => args.len(),
+            RawExpr::Concat(..) => 2,
+            _ => 1,
+        };
+        if operands > 1 {
+            let n = std::cell::Cell::new(0usize);
+            let over = raw_any(raw, &|x| {
+                if matches!(x, RawExpr::Case(_, _, true)) {
+                    n.set(n.get() + 1);
+                }
+                n.get() > PUSH_CASES
+            });
+            if over {
+                return None;
+            }
+        }
         // a NULL branch stays NULL: every function here answers NULL
         // for a NULL operand
         let wrap = |v: RawExpr| if matches!(v, RawExpr::Null) { v } else { with(i, v) };
@@ -78872,49 +78888,6 @@ fn push_into_simple_case(raw: &RawExpr, columns: &[RelationColumn], descs: &[Des
         ));
     }
     None
-}
-
-/// A resolved text conditional whose branches are in more than one set:
-/// its negotiated set, and whether every branch is in that set or a
-/// byte carrier (NONE, OCTETS) - None when the branches agree.
-fn case_branches_mixed(e: &Expr, descs: &[Descriptor]) -> Option<MixedCase> {
-    let Expr::Case(arms, els) = e else { return None };
-    if !matches!(e.type_of(descs), Some(ExprType::Text)) {
-        return None;
-    }
-    let joined = tf_charset(text_form(e, descs)?.2);
-    let sets: Vec<u8> = arms
-        .iter()
-        .map(|(_, x)| x)
-        .chain(els.as_deref())
-        .filter(|x| !matches!(x, Expr::Null))
-        .filter_map(|x| value_cs(x, descs).map(tf_charset))
-        .collect();
-    if sets.windows(2).all(|w| w[0] == w[1]) {
-        return None;
-    }
-    Some(MixedCase {
-        joined,
-        carrier: sets.iter().any(|&c| c != joined && carrier_cmp_set(c)),
-        within: sets.iter().all(|&c| c == joined || carrier_cmp_set(c)),
-    })
-}
-
-/// [case_branches_mixed]'s verdict on one simple CASE.
-#[derive(Clone, Copy, PartialEq)]
-struct MixedCase {
-    /// the negotiated set
-    joined: u8,
-    /// a branch is a byte carrier the negotiated set is not
-    carrier: bool,
-    /// every branch is in the negotiated set or a byte carrier
-    within: bool,
-}
-
-/// NONE and OCTETS: a comparison against one of them is a byte compare,
-/// whichever of the other side's sets the bytes are tagged with.
-fn carrier_cmp_set(cs: u8) -> bool {
-    cs == fire_crab_ods::intl::CS_NONE || cs == fire_crab_ods::intl::CS_OCTETS
 }
 
 /// Are a simple CASE's text branches in more than one set?
@@ -78980,23 +78953,86 @@ fn simple_case_mixed(
     if values.iter().map(|v| conditionals(v)).sum::<usize>() > 8 {
         return false;
     }
-    let mut one: Option<u8> = None;
+    let mut sets: Vec<TfCs> = Vec::new();
     for v in values {
-        let outer = PUSH_PROBE.with(|p| p.replace(true));
-        let e = resolve_expr(v, columns, descs);
-        PUSH_PROBE.with(|p| p.set(outer));
-        let Some(e) = e else { return false };
-        if !matches!(e.type_of(descs), Some(ExprType::Text)) || blob_result(&e, descs).is_some() {
+        if !raw_run_sets(v, columns, descs, &mut sets) {
             return false;
         }
-        let Some(c) = value_cs(&e, descs) else { return false };
-        match one {
-            None => one = Some(tf_charset(c)),
-            Some(o) if o == tf_charset(c) => {}
-            Some(_) => return true,
+    }
+    sets.len() > 1
+}
+
+/// Every set a text operand's VALUE can be in at run time, gathered into
+/// `out` one per set; false where it is not text, or not known. A
+/// branch of a simple CASE that is itself one - bare, under a function
+/// that keeps its operand's set, or concatenated - is walked rather
+/// than resolved: resolved alone it distributes nothing ([PUSH_PROBE])
+/// and reads as the one negotiated set, which found `LOWER(DECODE(ID,
+/// 2, U, LOWER(DECODE(ID, 2, U, DECODE(ID, 1, W1, 'Ω')))))` agreeing and
+/// left the rows that take the literal to 22018 under UTF8 (the engine
+/// answers 'ω', measured).
+fn raw_run_sets(x: &RawExpr, columns: &[RelationColumn], descs: &[Descriptor], out: &mut Vec<TfCs>) -> bool {
+    fn add(out: &mut Vec<TfCs>, c: TfCs) {
+        if !out.iter().any(|o| tf_charset(*o) == tf_charset(c)) {
+            out.push(c);
         }
     }
-    false
+    if raw_any(x, &|y| matches!(y, RawExpr::Case(_, _, true))) {
+        match x {
+            RawExpr::Case(branches, else_, true) => {
+                return branches
+                    .iter()
+                    .map(|(_, v)| v)
+                    .chain(else_.as_deref())
+                    .filter(|v| !matches!(v, RawExpr::Null))
+                    .all(|v| raw_run_sets(v, columns, descs, out));
+            }
+            RawExpr::Func(f, args) => {
+                let at = match f {
+                    SysFn::Upper
+                    | SysFn::Lower
+                    | SysFn::Substring
+                    | SysFn::Left
+                    | SysFn::Right
+                    | SysFn::Reverse
+                    | SysFn::Lpad
+                    | SysFn::Rpad
+                    | SysFn::Replace => args.first(),
+                    SysFn::Trim(_) => args.last(),
+                    _ => None,
+                };
+                if let Some(a) = at {
+                    return raw_run_sets(a, columns, descs, out);
+                }
+            }
+            RawExpr::Concat(a, b) => {
+                let (mut sa, mut sb) = (Vec::new(), Vec::new());
+                if !raw_run_sets(a, columns, descs, &mut sa) || !raw_run_sets(b, columns, descs, &mut sb) {
+                    return false;
+                }
+                for &p in &sa {
+                    for &q in &sb {
+                        add(out, cs_join(p, q));
+                    }
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
+    let outer = PUSH_PROBE.with(|p| p.replace(true));
+    let e = resolve_expr(x, columns, descs);
+    PUSH_PROBE.with(|p| p.set(outer));
+    let Some(e) = e else { return false };
+    if matches!(e, Expr::Null) {
+        return true;
+    }
+    if !matches!(e.type_of(descs), Some(ExprType::Text)) || blob_result(&e, descs).is_some() {
+        return false;
+    }
+    let Some(c) = value_cs(&e, descs) else { return false };
+    add(out, c);
+    true
 }
 
 /// A destination a conditional's branches are moved into: a carrier
@@ -79034,41 +79070,193 @@ fn recode_branch(x: Expr, dst: u8, descs: &[Descriptor]) -> Expr {
     }
 }
 
-/// A SIMPLE CASE DELIVERED: each branch moves from its own set into the
-/// client's field - the attachment's set under a real attachment (a
-/// WIN1252 branch's letters and a UTF8 literal 'Ω' both arrive under
-/// UTF8, a NONE `E9` branch is *Malformed string*), the describe's set
-/// under NONE, where the field is typed in it (a UTF8 'ß' branch arrives
-/// as WIN1252 `DF` beside a WIN1252 one, a NONE `E9` as itself; all
-/// measured). A branch that is itself a simple CASE ([is_simple_case])
-/// was left unconverted for this and is delivered branch by branch too.
-fn deliver_simple_case(e: Expr, descs: &[Descriptor]) -> Expr {
-    if !matches!(e.type_of(descs), Some(ExprType::Text)) {
-        return e;
+/// A SIMPLE CASE DELIVERED OR STORED: each branch moves from its own set
+/// into the field - the client's (the attachment's set under a real
+/// attachment, the describe's under NONE: [deliver_plan_items]) or the
+/// target column's ([plan_insert_select]) - where the resolution moved
+/// it into the CASE's negotiated set ([recode_conditional]), the type
+/// the engine folds and sorts it in. Measured on 2182 over the csfn
+/// fixture: delivered under UTF8, a WIN1252 branch's letters and a UTF8
+/// literal 'Ω' both arrive and a NONE `E9` branch is *Malformed string*;
+/// under NONE, where the field is typed WIN1252, a UTF8 'ß' branch
+/// arrives as `DF` beside a WIN1252 one and a NONE `E9` as itself;
+/// stored, `INSERT INTO TT (ID, N) SELECT ID, DECODE(ID, 1, W1, U)`
+/// under UTF8 writes W1's `C0 C9 CE` and U's `C3 9F` into the NONE
+/// column, and `CASE ID WHEN 2 THEN N ELSE W1 END` into a WIN1252 one
+/// the NONE `E9` as é.
+///
+/// The moves are redone from the resolved form alone: a moved branch is
+/// the synthetic transcoding CAST [recode_branch] wrapped it in, which
+/// names the set it came from and its width; a branch it left alone is
+/// in the negotiated set (or is a literal under a carrier attachment,
+/// in the attachment's). A branch that is itself a simple CASE
+/// ([is_simple_case]) is walked the same way. None where the branches
+/// share one set, or where a branch's set or width cannot be read -
+/// `descs` reads an unmoved branch's; without them the width of the
+/// whole-value delivery around the CASE ([deliver_in_announced_set])
+/// stands in.
+fn deliver_simple_case(e: &Expr, dst: u8, descs: Option<&[Descriptor]>) -> Option<Expr> {
+    use fire_crab_ods::intl::{byte_carrier, bytes_per_char};
+    // a synthetic transcoding CAST's width, in its source's characters
+    // (the inverse of [transcode_cast])
+    fn width(len: usize, src: u8, dst: u8) -> i32 {
+        if byte_carrier(dst) {
+            (len / (bytes_per_char(src).max(1) as usize)) as i32
+        } else {
+            len as i32
+        }
+    }
+    fn moved(x: &Expr) -> Option<(&Expr, u8, i32, u8)> {
+        match x {
+            Expr::Cast(inner, CastTarget::Text { len, pad: false, synthetic: true, cs: Some(d) }, src) => {
+                Some((&**inner, *src, width(*len, *src, *d), *d))
+            }
+            _ => None,
+        }
+    }
+    // the value delivered whole, in the negotiated set
+    let (e, whole, whole_src) = match moved(e) {
+        Some((inner, src, w, _)) => (inner, Some(w), Some(src)),
+        None => (e, None, None),
+    };
+    // a CHAR-formed CASE's pad stays outside
+    if let Expr::Cast(inner, t @ CastTarget::Text { pad: true, synthetic: true, cs: None, .. }, s) = e {
+        return Some(Expr::Cast(Box::new(deliver_simple_case(inner, dst, descs)?), *t, *s));
+    }
+    if !is_simple_case(e) {
+        return None;
+    }
+    // a level's negotiated set: where its moved branches went
+    fn negotiated(x: &Expr) -> Option<u8> {
+        let Expr::Case(arms, els) = x else { return None };
+        arms.iter().map(|(_, v)| v).chain(els.as_deref()).find_map(|v| moved(v).map(|(_, _, _, d)| d))
+    }
+    // nothing moved at all: the branches were in one set
+    fn any_moved(x: &Expr) -> bool {
+        let Expr::Case(arms, els) = x else { return false };
+        arms.iter().map(|(_, v)| v).chain(els.as_deref()).any(|v| match moved(v) {
+            Some(_) => true,
+            None => is_simple_case(v) && any_moved(v),
+        })
+    }
+    if !any_moved(e) {
+        return None;
     }
     let att = CURRENT_ATT_CS.with(|c| c.get());
-    let dst = if att != 0 {
+    // unmoved at the top, a branch is in the set the whole value is in -
+    // the field's own when nothing delivered it whole
+    let neg = negotiated(e).or(whole_src).unwrap_or(dst);
+    // `neg` and `w` are the set a branch left unmoved is in at this level,
+    // and the width it can be given
+    struct Walk<'a> {
+        dst: u8,
+        att: u8,
+        descs: Option<&'a [Descriptor]>,
+        sets: Vec<u8>,
+    }
+    impl Walk<'_> {
+        fn case(&mut self, x: &Expr, neg: u8, w: Option<i32>) -> Option<Expr> {
+            let Expr::Case(arms, els) = x else { return None };
+            let neg = negotiated(x).unwrap_or(neg);
+            let mut out = Vec::with_capacity(arms.len());
+            for (c, v) in arms {
+                out.push((c.clone(), self.branch(v, neg, w)?));
+            }
+            let els = match els {
+                Some(v) => Some(Box::new(self.branch(v, neg, w)?)),
+                None => None,
+            };
+            Some(Expr::Case(out, els))
+        }
+        fn branch(&mut self, x: &Expr, neg: u8, whole: Option<i32>) -> Option<Expr> {
+            if matches!(x, Expr::Null) {
+                return Some(Expr::Null);
+            }
+            if is_simple_case(x) {
+                return self.case(x, neg, whole);
+            }
+            if let Some((inner, src, w, _)) = moved(x) {
+                if is_simple_case(inner) {
+                    return self.case(inner, src, Some(w));
+                }
+                self.sets.push(src);
+                return Some(*transcode_cast(Box::new(inner.clone()), src, w, self.dst));
+            }
+            // left where it was: a literal under a carrier attachment is
+            // the attachment's octets, anything else the negotiated set's
+            let (src, w) = match (x, self.descs) {
+                (Expr::Str(t), _) if fire_crab_ods::intl::byte_carrier(self.att) => {
+                    (self.att, t.chars().count() as i32)
+                }
+                (_, Some(d)) => {
+                    if !matches!(x.type_of(d), Some(ExprType::Text)) || blob_result(x, d).is_some() {
+                        return None;
+                    }
+                    let (_, w, c) = value_form(x, d)?;
+                    (tf_charset(c), w)
+                }
+                (_, None) if neg == self.dst => (neg, 0),
+                (_, None) => (neg, whole?),
+            };
+            self.sets.push(src);
+            Some(*transcode_cast(Box::new(x.clone()), src, w, self.dst))
+        }
+    }
+    let mut walk = Walk { dst, att, descs, sets: Vec::new() };
+    let out = walk.case(e, neg, whole)?;
+    if walk.sets.windows(2).all(|w| w[0] == w[1]) {
+        return None;
+    }
+    Some(out)
+}
+
+/// The set a text column's value is delivered in: the field its
+/// `sub_type` announces, resolved against the attachment as the
+/// emission resolves it ([ATT_SUBTYPE], [enc_real_cs]).
+fn announced_set(sub_type: i32) -> u8 {
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    if sub_type == ATT_SUBTYPE {
         att
+    } else if sub_type <= -2 {
+        if att != 0 { att } else { (-2 - sub_type) as u8 }
     } else {
-        match text_form(&e, descs) {
-            Some((_, _, c)) => tf_charset(c),
-            None => return e,
-        }
+        fire_crab_ods::intl::charset_id(sub_type as i16)
+    }
+}
+
+/// The CLIENT's statement: each select item that is a simple CASE whose
+/// branches are in different sets is delivered branch by branch
+/// ([deliver_simple_case]). Only here - a query read by another (a
+/// derived table, a view, a subquery, a UNION branch, an INSERT's
+/// source) keeps the negotiated set its column describes - and after
+/// every rewrite the planner makes of the statement (a select-list
+/// subquery folded, a CTE expanded, ROWS / FIRST / DISTINCT wrapped),
+/// whose re-planned outer query is the one the client reads.
+fn deliver_plan_items(plan: &mut Plan) {
+    let cols = match plan {
+        // DISTINCT compares the values in the negotiated set, as the
+        // engine's sort does (`SELECT DISTINCT DECODE(ID, 1, W1, 'Ω')`
+        // under UTF8 is 22018, measured) - and hands on what it compared
+        Plan::Modified { distinct: true, .. } => return,
+        Plan::Modified { inner, .. } => return deliver_plan_items(inner),
+        Plan::Project { cols, .. }
+        | Plan::Join { cols, .. }
+        | Plan::JoinGroup { cols, .. }
+        | Plan::Lateral { cols, .. }
+        | Plan::Group { cols, .. }
+        | Plan::Derived { cols, .. } => cols,
+        _ => return,
     };
-    if !recodes_into(dst) {
-        return e;
-    }
-    fn walk(x: Expr, dst: u8, descs: &[Descriptor]) -> Expr {
-        if !is_simple_case(&x) {
-            return recode_branch(x, dst, descs);
+    for c in cols.iter_mut() {
+        let Some(e) = &c.expr else { continue };
+        let dst = announced_set(c.sub_type);
+        if !recodes_into(dst) {
+            continue;
         }
-        let Expr::Case(arms, els) = x else { return x };
-        Expr::Case(
-            arms.into_iter().map(|(c, v)| (c, walk(v, dst, descs))).collect(),
-            els.map(|v| Box::new(walk(*v, dst, descs))),
-        )
+        if let Some(d) = deliver_simple_case(e, dst, None) {
+            c.expr = Some(d);
+        }
     }
-    walk(e, dst, descs)
 }
 
 /// Is this the resolved form of a SIMPLE CASE / DECODE? It carries the
@@ -79076,21 +79264,6 @@ fn deliver_simple_case(e: Expr, descs: &[Descriptor]) -> Expr {
 fn is_simple_case(e: &Expr) -> bool {
     matches!(e, Expr::Case(arms, _)
         if matches!(arms.first(), Some((Cond2::IsNull(b), Expr::Null)) if matches!(**b, Expr::Int(0))))
-}
-
-/// `f` with these raw nodes marked as branches of a delivered simple
-/// CASE ([resolve_expr]) - their addresses, which are stable for as
-/// long as `f` runs.
-fn with_delivered_branches<T>(nodes: &[&RawExpr], f: impl FnOnce() -> T) -> T {
-    let n = DELIVER_BRANCHES.with(|v| {
-        let mut v = v.borrow_mut();
-        let n = v.len();
-        v.extend(nodes.iter().map(|x| *x as *const RawExpr as usize));
-        n
-    });
-    let r = f();
-    DELIVER_BRANCHES.with(|v| v.borrow_mut().truncate(n));
-    r
 }
 
 fn align_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
@@ -113006,20 +113179,30 @@ fn resolve_expr_term(
     descs: &[Descriptor],
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
-    if !matches!(rt.kind, RawKind::Cmp(..) | RawKind::CmpExpr(..)) {
-        return resolve_expr_term_body(rt, columns, descs, params);
-    }
-    compare_refusing_mixed_case(
-        || resolve_expr_term_body(rt, columns, descs, params),
-        |t| match t {
-            Term::ExprCond(c) => match &**c {
-                Cond2::Cmp(l, op, r) => Some((&**l, *op, &**r)),
+    // a comparison over a simple CASE whose branches are in different
+    // sets runs per branch ([distribute_cmp]), as a condition term
+    if rt.in_list.is_none() {
+        let lhs = match &rt.lhs {
+            RawLhs::Expr(e) => Some(e.clone()),
+            RawLhs::Col(c) => Some(RawExpr::Col(c.clone())),
+            _ => None,
+        };
+        let rhs = match &rt.kind {
+            RawKind::CmpExpr(op, r) => Some((*op, r.clone())),
+            RawKind::Cmp(op, r) => match r {
+                Rhs::Int(i) => Some((*op, RawExpr::Int(*i))),
+                Rhs::Str(t) => Some((*op, RawExpr::Str(t.clone()))),
                 _ => None,
             },
             _ => None,
-        },
-        descs,
-    )
+        };
+        if let (Some(l), Some((op, r))) = (lhs, rhs) {
+            if let Some(d) = distribute_cmp(&l, op, &r, columns, descs) {
+                return Some(Term::ExprCond(Box::new(resolve_distributed(&d, columns, descs)?)));
+            }
+        }
+    }
+    resolve_expr_term_body(rt, columns, descs, params)
 }
 
 fn resolve_expr_term_body(

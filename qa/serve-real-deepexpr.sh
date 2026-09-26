@@ -117,6 +117,7 @@ agrees "an ordinary expression (control)" "SELECT ID + 1, S || 'x' FROM T ORDER 
 agrees "390 nested UPPER"  "SELECT CHAR_LENGTH($(python3 -c "print('UPPER('*390 + \"'a'\" + ')'*390)")) AS X FROM RDB\$DATABASE"
 agrees "390 nested TRIM || 'b'" "SELECT CHAR_LENGTH($(python3 -c "print('TRIM('*390 + \"'a'\" + \" || 'b')\"*390)")) AS X FROM RDB\$DATABASE"
 agrees "60 nested UPPER(DECODE(...))" "SELECT CHAR_LENGTH($(python3 -c "print('UPPER(DECODE(1, 1, '*60 + \"'a'\" + \", 'b'))\"*60)")) AS X FROM RDB\$DATABASE"
+agrees "20 concatenated mixed-set DECODEs" "SELECT CHAR_LENGTH($(chain x ' || ' 20 "DECODE(ID, 1, CAST(S AS VARCHAR(10) CHARACTER SET WIN1252), 'x')")) AS X FROM T WHERE ID = 1"
 
 echo "--- 3. and in BOUNDED TIME ------------------------------------------"
 # A 2000-deep || took 90 s to PREPARE: every level of resolution asked
@@ -149,9 +150,16 @@ fast "390 nested UPPER"  15 "SELECT CHAR_LENGTH($(python3 -c "print('UPPER('*390
 # `UPPER(DECODE(...))`.
 fast "390 nested TRIM || 'b'" 15 "SELECT CHAR_LENGTH($(python3 -c "print('TRIM('*390 + \"'a'\" + \" || 'b')\"*390)")) AS X FROM RDB\$DATABASE"
 fast "60 nested UPPER(DECODE(...))" 15 "SELECT CHAR_LENGTH($(python3 -c "print('UPPER(DECODE(1, 1, '*60 + \"'a'\" + \", 'b'))\"*60)")) AS X FROM RDB\$DATABASE"
+# A function over a simple CASE whose branches are in different sets is
+# distributed into the branches, and `||` over either side: that copies
+# the other side into every branch, so n concatenated DECODEs resolved
+# about 2^n branches - 16 took 35 s to prepare, 18 ran past 100 s and
+# left the server at 3.9 GB (2026-09-26). Past four such CASEs under one
+# `||` the chain keeps the negotiated set.
+fast "20 concatenated mixed-set DECODEs" 15 "SELECT CHAR_LENGTH($(chain x ' || ' 20 "DECODE(ID, 1, CAST(S AS VARCHAR(10) CHARACTER SET WIN1252), 'x')")) AS X FROM T WHERE ID = 1"
 
 echo "----------------------------------------------------------------------"
 echo "ran $ran checks"
-[ "$ran" -ge 26 ] || { echo "FAIL only $ran checks ran"; fail=1; }
+[ "$ran" -ge 28 ] || { echo "FAIL only $ran checks ran"; fail=1; }
 [ $fail -eq 0 ] && echo "PASS $ran checks" || echo "FAIL"
 exit $fail
