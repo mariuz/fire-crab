@@ -136,7 +136,7 @@ agree "derived union distinct"   "select * from (select id a from t union distin
 agree "cte union distinct"       "with q as (select id a from t union distinct select id from u) select count(*), sum(a) from q;"
 agree "union distinct d16"       "select a from (select d16 a from t union distinct select d16 from t) q order by a;"
 echo "-- pre-existing boundaries, NOT derived-specific (the base-table form refuses too): recorded --"
-refuses_fc "decfloat IN subquery"  "select id from t where d16 in (select d16 from t where d16 > 2);"
+agree "decfloat IN subquery (answers since the merged-binary review: a DECFLOAT answer folds back as its decimal128 literal)"  "select id from t where d16 in (select d16 from t where d16 > 2);"
 agree "HAVING over decfloat (answers since the wide-numeric round of 2026-09-26)" "select sum(d16) from t having sum(d16) > 1;"
 echo "-- controls: other types through a derived table unchanged --"
 agree "numeric(9,2) sum"     "select sum(a) from (select cast(id as numeric(9,2)) a from t union all select n from u) q;"

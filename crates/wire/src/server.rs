@@ -77758,6 +77758,7 @@ fn resolve_raw_cond(
     columns: &[RelationColumn],
     descs: &[Descriptor],
 ) -> Option<Cond2> {
+    let _depth = ResolveDepth::enter();
     Some(match c {
         // the SAME side typing the predicate resolver applies - a
         // temporal or approximate or boolean side against something it
@@ -77997,6 +77998,7 @@ fn resolve_raw_cond_sink(
     descs: &[Descriptor],
     sink: &mut Vec<Option<Descriptor>>,
 ) -> Option<Cond2> {
+    let _depth = ResolveDepth::enter();
     let (r, fresh) = marking_chunk_new(sink, |sink| resolve_raw_cond_sink_body(c, columns, descs, sink))?;
     if chunk_new_text_slot(sink, &fresh) && raw_cond_any(c, &text_arm_node) {
         cap_note("K4 (a text-slot conditional value arm in a condition)");
@@ -78049,6 +78051,7 @@ fn resolve_expr(
     columns: &[RelationColumn],
     descs: &[Descriptor],
 ) -> Option<Expr> {
+    let _depth = ResolveDepth::enter();
     // every level of resolution goes through here, so a CHAR-formed
     // conditional is padded - and a scaled one ALIGNED - wherever it
     // appears: inside a concatenation, a comparison, an aggregate's
@@ -81778,6 +81781,7 @@ fn resolve_proj_expr(
     if !raw_has_param(raw) {
         return resolve_expr(raw, columns, descs);
     }
+    let _depth = ResolveDepth::enter();
     // K4 (round 12): a TRIM over a bare `?` inside a conditional's value
     // arm refuses at prepare ([raw_cond_arm_trim_param])
     if raw_cond_arm_trim_param(raw) {
@@ -81837,7 +81841,7 @@ fn resolve_proj_expr(
                         return None;
                     }
                     let cs = cast_source_charset(&e, t, descs);
-                    Expr::Cast(Box::new(runtime_double_cast(e, t, cs)), *t, cs)
+                    Expr::Cast(Box::new(assignment_literal_fold(runtime_double_cast(e, t, cs), t)), *t, cs)
                 }
             }
         }
@@ -82164,7 +82168,7 @@ fn resolve_expr_inner(
                 return None;
             }
             let cs = cast_source_charset(&inner, t, descs);
-            Expr::Cast(Box::new(runtime_double_cast(inner, t, cs)), *t, cs)
+            Expr::Cast(Box::new(assignment_literal_fold(runtime_double_cast(inner, t, cs), t)), *t, cs)
         }
         RawExpr::Coalesce(args) => Expr::Coalesce(
             args.iter()
@@ -83119,6 +83123,15 @@ impl Cond2 {
                 let (x, y) = (a.eval(values)?, b.eval(values)?);
                 if matches!(x, Value::Null) || matches!(y, Value::Null) {
                     None
+                } else if dec_is_nan(&x) || dec_is_nan(&y) {
+                    // a DECFLOAT NaN compares through Decimal128::compare,
+                    // whose decQuadToInt32 of the NaN answer is the
+                    // context's Invalid: 22000 for any operator (measured
+                    // on 2182: `CAST('NaN' AS DECFLOAT(34)) > 1`,
+                    // `IIF(ID = 2, <NaN>, D34) > 1`, a scalar subquery
+                    // answering NaN) - where the total order below ranked
+                    // it above everything and answered the rows
+                    return Err(EvalErr::DecfloatInvalidOperation);
                 } else {
                     // A NaN ON EITHER SIDE has the engine's own order,
                     // which `value_cmp` cannot give: its approximate arm
@@ -84165,7 +84178,20 @@ fn float_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
     if !widen_needed {
         return e;
     }
+    // an EXACT branch beside a DOUBLE one converts too, when the whole
+    // conditional is DOUBLE: the engine's consumers read the node's
+    // DOUBLE descriptor and take every branch value through
+    // MOV_get_double, where a raw INT128 / NUMERIC value here reached
+    // the fold beside Doubles - VAR_POP(IIF(ID = 1, I, DBL)) read the
+    // mixed values as a decimal fold and answered 0 (engine
+    // 1.555555555555556), SUM / AVG(COALESCE(I, DBL)) 0 (7.0 / 2.333..)
+    // and MAX(IIF(ID = 1, I, DBL)) raised 22003 (4.0), all measured on
+    // 2182. A DECFLOAT branch makes the node DECFLOAT and is left alone.
+    let whole_double = e.type_of(descs) == Some(ExprType::Approx);
     let widen = |b: Expr| -> Expr {
+        if whole_double && matches!(b.type_of(descs), Some(ExprType::Int | ExprType::Numeric)) {
+            return Expr::Cast(Box::new(b), CastTarget::Approx, fire_crab_ods::intl::CS_UTF8);
+        }
         if approx_expr_single(&b, descs) {
             Expr::Cast(Box::new(b), CastTarget::Approx, fire_crab_ods::intl::CS_UTF8)
         } else {
@@ -85176,6 +85202,12 @@ fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
             Expr::Func(SysFn::Ceil | SysFn::Ceiling | SysFn::Floor, args) if args.len() == 1 => {
                 walk(&args[0], descs)?
             }
+            // a scalar subquery evaluated per row whose one column is a
+            // DECFLOAT - a DECFLOAT column's fold, or since the wide
+            // numerics a DblDec call / statistical fold over an INT128:
+            // `(SELECT VAR_POP(X.I) FROM BIG2 X) > 1` compares in decimal
+            // on the engine (every row, measured on 2182) and refused here
+            Expr::CorrSub { desc: Some(pc), .. } if matches!(pc.sql_type & !1, 32760 | 32762) => true,
             Expr::Func(SysFn::Round | SysFn::Trunc, args) if !args.is_empty() => {
                 let w = walk(&args[0], descs)?;
                 if let Some(n) = args.get(1) {
@@ -85215,6 +85247,104 @@ fn runtime_double_cast(inner: Expr, t: &CastTarget, cs: u8) -> Expr {
     } else {
         inner
     }
+}
+
+/// The stamp of the implicit CAST [assignment_literal_fold] puts around a
+/// double literal: the literal as the ASSIGNMENT's target type, read from
+/// its spelling by the CAST arms' literal fold. An enclosing INT128 /
+/// DECFLOAT cast re-targets it (the outermost target is the one the
+/// engine's `csb_preferredDesc` names).
+const CS_LIT_FOLD: u8 = 0xEE;
+
+thread_local! {
+    /// How deep the resolvers are: [resolve_expr], [resolve_proj_expr]
+    /// (past its no-parameter hand-off) and the condition resolvers each
+    /// count one. [assignment_literal_fold] acts only at depth 1 - a CAST
+    /// that IS the item being resolved, so the item's type is the CAST's
+    /// target, the engine's `csb_preferredDesc`. A cast under a
+    /// concatenation, a comparison or any other operator is not the
+    /// assignment's target (`CAST(CAST(1e37 AS DOUBLE PRECISION) AS
+    /// NUMERIC(38,0)) || ''` is VARCHAR, and the engine's literal there is
+    /// cvt.cpp's double: 10000000000000000719354278919532445696, measured).
+    static RESOLVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// One level of [RESOLVE_DEPTH], released on every exit path.
+struct ResolveDepth;
+
+impl ResolveDepth {
+    fn enter() -> ResolveDepth {
+        RESOLVE_DEPTH.with(|d| d.set(d.get() + 1));
+        ResolveDepth
+    }
+}
+
+impl Drop for ResolveDepth {
+    fn drop(&mut self) {
+        RESOLVE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// THE LITERAL FOLD IS NOT THE CAST's, IT IS THE ASSIGNMENT's: the
+/// engine's LiteralNode::pass2 reads `csb_preferredDesc`, which
+/// AssignmentNode::pass2 sets to its TARGET's descriptor around the
+/// whole source expression - so EVERY double literal anywhere in an
+/// INT128 / DECFLOAT item is re-read from its text as that type (an
+/// INT128 at the target's scale, rounded half away from zero, or a
+/// decimal128), and only then do the operators around it run. Measured
+/// on 2182: `CAST(CAST(1e37 AS DOUBLE PRECISION) AS INT128)` is
+/// 9999999999999999538762658202121142272 (10^37 exact, then the nearest
+/// double, then Int128::set(double)) where cvt.cpp's own double gives
+/// 10000000000000000719354278919532445696; `CAST(CAST(1e37 AS DOUBLE
+/// PRECISION) AS DECFLOAT(34))` 9.9999999999999995E+36;
+/// `CAST(CAST(0.4999999999999999e0 AS DOUBLE PRECISION) AS INT128)` 0
+/// and `.. 2.49999999999999e0 ..` 2 (the exact decimal rounds, not the
+/// double); `CAST(0.4e0 + 0.4e0 AS INT128)` 0 (each literal is 0 before
+/// the add); `CAST(CAST(1e37 AS DOUBLE PRECISION) + 0 AS INT128)` the
+/// folded value too. A UNION branch and an aggregate argument are no
+/// assignment ([RUNTIME_DOUBLE_CASTS]): there the literal is cvt.cpp's
+/// double (the same statements answer 170141183460469193952755440758722396160
+/// for 1.7014118346046921e38 and 1 for 0.4999999999999999e0 in a UNION
+/// branch, measured). A bare literal operand keeps the CAST arms' own
+/// fold; every literal deeper in the operand is wrapped in an implicit
+/// cast to `t` ([CS_LIT_FOLD]), an inner INT128 / DECFLOAT cast's wraps
+/// re-targeted to this, the outer one.
+fn assignment_literal_fold(inner: Expr, t: &CastTarget) -> Expr {
+    if RUNTIME_DOUBLE_CASTS.with(|c| c.get())
+        || RESOLVE_DEPTH.with(|d| d.get()) != 1
+        || !matches!(t, CastTarget::Numeric { bytes: 16, .. } | CastTarget::DecFloat { .. })
+    {
+        return inner;
+    }
+    fn is_lit(e: &Expr) -> bool {
+        match e {
+            Expr::Double(_) => true,
+            Expr::Neg(x) => matches!(**x, Expr::Double(_)),
+            _ => false,
+        }
+    }
+    fn walk(e: Expr, t: &CastTarget) -> Expr {
+        let w = |x: Box<Expr>| Box::new(walk(*x, t));
+        match e {
+            e if is_lit(&e) => Expr::Cast(Box::new(e), *t, CS_LIT_FOLD),
+            Expr::Cast(x, _, CS_LIT_FOLD) => Expr::Cast(x, *t, CS_LIT_FOLD),
+            Expr::Cast(x, tt, cs) => Expr::Cast(w(x), tt, cs),
+            Expr::Neg(x) => Expr::Neg(w(x)),
+            Expr::Bin(a, op, b) => Expr::Bin(w(a), op, w(b)),
+            Expr::Coalesce(v) => Expr::Coalesce(v.into_iter().map(|x| walk(x, t)).collect()),
+            Expr::NullIf(a, b) => Expr::NullIf(w(a), w(b)),
+            Expr::Iif(c, a, b) => Expr::Iif(c, w(a), w(b)),
+            Expr::Case(arms, els) => {
+                Expr::Case(arms.into_iter().map(|(c, x)| (c, walk(x, t))).collect(), els.map(w))
+            }
+            Expr::Func(f, args) => Expr::Func(f, args.into_iter().map(|x| walk(x, t)).collect()),
+            other => other,
+        }
+    }
+    if is_lit(&inner) {
+        return inner;
+    }
+    walk(inner, t)
 }
 
 /// A double LITERAL under a CAST to DECFLOAT folds from its spelling
@@ -85638,21 +85768,36 @@ fn classify_exp_literal(text: &str) -> Option<ExpLit> {
 /// decimals (`1.5e0` beside `1.50e0` for a DECFLOAT target) cannot be
 /// told apart by the bits, and decline; a literal no lexer recorded (a
 /// double built in code) takes the shortest round-trip form.
+///
+/// A NEGATED literal is spelled with its minus: the engine's
+/// NegateNode::genBlr hands a literal child to genConstant with
+/// `negateValue`, so the BLR carries the text `-1e37` and the fold reads
+/// it exactly (`CAST(-1e37 AS INT128)` is -10^37, `CAST(-1.7e38 AS
+/// INT128)` -1.7x10^38, `CAST(-9007199254740993e0 AS NUMERIC(38,0))`
+/// -9007199254740993, measured on 2182). The lexer records the unsigned
+/// spelling, so a double with no spelling of its own takes its
+/// negation's, minus prefixed - where this fell to the shortest decimal
+/// of the one-ULP-off double (-10000000000000001000000000000000000000).
 fn double_literal_text(d: f64) -> Option<String> {
-    DOUBLE_LITERAL_TEXT.with(|t| {
-        let t = t.borrow();
-        let mut spellings = t.iter().filter(|(b, _)| *b == d.to_bits()).map(|(_, s)| s);
-        let first = match spellings.next() {
-            Some(s) => s.clone(),
-            None => return Some(format!("{:e}", d)),
-        };
-        let bits_of = |s: &str| text_to_dec128_clamped(s).ok();
-        if spellings.all(|s| bits_of(s) == bits_of(&first)) {
-            Some(first)
-        } else {
-            None
-        }
-    })
+    let spelled = |d: f64| -> Option<Option<String>> {
+        DOUBLE_LITERAL_TEXT.with(|t| {
+            let t = t.borrow();
+            let mut spellings = t.iter().filter(|(b, _)| *b == d.to_bits()).map(|(_, s)| s);
+            let first = spellings.next()?.clone();
+            let bits_of = |s: &str| text_to_dec128_clamped(s).ok();
+            Some(spellings.all(|s| bits_of(s) == bits_of(&first)).then_some(first))
+        })
+    };
+    match spelled(d) {
+        Some(found) => found,
+        None => match spelled(-d) {
+            Some(found) => found.map(|s| match s.strip_prefix('-') {
+                Some(pos) => pos.to_string(),
+                None => format!("-{}", s),
+            }),
+            None => Some(format!("{:e}", d)),
+        },
+    }
 }
 
 fn cvt_text_to_double(text: &str) -> Option<f64> {
@@ -88337,10 +88482,14 @@ fn dec_round_family(
         }
         Dec::Finite { neg: v < 0, coeff: v.unsigned_abs() as u128, exp: 0 }
     };
-    let modf = |x: &Dec| -> (Dec, Dec) {
+    // Decimal128::modf: decQuadToIntegralValue, then `x - ip` - which for
+    // an Infinity is Inf - Inf, the context's Invalid: `TRUNC(Inf)`,
+    // `TRUNC(-Inf)`, `TRUNC(Inf, 2)` and `TRUNC(Inf, -2)` all raise 22000
+    // (measured on 2182), where a quiet NaN passes as NaN
+    let modf = |x: &Dec| -> Result<(Dec, Dec), EvalErr> {
         let ip = dec_to_integral(x, RndMode::Trunc);
         let r = dfl::sub(x, &ip);
-        (ip, r)
+        Ok((ip, trap(&[x], r)?))
     };
     match mode {
         RndMode::Ceil | RndMode::Floor => Ok(out(dec_to_integral(d, mode))),
@@ -88362,15 +88511,15 @@ fn dec_round_family(
             let result_scale = -round_places(places, "TRUNC")?;
             if result_scale > 0 {
                 let vv = pow_i64(result_scale);
-                let (ip, _) = modf(&div(d, &vv)?);
+                let (ip, _) = modf(&div(d, &vv)?)?;
                 Ok(out(mul(&ip, &vv)?))
             } else {
-                let (ip, r) = modf(d);
+                let (ip, r) = modf(d)?;
                 if result_scale == 0 {
                     return Ok(out(ip));
                 }
                 let vv = pow_i64(-result_scale);
-                let (ri, _) = modf(&mul(&r, &vv)?);
+                let (ri, _) = modf(&mul(&r, &vv)?)?;
                 Ok(out(trap(&[&ip], dfl::add(&ip, &div(&ri, &vv)?))?))
             }
         }
@@ -88840,6 +88989,11 @@ fn cvt_dec_to_int64(d: &fire_crab_ods::decfloat::Dec, scale: i32) -> Result<i64,
     i64::try_from(raw).map_err(|_| EvalErr::FloatInvalidOperand)
 }
 
+/// A DECFLOAT value holding a NaN (either width).
+fn dec_is_nan(v: &Value) -> bool {
+    matches!(dec_of(v), Some(fire_crab_ods::decfloat::Dec::Nan))
+}
+
 /// The DECFLOAT a value holds, decoded - `None` for any other value
 fn dec_of(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
     match v {
@@ -89067,6 +89221,8 @@ impl Expr {
             // cannot say, since an empty inner table has no value to
             // read a type from
             Expr::Lookup { ty, .. } => Some(*ty),
+            // a DECFLOAT scalar is typeless like a DECFLOAT column
+            Expr::CorrSub { desc: Some(pc), .. } if matches!(pc.sql_type & !1, 32760 | 32762) => None,
             Expr::CorrSub { ty, .. } => Some(*ty),
             // a generator's value is a plain INT64, whatever wraps it
             Expr::GenVal(_) => Some(ExprType::Int),
@@ -91049,6 +91205,20 @@ impl Expr {
                     // decimal64 (16). NaN/Infinity carry through as-is (a
                     // CAST re-represents, it does not trap).
                     CastTarget::DecFloat { wide } => {
+                        // a SIGNALLING or a NEGATIVE NaN has no form here:
+                        // the decoded value is one quiet, unsigned NaN,
+                        // so every consumer would answer the quiet one's
+                        // result where the engine's differs (measured on
+                        // 2182: CEILING / FLOOR / TRUNC / EXP / POWER of
+                        // 'sNaN' raise 22000, SIGN('-NaN') is -1, and
+                        // the casts themselves print sNaN / -NaN) - the
+                        // cast refuses rather than answer the wrong one
+                        if let Value::Text(s) = &v {
+                            let t = s.to_ascii_lowercase();
+                            if dec_special_text(s) && (t.trim_start_matches(['+', '-']).starts_with("snan") || (t.starts_with('-') && t.contains("nan"))) {
+                                return Err(EvalErr::Unsupported);
+                            }
+                        }
                         let dec = if let Value::Text(s) = &v {
                             // an exponent past decimal128's range CLAMPS
                             // ('1E-6177' is 0E-6176, '1E+6112' 1.0E+6112) and
@@ -92866,16 +93036,29 @@ impl Expr {
                         use fire_crab_ods::decmath as dm;
                         let ds = dec_math_operands(&vs).unwrap_or_default();
                         let zero = Dec::Finite { neg: false, coeff: 0, exp: 0 };
-                        let le0 = |d: &Dec| cmp(d, &zero) != std::cmp::Ordering::Greater;
+                        // the domain checks are `Decimal128::compare`
+                        // against 0: decQuadCompare answers NaN for a NaN
+                        // operand and decQuadToInt32 of that is the
+                        // context's Invalid - so a NaN argument to SQRT /
+                        // LN / LOG10 / LOG raises 22000 BEFORE the math,
+                        // where EXP and POWER (no compare) let a quiet NaN
+                        // through as NaN (measured on 2182, both ways)
+                        let dcmp = |d: &Dec| -> Result<std::cmp::Ordering, EvalErr> {
+                            if matches!(d, Dec::Nan) {
+                                return Err(EvalErr::DecfloatInvalidOperation);
+                            }
+                            Ok(cmp(d, &zero))
+                        };
+                        let le0 = |d: &Dec| dcmp(d).map(|o| o != std::cmp::Ordering::Greater);
                         let r = match f {
                             SysFn::Sqrt => {
-                                if cmp(&ds[0], &zero) == std::cmp::Ordering::Less {
+                                if dcmp(&ds[0])? == std::cmp::Ordering::Less {
                                     return Err(EvalErr::MathDomain { func: "SQRT", code: GDS_SYSF_ARG_NONNEG });
                                 }
                                 dm::sqrt(&ds[0])
                             }
                             SysFn::Ln | SysFn::Log10 => {
-                                if le0(&ds[0]) {
+                                if le0(&ds[0])? {
                                     return Err(EvalErr::MathDomain {
                                         func: if matches!(f, SysFn::Ln) { "LN" } else { "LOG10" },
                                         code: GDS_SYSF_ARG_POSITIVE,
@@ -92887,23 +93070,40 @@ impl Expr {
                             SysFn::Power => dm::pow(&ds[0], &ds[1]),
                             _ => {
                                 // LOG(base, value) = ln(value) / ln(base): each
-                                // ln at 34 digits, then the decimal128 divide
-                                // (a zero divisor is the 22012, 0 / 0 the 22000)
-                                if le0(&ds[0]) {
+                                // ln at 34 digits, then decQuadDivide - whose
+                                // specials come first: Inf / Inf is the 22000,
+                                // Inf / x (a zero x too) a signed Infinity, x /
+                                // Inf a signed zero at etiny; then a zero
+                                // divisor is the 22012 and 0 / 0 the 22000.
+                                // Measured: `LOG(2, Inf)` Infinity, `LOG(Inf,
+                                // 2)` 0E-6176, `LOG(Inf, 0.5)` -0E-6176, `LOG(1,
+                                // Inf)` Infinity, `LOG(Inf, Inf)` 22000.
+                                if le0(&ds[0])? {
                                     return Err(EvalErr::MathDomain { func: "LOG", code: GDS_SYSF_BASE_POSITIVE });
                                 }
-                                if le0(&ds[1]) {
+                                if le0(&ds[1])? {
                                     return Err(EvalErr::MathDomain { func: "LOG", code: GDS_SYSF_ARG_POSITIVE });
                                 }
+                                let sign = |d: &Dec| match d {
+                                    Dec::Finite { neg, coeff, .. } => *neg && *coeff != 0,
+                                    Dec::Infinity { neg } => *neg,
+                                    Dec::Nan => false,
+                                };
                                 match (dm::ln(&ds[1]), dm::ln(&ds[0])) {
-                                    (Ok(a), Ok(b)) => {
-                                        if fire_crab_ods::decfloat::is_zero(&b) {
+                                    (Ok(a), Ok(b)) => match (&a, &b) {
+                                        (Dec::Infinity { .. }, Dec::Infinity { .. }) => Err(dm::MathErr::Invalid),
+                                        (Dec::Infinity { .. }, _) => Ok(Dec::Infinity { neg: sign(&a) != sign(&b) }),
+                                        (_, Dec::Infinity { .. }) => {
+                                            Ok(Dec::Finite { neg: sign(&a) != sign(&b), coeff: 0, exp: -6176 })
+                                        }
+                                        _ if fire_crab_ods::decfloat::is_zero(&b) => {
                                             Err(if fire_crab_ods::decfloat::is_zero(&a) { dm::MathErr::Invalid } else { dm::MathErr::DivByZero })
-                                        } else {
+                                        }
+                                        _ => {
                                             let q = fire_crab_ods::decfloat::div(&a, &b);
                                             if matches!(q, Dec::Infinity { .. }) { Err(dm::MathErr::Overflow) } else { Ok(q) }
                                         }
-                                    }
+                                    },
                                     (Err(e), _) | (_, Err(e)) => Err(e),
                                 }
                             }
@@ -93472,6 +93672,23 @@ fn value_to_tok(v: &Value, key: bool) -> Option<Tok> {
         // as a DATE, and a Tok::Str would have taken the text path
         Value::Double(d) => Tok::FnExpr(RawExpr::Double(*d)),
         Value::Float(f) => Tok::FnExpr(RawExpr::Double(*f as f64)),
+        // a FINITE DECFLOAT answer folds back as the decimal128 literal
+        // it is (a DECFLOAT(16) one widened, which is exact): the
+        // DECFLOAT(34) results of SQRT / POWER / the statistical folds
+        // over an INT128 feed `I IN (SELECT SQRT(I) ..)` and `(SELECT
+        // VAR_POP(X.I) ..) > 1`, which the engine compares in decimal
+        // (measured on 2182: 1, 2 and every row) and this refused. A
+        // NaN or an Infinity keeps the refusal: its compare traps
+        // per row on the engine.
+        Value::DecFloat34(b) if matches!(fire_crab_ods::decfloat::decode_dec128(*b), fire_crab_ods::decfloat::Dec::Finite { .. }) => {
+            Tok::FnExpr(RawExpr::DecFloat34(*b))
+        }
+        Value::DecFloat16(b) => match fire_crab_ods::decfloat::decode_dec64(*b) {
+            d @ fire_crab_ods::decfloat::Dec::Finite { .. } => {
+                Tok::FnExpr(RawExpr::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&d)))
+            }
+            _ => return None,
+        },
         Value::Date(d) => Tok::FnExpr(RawExpr::DateLit(*d)),
         Value::Time(t) => Tok::FnExpr(RawExpr::TimeLit(*t)),
         Value::Timestamp(d, t) => Tok::FnExpr(RawExpr::TsLit(*d, *t)),
@@ -95707,6 +95924,10 @@ fn corr_result_type(pc: &ProjCol) -> Option<(ExprType, i8, Option<NumRank>)> {
         32756 => (ExprType::Temporal(TKind::TimeTz), 0, None),
         32754 => (ExprType::Temporal(TKind::TimestampTz), 0, None),
         32764 => (ExprType::Bool, 0, None),
+        // a DECFLOAT column has no ExprType ([Expr::type_of] answers None
+        // for this template's DECFLOAT desc) - the decimal compare takes
+        // it through [is_decfloat_arith]; the placeholder is never read
+        32760 | 32762 => (ExprType::Numeric, 0, None),
         _ => return None,
     })
 }
@@ -112161,6 +112382,22 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
 /// with the column's descriptor (a leaf the DNF cross-product
 /// duplicated fills its one slot twice with the same descriptor).
 fn resolve_predicate(
+    raw: (Vec<Vec<RawTerm>>, Vec<Vec<u32>>),
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    params: &mut Vec<Option<Descriptor>>,
+) -> Option<Predicate> {
+    // a predicate is no assignment: its casts never fold their literals
+    // ([assignment_literal_fold]), and a bare literal cast converts
+    // cvt.cpp's double at run time ([runtime_double_cast]) - `WHERE
+    // CAST(1e37 AS INT128) = 10000000000000000000000000000000000000` is
+    // no row on 2182 (the double's 10000000000000000719354278919532445696),
+    // where the CAST arm's fold answered every row
+    let _depth = ResolveDepth::enter();
+    with_runtime_double_casts(|| resolve_predicate_body(raw, columns, descs, params))
+}
+
+fn resolve_predicate_body(
     raw: (Vec<Vec<RawTerm>>, Vec<Vec<u32>>),
     columns: &[RelationColumn],
     descs: &[Descriptor],
