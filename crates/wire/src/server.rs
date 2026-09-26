@@ -14825,7 +14825,7 @@ fn not_null_fids_uncached(db: &Database, table: &str) -> Vec<usize> {
     // DS)` refuses an omitted S with isc_not_valid on "TS"."S")
     let mut by_source: Vec<(usize, String)> = Vec::new();
     let fmts = vec![(0u8, descs.clone())];
-    for_each_record(db, 5, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, 5, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_fid), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
@@ -14846,7 +14846,7 @@ fn not_null_fids_uncached(db: &Database, table: &str) -> Vec<usize> {
                 let ffid = |name: &str| fcols.iter().find(|c| c.name == name).map(|c| c.field_id as usize);
                 if let (Some(fname), Some(fnn)) = (ffid("RDB$FIELD_NAME"), ffid("RDB$NULL_FLAG")) {
                     let ffmts = vec![(0u8, fdescs.clone())];
-                    for_each_record(db, 2, &ffmts, usize::MAX, |values| {
+                    for_each_catalog_record(db, 2, &ffmts, usize::MAX, |values| {
                         if !matches!(values.get(fnn), Some(Value::Int(1))) {
                             return;
                         }
@@ -14914,7 +14914,7 @@ fn identity_columns_uncached(db: &Database, table: &str) -> Vec<(usize, String, 
     };
     let mut out = Vec::new();
     let fmts = vec![(0u8, descs.clone())];
-    for_each_record(db, 5, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, 5, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_fid), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
@@ -14978,7 +14978,7 @@ fn computed_sources_uncached(
     // (field id, field source) of the table's columns
     let mut members: Vec<(usize, String)> = Vec::new();
     let fmts = vec![(0u8, rf_descs.clone())];
-    for_each_record(db, 5, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, 5, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
@@ -15009,7 +15009,7 @@ fn computed_sources_uncached(
     };
     let mut blobs: Vec<(usize, u16, u64)> = Vec::new();
     let fmts2 = vec![(0u8, f_descs.clone())];
-    for_each_record(db, 2, &fmts2, usize::MAX, |values| {
+    for_each_catalog_record(db, 2, &fmts2, usize::MAX, |values| {
         let Some(Value::Text(fname)) = values.get(name_f) else { return };
         let fname = fname.trim_end();
         for (id, src) in &members {
@@ -15074,7 +15074,7 @@ fn fk_trigger_parent_cols(db: &Database, table: &str, trigs: &[String]) -> Optio
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$DEPENDENCIES")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut out: Vec<String> = Vec::new();
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         let Some(Value::Text(dep)) = values.get(dep_f) else { return };
         if !trigs.iter().any(|t| t.eq_ignore_ascii_case(dep.trim_end())) {
             return;
@@ -15299,7 +15299,7 @@ fn table_defaults(
     let rf_fmts = vec![(0u8, rf_descs.clone())];
     // (fid, column default blob, domain source name)
     let mut omitted: Vec<(usize, Option<(u16, u64)>, String)> = Vec::new();
-    for_each_record(db, 5, &rf_fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, 5, &rf_fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
@@ -15353,7 +15353,7 @@ fn table_defaults(
         let (fname_f, fdef_f) = (ffid("RDB$FIELD_NAME")?, ffid("RDB$DEFAULT_VALUE")?);
         let f_fmts = vec![(0u8, f_descs.clone())];
         let mut blobs: Vec<(usize, u16, u64)> = Vec::new();
-        for_each_record(db, 2, &f_fmts, usize::MAX, |values| {
+        for_each_catalog_record(db, 2, &f_fmts, usize::MAX, |values| {
             let Some(Value::Text(fname)) = values.get(fname_f) else { return };
             let fname = fname.trim_end();
             for (fid, src) in &pending {
@@ -15535,7 +15535,7 @@ fn ref_constraint_rules(db: &Database) -> Vec<(String, RefAction, RefAction)> {
     };
     let fmts = vec![(0u8, descs.clone())];
     let mut out: Vec<(String, RefAction, RefAction)> = Vec::new();
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         let Some(Value::Text(cn)) = values.get(cn_f) else { return };
         let rule = |f: usize| match values.get(f) {
             Some(Value::Text(t)) => RefAction::from_rule(t),
@@ -15571,7 +15571,7 @@ fn fk_partners_uncached(
     // `RDB$INDEX_ID - 1`, the address of the tree and of the segment
     // descriptors that outlive a deferred drop)
     let mut rows: Vec<(String, String, Option<String>, Option<u8>)> = Vec::new();
-    for_each_record(db, irel, &ifmts, usize::MAX, |values| {
+    for_each_catalog_record(db, irel, &ifmts, usize::MAX, |values| {
         let Some(Value::Text(ix)) = values.get(ix_f) else { return };
         let Some(Value::Text(rn)) = values.get(rn_f) else { return };
         let fk = match values.get(fk_f) {
@@ -15613,7 +15613,7 @@ fn fk_partners_uncached(
     let srel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$INDEX_SEGMENTS")?;
     let sfmts = vec![(0u8, s_descs.clone())];
     let mut segrows: Vec<(String, i64, String)> = Vec::new();
-    for_each_record(db, srel, &sfmts, usize::MAX, |values| {
+    for_each_catalog_record(db, srel, &sfmts, usize::MAX, |values| {
         let Some(Value::Text(ix)) = values.get(sn_f) else { return };
         let Some(Value::Text(col)) = values.get(sc_f) else { return };
         let pos = match values.get(sp_f) {
@@ -16749,7 +16749,7 @@ fn fk_action_trigger_name(db: &Database, constraint: &str, is_update: bool) -> O
         let trel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$TRIGGERS")?;
         let fmts = vec![(0u8, descs.clone())];
         let mut found: Option<String> = None;
-        for_each_record(db, trel, &fmts, usize::MAX, |values| {
+        for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
             if found.is_some() {
                 return;
             }
@@ -17233,7 +17233,7 @@ fn db_triggers(db: &Database, event: i64) -> Option<Vec<TrigDef>> {
     let fmts = vec![(0u8, t_descs.clone())];
     let mut out: Vec<TrigDef> = Vec::new();
     let mut refuse = false;
-    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
         if refuse {
             return;
         }
@@ -17388,7 +17388,7 @@ fn ddl_triggers(db: &Database, event: u32, before: bool) -> Option<Vec<TrigDef>>
     let fmts = vec![(0u8, t_descs.clone())];
     let mut out: Vec<TrigDef> = Vec::new();
     let mut refuse = false;
-    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
         if refuse
             || !matches!(values.get(rel_f), Some(Value::Null) | None)
             || !matches!(values.get(sys_f), Some(Value::Int(0)))
@@ -17933,7 +17933,7 @@ fn db_ddl_triggers_present(db: &Database) -> bool {
     };
     let fmts = vec![(0u8, t_descs.clone())];
     let mut found = false;
-    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
         if found
             || !matches!(values.get(rel_f), Some(Value::Null) | None)
             || !matches!(values.get(sys_f), Some(Value::Int(0)))
@@ -17975,7 +17975,7 @@ fn db_triggers_present(db: &Database, event: i64) -> bool {
     };
     let fmts = vec![(0u8, t_descs.clone())];
     let mut found = false;
-    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
         if found
             || !matches!(values.get(rel_f), Some(Value::Null) | None)
             || !matches!(values.get(sys_f), Some(Value::Int(0)))
@@ -18224,7 +18224,7 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
     let fmts = vec![(0u8, t_descs.clone())];
     let mut out: Vec<TrigDef> = Vec::new();
     let mut refuse = false;
-    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
         if refuse {
             return;
         }
@@ -18588,7 +18588,7 @@ fn check_predicates_uncached(
     let mut fk_unknown = false;
     let mut fk_update_trigs: Vec<String> = Vec::new();
     let fmts = vec![(0u8, t_descs.clone())];
-    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
@@ -18853,7 +18853,7 @@ fn domain_check_predicates_uncached(
     );
     let mut by_source: Vec<(usize, String)> = Vec::new(); // (fid, field source)
     let fmts = vec![(0u8, rf_descs.clone())];
-    for_each_record(db, 5, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, 5, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
@@ -18884,7 +18884,7 @@ fn domain_check_predicates_uncached(
     // domain's name verbatim, and "dm2" and DM2 are DIFFERENT domains -
     // a case-blind find bound the wrong domain's check (review-caught:
     // fc stored rows the engine refuses)
-    for_each_record(db, 2, &ffmts, usize::MAX, |values| {
+    for_each_catalog_record(db, 2, &ffmts, usize::MAX, |values| {
         let Some(Value::Text(n)) = values.get(fname_f) else { return };
         let n = n.trim_end();
         if !by_source.iter().any(|(_, s)| s == n) {
@@ -19079,7 +19079,7 @@ fn check_constraint_names(db: &Database) -> Option<Vec<(String, String)>> {
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$CHECK_CONSTRAINTS")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut out = Vec::new();
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         if let (Some(Value::Text(t)), Some(Value::Text(c))) = (values.get(tn_f), values.get(cn_f)) {
             out.push((t.trim_end().to_string(), c.trim_end().to_string()));
         }
@@ -19104,7 +19104,7 @@ fn constraint_for_index(db: &Database, index_name: &str) -> Option<String> {
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$RELATION_CONSTRAINTS")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut found: Option<String> = None;
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         if found.is_some() {
             return;
         }
@@ -25717,7 +25717,7 @@ fn exception_identity(db: &Database, name: &str) -> Option<(i64, String)> {
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$EXCEPTIONS")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut found = None;
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         let is_it = matches!(values.get(name_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !is_it {
@@ -25761,7 +25761,7 @@ fn exception_exists(db: &Database, name: &str) -> bool {
     };
     let fmts = vec![(0u8, descs.clone())];
     let mut found = false;
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         if matches!(values.get(name_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name)) {
             found = true;
         }
@@ -40192,7 +40192,7 @@ fn index_error_names(db: &Database, table: &str, index_id: u8) -> Option<(String
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$INDICES")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut found: Option<String> = None;
-    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
         if found.is_some() {
             return;
         }
@@ -45080,7 +45080,7 @@ fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
     // the name is RESOLVED once: the first row that carries it is the
     // relation, and whether THAT row has a view source is the answer
     let mut resolved = false;
-    for_each_record(db, 6, &fmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 6, &fmts, usize::MAX, |v| {
         let row_name = match v.get(name_f) {
             Some(Value::Text(t)) => Some(t.as_str()),
             _ => None,
@@ -45436,7 +45436,7 @@ fn view_field_bases(db: &Database, view: &str) -> Option<Vec<(String, Option<Str
     );
     let fmts = vec![(0u8, descs)];
     let mut out: Vec<(i64, String, Option<String>)> = Vec::new();
-    for_each_record(db, 5, &fmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 5, &fmts, usize::MAX, |v| {
         let is_rel = matches!(v.get(rel_f),
             Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
@@ -45474,7 +45474,7 @@ fn view_check_triggers(db: &Database, view: &str) -> Option<(Option<String>, Opt
     let fmts = vec![(0u8, descs)];
     let mut upd: Option<String> = None;
     let mut ins: Option<String> = None;
-    for_each_record(db, trel, &fmts, usize::MAX, |v| {
+    for_each_catalog_record(db, trel, &fmts, usize::MAX, |v| {
         let is_rel = matches!(v.get(rel_f),
             Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel || !matches!(v.get(sys_f), Some(Value::Int(5))) {
@@ -47587,7 +47587,7 @@ fn relation_schema(db: &Database, name: &str) -> Option<String> {
     let flag_f = fid("RDB$SYSTEM_FLAG");
     let fmts = vec![(0u8, rdescs)];
     let mut found: Option<String> = None;
-    for_each_record(db, 6, &fmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 6, &fmts, usize::MAX, |v| {
         let hit = matches!(v.get(name_f),
             Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !hit || found.is_some() {
@@ -56343,13 +56343,16 @@ struct ReadView<'a> {
 
 impl<'a> ReadView<'a> {
     fn of(db: &Database, image: &'a fire_crab_ods::Image) -> ReadView<'a> {
+        let catalog = CATALOG_WALK.with(|c| c.get());
         ReadView {
             tips: fire_crab_ods::tra::TipChain::read(image, db.page_size),
             own: db.own_tx(),
-            // isolation snapshot if it has one, else the statement view
-            snapshot: db.view_snapshot(),
+            // isolation snapshot if it has one, else the statement view -
+            // except for a catalog walk, which reads the latest committed
+            // schema (see [for_each_catalog_record])
+            snapshot: if catalog { None } else { db.view_snapshot() },
             // only a concurrency snapshot makes a write conflict
-            is_isolation: db.snapshot.is_some(),
+            is_isolation: !catalog && db.snapshot.is_some(),
             limbo: std::cell::Cell::new(0),
             decode_len: usize::MAX,
         }
@@ -57626,6 +57629,56 @@ fn count_visible_records(db: &Database, rel: u16) -> Result<i64, u64> {
         }
     }
     Ok(n)
+}
+
+thread_local! {
+    /// Set while [for_each_catalog_record] walks: [ReadView::of] then
+    /// leaves the transaction's snapshot out. See there for why.
+    static CATALOG_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A walk of a SYSTEM relation that the server makes FOR ITSELF - to
+/// learn a table's defaults, a domain's collation, a procedure's body,
+/// which relations are GTTs - reads the LATEST COMMITTED catalog (and
+/// this attachment's own uncommitted DDL), never the transaction's
+/// isolation snapshot. The engine's metadata is not MVCC-bound: it
+/// resolves names through its metadata cache, which a committed DDL
+/// updates for every attachment at once. Measured, isql's AUTODDL runs
+/// each DDL in a transaction of its own and commits it, while the
+/// statements after it run in the SNAPSHOT transaction isql opened
+/// before the DDL:
+///
+/// ```text
+///   create procedure p0 ...;  select * from p0        -> X 1 (engine)
+///   create table tnew ...;    select count(*) from rdb$relations
+///                             where rdb$relation_name = 'TNEW'  -> 0
+/// ```
+///
+/// - the new object is USABLE at once while a user SELECT of the
+/// catalog still honours the snapshot and does not see its row. These
+/// walks took the snapshot and answered what the transaction's start
+/// knew: a procedure unknown (42000), a GTT ON COMMIT DELETE ROWS the
+/// COMMIT purge did not know of (and [gtt_relations] then held that
+/// empty answer in the SHARED cache, for every attachment, until the
+/// next DDL), a domain's COLLATE UNICODE_CI missing from its column,
+/// an added column's DEFAULT not applied. A user query of RDB$ tables
+/// does not come here and keeps its snapshot.
+fn for_each_catalog_record<F: FnMut(&[Value])>(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    decode_len: usize,
+    f: F,
+) -> u64 {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let was = self.0;
+            CATALOG_WALK.with(|c| c.set(was));
+        }
+    }
+    let _reset = Reset(CATALOG_WALK.with(|c| c.replace(true)));
+    for_each_record(db, rel, formats, decode_len, f)
 }
 
 /// Returns the LIMBO transaction the walk stopped on, 0 when none -
@@ -92645,7 +92698,7 @@ fn procedure_defined(db: &Database, name: &str) -> bool {
     let (schema_f, pkg_f) = (fid("RDB$SCHEMA_NAME"), fid("RDB$PACKAGE_NAME"));
     let fmts = vec![(0u8, descs)];
     let mut found = false;
-    for_each_record(db, 26, &fmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 26, &fmts, usize::MAX, |v| {
         if found {
             return;
         }
@@ -92766,7 +92819,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     // type for the body this one read
     let mut found = false;
     let mut found_schema: Option<String> = None;
-    for_each_record(db, 26, &pfmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 26, &pfmts, usize::MAX, |v| {
         let hit = matches!(v.get(name_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || found || !row_visible(v, schema_f, pkg_f) {
@@ -92851,7 +92904,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     // relation, and merging them in was the probed arity error
     let (cschema_f, cpkg_f) = (cfid("RDB$SCHEMA_NAME"), cfid("RDB$PACKAGE_NAME"));
     let cfmts = vec![(0u8, cdescs)];
-    for_each_record(db, 27, &cfmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 27, &cfmts, usize::MAX, |v| {
         let hit = matches!(v.get(pn_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || !row_visible(v, cschema_f, cpkg_f) {
@@ -92985,7 +93038,7 @@ fn package_body_source(db: &Database, schema: &str, pkg: &str) -> Option<String>
     let fmts = vec![(0u8, descs)];
     let mut body: Option<String> = None;
     let mut found = false;
-    for_each_record(db, rel, &fmts, usize::MAX, |v| {
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |v| {
         if found {
             return;
         }
@@ -94119,7 +94172,7 @@ fn gtt_relations(db: &Database) -> std::sync::Arc<Vec<(u16, i64)>> {
         };
         let fmts = vec![(0u8, rdescs)];
         let mut out: Vec<(u16, i64)> = Vec::new();
-        for_each_record(db, 6, &fmts, usize::MAX, |v| {
+        for_each_catalog_record(db, 6, &fmts, usize::MAX, |v| {
             let ty = match v.get(ty_f) {
                 Some(Value::Int(t)) => *t,
                 _ => return,
@@ -98509,7 +98562,7 @@ fn user_function_sigs(db: &Database) -> std::collections::HashMap<String, (Descr
     // path spelling) and `SCHEMA.PKG.FF` (fully qualified), each mapping
     // to the same signature - and load_function resolves either.
     let mut keys: Vec<(String, String)> = Vec::new();
-    for_each_record(db, 14, &ffmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 14, &ffmts, usize::MAX, |v| {
         if matches!(sys_f.and_then(|i| v.get(i)), Some(Value::Int(n)) if *n != 0) {
             return;
         }
@@ -98674,7 +98727,7 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     let mut body_at: Option<(usize, usize)> = None;
     let mut found = false;
     let mut found_schema: Option<String> = None;
-    for_each_record(db, 14, &ffmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 14, &ffmts, usize::MAX, |v| {
         let hit = matches!(v.get(name_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || found || !row_visible(v, schema_f, pkg_f) {
             return;
@@ -98718,7 +98771,7 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     let (aschema_f, apkg_f) = (afid("RDB$SCHEMA_NAME"), afid("RDB$PACKAGE_NAME"));
     let afmts = vec![(0u8, adescs)];
     let mut raw: Vec<(i64, String, String, Option<DefaultVal>)> = Vec::new();
-    for_each_record(db, 15, &afmts, usize::MAX, |v| {
+    for_each_catalog_record(db, 15, &afmts, usize::MAX, |v| {
         let hit = matches!(v.get(an_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || !row_visible(v, aschema_f, apkg_f) {
             return;
@@ -111846,7 +111899,7 @@ fn generator_info(db: &Database, name: &str) -> Option<(i64, i64)> {
     let incr_fid = field("RDB$GENERATOR_INCREMENT")?;
     let want = name.trim();
     let mut found = None;
-    for_each_record(db, rel, &formats, usize::MAX, |row| {
+    for_each_catalog_record(db, rel, &formats, usize::MAX, |row| {
         if found.is_some() {
             return;
         }

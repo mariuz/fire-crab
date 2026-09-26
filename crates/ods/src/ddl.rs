@@ -1476,6 +1476,7 @@ pub fn alter_table_add_column(
             rc.sub_type = dt.sub_type;
             rc.char_len = dt.char_len;
             rc.dims = dt.dims.clone();
+            rc.charset_id = dt.charset_id;
             resolved_col = rc;
             (&resolved_col, Some(dname))
         }
@@ -1648,7 +1649,7 @@ pub fn alter_table_add_column(
     }
     } // domain_source.is_none() - a user domain's row already exists
 
-    let rf_vals: Vec<(&str, SysVal<'_>)> = vec![
+    let mut rf_vals: Vec<(&str, SysVal<'_>)> = vec![
         ("RDB$FIELD_NAME", SysVal::S(&col.name)),
         ("RDB$RELATION_NAME", SysVal::S(&table)),
         ("RDB$FIELD_SOURCE", SysVal::S(&dom)),
@@ -1659,10 +1660,28 @@ pub fn alter_table_add_column(
         ("RDB$SYSTEM_FLAG", SysVal::I(0)),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ("RDB$FIELD_SOURCE_SCHEMA_NAME", SysVal::S("PUBLIC")),
-        // a text column's collation rides here too (the ttype high byte);
-        // a built-in non-text column is 0
-        ("RDB$COLLATION_ID", SysVal::I(crate::intl::collation_id(col.sub_type) as i64)),
     ];
+    // a text column's collation rides here too (the ttype high byte); a
+    // built-in non-text column is 0. A DOMAIN column's is NULL - its
+    // collation is the domain's, as create_table writes it (measured:
+    // `alter table tc add z dci` leaves RDB$COLLATION_ID NULL on the
+    // engine; this wrote the domain's 3 once the ttype carried it)
+    if domain_source.is_none() {
+        rf_vals.push(("RDB$COLLATION_ID", SysVal::I(crate::intl::collation_id(col.sub_type) as i64)));
+    }
+    // the column's DEFAULT lands on its RDB$RELATION_FIELDS row, exactly
+    // as create_table puts it, BEFORE the runtime rebuild below re-reads
+    // it. It was parsed and dropped here: measured, `alter table tt add c
+    // integer default 4` then `insert into tt (a) values (2)` reads C 4
+    // on the engine (RDB$DEFAULT_SOURCE 'default 4') and read NULL here,
+    // with no default in the catalog at all. Rows already stored keep
+    // reading NULL for the new column on both (a nullable ADD).
+    if let Some(def) = &col.default {
+        let src = dml::insert_blob_cs(file, page_size, 5, &[def.source.as_bytes().to_vec()], 1, 4)?;
+        let val = dml::insert_blob(file, page_size, 5, &[def.value_blr.clone()], 2)?;
+        rf_vals.push(("RDB$DEFAULT_SOURCE", SysVal::B(blob_id_bytes(5, src))));
+        rf_vals.push(("RDB$DEFAULT_VALUE", SysVal::B(blob_id_bytes(5, val))));
+    }
     sys_insert(file, page_size, "RDB$RELATION_FIELDS", 5, &rf_vals)?;
 
     // --- rebuild RDB$RUNTIME for all fields (incl. the new one, now in
@@ -2536,6 +2555,8 @@ pub struct DomainType {
     /// an ARRAY domain's bounds (RDB$DIMENSIONS + RDB$FIELD_DIMENSIONS);
     /// empty for a scalar domain
     pub dims: Vec<(i32, i32)>,
+    /// the domain's RDB$CHARACTER_SET_ID (text and text BLOB domains)
+    pub charset_id: Option<u8>,
 }
 
 /// The bounds of an ARRAY field's dimensions, in dimension order -
@@ -2634,6 +2655,9 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
     let dv_f = fid("RDB$DEFAULT_VALUE");
     let vb_f = fid("RDB$VALIDATION_BLR");
     let dim_f = fid("RDB$DIMENSIONS");
+    let cs_f = fid("RDB$CHARACTER_SET_ID");
+    let coll_f = fid("RDB$COLLATION_ID");
+    let mut cs_coll: (Option<i64>, i64) = (None, 0);
     #[allow(clippy::type_complexity)]
     let mut found: Option<(
         i16,
@@ -2665,6 +2689,13 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
                 Some(Value::Blob(r, n)) => Some((*r, *n)),
                 _ => None,
             });
+            cs_coll = (
+                cs_f.and_then(|f| match v.get(f) {
+                    Some(Value::Int(i)) => Some(*i),
+                    _ => None,
+                }),
+                coll_f.map_or(0, geti),
+            );
             found = Some((
                 geti(ft_f) as i16,
                 geti(len_f) as u16,
@@ -2679,6 +2710,20 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
         }
     });
     let (field_type, byte_len, scale, sub_type, char_len, not_null, def, vblr, ndims) = found?;
+    // A TEXT domain's column carries the domain's CHARACTER SET and
+    // COLLATE in its format descriptor, as the ttype (charset low byte,
+    // collation high byte) - RDB$FIELD_SUB_TYPE is 0 for CHAR/VARCHAR, so
+    // copying that dropped both. Measured: a column of `varchar(5)
+    // character set utf8 collate unicode_ci` describes charset 4
+    // SYSTEM.UTF8 and `where a = 'abc'` finds 'AbC' on the engine; this
+    // described charset 0 NONE and compared byte-wise (count 0).
+    let (charset_id, sub_type) = match (field_type, cs_coll.0) {
+        (14 | 37 | 40, Some(cs)) => {
+            (Some(cs as u8), ((cs as u16 & 0xFF) | ((cs_coll.1 as u16 & 0xFF) << 8)) as i16)
+        }
+        (261, Some(cs)) => (Some(cs as u8), sub_type),
+        _ => (None, sub_type),
+    };
     let dims = if ndims > 0 { field_dimensions(file, page_size, dname) } else { Vec::new() };
     let dtype = field_type_to_dtype(field_type)?;
     // dsc_length: a VARYING carries its 2-byte count word, other types do not
@@ -2701,6 +2746,7 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
         default_blr,
         validation_blr,
         dims,
+        charset_id,
     })
 }
 
@@ -4239,6 +4285,7 @@ pub fn create_table(
             rc.scale = dt.scale;
             rc.sub_type = dt.sub_type;
             rc.char_len = dt.char_len;
+            rc.charset_id = dt.charset_id;
             // an ARRAY domain makes the column an array of its shape (the
             // bounds live on the domain's RDB$FIELDS row; the column's
             // storage is the 8-byte array id like any other)
