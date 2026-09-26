@@ -80,6 +80,20 @@ COMMIT;
 INSERT INTO TX VALUES (1, _UTF8 x'73747261C39F65', _WIN1252 x'737472619F65',
                           _NONE x'73747261C39F65', _OCTETS x'616263');
 COMMIT;
+-- section 8's rows: 'é' in every set (the NONE and OCTETS columns hold
+-- its UTF-8 octets C3 A9), an ASCII row, a NULL row, and a NONE/OCTETS
+-- E9 that no UTF8 spells
+CREATE TABLE TN (ID INTEGER,
+                 U VARCHAR(10) CHARACTER SET UTF8,
+                 W VARCHAR(10) CHARACTER SET WIN1252,
+                 N VARCHAR(10) CHARACTER SET NONE,
+                 O VARCHAR(10) CHARACTER SET OCTETS);
+COMMIT;
+INSERT INTO TN VALUES (1, _UTF8 x'C3A9', _WIN1252 x'E9', _NONE x'C3A9', _OCTETS x'C3A9');
+INSERT INTO TN VALUES (2, 'ab', 'ab', 'ab', x'4142');
+INSERT INTO TN VALUES (3, NULL, NULL, NULL, NULL);
+INSERT INTO TN VALUES (4, NULL, NULL, _NONE x'E9', _OCTETS x'E9');
+COMMIT;
 EOF
 }
 for f in "$A" "$B"; do
@@ -304,7 +318,97 @@ both "...over the WIN1252 column: 9F is no UTF8, 22000 (it answered the octets)"
 both "a folded scalar subquery of a real set keeps it under NONE (it was 22000)" \
     "SELECT OCTET_LENGTH('a' || (SELECT CAST(x'C3A9' AS CHAR(1) CHARACTER SET UTF8) FROM RDB\$DATABASE)) AS R FROM RDB\$DATABASE" "-ch NONE"
 
+echo "--- 8. a collation through a function, a NONE value through a conditional or a bare CAST under a real attachment, LOWER over a carrier ------"
+# Found by the review of section 7's fix. A literal under COLLATE resolves
+# since section 7, but the collation was DROPPED on the way through
+# UPPER, LOWER, TRIM, SUBSTRING, LEFT, RIGHT, REPLACE, REVERSE, LPAD,
+# COALESCE, IIF, CASE and NULLIF - the engine's result type for each is
+# its argument's, collation included - so `UPPER('é' COLLATE UNICODE_CI)
+# = U` counted 0 for 1; a CAST and a concatenation drop it (measured 0
+# both), and a COALESCE takes its FIRST value's. A byte carrier beside an
+# explicit collation MOVES INTO the collation's set before the compare
+# (a NONE literal under -ch NONE, a NONE column under -ch UTF8), where
+# the byte-space branch compared octets; OCTETS stays binary. Under a
+# REAL attachment a NONE value that reaches a typed operand through
+# COALESCE / IIF / CASE, or a bare CAST, was TRANSLITERATED (C3 A9 ->
+# C3 83 C2 A9) where the engine copies its bytes ('é'); and LOWER over a
+# carrier literal cased ASCII only on the engine where this folded the
+# carrier chars into an octet no set spells. Every cell pins the value.
+val() { # <dsn> <select> [flags]
+    printf 'SET LIST ON;\n%s;\n' "$2" |
+        timeout 25 "$ISQL" -q -user "$U" -pas "$P" ${3:-} "$1" 2>&1 |
+        grep -av '^ *$' | sed 's/  */ /g;s/ *$//' | paste -sd'|'
+}
+pinv() { # <label> <select> <flags> <engine-output>
+    ran=$((ran + 1))
+    local e c
+    e=$(val "$EN" "$2" "${3:-}"); c=$(val "$FC" "$2" "${3:-}")
+    if [ "$e" != "$4" ]; then echo "DIFF $1 - THE ENGINE ANSWERS [$e], not the pinned [$4]"; fail=1
+    elif [ "$e" != "$c" ]; then echo "DIFF $1"; echo "     engine: $e"; echo "     fcwire: $c"; fail=1
+    else echo "OK   $1 [$e]"; fi
+}
+MAL='Statement failed, SQLSTATE = 22000|Malformed string'
+pinv "UPPER('é' COLLATE UNICODE_CI) = U (it counted 0)" "SELECT COUNT(*) AS R FROM TN WHERE UPPER('é' COLLATE UNICODE_CI) = U" "-ch UTF8" "R 1"
+pinv "LOWER('É' COLLATE UNICODE_CI) = U" "SELECT COUNT(*) AS R FROM TN WHERE LOWER('É' COLLATE UNICODE_CI) = U" "-ch UTF8" "R 1"
+pinv "TRIM('É' COLLATE UNICODE_CI) = U" "SELECT COUNT(*) AS R FROM TN WHERE TRIM('É' COLLATE UNICODE_CI) = U" "-ch UTF8" "R 1"
+pinv "TRIM(LEADING 'z' FROM 'zÉ' COLLATE UNICODE_CI) = U" "SELECT COUNT(*) AS R FROM TN WHERE TRIM(LEADING 'z' FROM 'zÉ' COLLATE UNICODE_CI) = U" "-ch UTF8" "R 1"
+pinv "SUBSTRING('É' COLLATE UNICODE_CI FROM 1) = U" "SELECT COUNT(*) AS R FROM TN WHERE SUBSTRING('É' COLLATE UNICODE_CI FROM 1) = U" "-ch UTF8" "R 1"
+pinv "LEFT('Éz' COLLATE UNICODE_CI, 1) = U" "SELECT COUNT(*) AS R FROM TN WHERE LEFT('Éz' COLLATE UNICODE_CI, 1) = U" "-ch UTF8" "R 1"
+pinv "REPLACE('Éz' COLLATE UNICODE_CI, 'z', '') = U" "SELECT COUNT(*) AS R FROM TN WHERE REPLACE('Éz' COLLATE UNICODE_CI, 'z', '') = U" "-ch UTF8" "R 1"
+pinv "COALESCE('É' COLLATE UNICODE_CI, 'z') = U" "SELECT COUNT(*) AS R FROM TN WHERE COALESCE('É' COLLATE UNICODE_CI, 'z') = U" "-ch UTF8" "R 1"
+pinv "COALESCE(NULL, 'É' COLLATE UNICODE_CI) = U: the first VALUE's collation" "SELECT COUNT(*) AS R FROM TN WHERE COALESCE(NULL, 'É' COLLATE UNICODE_CI) = U" "-ch UTF8" "R 1"
+pinv "COALESCE('z', 'É' COLLATE UNICODE_CI) = U: the first value has none" "SELECT COUNT(*) AS R FROM TN WHERE COALESCE('z', 'É' COLLATE UNICODE_CI) = U" "-ch UTF8" "R 0"
+pinv "IIF(TRUE, 'É' COLLATE UNICODE_CI, 'z') = U" "SELECT COUNT(*) AS R FROM TN WHERE IIF(TRUE, 'É' COLLATE UNICODE_CI, 'z') = U" "-ch UTF8" "R 1"
+pinv "CASE WHEN TRUE THEN 'É' COLLATE UNICODE_CI ELSE 'z' END = U" "SELECT COUNT(*) AS R FROM TN WHERE CASE WHEN TRUE THEN 'É' COLLATE UNICODE_CI ELSE 'z' END = U" "-ch UTF8" "R 1"
+pinv "NULLIF('É' COLLATE UNICODE_CI, 'z') = U" "SELECT COUNT(*) AS R FROM TN WHERE NULLIF('É' COLLATE UNICODE_CI, 'z') = U" "-ch UTF8" "R 1"
+pinv "CAST('É' COLLATE UNICODE_CI AS VARCHAR(5)) = U: a CAST drops it" "SELECT COUNT(*) AS R FROM TN WHERE CAST('É' COLLATE UNICODE_CI AS VARCHAR(5)) = U" "-ch UTF8" "R 0"
+pinv "'x' || UPPER('é' COLLATE UNICODE_CI) = 'x' || U: a concatenation drops it" "SELECT COUNT(*) AS R FROM TN WHERE 'x' || UPPER('é' COLLATE UNICODE_CI) = 'x' || U" "-ch UTF8" "R 0"
+pinv "UPPER('é' COLLATE UNICODE_CI) <> U (it counted the 'é' row too)" "SELECT COUNT(*) AS R FROM TN WHERE UPPER('é' COLLATE UNICODE_CI) <> U" "-ch UTF8" "R 1"
+pinv "UPPER('é' COLLATE UNICODE_CI_AI) = 'e' is true of every row" "SELECT COUNT(*) AS R FROM TN WHERE UPPER('é' COLLATE UNICODE_CI_AI) = 'e'" "-ch UTF8" "R 4"
+pinv "UPPER('é' COLLATE UCS_BASIC) = U: the byte order" "SELECT COUNT(*) AS R FROM TN WHERE UPPER('é' COLLATE UCS_BASIC) = U" "-ch UTF8" "R 0"
+pinv "UPPER(U COLLATE UNICODE_CI) = 'é': the column's side" "SELECT COUNT(*) AS R FROM TN WHERE UPPER(U COLLATE UNICODE_CI) = 'é'" "-ch UTF8" "R 1"
+pinv "UPPER('é' COLLATE UNICODE_CI) = W: the WIN1252 column moves into the collation's set" "SELECT COUNT(*) AS R FROM TN WHERE UPPER('é' COLLATE UNICODE_CI) = W" "-ch UTF8" "R 1"
+pinv "UPPER(U COLLATE UNICODE_CI) STARTING WITH 'é'" "SELECT COUNT(*) AS R FROM TN WHERE UPPER(U COLLATE UNICODE_CI) STARTING WITH 'é'" "-ch UTF8" "R 1"
+pinv "UPPER(U COLLATE UNICODE_CI) LIKE 'é%'" "SELECT COUNT(*) AS R FROM TN WHERE UPPER(U COLLATE UNICODE_CI) LIKE 'é%'" "-ch UTF8" "R 1"
+pinv "under NONE: U COLLATE UNICODE_CI = 'É' - the NONE literal C3 89 moves into UTF8 (it compared octets: 0)" "SELECT COUNT(*) AS R FROM TN WHERE U COLLATE UNICODE_CI = 'É'" "-ch NONE" "R 1"
+pinv "under NONE: U COLLATE UNICODE_CI STARTING WITH 'É'" "SELECT COUNT(*) AS R FROM TN WHERE U COLLATE UNICODE_CI STARTING WITH 'É'" "-ch NONE" "R 1"
+pinv "under NONE: U COLLATE UNICODE_CI IN ('É', 'x')" "SELECT COUNT(*) AS R FROM TN WHERE U COLLATE UNICODE_CI IN ('É', 'x')" "-ch NONE" "R 1"
+pinv "N = CAST('É' AS VARCHAR(5) CHARACTER SET UTF8) COLLATE UNICODE_CI: the NONE column C3 A9 moves into UTF8" "SELECT COUNT(*) AS R FROM TN WHERE ID < 4 AND N = CAST('É' AS VARCHAR(5) CHARACTER SET UTF8) COLLATE UNICODE_CI" "-ch UTF8" "R 1"
+pinv "...and the E9 row raises on the way in" "SELECT COUNT(*) AS R FROM TN WHERE N = CAST('É' AS VARCHAR(5) CHARACTER SET UTF8) COLLATE UNICODE_CI" "-ch UTF8" "$MAL"
+pinv "CAST(N AS VARCHAR(5)) = 'É' COLLATE UNICODE_CI" "SELECT COUNT(*) AS R FROM TN WHERE ID < 4 AND CAST(N AS VARCHAR(5)) = 'É' COLLATE UNICODE_CI" "-ch UTF8" "R 1"
+pinv "O = CAST('É' AS VARCHAR(5) CHARACTER SET UTF8) COLLATE UNICODE_CI: OCTETS stays binary" "SELECT COUNT(*) AS R FROM TN WHERE O = CAST('É' AS VARCHAR(5) CHARACTER SET UTF8) COLLATE UNICODE_CI" "-ch UTF8" "R 0"
+known_diff "two explicit collations that disagree: UPPER('é' COLLATE UNICODE_CI) = U COLLATE UNICODE (engine 1, refused here)" \
+    "SELECT COUNT(*) AS R FROM TN WHERE UPPER('é' COLLATE UNICODE_CI) = U COLLATE UNICODE" "-ch UTF8"
+known_diff "a collated value LIKE a column: UPPER('é' COLLATE UNICODE_CI) LIKE U (engine 1, refused here)" \
+    "SELECT COUNT(*) AS R FROM TN WHERE UPPER('é' COLLATE UNICODE_CI) LIKE U" "-ch UTF8"
+pinv "COALESCE(N, 'q') || 'x' under UTF8: the NONE octets C3 A9 read as UTF8 (it was 'Ã©x')" "SELECT COALESCE(N, 'q') || 'x' AS R FROM TN WHERE ID = 1" "-ch UTF8" "R éx"
+pinv "COALESCE(N, 'q') alone" "SELECT COALESCE(N, 'q') AS R FROM TN WHERE ID = 1" "-ch UTF8" "R é"
+pinv "...its octets" "SELECT CAST(COALESCE(N, 'q') || 'x' AS VARCHAR(20) CHARACTER SET OCTETS) AS R FROM TN WHERE ID = 1" "-ch UTF8" "R C3A978"
+pinv "...its length (it was 4)" "SELECT OCTET_LENGTH(COALESCE(N, 'q')) AS R FROM TN WHERE ID = 1" "-ch UTF8" "R 2"
+pinv "IIF(TRUE, N, 'q') || 'x'" "SELECT IIF(TRUE, N, 'q') || 'x' AS R FROM TN WHERE ID = 1" "-ch UTF8" "R éx"
+pinv "CASE WHEN TRUE THEN N ELSE 'q' END || 'x'" "SELECT CASE WHEN TRUE THEN N ELSE 'q' END || 'x' AS R FROM TN WHERE ID = 1" "-ch UTF8" "R éx"
+pinv "WHERE COALESCE(N, 'q') = 'é' (it counted 0)" "SELECT COUNT(*) AS R FROM TN WHERE ID < 4 AND COALESCE(N, 'q') = 'é'" "-ch UTF8" "R 1"
+pinv "...over the E9 row too: 22000" "SELECT COUNT(*) AS R FROM TN WHERE COALESCE(N, 'q') = 'é'" "-ch UTF8" "$MAL"
+pinv "UPPER(COALESCE(N, 'q'))" "SELECT UPPER(COALESCE(N, 'q')) AS R FROM TN WHERE ID = 1" "-ch UTF8" "R É"
+pinv "COALESCE(N, U) || 'x'" "SELECT COALESCE(N, U) || 'x' AS R FROM TN WHERE ID = 1" "-ch UTF8" "R éx"
+pinv "COALESCE(N, 'q') || W" "SELECT COALESCE(N, 'q') || W AS R FROM TN WHERE ID = 1" "-ch UTF8" "R éé"
+pinv "NULLIF(N, 'q') || 'x' (a control: NULLIF is its first operand's set)" "SELECT NULLIF(N, 'q') || 'x' AS R FROM TN WHERE ID = 1" "-ch UTF8" "R éx"
+pinv "a bare CAST(N AS VARCHAR(5)) is the attachment's UTF8 with the octets moved (it re-encoded them: C383C2A9)" "SELECT CAST(CAST(N AS VARCHAR(5)) AS VARCHAR(5) CHARACTER SET OCTETS) AS R FROM TN WHERE ID = 1" "-ch UTF8" "R C3A9"
+pinv "CAST(N AS VARCHAR(5)) || 'x'" "SELECT CAST(N AS VARCHAR(5)) || 'x' AS R FROM TN WHERE ID = 1" "-ch UTF8" "R éx"
+pinv "OCTET_LENGTH(CAST(N AS VARCHAR(5)))" "SELECT OCTET_LENGTH(CAST(N AS VARCHAR(5))) AS R FROM TN WHERE ID = 1" "-ch UTF8" "R 2"
+pinv "CAST(x'C3A9' AS VARCHAR(5)): a binary literal the same way" "SELECT CAST(x'C3A9' AS VARCHAR(5)) AS R FROM RDB\\$DATABASE" "-ch UTF8" "R é"
+pinv "CAST(O AS VARCHAR(5)) over the OCTETS C3 A9" "SELECT CAST(O AS VARCHAR(5)) AS R FROM TN WHERE ID = 1" "-ch UTF8" "R é"
+pinv "COALESCE(O, 'q') is OCTETS: the octets themselves" "SELECT COALESCE(O, 'q') AS R FROM TN WHERE ID = 1" "-ch UTF8" "R C3A9"
+pinv "CAST(x'E9' AS VARCHAR(5)): no UTF8 spells E9, 22000" "SELECT CAST(x'E9' AS VARCHAR(5)) AS R FROM RDB\\$DATABASE" "-ch UTF8" "$MAL"
+pinv "CAST(N AS VARCHAR(5)) over a NONE E9: 22000" "SELECT CAST(N AS VARCHAR(5)) AS R FROM TN WHERE ID = 4" "-ch UTF8" "$MAL"
+pinv "COALESCE(N, 'q') over a NONE E9: 22000" "SELECT COALESCE(N, 'q') AS R FROM TN WHERE ID = 4" "-ch UTF8" "$MAL"
+pinv "under NONE the pair stays NONE: COALESCE(N, 'q') || 'x' is the octets" "SELECT COALESCE(N, 'q') || 'x' AS R FROM TN WHERE ID = 1" "-ch NONE" "R éx"
+pinv "LOWER('É') under NONE cases ASCII only: 'É' (it wrote an octet no set spells)" "SELECT LOWER('É') AS R FROM RDB\\$DATABASE" "-ch NONE" "R É"
+pinv "...its length" "SELECT OCTET_LENGTH(LOWER('É')) AS R FROM RDB\\$DATABASE" "-ch NONE" "R 2"
+pinv "LOWER('ÉA') under NONE" "SELECT LOWER('ÉA') AS R FROM RDB\\$DATABASE" "-ch NONE" "R Éa"
+pinv "LOWER('É') || U under NONE (it raised 22000)" "SELECT LOWER('É') || U AS R FROM TN WHERE ID = 1" "-ch NONE" "R Éé"
+
 echo "----------------------------------------------------------------------"
-[ "$ran" -ge 72 ] || { echo "FAIL only $ran checks ran"; fail=1; }
+[ "$ran" -ge 120 ] || { echo "FAIL only $ran checks ran"; fail=1; }
 [ $fail -eq 0 ] && echo "PASS $ran checks" || echo "FAIL"
 exit $fail

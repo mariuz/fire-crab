@@ -78465,6 +78465,17 @@ fn recode_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
     }
     let att = CURRENT_ATT_CS.with(|c| c.get());
     let Some((_, _, joined)) = text_form(&e, descs) else { return e };
+    // AND UNDER A REAL ATTACHMENT TOO: there the LITERAL is of the
+    // attachment's set and it is the CARRIER branch - a NONE column, a
+    // bare CAST - that holds its octets as chars, and it moves into the
+    // joined real set by its bytes. Measured on engine 2182 under -ch
+    // UTF8 over a NONE N holding C3 A9: `COALESCE(N, 'q')` is 'é' (2
+    // octets), `COALESCE(N, 'q') || 'x'` 'éx', `IIF(TRUE, N, 'q')` and
+    // `CASE WHEN TRUE THEN N ELSE 'q' END` the same, and `WHERE
+    // COALESCE(N, 'q') = 'é'` counts the row; the untouched branch was
+    // re-encoded on the way out as 'Ã©' (C3 83 C2 A9) and the count
+    // was 0. A branch of another REAL set is left to the row encoder,
+    // as before.
     let dst = tf_charset(joined);
     // a carrier destination keeps the carrier bytes as they are - but
     // ASCII, a carrier here, is a real set in the engine and a
@@ -103507,6 +103518,10 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
         // NULL on either side is NULL, and a CHAR operand keeps its
         // blank padding (that padding is part of the value - see
         // [render_dyn_text]).
+        // ...and each operand is MOVED INTO THE SET THE PAIR IS IN
+        // ([join_text_cs], [psql_concat_part]) before the glue, so a
+        // carrier's octets beside a real set's literal read as that
+        // set and a value that does not spell it raises.
         E::Concat(a, b) => match (eval_psql_expr(a, f)?, eval_psql_expr(b, f)?) {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
             (x, y) => {
@@ -103516,7 +103531,17 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
                     _ => None,
                 };
                 match (part(&x), part(&y)) {
-                    (Some(l), Some(r)) => Ok(Value::Text(format!("{}{}", l, r))),
+                    (Some(l), Some(r)) => {
+                        let (ca, cb) = (psql_expr_cs(a, f), psql_expr_cs(b, f));
+                        let (l, r) = match (ca, cb) {
+                            (Ok(ca), Ok(cb)) => {
+                                let dst = join_text_cs(ca, cb).ok().flatten();
+                                (psql_concat_part(l, ca, dst)?, psql_concat_part(r, cb, dst)?)
+                            }
+                            _ => (l, r),
+                        };
+                        Ok(Value::Text(format!("{}{}", l, r)))
+                    }
                     _ => Err(PsqlStop::Unsupported),
                 }
             }
@@ -108525,15 +108550,17 @@ fn psql_expr_cs_lit(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<(Opt
     }
 }
 
-/// [join_text_cs], where a side that is only ASCII literals (`a_lit`,
-/// `b_lit`) yields to a byte carrier on the other ([psql_expr_cs_lit]).
-fn join_lit_cs(a: Option<u8>, a_lit: bool, b: Option<u8>, b_lit: bool) -> Result<Option<u8>, ()> {
-    use fire_crab_ods::intl::byte_carrier;
-    match (a, b) {
-        (Some(p), Some(q)) if a_lit && byte_carrier(q) && !byte_carrier(p) => Ok(Some(q)),
-        (Some(p), Some(q)) if b_lit && byte_carrier(p) && !byte_carrier(q) => Ok(Some(p)),
-        _ => join_text_cs(a, b),
-    }
+/// [join_text_cs]. An ASCII literal of a real set (`a_lit`, `b_lit`)
+/// used to YIELD to a byte carrier on the other side, which kept the
+/// carrier's octets under the carrier's label - right wherever the
+/// value was measured or moved into a carrier or into the literal's
+/// own set, and wrong the moment it moved into a THIRD real set: a
+/// WIN1252-created body's `V || 'x'` over a NONE V holding C3 A9 into
+/// a UTF8 output is 'Ã©x' on the engine (the WIN1252 literal decides
+/// the set, the octets read as WIN1252) and read 'éx' here. The
+/// literal's real set wins now and the octets move into it.
+fn join_lit_cs(a: Option<u8>, _a_lit: bool, b: Option<u8>, _b_lit: bool) -> Result<Option<u8>, ()> {
+    join_text_cs(a, b)
 }
 
 /// [psql_expr_cs] for a slot: its declared set; a slot with none (not
@@ -108559,16 +108586,41 @@ fn var_text_cs(f: &PsqlFrame, n: usize) -> Result<Option<u8>, ()> {
     }
 }
 
-/// The set a concatenation of two spelled values is in. Two REAL sets
-/// hold characters alike, so the pair is still characters; a byte
-/// carrier beside a real set is octets beside characters - glued as
-/// Rust text that is neither, and not known.
+/// The set a concatenation of two spelled values is in - the planner's
+/// [cs_join] law: of two REAL sets the first, OCTETS absorbs, and a
+/// byte carrier YIELDS to a real set. The value glued for that pair
+/// holds the carrier's octets moved into the real set ([psql_concat_part]),
+/// so the label and the characters agree. Measured on engine 2182 in
+/// a UTF8-created body: `N || V` over a NONE N holding C3 A9 and a
+/// UTF8 V holding 'é' is 'éé' (4 octets), `'ab' || N` 'abé', and a
+/// NONE N holding E9 (fetched from a WIN1252 'é') beside the UTF8
+/// literal 'x' raises 22000 *Malformed string*. In a WIN1252-created
+/// body `V || 'x'` over a NONE V holding C3 A9 is the WIN1252 'Ã©x'
+/// and reaches a UTF8 output as 'Ã©x' - the pair was labelled NONE
+/// here (the carrier kept its tag beside an ASCII literal) and the
+/// output read 'éx'.
 fn join_text_cs(a: Option<u8>, b: Option<u8>) -> Result<Option<u8>, ()> {
-    use fire_crab_ods::intl::byte_carrier;
+    use fire_crab_ods::intl::{byte_carrier, CS_OCTETS};
     match (a, b) {
         (None, x) | (x, None) => Ok(x),
-        (Some(p), Some(q)) if p == q || (!byte_carrier(p) && !byte_carrier(q)) => Ok(Some(p)),
-        _ => Err(()),
+        (Some(p), Some(q)) if p == q => Ok(Some(p)),
+        (Some(p), Some(q)) if p == CS_OCTETS || q == CS_OCTETS => Ok(Some(CS_OCTETS)),
+        (Some(p), Some(q)) if byte_carrier(p) != byte_carrier(q) => {
+            Ok(Some(if byte_carrier(p) { q } else { p }))
+        }
+        (Some(p), Some(_)) => Ok(Some(p)),
+    }
+}
+
+/// Move one operand of a concatenation into the set the pair is in
+/// ([join_text_cs]): a carrier's octets read as the real set (22000
+/// where they do not spell it), a real set's characters into another
+/// real set (22018 where one has no image), and either into OCTETS by
+/// its bytes. `None` for a value with no set to speak of.
+fn psql_concat_part(t: String, cs: Option<u8>, dst: Option<u8>) -> Result<String, PsqlStop> {
+    match (cs, dst) {
+        (Some(src), Some(dst)) if src != dst => transcode_text(src, dst, t).map_err(psql_raise),
+        _ => Ok(t),
     }
 }
 
@@ -108639,19 +108691,35 @@ fn dyn_statement_text(parts: &[DynPart], f: &PsqlFrame) -> Result<String, PsqlSt
 }
 
 /// An EXECUTE STATEMENT argument's value and, for non-ASCII text of a
-/// set other than the attachment's, that set ([DynArg]); one whose set
-/// cannot be told refuses.
+/// REAL set other than the attachment's, that set ([DynArg]); one whose
+/// set cannot be told refuses.
+///
+/// A value of a BYTE-CARRIER set - a NONE or OCTETS local, an untyped
+/// local in a database with no default set - is READ IN THE
+/// ATTACHMENT'S SET: its octets are the argument. Measured on engine
+/// 2182 in a UTF8-created body over a NONE N holding C3 A9, `('select
+/// count(*) from srt where u = ?') (N)` counts the UTF8 'é' row under
+/// a UTF8 caller and nothing under WIN1252 (the octets read 'Ã©'
+/// there), `... where w = ?` the WIN1252 'é' row under UTF8 and
+/// nothing under WIN1252, and `octet_length(cast(? as varchar(10)))`
+/// is 2 under both; an OCTETS x'C3A9' answers the same cells. A NONE
+/// N holding E9 is 22000 *Malformed string* under a UTF8 caller.
+/// Spelled typed as NONE the argument compared by its bytes and
+/// answered the opposite cell (1 for 0, 0 for 1, 4 for 2).
 fn dyn_param_value(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<DynArg, PsqlStop> {
     let v = eval_psql_expr(e, f)?;
-    let cs = match &v {
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    match v {
         Value::Text(t) if !t.is_ascii() => match psql_expr_src(e, f) {
-            Some(cs) if cs != CURRENT_ATT_CS.with(|c| c.get()) => Some(cs),
-            Some(_) => None,
-            None => return Err(PsqlStop::Unsupported),
+            Some(cs) if fire_crab_ods::intl::byte_carrier(cs) => {
+                Ok((Value::Text(transcode_text(cs, att, t).map_err(psql_raise)?), None))
+            }
+            Some(cs) if cs != att => Ok((Value::Text(t), Some(cs))),
+            Some(_) => Ok((Value::Text(t), None)),
+            None => Err(PsqlStop::Unsupported),
         },
-        _ => None,
-    };
-    Ok((v, cs))
+        v => Ok((v, None)),
+    }
 }
 
 fn render_dyn_text(parts: &[DynPart], f: &PsqlFrame) -> Result<Option<String>, PsqlStop> {
@@ -108664,10 +108732,21 @@ fn render_dyn_text(parts: &[DynPart], f: &PsqlFrame) -> Result<Option<String>, P
     // renderer that trimmed for both would answer `[ab]`.
     let whole = parts.len() == 1;
     let text_of = |t: &str| if whole { t.trim_end().to_string() } else { t.to_string() };
+    // EACH PART MOVES INTO THE SET THE TEXT IS IN ([dyn_text_src], the
+    // [join_text_cs] law) as it is glued: a NONE local's octets beside
+    // a UTF8-created body's ASCII literals read as UTF8. Measured on
+    // engine 2182 under a WIN1252 caller, `EXECUTE STATEMENT 'select
+    // count(*) from srt where w = ''' || N || ''''` over a NONE N
+    // holding C3 A9 counts the WIN1252 'é' row (the UTF8 text moves
+    // into the attachment's set as E9), where the glued octets kept
+    // the carrier's label, moved by their bytes and counted 0; a NONE
+    // N holding E9 raises 22000 under every caller.
+    let dst = if parts.len() > 1 { dyn_text_src(parts, f) } else { None };
     let mut out = String::new();
     for p in parts {
         match p {
-            DynPart::Lit(t) => out.push_str(t),
+            DynPart::Lit(t) if t.is_ascii() => out.push_str(t),
+            DynPart::Lit(t) => out.push_str(&psql_concat_part(t.clone(), f.lit_cs, dst)?),
             DynPart::Row(ctx, col) => {
                 match f.trig.as_ref().and_then(|t| t.read(*ctx, col)) {
                     Some(Value::Text(t)) => out.push_str(&text_of(&t)),
@@ -108679,7 +108758,10 @@ fn render_dyn_text(parts: &[DynPart], f: &PsqlFrame) -> Result<Option<String>, P
                 }
             }
             DynPart::Var(n) => match f.vars.get(*n as usize) {
-                Some(Value::Text(t)) => out.push_str(&text_of(t)),
+                Some(Value::Text(t)) => {
+                    let cs = var_text_cs(f, *n as usize).ok().flatten();
+                    out.push_str(&psql_concat_part(text_of(t), cs, dst)?)
+                }
                 Some(Value::Int(v)) => out.push_str(&v.to_string()),
                 // NULL || anything is NULL
                 Some(Value::Null) | None => return Ok(None),
@@ -108944,6 +109026,18 @@ fn try_procedure_blr(
     args: &[Value],
     first_only: bool,
 ) -> BlrProcOutcome {
+    try_procedure_blr_at(database, name, args, first_only, false)
+}
+
+/// [try_procedure_blr], with the non-ASCII-literal guard LIFTED when
+/// `lit_ok` - what [exe_after_refusal] asks for.
+fn try_procedure_blr_at(
+    database: &Option<Database>,
+    name: &str,
+    args: &[Value],
+    first_only: bool,
+    lit_ok: bool,
+) -> BlrProcOutcome {
     let Some(db) = database.as_ref() else {
         return BlrProcOutcome::Outside;
     };
@@ -108953,7 +109047,7 @@ fn try_procedure_blr(
     if *db.meta_memo("blrcoll-proc", name, || blr_reads_collated_relation(db, &blr)) {
         return BlrProcOutcome::Outside; // a COLLATION decides in there
     }
-    if blr_has_non_ascii_literal(&blr) {
+    if !lit_ok && blr_has_non_ascii_literal(&blr) {
         return BlrProcOutcome::Outside;
     }
     // THE SAME BINDING AS THE SOURCE PATH, or the two disagree about
@@ -109076,6 +109170,12 @@ fn try_procedure_blr(
 /// packaged member, a sibling blr_function2 call, a generator) returns
 /// Outside and the source interpreter answers as before.
 fn try_function_blr(database: &Option<Database>, name: &str, args: &[Value]) -> FnBlrOutcome {
+    try_function_blr_at(database, name, args, false)
+}
+
+/// [try_function_blr], with the non-ASCII-literal guard LIFTED when
+/// `lit_ok` - what [exe_after_refusal] asks for.
+fn try_function_blr_at(database: &Option<Database>, name: &str, args: &[Value], lit_ok: bool) -> FnBlrOutcome {
     let Some(db) = database.as_ref() else {
         return FnBlrOutcome::Outside;
     };
@@ -109091,7 +109191,7 @@ fn try_function_blr(database: &Option<Database>, name: &str, args: &[Value]) -> 
     if *db.meta_memo("blrcoll-fn", name, || blr_reads_collated_relation(db, &blr)) {
         return FnBlrOutcome::Outside; // a COLLATION decides in there
     }
-    if blr_has_non_ascii_literal(&blr) {
+    if !lit_ok && blr_has_non_ascii_literal(&blr) {
         return FnBlrOutcome::Outside;
     }
     let Some(meta) = load_function(db, name) else {
@@ -110112,7 +110212,24 @@ fn run_function(
     let db = database.as_ref().ok_or("no database attached")?;
     let meta = load_function(db, name)
         .ok_or_else(|| format!("function {} is not one this server can run", name))?;
-    let (outs, _) = run_body_source(database, name, &meta, args, ctx, None)?;
+    let (outs, _) = match run_body_source(database, name, &meta, args, ctx, None) {
+        // a refused body the executor may answer after all
+        // ([exe_after_refusal])
+        Err(e) if e.status.is_none() && e.rows.is_empty() && exe_after_refusal(database, &meta) => {
+            match try_function_blr_at(database, name, args, true) {
+                FnBlrOutcome::Value(v) => (vec![v], Vec::new()),
+                FnBlrOutcome::Runtime(status) => {
+                    return Err(ProcErr {
+                        text: format!("function {} raised", name),
+                        status: Some(status),
+                        rows: Vec::new(),
+                    })
+                }
+                FnBlrOutcome::Outside => return Err(e),
+            }
+        }
+        r => r?,
+    };
     let v = outs.into_iter().next().unwrap_or(Value::Null);
     // COERCE the result to the declared RETURN scale. The source
     // interpreter's RETURN stores the value uncoerced, so a scale-0 value
@@ -110531,7 +110648,60 @@ fn run_procedure_capped(
     let db = database.as_ref().ok_or("no database attached")?;
     let meta = load_procedure(db, name)
         .ok_or_else(|| format!("procedure {} is not one this server can run", name))?;
-    run_body_source(database, name, &meta, args, ctx, stop_after)
+    // the executor takes only "every row" and "the first row"
+    let first_only = match &stop_after {
+        None => Some(false),
+        Some(BodyCap { take: 1, keep: None }) => Some(true),
+        Some(_) => None,
+    };
+    match run_body_source(database, name, &meta, args, ctx, stop_after) {
+        Err(e) if e.status.is_none() && e.rows.is_empty() => {
+            let Some(first_only) = first_only else { return Err(e) };
+            if !exe_after_refusal(database, &meta) {
+                return Err(e);
+            }
+            match try_procedure_blr_at(database, name, args, first_only, true) {
+                BlrProcOutcome::Rows(suspended, finals) => Ok((finals, suspended)),
+                BlrProcOutcome::Runtime(status) => Err(ProcErr {
+                    text: format!("procedure {} raised", name),
+                    status: Some(status),
+                    rows: Vec::new(),
+                }),
+                BlrProcOutcome::Outside => Err(e),
+            }
+        }
+        r => r,
+    }
+}
+
+/// Should the BLR executor run a stored body the source interpreter
+/// just REFUSED? The executor had stood aside for the body's non-ASCII
+/// literal ([blr_has_non_ascii_literal]) and the source path then met
+/// a statement it cannot plan: a user-function call outside a select
+/// list - in a WHERE, an aggregate, an EXISTS, a FOR SELECT's WHERE -
+/// which the planner has no place for ([materialise_user_fn_rows]).
+/// Measured on engine 2182 with bodies holding a UTF8 'é' local:
+/// `SELECT COUNT(*) FROM SRT WHERE SFN(U) = 'fab' INTO C` is 1,
+/// `SELECT SUM(SFI(I)) FROM SRT` 60, `SELECT MAX(SFN(U))` 'fé', an
+/// EXISTS over the call 1 and a FOR SELECT with the call in its WHERE
+/// 2 - every one of which the executor answered before f352cd5 routed
+/// such bodies to the source path, and which refused after it.
+///
+/// Only a body that CALLS a user function, and holds no statement that
+/// WRITES - INSERT, UPDATE, DELETE, MERGE, EXECUTE, GEN_ID, NEXT VALUE:
+/// the source path may have run part of the body before it refused,
+/// and a second run must not write twice. The executor is set-blind
+/// about the literal it stood aside for, which is the recorded
+/// limitation of the ASCII-literal bodies it has always run; here it
+/// buys an answer where the alternative is a refusal.
+fn exe_after_refusal(database: &Option<Database>, meta: &ProcMeta) -> bool {
+    let Some(db) = database.as_ref() else { return false };
+    let up = meta.source.to_ascii_uppercase();
+    const WRITES: &[&str] = &["INSERT", "UPDATE", "DELETE", "MERGE", "EXECUTE", "GEN_ID", "NEXT"];
+    if WRITES.iter().any(|w| find_word(&up, w, 0).is_some()) {
+        return false;
+    }
+    user_function_sigs(db).keys().any(|n| sql_calls_name(&up, n))
 }
 
 /// `EXECUTE BLOCK AS ... BEGIN ... END` - a procedure with no name and
@@ -111516,7 +111686,12 @@ fn collate_canon_of(
     match e {
         Expr::Collate(inner, tt) => fire_crab_ods::coll::icu_strength_of_ttype(*tt)
             .map(|st| ((**inner).clone(), *tt, st)),
-        _ => None,
+        // a collation under a function that keeps it
+        // ([explicit_collate_of]); the wrapper inside is transparent
+        // at eval, so the whole expression is the operand
+        other => explicit_collate_of(other).and_then(|tt| {
+            fire_crab_ods::coll::icu_strength_of_ttype(tt).map(|st| (other.clone(), tt, st))
+        }),
     }
 }
 
@@ -111674,10 +111849,15 @@ fn read_quoted_alone(b: &[char], pos: &mut usize) -> Option<String> {
 fn collate_operand_ttype(e: Expr, descs: &[Descriptor]) -> Option<(Expr, u16)> {
     Some(match e {
         Expr::Collate(inner, tt) => ((*inner), tt),
-        other => {
-            let tt = expr_text_ttype(&other, descs).unwrap_or(0);
-            (other, tt)
-        }
+        // a collation under a function that keeps it
+        // ([explicit_collate_of]) decides too
+        other => match explicit_collate_of(&other) {
+            Some(tt) => (other, tt),
+            None => {
+                let tt = expr_text_ttype(&other, descs).unwrap_or(0);
+                (other, tt)
+            }
+        },
     })
 }
 
@@ -111689,6 +111869,17 @@ fn starting_canon(
     descs: &[Descriptor],
 ) -> Option<(Expr, String)> {
     let (value, tt) = collate_operand_ttype(e, descs)?;
+    // a prefix written under a BYTE-CARRIER attachment holds its octets
+    // as chars; the collation reads it in ITS set (measured under -ch
+    // NONE: `U COLLATE UNICODE_CI STARTING WITH 'É'` counts the 'é' row)
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    let cs = fire_crab_ods::intl::charset_id(tt as i16);
+    let prefix = if fire_crab_ods::intl::byte_carrier(att) && !fire_crab_ods::intl::byte_carrier(cs) {
+        transcode_text(att, cs, prefix.to_string()).unwrap_or_else(|_| prefix.to_string())
+    } else {
+        prefix.to_string()
+    };
+    let prefix = prefix.as_str();
     match fire_crab_ods::coll::icu_strength_of_ttype(tt) {
         Some(st) => Some((
             Expr::CollCanon(Box::new(value), tt, false),
@@ -112364,10 +112555,10 @@ fn resolve_expr_term(
     // cannot key by default is keyable when the statement says which
     // collation to use (`CI COLLATE UCS_BASIC = 'APPLE'` is the byte
     // comparison, and the engine answers it).
-    let explicit_ok = matches!(&lhs, Expr::Collate(_, tt)
-        if fire_crab_ods::intl::collation_id(*tt as i16) == 0
-            || fire_crab_ods::coll::icu_strength_of_ttype(*tt).is_some()
-            || *tt == fire_crab_ods::coll::TTYPE_PXW_INTL);
+    let explicit_ok = matches!(explicit_collate_of(&lhs), Some(tt)
+        if fire_crab_ods::intl::collation_id(tt as i16) == 0
+            || fire_crab_ods::coll::icu_strength_of_ttype(tt).is_some()
+            || tt == fire_crab_ods::coll::TTYPE_PXW_INTL);
     // A COMPARISON is [cmp_sides]' business: it knows both operands, and
     // it keys or refuses them by the rule above. Everything else on this
     // path - LIKE, STARTING WITH, CONTAINING, SIMILAR TO - matches
@@ -113060,12 +113251,24 @@ fn resolve_expr_term(
             };
             match collate_canon_of(&lhs) {
                 // the WRITTEN collation decides the prefix test, and it
-                // reads the CANONICAL form of both sides
-                Some((inner, tt, st)) => Term::ExprStarting(
-                    Box::new(Expr::CollCanon(Box::new(inner), tt, false)),
-                    fire_crab_ods::coll::icu_canonical(&p, st),
-                    *negated,
-                ),
+                // reads the CANONICAL form of both sides - a prefix
+                // written under a byte-carrier attachment read in the
+                // collation's set first (measured under -ch NONE: `U
+                // COLLATE UNICODE_CI STARTING WITH 'É'` counts the 'é'
+                // row; canonicalised as carrier chars it counted 0)
+                Some((inner, tt, st)) => {
+                    let cs = fire_crab_ods::intl::charset_id(tt as i16);
+                    let p = if fire_crab_ods::intl::byte_carrier(att) && !fire_crab_ods::intl::byte_carrier(cs) {
+                        transcode_text(att, cs, p.clone()).unwrap_or(p)
+                    } else {
+                        p
+                    };
+                    Term::ExprStarting(
+                        Box::new(Expr::CollCanon(Box::new(inner), tt, false)),
+                        fire_crab_ods::coll::icu_canonical(&p, st),
+                        *negated,
+                    )
+                }
                 None => Term::ExprStarting(Box::new(lhs), p, *negated),
             }
         }
@@ -113202,6 +113405,68 @@ fn resolve_expr_term(
         _ => {}
     }
     Some(term)
+}
+
+/// The explicit `COLLATE` an operand carries into a comparison, a
+/// match or a sort: the wrapper itself ([Expr::Collate]), or one under
+/// a function that keeps its operand's text type - the engine's
+/// result descriptor for these is the argument's, collation included.
+/// Measured on engine 2182 under -ch UTF8 over a UTF8 U holding 'é':
+/// `UPPER('é' COLLATE UNICODE_CI) = U` counts 1, and so do LOWER,
+/// TRIM, SUBSTRING, LEFT, RIGHT, REPLACE, REVERSE, LPAD, IIF, CASE,
+/// NULLIF and a COALESCE whose FIRST value carries it (`COALESCE(NULL,
+/// 'É' COLLATE UNICODE_CI) = U` 1, `COALESCE('z', 'É' COLLATE
+/// UNICODE_CI) = U` 0); a CAST (`CAST('É' COLLATE UNICODE_CI AS
+/// VARCHAR(5)) = U` 0) and a concatenation (`'x' || UPPER(...) = 'x'
+/// || U` 0) drop it. Only the wrapper was seen before, and every one
+/// of the function cells counted 0 - a silent wrong answer, since
+/// the literal under it resolves.
+fn explicit_collate_of(e: &Expr) -> Option<u16> {
+    match e {
+        Expr::Collate(_, tt) => Some(*tt),
+        // the SYNTHETIC casts the resolver wraps a conditional in (the
+        // CHAR pad, [pad_conditional]) are not the user's CAST
+        Expr::Cast(inner, CastTarget::Text { synthetic: true, .. }, _) => explicit_collate_of(inner),
+        Expr::Func(f, args) => match f {
+            // TRIM's source is its LAST argument: the written-out (or
+            // filled-in) character to trim comes first
+            SysFn::Trim(_) => args.last().and_then(explicit_collate_of),
+            SysFn::Upper
+            | SysFn::Lower
+            | SysFn::UpperCs(_)
+            | SysFn::LowerCs(_)
+            | SysFn::UpperColl(_)
+            | SysFn::LowerColl(_)
+            | SysFn::Substring
+            | SysFn::Left
+            | SysFn::Right
+            | SysFn::Replace
+            | SysFn::Reverse
+            | SysFn::Lpad
+            | SysFn::Rpad => args.first().and_then(explicit_collate_of),
+            _ => None,
+        },
+        Expr::Coalesce(args) => args
+            .iter()
+            .find(|a| !matches!(synthetic_inner(a), Expr::Null))
+            .and_then(explicit_collate_of),
+        Expr::Iif(_, a, _) | Expr::NullIf(a, _) => explicit_collate_of(a),
+        Expr::Case(arms, els) => arms
+            .first()
+            .map(|(_, x)| x)
+            .or(els.as_deref())
+            .and_then(explicit_collate_of),
+        _ => None,
+    }
+}
+
+/// The expression under the resolver's SYNTHETIC text casts (the CHAR
+/// pad of [pad_conditional]), which are not the user's.
+fn synthetic_inner(e: &Expr) -> &Expr {
+    match e {
+        Expr::Cast(inner, CastTarget::Text { synthetic: true, .. }, _) => synthetic_inner(inner),
+        other => other,
+    }
 }
 
 /// Type-check (and where the engine converts, CONVERT) the two sides of
@@ -113528,8 +113793,46 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             // collation branches (a byte-carrier side bypasses collation
             // in the engine too). Two real charsets, or two byte
             // carriers, fall through to the existing paths unchanged.
-            if let (false, Some(ca), Some(cb)) =
-                (adopted, cmp_text_charset(&lhs, descs), cmp_text_charset(&rhs, descs))
+            //
+            // ...UNLESS AN EXPLICIT COLLATION NAMES A REAL SET: then the
+            // carrier side MOVES INTO that set by its bytes and the
+            // collation compares - the engine's CVT into the collated
+            // descriptor. Measured on engine 2182: under -ch NONE `U
+            // COLLATE UNICODE_CI = 'É'` counts 1 (the NONE 'É' is C3 89,
+            // read as UTF8), and under -ch UTF8 `N = CAST('É' AS
+            // VARCHAR(5) CHARACTER SET UTF8) COLLATE UNICODE_CI` over a
+            // NONE N holding C3 A9 counts 1; the byte-space branch
+            // compared octets for both and counted 0.
+            let coll_cs = explicit_collate_of(&lhs)
+                .or_else(|| explicit_collate_of(&rhs))
+                .map(|tt| fire_crab_ods::intl::charset_id(tt as i16))
+                .filter(|cs| !fire_crab_ods::intl::byte_carrier(*cs));
+            let (lhs, rhs) = match (coll_cs, cmp_text_charset(&lhs, descs), cmp_text_charset(&rhs, descs)) {
+                // ...an OCTETS side stays binary (measured under -ch UTF8:
+                // `O = CAST('É' AS VARCHAR(5) CHARACTER SET UTF8) COLLATE
+                // UNICODE_CI` over an OCTETS C3 A9 counts 0)
+                (Some(_), Some(ca), Some(cb))
+                    if ca == fire_crab_ods::intl::CS_OCTETS || cb == fire_crab_ods::intl::CS_OCTETS =>
+                {
+                    return Some((
+                        Expr::OctKey(Box::new(lhs), false),
+                        Expr::OctKey(Box::new(rhs), false),
+                    ));
+                }
+                (Some(cc), Some(ca), Some(cb)) => {
+                    let lift = |e: Expr, cs: u8| {
+                        if fire_crab_ods::intl::byte_carrier(cs) {
+                            Expr::CarrierDec(Box::new(e), cs, cc)
+                        } else {
+                            e
+                        }
+                    };
+                    (lift(lhs, ca), lift(rhs, cb))
+                }
+                _ => (lhs, rhs),
+            };
+            if let (false, None, Some(ca), Some(cb)) =
+                (adopted, coll_cs, cmp_text_charset(&lhs, descs), cmp_text_charset(&rhs, descs))
             {
                 use fire_crab_ods::intl::{byte_carrier, CS_OCTETS};
                 if byte_carrier(ca) != byte_carrier(cb) {
@@ -113561,7 +113864,7 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             // sides wrap so the ordinary value compare runs over
             // byte-string KEYS - and this comes FIRST, because a
             // binary side also bypasses the collation path
-            if expr_is_octets(&lhs, descs) || expr_is_octets(&rhs, descs) {
+            if coll_cs.is_none() && (expr_is_octets(&lhs, descs) || expr_is_octets(&rhs, descs)) {
                 return Some((
                     Expr::OctKey(Box::new(lhs), false),
                     Expr::OctKey(Box::new(rhs), false),
@@ -113579,10 +113882,10 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             // 'apple' too, measured) - and it beats the operand's own,
             // which is what writing it is for. The wrapper comes OFF
             // here: what the comparison needs is the KEY.
-            let explicit = |e: &Expr| match e {
-                Expr::Collate(_, tt) => Some(*tt),
-                _ => None,
-            };
+            // ...and it is READ THROUGH the functions that keep it
+            // ([explicit_collate_of]): `UPPER('é' COLLATE UNICODE_CI) =
+            // U` counts the 'é' row, as the engine does.
+            let explicit = explicit_collate_of;
             let unwrap = |e: Expr| match e {
                 Expr::Collate(inner, _) => *inner,
                 other => other,
