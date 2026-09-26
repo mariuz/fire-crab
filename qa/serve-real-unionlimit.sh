@@ -354,8 +354,8 @@ pin  "13 ...with OFFSET, under FIRST" "select first 2 id from t1 where exists (s
 pin  "13 an IN-subquery's ROWS under FIRST" "select first 2 id from t1 where id in (select id from t2 rows 3) order by id;" "ID|1|2"
 
 echo "--- 14. recorded, not fixed (second round)"
-refused "14 a window under a member's FIRST (the fold's row order is not the window's)" "select first 3 row_number() over (order by id desc) from t1 union all select first 1 x from t2;"
-refused "14 ...under FIRST alone" "select first 3 row_number() over (order by id desc) from t1;"
+same    "14 a window under a member's FIRST (answers since 2026-09-26: the fold keeps the window's order - the aggplan chunk)" "select first 3 row_number() over (order by id desc) from t1 union all select first 1 x from t2;"
+same    "14 ...under FIRST alone" "select first 3 row_number() over (order by id desc) from t1;"
 refused "14 a union ORDER BY of two keys (with or without FIRST)" "select first 1 id, a from t1 union all select first 1 id, x from t2 order by 1, 2 desc;"
 refused "14 a quantified comparison over a union" "select 1 from rdb\$database where 20 = any (select first 2 a from t1 union all select x from t2);"
 refused "14 a q-string (this server has none)" "select q'{'}', ' order ', ' union ' from t1 rows 1;"

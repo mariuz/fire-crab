@@ -11564,6 +11564,9 @@ struct Frame {
     mode: FrameMode,
     start: FrameBound,
     end: FrameBound,
+    /// a negative literal offset was written on either bound: the
+    /// engine's execute-time refusal ([EvalErr::WindowFrameNegative])
+    negative: bool,
 }
 
 /// The function a window column computes. An [AggFn] fold over a partition
@@ -29310,6 +29313,45 @@ fn plan_alter_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descri
     }
 }
 
+/// `CREATE OR ALTER VIEW <name> ...`: the CREATE planner over the text
+/// with `OR ALTER` removed, then a CreateView when no view of that name
+/// exists and an AlterView (the relation id survives) when one does -
+/// what the engine does by existence (measured: a first `CREATE OR
+/// ALTER VIEW V2 AS SELECT ID, S FROM T1` creates it, a second with
+/// another list redefines it, `SELECT * FROM V2` answers the new list).
+/// Refused generically until 2026-09-26.
+fn plan_create_or_alter_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim_start();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "CREATE", 0) != Some(0) {
+        return None;
+    }
+    let or_at = find_word(&masked, "OR", "CREATE".len())?;
+    if masked["CREATE".len()..or_at].trim() != "" {
+        return None;
+    }
+    let alter_at = find_word(&masked, "ALTER", or_at + 2)?;
+    if masked[or_at + 2..alter_at].trim() != "" {
+        return None;
+    }
+    let vk = find_word(&masked, "VIEW", alter_at + "ALTER".len())?;
+    if masked[alter_at + "ALTER".len()..vk].trim() != "" {
+        return None;
+    }
+    let create_sql = format!("CREATE VIEW {}", s[vk + "VIEW".len()..].trim_start());
+    let (create, descs) = plan_create_view(&create_sql, db)?;
+    let Plan::CreateView { name, blr, source, fields, contexts } = create else {
+        return None;
+    };
+    let exists = db.as_ref().is_some_and(|d| view_of(d, &name).is_some());
+    if exists {
+        Some((Plan::AlterView { name, blr, source, fields, contexts }, descs))
+    } else {
+        Some((Plan::CreateView { name, blr, source, fields, contexts }, descs))
+    }
+}
+
 /// Parse `DROP FILTER <name>`.
 fn plan_drop_filter(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
@@ -45009,6 +45051,46 @@ fn substitute_over_name(sql: &str, name: &str, spec: &str) -> String {
             out.push_str(spec);
             out.push(')');
             i = k;
+        } else if b.get(j) == Some(&b'(') {
+            // `OVER (<name> [ORDER BY ...] [frame])` REFINES the named
+            // window: its spec is the named one's PARTITION BY with the
+            // refinement appended (measured: `RANK() OVER (win ORDER BY
+            // val) .. WINDOW win AS (PARTITION BY grp)` ranks within grp
+            // by val). Only a legal refinement is spliced - the named
+            // window carries no ORDER BY or frame of its own, and the
+            // refinement starts with ORDER BY or a frame - so an illegal
+            // one keeps its text and refuses at the planner
+            let Some(close) = matching_paren(b, j) else {
+                i = j;
+                continue;
+            };
+            let inner = sql[j + 1..close].trim();
+            let nl = inner.bytes().take_while(|c| is_ident_byte(*c)).count();
+            let rest = inner[nl..].trim();
+            let rest_up = rest.to_ascii_uppercase();
+            let spec_up = spec.to_ascii_uppercase();
+            let spec_has = |kw: &str| find_word(&spec_up, kw, 0).is_some();
+            let rest_is = |kw: &str| find_word(&rest_up, kw, 0) == Some(0);
+            let refines = nl > 0
+                && inner[..nl].eq_ignore_ascii_case(name)
+                && !spec_has("ROWS")
+                && !spec_has("RANGE")
+                && (rest.is_empty()
+                    || (rest_is("ORDER") && !spec_has("ORDER"))
+                    || rest_is("ROWS")
+                    || rest_is("RANGE"));
+            if refines {
+                out.push('(');
+                out.push_str(spec);
+                if !rest.is_empty() {
+                    out.push(' ');
+                    out.push_str(rest);
+                }
+                out.push(')');
+                i = close + 1;
+            } else {
+                i = j;
+            }
         } else {
             // `OVER (` inline, or a different window name - leave the token
             i = j;
@@ -45035,6 +45117,794 @@ fn rewrite_named_windows(sql: &str) -> Option<String> {
         rewritten = substitute_over_name(&rewritten, name, spec);
     }
     Some(rewritten)
+}
+
+/// A WINDOWED SELECT OVER ANYTHING BUT A PLAIN RELATION IS PLANNED AS
+/// WINDOWS OVER THAT SELECT WITHOUT ITS WINDOWS.
+///
+/// The engine's plan for `SELECT grp, RANK() OVER (ORDER BY SUM(val)
+/// DESC) FROM w GROUP BY grp` is a window stream over the AGGREGATE
+/// stream (WindowedStream over the group's map); for a JOIN it is the
+/// window over the join; DISTINCT, FIRST/SKIP and the statement's ORDER
+/// BY sit ABOVE the window (measured: `SELECT FIRST 1 grp, RANK() OVER
+/// (ORDER BY SUM(val) DESC) .. GROUP BY grp` is A 1; `SELECT DISTINCT
+/// COUNT(*) OVER (PARTITION BY grp) FROM w ORDER BY 1` is 1, 2; `SELECT
+/// id FROM w ORDER BY ROW_NUMBER() OVER (ORDER BY val DESC)` is
+/// 2,3,1,5,4). This server's window fold lives on the single-relation
+/// projection and on a derived table only, so every one of those shapes
+/// refused until 2026-09-26.
+///
+/// Rather than teach each planner a window stage, the statement is
+/// REWRITTEN into the three levels the engine composes, and re-planned:
+///   L1  `SELECT <every non-window item> AS "FC$I<k>", <every expression
+///        a window call needs> AS "FC$W<k>", <every ORDER BY expression
+///        the select list has not got> AS "FC$O<k>" FROM <from> [WHERE]
+///        [GROUP BY] [HAVING]`   - the grouped / joined / derived query,
+///        planned by the planner that already answers it;
+///   L2  `SELECT "FC$I..", "FC$O..", <call over the "FC$W.." columns> AS
+///        "FC$X<k>" FROM (L1) "FC$D1"`   - the windows, folded by the
+///        derived-table path ([plan_over_source]), which delivers rows
+///        in the last sorted window's order ([compute_windows]);
+///   L3  `SELECT [FIRST][SKIP][DISTINCT] "FC$I.." AS <name>, <expression
+///        over "FC$X.."> FROM (L2) "FC$D2" [ORDER BY ...]`   - the names
+///        the statement describes, the modifiers, the ORDER BY.
+/// A window's argument, PARTITION BY and ORDER BY expressions are lifted
+/// WHOLE into L1 (an aggregate, a grouped column, a qualified join
+/// column all evaluate there); an expression AROUND a window call keeps
+/// its shape in L3 with its column references lifted token by token
+/// ([lift_column_tokens]). The describe survives the levels: a derived
+/// table's column keeps the base field name, relation and nullability
+/// ([plan_over_source]), and [inherit_rel_alias] restores the relation
+/// ALIAS the two wrappers would otherwise overwrite.
+///
+/// None when the statement is not a windowed one, when it is the PLAIN
+/// shape the projection path folds directly (one base relation, no
+/// aggregate, GROUP BY, HAVING, DISTINCT, FIRST/SKIP/ROWS, and no window
+/// in the ORDER BY), or when the text cannot be taken apart here (a
+/// `*`, a `?`, a FILTER on a window, a union); the caller then plans
+/// the original text, which refuses those as before. A level the
+/// planner declines is a clean refusal too: nothing here answers.
+fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<String> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "SELECT", 0) != Some(0) || find_word(&masked, "OVER", 0).is_none() {
+        return None;
+    }
+    if split_union(s).is_some() || masked.contains('?') {
+        return None;
+    }
+    let (core, distinct, skip, take) = match strip_modifiers(s) {
+        Some((_, _, _, _, true)) => return None,
+        Some((inner, d, sk, tk, false)) => (inner, d, sk, tk),
+        None => (s.to_string(), false, 0usize, None),
+    };
+    let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(&core)?;
+    let has_over = |t: &str| find_word(&mask_literals(&t.to_ascii_uppercase()), "OVER", 0).is_some();
+    let order_windowed = order_s.is_some_and(has_over);
+    if !has_over(proj_s) && !order_windowed {
+        return None;
+    }
+    // the plain shape stays on the projection path
+    let single_relation = parse_derived_table(table_s).is_none()
+        && parse_from(table_s).is_some_and(|(_, joins)| joins.is_empty())
+        && split_top_level_commas(table_s).len() == 1;
+    let items_raw = split_top_level_commas(proj_s);
+    let has_agg = items_raw.iter().any(|it| {
+        let (body, _) = split_alias(it.trim());
+        // an aggregate OUTSIDE a window call: strip the calls first
+        let bare = lift_window_calls(body).map(|(r, _)| r).unwrap_or_else(|| body.to_string());
+        parse_agg_item(bare.trim()).is_some()
+            || parse_raw_expr_any(bare.trim()).is_some_and(|r| raw_has_agg(&r))
+    });
+    // ...and so does a DERIVED TABLE whose windows are all bare items
+    // (the shape [plan_over_source] folds, and the shape L2 below HAS -
+    // which is what keeps this rewrite from re-entering on its own
+    // output). An expression around a window over a derived table is
+    // not that shape and is rewritten.
+    let derived_plain = parse_derived_table(table_s).is_some()
+        && items_raw.iter().all(|it| {
+            let (body, _) = split_alias(it.trim());
+            !has_over(body) || parse_window_item(body.trim()).is_some()
+        });
+    let plain = (single_relation || derived_plain)
+        && !distinct
+        && skip == 0
+        && take.is_none()
+        && group_s.is_none()
+        && having_s.is_none()
+        && !order_windowed
+        && !has_agg;
+    if plain || up.contains("\"FC$D1\"") {
+        return None;
+    }
+    // a rewrite nested more than one level deep is a loop, not a
+    // statement: every level this produces is either windowless or the
+    // derived-plain shape above, so one nesting (a derived table inside
+    // L1 that needs the rewrite itself) is the most a statement can ask
+    let depth = WIN_REWRITE_DEPTH.with(|d| d.get());
+    if depth > 1 {
+        return None;
+    }
+    let mut lift = WinLift::default();
+    // L1 items: (text, name) - the non-window items first, in order, so
+    // an ordinal GROUP BY / ORDER BY keeps its meaning
+    let mut l1_items: Vec<String> = Vec::new();
+    // L2 window items: the rewritten call and its synthetic name
+    let mut l2_wins: Vec<(String, String)> = Vec::new();
+    // L3 items: text, and for a plain item the L1 slot whose planned
+    // name it takes when the user gave no alias
+    struct L3Item {
+        text: String,
+        alias: Option<String>,
+        from_l1: Option<usize>,
+        /// the name the statement's ORDER BY may use for this item: the
+        /// alias, a column item's own name, a bare window's function
+        out_name: Option<String>,
+    }
+    let mut l3_items: Vec<L3Item> = Vec::new();
+    let quote = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+    let alias_canon = |a: &str| -> String {
+        let t = a.trim();
+        if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
+            t[1..t.len() - 1].replace("\"\"", "\"")
+        } else {
+            t.to_ascii_uppercase()
+        }
+    };
+    for it in &items_raw {
+        let it = it.trim();
+        if it.is_empty() {
+            return None;
+        }
+        let (body, alias) = split_alias(it);
+        let body = body.trim();
+        if body == "*" || body.ends_with(".*") {
+            return None;
+        }
+        let alias = alias.map(alias_canon);
+        if !has_over(body) {
+            let k = l1_items.len();
+            l1_items.push(format!("{} AS {}", body, quote(&format!("FC$I{}", k + 1))));
+            let own = if is_qualified_col(body) {
+                body.rsplit('.').next().and_then(canon_ident)
+            } else {
+                canon_ident(body)
+            };
+            let out_name = alias.clone().or(own);
+            l3_items.push(L3Item { text: quote(&format!("FC$I{}", k + 1)), alias, from_l1: Some(k), out_name });
+            continue;
+        }
+        // the window calls in this item, each rewritten over lifted
+        // expressions and folded at L2 under its own name
+        let (text, calls, whole) = lift.rewrite_calls(body, &mut l2_wins)?;
+        if whole {
+            // a bare window item: named by its function unless aliased
+            let (_, _, fname) = &calls[0];
+            let name = alias.unwrap_or_else(|| fname.clone());
+            l3_items.push(L3Item {
+                text: text.clone(),
+                alias: Some(name.clone()),
+                from_l1: None,
+                out_name: Some(name),
+            });
+        } else {
+            let text = lift.lift_column_tokens(&text);
+            l3_items.push(L3Item { text, out_name: alias.clone(), alias, from_l1: None });
+        }
+    }
+    // the statement's ORDER BY: an ordinal or an output name stays; a
+    // windowed key folds at L2; anything else is L1's to compute
+    let mut l3_order: Vec<String> = Vec::new();
+    if let Some(os) = order_s {
+        // the output names, for the "names an output column" test
+        let out_names: Vec<Option<String>> = l3_items.iter().map(|i| i.out_name.clone()).collect();
+        for key in split_top_level_commas(os) {
+            let key = key.trim();
+            let (core_k, dir) = split_order_direction(key);
+            let core_k = core_k.trim();
+            if core_k.is_empty() {
+                return None;
+            }
+            if core_k.chars().all(|c| c.is_ascii_digit()) {
+                l3_order.push(key.to_string());
+                continue;
+            }
+            let names_output = canon_ident(core_k).is_some_and(|n| {
+                out_names.iter().any(|o| o.as_deref() == Some(n.as_str()))
+            });
+            if names_output && !has_over(core_k) {
+                l3_order.push(key.to_string());
+                continue;
+            }
+            if has_over(core_k) {
+                let (text, _, whole) = lift.rewrite_calls(core_k, &mut l2_wins)?;
+                let text = if whole { text } else { lift.lift_column_tokens(&text) };
+                l3_order.push(format!("{}{}", text, dir));
+                continue;
+            }
+            let name = lift.name_for(core_k, "FC$O");
+            l3_order.push(format!("{}{}", quote(&name), dir));
+        }
+    }
+    // A GROUP BY name that is one of the statement's ALIASES names the
+    // item's BODY, and L1 - whose items are renamed FC$In - must group
+    // by that body, not by the base column the alias shadows: `SELECT
+    // VAL ID, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM W GROUP BY
+    // VAL, ID` groups by VAL twice over on the engine (measured: four
+    // groups), so L1 says `GROUP BY VAL, VAL`; the same rule that
+    // [parse_group_by] applies, applied to the text. A bare FIELD item
+    // of the same name beside the alias is the engine's 42702 (`SELECT
+    // ID, VAL ID ... GROUP BY ID`), posted here and left to refuse; an
+    // alias over a WINDOW item is the engine's -104 "Cannot use an
+    // aggregate or window function in a GROUP BY clause", a refusal.
+    let group_s: Option<String> = match group_s {
+        None => None,
+        Some(g) => {
+            let mut parts: Vec<String> = Vec::new();
+            for part in split_top_level_commas(g) {
+                let part = part.trim();
+                let Some(name) = canon_ident(part) else {
+                    parts.push(part.to_string());
+                    continue;
+                };
+                let mut body_of: Option<&str> = None;
+                let mut field_item = false;
+                for it in &items_raw {
+                    let (body, alias) = split_alias(it.trim());
+                    let body = body.trim();
+                    match alias.map(alias_canon) {
+                        Some(a) if a == name => {
+                            if has_over(body) {
+                                return None;
+                            }
+                            body_of = Some(body);
+                        }
+                        Some(_) => {}
+                        None => {
+                            let own = if is_qualified_col(body) {
+                                body.rsplit('.').next().and_then(canon_ident)
+                            } else {
+                                canon_ident(body)
+                            };
+                            if own.as_deref() == Some(name.as_str()) {
+                                field_item = true;
+                            }
+                        }
+                    }
+                }
+                match body_of {
+                    Some(_) if field_item => {
+                        PREPARE_REFUSAL.with(|r| {
+                            *r.borrow_mut() = Some(EvalErr::AmbiguousField {
+                                first: "a field".to_string(),
+                                second: "an alias in the select list with name".to_string(),
+                                name: name.clone(),
+                            })
+                        });
+                        return None;
+                    }
+                    Some(b) => parts.push(b.to_string()),
+                    None => parts.push(part.to_string()),
+                }
+            }
+            Some(parts.join(", "))
+        }
+    };
+    let group_s = group_s.as_deref();
+    // L1 - the query without its windows
+    let mut l1 = String::from("SELECT ");
+    let mut first = true;
+    let mut push_item = |l1: &mut String, t: &str| {
+        if !first {
+            l1.push_str(", ");
+        }
+        first = false;
+        l1.push_str(t);
+    };
+    for t in &l1_items {
+        push_item(&mut l1, t);
+    }
+    for (text, name) in &lift.exprs {
+        push_item(&mut l1, &format!("{} AS {}", text, quote(name)));
+    }
+    if l1_items.is_empty() && lift.exprs.is_empty() {
+        // nothing but windows over constants: one constant keeps the
+        // select list non-empty (a grouped query allows a literal)
+        push_item(&mut l1, "1 AS \"FC$D\"");
+    }
+    let l1_from = l1.len();
+    l1.push_str(" FROM ");
+    l1.push_str(table_s.trim());
+    if let Some(w) = where_s {
+        l1.push_str(" WHERE ");
+        l1.push_str(w.trim());
+    }
+    if let Some(g) = group_s {
+        l1.push_str(" GROUP BY ");
+        l1.push_str(g.trim());
+    }
+    if let Some(h) = having_s {
+        l1.push_str(" HAVING ");
+        l1.push_str(h.trim());
+    }
+    // the names of the unaliased plain items are what the statement
+    // WITHOUT its windows describes - a column's name, an aggregate's
+    // function, an expression's symbol, a derived column's own name -
+    // so that statement is planned once for them, every window item a
+    // literal in its place (an ordinal GROUP BY keeps its meaning)
+    let l1_names: Vec<String> = {
+        let mut probe = String::from("SELECT ");
+        let mut ps_items: Vec<String> = Vec::new();
+        for it in &items_raw {
+            let (body, _) = split_alias(it.trim());
+            ps_items.push(if has_over(body) { "1".to_string() } else { it.trim().to_string() });
+        }
+        probe.push_str(&ps_items.join(", "));
+        probe.push_str(&l1[l1_from..]);
+        let mut ps: Vec<Option<Descriptor>> = Vec::new();
+        WIN_REWRITE_DEPTH.with(|d| d.set(depth + 1));
+        let plan = plan_query_inner(&probe, db, &mut ps);
+        WIN_REWRITE_DEPTH.with(|d| d.set(depth));
+        let plan = plan?;
+        if matches!(plan, Plan::Refused | Plan::RefusedEval(_)) {
+            return None;
+        }
+        let cols = output_cols_of(&plan);
+        if cols.len() != items_raw.len() {
+            return None;
+        }
+        // the plain items' names, in their L1 order
+        let mut names = Vec::new();
+        for (c, it) in cols.iter().zip(items_raw.iter()) {
+            let (body, _) = split_alias(it.trim());
+            if !has_over(body) {
+                names.push(c.name.clone());
+            }
+        }
+        names
+    };
+    if l1_names.len() != l1_items.len() {
+        return None;
+    }
+    // L2 - the windows over L1
+    let mut l2 = String::from("SELECT ");
+    let mut parts: Vec<String> = Vec::new();
+    for k in 0..l1_items.len() {
+        parts.push(quote(&format!("FC$I{}", k + 1)));
+    }
+    for (_, name) in lift.exprs.iter().filter(|(_, n)| n.starts_with("FC$O") || n.starts_with("FC$C")) {
+        parts.push(quote(name));
+    }
+    for (call, name) in &l2_wins {
+        parts.push(format!("{} AS {}", call, quote(name)));
+    }
+    l2.push_str(&parts.join(", "));
+    l2.push_str(" FROM (");
+    l2.push_str(&l1);
+    l2.push_str(") \"FC$D1\"");
+    // L3 - the names, the modifiers, the ORDER BY
+    let mut l3 = String::from("SELECT");
+    if let Some(n) = take {
+        l3.push_str(&format!(" FIRST {}", n));
+    }
+    if skip > 0 {
+        l3.push_str(&format!(" SKIP {}", skip));
+    }
+    if distinct {
+        l3.push_str(" DISTINCT");
+    }
+    l3.push(' ');
+    let mut parts: Vec<String> = Vec::new();
+    for it in &l3_items {
+        let name = match (&it.alias, it.from_l1) {
+            (Some(a), _) => Some(a.clone()),
+            (None, Some(k)) => Some(l1_names[k].clone()),
+            (None, None) => None,
+        };
+        match name {
+            Some(n) => parts.push(format!("{} AS {}", it.text, quote(&n))),
+            None => parts.push(it.text.clone()),
+        }
+    }
+    l3.push_str(&parts.join(", "));
+    l3.push_str(" FROM (");
+    l3.push_str(&l2);
+    l3.push_str(") \"FC$D2\"");
+    if !l3_order.is_empty() {
+        l3.push_str(" ORDER BY ");
+        l3.push_str(&l3_order.join(", "));
+    }
+    Some(l3)
+}
+
+thread_local! {
+    /// how many windowed rewrites are being planned inside one another
+    /// ([rewrite_windowed_select]'s loop guard)
+    static WIN_REWRITE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The expressions a windowed rewrite lifts into its inner query, each
+/// once, under a synthetic name ([rewrite_windowed_select]).
+#[derive(Default)]
+struct WinLift {
+    /// (expression text, synthetic name)
+    exprs: Vec<(String, String)>,
+    /// windows lifted so far - the next `FC$X` number
+    nwin: usize,
+}
+
+impl WinLift {
+    /// The inner-query name for `text` - reused when the same text was
+    /// lifted before under the same prefix.
+    fn name_for(&mut self, text: &str, prefix: &str) -> String {
+        let t = text.trim();
+        if let Some((_, n)) = self.exprs.iter().find(|(e, n)| e == t && n.starts_with(prefix)) {
+            return n.clone();
+        }
+        let n = format!("{}{}", prefix, self.exprs.iter().filter(|(_, n)| n.starts_with(prefix)).count() + 1);
+        self.exprs.push((t.to_string(), n.clone()));
+        n
+    }
+
+    /// Every window call in `body`, rewritten over lifted expressions and
+    /// replaced by a reference to the L2 column it folds into. Answers
+    /// the rewritten body, the calls as (rewritten call, L2 name,
+    /// function name), and whether the body WAS one bare call.
+    fn rewrite_calls(
+        &mut self,
+        body: &str,
+        l2_wins: &mut Vec<(String, String)>,
+    ) -> Option<(String, Vec<(String, String, String)>, bool)> {
+        let mut text = body.to_string();
+        let mut calls = Vec::new();
+        let mut at = 0usize;
+        let mut whole = false;
+        while let Some((lo, hi)) = window_call_span(&text, at) {
+            let call = text[lo..=hi].to_string();
+            let (rewritten, fname) = self.rewrite_call(&call)?;
+            self.nwin += 1;
+            let name = format!("FC$X{}", self.nwin);
+            whole = lo == 0 && hi + 1 == text.trim_end().len() && calls.is_empty();
+            let reference = format!("\"{}\"", name);
+            text.replace_range(lo..=hi, &reference);
+            at = lo + reference.len();
+            l2_wins.push((rewritten.clone(), name.clone()));
+            calls.push((rewritten, name, fname));
+        }
+        if calls.is_empty() {
+            return None;
+        }
+        if whole && calls.len() > 1 {
+            whole = false;
+        }
+        Some((text, calls, whole))
+    }
+
+    /// One `NAME(args) OVER (spec)`: the arguments, PARTITION BY keys and
+    /// ORDER BY keys become lifted columns (a literal, `*` and a
+    /// DISTINCT/ALL quantifier stay); the frame text is kept. Answers the
+    /// call over those columns and the function's upper-cased name. A
+    /// FILTER clause declines (its predicate belongs to the inner scope).
+    fn rewrite_call(&mut self, call: &str) -> Option<(String, String)> {
+        let t = call.trim();
+        let b = t.as_bytes();
+        let lp = t.find('(')?;
+        let call_end = matching_paren(b, lp)?;
+        let fname = t[..lp].trim();
+        if !bare_ident_ok(fname) {
+            return None;
+        }
+        let after = t[call_end + 1..].trim_start();
+        if !after.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("OVER")) {
+            return None;
+        }
+        let tail = after[4..].trim_start();
+        if !tail.starts_with('(') {
+            return None;
+        }
+        let over_lp = t.len() - tail.len();
+        let over_end = matching_paren(b, over_lp)?;
+        if !t[over_end + 1..].trim().is_empty() {
+            return None;
+        }
+        let args = t[lp + 1..call_end].trim();
+        let mut new_args: Vec<String> = Vec::new();
+        if !args.is_empty() {
+            for a in split_top_level_commas(args) {
+                let a = a.trim();
+                let (q, expr) = match a.get(..9).filter(|w| w.eq_ignore_ascii_case("DISTINCT ")) {
+                    Some(_) => ("DISTINCT ", a[9..].trim()),
+                    None => match a.get(..4).filter(|w| w.eq_ignore_ascii_case("ALL ")) {
+                        Some(_) => ("ALL ", a[4..].trim()),
+                        None => ("", a),
+                    },
+                };
+                if expr == "*" || is_literal_text(expr) {
+                    new_args.push(format!("{}{}", q, expr));
+                } else {
+                    let n = self.name_for(expr, "FC$W");
+                    new_args.push(format!("{}\"{}\"", q, n));
+                }
+            }
+        }
+        let spec = t[over_lp + 1..over_end].trim();
+        let spec_up = mask_literals(&spec.to_ascii_uppercase());
+        let frame_at = ["ROWS", "RANGE", "GROUPS"]
+            .iter()
+            .filter_map(|kw| find_word_depth0(&spec_up, kw, 0))
+            .min();
+        let (head, frame) = match frame_at {
+            Some(p) => (&spec[..p], Some(spec[p..].trim())),
+            None => (spec, None),
+        };
+        let head_up = mask_literals(&head.to_ascii_uppercase());
+        let order_at = find_word_depth0(&head_up, "ORDER", 0);
+        let (part_s, order_s) = match order_at {
+            Some(p) => (&head[..p], Some(head[p + 5..].trim())),
+            None => (head, None),
+        };
+        let mut out = String::new();
+        let part_s = part_s.trim();
+        if !part_s.is_empty() {
+            let list = part_s
+                .get(..12)
+                .filter(|w| w.eq_ignore_ascii_case("PARTITION BY"))
+                .and(part_s.get(12..))?
+                .trim();
+            let mut keys = Vec::new();
+            for k in split_top_level_commas(list) {
+                let n = self.name_for(k.trim(), "FC$W");
+                keys.push(format!("\"{}\"", n));
+            }
+            out.push_str("PARTITION BY ");
+            out.push_str(&keys.join(", "));
+        }
+        if let Some(os) = order_s {
+            let list = os.get(..2).filter(|w| w.eq_ignore_ascii_case("BY")).and(os.get(2..))?.trim();
+            let mut keys = Vec::new();
+            for k in split_top_level_commas(list) {
+                let (core_k, dir) = split_order_direction(k.trim());
+                let n = self.name_for(core_k.trim(), "FC$W");
+                keys.push(format!("\"{}\"{}", n, dir));
+            }
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str("ORDER BY ");
+            out.push_str(&keys.join(", "));
+        }
+        if let Some(f) = frame {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(f);
+        }
+        Some((format!("{}({}) OVER ({})", fname, new_args.join(", "), out), fname.to_ascii_uppercase()))
+    }
+
+    /// The column references of an expression that stays at L3, each
+    /// lifted into L1 under a synthetic name and replaced in the text:
+    /// a bare or qualified identifier that is neither a keyword, a
+    /// function call's name, a literal nor an `FC$` reference. A
+    /// mis-taken token makes a level that does not plan - a refusal,
+    /// never a wrong value.
+    fn lift_column_tokens(&mut self, text: &str) -> String {
+        let b = text.as_bytes();
+        let mut out = String::new();
+        let mut i = 0usize;
+        let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+        while i < b.len() {
+            let c = b[i];
+            if c == b'\'' {
+                // a string literal, `''` escaped
+                let start = i;
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\'' {
+                        if b.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push_str(&text[start..i]);
+                continue;
+            }
+            if c == b'"' || c.is_ascii_alphabetic() || c == b'_' {
+                // an identifier chain: `a`, `"a"`, `a.b`, `a."b"`, `a.b.c`
+                let start = i;
+                loop {
+                    if b.get(i) == Some(&b'"') {
+                        i += 1;
+                        while i < b.len() {
+                            if b[i] == b'"' {
+                                if b.get(i + 1) == Some(&b'"') {
+                                    i += 2;
+                                    continue;
+                                }
+                                i += 1;
+                                break;
+                            }
+                            i += 1;
+                        }
+                    } else {
+                        while i < b.len() && is_ident(b[i]) {
+                            i += 1;
+                        }
+                    }
+                    if b.get(i) == Some(&b'.')
+                        && b.get(i + 1).is_some_and(|n| *n == b'"' || n.is_ascii_alphabetic() || *n == b'_')
+                    {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                let tok = &text[start..i];
+                let mut j = i;
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let is_call = b.get(j) == Some(&b'(');
+                // an AGGREGATE call is the inner query's whole: `SUM(VAL)
+                // * 100 / SUM(SUM(VAL)) OVER ()` lifts `SUM(VAL)` as one
+                // expression (its own FILTER included), never its
+                // argument's columns
+                if is_call && !tok.contains('.') && !tok.starts_with('"') && agg_named(tok) {
+                    if let Some(close) = matching_paren(b, j) {
+                        let mut end = close + 1;
+                        let mut k = end;
+                        while k < b.len() && b[k].is_ascii_whitespace() {
+                            k += 1;
+                        }
+                        if text[k..].get(..6).is_some_and(|w| w.eq_ignore_ascii_case("FILTER")) {
+                            let mut l = k + 6;
+                            while l < b.len() && b[l].is_ascii_whitespace() {
+                                l += 1;
+                            }
+                            if b.get(l) == Some(&b'(') {
+                                if let Some(fc) = matching_paren(b, l) {
+                                    end = fc + 1;
+                                }
+                            }
+                        }
+                        let n = self.name_for(&text[start..end], "FC$C");
+                        out.push_str(&format!("\"{}\"", n));
+                        i = end;
+                        continue;
+                    }
+                }
+                let bare = !tok.contains('.') && !tok.starts_with('"');
+                let keyword = bare && WIN_EXPR_KEYWORDS.contains(&tok.to_ascii_uppercase().as_str());
+                let placeholder = tok.starts_with("\"FC$");
+                if is_call || keyword || placeholder {
+                    out.push_str(tok);
+                } else {
+                    let n = self.name_for(tok, "FC$C");
+                    out.push_str(&format!("\"{}\"", n));
+                }
+                continue;
+            }
+            if c.is_ascii_digit() {
+                let start = i;
+                while i < b.len() && (is_ident(b[i]) || b[i] == b'.') {
+                    i += 1;
+                }
+                out.push_str(&text[start..i]);
+                continue;
+            }
+            out.push(c as char);
+            i += 1;
+        }
+        out
+    }
+}
+
+/// The words an expression around a window call may carry that are NOT
+/// column references ([WinLift::lift_column_tokens]).
+const WIN_EXPR_KEYWORDS: &[&str] = &[
+    "AND", "OR", "NOT", "IS", "NULL", "TRUE", "FALSE", "UNKNOWN", "LIKE", "IN", "BETWEEN",
+    "ESCAPE", "AS", "CASE", "WHEN", "THEN", "ELSE", "END", "CAST", "SIMILAR", "TO",
+    "CONTAINING", "STARTING", "WITH", "DISTINCT", "FROM", "ALL", "ANY", "SOME", "EXISTS",
+    "SELECT", "WHERE", "ORDER", "BY", "GROUP", "HAVING", "ASC", "DESC", "NULLS", "FIRST",
+    "LAST", "COLLATE", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER",
+    "CURRENT_ROLE", "USER", "LOCALTIME", "LOCALTIMESTAMP", "DAY", "MONTH", "YEAR", "HOUR",
+    "MINUTE", "SECOND", "MILLISECOND", "WEEK", "WEEKDAY", "YEARDAY", "TIMEZONE_HOUR",
+    "TIMEZONE_MINUTE", "INTEGER", "INT", "SMALLINT", "BIGINT", "INT128", "VARCHAR", "CHAR",
+    "CHARACTER", "VARYING", "NUMERIC", "DECIMAL", "DECFLOAT", "FLOAT", "DOUBLE", "PRECISION",
+    "DATE", "TIME", "TIMESTAMP", "BLOB", "BOOLEAN", "ZONE", "LEADING", "TRAILING", "BOTH",
+    "FOR", "PLACING", "SUB_TYPE", "SET", "DEFAULT", "INTERVAL", "TEXT", "BINARY", "VARBINARY",
+    "NEXT", "VALUE", "WITHOUT", "TIMEZONE", "OVER", "PARTITION", "ROWS", "RANGE",
+];
+
+/// A literal an inner query need not compute: a number, a string, or
+/// NULL / TRUE / FALSE.
+fn is_literal_text(t: &str) -> bool {
+    let t = t.trim();
+    let up = t.to_ascii_uppercase();
+    if matches!(up.as_str(), "NULL" | "TRUE" | "FALSE") {
+        return true;
+    }
+    if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
+        return true;
+    }
+    let num = t.strip_prefix('-').or_else(|| t.strip_prefix('+')).unwrap_or(t).trim();
+    !num.is_empty() && num.chars().all(|c| c.is_ascii_digit() || c == '.') && num.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// An ORDER BY key split into its expression and its trailing direction
+/// (` DESC`, ` ASC NULLS LAST`, ...), the direction as written.
+fn split_order_direction(key: &str) -> (&str, String) {
+    let t = key.trim_end();
+    let up = t.to_ascii_uppercase();
+    let mut end = t.len();
+    let strip = |up: &str, end: usize, word: &str| -> Option<usize> {
+        let head = up[..end].trim_end();
+        let h = head.strip_suffix(word)?;
+        if h.ends_with(|c: char| c.is_whitespace()) {
+            Some(h.len())
+        } else {
+            None
+        }
+    };
+    if let Some(e) = strip(&up, end, "FIRST").or_else(|| strip(&up, end, "LAST")) {
+        if let Some(e2) = strip(&up, e, "NULLS") {
+            end = e2;
+        }
+    }
+    if let Some(e) = strip(&up, end, "ASC").or_else(|| strip(&up, end, "DESC")) {
+        end = e;
+    }
+    let core = t[..end].trim_end();
+    (core, format!(" {}", t[core.len()..].trim()).trim_end().to_string())
+}
+
+/// After a windowed rewrite ([rewrite_windowed_select]) the two derived
+/// wrappers announce their own binding alias on every plain column; the
+/// engine announces the BASE relation's alias, as the unwrapped
+/// statement would. Walk L3 -> L2 -> L1 and copy the L1 column's alias
+/// up through both levels (a Modified wrapper's own column copy too).
+fn inherit_rel_alias(plan: Plan) -> Plan {
+    fn fix(plan: &mut Plan) {
+        match plan {
+            Plan::Modified { inner, cols, .. } => {
+                fix(inner);
+                let oc = output_cols_of(inner);
+                for (i, c) in cols.iter_mut().enumerate() {
+                    if let Some(o) = oc.get(i) {
+                        c.rel_alias = o.rel_alias.clone();
+                    }
+                }
+            }
+            Plan::Derived { inner, cols, .. } => {
+                if let Plan::Derived { inner: l1, cols: c2, .. } = &mut **inner {
+                    let l1_cols = output_cols_of(l1);
+                    for c in c2.iter_mut() {
+                        if c.expr.is_none() {
+                            if let Some(src) = l1_cols.get(c.field_id) {
+                                c.rel_alias = src.rel_alias.clone();
+                            }
+                        }
+                    }
+                    for c in cols.iter_mut() {
+                        if c.expr.is_none() {
+                            if let Some(src) = c2.get(c.field_id) {
+                                c.rel_alias = src.rel_alias.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut plan = plan;
+    fix(&mut plan);
+    plan
 }
 
 /// `<name> AS (` at a word boundary in the (masked, uppercased) text
@@ -47393,6 +48263,12 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     // the limit-clause grammar around UNION is the PARSER's, so it is
     // judged on the text as sent, before any rewrite ([limit_clause_lint])
     let lint = if outermost { Some(limit_lint_scan_db(sql, db)) } else { None };
+    // ...and the window-frame grammar ([window_frame_lint]) is the
+    // parser's too: judged on the text as sent, after the limit lint
+    let lint = lint.map(|l| match l {
+        LimitLint { err: None, unknown } => LimitLint { err: window_frame_lint(sql), unknown },
+        other => other,
+    });
     // THE ENGINE'S -206 FOR A QUALIFIER NOTHING BINDS, judged on the text
     // as sent and only for a statement a client sent whole
     // ([SEMANTIC_SCAN_ARMED]): a parser error (the lint's -104) still
@@ -51366,6 +52242,38 @@ fn ident_span(b: &[char], at: usize) -> Option<(String, usize)> {
         return None;
     }
     Some((b[at..i].iter().collect(), i))
+}
+
+/// Does a GROUP BY or ORDER BY key name a column QUALIFIED (`W.ID`,
+/// `E.ID`) whose bare name is one of the select list's ALIASES? Such a
+/// key is the column on the engine, while the alias-first law
+/// ([parse_group_by]) would take the alias once the qualifier is
+/// stripped - so the single-relation path refuses it rather than
+/// answer the alias's grouping (measured, see the caller).
+fn alias_shadowed_qualified_key(proj_s: &str, group_s: Option<&str>, order_s: Option<&str>) -> bool {
+    let aliases: Vec<String> = split_top_level_commas(proj_s)
+        .into_iter()
+        .filter_map(|it| {
+            let (_, alias) = split_alias(it.trim());
+            let a = alias?.trim();
+            Some(match a.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                Some(inner) => inner.replace("\"\"", "\""),
+                None => a.to_ascii_uppercase(),
+            })
+        })
+        .collect();
+    if aliases.is_empty() {
+        return false;
+    }
+    let names_alias = |key: &str| -> bool {
+        let k = key.trim();
+        is_qualified_col(k)
+            && k.rsplit('.').next().and_then(canon_ident).is_some_and(|n| aliases.contains(&n))
+    };
+    group_s.is_some_and(|g| split_top_level_commas(g).iter().any(|k| names_alias(k)))
+        || order_s.is_some_and(|o| {
+            split_top_level_commas(o).iter().any(|k| names_alias(split_order_direction(k.trim()).0))
+        })
 }
 
 /// Drop a qualifier that names the query's ONE relation: `E.ID` and
@@ -55427,6 +56335,29 @@ fn plan_query_inner_at(
         }
     }
 
+    // A WINDOWED SELECT OVER A GROUPED, JOINED, DISTINCT OR LIMITED
+    // QUERY, or one ordered by a window, is re-planned as the three
+    // levels the engine composes ([rewrite_windowed_select]); the plain
+    // single-relation shape passes through to the projection path. A
+    // level that declines leaves the original text to refuse as before.
+    if let Some(rw) = rewrite_windowed_select(sql, db) {
+        if trace {
+            eprintln!("[srv] plan: windowed rewrite {:?}", rw);
+        }
+        let mut ps: Vec<Option<Descriptor>> = Vec::new();
+        let depth = WIN_REWRITE_DEPTH.with(|d| d.get());
+        WIN_REWRITE_DEPTH.with(|d| d.set(depth + 1));
+        let planned = plan_query_inner(&rw, db, &mut ps).map(downgrade_rewritten);
+        WIN_REWRITE_DEPTH.with(|d| d.set(depth));
+        match planned {
+            Some(Plan::Refused) | None => {}
+            Some(p) => {
+                params.clear();
+                params.extend(ps);
+                return Some(inherit_rel_alias(p));
+            }
+        }
+    }
     if let Some((inner_sql, distinct, skip, take, bad_order)) = strip_modifiers(sql) {
         if bad_order {
             if trace {
@@ -55492,14 +56423,13 @@ fn plan_query_inner_at(
         if matches!(&plan, Plan::Project { gen_cols, .. } if !gen_cols.is_empty()) {
             return Some(Plan::Refused);
         }
-        // a WINDOW under FIRST/SKIP/DISTINCT still refuses: the engine
-        // delivers a windowed query in its window's sort order, which the
-        // fold here does not keep (measured: `select first 3 row_number()
-        // over (order by id desc) from t1` is 1,2,3 on the engine, and
-        // lifting this refusal answered 6,5,4)
-        if matches!(&plan, Plan::Project { windows, .. } if !windows.is_empty()) {
-            return Some(Plan::Refused);
-        }
+        // a WINDOW under FIRST/SKIP/DISTINCT answers now: the engine
+        // delivers a windowed query in its LAST SORTED WINDOW's order
+        // (measured: `select first 3 row_number() over (order by id desc)
+        // from t1` is 1,2,3), and [compute_windows] leaves its rows in
+        // exactly that order, so the modifier reads them as the engine
+        // does. It refused until 2026-09-26, when the fold kept scan
+        // order and lifting the refusal answered 6,5,4.
         // A GROUP BY and a lone aggregate (a Scalar) under FIRST / SKIP /
         // DISTINCT materialise through [branch_rows_res], which reads both
         // as rows - the row source a union branch or a derived table
@@ -56510,6 +57440,18 @@ fn plan_query_inner_at(
                     _ => None,
                 },
             };
+            // A QUALIFIED GROUP BY / ORDER BY key is the COLUMN even when
+            // a select-list alias shadows its name (measured: `SELECT VAL
+            // ID, COUNT(*) FROM W GROUP BY W.ID` is -104 "Invalid
+            // expression in the select list" - VAL is ungrouped - and
+            // `GROUP BY ID, W.ID` groups five ways where `GROUP BY ID`
+            // groups four; `ORDER BY W.ID` over the grouped alias is the
+            // -104 of the ORDER BY clause). Stripped to its bare name the
+            // key would resolve to the ALIAS ([parse_group_by]'s law), so
+            // the shape is refused here, before the strip.
+            if alias_shadowed_qualified_key(proj_s, group_s, order_s) {
+                return Some(Plan::Refused);
+            }
             if let Some(rewritten) = unqualify_single(sql, &bind) {
                 if trace {
                     eprintln!("[srv] plan: unqualified to {:?}", rewritten);
@@ -57362,6 +58304,16 @@ fn plan_query_inner_at(
         SelItem::Expr(raw, ..) => raw_contains_gen(raw),
         _ => false,
     });
+    // HAVING WITHOUT GROUP BY makes the query ONE GLOBAL GROUP: a
+    // select list of constants answers one row when the condition holds
+    // (measured: `select 1 from w having count(*) > 1` is CONSTANT 1;
+    // `.. having count(*) > 100` no row; a bare column there is the
+    // engine's "Invalid expression in the select list", which stays a
+    // refusal here). Such a list takes the grouped path.
+    let has_agg = has_agg
+        || (having_s.is_some()
+            && group_s.is_none()
+            && items.iter().all(|i| matches!(i, SelItem::Expr(raw, ..) if raw_is_constant(raw))));
     let has_win = items.iter().any(|i| matches!(i, SelItem::Win(..) | SelItem::WinExpr(..)));
     // a generator advance in the select list needs the row-by-row Project
     // path; a grouped/aggregated query with one is not a shape we answer
@@ -57391,12 +58343,12 @@ fn plan_query_inner_at(
     // work, review-caught); the group machinery below computes once, at
     // fetch, and raises there
     let where_corr = corr_built_count() != corr_before;
-    if group_s.is_none() && having_s.is_none() && items.len() == 1 && params.is_empty() && !where_corr {
+    // an ORDER BY on the implicit group is the engine's to judge (`order
+    // by sum(id)` answers, `order by id` is its "Invalid expression in
+    // the ORDER BY clause"): the group machinery resolves it, so the
+    // fast path stands aside
+    if group_s.is_none() && having_s.is_none() && order_s.is_none() && items.len() == 1 && params.is_empty() && !where_corr {
         if let SelItem::Agg(func, target, alias) = &items[0] {
-            // ORDER BY on a single-row aggregate is meaningless; reject it
-            if order_s.is_some() {
-                return None;
-            }
             // the integer fast path computes at prepare; the shapes it
             // declines (MIN/MAX over text or temporal, SUM/AVG over
             // scaled numerics, COUNT(DISTINCT)) fall THROUGH to the
@@ -57658,13 +58610,32 @@ fn plan_query_inner_at(
                     SelItem::WinExpr(raw, calls, alias, fname) => {
                         let mut cols2: Vec<fire_crab_ods::catalog::RelationColumn> = columns.to_vec();
                         let mut descs2 = descs.clone();
+                        // the slots of the lifted windows that are NOT
+                        // nullable (a ranking, a COUNT), for the
+                        // expression's own nullability below
+                        let mut nn_slots: Vec<usize> = Vec::new();
                         for (n, (func, part_raw, order_raw, frame)) in calls.iter().enumerate() {
                             let (pc, spec) = plan_win_item(
                                 func, part_raw, order_raw, frame, &None,
                                 "", &columns, &descs, win_base, windows.len(),
                             )?;
+                            if pc.sql_type & 1 == 0 {
+                                nn_slots.push(pc.field_id);
+                            }
                             // the synthetic column reads the slot this
-                            // window will be folded into
+                            // window will be folded into - and its
+                            // descriptor must sit AT that slot's index:
+                            // the resolver types a column through
+                            // `descs[field_id]`. Pushed at `descs2.len()`
+                            // it landed there only while this was the
+                            // FIRST window of the statement, which is why
+                            // `ROW_NUMBER() OVER (..), ROW_NUMBER() OVER
+                            // (..) + 1` refused while the two items the
+                            // other way round answered (2026-09-26)
+                            let filler = desc_of_projcol(&pc);
+                            while descs2.len() < pc.field_id {
+                                descs2.push(filler.clone());
+                            }
                             cols2.push(fire_crab_ods::catalog::RelationColumn {
                                 name: format!("{}{}", WIN_PLACEHOLDER, n),
                                 field_id: u16::try_from(pc.field_id).ok()?,
@@ -57674,11 +58645,19 @@ fn plan_query_inner_at(
                             windows.push(spec);
                         }
                         let e = resolve_expr(&raw, &cols2, &descs2)?;
-                        let mut pc = build_expr_col_from(e, &fname, &descs2)?;
+                        let mut pc = build_expr_col_from(e.clone(), &fname, &descs2)?;
                         pc.name = alias.clone();
                         pc.fname = Some(fname.clone());
                         pc.relation = None;
                         pc.rel_alias = None;
+                        // NOT NULL travels through the window slot: a
+                        // ROW_NUMBER is not nullable and neither is
+                        // `ROW_NUMBER() OVER (..) + 1` (measured: ADD,
+                        // no Nullable flag); this announced it nullable
+                        let slot_nn = |fid: usize| -> bool { nn_slots.contains(&fid) };
+                        if !expr_nullable(&e, &slot_nn) {
+                            pc.sql_type &= !1;
+                        }
                         out.push(pc);
                     }
                 }
@@ -58551,6 +59530,14 @@ fn agg_result_desc(
     descs: &[Descriptor],
 ) -> Option<Descriptor> {
     let stripped = strip_collate_target(target);
+    // DISTINCT changes what is folded, never the result type: a
+    // SUM/AVG/MIN/MAX(DISTINCT x) is described as the plain fold over x
+    // (measured, 2026-09-26); COUNT keeps its own arm below
+    let stripped = match stripped {
+        AggTarget::Distinct(n) if !matches!(func, AggFn::Count) => AggTarget::Col(n),
+        AggTarget::DistinctExpr(e) if !matches!(func, AggFn::Count) => AggTarget::Expr(e),
+        other => other,
+    };
     // a COMPUTED BY column is typed by its defining EXPRESSION - demote
     // the target to its Expr form so the expression-source describe arms
     // handle it (resolve_expr expands the computed fid and casts to the
@@ -58703,6 +59690,24 @@ fn agg_result_desc(
             _ => None,
         };
     }
+    // AN AGGREGATE OVER THE UNTYPED NULL LITERAL: the engine types the
+    // literal CHAR(1) NONE, so SUM/AVG/MIN/MAX(NULL) describe as a
+    // nullable TEXT of length 1 and answer NULL; COUNT(NULL) is the
+    // usual INT64 and answers 0 (measured on 2182, `set sqlda_display`)
+    if let AggTarget::Expr(RawExpr::Null) | AggTarget::DistinctExpr(RawExpr::Null) = target {
+        return match func {
+            AggFn::Count => Some(int64(0)),
+            AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max => Some(Descriptor {
+                dtype: dtype::TEXT,
+                scale: 0,
+                length: 1,
+                sub_type: 0,
+                flags: 0,
+                offset: 1,
+            }),
+            _ => None,
+        };
+    }
     Some(match func {
         // a LIST result is a computed BLOB: no scalar slot descriptor -
         // LIST inside an expression stays refused (recorded boundary)
@@ -58728,7 +59733,17 @@ fn agg_result_desc(
             AggTarget::Expr(raw) => {
                 let e = resolve_expr_sink(raw, columns, descs, &mut Vec::new())?;
                 match e.type_of(descs)? {
-                    ExprType::Int => int64(0),
+                    // MIN/MAX keep the SOURCE's width: over a CASE of
+                    // INTEGERs the engine describes LONG (the bare item
+                    // arm measured it; this one said INT64, so
+                    // `COALESCE(MAX(CASE ..), -1)` announced 8 bytes
+                    // where the engine announces 4 - 2026-09-26)
+                    ExprType::Int => match result_width_bytes(&e, descs) {
+                        2 => Descriptor { dtype: dtype::SHORT, scale: 0, length: 2, sub_type: 0, flags: 0, offset: 1 },
+                        4 => Descriptor { dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 1 },
+                        16 => Descriptor { dtype: dtype::INT128, scale: 0, length: 16, sub_type: 0, flags: 0, offset: 1 },
+                        _ => int64(0),
+                    },
                     ExprType::Numeric => {
                         // the NUMERIC sub_type rides along (review-
                         // caught: MAX(N*2)+0 announced subtype 0 where
@@ -58964,6 +59979,32 @@ fn agg_slot_name(slot: usize) -> String {
 }
 
 /// Does this expression contain an AGGREGATE anywhere?
+/// A select-list expression with no column, parameter, subquery or
+/// aggregate in it - a literal, a context value, or arithmetic over
+/// them. What a HAVING without GROUP BY may project.
+fn raw_is_constant(e: &RawExpr) -> bool {
+    match e {
+        RawExpr::Int(_)
+        | RawExpr::Dec(..)
+        | RawExpr::Double(_)
+        | RawExpr::Bool(_)
+        | RawExpr::BareTrue
+        | RawExpr::Str(_)
+        | RawExpr::Null
+        | RawExpr::Hex(_)
+        | RawExpr::DateLit(_)
+        | RawExpr::TimeLit(_)
+        | RawExpr::TsLit(..)
+        | RawExpr::CtxUser
+        | RawExpr::CtxRole => true,
+        RawExpr::Neg(a) => raw_is_constant(a),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) => raw_is_constant(a) && raw_is_constant(b),
+        RawExpr::Cast(a, _) => raw_is_constant(a),
+        RawExpr::Coalesce(v) => v.iter().all(raw_is_constant),
+        _ => false,
+    }
+}
+
 fn raw_has_agg(e: &RawExpr) -> bool {
     !collect_aggs(e).is_empty()
 }
@@ -59246,8 +60287,8 @@ fn build_group_items(
                 let (f, t) = aggs.first()?.clone();
                 let d = agg_result_desc(f, &t, columns, descs)?;
                 let (src, distinct) = resolve_agg_src(&t, columns, descs, sink)?;
-                if distinct && !matches!(f, AggFn::Count) {
-                    return None; // only COUNT(DISTINCT) is answered
+                if distinct && !matches!(f, AggFn::Count | AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max) {
+                    return None; // DISTINCT folds: COUNT, SUM, AVG, MIN, MAX
                 }
                 // the item's OWN slot holds its first aggregate; any
                 // further ones are appended after the loop
@@ -59434,8 +60475,8 @@ fn build_group_items(
             SelItem::Agg(func, target, agg_alias) => {
                 let (src, distinct) = resolve_agg_src(target, columns, descs, sink)?;
 
-                if distinct && !matches!(func, AggFn::Count) {
-                    return None; // only COUNT(DISTINCT) is answered
+                if distinct && !matches!(func, AggFn::Count | AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max) {
+                    return None; // DISTINCT folds: COUNT, SUM, AVG, MIN, MAX
                 }
                 // the OUTPUT TYPE follows the function and its source
                 // (probed): COUNT is BIGINT; MIN/MAX keep the source's
@@ -59488,7 +60529,35 @@ fn build_group_items(
                 // EXPRESSION source is skipped on is_decfloat_arith (NOT
                 // df_expr), so a REFUSED shape (AVG(d16-d16)) still skips
                 // src_shape's `type_of()?` and falls to a clean None.
+                // AN AGGREGATE OVER THE UNTYPED NULL LITERAL: the engine
+                // types the literal CHAR(1) NONE, so SUM/AVG/MIN/MAX(NULL)
+                // describe as a nullable TEXT of length 1 and answer NULL
+                // (COUNT(NULL) is its usual INT64, 0) - measured on 2182
+                // with `set sqlda_display on`. Typed here as its own
+                // tuple; the source-shape typing below has no ExprType
+                // for a bare NULL and would refuse.
+                let null_lit = matches!(
+                    target,
+                    AggTarget::Expr(RawExpr::Null) | AggTarget::DistinctExpr(RawExpr::Null)
+                );
+                let null_tuple = if null_lit {
+                    Some(match func {
+                        AggFn::Count => (Wire::Int64, 580, 8, 0, 0),
+                        AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max => wire_for(&Descriptor {
+                            dtype: dtype::TEXT,
+                            scale: 0,
+                            length: 1,
+                            sub_type: 0,
+                            flags: 0,
+                            offset: 1,
+                        }),
+                        _ => return None,
+                    })
+                } else {
+                    None
+                };
                 let src_shape: Option<(ExprType, i8, NumRank)> = if df_wide.is_some()
+                    || null_lit
                     || matches!(&src, AggSrc::Expr(e) if is_decfloat_arith(e, descs))
                     || matches!(&src, AggSrc::Percentile { order: e, .. } if is_decfloat_arith(e, descs))
                     || matches!(&src, AggSrc::Pair(y, _) if is_decfloat_arith(y, descs))
@@ -59592,7 +60661,7 @@ fn build_group_items(
                     }),
                     _ => None,
                 });
-                let (wire, sql_type, length, scale, sub_type) = match df_tuple {
+                let (wire, sql_type, length, scale, sub_type) = match df_tuple.or(null_tuple) {
                     Some(t) => t,
                     None => match func {
                     // COUNT is INT64 and the ONE aggregate the engine
@@ -59899,7 +60968,7 @@ fn build_group_items(
                 } else {
                     let d = agg_result_desc(*f, t, columns, descs)?;
                     let (src, distinct) = resolve_agg_src(t, columns, descs, sink)?;
-                    if distinct && !matches!(f, AggFn::Count) {
+                    if distinct && !matches!(f, AggFn::Count | AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max) {
                         return None;
                     }
                     gitems.push(GItem::Agg(*f, stat_dec_src(*f, src, d.dtype == dtype::DEC128), distinct));
@@ -60148,7 +61217,7 @@ fn plan_group(
                 for (f, t) in &aggs {
                     let d = agg_result_desc(*f, t, columns, descs)?;
                     let (src, distinct) = resolve_agg_src(t, columns, descs, &mut **ps)?;
-                    if distinct && !matches!(f, AggFn::Count) {
+                    if distinct && !matches!(f, AggFn::Count | AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max) {
                         return None;
                     }
                     gitems.push(GItem::Agg(*f, stat_dec_src(*f, src, d.dtype == dtype::DEC128), distinct));
@@ -60363,55 +61432,89 @@ fn parse_group_by(
                 return None;
             }
         } else if canon.is_some() {
-            // a bare name is a COLUMN, or one of the select list's
-            // ALIASES: `SELECT G AS X ... GROUP BY X` groups by G (the
-            // engine resolves the alias). A real column of that name
-            // wins, which is what makes an alias that shadows one
-            // harmless.
+            // a bare name is one of the select list's ALIASES FIRST, and
+            // a COLUMN only when no item is aliased so: `SELECT G AS X
+            // ... GROUP BY X` groups by G, and so does `SELECT VAL ID,
+            // COUNT(*) FROM W GROUP BY VAL, ID` - the alias SHADOWS the
+            // base column ID (measured on 2182: four groups, 20 twice
+            // over, the same four for `GROUP BY ID` alone; a qualified
+            // `GROUP BY W.ID` is the column and refuses the ungrouped
+            // VAL). This server let the real column win, which grouped
+            // that statement five ways - a wrong answer in the rows.
             //
-            // ...EXCEPT WHEN THE ALIAS NAMES AN AGGREGATE, and there the
-            // "harmless" above was a WRONG ANSWER. Measured: the bare
-            // `SELECT COUNT(*) AS N FROM T GROUP BY N` refuses on the
-            // engine with 42000 / -104 / "Cannot use an aggregate
-            // function..." - the alias makes `GROUP BY N` look like it
-            // references the AGGREGATE, and the engine rejects the
-            // statement whether or not HAVING or ORDER BY names it
-            // (`ORDER BY 1` refuses too). This server took the real column
-            // and answered `2|1`. `SELECT COUNT(*) AS C FROM T GROUP BY N`
-            // is fine on both, so it is the COLLISION that is invalid, not
-            // the alias.
+            // The alias is what the select list SAYS, so the item's
+            // BODY is what the key becomes: a column item its column,
+            // an expression item its expression (`SELECT VAL+1 ID ...
+            // GROUP BY ID` groups by VAL+1 - measured, four groups
+            // 6/11/21/NULL).
             //
-            // The check runs BEFORE the column lookup precisely because a
-            // real column of that name exists in the failing case - that
-            // is what made it silent.
+            // WHEN THE ALIAS NAMES AN AGGREGATE the statement is
+            // invalid. Measured: the bare `SELECT COUNT(*) AS N FROM T
+            // GROUP BY N` refuses on the engine with 42000 / -104 /
+            // "Cannot use an aggregate function..." - the alias makes
+            // `GROUP BY N` look like it references the AGGREGATE, and
+            // the engine rejects the statement whether or not HAVING or
+            // ORDER BY names it (`ORDER BY 1` refuses too). This server
+            // once took the real column and answered `2|1`. `SELECT
+            // COUNT(*) AS C FROM T GROUP BY N` is fine on both, so it is
+            // the COLLISION that is invalid, not the alias.
             if items.iter().any(|it| matches!(it, SelItem::Agg(_, _, Some(a)) if a == name)) {
                 return None;
             }
-            match find_col(columns, name) {
-                Some(_) => name,
-                None => {
-                    let aliased = items.iter().find_map(|it| match it {
-                        SelItem::Col(c, Some(a)) if a == name => {
-                            Some(c.as_str())
-                        }
-                        _ => None,
-                    });
-                    match aliased {
-                        Some(c) => c,
-                        None => {
-                            // an alias over an EXPRESSION item groups by
-                            // that expression
-                            let raw = items.iter().find_map(|it| match it {
-                                SelItem::Expr(raw, n, _) if n == name => {
-                                    Some(raw.clone())
-                                }
-                                _ => None,
-                            })?;
-                            push_expr(raw, &mut key_exprs, &mut fids, sink)?;
-                            continue;
-                        }
-                    }
+            // the alias: a column item's, or an expression item's (an
+            // expression's NAME is its alias when it has one, else the
+            // engine's symbol - ADD, UPPER - which is not an alias and
+            // is left to the fallback below)
+            enum Aliased<'a> {
+                Col(&'a str),
+                Expr(RawExpr),
+            }
+            let aliased = items.iter().find_map(|it| match it {
+                SelItem::Col(c, Some(a)) if a == name => Some(Aliased::Col(c.as_str())),
+                SelItem::Expr(raw, n, sym) if n == name && n != sym => Some(Aliased::Expr(raw.clone())),
+                _ => None,
+            });
+            // ...and a bare FIELD item of that name beside it - `SELECT
+            // ID, VAL ID ... GROUP BY ID` (or `W.ID, VAL ID`) - is the
+            // engine's 42702 / -204 "Ambiguous field name between a
+            // field and an alias in the select list with name" / ID
+            // (measured; `GROUP BY ID, VAL` and a list without any
+            // aggregate raise it too). Posted for the outermost refusal
+            // arm to serve.
+            let field_item = items.iter().any(|it| match it {
+                SelItem::Col(c, None) => col_name_is(c.rsplit('.').next().unwrap_or(c), name),
+                _ => false,
+            });
+            if aliased.is_some() && field_item {
+                PREPARE_REFUSAL.with(|r| {
+                    *r.borrow_mut() = Some(EvalErr::AmbiguousField {
+                        first: "a field".to_string(),
+                        second: "an alias in the select list with name".to_string(),
+                        name: name.to_string(),
+                    })
+                });
+                return None;
+            }
+            match aliased {
+                Some(Aliased::Col(c)) => c,
+                Some(Aliased::Expr(raw)) => {
+                    push_expr(raw, &mut key_exprs, &mut fids, sink)?;
+                    continue;
                 }
+                None => match find_col(columns, name) {
+                    Some(_) => name,
+                    None => {
+                        // an expression item's SYMBOL (`GROUP BY UPPER`
+                        // over an unaliased UPPER(S)) groups by that
+                        // expression
+                        let raw = items.iter().find_map(|it| match it {
+                            SelItem::Expr(raw, n, _) if n == name => Some(raw.clone()),
+                            _ => None,
+                        })?;
+                        push_expr(raw, &mut key_exprs, &mut fids, sink)?;
+                        continue;
+                    }
+                },
             }
         } else {
             // not a bare column: an expression key - GROUP BY UPPER(S),
@@ -60439,6 +61542,20 @@ fn parse_group_by(
         }
         fids.push(rc.field_id as usize);
     }
+    // the same key named twice - `GROUP BY VAL, ID` under `SELECT VAL
+    // ID` resolves both to VAL, `GROUP BY ID, VAL, ID` spells it out -
+    // groups once (measured: the alias-shadowed statement's four groups
+    // are the same four as `GROUP BY VAL`, in the same order); the
+    // first spelling keeps its place in the group order
+    let mut seen: Vec<usize> = Vec::new();
+    fids.retain(|f| {
+        if seen.contains(f) {
+            false
+        } else {
+            seen.push(*f);
+            true
+        }
+    });
     if fids.is_empty() {
         None
     } else {
@@ -63633,6 +64750,18 @@ fn compute_windows(
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
     use std::cmp::Ordering::Equal;
     let n = rows.len();
+    // a negative literal frame offset is the engine's EXECUTE-time
+    // refusal, rows or no rows (measured over an empty table and under
+    // WHERE 1=0 alike) - so it is judged before any fold, over any input
+    for spec in windows {
+        let frame = match &spec.kind {
+            WinKind::Agg { frame, .. } | WinKind::Val { frame, .. } => frame.as_ref(),
+            _ => None,
+        };
+        if frame.is_some_and(|f| f.negative) {
+            return Err(EvalErr::WindowFrameNegative);
+        }
+    }
     // per-row value of each window, filled partition by partition
     let mut vals: Vec<Vec<Value>> = vec![vec![Value::Null; windows.len()]; n];
     // THE STAGES: the windows grouped by OVER clause, in first-appearance
@@ -65360,7 +66489,11 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                 // approximate value can never be SILENTLY DROPPED, which is
                 // what `numeric_parts` returning None used to do: AVG over a
                 // DOUBLE column folded nothing and answered NULL.
-                GItem::Agg(func @ (AggFn::Sum | AggFn::Avg), src, _) => {
+                GItem::Agg(func @ (AggFn::Sum | AggFn::Avg), src, distinct) => {
+                    // SUM/AVG(DISTINCT x): each distinct non-NULL value
+                    // counts once - the COUNT(DISTINCT) seen-list, the
+                    // same exact comparison
+                    let mut seen: Vec<Value> = Vec::new();
                     let (mut sum, mut scale, mut n) = (0i128, None::<i8>, 0i64);
                     let (mut fsum, mut approx, mut exact_ovf) = (0f64, false, false);
                     // a DECFLOAT fold accumulates in decimal (the engine's
@@ -65373,6 +66506,12 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                     let mut dwide = false;
                     for r in rows {
                         let v = src_value(src, r)?;
+                        if *distinct && !matches!(v, Value::Null) {
+                            if seen.iter().any(|s| fold_cmp(s, &v, src) == std::cmp::Ordering::Equal) {
+                                continue;
+                            }
+                            seen.push(v.clone());
+                        }
                         if matches!(v, Value::DecFloat16(_) | Value::DecFloat34(_)) {
                             if matches!(v, Value::DecFloat34(_)) {
                                 dwide = true;
@@ -67161,6 +68300,18 @@ const GDS_INVALID_BOOLEAN_USAGE: i32 = 335545023;
 /// `WITH RECURSIVE X AS (<body naming X>)` whose body is NOT a union:
 /// @1 is BARE, the template supplies the parentheses (sqlerr.h:180).
 const GDS_DSQL_CTE_NOT_A_UNION: i32 = 336397229;
+/// `isc_dsql_window_incompat_frames` - "If <window frame bound 1>
+/// specifies @1, then <window frame bound 2> shall not specify @2"
+/// (jrd.h:797), posted BARE at prepare.
+const GDS_DSQL_WINDOW_INCOMPAT_FRAMES: i32 = 335545116;
+/// `isc_dsql_window_frame_value_inv_type` - "Window RANGE/ROWS/GROUPS
+/// PRECEDING/FOLLOWING value must be of a numerical type" (jrd.h:800),
+/// posted bare at prepare.
+const GDS_DSQL_WINDOW_FRAME_VALUE_INV_TYPE: i32 = 335545119;
+/// `isc_window_frame_value_invalid` - "Invalid PRECEDING or FOLLOWING
+/// offset in window function: cannot be negative" (jrd.h:801), raised
+/// at execute.
+const GDS_WINDOW_FRAME_VALUE_INVALID: i32 = 335545120;
 /// `isc_dsql_cte_miss_nonrecursive` - "Non-recursive member is missing
 /// in CTE '@1'". A recursive body that IS a union but whose FIRST
 /// member already names the CTE, so there is no anchor to start from:
@@ -67910,6 +69061,23 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(GDS_DSQL_CTE_CYCLE)
                 .int(2) // isc_arg_string - @1, quotes already applied
                 .bytes(name.as_bytes());
+        }
+        // the three window-frame vectors are BARE: the gds code and its
+        // arguments, no "Dynamic SQL Error" primary (measured: isql prints
+        // the SQLSTATE line and the message, nothing between)
+        EvalErr::WindowIncompatFrames(b1, b2) => {
+            w.int(1)
+                .int(GDS_DSQL_WINDOW_INCOMPAT_FRAMES)
+                .int(2) // isc_arg_string - @1, what bound 1 specifies
+                .bytes(b1.as_bytes())
+                .int(2) // isc_arg_string - @2, what bound 2 may not
+                .bytes(b2.as_bytes());
+        }
+        EvalErr::WindowFrameValueType => {
+            w.int(1).int(GDS_DSQL_WINDOW_FRAME_VALUE_INV_TYPE);
+        }
+        EvalErr::WindowFrameNegative => {
+            w.int(1).int(GDS_WINDOW_FRAME_VALUE_INVALID);
         }
         EvalErr::CteNotAUnion(name) => {
             w.int(1)
@@ -81913,6 +83081,24 @@ enum ArithOp {
 /// server would.
 #[derive(Debug, Clone, PartialEq)]
 enum EvalErr {
+    /// a window frame whose two bounds cannot meet - `isc_dsql_window_
+    /// incompat_frames` (42000, -104): *If <window frame bound 1>
+    /// specifies @1, then <window frame bound 2> shall not specify @2*.
+    /// Measured on engine 2182 at PREPARE: bound 1 FOLLOWING with bound
+    /// 2 PRECEDING or CURRENT ROW is ("FOLLOWING", "PRECEDING or CURRENT
+    /// ROW"); bound 1 CURRENT ROW with bound 2 PRECEDING is ("CURRENT
+    /// ROW", "PRECEDING"). The vector is the bare gds code and its two
+    /// strings - no "Dynamic SQL Error" line (ERRD_post of the code alone)
+    WindowIncompatFrames(&'static str, &'static str),
+    /// a frame offset that is not a number - `NULL PRECEDING`, `'a'
+    /// PRECEDING`: `isc_dsql_window_frame_value_inv_type` (42000, -104)
+    /// at PREPARE, bare like the one above (measured)
+    WindowFrameValueType,
+    /// a NEGATIVE frame offset - `-1 PRECEDING`, `(-1) FOLLOWING`:
+    /// `isc_window_frame_value_invalid` (42000, -833), raised at EXECUTE
+    /// (the describe is answered first; an empty input raises too -
+    /// measured over an empty table and under `WHERE 1=0`)
+    WindowFrameNegative,
     /// a TIME ZONE literal/string whose offset part is malformed or out
     /// of range: `isc_invalid_timezone_offset` (22009), the spelling as
     /// the one argument
@@ -96135,8 +97321,8 @@ fn eval_subquery_rel(
                 (agg_expr_src(e)?, false)
             }
         };
-        if distinct && !matches!(func, AggFn::Count) {
-            return None; // only COUNT(DISTINCT) is answered
+        if distinct && !matches!(func, AggFn::Count | AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max) {
+            return None; // DISTINCT folds: COUNT, SUM, AVG, MIN, MAX
         }
         let gitems = vec![GItem::Agg(func, src, distinct)];
         let rows =
@@ -97127,11 +98313,20 @@ fn parse_window_item(
     // the engine's own error for a shape this build does not answer).
     // LIST too: its whole-partition window form (the engine refuses the
     // ordered/framed ones itself) is a later slice.
-    if matches!(&func, WinFunc::Agg(f, _) if f.is_statistical() || matches!(f, AggFn::List)) {
+    if matches!(&func, WinFunc::Agg(AggFn::List, _)) {
         return None;
     }
     let spec = t[over_lp + 1..over_end].trim();
     let (part, order, frame) = parse_over_spec(spec)?;
+    // the engine refuses DISTINCT in a window with an ORDER BY or a
+    // ROWS frame (WindowedStream.cpp: "DISTINCT is not supported in
+    // windows with ORDER BY or frame by ROWS/GROUPS clauses"); this
+    // build refuses too rather than folding it
+    if matches!(&func, WinFunc::Agg(_, AggTarget::Distinct(_) | AggTarget::DistinctExpr(_)))
+        && (order.is_some() || frame.is_some())
+    {
+        return None;
+    }
     // a frame is answered only WITH an ORDER BY (it is relative to it). An
     // explicit ROWS frame rides an AGGREGATE or a VALUE function (FIRST/
     // LAST/NTH_VALUE); a RANGE-offset frame rides an AGGREGATE only (a
@@ -97322,6 +98517,12 @@ fn parse_over_spec(spec: &str) -> Option<(Vec<RawExpr>, Option<String>, Option<F
 
 /// Parse an explicit frame - `<ROWS|RANGE> BETWEEN <start> AND <end>`, or
 /// the `<ROWS|RANGE> <start>` shorthand (end = CURRENT ROW).
+///
+/// The bound COMBINATIONS the engine refuses are not judged here: they
+/// are the statement-level [window_frame_lint]'s, which sees the whole
+/// text and answers the engine's own vectors and positions. A NEGATIVE
+/// literal offset parses (its magnitude is kept) and marks the frame,
+/// which raises at EXECUTE ([EvalErr::WindowFrameNegative]).
 fn parse_frame_clause(s: &str) -> Option<Frame> {
     // the mode word, then the extent
     let (mode, kwlen) = if s.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("ROWS")) {
@@ -97336,34 +98537,251 @@ fn parse_frame_clause(s: &str) -> Option<Frame> {
     if up.strip_prefix("BETWEEN ").is_some() {
         // BETWEEN <start> AND <end>; split at the depth-0 ` AND `
         let and_at = find_word_depth0(&up, "AND", "BETWEEN ".len())?;
-        let start = parse_frame_bound(body["BETWEEN ".len()..and_at].trim())?;
-        let end = parse_frame_bound(body[and_at + "AND".len()..].trim())?;
-        Some(Frame { mode, start, end })
+        let (start, n1) = parse_frame_bound(body["BETWEEN ".len()..and_at].trim())?;
+        let (end, n2) = parse_frame_bound(body[and_at + "AND".len()..].trim())?;
+        Some(Frame { mode, start, end, negative: n1 || n2 })
     } else {
         // shorthand: <mode> <start> == BETWEEN <start> AND CURRENT ROW
-        Some(Frame { mode, start: parse_frame_bound(body)?, end: FrameBound::CurrentRow })
+        let (start, negative) = parse_frame_bound(body)?;
+        Some(Frame { mode, start, end: FrameBound::CurrentRow, negative })
     }
 }
 
 /// One frame bound: `UNBOUNDED PRECEDING`, `<n> PRECEDING`, `CURRENT ROW`,
-/// `<n> FOLLOWING`, `UNBOUNDED FOLLOWING` (n a non-negative integer).
-fn parse_frame_bound(s: &str) -> Option<FrameBound> {
+/// `<n> FOLLOWING`, `UNBOUNDED FOLLOWING`. `n` is an integer literal,
+/// optionally negative and optionally parenthesised - `-1 PRECEDING`
+/// and `(-1) PRECEDING` are the engine's execute-time refusal, not a
+/// parse error (measured), so the second field says "negative" and the
+/// bound carries the magnitude.
+fn parse_frame_bound(s: &str) -> Option<(FrameBound, bool)> {
     let t = s.trim();
     let up = t.to_ascii_uppercase();
     match up.as_str() {
-        "UNBOUNDED PRECEDING" => Some(FrameBound::UnboundedPreceding),
-        "UNBOUNDED FOLLOWING" => Some(FrameBound::UnboundedFollowing),
-        "CURRENT ROW" => Some(FrameBound::CurrentRow),
+        "UNBOUNDED PRECEDING" => Some((FrameBound::UnboundedPreceding, false)),
+        "UNBOUNDED FOLLOWING" => Some((FrameBound::UnboundedFollowing, false)),
+        "CURRENT ROW" => Some((FrameBound::CurrentRow, false)),
         _ => {
+            let offset = |n: &str| -> Option<(usize, bool)> {
+                let mut v = n.trim();
+                if let Some(inner) = v.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+                    v = inner.trim();
+                }
+                let (neg, mag) = match v.strip_prefix('-') {
+                    Some(m) => (true, m.trim()),
+                    None => (false, v),
+                };
+                Some((mag.parse::<usize>().ok()?, neg))
+            };
             if let Some(n) = up.strip_suffix(" PRECEDING") {
-                Some(FrameBound::Preceding(n.trim().parse::<usize>().ok()?))
+                let (k, neg) = offset(n)?;
+                Some((FrameBound::Preceding(k), neg))
             } else if let Some(n) = up.strip_suffix(" FOLLOWING") {
-                Some(FrameBound::Following(n.trim().parse::<usize>().ok()?))
+                let (k, neg) = offset(n)?;
+                Some((FrameBound::Following(k), neg))
             } else {
                 None
             }
         }
     }
+}
+
+/// THE ENGINE'S WINDOW-FRAME GRAMMAR AND ITS BOUND RULE, judged once on
+/// the statement as sent - every `OVER (...)` at any depth (a derived
+/// table's, a CTE's, a subquery's), in text order. Measured on engine
+/// 2182 (`select id, sum(val) over (order by id rows between <b1> and
+/// <b2>) from w`, and the `rows <b1>` shorthand):
+///   - the PARSER has no `UNBOUNDED FOLLOWING` as bound 1, no
+///     `UNBOUNDED PRECEDING` as bound 2, and no FOLLOWING at all in the
+///     shorthand: each is -104 *Token unknown* at that keyword, line and
+///     column as the lexer counts ([line_col_of]), the token as written;
+///   - bound 1 FOLLOWING with bound 2 PRECEDING or CURRENT ROW, and
+///     bound 1 CURRENT ROW with bound 2 PRECEDING, are the semantic
+///     [EvalErr::WindowIncompatFrames] - `1 following and 1 preceding`
+///     included;
+///   - an offset that is NULL or a string literal is
+///     [EvalErr::WindowFrameValueType];
+///   - every other pair answers: an empty frame (`2 following and 1
+///     following`, `1 preceding and 2 preceding`) folds no rows.
+/// Parse errors outrank the semantic ones, as the parser runs first;
+/// among parse errors the earliest wins. None when every frame is legal
+/// (or there is no window at all - the common case, one word search).
+///
+/// A NAMED window's spec is judged the same way (`WINDOW W AS (ORDER BY
+/// ID ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW)`, and the ones after
+/// the comma): measured, each illegal pair raises the same vector from
+/// the WINDOW clause as from an OVER - the token error at its own
+/// column - and this server had folded them (NULLs, or 5,5,5,5,5 for
+/// `UNBOUNDED FOLLOWING` as bound 1). The lint holds for DML too - an
+/// UPDATE/DELETE subquery's window, an INSERT's source - where the
+/// engine refuses at prepare and changes nothing (measured; this
+/// server had updated five rows, emptied the table, inserted five).
+fn window_frame_lint(sql: &str) -> Option<EvalErr> {
+    let up = sql.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let b = masked.as_bytes();
+    let mut token_err: Option<EvalErr> = None;
+    let mut semantic: Option<EvalErr> = None;
+    // the `(` of every window spec, in text order: each OVER's, and
+    // each definition's in a WINDOW clause (`WINDOW <name> AS (...)
+    // [, <name> AS (...)]*`)
+    let mut specs: Vec<usize> = Vec::new();
+    let skip_ws = |mut i: usize| -> usize {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let mut from = 0usize;
+    while let Some(o) = find_word(&masked, "OVER", from) {
+        from = o + 4;
+        let lp = skip_ws(o + 4);
+        if b.get(lp) == Some(&b'(') {
+            specs.push(lp);
+        }
+    }
+    let mut from = 0usize;
+    while let Some(w) = find_word(&masked, "WINDOW", from) {
+        from = w + 6;
+        let mut at = w + 6;
+        loop {
+            // <name> AS (
+            let ns = skip_ws(at);
+            let mut ne = ns;
+            if b.get(ne) == Some(&b'"') {
+                ne += 1;
+                while ne < b.len() && b[ne] != b'"' {
+                    ne += 1;
+                }
+                ne += 1;
+            } else {
+                while ne < b.len() && is_ident_byte(b[ne]) {
+                    ne += 1;
+                }
+            }
+            if ne == ns {
+                break;
+            }
+            let a = skip_ws(ne);
+            if masked.get(a..a + 2) != Some("AS") {
+                break;
+            }
+            let lp = skip_ws(a + 2);
+            if b.get(lp) != Some(&b'(') {
+                break;
+            }
+            specs.push(lp);
+            let Some(rp) = matching_paren(b, lp) else { break };
+            let c = skip_ws(rp + 1);
+            if b.get(c) != Some(&b',') {
+                break;
+            }
+            at = c + 1;
+        }
+    }
+    specs.sort_unstable();
+    for lp in specs {
+        let Some(rp) = matching_paren(b, lp) else { break };
+        let spec_lo = lp + 1;
+        let spec = &masked[spec_lo..rp];
+        // the frame clause: the first depth-0 ROWS / RANGE / GROUPS
+        let frame_at = ["ROWS", "RANGE", "GROUPS"]
+            .iter()
+            .filter_map(|kw| find_word_depth0(spec, kw, 0).map(|p| (p, kw.len())))
+            .min();
+        let Some((fp, kwlen)) = frame_at else { continue };
+        let body_lo = spec_lo + fp + kwlen;
+        let body = &masked[body_lo..rp];
+        // a bound as (text, absolute start): BETWEEN a AND b, or the
+        // shorthand's single bound
+        let bounds: Vec<(&str, usize)> = {
+            let bt = body.trim_start();
+            let bl = body_lo + (body.len() - bt.len());
+            if bt.starts_with("BETWEEN ") {
+                let after = bl + "BETWEEN ".len();
+                match find_word_depth0(&masked[after..rp], "AND", 0) {
+                    Some(a) => vec![(&masked[after..after + a], after), (&masked[after + a + 3..rp], after + a + 3)],
+                    None => continue,
+                }
+            } else {
+                vec![(bt, bl)]
+            }
+        };
+        let shorthand = bounds.len() == 1;
+        // (kind, offset text) of a bound: kind 0 unbounded preceding, 1
+        // preceding(n), 2 current row, 3 following(n), 4 unbounded
+        // following; the absolute position of its keyword
+        let classify = |t: &str, at: usize| -> Option<(u8, usize, String)> {
+            let lead = t.len() - t.trim_start().len();
+            let tt = t.trim();
+            let kw_at = |kw: &str| -> usize {
+                let inner = tt.len() - kw.len();
+                at + lead + inner
+            };
+            if tt == "UNBOUNDED PRECEDING" {
+                return Some((0, at + lead + "UNBOUNDED ".len(), String::new()));
+            }
+            if tt == "UNBOUNDED FOLLOWING" {
+                return Some((4, at + lead + "UNBOUNDED ".len(), String::new()));
+            }
+            if tt == "CURRENT ROW" {
+                return Some((2, at + lead, String::new()));
+            }
+            // the offset text is read from the ORIGINAL statement (the
+            // mask turns a string literal into X's, and X is a legal
+            // identifier start), at the same positions
+            if let Some(n) = tt.strip_suffix(" PRECEDING") {
+                return Some((1, kw_at("PRECEDING"), sql[at + lead..at + lead + n.len()].to_string()));
+            }
+            if let Some(n) = tt.strip_suffix(" FOLLOWING") {
+                return Some((3, kw_at("FOLLOWING"), sql[at + lead..at + lead + n.len()].to_string()));
+            }
+            None
+        };
+        let Some(b1) = classify(bounds[0].0, bounds[0].1) else { continue };
+        let b2 = if shorthand { None } else { classify(bounds[1].0, bounds[1].1) };
+        let token = |at: usize, len: usize| -> EvalErr {
+            let (line, col) = line_col_of(&sql[..at]);
+            EvalErr::TokenUnknown { line, col, token: sql[at..at + len].to_string() }
+        };
+        let mut this_token: Option<(usize, EvalErr)> = None;
+        // the parser's three holes, earliest first
+        if b1.0 == 4 || (shorthand && b1.0 == 3) {
+            this_token = Some((b1.1, token(b1.1, "FOLLOWING".len())));
+        }
+        if let Some(b2) = &b2 {
+            if b2.0 == 0 && this_token.as_ref().is_none_or(|(p, _)| b2.1 < *p) {
+                this_token = Some((b2.1, token(b2.1, "PRECEDING".len())));
+            }
+        }
+        if let Some((_, e)) = this_token {
+            if token_err.is_none() {
+                token_err = Some(e);
+            }
+            continue;
+        }
+        if semantic.is_some() {
+            continue;
+        }
+        // an offset that is not a number: NULL or a (masked) string literal
+        let non_numeric = |t: &str| -> bool {
+            let v = t.trim().trim_start_matches('(').trim_end_matches(')').trim();
+            v.eq_ignore_ascii_case("NULL") || v.starts_with('\'')
+        };
+        if non_numeric(&b1.2) || b2.as_ref().is_some_and(|x| non_numeric(&x.2)) {
+            semantic = Some(EvalErr::WindowFrameValueType);
+            continue;
+        }
+        if let Some(b2) = &b2 {
+            semantic = match (b1.0, b2.0) {
+                (3, 1) | (3, 2) => {
+                    Some(EvalErr::WindowIncompatFrames("FOLLOWING", "PRECEDING or CURRENT ROW"))
+                }
+                (2, 1) => Some(EvalErr::WindowIncompatFrames("CURRENT ROW", "PRECEDING")),
+                _ => None,
+            };
+        }
+    }
+    token_err.or(semantic)
 }
 
 /// Split a trailing `FILTER (WHERE <cond>)` off an aggregate item. Returns
@@ -97511,6 +98929,172 @@ fn parse_percentile_item(func: AggFn, t: &str, open: usize) -> Option<(AggFn, Ag
     ))
 }
 
+/// `<agg>(arg) FILTER (WHERE c)` as the CASE-argument fold it equals:
+/// `<agg>(CASE WHEN c THEN arg END)` - a non-matching row becomes NULL and
+/// drops out (COUNT(*) filtered counts `CASE WHEN c THEN 1 END`; a
+/// DISTINCT or two-argument fold wraps each value). Identical in value
+/// and describe (checked against the engine's SQLDA). Shared by the
+/// bare aggregate item and by [rewrite_agg_filters], which lifts a
+/// FILTER out of an EXPRESSION (`SUM(V) FILTER (WHERE c) + 0`).
+fn agg_filter_rewrite(call: &str, cond: &str) -> Option<String> {
+    let open = call.find('(')?;
+    if !call.ends_with(')') {
+        return None;
+    }
+    let fname = call[..open].trim();
+    let arg = call[open + 1..call.len() - 1].trim();
+    if arg.is_empty() {
+        return None;
+    }
+    // `LIST([DISTINCT] x [, sep]) FILTER (WHERE c)` wraps only the
+    // VALUE argument in the CASE - the separator stays a separate
+    // argument (the generic rewrite below would swallow it into the
+    // CASE and break the two-argument form)
+    if fname.eq_ignore_ascii_case("LIST") {
+        let (dkw, rest) = match arg
+            .get(..8)
+            .filter(|w| w.eq_ignore_ascii_case("DISTINCT"))
+            .and(arg.get(8..))
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            Some(r) => ("DISTINCT ", r.trim()),
+            None => ("", arg),
+        };
+        let rewritten = match split_top_comma2(rest) {
+            Some((a, s)) => format!(
+                "LIST({}CASE WHEN ({}) THEN {} END, {})",
+                dkw,
+                cond,
+                a.trim(),
+                s.trim()
+            ),
+            None => format!("LIST({}CASE WHEN ({}) THEN {} END)", dkw, cond, rest),
+        };
+        return Some(rewritten);
+    }
+    // `COUNT(DISTINCT x) FILTER (WHERE c)` filters the DISTINCT fold:
+    // it counts the distinct non-NULL values of `x` among the rows the
+    // condition accepts, which is exactly `COUNT(DISTINCT CASE WHEN c
+    // THEN x END)` - a non-matching row becomes NULL and the distinct
+    // fold drops it. Wrap the inner argument in the CASE and re-read as
+    // an ordinary DISTINCT aggregate (COUNT-only, as bare DISTINCT is).
+    if let Some(inner) = arg
+        .get(..8)
+        .filter(|w| w.eq_ignore_ascii_case("DISTINCT"))
+        .and(arg.get(8..))
+        .filter(|r| r.starts_with(char::is_whitespace))
+        .map(str::trim)
+    {
+        if inner == "*" || inner.is_empty() {
+            return None;
+        }
+        let rewritten =
+            format!("{}(DISTINCT CASE WHEN ({}) THEN {} END)", fname, cond, inner);
+        return Some(rewritten);
+    }
+    // a FILTERed two-argument fold drops a non-matching row from BOTH
+    // arguments (either becoming NULL skips the pair), so wrap each side
+    if is_stat2_name(fname) {
+        let (a, b) = split_top_comma2(arg)?;
+        let rewritten = format!(
+            "{}(CASE WHEN ({}) THEN {} END, CASE WHEN ({}) THEN {} END)",
+            fname,
+            cond,
+            a.trim(),
+            cond,
+            b.trim()
+        );
+        return Some(rewritten);
+    }
+    let then = if arg == "*" { "1" } else { arg };
+    // `SUM(ALL x) FILTER (...)`: the quantifier stays OUTSIDE the
+    // CASE (measured: 26, as the unquantified fold)
+    let (q, then) = match then
+        .get(..3)
+        .filter(|w| w.eq_ignore_ascii_case("ALL"))
+        .and(then.get(3..))
+        .filter(|r| r.starts_with(|c: char| c.is_whitespace() || c == '('))
+    {
+        Some(r) => ("ALL ", r.trim()),
+        None => ("", then),
+    };
+    let rewritten = format!("{}({}CASE WHEN ({}) THEN {} END)", fname, q, cond, then);
+    return Some(rewritten);
+}
+
+/// Every `<agg>(args) FILTER (WHERE c)` inside `body`, at any depth,
+/// rewritten through [agg_filter_rewrite] so the expression parser -
+/// which knows no FILTER - reads the CASE form. `SUM(val) FILTER (WHERE
+/// grp='A') + 0` answered ADD 30 on the engine and refused here until
+/// 2026-09-26 (as did `COALESCE(MAX(val) FILTER (WHERE ..), -1)`). None
+/// when there is nothing to rewrite.
+fn rewrite_agg_filters(body: &str) -> Option<String> {
+    let mut text = body.to_string();
+    let mut changed = false;
+    let mut from = 0usize;
+    loop {
+        let masked = mask_literals(&text.to_ascii_uppercase());
+        let b = masked.as_bytes();
+        let Some(f) = find_word(&masked, "FILTER", from) else { break };
+        from = f + 6;
+        // `) FILTER (` - the call's close paren before, the condition after
+        let mut i = f;
+        while i > 0 && b[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i == 0 || b[i - 1] != b')' {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut j = i - 1;
+        let open = loop {
+            match b[j] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break j;
+                    }
+                }
+                _ => {}
+            }
+            if j == 0 {
+                break usize::MAX;
+            }
+            j -= 1;
+        };
+        if open == usize::MAX {
+            continue;
+        }
+        let mut k = open;
+        while k > 0 && b[k - 1].is_ascii_whitespace() {
+            k -= 1;
+        }
+        let name_end = k;
+        while k > 0 && (b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_') {
+            k -= 1;
+        }
+        if k == name_end || !agg_named(&masked[k..name_end]) {
+            continue;
+        }
+        let mut lp = f + 6;
+        while lp < b.len() && b[lp].is_ascii_whitespace() {
+            lp += 1;
+        }
+        if b.get(lp) != Some(&b'(') {
+            continue;
+        }
+        let Some(rp) = matching_paren(b, lp) else { break };
+        let whole = &text[k..=rp];
+        let Some((call, cond)) = split_agg_filter(whole) else { continue };
+        let Some(rewritten) = agg_filter_rewrite(call, cond) else { continue };
+        from = k + rewritten.len();
+        text.replace_range(k..=rp, &rewritten);
+        changed = true;
+    }
+    changed.then_some(text)
+}
+
 fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
     let t = item.trim();
     // `<agg>(arg) FILTER (WHERE c)` folds only the rows the condition
@@ -97520,89 +99104,7 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
     // value AND describe (checked against the engine's SQLDA). So rewrite
     // the argument to a CASE and re-read it: no new fold machinery.
     if let Some((call, cond)) = split_agg_filter(t) {
-        let open = call.find('(')?;
-        if !call.ends_with(')') {
-            return None;
-        }
-        let fname = call[..open].trim();
-        let arg = call[open + 1..call.len() - 1].trim();
-        if arg.is_empty() {
-            return None;
-        }
-        // `LIST([DISTINCT] x [, sep]) FILTER (WHERE c)` wraps only the
-        // VALUE argument in the CASE - the separator stays a separate
-        // argument (the generic rewrite below would swallow it into the
-        // CASE and break the two-argument form)
-        if fname.eq_ignore_ascii_case("LIST") {
-            let (dkw, rest) = match arg
-                .get(..8)
-                .filter(|w| w.eq_ignore_ascii_case("DISTINCT"))
-                .and(arg.get(8..))
-                .filter(|r| r.starts_with(char::is_whitespace))
-            {
-                Some(r) => ("DISTINCT ", r.trim()),
-                None => ("", arg),
-            };
-            let rewritten = match split_top_comma2(rest) {
-                Some((a, s)) => format!(
-                    "LIST({}CASE WHEN ({}) THEN {} END, {})",
-                    dkw,
-                    cond,
-                    a.trim(),
-                    s.trim()
-                ),
-                None => format!("LIST({}CASE WHEN ({}) THEN {} END)", dkw, cond, rest),
-            };
-            return parse_agg_item(&rewritten);
-        }
-        // `COUNT(DISTINCT x) FILTER (WHERE c)` filters the DISTINCT fold:
-        // it counts the distinct non-NULL values of `x` among the rows the
-        // condition accepts, which is exactly `COUNT(DISTINCT CASE WHEN c
-        // THEN x END)` - a non-matching row becomes NULL and the distinct
-        // fold drops it. Wrap the inner argument in the CASE and re-read as
-        // an ordinary DISTINCT aggregate (COUNT-only, as bare DISTINCT is).
-        if let Some(inner) = arg
-            .get(..8)
-            .filter(|w| w.eq_ignore_ascii_case("DISTINCT"))
-            .and(arg.get(8..))
-            .filter(|r| r.starts_with(char::is_whitespace))
-            .map(str::trim)
-        {
-            if inner == "*" || inner.is_empty() {
-                return None;
-            }
-            let rewritten =
-                format!("{}(DISTINCT CASE WHEN ({}) THEN {} END)", fname, cond, inner);
-            return parse_agg_item(&rewritten);
-        }
-        // a FILTERed two-argument fold drops a non-matching row from BOTH
-        // arguments (either becoming NULL skips the pair), so wrap each side
-        if is_stat2_name(fname) {
-            let (a, b) = split_top_comma2(arg)?;
-            let rewritten = format!(
-                "{}(CASE WHEN ({}) THEN {} END, CASE WHEN ({}) THEN {} END)",
-                fname,
-                cond,
-                a.trim(),
-                cond,
-                b.trim()
-            );
-            return parse_agg_item(&rewritten);
-        }
-        let then = if arg == "*" { "1" } else { arg };
-        // `SUM(ALL x) FILTER (...)`: the quantifier stays OUTSIDE the
-        // CASE (measured: 26, as the unquantified fold)
-        let (q, then) = match then
-            .get(..3)
-            .filter(|w| w.eq_ignore_ascii_case("ALL"))
-            .and(then.get(3..))
-            .filter(|r| r.starts_with(|c: char| c.is_whitespace() || c == '('))
-        {
-            Some(r) => ("ALL ", r.trim()),
-            None => ("", then),
-        };
-        let rewritten = format!("{}({}CASE WHEN ({}) THEN {} END)", fname, q, cond, then);
-        return parse_agg_item(&rewritten);
+        return parse_agg_item(&agg_filter_rewrite(call, cond)?);
     }
     let open = t.find('(')?;
     if !t.ends_with(')') {
@@ -97719,15 +99221,22 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
         .and(arg.get(8..))
         .filter(|r| r.starts_with(char::is_whitespace))
     {
-        if !matches!(func, AggFn::Count) {
-            return None; // SUM/AVG/MIN/MAX DISTINCT: not answered
+        // SUM/AVG/MIN/MAX(DISTINCT x) fold the distinct non-NULL values
+        // (measured: SUM(DISTINCT i) over 10,20,20 is 30, AVG(DISTINCT
+        // n) over 1.50,2.25,2.25 is 1.87, described as the plain fold
+        // is); the statistical folds and LIST take no DISTINCT here
+        if !matches!(func, AggFn::Count | AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max) {
+            return None;
         }
         let inner = rest.trim();
         // a bare column keeps the field-sourced fold; anything else - a
         // CASE (from a filtered distinct) or `COUNT(DISTINCT UPPER(S))` -
         // becomes an expression the fold evaluates per row before dedup.
-        // The column is CANONICAL ([canon_ident]): `"a"` is `a`.
-        if let Some(name) = canon_ident(inner) {
+        // The column is CANONICAL ([canon_ident]): `"a"` is `a`. A bare
+        // NULL / TRUE / FALSE is a literal, not a column named so.
+        let literal_kw = !inner.starts_with('"')
+            && matches!(inner.to_ascii_uppercase().as_str(), "NULL" | "TRUE" | "FALSE");
+        if let (false, Some(name)) = (literal_kw, canon_ident(inner)) {
             return Some((func, AggTarget::Distinct(name)));
         }
         return Some((func, AggTarget::DistinctExpr(parse_raw_expr_any(inner)?)));
@@ -97738,7 +99247,12 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
             return None;
         }
         AggTarget::Star
-    } else if let Some(name) = canon_ident(arg) {
+    } else if let (false, Some(name)) = (
+        // a bare NULL / TRUE / FALSE argument is a literal, not a column
+        // named so (quoted, it is a name)
+        !arg.starts_with('"') && matches!(arg.to_ascii_uppercase().as_str(), "NULL" | "TRUE" | "FALSE"),
+        canon_ident(arg),
+    ) {
         AggTarget::Col(name)
     } else {
         // not a bare column: an expression argument - SUM(A + B),
@@ -97765,7 +99279,11 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         // aggregate carries one too (`COUNT(*) AS N`), and asking
         // `parse_agg_item` about the whole part left it unparsed
         let (body, alias) = split_alias(part);
-        let body = body.trim();
+        // a FILTER inside an expression becomes its CASE form first
+        // ([rewrite_agg_filters]); a bare filtered aggregate reads the
+        // same either way
+        let body_rw = rewrite_agg_filters(body.trim());
+        let body = body_rw.as_deref().unwrap_or(body).trim();
         // a quoted alias keeps its case; an unquoted one folds up, the
         // way every unquoted identifier does
         let alias_name = |a: &str| {
@@ -98059,7 +99577,9 @@ fn split_alias(item: &str) -> (&str, Option<&str>) {
         || head.ends_with(')')
         || parse_raw_expr_any(head).is_some()
         // ...or an expression whose windows have to come out first
-        || lift_window_calls(head).is_some_and(|(r, _)| parse_raw_expr_any(r.trim()).is_some());
+        || lift_window_calls(head).is_some_and(|(r, _)| parse_raw_expr_any(r.trim()).is_some())
+        // ...or one whose FILTER has to become its CASE form first
+        || rewrite_agg_filters(head).is_some_and(|r| parse_raw_expr_any(r.trim()).is_some());
     if !body_ok {
         return (item, None);
     }
@@ -102273,6 +103793,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_drop_package(text))
                     .or_else(|| plan_create_view(text, database))
                     .or_else(|| plan_alter_view(text, database))
+                    .or_else(|| plan_create_or_alter_view(text, database))
                     .or_else(|| plan_drop_view(text))
                     .or_else(|| plan_create_function(text, database))
                     .or_else(|| plan_drop_function(text))
@@ -115359,6 +116880,7 @@ fn after_auth(
                         .or_else(|| plan_drop_package(&stmt_sql))
                         .or_else(|| plan_create_view(&stmt_sql, &database))
                         .or_else(|| plan_alter_view(&stmt_sql, &database))
+                        .or_else(|| plan_create_or_alter_view(&stmt_sql, &database))
                         .or_else(|| plan_drop_view(&stmt_sql))
                         .or_else(|| plan_create_function(&stmt_sql, &database))
                         .or_else(|| plan_drop_function(&stmt_sql))
@@ -115489,7 +117011,13 @@ fn after_auth(
                     // inserts nothing - this inserted twelve rows - and a
                     // DELETE / UPDATE whose IN-subquery carries `order by
                     // .. union` or `rows 1 union` deleted / updated.
-                    let dml_lint = limit_lint_scan_db(&stmt_sql, &database).err;
+                    let dml_lint = limit_lint_scan_db(&stmt_sql, &database)
+                        .err
+                        // ...and the window-frame grammar ([window_frame_lint]):
+                        // a frame the parser refuses inside an UPDATE's or
+                        // DELETE's subquery, or an INSERT's source, must not
+                        // fold and then modify rows
+                        .or_else(|| window_frame_lint(&stmt_sql));
                     // ...and so does the -206 of a qualifier nothing binds
                     // - the base name of an aliased target (`UPDATE T1 T
                     // ... WHERE T1.ID = 1`), judged on the whole statement
@@ -125885,8 +127413,35 @@ mod tests {
         let (k, ke) =
             parse_group_by("MOD(ID, 2), DEPT_ID, mod( id , 2 )", &items, &columns, &descs, 100, 0, &mut Vec::new())
                 .unwrap();
-        assert_eq!(k, vec![100, 2, 100]);
+        assert_eq!(k, vec![100, 2]);
         assert_eq!(ke.len(), 1);
+        // a key named twice by name groups once too
+        assert_eq!(keys("DEPT_ID, DEPT_ID"), Some(vec![2]));
+        // AN ALIAS RESOLVES FIRST, even over a real column of that name
+        // (measured: `SELECT VAL ID, COUNT(*) FROM W GROUP BY VAL, ID`
+        // groups by VAL twice over): `SELECT DEPT_ID ID ... GROUP BY ID`
+        // is the DEPT_ID key, not the ID column, and `GROUP BY DEPT_ID,
+        // ID` is that one key
+        let shadow = vec![
+            SelItem::Col("DEPT_ID".into(), Some("ID".into())),
+            SelItem::Agg(AggFn::Count, AggTarget::Star, None),
+        ];
+        let skeys = |g: &str| parse_group_by(g, &shadow, &columns, &descs, 100, 0, &mut Vec::new()).map(|(k, _)| k);
+        assert_eq!(skeys("ID"), Some(vec![2]));
+        assert_eq!(skeys("DEPT_ID, ID"), Some(vec![2]));
+        // ...and a bare FIELD item of the alias's name beside it is the
+        // engine's 42702, posted for the refusal arm
+        let ambiguous = vec![
+            SelItem::Col("ID".into(), None),
+            SelItem::Col("DEPT_ID".into(), Some("ID".into())),
+            SelItem::Agg(AggFn::Count, AggTarget::Star, None),
+        ];
+        PREPARE_REFUSAL.with(|r| *r.borrow_mut() = None);
+        assert!(parse_group_by("ID", &ambiguous, &columns, &descs, 100, 0, &mut Vec::new()).is_none());
+        assert!(matches!(
+            PREPARE_REFUSAL.with(|r| r.borrow_mut().take()),
+            Some(EvalErr::AmbiguousField { name, .. }) if name == "ID"
+        ));
     }
 
     #[test]
@@ -128898,8 +130453,9 @@ mod tests {
             Err(EvalErr::DivideByZero)
         ));
 
-        // the parser: AVG joins the family, DISTINCT only under COUNT,
-        // and the keyword must stand as its own word
+        // the parser: AVG joins the family, DISTINCT under COUNT and (since
+        // 2026-09-26, measured) SUM/AVG/MIN/MAX, not the statistical
+        // folds, and the keyword must stand as its own word
         assert!(matches!(parse_agg_item("AVG(N)"), Some((AggFn::Avg, AggTarget::Col(c))) if c == "N"));
         assert!(matches!(
             parse_agg_item("COUNT(DISTINCT G)"),
@@ -128909,7 +130465,17 @@ mod tests {
             parse_agg_item("count( distinct  g )"),
             Some((AggFn::Count, AggTarget::Distinct(c))) if c == "G"
         ));
-        assert!(parse_agg_item("SUM(DISTINCT A)").is_none());
+        assert!(matches!(
+            parse_agg_item("SUM(DISTINCT A)"),
+            Some((AggFn::Sum, AggTarget::Distinct(c))) if c == "A"
+        ));
+        assert!(parse_agg_item("STDDEV_POP(DISTINCT A)").is_none());
+        // a bare NULL argument is the literal, distinct or not
+        assert!(matches!(parse_agg_item("SUM(NULL)"), Some((AggFn::Sum, AggTarget::Expr(RawExpr::Null)))));
+        assert!(matches!(
+            parse_agg_item("COUNT(DISTINCT NULL)"),
+            Some((AggFn::Count, AggTarget::DistinctExpr(RawExpr::Null)))
+        ));
         assert!(parse_agg_item("COUNT(DISTINCTG)").is_none() ||
                 matches!(parse_agg_item("COUNT(DISTINCTG)"),
                          Some((AggFn::Count, AggTarget::Col(c))) if c == "DISTINCTG"));
@@ -138244,6 +139810,32 @@ mod tests {
     /// Which of FIRST/SKIP-with-ROWS and an unknown FROM item the engine
     /// reports: a spec's FROM is resolved before its check, its WHERE and
     /// select list after (measured on 2182).
+    #[test]
+    fn window_frame_lint_judges_named_windows() {
+        // the bound rule and the parser's holes hold in a WINDOW clause
+        // as in an OVER (measured on 2182: the same vectors, the token
+        // error at the keyword's own column)
+        let over = "select id, sum(val) over (order by id rows between 1 following and current row) from w";
+        assert!(matches!(window_frame_lint(over), Some(EvalErr::WindowIncompatFrames("FOLLOWING", _))));
+        let named = "select id, sum(val) over win from w window win as (order by id rows between 1 following and current row)";
+        assert!(matches!(window_frame_lint(named), Some(EvalErr::WindowIncompatFrames("FOLLOWING", _))));
+        let second = "select id, sum(val) over w2 from w window w1 as (order by id), w2 as (order by id rows between current row and 1 preceding)";
+        assert!(matches!(window_frame_lint(second), Some(EvalErr::WindowIncompatFrames("CURRENT ROW", _))));
+        let token = "select id, sum(val) over win from w window win as (order by id rows between unbounded following and unbounded following)";
+        assert!(matches!(
+            window_frame_lint(token),
+            Some(EvalErr::TokenUnknown { line: 1, col: 87, token }) if token == "following"
+        ));
+        let legal = "select id, sum(val) over win from w window win as (order by id rows between 1 preceding and 1 following)";
+        assert!(window_frame_lint(legal).is_none());
+        // ...and inside DML, where a folded frame would modify rows
+        let dml = "delete from w where id in (select id from (select id, sum(val) over (order by id rows between unbounded following and unbounded following) s from w))";
+        assert!(matches!(
+            window_frame_lint(dml),
+            Some(EvalErr::TokenUnknown { line: 1, col: 105, token }) if token == "following"
+        ));
+    }
+
     #[test]
     fn limit_lint_unknown_relation_precedence() {
         let known = |n: &str, _: bool| !n.eq_ignore_ascii_case("nosuch");
