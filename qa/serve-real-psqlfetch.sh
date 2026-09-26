@@ -237,8 +237,9 @@ pin  "6 CONTROL a subquery keeps its colons" "$(eb 'EXECUTE BLOCK RETURNS (R INT
 pin  "6 CONTROL a local concatenated with a text" "$(eb "EXECUTE BLOCK RETURNS (R VARCHAR(20)) AS DECLARE X INTEGER = 3; BEGIN R = 'x' || X; SUSPEND; END")" "R|x3"
 
 echo "--- 7. RECORDED"
-refused "7 a stored function called in a block (the procedure compiler refuses it)" "$(eb 'EXECUTE BLOCK RETURNS (R SMALLINT) AS BEGIN R = F3(3); SUSPEND; END')" "R|3000"
-refused "7 ...its overflow" "$(eb 'EXECUTE BLOCK RETURNS (R SMALLINT) AS BEGIN R = F3(33); SUSPEND; END')" "R|$AR|-At function \"PUBLIC\".\"F3\" line: 1, col: 58|At block line: 1, col: 45"
+# PROMOTED: a block compiles against the catalog now, functions included
+pin  "7 a stored function called in a block (the procedure compiler refused it)" "$(eb 'EXECUTE BLOCK RETURNS (R SMALLINT) AS BEGIN R = F3(3); SUSPEND; END')" "R|3000"
+pin  "7 ...its overflow" "$(eb 'EXECUTE BLOCK RETURNS (R SMALLINT) AS BEGIN R = F3(33); SUSPEND; END')" "R|$AR|-At function \"PUBLIC\".\"F3\" line: 1, col: 58|At block line: 1, col: 45"
 refused "7 an INT128 local" "$(eb 'EXECUTE BLOCK RETURNS (R INT128) AS DECLARE A INT128; BEGIN A = 170141183460469231731687303715884105727; R = A; SUSPEND; END')" "R|170141183460469231731687303715884105727"
 refused "7 a NUMERIC(38,2) output" "$(eb 'EXECUTE BLOCK RETURNS (R NUMERIC(38,2)) AS DECLARE A NUMERIC(18,2); BEGIN A = 1.01; R = A; SUSPEND; END')" "R|1.01"
 refused "7 a scaled literal past 32 bits" "$(eb 'EXECUTE BLOCK RETURNS (R NUMERIC(18,2)) AS DECLARE A NUMERIC(18,2); BEGIN A = 92233720368547758.07; R = A; SUSPEND; END')" "R|92233720368547758.07"

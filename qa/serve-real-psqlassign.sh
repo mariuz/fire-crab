@@ -115,6 +115,15 @@
 # planner as an expression pattern, which the literal-first parse
 # refused (10c). Section 9's cells all stand.
 #
+# 10d and 10e came out of the review of THAT fix. A body the source
+# path runs (one with a non-ASCII literal) refused a function call with
+# a literal argument, a q-string, an introducer, a literal under COLLATE,
+# an EXECUTE STATEMENT argument of another set and a folded scalar
+# subquery - the BLR executor had answered every one (10d). And the
+# typed ASCII literal, beside a bare CAST (NONE in a database with no
+# default set) under a NONE caller, made the join TRANSLITERATE the NONE
+# value where the engine copies its bytes: 'é' came out 'Ã©' (10e).
+#
 # Usage: qa/serve-real-psqlassign.sh [port]   (default 5400)
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
@@ -273,6 +282,37 @@ CREATE PROCEDURE SA10 RETURNS (C INTEGER) AS DECLARE A VARCHAR(10) CHARACTER SET
 CREATE PROCEDURE SA12 RETURNS (C INTEGER) AS DECLARE A VARCHAR(10) CHARACTER SET UTF8 = 'ab'; DECLARE E VARCHAR(10) CHARACTER SET WIN1252 = 'é'; BEGIN SELECT COUNT(*) FROM STT WHERE U LIKE :A || '%' INTO C; SUSPEND; END^
 CREATE PROCEDURE SCALL (X VARCHAR(10)) RETURNS (R VARCHAR(10)) AS BEGIN R = X || '!'; SUSPEND; END^
 CREATE PROCEDURE SCALLER RETURNS (R VARCHAR(10), R2 VARCHAR(10)) AS DECLARE E VARCHAR(10) CHARACTER SET WIN1252 = 'é'; BEGIN SELECT R FROM SCALL('ab') INTO R; EXECUTE PROCEDURE SCALL('cd') RETURNING_VALUES R2; SUSPEND; END^
+SET TERM ;^
+CREATE TABLE SRT (ID INTEGER, U VARCHAR(10) CHARACTER SET UTF8, W VARCHAR(10) CHARACTER SET WIN1252);
+INSERT INTO SRT VALUES (1, 'é', 'é');
+INSERT INTO SRT VALUES (2, 'ab', 'ö');
+SET TERM ^;
+CREATE FUNCTION SFN (X VARCHAR(10) CHARACTER SET UTF8) RETURNS VARCHAR(20) CHARACTER SET UTF8 AS BEGIN RETURN 'f' || X; END^
+CREATE FUNCTION SFW (X VARCHAR(10) CHARACTER SET WIN1252) RETURNS INTEGER AS BEGIN RETURN OCTET_LENGTH('f' || X); END^
+CREATE PACKAGE SPK AS BEGIN FUNCTION PF (X VARCHAR(10) CHARACTER SET UTF8) RETURNS VARCHAR(20) CHARACTER SET UTF8; END^
+CREATE PACKAGE BODY SPK AS BEGIN FUNCTION PF (X VARCHAR(10) CHARACTER SET UTF8) RETURNS VARCHAR(20) CHARACTER SET UTF8 AS BEGIN RETURN 'p' || X || 'é'; END END^
+CREATE PROCEDURE SD1 RETURNS (R VARCHAR(40) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN R = SFN('ab'); SUSPEND; END^
+CREATE PROCEDURE SD7 RETURNS (R VARCHAR(40) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN R = SFN('ab') || 'z'; SUSPEND; END^
+CREATE PROCEDURE SD13 RETURNS (R VARCHAR(40) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN R = SFN('it''s'); SUSPEND; END^
+CREATE PROCEDURE SD14 RETURNS (R VARCHAR(40) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN R = SFN(''); SUSPEND; END^
+CREATE PROCEDURE SD8 RETURNS (O INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN O = SFW('é'); SUSPEND; END^
+CREATE PROCEDURE SD10 RETURNS (O INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT SFW(W) FROM SRT WHERE ID = 1 INTO O; SUSPEND; END^
+CREATE PROCEDURE SD4 RETURNS (R VARCHAR(40) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN R = SPK.PF('ab'); SUSPEND; END^
+CREATE PROCEDURE SD23 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COUNT(*) FROM SRT WHERE U = q'{it's}' INTO C; SUSPEND; END^
+CREATE PROCEDURE SD24 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COUNT(*) FROM SRT WHERE U = q'{é's}' INTO C; SUSPEND; END^
+CREATE PROCEDURE SD27 RETURNS (R VARCHAR(40) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN R = q'{it's}'; SUSPEND; END^
+CREATE PROCEDURE SD90 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COUNT(*) FROM SRT WHERE U = 'AB' COLLATE UNICODE_CI INTO C; SUSPEND; END^
+CREATE PROCEDURE SD119 RETURNS (O INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN O = OCTET_LENGTH(_utf8 'é' || 'ab'); SUSPEND; END^
+CREATE PROCEDURE SD120 RETURNS (O INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN O = OCTET_LENGTH('ab' || _win1252 'é'); SUSPEND; END^
+CREATE PROCEDURE SDE3 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN EXECUTE STATEMENT ('select count(*) from srt where u = ?') ('é') INTO C; SUSPEND; END^
+CREATE PROCEDURE SDE4 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN EXECUTE STATEMENT ('select count(*) from srt where u = :x') (x := 'é') INTO C; SUSPEND; END^
+CREATE PROCEDURE SD140 RETURNS (O INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN O = OCTET_LENGTH('a' || (SELECT 'é' FROM RDB$DATABASE)); SUSPEND; END^
+CREATE PROCEDURE SC13 RETURNS (R VARCHAR(40) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT CAST(U AS VARCHAR(5)) || 'x' FROM SRT WHERE ID = 1 INTO R; SUSPEND; END^
+CREATE PROCEDURE SC69 RETURNS (R VARCHAR(40) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN R = 'x' || CAST('é' AS VARCHAR(5)); SUSPEND; END^
+CREATE PROCEDURE SC57 RETURNS (R VARCHAR(40) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN R = CAST('é' AS CHAR(3)) || 'x'; SUSPEND; END^
+CREATE PROCEDURE SZ1 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COUNT(*) FROM SRT WHERE CAST(U AS VARCHAR(5)) || 'x' = 'éx' INTO C; SUSPEND; END^
+CREATE PROCEDURE SZ7 RETURNS (O INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT OCTET_LENGTH(CAST(U AS VARCHAR(5)) || 'x') FROM SRT WHERE ID = 1 INTO O; SUSPEND; END^
+CREATE PROCEDURE SC58 RETURNS (R VARCHAR(40) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT CAST(W AS VARCHAR(5)) || 'x' FROM SRT WHERE ID = 1 INTO R; SUSPEND; END^
 SET TERM ;^
 COMMIT;
 SQL
@@ -684,11 +724,59 @@ for CH in "" UTF8 WIN1252; do
   pin  "10c [${CH:-NONE}] U LIKE :A || '%' AND W <> 'é'" $'SELECT * FROM SA8;' $'C|2|3'
 done
 CH=""
+echo "--- 10d. A CALL, A Q-STRING, AN INTRODUCER, A COLLATE, AN EXECUTE STATEMENT ARGUMENT AND A SUBQUERY IN A BODY THE SOURCE PATH RUNS (each refused; the BLR executor had answered)"
+# every body here holds an unused UTF8 'é' local, which is what sends it
+# to the source path; the engine's answers are the same under every caller
+for CH in "" UTF8 WIN1252; do
+  pin  "10d [${CH:-NONE}] R = SFN('ab'): a function call with a literal argument (refused)" $'SELECT R FROM SD1;' $'R|fab'
+  pin  "10d [${CH:-NONE}] ...SFN('ab') || 'z'" $'SELECT R FROM SD7;' $'R|fabz'
+  pin  "10d [${CH:-NONE}] ...SFN('it''s')" $'SELECT R FROM SD13;' $'R|fit\'s'
+  pin  "10d [${CH:-NONE}] ...SFN('')" $'SELECT R FROM SD14;' $'R|f'
+  pin  "10d [${CH:-NONE}] ...SFW('é') into a WIN1252 parameter: OCTET_LENGTH('f' || X) is 3" $'SELECT O FROM SD8;' $'O|3'
+  pin  "10d [${CH:-NONE}] ...SELECT SFW(W) FROM SRT INTO" $'SELECT O FROM SD10;' $'O|3'
+  pin  "10d [${CH:-NONE}] U = q'{it's}': a q-string is the literal it spells (refused)" $'SELECT C FROM SD23;' $'C|0'
+  pin  "10d [${CH:-NONE}] ...q'{é's}'" $'SELECT C FROM SD24;' $'C|0'
+  pin  "10d [${CH:-NONE}] ...R = q'{it's}'" $'SELECT R FROM SD27;' $'R|it\'s'
+  pin  "10d [${CH:-NONE}] U = 'AB' COLLATE UNICODE_CI over the body's UTF8 literal (refused)" $'SELECT C FROM SD90;' $'C|1'
+  pin  "10d [${CH:-NONE}] OCTET_LENGTH(_utf8 'é' || 'ab'): an introducer types its literal (refused)" $'SELECT O FROM SD119;' $'O|4'
+  pin  "10d [${CH:-NONE}] ...'ab' || _win1252 'é': C3 A9 is two WIN1252 characters, four octets in the UTF8 result" $'SELECT O FROM SD120;' $'O|6'
+  pin  "10d [${CH:-NONE}] EXECUTE STATEMENT (... u = ?) ('é'): the argument keeps its UTF8 set (refused under NONE and WIN1252)" $'SELECT C FROM SDE3;' $'C|1'
+  pin  "10d [${CH:-NONE}] ...the named form (x := 'é')" $'SELECT C FROM SDE4;' $'C|1'
+  pin  "10d [${CH:-NONE}] 'a' || (SELECT 'é' FROM RDB\$DATABASE): the folded subquery keeps its set (it was 2, then 22000)" $'SELECT O FROM SD140;' $'O|3'
+done
+CH=""
+pin  $'10d [NONE] R = SPK.PF(\'ab\'): a package function (refused)' $'SELECT R FROM SD4;' $'R|pabé'
+CH=UTF8
+pin  $'10d [UTF8] R = SPK.PF(\'ab\')' $'SELECT R FROM SD4;' $'R|pabé'
+CH=WIN1252
+same $'10d [WIN1252] R = SPK.PF(\'ab\') (the é arrives as E9)' $'SELECT R FROM SD4;'
+CH=""
+
+echo "--- 10e. A BARE CAST BESIDE THE BODY'S LITERAL UNDER A NONE CALLER: the NONE value moves by its BYTES (they were re-encoded)"
+# in a database with no default set the CAST is NONE ([PsqlFrame::cast_cs]);
+# the body's UTF8 literal types the concatenation and the NONE operand's
+# octets are copied into it, C3 A9 read as UTF8. Written typed under the
+# NONE caller, that literal made the join transliterate the NONE value
+# instead: 'é' became 'Ã©' (C3 83 C2 A9), the count 0, the length 5.
+for CH in "" UTF8; do
+  pin  "10e [${CH:-NONE}] SELECT CAST(U AS VARCHAR(5)) || 'x' INTO R (it was Ã©x)" $'SELECT R FROM SC13;' $'R|éx'
+  pin  "10e [${CH:-NONE}] R = 'x' || CAST('é' AS VARCHAR(5))" $'SELECT R FROM SC69;' $'R|xé'
+  pin  "10e [${CH:-NONE}] R = CAST('é' AS CHAR(3)) || 'x' keeps the CHAR's blanks" $'SELECT R FROM SC57;' $'R|é x'
+  pin  "10e [${CH:-NONE}] WHERE CAST(U AS VARCHAR(5)) || 'x' = 'éx' (it counted 0)" $'SELECT C FROM SZ1;' $'C|1'
+  pin  "10e [${CH:-NONE}] OCTET_LENGTH(CAST(U AS VARCHAR(5)) || 'x') (it was 5)" $'SELECT O FROM SZ7;' $'O|3'
+done
+for CH in "" UTF8 WIN1252; do
+  same "10e [${CH:-NONE}] CAST(W AS VARCHAR(5)) || 'x' over a WIN1252 'é': E9 is no UTF8, 22000 Malformed string (it answered éx, then refused)" $'SELECT R FROM SC58;'
+done
+CH=WIN1252
+same $'10e [WIN1252] CAST(U AS VARCHAR(5)) || \'x\' (the é arrives as E9)' $'SELECT R FROM SC13;'
+same $'10e [WIN1252] WHERE CAST(U AS VARCHAR(5)) || \'x\' = \'éx\'' $'SELECT C FROM SZ1;'
+CH=""
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-psqlassign-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 295 ]; then echo "FAIL only $ran checks ran (floor 295)"; fail=1; fi
+if [ "$ran" -lt 358 ]; then echo "FAIL only $ran checks ran (floor 358)"; fail=1; fi
 exit $fail

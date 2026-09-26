@@ -267,7 +267,44 @@ both "a LIKE pattern that is 'str' || '%' (it refused)" \
 both "a STARTING WITH prefix that is 'st' || '' (it refused)" \
     "SELECT COUNT(*) AS R FROM TX WHERE U STARTING WITH 'st' || ''" "-ch UTF8"
 
+echo "--- 7. a literal beside a binary literal, a q-string, an introducer, a literal under COLLATE, a bare CAST's NONE bytes ------"
+# Found by the second review of the psqlassign section-10 fix. A UTF8
+# literal beside a binary literal is as wide as ITS set's characters
+# (VARCHAR(6) OCTETS for 'é' || x'4142', measured), where counting it one
+# octet per character announced 3 and the four octets raised 22001 on the
+# way out. A q-string is the literal it spells, an introducer types its
+# octets (`_win1252 'é'` is the two WIN1252 characters C3 A9), a literal
+# under COLLATE is of the attachment's set - and under NONE the engine's
+# own -204, no such collation for NONE. A bare CAST is the attachment's
+# set, NONE here, and a NONE operand MOVES BY ITS BYTES into the set a
+# typed operand decides: C3 A9 read as UTF8 is 'é' (it was re-encoded to
+# C3 83 C2 A9), and the WIN1252 column's 9F is no UTF8 - 22000, where
+# the octets were answered. A folded scalar subquery of a real set keeps
+# that set through the fold (it became a NONE literal, then 22000).
+both "'é' || x'4142' is the four octets C3 A9 41 42 (it raised 22001: expected length 3, actual 4)" \
+    "SELECT 'é' || x'4142' AS R FROM RDB\$DATABASE" "-ch UTF8"
+both "x'4142' || 'é'" "SELECT x'4142' || 'é' AS R FROM RDB\$DATABASE" "-ch UTF8"
+both "'éé' || x'41' (it raised expected 3, actual 5)" "SELECT 'éé' || x'41' AS R FROM RDB\$DATABASE" "-ch UTF8"
+both "...under NONE the literal is two octets and the width is 4" "SELECT 'é' || x'4142' AS R FROM RDB\$DATABASE" "-ch NONE"
+both "a q-string is the literal it spells (it refused)" "SELECT q'{it's}' AS R FROM RDB\$DATABASE" "-ch UTF8"
+both "...in a predicate" "SELECT COUNT(*) AS R FROM TX WHERE U = q'[straße]'" "-ch UTF8"
+both "_utf8 'é' || 'ab' is four octets (it refused)" "SELECT OCTET_LENGTH(_utf8 'é' || 'ab') AS R FROM RDB\$DATABASE" "-ch UTF8"
+both "'ab' || _win1252 'é' under UTF8: C3 A9 is two WIN1252 characters, four UTF8 octets" \
+    "SELECT OCTET_LENGTH('ab' || _win1252 'é') AS R FROM RDB\$DATABASE" "-ch UTF8"
+both "...under NONE the literal yields to WIN1252" "SELECT OCTET_LENGTH('ab' || _win1252 'é') AS R FROM RDB\$DATABASE" "-ch NONE"
+both "_utf8 x'C3A9' || 'a' types a binary literal" "SELECT _utf8 x'C3A9' || 'a' AS R FROM RDB\$DATABASE" "-ch UTF8"
+both "U = 'STRAßE' COLLATE UNICODE_CI: a literal collates in the attachment's set (it refused)" \
+    "SELECT COUNT(*) AS R FROM TX WHERE U = 'STRAßE' COLLATE UNICODE_CI" "-ch UTF8"
+both "...under NONE the engine's -204: no such collation for NONE" \
+    "SELECT COUNT(*) AS R FROM TX WHERE U = 'STRAßE' COLLATE UNICODE_CI" "-ch NONE"
+both "a bare CAST's NONE octets move by BYTES into the UTF8 a typed operand decides (it re-encoded them)" \
+    "SELECT CAST(CAST(U AS VARCHAR(10)) || CAST(x'78' AS CHAR(1) CHARACTER SET UTF8) AS VARCHAR(20) CHARACTER SET OCTETS) AS R FROM TX WHERE ID = 1" "-ch NONE"
+both "...over the WIN1252 column: 9F is no UTF8, 22000 (it answered the octets)" \
+    "SELECT CAST(CAST(W AS VARCHAR(10)) || CAST(x'78' AS CHAR(1) CHARACTER SET UTF8) AS VARCHAR(20) CHARACTER SET OCTETS) AS R FROM TX WHERE ID = 1" "-ch NONE"
+both "a folded scalar subquery of a real set keeps it under NONE (it was 22000)" \
+    "SELECT OCTET_LENGTH('a' || (SELECT CAST(x'C3A9' AS CHAR(1) CHARACTER SET UTF8) FROM RDB\$DATABASE)) AS R FROM RDB\$DATABASE" "-ch NONE"
+
 echo "----------------------------------------------------------------------"
-[ "$ran" -ge 49 ] || { echo "FAIL only $ran checks ran"; fail=1; }
+[ "$ran" -ge 72 ] || { echo "FAIL only $ran checks ran"; fail=1; }
 [ $fail -eq 0 ] && echo "PASS $ran checks" || echo "FAIL"
 exit $fail
