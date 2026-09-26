@@ -132,6 +132,10 @@ same "WHERE EXTRACT ="            "SELECT ID FROM T WHERE EXTRACT(YEAR FROM D) =
 same "WHERE EXTRACT BETWEEN"      "SELECT ID FROM T WHERE EXTRACT(MONTH FROM D) BETWEEN 1 AND 2 ORDER BY ID"
 same "WHERE EXTRACT AND plain"    "SELECT ID FROM T WHERE EXTRACT(WEEKDAY FROM D) = 4 AND ID > 0"
 same "WHERE EXTRACT IS NULL"      "SELECT ID FROM T WHERE EXTRACT(YEAR FROM D) IS NULL"
+# QUARTER is a part the engine answers (2182: 1..4, SMALLINT) - this
+# gate listed it among the refusals, a guess never checked against the
+# engine; qa/serve-real-fromloc.sh pins it
+same "EXTRACT QUARTER"            "SELECT ID, EXTRACT(QUARTER FROM D) FROM T ORDER BY ID"
 same "COUNT with EXTRACT filter"  "SELECT COUNT(*) FROM T WHERE EXTRACT(YEAR FROM D) > 1900"
 
 # --- the clock keywords (day-safe checks only) -------------------------
@@ -153,7 +157,6 @@ sameh "header CURRENT_DATE"       "SELECT CURRENT_DATE FROM T WHERE ID = 1"
 for bad in "SELECT EXTRACT(HOUR FROM D) FROM T" \
            "SELECT EXTRACT(YEAR FROM TM) FROM T" \
            "SELECT EXTRACT(YEAR FROM S) FROM T" \
-           "SELECT EXTRACT(QUARTER FROM D) FROM T" \
            "SELECT DATE '2024-02-30' FROM T" \
            "SELECT COALESCE(D, TIME '09:00:00') FROM T" \
            "SELECT COALESCE(D, 1) FROM T"; do

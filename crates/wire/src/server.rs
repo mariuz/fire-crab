@@ -11638,6 +11638,12 @@ enum ValFn {
     /// the argument at the Nth frame row (1-based), NULL if the frame holds
     /// fewer than N rows
     NthValue,
+    /// `NTH_VALUE(v, n) FROM LAST`: the Nth frame row counted back from
+    /// the frame END, NULL when the frame holds fewer than N rows
+    /// (measured on 2182, ids 1..3 over 10/20/30, `ORDER BY ID`: NULL,
+    /// 10, 20 - the default frame ends at the current row; `FROM FIRST`
+    /// is [ValFn::NthValue], NULL, 20, 20)
+    NthValueLast,
 }
 
 /// One edge of an explicit `ROWS` window frame, as a PHYSICAL-ROW offset
@@ -20859,6 +20865,7 @@ fn text_form_m(
                     | SysFn::Left
                     | SysFn::Right
                     | SysFn::Replace
+                    | SysFn::Overlay
                     | SysFn::Reverse
                     | SysFn::Lpad
                     | SysFn::Rpad
@@ -21193,6 +21200,20 @@ fn text_form_m(
                             cs_join(cs_join(cs, arg(1)?.2), arg(2)?.2),
                         ))
                     }
+                    _ => None,
+                },
+                // OVERLAY is VARYING, as wide as its source and its
+                // placing string together, in their negotiated set
+                // (makeOverlay: `convertLength(value) +
+                // convertLength(placing)`, getResultTextType; measured
+                // `OVERLAY(S PLACING 'Q' FROM 1)` over a VARCHAR(20) is
+                // VARYING(21), over two INTEGERs 22)
+                // ...and a bare NULL in ANY argument makes it the NULL
+                // string, CHAR(1) NONE (initResult - measured, `FROM NULL`
+                // describes as narrow as `OVERLAY(NULL ...)`)
+                SysFn::Overlay if args.iter().any(|a| matches!(a, Expr::Null)) => Some(all_null_form()),
+                SysFn::Overlay => match (arg(0), arg(1)) {
+                    (Some((_, w0, c0)), Some((_, w1, c1))) => Some((true, w0.saturating_add(w1), cs_join(c0, c1))),
                     _ => None,
                 },
                 SysFn::Lpad | SysFn::Rpad => {
@@ -46782,8 +46803,10 @@ fn is_cte_name(masked_up: &str, name: &str) -> bool {
 }
 
 /// Does the FROM at byte `k` of the (upper-cased, literal-masked) text
-/// sit directly inside the operand list of SUBSTRING, OVERLAY, TRIM or
-/// EXTRACT - the functions whose grammar spells an operand with FROM?
+/// sit directly inside the operand list of SUBSTRING, OVERLAY, TRIM,
+/// EXTRACT, FIRST_DAY / LAST_DAY or DATEDIFF - the functions whose
+/// grammar spells an operand with FROM (parse.y: `FIRST_DAY(OF MONTH
+/// FROM d)`, `DATEDIFF(DAY FROM a TO b)`)?
 fn from_is_operand(b: &[u8], k: usize) -> bool {
     let mut depth = 0i32;
     let mut i = k;
@@ -46801,12 +46824,126 @@ fn from_is_operand(b: &[u8], k: usize) -> bool {
                 while st > 0 && (b[st - 1].is_ascii_alphanumeric() || b[st - 1] == b'_') {
                     st -= 1;
                 }
-                return matches!(&b[st..e], b"SUBSTRING" | b"OVERLAY" | b"TRIM" | b"EXTRACT");
+                return matches!(
+                    &b[st..e],
+                    b"SUBSTRING" | b"OVERLAY" | b"TRIM" | b"EXTRACT" | b"FIRST_DAY" | b"LAST_DAY" | b"DATEDIFF"
+                );
             }
             _ => {}
         }
     }
     false
+}
+
+/// THE ONE LAW EVERY FROM LOCATOR ASKS: is the FROM at byte `k` of the
+/// (upper-cased, literal-masked) text the clause keyword? The engine's
+/// grammar spells FROM in three other places, and each was read here as
+/// the start of a FROM clause (measured on 2182, each answering where
+/// this server named the next word a table - `-204 Table unknown "2"`,
+/// `"LAST"`, `"DATE"`, `"FALSE"`):
+///   * inside a function's operand list ([from_is_operand]):
+///     `OVERLAY('abc' PLACING 'x' FROM 1)`, `FIRST_DAY(OF MONTH FROM D)`;
+///   * `<x> IS [NOT] DISTINCT FROM <y>` - at ANY depth, a bare predicate
+///     in a select list or a PSQL `IF (...)` alike;
+///   * `NTH_VALUE(<v>, <n>) FROM FIRST | FROM LAST OVER (...)` - after
+///     the call's close paren, at the select list's own depth; and any
+///     `FROM <word> OVER`, which is that spelling gone wrong
+///     (`FIRST_VALUE(V) FROM LAST OVER`, `NTH_VALUE(V, 2) FROM MIDDLE
+///     OVER` are the engine's -104 at the FROM / the word, and OVER is
+///     reserved, so it is no relation's alias) - a refusal, never a
+///     table named LAST.
+/// A clause FROM is never preceded by the bare word DISTINCT (a select
+/// item cannot end in it) and never followed by FIRST/LAST directly
+/// after an NTH_VALUE call, so neither test can hide a real clause.
+fn from_is_clause(b: &[u8], k: usize) -> bool {
+    if from_is_operand(b, k) {
+        return false;
+    }
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    // the word before
+    let mut e = k;
+    while e > 0 && b[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    let mut st = e;
+    while st > 0 && is_ident(b[st - 1]) {
+        st -= 1;
+    }
+    if &b[st..e] == b"DISTINCT" {
+        return false;
+    }
+    // FROM <word> OVER
+    {
+        let skip_ws = |mut j: usize| {
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            j
+        };
+        let w0 = skip_ws(k + "FROM".len());
+        let mut w1 = w0;
+        while w1 < b.len() && is_ident(b[w1]) {
+            w1 += 1;
+        }
+        let o0 = skip_ws(w1);
+        let mut o1 = o0;
+        while o1 < b.len() && is_ident(b[o1]) {
+            o1 += 1;
+        }
+        if w1 > w0 && &b[o0..o1] == b"OVER" {
+            return false;
+        }
+    }
+    // NTH_VALUE(...) FROM FIRST | LAST
+    if e > 0 && b[e - 1] == b')' {
+        let mut j = k + "FROM".len();
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let mut we = j;
+        while we < b.len() && is_ident(b[we]) {
+            we += 1;
+        }
+        if matches!(&b[j..we], b"FIRST" | b"LAST") {
+            let mut depth = 0i32;
+            let mut i = e;
+            while i > 0 {
+                i -= 1;
+                match b[i] {
+                    b')' => depth += 1,
+                    b'(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let mut ne = i;
+                            while ne > 0 && b[ne - 1].is_ascii_whitespace() {
+                                ne -= 1;
+                            }
+                            let mut ns = ne;
+                            while ns > 0 && is_ident(b[ns - 1]) {
+                                ns -= 1;
+                            }
+                            return &b[ns..ne] != b"NTH_VALUE";
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The first CLAUSE FROM at paren depth 0 of `masked_up` at or after
+/// `from` ([from_is_clause]) - [find_word_depth0] with the law applied.
+fn find_from_clause(masked_up: &str, from: usize) -> Option<usize> {
+    let mut cand = find_word_depth0(masked_up, "FROM", from);
+    loop {
+        let p = cand?;
+        if from_is_clause(masked_up.as_bytes(), p) {
+            return Some(p);
+        }
+        cand = find_word_depth0(masked_up, "FROM", p + "FROM".len());
+    }
 }
 
 // ===================================================================
@@ -48591,7 +48728,7 @@ impl QualCtx<'_> {
     /// `DELETE FROM <table> [alias] [WHERE ...]`.
     fn delete(&self, body: &str) -> QualScan {
         let up = self.up_of(body);
-        let Some(from) = find_word_depth0(up, "FROM", 0) else { return QualScan::Aside };
+        let Some(from) = find_from_clause(up, 0) else { return QualScan::Aside };
         let after = from + "FROM".len();
         let end = self.dml_tail(up, after);
         let wh = find_word_depth0(up, "WHERE", after).filter(|w| *w < end);
@@ -48630,7 +48767,7 @@ fn first_unknown_relation(sql: &str, db: &Database) -> Option<(usize, usize, boo
             // `OVERLAY('abc' PLACING 'x' FROM 2 FOR 1)` answered -204
             // *Table unknown "2"* where the engine answers 'axc'
             // (measured) - a wrong error, not a refusal.
-            if kw == "FROM" && from_is_operand(b, k) {
+            if kw == "FROM" && !from_is_clause(b, k) {
                 continue;
             }
             let mut i = from;
@@ -50594,7 +50731,7 @@ fn from_names(sql: &str) -> Vec<String> {
         let mut at = 0;
         while let Some(k) = find_word(&masked, kw, at) {
             at = k + kw.len();
-            if kw == "FROM" && from_is_operand(b, k) {
+            if kw == "FROM" && !from_is_clause(b, k) {
                 continue;
             }
             out.extend(name_at(at));
@@ -51447,7 +51584,7 @@ fn view_group_from_names(masked_up: &str, open: usize) -> Vec<String> {
         return Vec::new();
     }
     let inner = &masked_up[open + 1..close];
-    let Some(from) = find_word_depth0(inner, "FROM", 0) else { return Vec::new() };
+    let Some(from) = find_from_clause(inner, 0) else { return Vec::new() };
     let mut end = inner.len();
     for kw in ["WHERE", "GROUP", "HAVING", "ORDER", "UNION", "ROWS", "PLAN", "FETCH", "OFFSET"] {
         if let Some(p) = find_word_depth0(inner, kw, from + "FROM".len()) {
@@ -54095,7 +54232,15 @@ fn limit_lint_scan(sql: &str, known: &dyn Fn(&str, bool) -> bool) -> LimitLint {
                     "OPTIMIZE" if word(j + 1) == "FOR" && kind == Kind::Statement => Some(5),
                     _ => None,
                 };
-                if from_at.is_none() && w == "FROM" && j > ms && words[j - 1] != "DISTINCT" {
+                // not a predicate's `IS [NOT] DISTINCT FROM`, nor the
+                // `FROM FIRST | LAST` of an NTH_VALUE call ([from_is_clause])
+                let nth_dir = (j >= ms + 3
+                    && words[j - 1] == ")"
+                    && words[j - 2] == "("
+                    && words[j - 3] == "NTH_VALUE"
+                    && matches!(word(j + 1), "FIRST" | "LAST"))
+                    || word(j + 2) == "OVER";
+                if from_at.is_none() && w == "FROM" && j > ms && words[j - 1] != "DISTINCT" && !nth_dir {
                     from_at = Some(j);
                 }
                 if from_at.is_some()
@@ -66885,6 +67030,12 @@ fn compute_windows(
                                     }
                                     _ => Value::Null,
                                 },
+                                ValFn::NthValueLast => match n {
+                                    Some(k) if *k >= 1 && hi - (*k as isize - 1) >= lo => {
+                                        arg.eval(&rows[idxs[perm[(hi - (*k as isize - 1)) as usize]]])?
+                                    }
+                                    _ => Value::Null,
+                                },
                             }
                         };
                     }
@@ -70532,6 +70683,9 @@ const GDS_SYSF_ARGN_NONNEG: i32 = 335544962;
 /// sysf_argnmustbe_positive - "Argument #@1 for @2 must be positive"
 /// (POSITION's start, #3)
 const GDS_SYSF_ARGN_POSITIVE: i32 = 335544963;
+/// sysf_invalid_date_timestamp - "Expected DATE/TIMESTAMP value in @1"
+/// (FIRST_DAY / LAST_DAY over a TIME or a string, at fetch)
+const GDS_SYSF_INVALID_DATE_TIMESTAMP: i32 = 335545157;
 /// sysf_invalid_scale - "The numeric scale must be between -128 and 127
 /// in @1" (ROUND / TRUNC places)
 const GDS_SYSF_INVALID_SCALE: i32 = 335544966;
@@ -77144,6 +77298,28 @@ enum SysFn {
     /// operand; VARCHAR(32) CHARACTER SET ASCII (measured). A function of
     /// its own because every other EXTRACT part is an integer.
     TzName,
+    /// `OVERLAY(s PLACING p FROM n [FOR len])` - args [s, p, n] or
+    /// [s, p, n, len]: the characters of `s` before `n`, then `p`, then
+    /// `s` from `n + len` on (`len` defaults to the length of `p`, and
+    /// both clamp to the end of `s` - measured `OVERLAY('abcdef' PLACING
+    /// 'xy' FROM 10)` is 'abcdefxy'). evlOverlay's order, measured on
+    /// 2182: a NULL in any argument answers NULL before any check, then a
+    /// negative `len` raises *Argument #4 for OVERLAY must be zero or
+    /// positive* and a `n` below 1 *Argument #3 ... must be positive*,
+    /// both at fetch. Described VARYING, as wide as `s` and `p` together
+    /// (makeOverlay: `VARCHAR(6)` + `'xy'` is 8), in the two operands'
+    /// negotiated set.
+    Overlay,
+    /// `FIRST_DAY(OF <part> FROM d)` / `LAST_DAY(...)` - the part is
+    /// YEAR, QUARTER, MONTH or WEEK (the grammar knows no other); the
+    /// bool is LAST. evlFirstLastDay, measured on 2182: the result keeps
+    /// a TIMESTAMP's time of day (`LAST_DAY(OF MONTH FROM TIMESTAMP
+    /// '2024-02-10 13:14:15.1234')` is `2024-02-29 13:14:15.1234`), a
+    /// week runs Sunday to Saturday (2024-05-17 gives 05-12 / 05-18), a
+    /// DATE answers a DATE, and any other operand is described DATE and
+    /// raises *Expected DATE/TIMESTAMP value in FIRST_DAY* at fetch; a
+    /// result outside 0001..9999 raises 22008.
+    FirstLastDay(ExtractPart, bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -77166,6 +77342,10 @@ enum ExtractPart {
     /// `tzSign * tzm`)
     TimezoneHour,
     TimezoneMinute,
+    /// 1..4, `(month - 1) / 3 + 1`, a SMALLINT over a DATE or a
+    /// TIMESTAMP (measured on 2182: 2024-05-01 is 2, 2024-12-31 is 4, a
+    /// TIME is the -105); DATEADD and DATEDIFF do not take it
+    Quarter,
 }
 
 impl ExtractPart {
@@ -77174,7 +77354,7 @@ impl ExtractPart {
     fn valid_for(&self, k: TKind) -> bool {
         use ExtractPart::*;
         match self {
-            Year | Month | Day | Weekday | Yearday | Week => {
+            Year | Month | Day | Weekday | Yearday | Week | Quarter => {
                 matches!(k, TKind::Date | TKind::Timestamp | TKind::TimestampTz)
             }
             Hour | Minute | Second | Millisecond => {
@@ -77272,6 +77452,9 @@ impl SysFn {
             SysFn::Extract(_) | SysFn::TzName => "EXTRACT",
             SysFn::DateAdd(_) => "DATEADD",
             SysFn::DateDiff(_) => "DATEDIFF",
+            SysFn::Overlay => "OVERLAY",
+            SysFn::FirstLastDay(_, false) => "FIRST_DAY",
+            SysFn::FirstLastDay(_, true) => "LAST_DAY",
         }
     }
 }
@@ -79117,7 +79300,8 @@ fn names_expr_call(s: &str) -> bool {
         "COALESCE(", "NULLIF(", "IIF(", "UPPER(", "LOWER(", "CHAR_LENGTH(",
         "CHARACTER_LENGTH(", "OCTET_LENGTH(", "BIT_LENGTH(", "SUBSTRING(", "TRIM(", "LEFT(",
         "RIGHT(", "REPLACE(", "POSITION(", "REVERSE(", "ABS(", "MOD(",
-        "SIGN(", "LPAD(", "RPAD(", "EXTRACT(", "DATEADD(", "DATEDIFF(",
+        "SIGN(", "LPAD(", "RPAD(", "EXTRACT(", "DATEADD(", "DATEDIFF(", "OVERLAY(",
+        "FIRST_DAY(", "LAST_DAY(",
     ]
     .iter()
     .any(|f| up.contains(f))
@@ -79182,6 +79366,9 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
         "EXTRACT" => SysFn::Extract(ExtractPart::Year),
         "DATEADD" => SysFn::DateAdd(ExtractPart::Year),
         "DATEDIFF" => SysFn::DateDiff(ExtractPart::Year),
+        "OVERLAY" => SysFn::Overlay,
+        "FIRST_DAY" => SysFn::FirstLastDay(ExtractPart::Year, false),
+        "LAST_DAY" => SysFn::FirstLastDay(ExtractPart::Year, true),
         _ => return None,
     })
 }
@@ -79290,6 +79477,7 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
             "DAY" => ExtractPart::Day,
             "WEEKDAY" => ExtractPart::Weekday,
             "YEARDAY" => ExtractPart::Yearday,
+            "QUARTER" => ExtractPart::Quarter,
             "WEEK" => ExtractPart::Week,
             "HOUR" => ExtractPart::Hour,
             "MINUTE" => ExtractPart::Minute,
@@ -79312,6 +79500,46 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         }
         let operand = expr_add(b, pos)?;
         return Some(RawExpr::Func(SysFn::Extract(part), vec![operand]));
+    }
+    // OVERLAY(<s> PLACING <p> FROM <start> [FOR <len>])
+    if matches!(f, SysFn::Overlay) {
+        let src = expr_add(b, pos)?;
+        if !take_keyword(b, pos, "PLACING") {
+            return None;
+        }
+        let placing = expr_add(b, pos)?;
+        if !take_keyword(b, pos, "FROM") {
+            return None;
+        }
+        let mut args = vec![src, placing, expr_add(b, pos)?];
+        if take_keyword(b, pos, "FOR") {
+            args.push(expr_add(b, pos)?);
+        }
+        return Some(RawExpr::Func(SysFn::Overlay, args));
+    }
+    // FIRST_DAY / LAST_DAY(OF <YEAR|QUARTER|MONTH|WEEK> FROM <d>)
+    if let SysFn::FirstLastDay(_, last) = f {
+        if !take_keyword(b, pos, "OF") {
+            return None;
+        }
+        skip_ws(b, pos);
+        let start = *pos;
+        while *pos < b.len() && (b[*pos].is_alphanumeric() || b[*pos] == '_') {
+            *pos += 1;
+        }
+        let word: String = b[start..*pos].iter().collect();
+        let part = match word.to_ascii_uppercase().as_str() {
+            "YEAR" => ExtractPart::Year,
+            "QUARTER" => ExtractPart::Quarter,
+            "MONTH" => ExtractPart::Month,
+            "WEEK" => ExtractPart::Week,
+            _ => return None,
+        };
+        if !take_keyword(b, pos, "FROM") {
+            return None;
+        }
+        let operand = expr_add(b, pos)?;
+        return Some(RawExpr::Func(SysFn::FirstLastDay(part, last), vec![operand]));
     }
     // SUBSTRING(<s> FROM <start> [FOR <len>])
     if matches!(f, SysFn::Substring) {
@@ -79459,7 +79687,9 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::Extract(_)
         | SysFn::TzName
         | SysFn::DateAdd(_)
-        | SysFn::DateDiff(_) => unreachable!(),
+        | SysFn::DateDiff(_)
+        | SysFn::Overlay
+        | SysFn::FirstLastDay(..) => unreachable!(),
     };
     if args.len() < min || args.len() > max {
         return None;
@@ -80763,6 +80993,32 @@ fn strfn_result_cs(f: SysFn, args: &[Expr], descs: &[Descriptor]) -> Option<TfCs
         SysFn::Trim(_) if args.len() >= 2 => form(1),
         SysFn::Position => form(1),
         _ => None,
+    }
+}
+
+/// OVERLAY is answered here over characters of ONE set: evlOverlay
+/// MOV_make_string2's both operands into their negotiated set
+/// (getResultTextType) and cuts by that set's characters, which is the
+/// char algebra below only when no operand has to MOVE between two sets
+/// first. So the two text operands must be of the same set, or one of
+/// them must carry no set of its own - an ASCII literal, a NULL, a
+/// number (whose text is ASCII). Two different sets refuse, cleanly,
+/// rather than cut one set's bytes as the other's characters.
+fn overlay_operands_one_set(args: &[Expr], descs: &[Descriptor]) -> bool {
+    let set = |e: &Expr| -> Result<Option<u8>, ()> {
+        match e {
+            Expr::Null => Ok(None),
+            Expr::Str(s) if s.is_ascii() => Ok(None),
+            _ => match e.type_of(descs) {
+                Some(ExprType::Text) => value_cs(e, descs).map(|c| Some(tf_charset(c))).ok_or(()),
+                Some(ExprType::Int | ExprType::Numeric) => Ok(None),
+                _ => Err(()),
+            },
+        }
+    };
+    match (args.first().map(set), args.get(1).map(set)) {
+        (Some(Ok(a)), Some(Ok(b))) => a.is_none() || b.is_none() || a == b,
+        _ => false,
     }
 }
 
@@ -85288,6 +85544,9 @@ fn resolve_expr_inner(
             // 'É', U)` under NONE replaces the literal's two octets by
             // U's bytes, measured): under a carrier attachment the
             // literal already is in the set the call runs in
+            if matches!(f, SysFn::Overlay) && !overlay_operands_one_set(&resolved, descs) {
+                return None;
+            }
             let run_cs = strfn_result_cs(*f, &resolved, descs).map(tf_charset);
             if !run_cs.is_some_and(|cs| {
                 fire_crab_ods::intl::byte_carrier(cs) && cs != fire_crab_ods::intl::CS_ASCII
@@ -90849,7 +91108,7 @@ fn dateadd_impl(
         Week => SPAN / 7 + 1,
         Hour | Minute | Second | Millisecond => (SPAN + 1) * per_day,
         // DATEADD's own unit parser never yields these
-        Weekday | Yearday | TimezoneHour | TimezoneMinute => {
+        Weekday | Yearday | TimezoneHour | TimezoneMinute | Quarter => {
             return Err(EvalErr::ConversionError(None))
         }
     };
@@ -90893,7 +91152,7 @@ fn dateadd_impl(
             d = total.div_euclid(UNITS_PER_DAY) as i64;
             u = total.rem_euclid(UNITS_PER_DAY) as i64;
         }
-        Weekday | Yearday | TimezoneHour | TimezoneMinute => unreachable!(),
+        Weekday | Yearday | TimezoneHour | TimezoneMinute | Quarter => unreachable!(),
     }
     if !(MIN_DATE..=MAX_DATE).contains(&d) {
         return Err(range);
@@ -90950,7 +91209,7 @@ fn datediff_impl(
             Value::Scaled((total(b) - total(a)) as i64, -1)
         }
         // DATEDIFF's own unit parser never yields these
-        Weekday | Yearday | TimezoneHour | TimezoneMinute => return None,
+        Weekday | Yearday | TimezoneHour | TimezoneMinute | Quarter => return None,
     })
 }
 
@@ -92885,6 +93144,34 @@ impl Expr {
                     })
                     .collect::<Option<Vec<_>>>()?;
                 match f {
+                    // OVERLAY: its two text operands convert to text (a
+                    // number too - `OVERLAY(12345 PLACING 9 FROM 2)` is
+                    // '19345', measured), the start and length are
+                    // MOV_get_long'd ('2' and 2.6 both answer); a blob
+                    // operand is a blob result, not this slice
+                    SysFn::Overlay => {
+                        let texty = |t: &ExprType| matches!(t, ExprType::Text | ExprType::Int | ExprType::Numeric);
+                        let count = |t: &ExprType| matches!(t, ExprType::Int | ExprType::Numeric | ExprType::Text);
+                        (texty(&ts[0])
+                            && texty(&ts[1])
+                            && ts[2..].iter().all(count)
+                            && args[..2].iter().all(|a| blob_result(a, descs).is_none()))
+                        .then_some(ExprType::Text)
+                    }
+                    // FIRST_DAY / LAST_DAY: a TIMESTAMP (zoned or not)
+                    // answers its own kind, anything else is described DATE
+                    // (makeFirstLastDayResult) - a DATE is one, and a TIME
+                    // or a string raises at fetch
+                    SysFn::FirstLastDay(..) => match ts[0] {
+                        ExprType::Temporal(k @ (TKind::Timestamp | TKind::TimestampTz)) => {
+                            Some(ExprType::Temporal(k))
+                        }
+                        // (a bare NULL literal is unmeasured: it refuses)
+                        ExprType::Temporal(_) | ExprType::Text if !matches!(args[0], Expr::Null) => {
+                            Some(ExprType::Temporal(TKind::Date))
+                        }
+                        _ => None,
+                    },
                     SysFn::BlobOctetLength => Some(ExprType::Int), // answered above
                     // amount + temporal operand -> the operand's kind; a
                     // TIME takes only clock units. The amount is any
@@ -95693,6 +95980,86 @@ impl Expr {
                     vs.push(v);
                 }
                 match f {
+                    SysFn::Overlay => {
+                        let s: Vec<char> = fn_text(&vs[0]).chars().collect();
+                        let p = fn_text(&vs[1]);
+                        // evlOverlay reads the LENGTH first, then the start
+                        let len = match vs.get(3) {
+                            Some(l) => {
+                                let n = arg_long(l)?;
+                                if n < 0 {
+                                    return Err(EvalErr::ArgDomain {
+                                        func: "OVERLAY",
+                                        argno: 4,
+                                        code: GDS_SYSF_ARGN_NONNEG,
+                                    });
+                                }
+                                Some(n as usize)
+                            }
+                            None => None,
+                        };
+                        let from = arg_long(&vs[2])?;
+                        if from <= 0 {
+                            return Err(EvalErr::ArgDomain {
+                                func: "OVERLAY",
+                                argno: 3,
+                                code: GDS_SYSF_ARGN_POSITIVE,
+                            });
+                        }
+                        let from = (from as usize).min(s.len() + 1);
+                        let len = len.unwrap_or_else(|| p.chars().count()).min(s.len() + 1 - from);
+                        let mut out: String = s[..from - 1].iter().collect();
+                        out.push_str(&p);
+                        out.extend(&s[from - 1 + len..]);
+                        Value::Text(out)
+                    }
+                    SysFn::FirstLastDay(part, last) => {
+                        let (d, t, zone) = match vs[0] {
+                            Value::Date(d) => (d, None, None),
+                            Value::Timestamp(d, t) => (d, Some(t), None),
+                            Value::TimestampTz(d, t, z) => {
+                                // the WALL clock in the value's own zone,
+                                // and back through it (evlFirstLastDay's
+                                // decodeTimeStamp / localTimeStampToUtc)
+                                let (ld, lt) = tz_local_timestamp(d, t, z).ok_or(EvalErr::Unsupported)?;
+                                (ld, Some(lt), Some(z))
+                            }
+                            _ => {
+                                return Err(EvalErr::MathDomain {
+                                    func: if *last { "LAST_DAY" } else { "FIRST_DAY" },
+                                    code: GDS_SYSF_INVALID_DATE_TIMESTAMP,
+                                })
+                            }
+                        };
+                        let (y, m, _) = civil_of(d);
+                        let nd: i64 = match (part, last) {
+                            (ExtractPart::Year, false) => days_of_civil(y, 1, 1) as i64,
+                            (ExtractPart::Year, true) => days_of_civil(y, 12, 31) as i64,
+                            (ExtractPart::Month, false) => days_of_civil(y, m, 1) as i64,
+                            (ExtractPart::Month, true) => days_of_civil(y, m, last_day_of_month(y, m)) as i64,
+                            (ExtractPart::Quarter, false) => days_of_civil(y, (m - 1) / 3 * 3 + 1, 1) as i64,
+                            (ExtractPart::Quarter, true) => {
+                                let qm = (m - 1) / 3 * 3 + 3;
+                                days_of_civil(y, qm, last_day_of_month(y, qm)) as i64
+                            }
+                            // Sunday .. Saturday
+                            (_, false) => d as i64 - weekday_of(d) as i64,
+                            (_, true) => d as i64 + 6 - weekday_of(d) as i64,
+                        };
+                        // 0001-01-01 ..= 9999-12-31, isc_datetime_range_exceeded
+                        if !(-678_575..=2_973_483).contains(&nd) {
+                            return Err(EvalErr::DatetimeRange);
+                        }
+                        let nd = nd as i32;
+                        match (t, zone) {
+                            (None, _) => Value::Date(nd),
+                            (Some(t), None) => Value::Timestamp(nd, t),
+                            (Some(t), Some(z)) => {
+                                let (ud, ut) = wall_to_utc_timestamp(nd, t, z).ok_or(EvalErr::Unsupported)?;
+                                Value::TimestampTz(ud, ut, z)
+                            }
+                        }
+                    }
                     SysFn::DateAdd(unit) => {
                         let amount = arg_int64(
                             &vs[0],
@@ -95818,6 +96185,7 @@ impl Expr {
                             (Month, Some(d), _) => Value::Int(civil_of(d).1 as i64),
                             (Day, Some(d), _) => Value::Int(civil_of(d).2 as i64),
                             (Weekday, Some(d), _) => Value::Int(weekday_of(d) as i64),
+                            (Quarter, Some(d), _) => Value::Int(((civil_of(d).1 - 1) / 3 + 1) as i64),
                             (Yearday, Some(d), _) => {
                                 let (y, _, _) = civil_of(d);
                                 Value::Int((d - days_of_civil(y, 1, 1)) as i64)
@@ -102142,11 +102510,9 @@ fn split_query(
     // the clause FROM is the first one at paren depth 0 - SUBSTRING(S
     // FROM 2) and TRIM(x FROM y) carry their own FROM keyword INSIDE the
     // select list's parentheses, and a literal's is masked out entirely.
-    // One select-list construct embeds a FROM at depth 0 with no parens:
-    // `<x> IS [NOT] DISTINCT FROM <y>` - so a FROM whose preceding word
-    // is DISTINCT is that predicate's, not the clause's (a legitimate
-    // clause FROM is always preceded by a select item, never by the bare
-    // keyword DISTINCT, which cannot end one)
+    // Two select-list constructs embed a FROM at depth 0 with no parens,
+    // `<x> IS [NOT] DISTINCT FROM <y>` and `NTH_VALUE(v, n) FROM LAST
+    // OVER (...)` - [from_is_clause] is the law for all of them
     let masked_up = mask_literals(&up);
     let from = {
         let mut cand = find_word(&masked_up, "FROM", "SELECT".len());
@@ -102157,12 +102523,7 @@ fn split_query(
                 b')' => d - 1,
                 _ => d,
             });
-            let after_distinct = masked_up[..p]
-                .trim_end()
-                .rsplit(|c: char| c.is_whitespace())
-                .next()
-                .is_some_and(|w| w == "DISTINCT");
-            if depth == 0 && !after_distinct {
+            if depth == 0 && from_is_clause(masked_up.as_bytes(), p) {
                 break Some(p);
             }
             cand = find_word(&masked_up, "FROM", p + "FROM".len());
@@ -102291,6 +102652,33 @@ fn window_call_span(body: &str, from: usize) -> Option<(usize, usize)> {
     while i > 0 && b[i - 1].is_ascii_whitespace() {
         i -= 1;
     }
+    // an NTH_VALUE's `FROM FIRST | FROM LAST` sits between its call and
+    // the OVER: step back over the two words ([parse_window_item] reads
+    // them and refuses them on any other function)
+    {
+        let mb = masked.as_bytes();
+        let word_before = |end: usize| -> usize {
+            let mut st = end;
+            while st > 0 && (mb[st - 1].is_ascii_alphanumeric() || mb[st - 1] == b'_') {
+                st -= 1;
+            }
+            st
+        };
+        let d0 = word_before(i);
+        if matches!(&mb[d0..i], b"FIRST" | b"LAST") {
+            let mut e = d0;
+            while e > 0 && mb[e - 1].is_ascii_whitespace() {
+                e -= 1;
+            }
+            let f0 = word_before(e);
+            if &mb[f0..e] == b"FROM" && f0 < e {
+                i = f0;
+                while i > 0 && b[i - 1].is_ascii_whitespace() {
+                    i -= 1;
+                }
+            }
+        }
+    }
     if i == 0 || b[i - 1] != b')' {
         return None;
     }
@@ -102372,6 +102760,22 @@ fn parse_window_item(
     let lp = t.find('(')?;
     let call_end = matching_paren(bytes, lp)?;
     let mut after = t[call_end + 1..].trim_start();
+    // `NTH_VALUE(...) FROM FIRST | FROM LAST` - the direction, read off
+    // before FILTER / OVER; on any other function it is the engine's
+    // syntax error, so it refuses here
+    let mut from_last: Option<bool> = None;
+    if after.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("FROM"))
+        && after[4..].starts_with(|c: char| c.is_ascii_whitespace())
+    {
+        let dir = after[4..].trim_start();
+        let (w, rest) = dir.split_at(dir.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(dir.len()));
+        from_last = Some(match w.to_ascii_uppercase().as_str() {
+            "FIRST" => false,
+            "LAST" => true,
+            _ => return None,
+        });
+        after = rest.trim_start();
+    }
     // an optional `FILTER (WHERE c)` sits between the call and OVER, on an
     // AGGREGATE window only. Consume it; the call region then spans through
     // the FILTER's close paren so parse_agg_item does the FILTER -> CASE
@@ -102408,7 +102812,14 @@ fn parse_window_item(
     // args), a navigation one (`LAG`/`LEAD`, one to three args), or else an
     // aggregate the ordinary parser reads. A FILTER rides an AGGREGATE only,
     // so a filtered call goes straight to parse_agg_item (which rewrites it).
-    let func = if has_filter {
+    let func = if let Some(last) = from_last {
+        match parse_val_call(call)? {
+            (ValFn::NthValue, arg, nn) if !has_filter => {
+                WinFunc::Val(if last { ValFn::NthValueLast } else { ValFn::NthValue }, arg, nn)
+            }
+            _ => return None,
+        }
+    } else if has_filter {
         let (f, target) = parse_agg_item(call)?;
         WinFunc::Agg(f, target)
     } else if let Some(rk) = parse_rank_call(call) {
@@ -103451,7 +103862,7 @@ fn parse_projection(proj: &str) -> Option<Proj> {
                 WinFunc::Nav(NavFn::Lead, ..) => "LEAD",
                 WinFunc::Val(ValFn::FirstValue, ..) => "FIRST_VALUE",
                 WinFunc::Val(ValFn::LastValue, ..) => "LAST_VALUE",
-                WinFunc::Val(ValFn::NthValue, ..) => "NTH_VALUE",
+                WinFunc::Val(ValFn::NthValue | ValFn::NthValueLast, ..) => "NTH_VALUE",
             }
             .to_string();
             items.push(SelItem::Win(func, part, order, frame, alias_owned, fname));
@@ -118812,6 +119223,8 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
             }
             match f {
                 SysFn::GetContext | SysFn::SetContext | SysFn::TzName => false,
+                // a start below 1, a negative length, a DATE past 9999
+                SysFn::Overlay | SysFn::FirstLastDay(..) => false,
                 SysFn::Upper
                 | SysFn::Lower
                 | SysFn::UpperCs(_)
@@ -135851,8 +136264,10 @@ mod tests {
         assert!(build_expr_col(
             &parse_raw_expr("COALESCE(D, 1)").unwrap(), "X", &columns, &descs
         ).is_none());
-        // unknown part and malformed forms do not parse
-        assert!(parse_raw_expr("EXTRACT(QUARTER FROM D)").is_none());
+        // an unknown part and malformed forms do not parse (QUARTER is
+        // a part: the engine answers it, qa/serve-real-fromloc.sh)
+        assert!(parse_raw_expr("EXTRACT(QUARTER FROM D)").is_some());
+        assert!(parse_raw_expr("EXTRACT(BOGUS FROM D)").is_none());
         assert!(parse_raw_expr("EXTRACT(YEAR, D)").is_none());
         assert!(parse_raw_expr("DATE '2024-2'").is_none());
 
@@ -138548,6 +138963,21 @@ mod tests {
         assert_eq!(table, "T2");
         let (_, table, ..) = split_query("SELECT ' FROM X ' FROM T3").unwrap();
         assert_eq!(table, "T3");
+        // the FROMs the grammar writes outside the clause ([from_is_clause])
+        let (proj, table, ..) =
+            split_query("SELECT NTH_VALUE(V, 2) FROM LAST OVER (ORDER BY ID) FROM W").unwrap();
+        assert_eq!(proj, "NTH_VALUE(V, 2) FROM LAST OVER (ORDER BY ID)");
+        assert_eq!(table, "W");
+        let (_, table, ..) = split_query("SELECT A IS NOT DISTINCT FROM B FROM T4").unwrap();
+        assert_eq!(table, "T4");
+        let (_, table, ..) = split_query("SELECT FIRST_VALUE(V) FROM LAST OVER (ORDER BY ID) FROM T5").unwrap();
+        assert_eq!(table, "T5");
+        let m = "SELECT OVERLAY(S PLACING 'X' FROM 1), FIRST_DAY(OF MONTH FROM D) FROM T";
+        let k: Vec<usize> = m.match_indices("FROM").map(|(i, _)| i).collect();
+        assert_eq!(k.iter().filter(|&&i| from_is_clause(m.as_bytes(), i)).count(), 1);
+        // a real clause after a function call is still one
+        let m = "SELECT COUNT(*) FROM FIRST";
+        assert!(from_is_clause(m.as_bytes(), m.find("FROM").unwrap()));
     }
 
     #[test]

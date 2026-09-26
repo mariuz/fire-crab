@@ -66,7 +66,9 @@
 #     glued the literal's carrier characters on ('éÃ©' for 'éé', 8e).
 #
 # RECORDED in section 8 (the engine answers, this server refuses): the
-# lost-literal bodies; OVERLAY; a
+# lost-literal bodies; OVERLAY in an EXECUTE BLOCK (the block compiler
+# knows no OVERLAY - a stored body's, which the source interpreter runs,
+# answers since qa/serve-real-fromloc.sh taught the planner OVERLAY); a
 # procedure CALLED from a body's query with a non-ASCII variable; an
 # EXECUTE STATEMENT built from one; and the EXECUTE BLOCKs whose RETURNS
 # or locals name a CHARACTER SET (the block compiler refuses them).
@@ -654,7 +656,7 @@ pin  $'8b LOWER of \'ÉÈ\'' $'SELECT * FROM XPLO(\'ÉÈ\');' $'R|éè'
 pin  $'8b SUBSTRING counts characters (it answered \'ãã\')' $'SELECT * FROM XPSB(\'éèàx\');' $'R|èà'
 pin  $'8b X || \'-\' || X (it answered \'Ã©-Ã©\')' $'SELECT * FROM XPCT(\'é\');' $'R|é-é'
 pin  $'8b CHAR_LENGTH and OCTET_LENGTH of \'éé\' (4 and 8)' $'SELECT * FROM XPLN(\'éé\');' $'N O|2 4'
-refused $'8b OVERLAY over \'éèà\'' $'SELECT * FROM XPOV(\'éèà\');' $'R|éZà'
+pin  $'8b OVERLAY over \'éèà\' (promoted: the planner answers OVERLAY)' $'SELECT * FROM XPOV(\'éèà\');' $'R|éZà'
 pin  $'8b RPAD pads in characters (it answered \'Ã©**\')' $'SELECT * FROM XPRP(\'é\');' $'R|é***'
 pin  $'8b LPAD pads in characters' $'SELECT * FROM XPLP(\'é\');' $'R|***é'
 pin  $'8b REPLACE beside a non-ASCII character' $'SELECT * FROM XPRE(\'éa\');' $'R|éb'
