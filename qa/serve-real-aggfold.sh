@@ -238,8 +238,8 @@ pin  "4 grouped SUM(INT128): 1, -5, max in record order does not overflow" "SELE
 # the engine sends the groups folded before the failing one, then the
 # error; this server folds every group before it answers any row
 recorded "4 the groups before an overflowing one are not sent" "SELECT G, SUM(N) FROM T GROUP BY G;" "G SUM|1 120000000000000000000000000000000000001|$IOV"
-recorded "4 SUM(DISTINCT) is refused here" "SELECT SUM(DISTINCT N) FROM T;" "SUM|1"
-recorded "4 a windowed STDDEV_POP is refused here" "SELECT STDDEV_POP(X) OVER () FROM V;" "STDDEV_POP|Infinity|Infinity"
+pin      "4 SUM(DISTINCT) answers (promoted 2026-09-26; the aggplan chunk)" "SELECT SUM(DISTINCT N) FROM T;" "SUM|1"
+pin      "4 a windowed STDDEV_POP answers (promoted 2026-09-26; the aggplan chunk)" "SELECT STDDEV_POP(X) OVER () FROM V;" "STDDEV_POP|Infinity|Infinity"
 
 echo "--- 5. GROUP BY AND PARTITIONED WINDOWS: THE SORT RECORD'S ORDER (it folded in scan order)"
 pin  "5 grouped SUM(INT128): -max, max ... overflows in record order" "SELECT G, SUM(H) FROM P GROUP BY G ORDER BY G;" "G SUM|$IOV"

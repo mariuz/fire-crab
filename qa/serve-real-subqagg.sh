@@ -210,12 +210,10 @@ case "$r" in
     ERR*) echo "OK   SUM over a text column is refused" ;;
     *) echo "DIFF SUM(text) answered: [$r]"; fail=1 ;;
 esac
-# only COUNT takes DISTINCT
-r=$(query "SELECT ID FROM T WHERE AMT > (SELECT AVG(DISTINCT AMT) FROM T)" "$PORT" "$A")
-case "$r" in
-    ERR*) echo "OK   AVG(DISTINCT ...) is refused, not silently folded" ;;
-    *) echo "DIFF AVG(DISTINCT) answered: [$r]"; fail=1 ;;
-esac
+# AVG(DISTINCT) folds the distinct values (answered since 2026-09-26, the
+# aggplan chunk; it was refused as "only COUNT takes DISTINCT")
+both "AVG(DISTINCT) as a subquery value" \
+     "SELECT ID FROM T WHERE AMT > (SELECT AVG(DISTINCT AMT) FROM T) ORDER BY ID"
 
 rm -f "$A" "$B"
 exit $fail

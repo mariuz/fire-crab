@@ -142,10 +142,13 @@ sameh "header AVG"                   "SELECT AVG(A) FROM T"
 sameh "header COUNT for DISTINCT"    "SELECT COUNT(DISTINCT G) FROM T"
 sameh "MIN of text describes as the column" "SELECT MIN(S) FROM T"
 
+# --- DISTINCT under SUM/AVG (answered since 2026-09-26, measured: the
+# distinct non-NULL values fold; qa/serve-real-aggplan.sh pins the law)
+same "SUM(DISTINCT A)"               "SELECT SUM(DISTINCT A) FROM T"
+same "AVG(DISTINCT A)"               "SELECT AVG(DISTINCT A) FROM T"
+
 # --- refusals ----------------------------------------------------------
-for bad in "SELECT SUM(DISTINCT A) FROM T" \
-           "SELECT AVG(DISTINCT A) FROM T" \
-           "SELECT AVG(S) FROM T" \
+for bad in "SELECT AVG(S) FROM T" \
            "SELECT SUM(D) FROM T" \
            "SELECT AVG(*) FROM T"; do
     out=$(printf '%s;\n' "$bad" |

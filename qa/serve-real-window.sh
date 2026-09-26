@@ -435,10 +435,10 @@ both "T2 after INSERT..SELECT"     "SELECT K FROM T2 ORDER BY 1"
 # answers all four; fire-crab refuses, which is law-safe and ranks below
 # any wrong answer. Recorded here so the day one starts agreeing, the
 # gate says so instead of quietly passing.
-known_diff "window OVER a join"        "SELECT A.ID, SUM(A.V) OVER (PARTITION BY A.G) S FROM T A JOIN T B ON B.ID=A.ID ORDER BY A.ID"
-known_diff "window over a joined derived" "SELECT W FROM (SELECT SUM(A.V) OVER (PARTITION BY A.G) AS W FROM T A JOIN T B ON B.ID=A.ID) Z ORDER BY 1"
+both       "window OVER a join"        "SELECT A.ID, SUM(A.V) OVER (PARTITION BY A.G) S FROM T A JOIN T B ON B.ID=A.ID ORDER BY A.ID"
+both       "window over a joined derived" "SELECT W FROM (SELECT SUM(A.V) OVER (PARTITION BY A.G) AS W FROM T A JOIN T B ON B.ID=A.ID) Z ORDER BY 1"
 known_diff "window inside a RECURSIVE CTE" "WITH RECURSIVE R AS (SELECT 1 AS L FROM RDB\$DATABASE UNION ALL SELECT L+1 FROM R WHERE L<3) SELECT L FROM (SELECT L, ROW_NUMBER() OVER (ORDER BY L) N FROM R) Z ORDER BY L"
-known_diff "window mixed with GROUP BY"   "SELECT G, SUM(V) S, COUNT(*) OVER () C FROM T GROUP BY G ORDER BY G"
+both       "window mixed with GROUP BY"   "SELECT G, SUM(V) S, COUNT(*) OVER () C FROM T GROUP BY G ORDER BY G"
 # both servers REFUSE a `?` in a window - only the message differs (the
 # engine adds "SQL error code = -804"), so this records a message gap and
 # not a capability one

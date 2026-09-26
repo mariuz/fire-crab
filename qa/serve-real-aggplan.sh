@@ -1,0 +1,345 @@
+#!/bin/bash
+# THE AGGREGATE / WINDOW PLANNER'S SHAPES, composed as the engine composes
+# them - every cell measured on engine 2182 (2026-09-26) and pinned:
+#
+#   - a WINDOW over a GROUP BY, a HAVING, an implicit group, a JOIN, a
+#     derived table, a CTE or a view; under DISTINCT, FIRST/SKIP, ROWS
+#     and OFFSET/FETCH; in the statement's ORDER BY; a named window
+#     REFINED by ORDER BY or a frame; a bare window beside a window
+#     inside an expression. All refused on fc/integ b0b662f; the planner
+#     now rewrites a windowed select into the three levels the engine
+#     composes ([rewrite_windowed_select]: the query without its
+#     windows, the windows over it, the names / modifiers / ORDER BY
+#     over that).
+#   - DELIVERY ORDER without a statement ORDER BY: the LAST SORTED
+#     WINDOW's order, an `OVER ()` neither sorting nor resetting, ties
+#     by the previous windows' values then the referenced base fields
+#     (WindowedStream.cpp's chain; [compute_windows]).
+#   - HAVING without GROUP BY over a constant list; ORDER BY an
+#     aggregate on the implicit group; a FILTER inside an expression;
+#     SUM/AVG/MIN/MAX(DISTINCT x); SUM/AVG/MIN/MAX/COUNT over the untyped
+#     NULL literal (a CHAR(1) NONE, measured); STDDEV/VAR as windows.
+#   - FRAME BOUNDS: UNBOUNDED FOLLOWING as bound 1, UNBOUNDED PRECEDING
+#     as bound 2 and any FOLLOWING in the shorthand are the PARSER's
+#     -104 Token unknown at that keyword (line/column pinned); FOLLOWING
+#     then PRECEDING/CURRENT ROW, and CURRENT ROW then PRECEDING, are
+#     the bare dsql_window_incompat_frames; a NULL or string offset the
+#     bare dsql_window_frame_value_inv_type; a NEGATIVE offset raises at
+#     EXECUTE, over an empty input too. fc/integ ANSWERED the first four
+#     shapes (rows or NULLs) where the engine raises.
+#
+# RECORDED, not fixed (section 12 and the refused/differs cells): CREATE
+# VIEW over an aggregate, a GROUP BY or a window; LAG/LEAD/NTH_VALUE with
+# a NULL or non-constant offset; RANGE offsets over a NUMERIC or DATE
+# key; a fractional or column frame offset; a frame with no ORDER BY;
+# LIST and PERCENTILE_CONT as windows; MIN and COUNT(DISTINCT) over a
+# BLOB; CREATE VIEW ... WITH CHECK OPTION; DISTINCT in an ordered window (the engine's 0A000, a generic
+# refusal here); a bare column under a lone HAVING or in the ORDER BY of
+# an implicit group (the engine's specific -104, a generic refusal here).
+#
+# Usage: qa/serve-real-aggplan.sh [port]   (default 6010)
+set -u
+FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
+ISQL="${ISQL:-isql}"
+PORT="${1:-6010}"
+REAL="${FC_REAL_PORT:-3050}"
+U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
+D="/tmp/fbhandson"
+ENG="$D/aggplan-eng.fdb"; FC="$D/aggplan-fc.fdb"
+mkdir -p "$D"; rm -f "$ENG" "$FC"
+
+{ echo "CREATE DATABASE '127.0.0.1/$REAL:$ENG' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;"
+  cat <<'SQL'
+CREATE TABLE W (ID INTEGER, GRP VARCHAR(5), VAL INTEGER, AMT NUMERIC(9,2), D DATE);
+INSERT INTO W VALUES (1, 'A', 10, 1.10, DATE '2024-01-01');
+INSERT INTO W VALUES (2, 'A', 20, 2.20, DATE '2024-01-20');
+INSERT INTO W VALUES (3, 'B', 20, 3.30, DATE '2024-03-01');
+INSERT INTO W VALUES (4, 'B', NULL, NULL, NULL);
+INSERT INTO W VALUES (5, NULL, 5, 4.40, DATE '2024-04-01');
+CREATE TABLE T (I INTEGER, N NUMERIC(10,2), V VARCHAR(20));
+INSERT INTO T VALUES (10, 1.50, 'a');
+INSERT INTO T VALUES (20, 2.25, 'b');
+INSERT INTO T VALUES (20, 2.25, NULL);
+CREATE TABLE E (ID INTEGER, GRP VARCHAR(5), VAL INTEGER);
+CREATE TABLE T1 (ID INTEGER, N INTEGER, S VARCHAR(10));
+INSERT INTO T1 VALUES (1, 5, 'a');
+INSERT INTO T1 VALUES (2, 7, 'b');
+CREATE TABLE TP (ID INTEGER, NAME VARCHAR(10));
+INSERT INTO TP VALUES (1, 'p');
+CREATE TABLE CS (BL BLOB SUB_TYPE TEXT);
+INSERT INTO CS VALUES ('x');
+INSERT INTO CS VALUES ('yy');
+INSERT INTO CS VALUES (NULL);
+INSERT INTO CS VALUES ('x');
+CREATE VIEW VW (ID, GRP, VAL) AS SELECT ID, GRP, VAL FROM W;
+COMMIT;
+SQL
+} | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/aggplan-build.log 2>&1
+grep -qiE 'Statement failed|error' /tmp/aggplan-build.log && { echo "FAIL fixture build"; sed 's/^/   /' /tmp/aggplan-build.log; exit 1; }
+cp "$ENG" "$FC"; chmod 666 "$FC"
+
+"$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" > "/tmp/fc-serve-aggplan-$PORT.log" 2>&1 & srv=$!
+trap 'kill $srv 2>/dev/null; rm -f "$ENG" "$FC"' EXIT
+i=0; while [ $i -lt 20 ]; do
+    kill -0 $srv 2>/dev/null || break
+    ( exec 3<>"/dev/tcp/127.0.0.1/$PORT" ) 2>/dev/null && break
+    i=$((i + 1)); sleep 0.1
+done
+kill -0 $srv 2>/dev/null || { echo "FAIL fcwire is not running - port $PORT already in use?"; exit 1; }
+
+fail=0
+ran=0
+# a SCRIPT (a session), its lines squeezed and joined; errors included,
+# so an error cell compares the engine's whole message
+sess() { printf '%s\n' "$2" | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
+    | grep -av '^ *$' | grep -av '^=' | grep -av '^After line' | sed 's/^ *//;s/ *$//;s/  */ /g' | paste -sd'|'; }
+# the describe: type, length, charset, nullability, name and table
+dsc() { printf 'SET SQLDA_DISPLAY ON;\n%s\n' "$2" | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 \
+    | grep -a 'sqltype\|name:\|table:' | sed 's/  */ /g;s/^ *//' | paste -sd'|'; }
+# the ENGINE is pinned and this server must agree (the law, not just agreement)
+pin() { # <label> <script> <engine-output>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(sess "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2")
+    if [ "$ev" != "$3" ]; then echo "FAIL $1 - THE ENGINE ANSWERS [$ev], not the pinned [$3]"; fail=1
+    elif [ "$ev" != "$fv" ]; then
+        echo "FAIL $1"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
+    else echo "OK   $1 [${ev:0:70}]"; fi
+}
+# the same describe, pinned
+dpin() { # <label> <select> <engine-describe>
+    ran=$((ran + 1))
+    local ed fd
+    ed=$(dsc "127.0.0.1/$REAL:$ENG" "$2"); fd=$(dsc "127.0.0.1/$PORT:$FC" "$2")
+    if [ "$ed" != "$3" ]; then echo "FAIL $1 - THE ENGINE DESCRIBES [$ed], not the pinned [$3]"; fail=1
+    elif [ "$ed" != "$fd" ]; then echo "FAIL $1"; echo "     eng=[$ed]"; echo "     fc =[$fd]"; fail=1
+    else echo "OK   $1 [${ed:0:70}]"; fi
+}
+# the engine answers, this server REFUSES - recorded (never a wrong answer)
+refused() { # <label> <script>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(sess "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2")
+    if [ "${ev#*SQLSTATE}" != "$ev" ]; then echo "FAIL $1 - the engine raises now [$ev]"; fail=1
+    elif [ "$ev" = "$fv" ]; then echo "FAIL $1 - IT AGREES NOW; promote the cell"; fail=1
+    elif [ "${fv#*SQLSTATE}" = "$fv" ]; then echo "FAIL $1 - A WRONG ANSWER, not a refusal"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
+    else echo "OK   $1 (recorded: engine [${ev:0:60}], this server refuses)"; fi
+}
+# both RAISE, with different vectors - recorded (a refusal where the
+# engine has a specific error; never an answer)
+differs() { # <label> <script>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(sess "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2")
+    if [ "${ev#*SQLSTATE}" = "$ev" ]; then echo "FAIL $1 - the engine answers now [$ev]"; fail=1
+    elif [ "$ev" = "$fv" ]; then echo "FAIL $1 - IT AGREES NOW; promote the cell"; fail=1
+    elif [ "${fv#*SQLSTATE}" = "$fv" ]; then echo "FAIL $1 - AN ANSWER where the engine raises"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
+    else echo "OK   $1 (recorded: engine [${ev:0:60}], this server refuses generically)"; fi
+}
+
+echo "--- 1. WINDOWS OVER A GROUP BY, A HAVING, AN IMPLICIT GROUP"
+pin  "1 rank over sum, grouped, ordered" "SELECT GRP, RANK() OVER (ORDER BY SUM(VAL) DESC) FROM W GROUP BY GRP ORDER BY GRP;" "GRP RANK|<null> 3|A 1|B 2"
+pin  "1 ...bare: delivered in the window's order" "SELECT GRP, RANK() OVER (ORDER BY SUM(VAL) DESC) FROM W GROUP BY GRP;" "GRP RANK|A 1|B 2|<null> 3"
+pin  "1 count(*) over () on a GROUP BY" "SELECT GRP, COUNT(*) OVER () FROM W GROUP BY GRP ORDER BY GRP;" "GRP COUNT|<null> 3|A 3|B 3"
+pin  "1 count(*), row_number() over () - the implicit group" "SELECT COUNT(*), ROW_NUMBER() OVER () FROM W;" "COUNT ROW_NUMBER|5 1"
+pin  "1 sum(val), count(*) over () implicit group" "SELECT SUM(VAL), COUNT(*) OVER () FROM W;" "SUM COUNT|55 1"
+pin  "1 a window over a grouped HAVING" "SELECT GRP, SUM(VAL), RANK() OVER (ORDER BY SUM(VAL)) FROM W GROUP BY GRP HAVING COUNT(*) > 0;" "GRP SUM RANK|<null> 5 1|B 20 2|A 30 3"
+pin  "1 window keyed by the grouped column" "SELECT GRP, SUM(VAL), ROW_NUMBER() OVER (ORDER BY GRP NULLS LAST) FROM W GROUP BY GRP;" "GRP SUM ROW_NUMBER|A 30 1|B 20 2|<null> 5 3"
+pin  "1 partition by an aggregate" "SELECT GRP, COUNT(*) OVER (PARTITION BY COUNT(*)) FROM W GROUP BY GRP ORDER BY GRP;" "GRP COUNT|<null> 1|A 2|B 2"
+pin  "1 over an EMPTY table, grouped" "SELECT GRP, RANK() OVER (ORDER BY SUM(VAL)) FROM E GROUP BY GRP;" ""
+pin  "1 over an EMPTY table, implicit group" "SELECT COUNT(*), ROW_NUMBER() OVER () FROM E;" "COUNT ROW_NUMBER|0 1"
+pin  "1 NULL sums rank last under DESC" "SELECT GRP, SUM(VAL), RANK() OVER (ORDER BY SUM(VAL) DESC NULLS LAST) FROM W GROUP BY GRP ORDER BY 3;" "GRP SUM RANK|A 30 1|B 20 2|<null> 5 3"
+pin  "1 ties: two groups with equal sums share a RANK" "SELECT GRP, RANK() OVER (ORDER BY COUNT(*) DESC) FROM W GROUP BY GRP ORDER BY GRP;" "GRP RANK|<null> 3|A 1|B 1"
+pin  "1 ...and DENSE_RANK / ROW_NUMBER over the same" "SELECT GRP, DENSE_RANK() OVER (ORDER BY COUNT(*) DESC), ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) FROM W GROUP BY GRP ORDER BY GRP;" "GRP DENSE_RANK ROW_NUMBER|<null> 2 3|A 1 1|B 1 2"
+pin  "1 the shape inside a derived table" "SELECT R, GRP FROM (SELECT GRP, RANK() OVER (ORDER BY SUM(VAL) DESC) R FROM W GROUP BY GRP) D ORDER BY R;" "R GRP|1 A|2 B|3 <null>"
+pin  "1 ...inside a CTE" "WITH C AS (SELECT GRP, RANK() OVER (ORDER BY SUM(VAL) DESC) R FROM W GROUP BY GRP) SELECT GRP, R FROM C ORDER BY R;" "GRP R|A 1|B 2|<null> 3"
+pin  "1 ...over a VIEW" "SELECT GRP, RANK() OVER (ORDER BY SUM(VAL) DESC) FROM VW GROUP BY GRP ORDER BY GRP;" "GRP RANK|<null> 3|A 1|B 2"
+pin  "1 window expression over an aggregate" "SELECT GRP, SUM(VAL) * 100 / SUM(SUM(VAL)) OVER () FROM W GROUP BY GRP ORDER BY GRP;" "GRP DIVIDE|<null> 9|A 54|B 36"
+pin  "1 a WHERE under the group under the window" "SELECT GRP, RANK() OVER (ORDER BY SUM(VAL) DESC) FROM W WHERE VAL IS NOT NULL GROUP BY GRP ORDER BY GRP;" "GRP RANK|<null> 3|A 1|B 2"
+dpin "1 describe: grouped column keeps its table, RANK is INT64" "SELECT GRP, RANK() OVER (ORDER BY SUM(VAL) DESC) FROM W GROUP BY GRP;" "01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 5 charset: 0 SYSTEM.NONE|: name: GRP alias: GRP|: table: W schema: PUBLIC owner: SYSDBA|02: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8|: name: RANK alias: RANK|: table: schema: owner: "
+dpin "1 describe: COUNT beside a window" "SELECT COUNT(*), ROW_NUMBER() OVER () FROM W;" "01: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8|: name: COUNT alias: COUNT|: table: schema: owner: |02: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8|: name: ROW_NUMBER alias: ROW_NUMBER|: table: schema: owner: "
+dpin "1 describe: sum and window expression" "SELECT GRP, SUM(VAL), SUM(VAL) * 100 / SUM(SUM(VAL)) OVER () FROM W GROUP BY GRP;" "01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 5 charset: 0 SYSTEM.NONE|: name: GRP alias: GRP|: table: W schema: PUBLIC owner: SYSDBA|02: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|: name: SUM alias: SUM|: table: schema: owner: |03: sqltype: 32752 INT128 Nullable scale: 0 subtype: 0 len: 16|: name: DIVIDE alias: DIVIDE|: table: schema: owner: "
+
+echo "--- 2. HAVING WITHOUT GROUP BY; ORDER BY AN AGGREGATE ON THE IMPLICIT GROUP"
+pin  "2 HAVING count(*) > 1 over a constant list" "SELECT 1 FROM W HAVING COUNT(*) > 1;" "CONSTANT|1"
+pin  "2 ...condition false: no row" "SELECT 1 FROM W HAVING COUNT(*) > 100;" ""
+pin  "2 ...a string constant, empty table" "SELECT 'x' FROM E HAVING COUNT(*) = 0;" "CONSTANT|x"
+pin  "2 ...inside EXISTS" "SELECT EXISTS(SELECT 1 FROM W HAVING COUNT(*) > 1) FROM RDB\$DATABASE;" "BOOL|<true>"
+pin  "2 ...HAVING MAX(VAL) IS NULL" "SELECT 1 FROM W HAVING MAX(VAL) IS NULL;" ""
+pin  "2 ...constant beside an aggregate" "SELECT 1, COUNT(*) FROM W HAVING COUNT(*) > 1;" "CONSTANT COUNT|1 5"
+pin  "2 ...with a WHERE" "SELECT 1 FROM W WHERE VAL > 100 HAVING COUNT(*) > 0;" ""
+pin  "2 ORDER BY SUM on the implicit group" "SELECT COUNT(*) FROM W ORDER BY SUM(ID);" "COUNT|5"
+pin  "2 ...two keys" "SELECT COUNT(*) FROM W ORDER BY SUM(ID) DESC, MAX(VAL);" "COUNT|5"
+pin  "2 ...ORDER BY the aggregate itself" "SELECT COUNT(*) FROM W ORDER BY COUNT(*);" "COUNT|5"
+pin  "2 ...MAX ordered by MIN" "SELECT MAX(VAL) FROM W ORDER BY MIN(VAL);" "MAX|20"
+pin  "2 ...by alias" "SELECT COUNT(*) C FROM W ORDER BY C;" "C|5"
+pin  "2 ...by ordinal" "SELECT COUNT(*) FROM W ORDER BY 1;" "COUNT|5"
+pin  "2 ...with HAVING too" "SELECT COUNT(*) FROM W HAVING COUNT(*) > 1 ORDER BY SUM(ID);" "COUNT|5"
+pin  "2 ...over an empty table" "SELECT COUNT(*) FROM E ORDER BY SUM(ID);" "COUNT|0"
+dpin "2 describe: the constant under HAVING" "SELECT 1 FROM W HAVING COUNT(*) > 1;" "01: sqltype: 496 LONG scale: 0 subtype: 0 len: 4|: name: CONSTANT alias: CONSTANT|: table: schema: owner: "
+dpin "2 describe: COUNT ordered by SUM" "SELECT COUNT(*) FROM W ORDER BY SUM(ID);" "01: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8|: name: COUNT alias: COUNT|: table: schema: owner: "
+differs "2 RECORDED a bare column under HAVING alone (engine: invalid expression)" "SELECT ID FROM W HAVING COUNT(*) > 1;"
+differs "2 RECORDED ORDER BY a bare column on the implicit group" "SELECT COUNT(*) FROM W ORDER BY ID;"
+
+echo "--- 3. A BARE WINDOW BESIDE A WINDOW INSIDE AN EXPRESSION"
+pin  "3 bare window first, expression second" "SELECT ROW_NUMBER() OVER (ORDER BY ID), ROW_NUMBER() OVER (ORDER BY ID) + 1 FROM W ORDER BY 1;" "ROW_NUMBER ADD|1 2|2 3|3 4|4 5|5 6"
+pin  "3 ...aliased" "SELECT ROW_NUMBER() OVER (ORDER BY ID) X, ROW_NUMBER() OVER (ORDER BY ID) + 1 Y FROM W ORDER BY X;" "X Y|1 2|2 3|3 4|4 5|5 6"
+pin  "3 ...three items, mixed" "SELECT ID, COUNT(*) OVER () C, COALESCE(SUM(VAL) OVER (), 0) + ROW_NUMBER() OVER (ORDER BY ID) S FROM W ORDER BY ID;" "ID C S|1 5 56|2 5 57|3 5 58|4 5 59|5 5 60"
+pin  "3 ...over an empty table" "SELECT ROW_NUMBER() OVER (ORDER BY ID), ROW_NUMBER() OVER (ORDER BY ID) + 1 FROM E;" ""
+dpin "3 describe: ROW_NUMBER then ADD" "SELECT ROW_NUMBER() OVER (ORDER BY ID), ROW_NUMBER() OVER (ORDER BY ID) + 1 FROM W;" "01: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8|: name: ROW_NUMBER alias: ROW_NUMBER|: table: schema: owner: |02: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8|: name: ADD alias: ADD|: table: schema: owner: "
+
+echo "--- 4. A FILTER INSIDE AN EXPRESSION"
+pin  "4 SUM FILTER + 0" "SELECT SUM(VAL) FILTER (WHERE GRP = 'A') + 0 FROM W;" "ADD|30"
+pin  "4 COALESCE(MAX FILTER, -1) - no row matches" "SELECT COALESCE(MAX(VAL) FILTER (WHERE GRP = 'Z'), -1) FROM W;" "COALESCE|-1"
+pin  "4 two filtered sums added" "SELECT SUM(VAL) FILTER (WHERE GRP = 'A') + SUM(VAL) FILTER (WHERE GRP = 'B') FROM W;" "ADD|50"
+pin  "4 grouped, times two" "SELECT GRP, COUNT(*) FILTER (WHERE VAL > 10) * 2 FROM W GROUP BY GRP ORDER BY GRP;" "GRP MULTIPLY|<null> 0|A 2|B 2"
+pin  "4 filtered beside plain in one expression" "SELECT COUNT(*) FILTER (WHERE VAL > 10) + COUNT(*) FROM W;" "ADD|7"
+pin  "4 over an empty table" "SELECT COALESCE(SUM(VAL) FILTER (WHERE GRP = 'A'), 0) FROM E;" "COALESCE|0"
+pin  "4 COUNT(DISTINCT) FILTER in an expression" "SELECT COUNT(DISTINCT VAL) FILTER (WHERE GRP IS NOT NULL) * 10 FROM W;" "MULTIPLY|20"
+pin  "4 in a derived table" "SELECT X FROM (SELECT SUM(VAL) FILTER (WHERE GRP = 'A') + 0 X FROM W) D;" "X|30"
+dpin "4 describe: SUM FILTER + 0 is ADD INT64" "SELECT SUM(VAL) FILTER (WHERE GRP = 'A') + 0 FROM W;" "01: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|: name: ADD alias: ADD|: table: schema: owner: "
+dpin "4 describe: COALESCE(MAX FILTER) keeps LONG" "SELECT COALESCE(MAX(VAL) FILTER (WHERE GRP = 'Z'), -1) FROM W;" "01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: COALESCE alias: COALESCE|: table: schema: owner: "
+
+echo "--- 5. FIRST / SKIP / ROWS / OFFSET-FETCH OVER AGGREGATES, GROUPS AND WINDOWS"
+pin  "5 FIRST 1 COUNT(*)" "SELECT FIRST 1 COUNT(*) FROM W;" "COUNT|5"
+pin  "5 FIRST 2 grouped" "SELECT FIRST 2 GRP FROM W GROUP BY GRP ORDER BY GRP;" "GRP|<null>|A"
+pin  "5 grouped ROWS 1" "SELECT GRP FROM W GROUP BY GRP ORDER BY GRP ROWS 1;" "GRP|<null>"
+pin  "5 grouped FETCH FIRST" "SELECT GRP FROM W GROUP BY GRP ORDER BY GRP FETCH FIRST 1 ROW ONLY;" "GRP|<null>"
+pin  "5 COUNT(*) ROWS 1" "SELECT COUNT(*) FROM T1 ROWS 1;" "COUNT|2"
+pin  "5 FIRST 2 with a window, ordered" "SELECT FIRST 2 ID, ROW_NUMBER() OVER (ORDER BY ID) FROM W ORDER BY ID;" "ID ROW_NUMBER|1 1|2 2"
+pin  "5 FIRST 3 window, no ORDER BY: the window's order" "SELECT FIRST 3 ROW_NUMBER() OVER (ORDER BY ID DESC) FROM W;" "ROW_NUMBER|1|2|3"
+pin  "5 SKIP 1 under a window" "SELECT SKIP 1 ID, ROW_NUMBER() OVER (ORDER BY ID DESC) FROM W;" "ID ROW_NUMBER|4 2|3 3|2 4|1 5"
+pin  "5 window ROWS 2" "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID DESC) FROM W ROWS 2;" "ID ROW_NUMBER|5 1|4 2"
+pin  "5 window OFFSET/FETCH" "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID DESC) FROM W OFFSET 1 ROW FETCH NEXT 2 ROWS ONLY;" "ID ROW_NUMBER|4 2|3 3"
+pin  "5 FIRST 1 over a grouped window" "SELECT FIRST 1 GRP, RANK() OVER (ORDER BY SUM(VAL) DESC) FROM W GROUP BY GRP;" "GRP RANK|A 1"
+pin  "5 SKIP 1 over a grouped window" "SELECT SKIP 1 GRP, COUNT(*) OVER () FROM W GROUP BY GRP;" "GRP COUNT|A 3|B 3"
+pin  "5 FIRST over an empty windowed table" "SELECT FIRST 2 ID, ROW_NUMBER() OVER (ORDER BY ID) FROM E;" ""
+
+echo "--- 6. NAMED-WINDOW REFINEMENT, ORDER BY A WINDOW, DISTINCT"
+pin  "6 named window refined by ORDER BY" "SELECT ID, RANK() OVER (WIN ORDER BY VAL) FROM W WINDOW WIN AS (PARTITION BY GRP) ORDER BY ID;" "ID RANK|1 1|2 2|3 2|4 1|5 1"
+pin  "6 ...bare: partition order, val within" "SELECT ID, RANK() OVER (WIN ORDER BY VAL) FROM W WINDOW WIN AS (PARTITION BY GRP);" "ID RANK|5 1|1 1|2 2|4 1|3 2"
+pin  "6 ...refined by a frame" "SELECT ID, SUM(VAL) OVER (WIN ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM W WINDOW WIN AS (ORDER BY ID) ORDER BY ID;" "ID SUM|1 10|2 30|3 40|4 20|5 5"
+pin  "6 ...the plain named form beside it" "SELECT ID, COUNT(*) OVER WIN, RANK() OVER (WIN ORDER BY VAL) FROM W WINDOW WIN AS (PARTITION BY GRP) ORDER BY ID;" "ID COUNT RANK|1 2 1|2 2 2|3 2 2|4 2 1|5 1 1"
+pin  "6 ORDER BY a window function" "SELECT ID FROM W ORDER BY ROW_NUMBER() OVER (ORDER BY ID DESC);" "ID|5|4|3|2|1"
+pin  "6 ...ORDER BY a window with ties, then ID" "SELECT ID FROM W ORDER BY ROW_NUMBER() OVER (ORDER BY VAL DESC), ID;" "ID|2|3|1|5|4"
+pin  "6 ...ORDER BY a partitioned sum DESC" "SELECT ID, VAL FROM W ORDER BY SUM(VAL) OVER (PARTITION BY GRP) DESC, ID;" "ID VAL|1 10|2 20|3 20|4 <null>|5 5"
+pin  "6 ...ORDER BY count(*) over ()" "SELECT ID FROM W ORDER BY COUNT(*) OVER () DESC, ID DESC;" "ID|5|4|3|2|1"
+pin  "6 DISTINCT count over partition" "SELECT DISTINCT COUNT(*) OVER (PARTITION BY GRP) FROM W ORDER BY 1;" "COUNT|1|2"
+pin  "6 DISTINCT COUNT(*) grouped" "SELECT DISTINCT COUNT(*) FROM W GROUP BY GRP ORDER BY 1;" "COUNT|1|2"
+pin  "6 DISTINCT SUM implicit group" "SELECT DISTINCT SUM(VAL) FROM W;" "SUM|55"
+pin  "6 DISTINCT grouped window" "SELECT DISTINCT GRP, RANK() OVER (ORDER BY SUM(VAL) DESC) FROM W GROUP BY GRP ORDER BY 2;" "GRP RANK|A 1|B 2|<null> 3"
+pin  "6 DISTINCT window over an empty table" "SELECT DISTINCT COUNT(*) OVER (PARTITION BY GRP) FROM E;" ""
+dpin "6 describe: refined named window" "SELECT ID, RANK() OVER (WIN ORDER BY VAL) FROM W WINDOW WIN AS (PARTITION BY GRP);" "01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: ID alias: ID|: table: W schema: PUBLIC owner: SYSDBA|02: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8|: name: RANK alias: RANK|: table: schema: owner: "
+dpin "6 describe: DISTINCT COUNT over partition" "SELECT DISTINCT COUNT(*) OVER (PARTITION BY GRP) FROM W;" "01: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8|: name: COUNT alias: COUNT|: table: schema: owner: "
+
+echo "--- 7. WINDOWS OVER A JOIN"
+pin  "7 row_number over a self join" "SELECT W1.ID, ROW_NUMBER() OVER (ORDER BY W1.ID) FROM W W1 JOIN W W2 ON W1.ID = W2.ID ORDER BY 1;" "ID ROW_NUMBER|1 1|2 2|3 3|4 4|5 5"
+pin  "7 ...partition by the other side" "SELECT A.ID, B.NAME, COUNT(*) OVER (PARTITION BY B.NAME) FROM T1 A LEFT JOIN TP B ON A.ID = B.ID ORDER BY A.ID;" "ID NAME COUNT|1 p 1|2 <null> 1"
+pin  "7 ...a windowed expression over a join" "SELECT A.ID, A.N + SUM(A.N) OVER () FROM T1 A JOIN TP B ON A.ID = B.ID;" "ID ADD|1 10"
+pin  "7 ...grouped join with a window" "SELECT W1.GRP, COUNT(*), RANK() OVER (ORDER BY COUNT(*) DESC) FROM W W1 JOIN W W2 ON W1.ID = W2.ID GROUP BY W1.GRP ORDER BY W1.GRP;" "GRP COUNT RANK|<null> 1 3|A 2 1|B 2 1"
+pin  "7 ...comma join" "SELECT W1.ID, ROW_NUMBER() OVER (ORDER BY W1.ID DESC) FROM W W1, W W2 WHERE W1.ID = W2.ID;" "ID ROW_NUMBER|5 1|4 2|3 3|2 4|1 5"
+pin  "7 ...join with no match rows" "SELECT A.ID, ROW_NUMBER() OVER (ORDER BY A.ID) FROM T1 A JOIN TP B ON A.ID = B.ID + 100;" ""
+dpin "7 describe: the joined column keeps its table" "SELECT W1.ID, ROW_NUMBER() OVER (ORDER BY W1.ID) FROM W W1 JOIN W W2 ON W1.ID = W2.ID;" "01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: ID alias: ID|: table: W schema: PUBLIC owner: SYSDBA|02: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8|: name: ROW_NUMBER alias: ROW_NUMBER|: table: schema: owner: "
+
+echo "--- 8. SUM/AVG/MIN/MAX DISTINCT AND ALL; AGGREGATES OVER THE NULL LITERAL"
+pin  "8 SUM(DISTINCT)" "SELECT SUM(DISTINCT I) FROM T;" "SUM|30"
+pin  "8 AVG(DISTINCT)" "SELECT AVG(DISTINCT N) FROM T;" "AVG|1.87"
+pin  "8 MIN/MAX(DISTINCT)" "SELECT MIN(DISTINCT I), MAX(DISTINCT I) FROM T;" "MIN MAX|10 20"
+pin  "8 SUM(ALL)" "SELECT SUM(ALL I) FROM T;" "SUM|50"
+pin  "8 AVG(DISTINCT I) truncates" "SELECT AVG(DISTINCT I) FROM T;" "AVG|15"
+pin  "8 SUM(DISTINCT N) scaled" "SELECT SUM(DISTINCT N) FROM T;" "SUM|3.75"
+pin  "8 SUM(DISTINCT) over no rows" "SELECT SUM(DISTINCT I) FROM T WHERE I > 100;" "SUM|<null>"
+pin  "8 SUM(DISTINCT expr)" "SELECT SUM(DISTINCT I + 1) FROM T;" "SUM|32"
+pin  "8 SUM(DISTINCT) grouped" "SELECT I, SUM(DISTINCT N) FROM T GROUP BY I ORDER BY I;" "I SUM|10 1.50|20 2.25"
+pin  "8 SUM(DISTINCT) with NULLs" "SELECT SUM(DISTINCT VAL), COUNT(DISTINCT VAL), AVG(DISTINCT VAL) FROM W;" "SUM COUNT AVG|35 3 11"
+pin  "8 SUM(DISTINCT NULL)" "SELECT SUM(DISTINCT NULL) FROM T;" "SUM|<null>"
+pin  "8 the NULL literal folds" "SELECT SUM(NULL), COUNT(NULL), AVG(NULL), MIN(NULL), MAX(NULL) FROM T;" "SUM COUNT AVG MIN MAX|<null> 0 <null> <null> <null>"
+pin  "8 ...over an empty table" "SELECT SUM(NULL), COUNT(NULL) FROM E;" "SUM COUNT|<null> 0"
+pin  "8 ...grouped" "SELECT I, SUM(NULL) FROM T GROUP BY I ORDER BY I;" "I SUM|10 <null>|20 <null>"
+pin  "8 ...beside COUNT(*)" "SELECT SUM(NULL), COUNT(*) FROM T;" "SUM COUNT|<null> 3"
+pin  "8 COUNT(DISTINCT NULL)" "SELECT COUNT(DISTINCT NULL) FROM T;" "COUNT|0"
+dpin "8 describe: SUM/AVG DISTINCT as the plain fold" "SELECT SUM(DISTINCT I), AVG(DISTINCT N), MIN(DISTINCT I) FROM T;" "01: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|: name: SUM alias: SUM|: table: schema: owner: |02: sqltype: 580 INT64 Nullable scale: -2 subtype: 1 len: 8|: name: AVG alias: AVG|: table: schema: owner: |03: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: MIN alias: MIN|: table: schema: owner: "
+dpin "8 describe: the NULL literal is CHAR(1)" "SELECT SUM(NULL), COUNT(NULL), AVG(NULL), MIN(NULL) FROM T;" "01: sqltype: 452 TEXT Nullable scale: 0 subtype: 0 len: 1 charset: 0 SYSTEM.NONE|: name: SUM alias: SUM|: table: schema: owner: |02: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8|: name: COUNT alias: COUNT|: table: schema: owner: |03: sqltype: 452 TEXT Nullable scale: 0 subtype: 0 len: 1 charset: 0 SYSTEM.NONE|: name: AVG alias: AVG|: table: schema: owner: |04: sqltype: 452 TEXT Nullable scale: 0 subtype: 0 len: 1 charset: 0 SYSTEM.NONE|: name: MIN alias: MIN|: table: schema: owner: "
+pin  "8 SUM(DISTINCT) as an unordered window" "SELECT ID, SUM(DISTINCT VAL) OVER (PARTITION BY GRP) FROM W ORDER BY ID;" "ID SUM|1 30|2 30|3 20|4 20|5 5"
+differs "8 RECORDED DISTINCT in an ordered window (engine raises its own)" "SELECT ID, SUM(DISTINCT VAL) OVER (ORDER BY ID) FROM W;"
+
+echo "--- 9. FRAME BOUNDS: THE PARSER'S HOLES, THE BOUND RULE, THE NEGATIVE OFFSET"
+pin  "9 UNBOUNDED FOLLOWING as bound 1: token unknown" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING) FROM W;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 62|-FOLLOWING"
+pin  "9 UNBOUNDED PRECEDING as bound 2: token unknown" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN CURRENT ROW AND UNBOUNDED PRECEDING) FROM W;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 78|-PRECEDING"
+pin  "9 FOLLOWING then CURRENT ROW" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM W;" "Statement failed, SQLSTATE = 42000|If <window frame bound 1> specifies FOLLOWING, then <window frame bound 2> shall not specify PRECEDING or CURRENT ROW"
+pin  "9 CURRENT ROW then PRECEDING" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM W;" "Statement failed, SQLSTATE = 42000|If <window frame bound 1> specifies CURRENT ROW, then <window frame bound 2> shall not specify PRECEDING"
+pin  "9 FOLLOWING then PRECEDING" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM W;" "Statement failed, SQLSTATE = 42000|If <window frame bound 1> specifies FOLLOWING, then <window frame bound 2> shall not specify PRECEDING or CURRENT ROW"
+pin  "9 ...RANGE the same" "SELECT ID, SUM(VAL) OVER (ORDER BY ID RANGE BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM W;" "Statement failed, SQLSTATE = 42000|If <window frame bound 1> specifies FOLLOWING, then <window frame bound 2> shall not specify PRECEDING or CURRENT ROW"
+pin  "9 ...RANGE current row / unbounded preceding" "SELECT ID, SUM(VAL) OVER (ORDER BY ID RANGE BETWEEN CURRENT ROW AND UNBOUNDED PRECEDING) FROM W;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 79|-PRECEDING"
+pin  "9 shorthand n FOLLOWING: token unknown" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS 1 FOLLOWING) FROM W;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 46|-FOLLOWING"
+pin  "9 shorthand UNBOUNDED FOLLOWING: token unknown" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS UNBOUNDED FOLLOWING) FROM W;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 54|-FOLLOWING"
+pin  "9 the position counts lines" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM W;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 62|-FOLLOWING"
+pin  "9 ...and inside a derived table" "SELECT * FROM (SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 2 FOLLOWING AND 1 PRECEDING) S FROM W) D;" "Statement failed, SQLSTATE = 42000|If <window frame bound 1> specifies FOLLOWING, then <window frame bound 2> shall not specify PRECEDING or CURRENT ROW"
+pin  "9 an empty frame answers NULLs" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) FROM W;" "ID SUM|1 <null>|2 <null>|3 <null>|4 <null>|5 <null>"
+pin  "9 ...preceding pair the wrong way round" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 1 PRECEDING AND 2 PRECEDING) FROM W;" "ID SUM|1 <null>|2 <null>|3 <null>|4 <null>|5 <null>"
+pin  "9 ...and the right way round answers" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING) FROM W;" "ID SUM|1 <null>|2 10|3 30|4 40|5 20"
+pin  "9 CURRENT ROW AND CURRENT ROW" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN CURRENT ROW AND CURRENT ROW) FROM W;" "ID SUM|1 10|2 20|3 20|4 <null>|5 5"
+pin  "9 0 PRECEDING AND 0 FOLLOWING" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 0 PRECEDING AND 0 FOLLOWING) FROM W;" "ID SUM|1 10|2 20|3 20|4 <null>|5 5"
+pin  "9 a negative offset raises at EXECUTE" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM W;" "ID SUM|Statement failed, SQLSTATE = 42000|Invalid PRECEDING or FOLLOWING offset in window function: cannot be negative"
+pin  "9 ...parenthesised" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN (-1) PRECEDING AND CURRENT ROW) FROM W;" "ID SUM|Statement failed, SQLSTATE = 42000|Invalid PRECEDING or FOLLOWING offset in window function: cannot be negative"
+pin  "9 ...on bound 2" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 1 PRECEDING AND -1 FOLLOWING) FROM W;" "ID SUM|Statement failed, SQLSTATE = 42000|Invalid PRECEDING or FOLLOWING offset in window function: cannot be negative"
+pin  "9 ...RANGE" "SELECT ID, SUM(VAL) OVER (ORDER BY ID RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) FROM W;" "ID SUM|Statement failed, SQLSTATE = 42000|Invalid PRECEDING or FOLLOWING offset in window function: cannot be negative"
+pin  "9 ...over an EMPTY table still raises" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM E;" "ID SUM|Statement failed, SQLSTATE = 42000|Invalid PRECEDING or FOLLOWING offset in window function: cannot be negative"
+pin  "9 ...under WHERE 1=0 too" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM W WHERE 1 = 0;" "ID SUM|Statement failed, SQLSTATE = 42000|Invalid PRECEDING or FOLLOWING offset in window function: cannot be negative"
+pin  "9 NULL PRECEDING: numerical type" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN NULL PRECEDING AND CURRENT ROW) FROM W;" "Statement failed, SQLSTATE = 42000|Window RANGE/ROWS/GROUPS PRECEDING/FOLLOWING value must be of a numerical type"
+pin  "9 a string offset: numerical type" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 'a' PRECEDING AND CURRENT ROW) FROM W;" "Statement failed, SQLSTATE = 42000|Window RANGE/ROWS/GROUPS PRECEDING/FOLLOWING value must be of a numerical type"
+pin  "9 the parse error outranks the bound rule" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW), SUM(VAL) OVER (ORDER BY ID ROWS UNBOUNDED FOLLOWING) FROM W;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 124|-FOLLOWING"
+pin  "9 CONTROL the legal frames answer" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM W;" "ID SUM SUM|1 30 55|2 50 45|3 40 25|4 25 5|5 5 5"
+refused "9 RECORDED a fractional offset (engine rounds it)" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM W;"
+refused "9 RECORDED a column offset" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN ID PRECEDING AND CURRENT ROW) FROM W;"
+refused "9 RECORDED a frame without ORDER BY" "SELECT ID, SUM(VAL) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM W;"
+
+echo "--- 10. DELIVERY ORDER: THE LAST SORTED WINDOW'S"
+pin  "10 one sorted window: its order" "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID DESC) FROM W;" "ID ROW_NUMBER|5 1|4 2|3 3|2 4|1 5"
+pin  "10 two sorted windows: the LAST one's order, ties by the first's value" "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID DESC), ROW_NUMBER() OVER (ORDER BY VAL) FROM W;" "ID ROW_NUMBER ROW_NUMBER|4 2 1|5 1 2|1 5 3|3 3 4|2 4 5"
+pin  "10 ...the other way round" "SELECT ID, ROW_NUMBER() OVER (ORDER BY VAL), ROW_NUMBER() OVER (ORDER BY ID DESC) FROM W;" "ID ROW_NUMBER ROW_NUMBER|5 2 1|4 1 2|3 5 3|2 4 4|1 3 5"
+pin  "10 partition only: partition order, NULL first" "SELECT ID, COUNT(*) OVER (PARTITION BY GRP) FROM W;" "ID COUNT|5 1|1 2|2 2|3 2|4 2"
+pin  "10 OVER () alone: scan order" "SELECT ID, COUNT(*) OVER () FROM W;" "ID COUNT|1 5|2 5|3 5|4 5|5 5"
+pin  "10 OVER () before a sorted one" "SELECT ID, COUNT(*) OVER (), ROW_NUMBER() OVER (ORDER BY ID DESC) FROM W;" "ID COUNT ROW_NUMBER|5 5 1|4 5 2|3 5 3|2 5 4|1 5 5"
+pin  "10 OVER () after a sorted one" "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID DESC), COUNT(*) OVER () FROM W;" "ID ROW_NUMBER COUNT|5 1 5|4 2 5|3 3 5|2 4 5|1 5 5"
+pin  "10 a WHERE under it" "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID DESC) FROM W WHERE VAL IS NOT NULL;" "ID ROW_NUMBER|5 1|3 2|2 3|1 4"
+pin  "10 running sum by val, ties in scan order" "SELECT ID, SUM(VAL) OVER (ORDER BY VAL) FROM W;" "ID SUM|4 <null>|5 5|1 15|2 55|3 55"
+pin  "10 partitioned then plain sorted" "SELECT ID, ROW_NUMBER() OVER (PARTITION BY GRP ORDER BY ID DESC), ROW_NUMBER() OVER (ORDER BY VAL DESC) FROM W;" "ID ROW_NUMBER ROW_NUMBER|2 1 1|3 2 2|1 2 3|5 1 4|4 1 5"
+pin  "10 rank ties then row_number" "SELECT ID, RANK() OVER (ORDER BY VAL), ROW_NUMBER() OVER (ORDER BY ID DESC) FROM W;" "ID RANK ROW_NUMBER|5 2 1|4 1 2|3 4 3|2 4 4|1 3 5"
+pin  "10 two windows over one sort" "SELECT ID, ROW_NUMBER() OVER (ORDER BY VAL), SUM(VAL) OVER (ORDER BY VAL) FROM W;" "ID ROW_NUMBER SUM|4 1 <null>|5 2 5|1 3 15|2 4 55|3 5 55"
+pin  "10 the statement ORDER BY still wins" "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID DESC) FROM W ORDER BY ID;" "ID ROW_NUMBER|1 5|2 4|3 3|4 2|5 1"
+
+echo "--- 11. STATISTICAL FOLDS AS WINDOWS"
+pin  "11 STDDEV_POP over a partition" "SELECT ID, STDDEV_POP(VAL) OVER (PARTITION BY GRP) FROM W ORDER BY ID;" "ID STDDEV_POP|1 5.000000000000000|2 5.000000000000000|3 0.000000000000000|4 0.000000000000000|5 0.000000000000000"
+pin  "11 VAR_SAMP over ()" "SELECT ID, VAR_SAMP(VAL) OVER () FROM W ORDER BY ID;" "ID VAR_SAMP|1 56.25000000000000|2 56.25000000000000|3 56.25000000000000|4 56.25000000000000|5 56.25000000000000"
+pin  "11 STDDEV_SAMP running" "SELECT ID, STDDEV_SAMP(VAL) OVER (ORDER BY ID) FROM W ORDER BY ID;" "ID STDDEV_SAMP|1 0.000000000000000|2 7.071067811865476|3 5.773502691896256|4 5.773502691896256|5 7.500000000000000"
+pin  "11 VAR_POP framed" "SELECT ID, VAR_POP(VAL) OVER (ORDER BY ID ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM W ORDER BY ID;" "ID VAR_POP|1 0.000000000000000|2 25.00000000000000|3 0.000000000000000|4 0.000000000000000|5 0.000000000000000"
+pin  "11 ...over an empty table" "SELECT ID, STDDEV_POP(VAL) OVER (PARTITION BY GRP) FROM E;" ""
+dpin "11 describe: STDDEV_POP window is DOUBLE" "SELECT ID, STDDEV_POP(VAL) OVER (PARTITION BY GRP) FROM W;" "01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: ID alias: ID|: table: W schema: PUBLIC owner: SYSDBA|02: sqltype: 480 DOUBLE scale: 0 subtype: 0 len: 8|: name: STDDEV_POP alias: STDDEV_POP|: table: schema: owner: "
+refused "11 RECORDED LIST as a window" "SELECT ID, LIST(VAL) OVER (PARTITION BY GRP) FROM W ORDER BY ID;"
+refused "11 RECORDED PERCENTILE_CONT as a window" "SELECT ID, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY VAL) OVER (PARTITION BY GRP) FROM W ORDER BY ID;"
+
+echo "--- 12. RECORDED: THE CLUSTER'S REMAINING BOUNDARIES"
+refused "12 RECORDED CREATE VIEW over a GROUP BY" "CREATE VIEW AGV AS SELECT GRP, COUNT(*) C FROM W GROUP BY GRP;"
+refused "12 RECORDED CREATE VIEW over an aggregate" "CREATE VIEW AGV4 AS SELECT COUNT(*) C FROM W;"
+refused "12 RECORDED CREATE VIEW over a window" "CREATE VIEW VWIN AS SELECT ID, ROW_NUMBER() OVER (ORDER BY ID) RN FROM W;"
+refused "12 RECORDED LAG with a NULL offset" "SELECT ID, LEAD(VAL, NULL) OVER (ORDER BY ID) FROM W ORDER BY ID;"
+refused "12 RECORDED LAG with a column offset" "SELECT ID, LAG(VAL, ID - 1) OVER (ORDER BY ID) FROM W ORDER BY ID;"
+refused "12 RECORDED RANGE offset over a NUMERIC key" "SELECT ID, SUM(AMT) OVER (ORDER BY AMT RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM W ORDER BY ID;"
+refused "12 RECORDED RANGE offset over a DATE key" "SELECT ID, COUNT(*) OVER (ORDER BY D RANGE BETWEEN 31 PRECEDING AND CURRENT ROW) FROM W ORDER BY ID;"
+refused "12 RECORDED MIN over a BLOB" "SELECT MIN(BL) FROM CS;"
+refused "12 RECORDED COUNT(DISTINCT blob)" "SELECT COUNT(DISTINCT BL) FROM CS;"
+
+echo "--- 13. CREATE OR ALTER VIEW: by existence"
+pin  "13 CREATE OR ALTER VIEW creates when absent" "CREATE OR ALTER VIEW V2 AS SELECT ID, S FROM T1; COMMIT; SELECT * FROM V2 ORDER BY ID;" "ID S|1 a|2 b"
+pin  "13 ...and redefines when present" "CREATE OR ALTER VIEW V2 AS SELECT ID, N FROM T1; COMMIT; SELECT * FROM V2 ORDER BY ID; CREATE OR ALTER VIEW V2 (A, B, C) AS SELECT ID, N, S FROM T1; COMMIT; SELECT * FROM V2 ORDER BY A;" "ID N|1 5|2 7|A B C|1 5 a|2 7 b"
+dpin "13 describe: the redefined view" "SELECT * FROM V2;" "01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: A alias: A|: table: V2 schema: PUBLIC owner: SYSDBA|02: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: B alias: B|: table: V2 schema: PUBLIC owner: SYSDBA|03: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 10 charset: 0 SYSTEM.NONE|: name: C alias: C|: table: V2 schema: PUBLIC owner: SYSDBA"
+
+echo "--- panic check"
+ran=$((ran + 1))
+if grep -aq 'panicked at' "/tmp/fc-serve-aggplan-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
+elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
+else echo "OK   no panic and the server is still up"; fi
+echo "ran $ran checks"
+if [ "$ran" -lt 173 ]; then echo "FAIL only $ran checks ran (floor 173)"; fail=1; fi
+exit $fail
