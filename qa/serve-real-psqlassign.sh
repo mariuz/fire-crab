@@ -147,6 +147,29 @@
 # operand through COALESCE, IIF or CASE, or through a bare CAST, is
 # byte-moved into the real set, not transliterated (11e).
 #
+# SECTION 12 came out of the review of the MERGED binary (fc/integ
+# 6ec54c8), over RC: 'é', 'É', 'e', 'E', 'ab', 'AB', 'ö' in every set and
+# a UNICODE_CI column. An explicit collation is read through the functions
+# that keep it by ONE reader: the DISTINCT / GROUP BY / UNION fold had its
+# own, which saw the bare wrapper only and keyed LPAD / SUBSTRING / TRIM /
+# COALESCE ... of `U COLLATE UNICODE_CI` by bytes (7 groups for 4); a
+# distinct UNION takes its FIRST branch's collation (12a). A DISTINCT whose
+# expression merges two spellings refuses - which one survives is not
+# modelled. An OCTETS side beside a collation compares each side's OWN
+# octets (a UTF8 'É' was the one octet C9, 12b). A carrier beneath an
+# explicit COLLATE, or beside a collated column, moves into its set; a
+# carrier literal the adoption already read in that set is not moved a
+# second time (under -ch NONE `U COLLATE UNICODE_CI = 'É'` raised 22000,
+# 12c). A concatenation keeps its FIRST operand's collation unless that
+# operand is NONE (12d). MIN / MAX keep the collation under a WIN1252
+# caller, and a tie inside a group falls to the group's record order when
+# the group computes anything beside a lone MIN / MAX (12e). A folded
+# scalar subquery carries its column's octets and set, and a LIKE pattern
+# under a carrier caller is read in the collation's set, raising where
+# the engine raises (12f). In a body the same laws hold, and a parameter
+# or local of an explicit collation refuses - neither runner carries one,
+# and every comparison over it fell back to bytes (12g).
+#
 # Usage: qa/serve-real-psqlassign.sh [port]   (default 5400)
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
@@ -365,6 +388,28 @@ CREATE PROCEDURE XB9 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET 
 CREATE PROCEDURE XBA1 RETURNS (C INTEGER) AS BEGIN SELECT COUNT(*) FROM SRN WHERE SFN(U) = 'fab' INTO C; SUSPEND; END^
 CREATE PROCEDURE XBA2 RETURNS (S INTEGER) AS BEGIN SELECT SUM(SFI(I)) FROM SRN INTO S; SUSPEND; END^
 CREATE PROCEDURE XP5 RETURNS (R VARCHAR(40) CHARACTER SET UTF8, O INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COALESCE(CAST(U AS VARCHAR(5)), 'q') || 'x', OCTET_LENGTH(SUBSTRING(CAST(U AS VARCHAR(5)) FROM 1) || 'x') FROM SRN WHERE ID = 1 INTO R, O; SUSPEND; SELECT COALESCE(N, 'q') || 'x', OCTET_LENGTH(COALESCE(N, 'q')) FROM SRN WHERE ID = 1 INTO R, O; SUSPEND; SELECT IIF(TRUE, N, 'q') || 'x', OCTET_LENGTH(CASE WHEN TRUE THEN N ELSE 'q' END) FROM SRN WHERE ID = 1 INTO R, O; SUSPEND; END^
+SET TERM ;^
+COMMIT;
+-- section 12's rows: 'é', 'É', 'e', 'E', 'ab', 'AB', 'ö' and a NULL, in
+-- every set (the OCTETS column holds the UTF-8 octets) and a UNICODE_CI
+-- column beside them
+CREATE TABLE RC (ID INTEGER, U VARCHAR(10) CHARACTER SET UTF8, W VARCHAR(10) CHARACTER SET WIN1252, N VARCHAR(10) CHARACTER SET NONE, O VARCHAR(10) CHARACTER SET OCTETS, UC VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE_CI);
+INSERT INTO RC VALUES (1, 'é', 'é', 'é', x'C3A9', 'é');
+INSERT INTO RC VALUES (2, 'É', 'É', 'É', x'C389', 'É');
+INSERT INTO RC VALUES (3, 'e', 'e', 'e', x'65', 'e');
+INSERT INTO RC VALUES (4, 'E', 'E', 'E', x'45', 'E');
+INSERT INTO RC VALUES (5, 'ab', 'ab', 'ab', x'6162', 'ab');
+INSERT INTO RC VALUES (6, 'AB', 'AB', 'AB', x'4142', 'AB');
+INSERT INTO RC VALUES (7, 'ö', 'ö', 'ö', x'C3B6', 'ö');
+INSERT INTO RC VALUES (8, NULL, NULL, NULL, NULL, NULL);
+COMMIT;
+SET TERM ^;
+CREATE PROCEDURE YB1 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COUNT(*) FROM (SELECT COUNT(*) AS K FROM RC WHERE ID < 8 GROUP BY LPAD(U COLLATE UNICODE_CI, 2, 'z')) INTO C; SUSPEND; SELECT COUNT(*) FROM (SELECT UPPER(U COLLATE UNICODE_CI) AS X FROM RC WHERE ID < 8 UNION SELECT U FROM RC WHERE ID < 8) INTO C; SUSPEND; SELECT COUNT(*) FROM RC WHERE ID < 8 AND UPPER(U COLLATE UNICODE_CI) = O INTO C; SUSPEND; SELECT COUNT(*) FROM RC WHERE ID < 8 AND COALESCE(N, 'q') COLLATE UNICODE_CI = 'É' INTO C; SUSPEND; SELECT COUNT(*) FROM RC WHERE U COLLATE UNICODE_CI || 'x' = 'Éx' INTO C; SUSPEND; SELECT COUNT(*) FROM RC WHERE ID < 8 AND UPPER(U COLLATE UNICODE_CI) = (SELECT U FROM RC WHERE ID = 1) INTO C; SUSPEND; END^
+CREATE PROCEDURE YB2 RETURNS (C INTEGER) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN SELECT COUNT(*) FROM (SELECT DISTINCT UPPER(U COLLATE UNICODE_CI) AS X FROM RC WHERE ID < 8) INTO C; SUSPEND; SELECT COUNT(*) FROM (SELECT DISTINCT LPAD(U COLLATE UNICODE_CI, 2, 'z') AS X FROM RC WHERE ID < 8) INTO C; SUSPEND; END^
+CREATE PROCEDURE YB3 RETURNS (M VARCHAR(10) CHARACTER SET UTF8) AS DECLARE D VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN FOR SELECT MIN(UC) FROM RC GROUP BY CHAR_LENGTH(U) ORDER BY 1 INTO M DO SUSPEND; END^
+CREATE PROCEDURE YB4 RETURNS (C INTEGER) AS DECLARE V VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE_CI = 'é'; BEGIN SELECT COUNT(*) FROM RC WHERE U = UPPER(:V) INTO C; SUSPEND; C = 0; IF (V = 'É') THEN C = 1; SUSPEND; END^
+CREATE PROCEDURE YB5 RETURNS (C INTEGER) AS DECLARE V VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE_CI = 'ab'; BEGIN SELECT COUNT(*) FROM RC WHERE U = :V INTO C; SUSPEND; C = 0; IF (V || 'x' = 'ABx') THEN C = 1; SUSPEND; END^
+CREATE PROCEDURE YB6 (V VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE_CI) RETURNS (C INTEGER) AS BEGIN SELECT COUNT(*) FROM RC WHERE U = :V INTO C; SUSPEND; C = 0; IF (V = 'AB') THEN C = 1; SUSPEND; END^
 SET TERM ;^
 COMMIT;
 SQL
@@ -936,11 +981,77 @@ same "11e [NONE] the same three rows" $'SELECT * FROM XP5;'
 CH=WIN1252
 same "11e [WIN1252] the same three rows" $'SELECT * FROM XP5;'
 CH=""
+echo "--- 12a. AN EXPLICIT COLLATION THROUGH A FUNCTION DEDUPS, GROUPS AND UNIONS BY THE COLLATION (the merged fold keyed bytes: 7 for 4)"
+for CH in "" UTF8 WIN1252; do
+  pin  "12a [${CH:-NONE}] GROUP BY LPAD / SUBSTRING / TRIM / COALESCE (U COLLATE UNICODE_CI ...): 4 groups (it made 7)" $'SELECT COUNT(*) AS C FROM (SELECT COUNT(*) AS K FROM RC WHERE ID < 8 GROUP BY LPAD(U COLLATE UNICODE_CI, 2, \'z\'));\nSELECT COUNT(*) AS C FROM (SELECT COUNT(*) AS K FROM RC WHERE ID < 8 GROUP BY SUBSTRING(U COLLATE UNICODE_CI FROM 1));\nSELECT COUNT(*) AS C FROM (SELECT COUNT(*) AS K FROM RC WHERE ID < 8 GROUP BY TRIM(U COLLATE UNICODE_CI));\nSELECT COUNT(*) AS C FROM (SELECT COUNT(*) AS K FROM RC WHERE ID < 8 GROUP BY COALESCE(U COLLATE UNICODE_CI, \'q\'));' $'C|4|C|4|C|4|C|4'
+  pin  "12a [${CH:-NONE}] a distinct UNION takes the FIRST branch's collation: UPPER(..) first 4, LPAD(..) first 7, U COLLATE UNICODE_CI || 'x' first 4, UNICODE_CI over UNICODE_CI_AI 4, U over U COLLATE UNICODE_CI 7 (it made 8, 12, 7, 7, 7)" $'SELECT COUNT(*) AS C FROM (SELECT UPPER(U COLLATE UNICODE_CI) AS X FROM RC WHERE ID < 8 UNION SELECT U FROM RC WHERE ID < 8);\nSELECT COUNT(*) AS C FROM (SELECT LPAD(U COLLATE UNICODE_CI, 2, \'z\') AS X FROM RC WHERE ID < 8 UNION SELECT U FROM RC WHERE ID < 8);\nSELECT COUNT(*) AS C FROM (SELECT U COLLATE UNICODE_CI || \'x\' AS X FROM RC WHERE ID < 8 UNION SELECT U || \'x\' FROM RC WHERE ID < 8);\nSELECT COUNT(*) AS C FROM (SELECT U COLLATE UNICODE_CI AS X FROM RC WHERE ID < 8 UNION SELECT U COLLATE UNICODE_CI_AI FROM RC WHERE ID < 8);\nSELECT COUNT(*) AS C FROM (SELECT U AS X FROM RC WHERE ID < 8 UNION SELECT U COLLATE UNICODE_CI FROM RC WHERE ID < 8);' $'C|4|C|7|C|4|C|4|C|7'
+  pin  "12a [${CH:-NONE}] DISTINCT UPPER(U COLLATE UNICODE_CI): the spellings agree, 4" $'SELECT COUNT(*) AS C FROM (SELECT DISTINCT UPPER(U COLLATE UNICODE_CI) AS X FROM RC WHERE ID < 8);' $'C|4'
+  refused "12a [${CH:-NONE}] DISTINCT LPAD(U COLLATE UNICODE_CI, 2, 'z'): which spelling survives an expression's merge is not modelled (it counted 7)" $'SELECT COUNT(*) AS C FROM (SELECT DISTINCT LPAD(U COLLATE UNICODE_CI, 2, \'z\') AS X FROM RC WHERE ID < 8);' $'C|4'
+  refused "12a [${CH:-NONE}] DISTINCT TRIM / U COLLATE UNICODE_CI || 'x' likewise (7)" $'SELECT COUNT(*) AS C FROM (SELECT DISTINCT U COLLATE UNICODE_CI || \'x\' AS X FROM RC WHERE ID < 8);' $'C|4'
+  refused "12a [${CH:-NONE}] MIN / COUNT(DISTINCT) over LPAD(U COLLATE UNICODE_CI, ...): the fold has no key for an expression's collation (it answered AB and 7)" $'SELECT MIN(LPAD(U COLLATE UNICODE_CI, 2, \'z\')) AS M FROM RC;' $'M|ab'
+done
+
+echo "--- 12b. AN OCTETS SIDE BESIDE A COLLATED ONE COMPARES THE OCTETS OF EACH (a UTF8 'É' was keyed as the one octet C9: the non-ASCII rows dropped)"
+for CH in "" UTF8 WIN1252; do
+  pin  "12b [${CH:-NONE}] UPPER(U COLLATE UNICODE_CI) = O, U COLLATE UNICODE_CI = O, LOWER(..) = O, O = UPPER(..), U COLLATE UNICODE_CI IN (O, 'zz') (it counted 2, 4, 2, 2, 4)" $'SELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND UPPER(U COLLATE UNICODE_CI) = O;\nSELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND U COLLATE UNICODE_CI = O;\nSELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND LOWER(U COLLATE UNICODE_CI) = O;\nSELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND O = UPPER(U COLLATE UNICODE_CI);\nSELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND U COLLATE UNICODE_CI IN (O, \'zz\');' $'C|3|C|7|C|4|C|3|C|7'
+done
+CH=UTF8
+pin  "12b [UTF8] O = CAST('É' AS VARCHAR(5) CHARACTER SET UTF8) COLLATE UNICODE_CI: C3 89 is row 2's octets (it counted 0)" $'SELECT COUNT(*) AS C FROM RC WHERE O = CAST(\'É\' AS VARCHAR(5) CHARACTER SET UTF8) COLLATE UNICODE_CI;' $'C|1'
+
+echo "--- 12c. A CARRIER BENEATH AN EXPLICIT COLLATION, AND BESIDE A COLLATED COLUMN, MOVES INTO ITS SET (it compared bytes)"
+pin  "12c [UTF8] COALESCE(N, 'q') COLLATE UNICODE_CI = 'É', IIF(ID > 0, N, 'q') COLLATE .., = U, UPPER(COALESCE(N, 'q') COLLATE ..) = 'É' (it counted 0, 0, 4, 0)" $'SELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND COALESCE(N, \'q\') COLLATE UNICODE_CI = \'É\';\nSELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND IIF(ID > 0, N, \'q\') COLLATE UNICODE_CI = \'É\';\nSELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND COALESCE(N, \'q\') COLLATE UNICODE_CI = U;\nSELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND UPPER(COALESCE(N, \'q\') COLLATE UNICODE_CI) = \'É\';' $'C|2|C|2|C|7|C|2'
+pin  "12c [UTF8] UC = CAST(x'C389' AS .. NONE) and a JOIN of UC to N: the NONE octets read as UTF8 under UNICODE_CI (it counted 1 and 7)" $'SELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND UC = CAST(x\'C389\' AS VARCHAR(2) CHARACTER SET NONE);\nSELECT COUNT(*) AS C FROM RC T1 JOIN RC T2 ON T1.UC = T2.N;' $'C|2|C|13'
+refused "12c [UTF8] REPLACE(U COLLATE UNICODE_CI, 'b', 'c') = 'AC': the engine searches under the collation (it counted 1)" $'SELECT COUNT(*) AS C FROM RC WHERE REPLACE(U COLLATE UNICODE_CI, \'b\', \'c\') = \'AC\';' $'C|2'
+refused "12c [UTF8] U COLLATE UNICODE_CI SIMILAR TO 'É': the engine matches under the collation (it counted 1)" $'SELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI SIMILAR TO \'É\';' $'C|2'
+refused "12c [UTF8] UPPER(UC) = N: an expression over a collated column beside a carrier refuses (it counted 3)" $'SELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND UPPER(UC) = N;' $'C|7'
+CH=""
+pin  "12c [NONE] U COLLATE UNICODE_CI = 'É', <> 'É', > 'é', IN ('É', 'x'), BETWEEN 'É' AND 'É', 'É' = U COLLATE .., an OR of two (the adopted literal was moved twice: 22000 Malformed string)" $'SELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI = \'É\';\nSELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI <> \'É\';\nSELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI > \'é\';\nSELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI IN (\'É\', \'x\');\nSELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI BETWEEN \'É\' AND \'É\';\nSELECT COUNT(*) AS C FROM RC WHERE \'É\' = U COLLATE UNICODE_CI;\nSELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI = \'É\' OR U COLLATE UNICODE_CI = \'ab\';' $'C|2|C|5|C|1|C|2|C|2|C|2|C|4'
+pin  "12c [NONE] UPPER(U) COLLATE UNICODE_CI = 'é', (U || 'x') COLLATE .. = 'Éx', CAST(N AS .. UTF8) COLLATE .. = 'É', IIF(U COLLATE .. = 'É', 1, 0) (22000 each)" $'SELECT COUNT(*) AS C FROM RC WHERE UPPER(U) COLLATE UNICODE_CI = \'é\';\nSELECT COUNT(*) AS C FROM RC WHERE (U || \'x\') COLLATE UNICODE_CI = \'Éx\';\nSELECT COUNT(*) AS C FROM RC WHERE CAST(N AS VARCHAR(5) CHARACTER SET UTF8) COLLATE UNICODE_CI = \'É\';\nSELECT IIF(U COLLATE UNICODE_CI = \'É\', 1, 0) AS C FROM RC WHERE ID = 1;' $'C|2|C|2|C|2|C|1'
+pin  "12c [NONE] U COLLATE UNICODE_CI = x'C389': the binary literal moves too (it counted 0)" $'SELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI = x\'C389\';' $'C|1'
+
+echo "--- 12d. A CONCATENATION KEEPS ITS FIRST OPERAND'S COLLATION, UNLESS THAT OPERAND IS NONE (it kept none: 'a concatenation drops it')"
+for CH in "" UTF8; do
+  pin  "12d [${CH:-NONE}] U COLLATE UNICODE_CI || 'x' = 'Éx', SUBSTRING(..) || SUBSTRING(..) = 'éé', U COLLATE UNICODE_CI || U COLLATE UNICODE_CI_AI = 'EE' (the first's), (.. || 'x') || 'y' (it counted 1, 1, 1, 1)" $'SELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI || \'x\' = \'Éx\';\nSELECT COUNT(*) AS C FROM RC WHERE SUBSTRING(U COLLATE UNICODE_CI FROM 1 FOR 1) || SUBSTRING(U COLLATE UNICODE_CI FROM 1 FOR 1) = \'éé\';\nSELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI || U COLLATE UNICODE_CI_AI = \'EE\';\nSELECT COUNT(*) AS C FROM RC WHERE (U COLLATE UNICODE_CI || \'x\') || \'y\' = \'Éxy\';' $'C|2|C|2|C|2|C|2'
+  pin  "12d [${CH:-NONE}] UPPER(U COLLATE UNICODE_CI) || 'x' STARTING WITH 'é', IN ('éx') (it counted 0, 0)" $'SELECT COUNT(*) AS C FROM RC WHERE UPPER(U COLLATE UNICODE_CI) || \'x\' STARTING WITH \'é\';\nSELECT COUNT(*) AS C FROM RC WHERE UPPER(U COLLATE UNICODE_CI) || \'x\' IN (\'éx\');' $'C|2|C|2'
+done
+CH=UTF8
+pin  "12d [UTF8] UPPER('é' COLLATE UNICODE_CI) || 'x' = U || 'x' 2 (it counted 1); 'x' || U COLLATE UNICODE_CI = 'xÉ' 1 - the UTF8 literal first wins; UPPER(..) || 'x' LIKE 'é%' 2" $'SELECT COUNT(*) AS C FROM RC WHERE UPPER(\'é\' COLLATE UNICODE_CI) || \'x\' = U || \'x\';\nSELECT COUNT(*) AS C FROM RC WHERE \'x\' || U COLLATE UNICODE_CI = \'xÉ\';\nSELECT COUNT(*) AS C FROM RC WHERE UPPER(U COLLATE UNICODE_CI) || \'x\' LIKE \'é%\';' $'C|2|C|1|C|2'
+CH=""
+pin  "12d [NONE] 'x' || U COLLATE UNICODE_CI = 'xÉ': the NONE literal first yields, 2 (it counted 1)" $'SELECT COUNT(*) AS C FROM RC WHERE \'x\' || U COLLATE UNICODE_CI = \'xÉ\';' $'C|2'
+
+echo "--- 12e. MIN / MAX OVER A COLLATION: the collation under a WIN1252 caller, and a tie inside a group falls to the group's record order"
+CH=WIN1252
+pin  "12e [WIN1252] MIN(U COLLATE UNICODE_CI), over {e, E}, UNICODE_CI_AI, COUNT(DISTINCT U COLLATE UNICODE_CI) (it answered AB, E, AB, 7 - the delivery recode hid the collation)" $'SELECT MIN(U COLLATE UNICODE_CI) AS M FROM RC;\nSELECT MIN(U COLLATE UNICODE_CI) AS M FROM RC WHERE ID IN (3, 4);\nSELECT MIN(U COLLATE UNICODE_CI_AI) AS M FROM RC;\nSELECT COUNT(DISTINCT U COLLATE UNICODE_CI) AS C FROM RC;' $'M|ab|M|e|M|ab|C|4'
+for CH in "" UTF8 WIN1252; do
+  pin  "12e [${CH:-NONE}] grouped, beside another item: MIN(U COLLATE UNICODE_CI), COUNT(*); MIN(UC), MAX(UC) take the first in the group's record order, AB and E (they took ab and e)" $'SELECT MIN(U COLLATE UNICODE_CI) AS M, COUNT(*) AS C FROM RC GROUP BY CHAR_LENGTH(U) ORDER BY 2;\nSELECT MIN(UC) AS M, MAX(UC) AS X FROM RC WHERE CHAR_LENGTH(UC) = 2 GROUP BY CHAR_LENGTH(UC);\nSELECT CHAR_LENGTH(UC) AS K, MIN(UC) AS M FROM RC WHERE CHAR_LENGTH(UC) = 1 GROUP BY CHAR_LENGTH(UC);' $'M C|<null> 1|AB 2|E 5|M X|AB AB|K M|1 E'
+  pin  "12e [${CH:-NONE}] ...a lone MIN(UC), a constant key, and ID referenced keep the scan's ab and e" $'SELECT MIN(UC) AS M FROM RC GROUP BY CHAR_LENGTH(UC);\nSELECT MIN(UC) AS M FROM RC GROUP BY 1 = 1;\nSELECT MIN(UC) AS M FROM RC GROUP BY \'x\';\nSELECT MIN(UC) AS M FROM RC WHERE ID > 0 GROUP BY CHAR_LENGTH(UC) ORDER BY 1;' $'M|<null>|e|ab|M|ab|M|ab|M|<null>|ab|e'
+  refused "12e [${CH:-NONE}] a lone MIN(U COLLATE UNICODE_CI) ordered by itself keeps AB and E, which neither order names (the fold answered ab and e)" $'SELECT MIN(U COLLATE UNICODE_CI) AS M FROM RC GROUP BY CHAR_LENGTH(U) ORDER BY 1;' $'M|<null>|AB|E'
+done
+
+echo "--- 12f. A SCALAR SUBQUERY FOLDS AS ITS COLUMN'S OCTETS AND SET, AND A LIKE PATTERN UNDER A CARRIER CALLER IS READ IN THE COLLATION'S SET"
+CH=""
+pin  "12f [NONE] UPPER(U COLLATE UNICODE_CI) = (SELECT U / W ..), UPPER(U) = (SELECT U .. ID = 2), UC = (SELECT N ..) (22000, 22000, 0, and 2 kept)" $'SELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND UPPER(U COLLATE UNICODE_CI) = (SELECT U FROM RC WHERE ID = 1);\nSELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND UPPER(U COLLATE UNICODE_CI) = (SELECT W FROM RC WHERE ID = 1);\nSELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND UPPER(U) = (SELECT U FROM RC WHERE ID = 2);\nSELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND UC = (SELECT N FROM RC WHERE ID = 1);\nSELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND U COLLATE UNICODE_CI = (SELECT O FROM RC WHERE ID = 1);' $'C|2|C|2|C|2|C|2|C|1'
+pin  "12f [NONE] U COLLATE UNICODE_CI LIKE 'É', '%É', '%é%', LOWER(..) LIKE '%É' (they counted 0)" $'SELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI LIKE \'É\';\nSELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI LIKE \'%É\';\nSELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI LIKE \'%é%\';\nSELECT COUNT(*) AS C FROM RC WHERE LOWER(U COLLATE UNICODE_CI) LIKE \'%É\';' $'C|2|C|2|C|2|C|2'
+same "12f [NONE] UPPER(U COLLATE UNICODE_CI) LIKE 'é%', U COLLATE UNICODE_CI LIKE 'É%': a non-ASCII prefix before the wildcard raises 22000 (it counted 0)" $'SELECT COUNT(*) AS C FROM RC WHERE UPPER(U COLLATE UNICODE_CI) LIKE \'é%\';\nSELECT COUNT(*) AS C FROM RC WHERE U COLLATE UNICODE_CI LIKE \'É%\';'
+for CH in UTF8 WIN1252; do
+  pin  "12f [${CH}] UPPER(U COLLATE UNICODE_CI) = (SELECT N ..) and UC = (SELECT N ..): the NONE answer's octets C3 A9 are 'é' (they counted 0 and 0)" $'SELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND UPPER(U COLLATE UNICODE_CI) = (SELECT N FROM RC WHERE ID = 1);\nSELECT COUNT(*) AS C FROM RC WHERE ID < 8 AND UC = (SELECT N FROM RC WHERE ID = 1);' $'C|2|C|2'
+done
+
+echo "--- 12g. IN A BODY: the same laws through the source path, and a slot of an explicit collation refuses (it lost the collation)"
+for CH in "" UTF8 WIN1252; do
+  pin  "12g [${CH:-NONE}] GROUP BY LPAD(..), UNION UPPER(..) first, UPPER(..) = O, COALESCE(N, 'q') COLLATE .. = 'É', U COLLATE .. || 'x' = 'Éx', = (SELECT U ..)" $'SELECT * FROM YB1;' $'C|4|4|3|2|2|2'
+  pin  "12g [${CH:-NONE}] FOR SELECT MIN(UC) .. GROUP BY CHAR_LENGTH(U) ORDER BY 1: a lone MIN keeps the scan's spelling" $'SELECT * FROM YB3;' $'M|<null>|ab|e'
+  refused "12g [${CH:-NONE}] DISTINCT UPPER(..) then DISTINCT LPAD(..) (the body answered 4 | 7)" $'SELECT * FROM YB2;' $'C|4|4'
+  refused "12g [${CH:-NONE}] DECLARE V .. COLLATE UNICODE_CI = 'é': U = UPPER(:V), IF (V = 'É') (it answered 1 | 0; 0 | 0 under NONE)" $'SELECT * FROM YB4;' $'C|2|1'
+  refused "12g [${CH:-NONE}] DECLARE V .. COLLATE UNICODE_CI = 'ab': U = :V, IF (V || 'x' = 'ABx') (it answered 1 | 0)" $'SELECT * FROM YB5;' $'C|2|1'
+  refused "12g [${CH:-NONE}] a parameter V .. COLLATE UNICODE_CI bound 'ab': U = :V, IF (V = 'AB') (it answered 1 | 0)" $'SELECT * FROM YB6(\'ab\');' $'C|2|1'
+done
+CH=""
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-psqlassign-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 429 ]; then echo "FAIL only $ran checks ran (floor 429)"; fail=1; fi
+if [ "$ran" -lt 501 ]; then echo "FAIL only $ran checks ran (floor 501)"; fail=1; fi
 exit $fail

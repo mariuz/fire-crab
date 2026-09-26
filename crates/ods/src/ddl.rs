@@ -2825,6 +2825,29 @@ pub fn domain_charset_id(file: &crate::Image, page_size: usize, name: &str) -> O
     out
 }
 
+/// A domain's `RDB$COLLATION_ID` (None when SQL NULL) - where a
+/// procedure or function PARAMETER declared `COLLATE <name>` keeps its
+/// collation (the parameter row's own RDB$COLLATION_ID stays NULL,
+/// measured on 2182).
+pub fn domain_collation_id(file: &crate::Image, page_size: usize, name: &str) -> Option<i64> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$FIELDS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$FIELDS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let name_f = fid("RDB$FIELD_NAME")?;
+    let co_f = fid("RDB$COLLATION_ID")?;
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(name_f), name) {
+            if let Some(Value::Int(i)) = v.get(co_f) {
+                out = Some(*i);
+            }
+        }
+    });
+    out
+}
+
 fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Option<DomainType> {
     let rel = crate::resolve_relation(file, page_size, "RDB$FIELDS")?;
     let formats = system_relation_formats(file, page_size, "RDB$FIELDS")?;

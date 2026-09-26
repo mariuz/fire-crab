@@ -54175,7 +54175,7 @@ fn branch_rows_res(
         }
         if *distinct {
             let oc = output_cols_of(plan);
-            distinct_rows(&mut rows, order_by.is_some(), &coll_cols(&oc), &varying_cols(&oc), union_tie_unknown(branches))?;
+            distinct_rows(&mut rows, order_by.is_some(), &union_coll_cols(branches, &oc), &varying_cols(&oc), union_tie_unknown(branches))?;
         }
         if let Some(key) = order_by {
             let keys = [key.clone()];
@@ -54727,8 +54727,26 @@ fn stamp_group_order_coll(keys: &mut [OrderKey], slot_descs: &[Option<Descriptor
 /// and so does a key over [icu_blind_fn], whose value this server gets
 /// wrong before any bucketing.
 fn expr_key_coll(e: &Expr, descs: &[Descriptor]) -> Option<u16> {
+    // AN EXPLICIT COLLATION READ THROUGH THE FUNCTIONS THAT KEEP IT - the
+    // ONE reader the comparisons use ([explicit_collate_of]). This fold
+    // had its own, which saw the bare wrapper only: `DISTINCT LPAD(U
+    // COLLATE UNICODE_CI, 2, 'z')`, TRIM, SUBSTRING, LEFT, RIGHT, RPAD,
+    // REPLACE, REVERSE, COALESCE, IIF, CASE, NULLIF and `U COLLATE
+    // UNICODE_CI || 'x'` keyed BYTES and counted 7 where the engine counts
+    // 4 over {é, É, e, E, ab, AB, ö} (measured on 2182 under UTF8, NONE
+    // and WIN1252 callers, and GROUP BY the same keys 4 groups)
+    if let Some(tt) = explicit_collate_of(e, descs) {
+        return Some(tt);
+    }
     match e {
         Expr::Collate(_, tt) | Expr::CollKey(_, tt) | Expr::CollCanon(_, tt, _) => Some(*tt),
+        // the resolver's SYNTHETIC text casts (a delivery recode, the
+        // CHAR pad) are not the user's: the value is keyed before it is
+        // delivered, by what is under them. Read as a CAST they dropped
+        // an ICU column's collation under a WIN1252 caller alone:
+        // `DISTINCT LPAD(UC, 2, 'z')` and `DISTINCT N || UC` over a
+        // UNICODE_CI UC counted 7 where the engine counts 4 (measured)
+        Expr::Cast(inner, CastTarget::Text { synthetic: true, .. }, _) => expr_key_coll(inner, descs),
         // a CAST to a text type takes the target's charset and its DEFAULT
         // collation - the source's collation does not survive it
         Expr::Cast(..) => Some(expr_text_ttype(e, descs).map(|t| t & 0x00FF).unwrap_or(0)),
@@ -61258,6 +61276,7 @@ fn plan_group(
     if key_fids.iter().any(|f| descs.get(*f).is_some_and(|d| !coll_groupable(d)))
         || agg_needs_unkeyable_coll(&gitems, descs)
         || keys_coll(descs, &key_fids, &key_exprs.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(), synth_base).is_none()
+        || lone_explicit_extreme_ordered(&gitems, &key_fids, descs, !order_by.is_empty())
     {
         return Some(Plan::Refused);
     }
@@ -61277,6 +61296,29 @@ fn plan_group(
         index: None,
         defer: None,
     })
+}
+
+/// A grouped statement whose ONLY aggregate is a MIN or MAX over an
+/// EXPLICIT collation of an ICU family, with an ORDER BY: which of the
+/// spellings that collation calls equal the engine keeps is not the
+/// scan's and not the grouping record's alone. Measured on 2182 over
+/// {é, É, e, E, ab, AB, ö}: `MIN(U COLLATE UNICODE_CI) .. GROUP BY
+/// CHAR_LENGTH(U)` keeps the scan's 'ab' and 'e' (as [group_rows]
+/// does), `.. ORDER BY 1` keeps 'AB' and 'E', while `MIN(UC) .. ORDER
+/// BY 1` over a UNICODE_CI column keeps 'ab' and 'e' again. Refused
+/// rather than answered with a spelling this server cannot name.
+fn lone_explicit_extreme_ordered(gitems: &[GItem], key_fids: &[usize], descs: &[Descriptor], ordered: bool) -> bool {
+    if !ordered || key_fids.is_empty() {
+        return false;
+    }
+    let mut aggs = gitems.iter().filter(|g| matches!(g, GItem::Agg(..)));
+    match (aggs.next(), aggs.next()) {
+        (Some(GItem::Agg(AggFn::Min | AggFn::Max, AggSrc::CollField(fid, tt), _)), None) => {
+            fire_crab_ods::coll::icu_strength_of_ttype(*tt).is_some()
+                && descs.get(*fid).is_some_and(|d| d.sub_type as u16 != *tt)
+        }
+        _ => false,
+    }
 }
 
 /// Parse a GROUP BY list into record field ids. Items are column names or
@@ -62280,6 +62322,30 @@ impl<'a> ReadView<'a> {
 /// (measured, `serve-real-unionrep`: `SELECT DISTINCT c3 .. UNION SELECT
 /// v5 ..` keeps the CHAR leg's 'ab ' - OCTET_LENGTH 3 - where `SELECT c3
 /// .. UNION SELECT v5 ..` keeps the VARCHAR leg's 2) - unknown, refused.
+/// What a distinct UNION deduplicates by, column for column: the FIRST
+/// branch's collation, read through its expressions ([plan_coll_cols]) -
+/// the union's own columns are positional and carry only the first
+/// branch's ttype, which an explicit `COLLATE` under a function never
+/// reached. Measured on 2182 over {é, É, e, E, ab, AB, ö} under UTF8,
+/// NONE and WIN1252 callers: `UPPER(U COLLATE UNICODE_CI) UNION U` is 4
+/// rows, `LPAD(U COLLATE UNICODE_CI, 2, 'z') UNION U` 7, `U COLLATE
+/// UNICODE_CI || 'x' UNION U || 'x'` 4, `U COLLATE UNICODE_CI UNION U
+/// COLLATE UNICODE_CI_AI` 4 (the first's; the second's would be 3) and
+/// `U UNION U COLLATE UNICODE_CI` 7 - this server answered 8, 12, 7 and
+/// 7 by bytes.
+fn union_coll_cols(branches: &[Plan], oc: &[ProjCol]) -> Vec<u16> {
+    let own = coll_cols(oc);
+    let Some(first) = branches.first() else { return own };
+    let fc = plan_coll_cols(first, &output_cols_of(first));
+    own.iter()
+        .enumerate()
+        .map(|(i, tt)| match fc.get(i) {
+            Some(f) if fire_crab_ods::intl::collation_id(*f as i16) != 0 => *f,
+            _ => *tt,
+        })
+        .collect()
+}
+
 fn union_tie_unknown(branches: &[Plan]) -> bool {
     branches.iter().any(|b| !matches!(b, Plan::Project { windows, gen_cols, .. } if windows.is_empty() && gen_cols.is_empty()))
 }
@@ -65686,8 +65752,33 @@ fn group_rows(
         let text_key = key_fids.iter().any(|f| {
             input.iter().any(|r| matches!(r.get(*f), Some(Value::Text(_))))
         });
+        // a key that READS a field - a constant one (`GROUP BY 1 = 1`,
+        // `GROUP BY 'x'`) leaves a lone MIN / MAX in scan order on the
+        // engine (`MIN(UC) ... GROUP BY 1 = 1` and `GROUP BY 'x'` are
+        // 'ab', measured, where a LIST beside it makes it 'AB')
+        let field_key = key_fids.iter().any(|f| match f.checked_sub(synth_base) {
+            Some(i) if !key_exprs.is_empty() => key_exprs.get(i).is_some_and(|e| expr_reads(e, &|_| true)),
+            _ => true,
+        });
+        // ...and a statement that asks its groups for ONE collated MIN or
+        // MAX and nothing else (constants aside) leaves it in scan order
+        // too: `SELECT MIN(UC) ... GROUP BY CHAR_LENGTH(UC)` is 'ab' and
+        // 'e', `MIN(UC), MIN(UC)` and `MIN(UC), 1` the same, where a
+        // COUNT(*), a SUM(1), a MAX(UC), a MIN(U), the key itself in the
+        // select list or a HAVING COUNT(*) beside it make it 'AB' and 'E'
+        // (all measured on 2182 over {é, É, e, E, ab, AB, ö})
+        let lone_extreme = {
+            let mut it = gitems.iter().filter(|g| !matches!(g, GItem::Const(_)));
+            match it.next() {
+                Some(GItem::Agg(f @ (AggFn::Min | AggFn::Max), AggSrc::CollField(a, t), _)) => it.all(|g| {
+                    matches!(g, GItem::Agg(f2, AggSrc::CollField(b, u), _) if f2 == f && b == a && u == t)
+                }),
+                _ => false,
+            }
+        };
         let tie_fids = if tie_order
-            && (text_key
+            // a constant text key has one spelling: nothing to survive
+            && ((text_key && field_key)
                 || gitems.iter().any(|g| {
                     matches!(
                         g,
@@ -65702,6 +65793,19 @@ fn group_rows(
                             ..
                         )
                     ) || matches!(g, GItem::Agg(f, ..) if f.is_statistical2())
+                        // MIN / MAX under an ICU collation keep the FIRST of
+                        // the values it calls equal, and inside a sorted
+                        // group "first" is this record order: `MIN(UC),
+                        // COUNT(*) .. GROUP BY CHAR_LENGTH(U)` over {ab, AB}
+                        // is 'AB' on the engine (the bytes put AB first)
+                        // where the scan order answered 'ab', and `MAX(UC)`
+                        // the same;
+                        // with ID referenced the lower ID leads and 'ab'
+                        // it is (all measured on 2182) - over a key that
+                        // reads a field ([field_key]), beside something
+                        // else ([lone_extreme])
+                        || field_key && !lone_extreme && matches!(g, GItem::Agg(AggFn::Min | AggFn::Max, AggSrc::CollField(_, tt), _)
+                            if fire_crab_ods::coll::icu_strength_of_ttype(*tt).is_some())
                 }))
         {
             let refs = std::cell::RefCell::new(Vec::<usize>::new());
@@ -71480,7 +71584,7 @@ fn emit_rows_inner(
                 // duplicates of each other here (SQL's set semantics),
                 // unlike `= NULL` in a predicate.
                 if *distinct {
-                    distinct_rows(&mut rows, order_by.is_some(), &coll_cols(cols), &varying_cols(cols), union_tie_unknown(branches)).map_err(EmitErr::Eval)?;
+                    distinct_rows(&mut rows, order_by.is_some(), &union_coll_cols(branches, cols), &varying_cols(cols), union_tie_unknown(branches)).map_err(EmitErr::Eval)?;
                 }
                 if let Some(key) = order_by {
                     let keys = [key.clone()];
@@ -77845,7 +77949,7 @@ fn resolve_raw_cond(
             if raw_has_param(pat) {
                 return None;
             }
-            if collate_canon_of(&e).is_some() {
+            if collate_canon_of(&e, descs).is_some() {
                 return None;
             }
             let p = resolve_expr(pat, columns, descs)?;
@@ -81995,7 +82099,13 @@ fn resolve_expr_inner(
         // OPERAND'S OWN character set, so it resolves against the
         // inner expression's descriptor.
         RawExpr::Collate(inner, name) => {
-            let e = resolve_expr_inner(inner, columns, descs)?;
+            // through the FULL resolver, whose passes move a conditional's
+            // carrier branch into its negotiated set ([recode_conditional])
+            // as they do at every other level: `COALESCE(N, 'q') COLLATE
+            // UNICODE_CI = 'É'` over a NONE N holding C3 A9 counts 2 under
+            // -ch UTF8 on the engine (the 'é' and 'É' rows), and the
+            // unmoved branch was re-encoded as 'Ã©' and counted 0
+            let e = resolve_expr(inner, columns, descs)?;
             let cs = match text_form(&e, descs) {
                 Some((_, _, TfCs::Ttype(t))) => Some(fire_crab_ods::intl::charset_id(t as i16)),
                 // an ATTACHMENT-charset expression (an untyped literal)
@@ -93533,6 +93643,11 @@ struct SubqRows {
 /// None whenever the shape is not a text value of a REAL character set,
 /// and the caller keeps the plain literal it used before.
 fn subq_text_literal(v: &Value, sub: &str, db: &Option<Database>) -> Option<String> {
+    subq_text_literal_cs(v, sub, db).map(|(l, _)| l)
+}
+
+/// [subq_text_literal], with the character set the literal names.
+fn subq_text_literal_cs(v: &Value, sub: &str, db: &Option<Database>) -> Option<(String, u8)> {
     let Value::Text(t) = v else { return None };
     let ty = match plan_query_inner(sub, db, &mut Vec::new())? {
         Plan::Scalar(_, _, _, ty) => ty,
@@ -93569,7 +93684,7 @@ fn subq_text_literal(v: &Value, sub: &str, db: &Option<Database>) -> Option<Stri
     for b in &bytes {
         hex.push_str(&format!("{:02X}", b));
     }
-    Some(format!("CAST(x'{}' AS VARCHAR({}) CHARACTER SET {})", hex, width, name))
+    Some((format!("CAST(x'{}' AS VARCHAR({}) CHARACTER SET {})", hex, width, name), cs))
 }
 
 fn value_literal(v: &Value) -> Option<String> {
@@ -97959,6 +98074,31 @@ fn resolve_subqueries(
                 // key: `A = (SELECT T FROM J2)` answers where the same
                 // value through `A IN (SELECT T FROM J2)` raises (probed)
                 let lit = value_to_tok(&rows.values[0], false)?;
+                // A NON-ASCII TEXT answer folds as its column's bytes AND
+                // set ([subq_text_literal]), as the select-list fold does:
+                // a plain literal is of the ATTACHMENT's set, and under -ch
+                // NONE a UTF8 'é' spelled as one became the octet E9 -
+                // `UPPER(U COLLATE UNICODE_CI) = (SELECT U FROM TC WHERE ID
+                // = 1)` raised 22000 *Malformed string* and `UPPER(U) =
+                // (SELECT U ... ID = 2)` counted 0 where the engine counts
+                // 2 for both (measured), and under -ch UTF8 a NONE
+                // column's C3 A9 was read as the two letters 'Ã©' (`=
+                // (SELECT N ...)` 0 for 2). An ASCII answer means the same
+                // in every set and keeps the plain literal, and so does an
+                // answer already in the ATTACHMENT's set - the plain literal
+                // IS its octets and its set there, and adopts a collated
+                // column's as the engine does (`UC = (SELECT N ...)` under
+                // -ch NONE counts 2; `U COLLATE UNICODE_CI = (SELECT O
+                // ...)` stays OCTETS and counts 1 - both measured).
+                let att = CURRENT_ATT_CS.with(|c| c.get());
+                let lit = match &rows.values[0] {
+                    Value::Text(t) if !t.is_ascii() => subq_text_literal_cs(&rows.values[0], sql, db_opt)
+                        .filter(|(_, cs)| *cs != att)
+                        .and_then(|(l, _)| parse_raw_expr_any(&l))
+                        .map(Tok::FnExpr)
+                        .unwrap_or(lit),
+                    _ => lit,
+                };
                 // a `?` elsewhere in the statement may take ITS slot from
                 // this fold: the literal then carries the inner column's
                 // own exact type ([corr_fold_typed_tok])
@@ -102454,6 +102594,10 @@ impl ColKind {
 struct ProcParam {
     name: String,
     desc: Descriptor,
+    /// declared with a collation other than its set's default - kept
+    /// OFF the descriptor, whose describe carries the charset alone;
+    /// read by [body_declares_collated_slot]
+    collated: bool,
     /// an input parameter's LITERAL DEFAULT value (decoded from
     /// RDB$DEFAULT_VALUE), used to fill an omitted trailing argument at a
     /// call; None for a parameter without a literal default
@@ -102884,7 +103028,8 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         }
         let default_cs = defval.as_ref().and_then(|(_, c)| *c);
         let (default, default_ctx) = split_default(defval.map(|(d, _)| d));
-        let p = ProcParam { name: pnm, desc, default, default_ctx, default_cs };
+        let collated = fire_crab_ods::ddl::domain_collation_id(&db.bytes(), db.page_size, &fs).is_some_and(|c| c != 0);
+        let p = ProcParam { name: pnm, desc, collated, default, default_ctx, default_cs };
         if typ == 0 {
             ins.push(p)
         } else {
@@ -109060,6 +109205,41 @@ fn blr_reads_collated_relation(db: &Database, blr: &[u8]) -> bool {
     }
 }
 
+/// Does a body declare a parameter, an output or a local of an EXPLICIT
+/// COLLATION? Neither body runner carries one: a slot is typed by its
+/// set and width ([slot_cast_target]) and the BLR executor compares
+/// values with no descriptor in reach, so every comparison over such a
+/// variable fell back to bytes. Measured on engine 2182 with `DECLARE V
+/// VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE_CI = 'é'` over the TC
+/// fixture: `WHERE U = UPPER(:V)` counts 2, `IF (V = 'É')` is taken,
+/// `WHERE :V = U` counts 2, and a `'ab'` local's `IF (V || 'x' = 'ABx')`
+/// is taken (a concatenation keeps its first operand's collation); this
+/// server answered 1, not taken, 1 and not taken - and 0 for every cell
+/// under a NONE caller. A collated PARAMETER the same (`U = :V` bound
+/// 'ab' 2, answered 1). Refused - both runners - until a slot carries
+/// its collation; the set's own collation (`COLLATE UTF8`) still runs.
+fn body_declares_collated_slot(meta: &ProcMeta) -> bool {
+    if meta.ins.iter().chain(meta.outs.iter()).any(|p| p.collated) {
+        return true;
+    }
+    let up = meta.source.to_ascii_uppercase();
+    let header = &up[..find_word(&up, "BEGIN", 0).unwrap_or(up.len())];
+    let mut at = 0;
+    while let Some(p) = find_word(header, "COLLATE", at) {
+        let name: String = header[p + "COLLATE".len()..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+            .collect();
+        // the set's own collation shares its name
+        if charset_name_id(&name).is_none() {
+            return true;
+        }
+        at = p + "COLLATE".len();
+    }
+    false
+}
+
 fn try_procedure_blr(
     database: &Option<Database>,
     name: &str,
@@ -109094,6 +109274,7 @@ fn try_procedure_blr_at(
     // one call: the truncation raise is typed, everything else falls
     // to the source interpreter to refuse in its own words
     let bound_args = match load_procedure(db, name) {
+        Some(meta) if body_declares_collated_slot(&meta) => return BlrProcOutcome::Outside,
         Some(meta) => {
             // fill omitted trailing defaults, then REQUIRE an exact arity -
             // bind_proc_args zips and would otherwise silently drop extra
@@ -109237,6 +109418,9 @@ fn try_function_blr_at(database: &Option<Database>, name: &str, args: &[Value], 
     let Some(meta) = load_function(db, name) else {
         return FnBlrOutcome::Outside;
     };
+    if body_declares_collated_slot(&meta) {
+        return FnBlrOutcome::Outside;
+    }
     // fill omitted trailing defaults, then require exact arity (as the
     // procedure fast path does) - a mismatch falls to the source path
     let filled = with_proc_defaults(&meta, args, None);
@@ -110228,12 +110412,13 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
         if col_kind(&desc).is_none() && !is_numeric_col(&desc) {
             return None;
         }
+        let collated = fire_crab_ods::ddl::domain_collation_id(&db.bytes(), db.page_size, &fs).is_some_and(|c| c != 0);
         if pos == 0 {
-            outs.push(ProcParam { name: "RETURN".into(), desc, default: None, default_ctx: None, default_cs: None });
+            outs.push(ProcParam { name: "RETURN".into(), desc, collated, default: None, default_ctx: None, default_cs: None });
         } else {
             let default_cs = defval.as_ref().and_then(|(_, c)| *c);
             let (default, default_ctx) = split_default(defval.map(|(d, _)| d));
-            ins.push(ProcParam { name: pname, desc, default, default_ctx, default_cs });
+            ins.push(ProcParam { name: pname, desc, collated, default, default_ctx, default_cs });
         }
     }
     if outs.len() != 1 {
@@ -110787,6 +110972,12 @@ fn run_body_source(
     // the consumer's row limit, when it is known - see [PsqlFrame::stop_after]
     stop_after: Option<BodyCap>,
 ) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
+    if body_declares_collated_slot(meta) {
+        return Err(ProcErr::from(format!(
+            "{}: a parameter or variable of an explicit collation is outside this server's PSQL surface",
+            name
+        )));
+    }
     // omitted trailing arguments take their parameters' DEFAULTs
     let given = args.len();
     let args = with_proc_defaults(meta, args, Some(ctx));
@@ -111576,6 +111767,18 @@ fn stat_dec_src(func: AggFn, src: AggSrc, decimal: bool) -> AggSrc {
 
 fn agg_expr_src(e: Expr) -> Option<AggSrc> {
     match e {
+        // the delivery recode [deliver_in_announced_set] wraps round a
+        // real-set argument under a caller of another set: the fold
+        // compares under the collation BEFORE delivery. Read as a plain
+        // expression it dropped the collation under -ch WIN1252 alone:
+        // `MIN(U COLLATE UNICODE_CI)` answered 'AB' for the engine's
+        // 'ab' (and 'E' for 'e' over {e, E}), and `COUNT(DISTINCT U
+        // COLLATE UNICODE_CI)` 7 for 4 (measured)
+        Expr::Cast(inner, CastTarget::Text { synthetic: true, .. }, _)
+            if matches!(&*inner, Expr::Collate(c, _) if matches!(**c, Expr::Col(_))) =>
+        {
+            agg_expr_src(*inner)
+        }
         Expr::Collate(inner, tt) => match *inner {
             Expr::Col(fid) => {
                 if fire_crab_ods::intl::collation_id(tt as i16) == 0 {
@@ -111629,9 +111832,16 @@ fn agg_needs_unkeyable_coll(gitems: &[GItem], descs: &[Descriptor]) -> bool {
                 }
                 // keyed by the fold itself
                 AggSrc::CollField(..) => false,
-                // an expression carrying a collation into its result
+                // an expression carrying a collation into its result -
+                // a collated column's, or an explicit one read through
+                // the functions that keep it ([explicit_collate_of]):
+                // `MIN(LPAD(U COLLATE UNICODE_CI, 2, 'z'))` is 'ab' and
+                // `COUNT(DISTINCT LPAD(...))` 4 on the engine, and the
+                // plain fold answered 'AB' and 7 (measured)
                 AggSrc::Expr(e) => {
                     expr_reads(e, &|fid| descs.get(fid).is_some_and(collated))
+                        || explicit_collate_of(e, descs)
+                            .is_some_and(|tt| fire_crab_ods::intl::collation_id(tt as i16) != 0)
                 }
                 _ => false,
             }
@@ -111722,6 +111932,7 @@ fn icu_canon_strength(d: &Descriptor) -> Option<(u16, fire_crab_ods::coll::Stren
 /// the string itself, so the plain matcher is already right).
 fn collate_canon_of(
     e: &Expr,
+    descs: &[Descriptor],
 ) -> Option<(Expr, u16, fire_crab_ods::coll::Strength)> {
     match e {
         Expr::Collate(inner, tt) => fire_crab_ods::coll::icu_strength_of_ttype(*tt)
@@ -111729,7 +111940,7 @@ fn collate_canon_of(
         // a collation under a function that keeps it
         // ([explicit_collate_of]); the wrapper inside is transparent
         // at eval, so the whole expression is the operand
-        other => explicit_collate_of(other).and_then(|tt| {
+        other => explicit_collate_of(other, descs).and_then(|tt| {
             fire_crab_ods::coll::icu_strength_of_ttype(tt).map(|st| (other.clone(), tt, st))
         }),
     }
@@ -111891,7 +112102,7 @@ fn collate_operand_ttype(e: Expr, descs: &[Descriptor]) -> Option<(Expr, u16)> {
         Expr::Collate(inner, tt) => ((*inner), tt),
         // a collation under a function that keeps it
         // ([explicit_collate_of]) decides too
-        other => match explicit_collate_of(&other) {
+        other => match explicit_collate_of(&other, descs) {
             Some(tt) => (other, tt),
             None => {
                 let tt = expr_text_ttype(&other, descs).unwrap_or(0);
@@ -112595,7 +112806,7 @@ fn resolve_expr_term(
     // cannot key by default is keyable when the statement says which
     // collation to use (`CI COLLATE UCS_BASIC = 'APPLE'` is the byte
     // comparison, and the engine answers it).
-    let explicit_ok = matches!(explicit_collate_of(&lhs), Some(tt)
+    let explicit_ok = matches!(explicit_collate_of(&lhs, descs), Some(tt)
         if fire_crab_ods::intl::collation_id(tt as i16) == 0
             || fire_crab_ods::coll::icu_strength_of_ttype(tt).is_some()
             || tt == fire_crab_ods::coll::TTYPE_PXW_INTL);
@@ -112665,7 +112876,7 @@ fn resolve_expr_term(
             if raw_has_param(pat) {
                 return None;
             }
-            if collate_canon_of(&lhs).is_some() {
+            if collate_canon_of(&lhs, descs).is_some() {
                 return None;
             }
             let pat = resolve_expr(pat, columns, descs)?;
@@ -112952,17 +113163,41 @@ fn resolve_expr_term(
                 && matches!(lhs.type_of(descs), Some(ExprType::Text))
             {
                 Term::BadExprLike(Box::new(lhs), lenient_like_prefix(p, *escape))
-            } else if let Some((inner, tt, st)) = collate_canon_of(&lhs) {
+            } else if let Some((inner, tt, st)) = collate_canon_of(&lhs, descs) {
                 // `<x> COLLATE <name> LIKE ...` - the WRITTEN collation
                 // decides the match, and a pattern match reads its
                 // CANONICAL form, not its key
                 let esc = canon_escape(*escape, st)?;
-                Term::ExprLike(
-                    Box::new(Expr::CollCanon(Box::new(inner), tt, false)),
-                    fire_crab_ods::coll::icu_canonical(p, st),
-                    esc,
-                    *negated,
-                )
+                // ...and a pattern written under a BYTE-CARRIER attachment
+                // is read in the collation's set, with the column path's
+                // raise ([carrier_expr_like]): under -ch NONE `U COLLATE
+                // UNICODE_CI LIKE 'É'`, `'%É'`, `'%é%'` and `LOWER(U
+                // COLLATE UNICODE_CI) LIKE '%É'` count 2 on the engine and
+                // `LIKE 'é%'` / `'É%'` / `UPPER(...) LIKE 'é%'` raise 22000
+                // (measured), where the octets as chars matched nothing
+                let att = CURRENT_ATT_CS.with(|c| c.get());
+                let cs = fire_crab_ods::intl::charset_id(tt as i16);
+                let read;
+                let p = if fire_crab_ods::intl::byte_carrier(att) && !fire_crab_ods::intl::byte_carrier(cs) {
+                    read = transcode_text(att, cs, p.clone()).unwrap_or_else(|_| p.clone());
+                    &read
+                } else {
+                    p
+                };
+                if fire_crab_ods::intl::byte_carrier(att)
+                    && !fire_crab_ods::intl::byte_carrier(cs)
+                    && !negated
+                    && carrier_like_raises(p, *escape)
+                {
+                    Term::MalformedLike(Box::new(lhs))
+                } else {
+                    Term::ExprLike(
+                        Box::new(Expr::CollCanon(Box::new(inner), tt, false)),
+                        fire_crab_ods::coll::icu_canonical(p, st),
+                        esc,
+                        *negated,
+                    )
+                }
             } else {
                 // a BYTE-CARRIER pattern against a REAL-charset expression
                 // reinterprets into that charset (and may raise) - the
@@ -113055,6 +113290,13 @@ fn resolve_expr_term(
             // does ([converting_expr_pattern]); a DECFLOAT expression has
             // no type here and refuses. A parameter pattern is a later
             // slice.
+            // An explicit collation that canonicalises decides the match
+            // on the engine, which this regex over the bytes cannot: `U
+            // COLLATE UNICODE_CI SIMILAR TO 'É'` counts 2 there (measured
+            // under UTF8 and NONE) and 1 or 0 here - refused.
+            if collate_canon_of(&lhs, descs).is_some() {
+                return None;
+            }
             if !matches!(
                 lhs.type_of(descs),
                 Some(
@@ -113289,7 +113531,7 @@ fn resolve_expr_term(
                 }
                 _ => p.clone(),
             };
-            match collate_canon_of(&lhs) {
+            match collate_canon_of(&lhs, descs) {
                 // the WRITTEN collation decides the prefix test, and it
                 // reads the CANONICAL form of both sides - a prefix
                 // written under a byte-carrier attachment read in the
@@ -113337,7 +113579,7 @@ fn resolve_expr_term(
                 let _ = (a, b); // the mix is reconciled below, not refused
             }
             let pre = carrier_pattern(&lhs, pre, descs);
-            match collate_canon_of(&lhs) {
+            match collate_canon_of(&lhs, descs) {
                 // the written collation reads the CANONICAL form of both
                 // sides; the prefix's half of that moves per row
                 Some((inner, tt, _)) => Term::ExprStartingExpr(
@@ -113448,8 +113690,8 @@ fn resolve_expr_term(
 }
 
 /// The explicit `COLLATE` an operand carries into a comparison, a
-/// match or a sort: the wrapper itself ([Expr::Collate]), or one under
-/// a function that keeps its operand's text type - the engine's
+/// match, a sort or a fold: the wrapper itself ([Expr::Collate]), or one
+/// under a function that keeps its operand's text type - the engine's
 /// result descriptor for these is the argument's, collation included.
 /// Measured on engine 2182 under -ch UTF8 over a UTF8 U holding 'é':
 /// `UPPER('é' COLLATE UNICODE_CI) = U` counts 1, and so do LOWER,
@@ -113457,20 +113699,32 @@ fn resolve_expr_term(
 /// NULLIF and a COALESCE whose FIRST value carries it (`COALESCE(NULL,
 /// 'É' COLLATE UNICODE_CI) = U` 1, `COALESCE('z', 'É' COLLATE
 /// UNICODE_CI) = U` 0); a CAST (`CAST('É' COLLATE UNICODE_CI AS
-/// VARCHAR(5)) = U` 0) and a concatenation (`'x' || UPPER(...) = 'x'
-/// || U` 0) drop it. Only the wrapper was seen before, and every one
-/// of the function cells counted 0 - a silent wrong answer, since
-/// the literal under it resolves.
-fn explicit_collate_of(e: &Expr) -> Option<u16> {
+/// VARCHAR(5)) = U` 0) drops it. Only the wrapper was seen before, and
+/// every one of the function cells counted 0 - a silent wrong answer,
+/// since the literal under it resolves.
+///
+/// A CONCATENATION takes the WHOLE text type of the operand whose
+/// character set wins ([cs_join], `DataTypeUtilBase::getResultTextType`):
+/// the FIRST, unless it is NONE, or ASCII beside a real set, or the
+/// second is OCTETS (which has no collation). Measured on 2182 over the
+/// TC fixture (U plain UTF8, UC UTF8 UNICODE_CI, N NONE): under -ch UTF8
+/// `U COLLATE UNICODE_CI || 'x' = 'Éx'` counts 2, `UPPER('é' COLLATE
+/// UNICODE_CI) || 'x' = U || 'x'` 2, `U COLLATE UNICODE_CI || U COLLATE
+/// UNICODE_CI_AI = 'EE'` 2 (the first's, not the second's 4), `'x' ||
+/// U COLLATE UNICODE_CI = 'xÉ'` 1 (the UTF8 literal wins); under -ch
+/// NONE that last one counts 2, the NONE literal yielding - and `N ||
+/// UC = 'ÉÉ'` counts 2 under both. Reading only the second operand's
+/// (the first pass) answered 1 for the first three.
+fn explicit_collate_of(e: &Expr, descs: &[Descriptor]) -> Option<u16> {
     match e {
         Expr::Collate(_, tt) => Some(*tt),
         // the SYNTHETIC casts the resolver wraps a conditional in (the
         // CHAR pad, [pad_conditional]) are not the user's CAST
-        Expr::Cast(inner, CastTarget::Text { synthetic: true, .. }, _) => explicit_collate_of(inner),
+        Expr::Cast(inner, CastTarget::Text { synthetic: true, .. }, _) => explicit_collate_of(inner, descs),
         Expr::Func(f, args) => match f {
             // TRIM's source is its LAST argument: the written-out (or
             // filled-in) character to trim comes first
-            SysFn::Trim(_) => args.last().and_then(explicit_collate_of),
+            SysFn::Trim(_) => args.last().and_then(|a| explicit_collate_of(a, descs)),
             SysFn::Upper
             | SysFn::Lower
             | SysFn::UpperCs(_)
@@ -113483,20 +113737,55 @@ fn explicit_collate_of(e: &Expr) -> Option<u16> {
             | SysFn::Replace
             | SysFn::Reverse
             | SysFn::Lpad
-            | SysFn::Rpad => args.first().and_then(explicit_collate_of),
+            | SysFn::Rpad => args.first().and_then(|a| explicit_collate_of(a, descs)),
             _ => None,
         },
+        Expr::Concat(a, b) => {
+            use fire_crab_ods::intl::{CS_ASCII, CS_OCTETS};
+            match (cmp_text_charset(a, descs), cmp_text_charset(b, descs)) {
+                (Some(CS_OCTETS), _) | (_, Some(CS_OCTETS)) => None,
+                (Some(0), _) => explicit_collate_of(b, descs),
+                (Some(CS_ASCII), Some(cb)) if cb != 0 => explicit_collate_of(b, descs),
+                _ => explicit_collate_of(a, descs),
+            }
+        }
         Expr::Coalesce(args) => args
             .iter()
             .find(|a| !matches!(synthetic_inner(a), Expr::Null))
-            .and_then(explicit_collate_of),
-        Expr::Iif(_, a, _) | Expr::NullIf(a, _) => explicit_collate_of(a),
+            .and_then(|a| explicit_collate_of(a, descs)),
+        Expr::Iif(_, a, _) | Expr::NullIf(a, _) => explicit_collate_of(a, descs),
         Expr::Case(arms, els) => arms
             .first()
             .map(|(_, x)| x)
             .or(els.as_deref())
-            .and_then(explicit_collate_of),
+            .and_then(|a| explicit_collate_of(a, descs)),
         _ => None,
+    }
+}
+
+/// Does this operand's explicit collation reach it through a REPLACE whose
+/// search the collation would decide? The engine searches under the
+/// collation - `REPLACE(U COLLATE UNICODE_CI, 'b', 'c') = 'AC'` counts
+/// 'ab' and 'AB' (2, measured on 2182) - where this server's REPLACE
+/// matches bytes and then compares under the collation (1). A
+/// case- or accent-blind collation only; a full-strength one matches
+/// what the bytes match.
+fn replace_under_blind_coll(e: &Expr, descs: &[Descriptor]) -> bool {
+    match e {
+        // over a VALUE read from the row: a constant's search is pinned
+        // by concatcs section 8 (`REPLACE('Éz' COLLATE UNICODE_CI, 'z',
+        // '') = U` 1), and the rows are what the bytes cannot see
+        Expr::Func(SysFn::Replace, args) => args.first().is_some_and(|a| {
+            expr_reads(a, &|_| true)
+                && explicit_collate_of(a, descs)
+                    .and_then(fire_crab_ods::coll::icu_strength_of_ttype)
+                    .is_some_and(|st| st != fire_crab_ods::coll::Strength::Tertiary)
+        }) || args.first().is_some_and(|a| replace_under_blind_coll(a, descs)),
+        Expr::Cast(inner, CastTarget::Text { synthetic: true, .. }, _) => replace_under_blind_coll(inner, descs),
+        Expr::Func(SysFn::Trim(_), args) => args.last().is_some_and(|a| replace_under_blind_coll(a, descs)),
+        Expr::Func(_, args) => args.first().is_some_and(|a| replace_under_blind_coll(a, descs)),
+        Expr::Concat(a, b) => replace_under_blind_coll(a, descs) || replace_under_blind_coll(b, descs),
+        _ => false,
     }
 }
 
@@ -113843,23 +114132,66 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             // VARCHAR(5) CHARACTER SET UTF8) COLLATE UNICODE_CI` over a
             // NONE N holding C3 A9 counts 1; the byte-space branch
             // compared octets for both and counted 0.
-            let coll_cs = explicit_collate_of(&lhs)
-                .or_else(|| explicit_collate_of(&rhs))
+            // ...AND SO DOES A BARE COLUMN'S OWN collation: under -ch UTF8
+            // `UC = CAST(x'C389' AS VARCHAR(2) CHARACTER SET NONE)` over a
+            // UTF8 UNICODE_CI UC counts 2 (the 'é' and 'É' rows), where the
+            // octet compare took the one spelling (measured)
+            let col_coll = |e: &Expr| match e {
+                Expr::Col(f) => descs
+                    .get(*f)
+                    .filter(|d| matches!(col_kind(d), Some(ColKind::Text)) && d.sub_type >= 0)
+                    .map(|d| d.sub_type as u16)
+                    .filter(|tt| fire_crab_ods::coll::icu_strength_of_ttype(*tt).is_some()),
+                // an expression over such a column carries it into its
+                // result ([expr_key_coll]): `UPPER(UC) = N` counts 7
+                // (measured), the octet compare 3
+                _ if expr_reads_icu(e, descs) => expr_text_ttype(e, descs)
+                    .filter(|tt| fire_crab_ods::coll::icu_strength_of_ttype(*tt).is_some()),
+                _ => None,
+            };
+            let coll_cs = explicit_collate_of(&lhs, descs)
+                .or_else(|| explicit_collate_of(&rhs, descs))
+                .or_else(|| col_coll(&lhs))
+                .or_else(|| col_coll(&rhs))
                 .map(|tt| fire_crab_ods::intl::charset_id(tt as i16))
                 .filter(|cs| !fire_crab_ods::intl::byte_carrier(*cs));
             let (lhs, rhs) = match (coll_cs, cmp_text_charset(&lhs, descs), cmp_text_charset(&rhs, descs)) {
                 // ...an OCTETS side stays binary (measured under -ch UTF8:
                 // `O = CAST('É' AS VARCHAR(5) CHARACTER SET UTF8) COLLATE
                 // UNICODE_CI` over an OCTETS C3 A9 counts 0)
+                // ...by the OCTETS of each side: a real-set side is
+                // re-spelled as its OWN bytes ([Expr::CarrierEnc]), as the
+                // byte-space branch below does. Keyed without it, a UTF8
+                // 'é' became the one octet E9 and every non-ASCII row
+                // dropped out: `UPPER(U COLLATE UNICODE_CI) = O` counts
+                // 3 on the engine (rows É, E, AB - `C3 89` is `C3 89`),
+                // `U COLLATE UNICODE_CI = O` 7, `LOWER(...) = O` 4, and
+                // this counted 2, 4 and 2 (measured under UTF8, NONE and
+                // WIN1252 callers)
                 (Some(_), Some(ca), Some(cb))
                     if ca == fire_crab_ods::intl::CS_OCTETS || cb == fire_crab_ods::intl::CS_OCTETS =>
                 {
+                    let own_bytes = |e: Expr, cs: u8| {
+                        if fire_crab_ods::intl::byte_carrier(cs) {
+                            e
+                        } else {
+                            Expr::CarrierEnc(Box::new(e), cs)
+                        }
+                    };
                     return Some((
-                        Expr::OctKey(Box::new(lhs), false),
-                        Expr::OctKey(Box::new(rhs), false),
+                        Expr::OctKey(Box::new(own_bytes(lhs, ca)), false),
+                        Expr::OctKey(Box::new(own_bytes(rhs, cb)), false),
                     ));
                 }
-                (Some(cc), Some(ca), Some(cb)) => {
+                // ...a literal the adoption above already READ in the
+                // collated side's set is in it, and is not moved twice:
+                // lifted again, the NONE 'É' (C3 89, adopted as the one
+                // char É) was decoded as the octet C9 and raised 22000
+                // *Malformed string* under -ch NONE for `U COLLATE
+                // UNICODE_CI = 'É'`, `IN ('É', 'x')`, `BETWEEN`, `<>`,
+                // `>` and `UPPER(U) COLLATE UNICODE_CI = 'é'`, where the
+                // engine counts 2, 2, 2, 5, 1 and 2 (measured)
+                (Some(cc), Some(ca), Some(cb)) if !adopted => {
                     let lift = |e: Expr, cs: u8| {
                         if fire_crab_ods::intl::byte_carrier(cs) {
                             Expr::CarrierDec(Box::new(e), cs, cc)
@@ -113925,7 +114257,7 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             // ...and it is READ THROUGH the functions that keep it
             // ([explicit_collate_of]): `UPPER('é' COLLATE UNICODE_CI) =
             // U` counts the 'é' row, as the engine does.
-            let explicit = explicit_collate_of;
+            let explicit = |e: &Expr| explicit_collate_of(e, descs);
             let unwrap = |e: Expr| match e {
                 Expr::Collate(inner, _) => *inner,
                 other => other,
@@ -113935,6 +114267,11 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
                 // picks one by a precedence this server has not
                 // measured - refuse rather than guess
                 (Some(a), Some(b)) if a != b => return None,
+                (Some(_), _) | (_, Some(_))
+                    if replace_under_blind_coll(&lhs, descs) || replace_under_blind_coll(&rhs, descs) =>
+                {
+                    return None
+                }
                 (Some(tt), _) | (_, Some(tt)) => {
                     // a BYTE-ORDERING collation - a charset's own, or
                     // `UCS_BASIC` - says "compare the bytes", which is
@@ -118283,7 +118620,7 @@ fn after_auth(
                         outs: out_names
                             .iter()
                             .zip(out_descs.iter())
-                            .map(|(n, d)| ProcParam { name: n.clone(), desc: *d, default: None, default_ctx: None, default_cs: None })
+                            .map(|(n, d)| ProcParam { name: n.clone(), desc: *d, collated: false, default: None, default_ctx: None, default_cs: None })
                             .collect(),
                         source,
                         body_at: Some(body_at),
