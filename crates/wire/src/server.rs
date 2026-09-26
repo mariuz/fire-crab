@@ -10473,6 +10473,9 @@ AlterDomainRename {
         windows: Vec<WinSpec>,
         win_base: usize,
         order_by: Vec<OrderKey>,
+        /// the sort records a windowed rewrite hands this level
+        /// ([WinTie]); None everywhere else
+        tie: Option<Box<WinTie>>,
     },
     /// A LATERAL derived table - `FROM <base> a, LATERAL (<subquery>) x`
     /// (or `LEFT JOIN LATERAL (...) x ON TRUE`). The subquery is
@@ -11567,6 +11570,12 @@ struct Frame {
     /// a negative literal offset was written on either bound: the
     /// engine's execute-time refusal ([EvalErr::WindowFrameNegative])
     negative: bool,
+    /// an offset past INTEGER was written on either bound: the engine
+    /// reads the offset as an INTEGER at EXECUTE and raises 22003
+    /// *numeric value is out of range* (measured on 2182: `ROWS BETWEEN
+    /// 2147483648 PRECEDING AND CURRENT ROW` raises, over `WHERE 1 = 0`
+    /// too; 2147483647 answers)
+    too_big: bool,
 }
 
 /// The function a window column computes. An [AggFn] fold over a partition
@@ -45163,7 +45172,10 @@ fn rewrite_named_windows(sql: &str) -> Option<String> {
 /// ([lift_column_tokens]). The describe survives the levels: a derived
 /// table's column keeps the base field name, relation and nullability
 /// ([plan_over_source]), and [inherit_rel_alias] restores the relation
-/// ALIAS the two wrappers would otherwise overwrite.
+/// ALIAS the two wrappers would otherwise overwrite. The sort records
+/// the ORIGINAL statement's streams hold - which the levels' own
+/// references do not spell - travel beside the text ([WinTieNames],
+/// attached to the planned levels by [attach_win_tie]).
 ///
 /// None when the statement is not a windowed one, when it is the PLAIN
 /// shape the projection path folds directly (one base relation, no
@@ -45172,7 +45184,7 @@ fn rewrite_named_windows(sql: &str) -> Option<String> {
 /// `*`, a `?`, a FILTER on a window, a union); the caller then plans
 /// the original text, which refuses those as before. A level the
 /// planner declines is a clean refusal too: nothing here answers.
-fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<String> {
+fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<(String, WinTieNames)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
@@ -45251,6 +45263,10 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<String> {
         out_name: Option<String>,
     }
     let mut l3_items: Vec<L3Item> = Vec::new();
+    // where each L2 window first appears in the statement's text (a
+    // select-list item's index, or past the list for an ORDER BY key):
+    // the order the engine's window streams are listed in ([WinTie])
+    let mut win_pos: Vec<usize> = Vec::new();
     let quote = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
     let alias_canon = |a: &str| -> String {
         let t = a.trim();
@@ -45260,7 +45276,7 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<String> {
             t.to_ascii_uppercase()
         }
     };
-    for it in &items_raw {
+    for (pos, it) in items_raw.iter().enumerate() {
         let it = it.trim();
         if it.is_empty() {
             return None;
@@ -45286,6 +45302,7 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<String> {
         // the window calls in this item, each rewritten over lifted
         // expressions and folded at L2 under its own name
         let (text, calls, whole) = lift.rewrite_calls(body, &mut l2_wins)?;
+        win_pos.resize(l2_wins.len(), pos);
         if whole {
             // a bare window item: named by its function unless aliased
             let (_, _, fname) = &calls[0];
@@ -45304,10 +45321,13 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<String> {
     // the statement's ORDER BY: an ordinal or an output name stays; a
     // windowed key folds at L2; anything else is L1's to compute
     let mut l3_order: Vec<String> = Vec::new();
+    // the ORDER BY keys L1 computes (neither an ordinal, an output name
+    // nor a window): the fields only the ORDER BY reads
+    let mut order_plain_keys: Vec<String> = Vec::new();
     if let Some(os) = order_s {
         // the output names, for the "names an output column" test
         let out_names: Vec<Option<String>> = l3_items.iter().map(|i| i.out_name.clone()).collect();
-        for key in split_top_level_commas(os) {
+        for (ki, key) in split_top_level_commas(os).into_iter().enumerate() {
             let key = key.trim();
             let (core_k, dir) = split_order_direction(key);
             let core_k = core_k.trim();
@@ -45327,11 +45347,13 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<String> {
             }
             if has_over(core_k) {
                 let (text, _, whole) = lift.rewrite_calls(core_k, &mut l2_wins)?;
+                win_pos.resize(l2_wins.len(), items_raw.len() + ki);
                 let text = if whole { text } else { lift.lift_column_tokens(&text) };
                 l3_order.push(format!("{}{}", text, dir));
                 continue;
             }
             let name = lift.name_for(core_k, "FC$O");
+            order_plain_keys.push(core_k.to_string());
             l3_order.push(format!("{}{}", quote(&name), dir));
         }
     }
@@ -45400,6 +45422,16 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<String> {
         }
     };
     let group_s = group_s.as_deref();
+    let tie = win_tie_names(
+        &mut lift,
+        &items_raw,
+        &l2_wins,
+        &win_pos,
+        &order_plain_keys,
+        (table_s, where_s, order_s),
+        group_s.is_some() || having_s.is_some() || has_agg,
+        db,
+    );
     // L1 - the query without its windows
     let mut l1 = String::from("SELECT ");
     let mut first = true;
@@ -45481,7 +45513,11 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<String> {
     for k in 0..l1_items.len() {
         parts.push(quote(&format!("FC$I{}", k + 1)));
     }
-    for (_, name) in lift.exprs.iter().filter(|(_, n)| n.starts_with("FC$O") || n.starts_with("FC$C")) {
+    for (_, name) in lift
+        .exprs
+        .iter()
+        .filter(|(_, n)| n.starts_with("FC$O") || n.starts_with("FC$C") || n.starts_with("FC$R"))
+    {
         parts.push(quote(name));
     }
     for (call, name) in &l2_wins {
@@ -45523,7 +45559,310 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<String> {
         l3.push_str(" ORDER BY ");
         l3.push_str(&l3_order.join(", "));
     }
-    Some(l3)
+    Some((l3, tie))
+}
+
+/// [WinTie] by NAME, as [rewrite_windowed_select] knows it: the columns
+/// of the level each list is read over ([attach_win_tie] resolves them
+/// once the levels are planned).
+#[derive(Default)]
+struct WinTieNames {
+    /// L3's ORDER BY record over L2's columns; None a NULL slot
+    outer: Vec<Option<String>>,
+    /// L2's window-sort map and base over L1's columns
+    map: Option<Vec<String>>,
+    base: Option<Vec<String>>,
+    /// (lifted L1 column, base-field L1 column) pairs naming one column
+    same: Vec<(String, String)>,
+}
+
+/// The records of [WinTie] for a rewritten statement, by name, lifting
+/// into L1 whatever they read that it lacks.
+///
+/// OVER A GROUP (a GROUP BY, a HAVING or an aggregate) the engine's
+/// base stream is the aggregate's, whose fields are L1's own columns: a
+/// bare column or aggregate item is its `FC$I`, an expression item its
+/// column references and aggregate calls ([WinLift::lift_column_tokens]),
+/// and the window sorts keep [window_record]'s base. OVER RELATIONS the
+/// base record is every column of every FROM relation the statement
+/// names anywhere - the select list, an ON, the WHERE, a window's keys
+/// and arguments, the ORDER BY - in relation then field order, each
+/// lifted as an `FC$R` column (L1 lifts `11 - ID` whole and carries no
+/// column an ON alone reads): measured on 2182, `SELECT W.ID, ROW_NUMBER()
+/// OVER (ORDER BY G.NAME) FROM W LEFT JOIN G ON G.GRP = W.GRP` numbers
+/// the two NULL names 6 -> 1, 5 -> 2, W.GRP's and G.GRP's NULL flags
+/// ruling. A relation this cannot list (a derived table, a CTE, no
+/// database) leaves those records to the levels' own references.
+///
+/// The outer record lists the streams in first-appearance order: the
+/// map's fields (as above, then the fields only a non-window ORDER BY
+/// key reads), and each OVER clause's windows, a PARTITION BY clause's
+/// led by one NULL slot per key ([outer_window_tie]).
+#[allow(clippy::too_many_arguments)]
+fn win_tie_names(
+    lift: &mut WinLift,
+    items_raw: &[&str],
+    l2_wins: &[(String, String)],
+    win_pos: &[usize],
+    order_plain_keys: &[String],
+    (table_s, where_s, order_s): (&str, Option<&str>, Option<&str>),
+    grouped: bool,
+    db: &Option<Database>,
+) -> WinTieNames {
+    let has_over = |t: &str| find_word(&mask_literals(&t.to_ascii_uppercase()), "OVER", 0).is_some();
+    // the column tokens of a text, in reading order
+    let tokens = |text: &str| -> Vec<String> {
+        let mut sc = WinLift::default();
+        sc.lift_column_tokens(text);
+        sc.exprs.into_iter().map(|(t, _)| t).collect()
+    };
+    let bare_col = |body: &str| canon_ident(body).is_some() || is_qualified_col(body);
+    let mut t = WinTieNames::default();
+    let mut map: Vec<String> = Vec::new();
+    let mut map_at = usize::MAX;
+    let mut plain_k = 0usize;
+    if grouped {
+        for (pos, it) in items_raw.iter().enumerate() {
+            let (body, _) = split_alias(it.trim());
+            let body = body.trim();
+            if has_over(body) {
+                continue;
+            }
+            plain_k += 1;
+            let names: Vec<String> = if bare_col(body) || parse_agg_item(body).is_some() {
+                vec![format!("FC$I{}", plain_k)]
+            } else {
+                let text = lift.lift_column_tokens(body);
+                text.split('"').filter(|p| p.starts_with("FC$C")).map(str::to_string).collect()
+            };
+            if !names.is_empty() && map_at == usize::MAX {
+                map_at = pos;
+            }
+            for n in names {
+                if !map.contains(&n) {
+                    map.push(n);
+                }
+            }
+        }
+    } else {
+        // the FROM relations, each with its binding key and columns
+        let rels: Option<Vec<(String, std::sync::Arc<Vec<fire_crab_ods::RelationColumn>>)>> =
+            db.as_ref().and_then(|db| {
+                let (base, steps) = parse_from(table_s)?;
+                let mut v = Vec::new();
+                for r in std::iter::once(&base).chain(steps.iter().map(|(_, r, _, _)| r)) {
+                    if r.table.trim_start().starts_with('(') {
+                        return None;
+                    }
+                    let cols = db.columns(&r.table);
+                    if cols.is_empty() {
+                        return None;
+                    }
+                    v.push((r.key().to_string(), cols));
+                }
+                Some(v)
+            });
+        let Some(rels) = rels else { return t };
+        let ons: Vec<String> = parse_from(table_s)
+            .map(|(_, steps)| steps.iter().map(|(_, _, on, _)| on.to_string()).collect())
+            .unwrap_or_default();
+        // a token's (relation, field id, column name): a qualified one by
+        // its qualifier, a bare one when exactly one relation has it
+        let resolve = |tok: &str| -> Option<(usize, u16, String)> {
+            let parts: Vec<String> = split_ident_chain(tok)?.iter().map(|p| canon_ident(p)).collect::<Option<_>>()?;
+            let (q, c) = match parts.as_slice() {
+                [c] => (None, c.clone()),
+                [q, c] => (Some(q.clone()), c.clone()),
+                [_, q, c] => (Some(q.clone()), c.clone()),
+                _ => return None,
+            };
+            let mut hit = None;
+            for (ri, (key, cols)) in rels.iter().enumerate() {
+                if q.as_ref().is_some_and(|q| q != key) {
+                    continue;
+                }
+                if let Some(col) = cols.iter().find(|rc| rc.name == c) {
+                    if hit.is_some() {
+                        return None;
+                    }
+                    hit = Some((ri, col.field_id, col.name.clone()));
+                }
+            }
+            hit
+        };
+        let joined = items_raw.join(", ");
+        let mut texts: Vec<&str> = vec![&joined];
+        texts.extend(ons.iter().map(String::as_str));
+        texts.extend(where_s);
+        texts.extend(order_s);
+        let mut refd: Vec<(usize, u16, String)> = Vec::new();
+        for text in texts {
+            for tok in tokens(text) {
+                if let Some(r) = resolve(&tok) {
+                    if !refd.iter().any(|x| x.0 == r.0 && x.1 == r.1) {
+                        refd.push(r);
+                    }
+                }
+            }
+        }
+        refd.sort_by_key(|r| (r.0, r.1));
+        let quote = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+        for (k, r) in refd.iter().enumerate() {
+            let text = format!("{}.{}", quote(&rels[r.0].0), quote(&r.2));
+            lift.exprs.push((text, format!("FC$R{}", k + 1)));
+        }
+        let r_of = |tok: &str| {
+            let r = resolve(tok)?;
+            refd.iter().position(|x| x.0 == r.0 && x.1 == r.1).map(|k| format!("FC$R{}", k + 1))
+        };
+        // the lifted columns that ARE one of those fields
+        for (e, n) in lift.exprs.iter().filter(|(_, n)| !n.starts_with("FC$R")) {
+            if let Some(r) = r_of(e) {
+                t.same.push((n.clone(), r));
+            }
+        }
+        for (pos, it) in items_raw.iter().enumerate() {
+            let (body, _) = split_alias(it.trim());
+            let body = body.trim();
+            if has_over(body) {
+                continue;
+            }
+            plain_k += 1;
+            if bare_col(body) {
+                if let Some(r) = r_of(body) {
+                    t.same.push((format!("FC$I{}", plain_k), r));
+                }
+            }
+            for tok in tokens(body) {
+                if let Some(r) = r_of(&tok) {
+                    if map_at == usize::MAX {
+                        map_at = pos;
+                    }
+                    if !map.contains(&r) {
+                        map.push(r);
+                    }
+                }
+            }
+        }
+        for k in order_plain_keys {
+            for tok in tokens(k) {
+                if let Some(r) = r_of(&tok) {
+                    if map_at == usize::MAX {
+                        map_at = items_raw.len();
+                    }
+                    if !map.contains(&r) {
+                        map.push(r);
+                    }
+                }
+            }
+        }
+        t.base = Some(lift.exprs.iter().filter(|(_, n)| n.starts_with("FC$R")).map(|(_, n)| n.clone()).collect());
+    }
+    // the outer record: the streams in first-appearance order
+    let mut streams: Vec<(usize, Vec<Option<String>>)> = Vec::new();
+    if !map.is_empty() {
+        streams.push((map_at, map.iter().cloned().map(Some).collect()));
+    }
+    let over_of = |call: &str| call.find(" OVER (").map(|p| call[p..].to_string()).unwrap_or_default();
+    let mut seen = vec![false; l2_wins.len()];
+    for i in 0..l2_wins.len() {
+        if seen[i] {
+            continue;
+        }
+        let o = over_of(&l2_wins[i].0);
+        let members: Vec<usize> = (i..l2_wins.len()).filter(|&j| !seen[j] && over_of(&l2_wins[j].0) == o).collect();
+        members.iter().for_each(|&j| seen[j] = true);
+        let pos_of = |j: usize| win_pos.get(j).copied().unwrap_or(usize::MAX);
+        // the clause's PARTITION BY keys, each a quoted lifted name
+        let mut nkeys = 0usize;
+        if let Some(mut rest) = o.strip_prefix(" OVER (PARTITION BY ") {
+            while rest.starts_with('"') {
+                nkeys += 1;
+                match rest[1..].find('"') {
+                    Some(e) => rest = &rest[e + 2..],
+                    None => break,
+                }
+                match rest.strip_prefix(", ") {
+                    Some(r) => rest = r,
+                    None => break,
+                }
+            }
+        }
+        let mut fields: Vec<Option<String>> = vec![None; nkeys];
+        let mut ms = members.clone();
+        ms.sort_by_key(|&j| pos_of(j));
+        fields.extend(ms.iter().map(|&j| Some(l2_wins[j].1.clone())));
+        streams.push((members.iter().map(|&j| pos_of(j)).min().unwrap_or(usize::MAX), fields));
+    }
+    streams.sort_by_key(|(at, _)| *at);
+    t.outer = streams.into_iter().flat_map(|(_, f)| f).collect();
+    t.map = Some(map);
+    t
+}
+
+/// An identifier chain's parts as written - `a`, `"a"`, `a.b`,
+/// `a."b.c"` - split at the dots outside quotes; None for an empty part.
+fn split_ident_chain(tok: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let (mut start, mut quoted) = (0usize, false);
+    for (i, c) in tok.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '.' if !quoted => {
+                parts.push(&tok[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&tok[start..]);
+    parts.iter().all(|p| !p.trim().is_empty()).then_some(parts)
+}
+
+/// Hand a planned rewrite its levels' records ([WinTieNames] resolved to
+/// slots): L3 - the top Derived, under a modifier or not - takes the
+/// outer record less the fields its plain keys restore, L2 below it the
+/// window sorts' map and base. A name that does not resolve leaves that
+/// level to its own references.
+fn attach_win_tie(plan: &mut Plan, names: &WinTieNames) {
+    let l3 = match plan {
+        Plan::Modified { inner, .. } => &mut **inner,
+        p => p,
+    };
+    let Plan::Derived { inner: l2, order_by, tie, .. } = l3 else { return };
+    let resolve_in = |p: &Plan, ns: &[String]| -> Option<Vec<usize>> {
+        let cols = output_cols_of(p);
+        ns.iter().map(|n| cols.iter().position(|c| c.name == *n)).collect()
+    };
+    let l2_cols = output_cols_of(l2);
+    let slot = |n: &str| l2_cols.iter().position(|c| c.name == n);
+    let outer: Option<Vec<Option<usize>>> =
+        names.outer.iter().map(|o| o.as_ref().map_or(Some(None), |n| slot(n).map(Some))).collect();
+    if let Some(outer) = outer.filter(|o| !o.is_empty()) {
+        let descs: Vec<Option<Descriptor>> = l2_cols.iter().map(|c| Some(desc_of_projcol(c))).collect();
+        let same: Vec<(usize, usize)> =
+            names.same.iter().filter_map(|(a, b)| Some((slot(a)?, slot(b)?))).collect();
+        let keyed = |f: usize| {
+            order_by.iter().any(|k| {
+                k.expr.is_none() && (k.field == f || same.iter().any(|&(a, b)| (a == k.field && b == f) || (b == k.field && a == f)))
+            })
+        };
+        let outer = outer
+            .into_iter()
+            .filter(|o| !o.is_some_and(|f| keyed(f) && descs.get(f).copied().flatten().is_none_or(|d| sort_key_restored(&d))))
+            .collect();
+        *tie = Some(Box::new(WinTie { outer, ..WinTie::default() }));
+    }
+    if let Plan::Derived { inner: l1, tie: t2, .. } = &mut **l2 {
+        let map = names.map.as_ref().and_then(|m| resolve_in(l1, m));
+        let base = names.base.as_ref().and_then(|b| resolve_in(l1, b));
+        let l1_cols = output_cols_of(l1);
+        let at = |n: &str| l1_cols.iter().position(|c| c.name == n);
+        let key_alias = names.same.iter().filter_map(|(a, b)| Some((at(a)?, at(b)?))).collect();
+        if map.is_some() || base.is_some() {
+            *t2 = Some(Box::new(WinTie { outer: Vec::new(), map, base, key_alias }));
+        }
+    }
 }
 
 thread_local! {
@@ -49360,6 +49699,7 @@ fn plan_over_source(
         windows,
         win_base,
         order_by,
+        tie: None,
     })
 }
 
@@ -53883,7 +54223,7 @@ fn materialise_laterals(
                 .collect();
             Some(Plan::Rows { cols, rows })
         }
-        Plan::Derived { inner, cols, filter, windows, win_base, order_by } => {
+        Plan::Derived { inner, cols, filter, windows, win_base, order_by, tie } => {
             let inner = materialise_laterals(inner, db, args)?;
             Some(Plan::Derived {
                 inner: Box::new(inner),
@@ -53892,6 +54232,7 @@ fn materialise_laterals(
                 windows: windows.clone(),
                 win_base: *win_base,
                 order_by: order_by.clone(),
+                tie: tie.clone(),
             })
         }
         Plan::Modified { inner, cols, distinct, skip, take } => {
@@ -54302,7 +54643,7 @@ fn branch_rows_res(
             .map(|values| cols.iter().map(|c| c.value_of(values)).collect())
             .collect();
     }
-    if let Plan::Derived { inner, cols, filter, windows, win_base, order_by } = plan {
+    if let Plan::Derived { inner, cols, filter, windows, win_base, order_by, tie } = plan {
         let rows = branch_rows_res(inner, db, args)?;
         let filtered = RowSource::Filter {
             input: Box::new(RowSource::Rows(rows)),
@@ -54310,15 +54651,22 @@ fn branch_rows_res(
         }
         .rows(db)?;
         // a window folds over the FILTERED rows and is appended to each
-        // before the sort, exactly as the Project path orders it
-        let rows = if windows.is_empty() {
-            filtered
-        } else {
+        // before the sort, exactly as the Project path orders it; a
+        // rewrite's top level sorts its ties by the record it was handed
+        let inner_descs: Vec<Option<Descriptor>> =
+            output_cols_of(inner).iter().map(|c| Some(desc_of_projcol(c))).collect();
+        let out = if !windows.is_empty() {
             let rec = window_record(cols, filter.as_ref(), windows, order_by, *win_base);
-            compute_windows(filtered, windows, *win_base, &rec)?
+            let descs = window_slot_descs(inner_descs, cols, windows.len(), *win_base);
+            fold_windows_ordered(filtered, windows, *win_base, rec, descs, order_by, tie.as_deref())?
+        } else if let Some(t) = tie.as_deref().filter(|t| !t.outer.is_empty() && !order_by.is_empty()) {
+            let mut rows = filtered;
+            let outer = outer_tie_less_keys(t.outer.clone(), order_by, &inner_descs);
+            sort_rows_tied(&mut rows, order_by, &outer, &inner_descs)?;
+            rows
+        } else {
+            RowSource::Sort { input: Box::new(RowSource::Rows(filtered)), keys: order_by.clone() }.rows(db)?
         };
-        let out = RowSource::Sort { input: Box::new(RowSource::Rows(rows)), keys: order_by.clone() }
-            .rows(db)?;
         return out
             .iter()
             // a column's own evaluation error travels too - this used
@@ -56348,7 +56696,7 @@ fn plan_query_inner_at(
     // levels the engine composes ([rewrite_windowed_select]); the plain
     // single-relation shape passes through to the projection path. A
     // level that declines leaves the original text to refuse as before.
-    if let Some(rw) = rewrite_windowed_select(sql, db) {
+    if let Some((rw, tie)) = rewrite_windowed_select(sql, db) {
         if trace {
             eprintln!("[srv] plan: windowed rewrite {:?}", rw);
         }
@@ -56359,7 +56707,8 @@ fn plan_query_inner_at(
         WIN_REWRITE_DEPTH.with(|d| d.set(depth));
         match planned {
             Some(Plan::Refused) | None => {}
-            Some(p) => {
+            Some(mut p) => {
+                attach_win_tie(&mut p, &tie);
                 params.clear();
                 params.extend(ps);
                 return Some(inherit_rel_alias(p));
@@ -64727,8 +65076,10 @@ fn sort_key_restored(d: &Descriptor) -> bool {
 ///     appearance; then the base record's referenced fields
 ///     ([WinRecord::base]) less the keys this sort restores from their
 ///     key slot ([WinSpec::restored_keys]) - the streams the sort names,
-///     outermost first, compared as [group_tie_cmp] compares a group's
-///     (NULL flags, then values word by word);
+///     outermost first, compared as the engine's record image
+///     ([sort_record_image]: NULL flag bytes, then aligned values, as
+///     little-endian words; [group_tie_cmp]'s per-value reading where a
+///     descriptor is unknown);
 ///   - then the row's position in the sort before it (the outermost
 ///     stream's record number): scan order for the first.
 /// Measured on 2182 (`serve-real-collkey` section 9): `SELECT Y, X,
@@ -64778,6 +65129,9 @@ fn compute_windows(
         };
         if frame.is_some_and(|f| f.negative) {
             return Err(EvalErr::WindowFrameNegative);
+        }
+        if frame.is_some_and(|f| f.too_big) {
+            return Err(EvalErr::NumericOutOfRange);
         }
     }
     // per-row value of each window, filled partition by partition
@@ -64887,6 +65241,13 @@ fn compute_windows(
             (0..n).collect()
         } else {
             let at = |r: &[Value], f: usize| r.get(f).cloned().unwrap_or(Value::Null);
+            // a base field this sort restores from its key slot rides in
+            // no record - nor does the base field a rewrite's lifted key
+            // names ([WinTie::key_alias])
+            let restored = |f: usize| {
+                spec.restored_keys.contains(&f)
+                    || rec.key_alias.iter().any(|(k, b)| *b == f && spec.restored_keys.contains(k))
+            };
             let trec: Vec<Vec<Value>> = (0..n)
                 .map(|i| {
                     let mut t: Vec<Value> = Vec::new();
@@ -64896,16 +65257,30 @@ fn compute_windows(
                             Stream::Map => t.extend(rec.map.iter().map(|&f| at(&rows[i], f))),
                         }
                     }
-                    t.extend(
-                        rec.base
-                            .iter()
-                            .filter(|f| !spec.restored_keys.contains(f))
-                            .map(|&f| at(&rows[i], f)),
-                    );
+                    t.extend(rec.base.iter().filter(|&&f| !restored(f)).map(|&f| at(&rows[i], f)));
                     t
                 })
                 .collect();
             let tfields: Vec<usize> = (0..trec.first().map_or(0, |t| t.len())).collect();
+            // the record's byte image ([sort_record_image]) where every
+            // field's descriptor is known - the engine's word compare;
+            // otherwise the per-value approximation [group_tie_cmp]
+            let tdescs: Option<Vec<Descriptor>> = {
+                let d = |f: usize| rec.descs.get(f).copied().flatten();
+                let mut v: Vec<Option<Descriptor>> = Vec::new();
+                for st in &chain {
+                    match st {
+                        Stream::Wins(ws) => v.extend(ws.iter().map(|&w| d(win_base + w))),
+                        Stream::Map => v.extend(rec.map.iter().map(|&f| d(f))),
+                    }
+                }
+                v.extend(rec.base.iter().filter(|&&f| !restored(f)).map(|&f| d(f)));
+                v.into_iter().collect()
+            };
+            // all rows or none: the two compares never mix in one sort
+            let images: Option<Vec<Vec<u32>>> = tdescs.as_ref().and_then(|td| {
+                trec.iter().map(|t| sort_record_image(&t.iter().collect::<Vec<_>>(), td)).collect()
+            });
             let mut perm: Vec<usize> = (0..n).collect();
             perm.sort_by(|&a, &b| {
                 order_cmp(&keyrows[a], &keyrows[b], &pkeys_sort)
@@ -64916,7 +65291,10 @@ fn compute_windows(
                             order_cmp(&ordrows[a], &ordrows[b], &okeys)
                         }
                     })
-                    .then_with(|| group_tie_cmp(&trec[a], &trec[b], &[], &tfields))
+                    .then_with(|| match &images {
+                        Some(im) => im[a].cmp(&im[b]),
+                        None => group_tie_cmp(&trec[a], &trec[b], &[], &tfields),
+                    })
                     .then_with(|| prev_pos[a].cmp(&prev_pos[b]))
             });
             perm
@@ -65388,6 +65766,155 @@ fn compute_windows(
     Ok(out)
 }
 
+/// THE SORT RECORD PAST ITS KEYS, AS THE ENGINE LAYS IT OUT AND COMPARES
+/// IT - the tie law of every sort a window takes part in.
+///
+/// `Optimizer::generateSort` puts one NULL-flag BYTE per record field
+/// right after the keys (a 4-aligned offset), then each field's value at
+/// its descriptor's length, aligned to `type_alignments` for a dtype
+/// past dtype_text (VARCHAR 2, INTEGER/DATE/TIME/TIMESTAMP 4, BIGINT /
+/// DOUBLE / INT128 / DECFLOAT 8); `SortedStream::open` zeroes the record
+/// first, so a NULL field's value bytes are zero, a VARCHAR's tail past
+/// its length is zero and a CHAR is padded with its blank; and
+/// `sort.cpp`'s quick() and its fix-up pass compare the WHOLE record as
+/// native ULONG words. On this little-endian host a word's LAST byte is
+/// its most significant, so the flags of a word's later fields outrank
+/// its earlier ones, and a VARCHAR whose length half-word shares the
+/// flags' word outranks them all. Measured on 2182 over `U (ID, K, K2, S
+/// VARCHAR(10), V, B BIGINT)`: `SELECT S, K2 FROM U ORDER BY RANK() OVER
+/// (ORDER BY K)` puts the K=1 ties (NULL,1), (a,2), (b,2), (b,NULL),
+/// (ab,1) - S's flag and its length share word 0, so the NULL S (length
+/// 0) leads and 'ab' (length 2) trails, and (b,NULL) follows (b,2) by
+/// K2's flag in the same word; `SELECT K2, S, ...` puts a NULL K2 AFTER
+/// every non-NULL row (S starts a word of its own); `SELECT B, ..` over
+/// BIGINTs orders 3, 5, -7, -1 (the low word first, unsigned). The words
+/// start at the flags: the key region is 4-aligned, and an 8-aligned
+/// field only inserts a zero word into both records alike.
+///
+/// Answers the words, or None when a field's descriptor is unknown or
+/// its value is not one this image can spell (the caller then keeps its
+/// per-value comparison). A `None` descriptor slot in `descs` is a NULL
+/// INTEGER-sized placeholder the caller asks for ([SORT_REC_NULL_SLOT]).
+fn sort_record_image(vals: &[&Value], descs: &[Descriptor]) -> Option<Vec<u32>> {
+    use fire_crab_ods::intl;
+    if vals.len() != descs.len() {
+        return None;
+    }
+    let align = |t: u8| -> usize {
+        match t {
+            dtype::VARYING | dtype::SHORT => 2,
+            dtype::DOUBLE | dtype::INT64 | dtype::DEC64 | dtype::DEC128 | dtype::INT128 => 8,
+            dtype::BOOLEAN => 1,
+            t if t >= dtype::VARYING => 4,
+            _ => 1,
+        }
+    };
+    let mut buf: Vec<u8> = vec![0u8; vals.len()];
+    for (i, (v, d)) in vals.iter().zip(descs.iter()).enumerate() {
+        let a = align(d.dtype);
+        let at = buf.len().div_ceil(a) * a;
+        let len = d.length as usize;
+        buf.resize(at + len, 0);
+        if matches!(v, Value::Null) {
+            buf[i] = 1;
+            continue;
+        }
+        let slot = &mut buf[at..at + len];
+        // an exact value's raw integer at the descriptor's own scale
+        let raw = |v: &Value| -> Option<i128> {
+            match v {
+                Value::Int(x) if d.scale == 0 => Some(*x as i128),
+                Value::Scaled(x, s) if *s == d.scale => Some(*x as i128),
+                Value::Int128(x, s) if *s == d.scale => Some(*x),
+                _ => None,
+            }
+        };
+        let put = |slot: &mut [u8], b: &[u8]| -> Option<()> {
+            if b.len() > slot.len() {
+                return None;
+            }
+            slot[..b.len()].copy_from_slice(b);
+            Some(())
+        };
+        match d.dtype {
+            dtype::TEXT | dtype::VARYING => {
+                let Value::Text(s) = v else { return None };
+                let cs = intl::charset_id(d.sub_type);
+                let bytes = match intl::encode_text(cs, s) {
+                    Ok(Some(b)) => b,
+                    _ if intl::byte_carrier(cs) => intl::carrier_encode(s).unwrap_or_else(|| s.as_bytes().to_vec()),
+                    _ => s.as_bytes().to_vec(),
+                };
+                if d.dtype == dtype::VARYING {
+                    if bytes.len() + 2 > len {
+                        return None;
+                    }
+                    slot[..2].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
+                    slot[2..2 + bytes.len()].copy_from_slice(&bytes);
+                } else {
+                    put(slot, &bytes)?;
+                    let pad = intl::pad_byte(cs);
+                    slot[bytes.len()..].iter_mut().for_each(|b| *b = pad);
+                }
+            }
+            dtype::SHORT => put(slot, &i16::try_from(raw(v)?).ok()?.to_le_bytes())?,
+            dtype::LONG => put(slot, &i32::try_from(raw(v)?).ok()?.to_le_bytes())?,
+            dtype::INT64 => put(slot, &i64::try_from(raw(v)?).ok()?.to_le_bytes())?,
+            dtype::INT128 => put(slot, &raw(v)?.to_le_bytes())?,
+            dtype::DOUBLE => match v {
+                Value::Double(x) => put(slot, &x.to_le_bytes())?,
+                Value::Float(x) => put(slot, &(*x as f64).to_le_bytes())?,
+                _ => return None,
+            },
+            dtype::REAL => match v {
+                Value::Float(x) => put(slot, &x.to_le_bytes())?,
+                _ => return None,
+            },
+            dtype::SQL_DATE => match v {
+                Value::Date(x) => put(slot, &x.to_le_bytes())?,
+                _ => return None,
+            },
+            dtype::SQL_TIME => match v {
+                Value::Time(x) => put(slot, &x.to_le_bytes())?,
+                _ => return None,
+            },
+            dtype::TIMESTAMP => match v {
+                Value::Timestamp(dd, tt) => {
+                    put(slot, &dd.to_le_bytes())?;
+                    put(&mut slot[4..], &tt.to_le_bytes())?;
+                }
+                _ => return None,
+            },
+            dtype::BOOLEAN => match v {
+                Value::Bool(x) => put(slot, &[*x as u8])?,
+                _ => return None,
+            },
+            dtype::DEC64 => match v {
+                Value::DecFloat16(x) => put(slot, &x.to_le_bytes())?,
+                _ => return None,
+            },
+            dtype::DEC128 => match v {
+                Value::DecFloat34(x) => put(slot, &x.to_le_bytes())?,
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    buf.resize(buf.len().div_ceil(4) * 4, 0);
+    Some(buf.chunks(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect())
+}
+
+/// The descriptor a sort record gives a field this server cannot name
+/// but the engine's record carries: a PARTITION BY window's stream holds
+/// one per partition key that the outer sort reads as NULL on every row
+/// (measured: `SELECT S, COUNT(*) OVER (PARTITION BY K2) .. ORDER BY K`
+/// puts the NULL S LAST where `SELECT S, COUNT(*) OVER (ORDER BY ID)`
+/// puts it FIRST - a third flag byte moves S's length out of word 0 -
+/// and a NULL K2 does not move its row). Its width is unmeasured; an
+/// INTEGER's keeps every later field's offset within its word.
+const SORT_REC_NULL_SLOT: Descriptor =
+    Descriptor { dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 0 };
+
 /// The engine's grouping-sort compare over two rows of one group run:
 /// the group keys, then the referenced fields' NULL flags, then their
 /// values word by word ([group_rows] explains the record; the value arms
@@ -65470,13 +65997,19 @@ fn group_tie_cmp(a: &[Value], b: &[Value], keys: &[OrderKey], extra: &[usize]) -
 ///     (ORDER BY G) FROM TQ WHERE X > 0` breaks the tie by X);
 ///   - `first_at[w]`: where window `w` first appears in that visit, and
 ///     `map_at` where the first bare field does - the order the engine's
-///     window streams are chained in.
+///     window streams are chained in;
+///   - `descs`: each row slot's descriptor (a field's, then each
+///     window's value at `win_base + w`) - the widths and alignments of
+///     [sort_record_image]; empty or a `None` slot keeps the per-value
+///     compare.
 /// A window value's own slot (at or past `win_base`) is no record field.
 struct WinRecord {
     map: Vec<usize>,
     base: Vec<usize>,
     first_at: Vec<usize>,
     map_at: usize,
+    descs: Vec<Option<Descriptor>>,
+    key_alias: Vec<(usize, usize)>,
 }
 
 fn window_record(
@@ -65492,6 +66025,8 @@ fn window_record(
             base: Vec::new(),
             first_at: vec![usize::MAX; windows.len()],
             map_at: usize::MAX,
+            descs: Vec::new(),
+            key_alias: Vec::new(),
         },
         0usize, // the visit's clock
     ));
@@ -65596,6 +66131,194 @@ fn window_record(
     let (mut rec, _) = st.into_inner();
     rec.base.sort_unstable();
     rec
+}
+
+/// The sort records a windowed rewrite ([rewrite_windowed_select]) hands
+/// its levels, in the level's own row slots: what the engine's records
+/// hold for the ORIGINAL statement, which the levels' own references do
+/// not spell (L1 lifts `11 - ID` whole, where the engine's map posts ID;
+/// L1 carries no column the statement names only in an ON or a WHERE).
+#[derive(Clone, Default)]
+struct WinTie {
+    /// L3: the statement ORDER BY's record past its keys
+    /// ([outer_window_tie]'s law); `None` a NULL placeholder slot
+    /// ([SORT_REC_NULL_SLOT])
+    outer: Vec<Option<usize>>,
+    /// L2: the window sorts' map and base fields ([WinRecord]), each
+    /// overriding what [window_record] reads off the level
+    map: Option<Vec<usize>>,
+    base: Option<Vec<usize>>,
+    /// L2: (key slot, base slot) pairs naming ONE column - a window key
+    /// lifted as its own L1 column beside the base field it reads, so a
+    /// key the sort restores drops that base field too
+    key_alias: Vec<(usize, usize)>,
+}
+
+/// THE STATEMENT ORDER BY ABOVE A WINDOW breaks its ties by the WINDOW
+/// STREAMS' record, not by the order the windows delivered the rows in.
+/// The outer sort's streams are the WindowSourceNode's
+/// (`computeRseStreams`: one per distinct OVER clause, the bare-field
+/// map's among them), in first-appearance order, each contributing its
+/// referenced fields in field order: the map's bare fields as the select
+/// list posts them (an expression's fields as it reads them), a window
+/// stream's values, and - for a PARTITION BY stream - one more slot per
+/// partition key that reads NULL ([SORT_REC_NULL_SLOT]). A plain-field
+/// key rides in its key slot and leaves the record unless its key cannot
+/// be restored ([sort_key_restored]); [sort_record_image] compares what
+/// is left. Measured on 2182 over T (ID, K, S, V): `SELECT ID, ROW_NUMBER()
+/// OVER (ORDER BY ID DESC) FROM T ORDER BY K` ties by ID (6, 9, 1, 3, 5,
+/// 8, 2, 4, 7, 10), `SELECT 11 - ID R, ..` by ID too (R = 5, 2, 10, ..),
+/// `SELECT S, ID, ..` by S then ID, and `SELECT ROW_NUMBER() .. RN, ID`
+/// by RN - the window's stream appears first. This server sorted the
+/// windows' delivery order stably, which is the last window's order.
+fn outer_window_tie(
+    rec: &WinRecord,
+    windows: &[WinSpec],
+    order_by: &[OrderKey],
+    win_base: usize,
+) -> Vec<Option<usize>> {
+    let same_clause = |a: &WinSpec, b: &WinSpec| a.part_raw == b.part_raw && a.order_text == b.order_text;
+    let mut streams: Vec<(usize, Vec<Option<usize>>)> = Vec::new();
+    if !rec.map.is_empty() {
+        streams.push((rec.map_at, rec.map.iter().map(|&f| Some(f)).collect()));
+    }
+    let mut seen = vec![false; windows.len()];
+    for wi in 0..windows.len() {
+        if seen[wi] {
+            continue;
+        }
+        let mut members: Vec<usize> =
+            (wi..windows.len()).filter(|&w| !seen[w] && same_clause(&windows[wi], &windows[w])).collect();
+        members.iter().for_each(|&w| seen[w] = true);
+        let first = |w: usize| rec.first_at.get(w).copied().unwrap_or(usize::MAX);
+        members.sort_by_key(|&w| first(w));
+        let at = members.iter().map(|&w| first(w)).min().unwrap_or(usize::MAX);
+        let mut fields: Vec<Option<usize>> = vec![None; windows[wi].part.len()];
+        fields.extend(members.iter().map(|&w| Some(win_base + w)));
+        streams.push((at, fields));
+    }
+    streams.sort_by_key(|(at, _)| *at);
+    outer_tie_less_keys(streams.into_iter().flat_map(|(_, f)| f).collect(), order_by, &rec.descs)
+}
+
+/// A record field that is also a plain-field sort key leaves the record
+/// (`generateSort` restores it from its key slot) unless its key is one
+/// the sort cannot turn back into the value ([sort_key_restored]).
+fn outer_tie_less_keys(
+    tie: Vec<Option<usize>>,
+    order_by: &[OrderKey],
+    descs: &[Option<Descriptor>],
+) -> Vec<Option<usize>> {
+    let restored = |f: usize| {
+        order_by.iter().any(|k| k.expr.is_none() && k.field == f)
+            && descs.get(f).copied().flatten().is_none_or(|d| sort_key_restored(&d))
+    };
+    let mut out: Vec<Option<usize>> = Vec::new();
+    for t in tie {
+        match t {
+            Some(f) if restored(f) || out.contains(&Some(f)) => {}
+            t => out.push(t),
+        }
+    }
+    out
+}
+
+/// Sort by `keys`, the ties by the record `tie` names ([sort_record_image]
+/// over `descs`), then stably. A record this server cannot spell for
+/// every row - an unknown descriptor, a value the image has no arm for -
+/// keeps the plain stable sort.
+fn sort_rows_tied(
+    rows: &mut Vec<Vec<Value>>,
+    keys: &[OrderKey],
+    tie: &[Option<usize>],
+    descs: &[Option<Descriptor>],
+) -> Result<(), EvalErr> {
+    let td: Option<Vec<Descriptor>> = tie
+        .iter()
+        .map(|t| match t {
+            Some(f) => descs.get(*f).copied().flatten(),
+            None => Some(SORT_REC_NULL_SLOT),
+        })
+        .collect();
+    let Some(td) = td.filter(|v| !v.is_empty()) else {
+        return sort_rows(rows, keys);
+    };
+    let null = Value::Null;
+    let images: Option<Vec<Vec<u32>>> = rows
+        .iter()
+        .map(|r| {
+            let vals: Vec<&Value> = tie.iter().map(|t| t.and_then(|f| r.get(f)).unwrap_or(&null)).collect();
+            sort_record_image(&vals, &td)
+        })
+        .collect();
+    let Some(images) = images else {
+        return sort_rows(rows, keys);
+    };
+    let mut dec: Vec<(Vec<Value>, Vec<u32>, Vec<Value>)> = Vec::with_capacity(rows.len());
+    for (r, img) in rows.drain(..).zip(images) {
+        let mut k = Vec::with_capacity(keys.len());
+        for key in keys {
+            k.push(key.value_of(&r)?);
+        }
+        dec.push((k, img, r));
+    }
+    let flat: Vec<OrderKey> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| OrderKey { field: i, expr: None, ..k.clone() })
+        .collect();
+    dec.sort_by(|a, b| order_cmp(&a.0, &b.0, &flat).then_with(|| a.1.cmp(&b.1)));
+    rows.extend(dec.into_iter().map(|(_, _, r)| r));
+    Ok(())
+}
+
+/// Each row slot's descriptor for [WinRecord::descs]: the fields' own,
+/// then each window's value from its bare output column (a window only
+/// inside an expression has none, and its sorts keep the per-value
+/// compare).
+fn window_slot_descs(
+    mut fields: Vec<Option<Descriptor>>,
+    cols: &[ProjCol],
+    nwin: usize,
+    win_base: usize,
+) -> Vec<Option<Descriptor>> {
+    fields.resize(win_base, None);
+    for w in 0..nwin {
+        fields.push(cols.iter().find(|c| c.field_id == win_base + w && c.expr.is_none()).map(desc_of_projcol));
+    }
+    fields
+}
+
+/// Fold the windows over `rows` and sort the result by the statement's
+/// ORDER BY - the one sequence every windowed executor runs: the record
+/// is [window_record]'s with the slot descriptors and a rewrite's
+/// overrides ([WinTie]) applied, the ORDER BY's ties are the window
+/// streams' record ([outer_window_tie]).
+fn fold_windows_ordered(
+    rows: Vec<Vec<Value>>,
+    windows: &[WinSpec],
+    win_base: usize,
+    mut rec: WinRecord,
+    descs: Vec<Option<Descriptor>>,
+    order_by: &[OrderKey],
+    tie: Option<&WinTie>,
+) -> Result<Vec<Vec<Value>>, EvalErr> {
+    rec.descs = descs;
+    if let Some(t) = tie {
+        if let Some(m) = &t.map {
+            rec.map = m.clone();
+        }
+        if let Some(b) = &t.base {
+            rec.base = b.clone();
+        }
+        rec.key_alias = t.key_alias.clone();
+    }
+    let outer = outer_window_tie(&rec, windows, order_by, win_base);
+    let mut rows = compute_windows(rows, windows, win_base, &rec)?;
+    if !order_by.is_empty() {
+        sort_rows_tied(&mut rows, order_by, &outer, &rec.descs)?;
+    }
+    Ok(rows)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -67352,11 +68075,8 @@ fn fold_project_windows(
         access,
     )
     .rows(db)?;
-    let mut rows = compute_windows(base, windows, win_base, &rec)?;
-    if !order_by.is_empty() {
-        sort_rows(&mut rows, order_by)?;
-    }
-    Ok(rows)
+    let descs = window_slot_descs(descs_now.iter().map(|d| Some(*d)).collect(), cols, windows.len(), win_base);
+    fold_windows_ordered(base, windows, win_base, rec, descs, order_by, None)
 }
 
 /// The [ProjCol] a [Plan::Scalar] projects.
@@ -68359,6 +69079,8 @@ const GDS_DSQL_WINDOW_FRAME_VALUE_INV_TYPE: i32 = 335545119;
 /// offset in window function: cannot be negative" (jrd.h:801), raised
 /// at execute.
 const GDS_WINDOW_FRAME_VALUE_INVALID: i32 = 335545120;
+/// `isc_dsql_window_duplicate` - "Duplicate window definition for @1"
+const GDS_DSQL_WINDOW_DUPLICATE: i32 = 335545125;
 /// `isc_dsql_cte_miss_nonrecursive` - "Non-recursive member is missing
 /// in CTE '@1'". A recursive body that IS a union but whose FIRST
 /// member already names the CTE, so there is no anchor to start from:
@@ -69125,6 +69847,20 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
         }
         EvalErr::WindowFrameNegative => {
             w.int(1).int(GDS_WINDOW_FRAME_VALUE_INVALID);
+        }
+        // "Dynamic SQL Error", "SQL error code = -204", then the
+        // diagnosis naming the window (measured)
+        EvalErr::WindowDuplicate(name) => {
+            w.int(1)
+                .int(GDS_DSQL_ERROR)
+                .int(1)
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-204)
+                .int(1)
+                .int(GDS_DSQL_WINDOW_DUPLICATE)
+                .int(2)
+                .bytes(name.as_bytes());
         }
         EvalErr::CteNotAUnion(name) => {
             w.int(1)
@@ -71582,7 +72318,12 @@ fn emit_rows_inner(
                     // ([fold_project_windows]) - the filter and access
                     // are already bound above, so they are handed in
                     // rather than resolved twice
-                    let mut rows = compute_windows(
+                    let descs_now: Vec<Option<Descriptor>> = formats
+                        .iter()
+                        .max_by_key(|(n, _)| *n)
+                        .map(|(_, d)| d.iter().map(|d| Some(*d)).collect())
+                        .unwrap_or_default();
+                    let rows = fold_windows_ordered(
                         RowSource::scan_filter_sort(
                             *rel,
                             formats.clone(),
@@ -71594,12 +72335,12 @@ fn emit_rows_inner(
                         .map_err(EmitErr::Eval)?,
                         windows,
                         *win_base,
-                        &window_record(cols, filter.as_ref(), windows, order_by, *win_base),
+                        window_record(cols, filter.as_ref(), windows, order_by, *win_base),
+                        window_slot_descs(descs_now, cols, windows.len(), *win_base),
+                        order_by,
+                        None,
                     )
                     .map_err(EmitErr::Eval)?;
-                    if !order_by.is_empty() {
-                        sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
-                    }
                     for values in &rows {
                         encode_row(w, cols, values, out)?;
                     }
@@ -71686,7 +72427,7 @@ fn emit_rows_inner(
                 }
             }
         }
-        Plan::Derived { inner, cols, filter, windows, win_base, order_by } => {
+        Plan::Derived { inner, cols, filter, windows, win_base, order_by, tie } => {
             if let Some(db) = db {
                 // the inner plan's rows are a MATERIALISED LEAF; the
                 // outer WHERE and ORDER BY are nodes above it - the same
@@ -71756,17 +72497,34 @@ fn emit_rows_inner(
                     let filtered = RowSource::Filter { input: Box::new(RowSource::Rows(rows)), pred }
                         .rows(db)
                         .map_err(EmitErr::Eval)?;
-                    let mut rows =
-                        compute_windows(
-                            filtered,
-                            windows,
-                            *win_base,
-                            &window_record(cols, filter.as_ref(), windows, order_by, *win_base),
-                        )
-                        .map_err(EmitErr::Eval)?;
-                    if !order_by.is_empty() {
-                        sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
+                    let inner_descs: Vec<Option<Descriptor>> =
+                        output_cols_of(inner).iter().map(|c| Some(desc_of_projcol(c))).collect();
+                    let rows = fold_windows_ordered(
+                        filtered,
+                        windows,
+                        *win_base,
+                        window_record(cols, filter.as_ref(), windows, order_by, *win_base),
+                        window_slot_descs(inner_descs, cols, windows.len(), *win_base),
+                        order_by,
+                        tie.as_deref(),
+                    )
+                    .map_err(EmitErr::Eval)?;
+                    for values in &rows {
+                        encode_row(w, cols, values, out)?;
                     }
+                } else if let Some(t) = tie.as_deref().filter(|t| !t.outer.is_empty() && !order_by.is_empty()) {
+                    // a windowed rewrite's top level: its ties are the
+                    // original statement's window-stream record
+                    // ([WinTie::outer]), so it materialises and sorts
+                    // whole rather than by records
+                    let inner_descs: Vec<Option<Descriptor>> =
+                        output_cols_of(inner).iter().map(|c| Some(desc_of_projcol(c))).collect();
+                    let rows = branch_rows_res(inner, db, args).map_err(EmitErr::Eval)?;
+                    let mut rows = RowSource::Filter { input: Box::new(RowSource::Rows(rows)), pred }
+                        .rows(db)
+                        .map_err(EmitErr::Eval)?;
+                    let outer = outer_tie_less_keys(t.outer.clone(), order_by, &inner_descs);
+                    sort_rows_tied(&mut rows, order_by, &outer, &inner_descs).map_err(EmitErr::Eval)?;
                     for values in &rows {
                         encode_row(w, cols, values, out)?;
                     }
@@ -83165,6 +83923,9 @@ enum EvalErr {
     /// ROW", "PRECEDING"). The vector is the bare gds code and its two
     /// strings - no "Dynamic SQL Error" line (ERRD_post of the code alone)
     WindowIncompatFrames(&'static str, &'static str),
+    /// a WINDOW clause naming one window twice - `isc_dsql_window_
+    /// duplicate` under "SQL error code = -204" (42000), at PREPARE
+    WindowDuplicate(String),
     /// a frame offset that is not a number - `NULL PRECEDING`, `'a'
     /// PRECEDING`: `isc_dsql_window_frame_value_inv_type` (42000, -104)
     /// at PREPARE, bare like the one above (measured)
@@ -98612,13 +99373,13 @@ fn parse_frame_clause(s: &str) -> Option<Frame> {
     if up.strip_prefix("BETWEEN ").is_some() {
         // BETWEEN <start> AND <end>; split at the depth-0 ` AND `
         let and_at = find_word_depth0(&up, "AND", "BETWEEN ".len())?;
-        let (start, n1) = parse_frame_bound(body["BETWEEN ".len()..and_at].trim())?;
-        let (end, n2) = parse_frame_bound(body[and_at + "AND".len()..].trim())?;
-        Some(Frame { mode, start, end, negative: n1 || n2 })
+        let (start, n1, b1) = parse_frame_bound(body["BETWEEN ".len()..and_at].trim())?;
+        let (end, n2, b2) = parse_frame_bound(body[and_at + "AND".len()..].trim())?;
+        Some(Frame { mode, start, end, negative: n1 || n2, too_big: b1 || b2 })
     } else {
         // shorthand: <mode> <start> == BETWEEN <start> AND CURRENT ROW
-        let (start, negative) = parse_frame_bound(body)?;
-        Some(Frame { mode, start, end: FrameBound::CurrentRow, negative })
+        let (start, negative, too_big) = parse_frame_bound(body)?;
+        Some(Frame { mode, start, end: FrameBound::CurrentRow, negative, too_big })
     }
 }
 
@@ -98627,16 +99388,17 @@ fn parse_frame_clause(s: &str) -> Option<Frame> {
 /// optionally negative and optionally parenthesised - `-1 PRECEDING`
 /// and `(-1) PRECEDING` are the engine's execute-time refusal, not a
 /// parse error (measured), so the second field says "negative" and the
-/// bound carries the magnitude.
-fn parse_frame_bound(s: &str) -> Option<(FrameBound, bool)> {
+/// bound carries the magnitude; the third says "past INTEGER" (the
+/// magnitude then saturates - the fold never runs).
+fn parse_frame_bound(s: &str) -> Option<(FrameBound, bool, bool)> {
     let t = s.trim();
     let up = t.to_ascii_uppercase();
     match up.as_str() {
-        "UNBOUNDED PRECEDING" => Some((FrameBound::UnboundedPreceding, false)),
-        "UNBOUNDED FOLLOWING" => Some((FrameBound::UnboundedFollowing, false)),
-        "CURRENT ROW" => Some((FrameBound::CurrentRow, false)),
+        "UNBOUNDED PRECEDING" => Some((FrameBound::UnboundedPreceding, false, false)),
+        "UNBOUNDED FOLLOWING" => Some((FrameBound::UnboundedFollowing, false, false)),
+        "CURRENT ROW" => Some((FrameBound::CurrentRow, false, false)),
         _ => {
-            let offset = |n: &str| -> Option<(usize, bool)> {
+            let offset = |n: &str| -> Option<(usize, bool, bool)> {
                 let mut v = n.trim();
                 if let Some(inner) = v.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
                     v = inner.trim();
@@ -98645,14 +99407,18 @@ fn parse_frame_bound(s: &str) -> Option<(FrameBound, bool)> {
                     Some(m) => (true, m.trim()),
                     None => (false, v),
                 };
-                Some((mag.parse::<usize>().ok()?, neg))
+                if mag.is_empty() || !mag.bytes().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                let big = mag.trim_start_matches('0').len() > 10 || mag.parse::<u64>().ok()? > i32::MAX as u64;
+                Some((if big { i32::MAX as usize } else { mag.parse::<usize>().ok()? }, neg, big))
             };
             if let Some(n) = up.strip_suffix(" PRECEDING") {
-                let (k, neg) = offset(n)?;
-                Some((FrameBound::Preceding(k), neg))
+                let (k, neg, big) = offset(n)?;
+                Some((FrameBound::Preceding(k), neg, big))
             } else if let Some(n) = up.strip_suffix(" FOLLOWING") {
-                let (k, neg) = offset(n)?;
-                Some((FrameBound::Following(k), neg))
+                let (k, neg, big) = offset(n)?;
+                Some((FrameBound::Following(k), neg, big))
             } else {
                 None
             }
@@ -98714,10 +99480,16 @@ fn window_frame_lint(sql: &str) -> Option<EvalErr> {
             specs.push(lp);
         }
     }
+    // a name defined twice in one WINDOW clause is the engine's -204
+    // *Duplicate window definition for WIN* (measured on 2182: `WINDOW
+    // WIN AS (ORDER BY ID), WIN AS (ORDER BY VAL)`; this server folded
+    // the first definition)
+    let mut dup: Option<EvalErr> = None;
     let mut from = 0usize;
     while let Some(w) = find_word(&masked, "WINDOW", from) {
         from = w + 6;
         let mut at = w + 6;
+        let mut names: Vec<String> = Vec::new();
         loop {
             // <name> AS (
             let ns = skip_ws(at);
@@ -98739,6 +99511,13 @@ fn window_frame_lint(sql: &str) -> Option<EvalErr> {
             let a = skip_ws(ne);
             if masked.get(a..a + 2) != Some("AS") {
                 break;
+            }
+            if let Some(n) = canon_ident(&sql[ns..ne]) {
+                if names.contains(&n) {
+                    dup.get_or_insert(EvalErr::WindowDuplicate(n));
+                } else {
+                    names.push(n);
+                }
             }
             let lp = skip_ws(a + 2);
             if b.get(lp) != Some(&b'(') {
@@ -98856,7 +99635,7 @@ fn window_frame_lint(sql: &str) -> Option<EvalErr> {
             };
         }
     }
-    token_err.or(semantic)
+    token_err.or(semantic).or(dup)
 }
 
 /// Split a trailing `FILTER (WHERE <cond>)` off an aggregate item. Returns
@@ -99504,8 +100283,19 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
+    // a string literal's or a quoted name's parentheses and commas are
+    // text (`SELECT GRP, ')' X, COUNT(*) ..` is four items); a doubled
+    // quote inside either toggles twice and changes nothing
+    let mut quote: Option<char> = None;
     for (i, ch) in s.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
         match ch {
+            '\'' | '"' => quote = Some(ch),
             '(' => depth += 1,
             ')' => depth -= 1,
             ',' if depth == 0 => {
@@ -111558,11 +112348,20 @@ fn agg_field_src(fid: usize, descs: &[Descriptor]) -> AggSrc {
 /// can still arrive as small exact [Value]s: wrapped in the CAST TO
 /// DECFLOAT(34) that is the engine's own MOV_get_dec128 of each value,
 /// so the fold ([compute_group]) takes the decimal path its describe
-/// (DECFLOAT(34)) announced. Every other source passes through.
+/// (DECFLOAT(34)) announced. A FIELD source is wrapped the same way: a
+/// derived table's or a windowed rewrite's column whose value is a
+/// COMPUTED scaled INT128 (`SUM(<NUMERIC(18,2)>)`, `SUM(<BIGINT>)`,
+/// `X + 0` over a NUMERIC(38,4)) describes INT128-backed while its small
+/// values arrive as [Value::Scaled] - measured on 2182, `VAR_POP(S) FROM
+/// (SELECT SUM(Z) S FROM H GROUP BY ID)` is 0.8750 and `VAR_POP(SUM(N))
+/// OVER () .. GROUP BY T` 0.40625000, where the value-kind test folded a
+/// DOUBLE under the DECFLOAT describe and the client read 0E-6176. Every
+/// other source passes through.
 fn stat_dec_src(func: AggFn, src: AggSrc, decimal: bool) -> AggSrc {
     let dec = |e: Expr| Expr::Cast(Box::new(e), CastTarget::DecFloat { wide: true }, fire_crab_ods::intl::CS_UTF8);
     match src {
         AggSrc::Expr(e) if decimal && func.is_statistical() => AggSrc::Expr(dec(e)),
+        AggSrc::Field(f) if decimal && func.is_statistical() => AggSrc::Expr(dec(Expr::Col(f))),
         // PERCENTILE_CONT's ORDER BY value, read as MOV_get_dec128 does
         AggSrc::Percentile { frac, order, desc } if decimal && func == AggFn::PercentileCont => {
             AggSrc::Percentile { frac, order: dec(order), desc }
@@ -115671,7 +116470,7 @@ fn resolve_having(
                             })
                             .unwrap_or_else(|| {
                                 let src = match fid {
-                                    Some(f) => agg_field_src(f, descs),
+                                    Some(f) => stat_dec_src(*func, agg_field_src(f, descs), decimal),
                                     None => AggSrc::Star,
                                 };
                                 gitems.push(GItem::Agg(*func, src, distinct));
@@ -128827,6 +129626,7 @@ mod tests {
                 windows,
                 win_base,
                 order_by: Vec::new(),
+                tie: None,
             }
         };
         // the inner layer: output (ID, V) = base fields (1, 0)
@@ -140201,6 +141001,37 @@ mod tests {
             window_frame_lint(dml),
             Some(EvalErr::TokenUnknown { line: 1, col: 105, token }) if token == "following"
         ));
+    }
+
+    #[test]
+    fn sort_record_image_and_the_window_lints() {
+        // the record as the engine lays it out and compares it (measured
+        // on 2182, [sort_record_image]): a VARCHAR's length shares word 0
+        // with the NULL flags, so a NULL (length 0) leads 'a' and 'b',
+        // and 'ab' (length 2) trails them
+        let vc = Descriptor { dtype: dtype::VARYING, scale: 0, length: 12, sub_type: 0, flags: 0, offset: 0 };
+        let img = |v: Value| sort_record_image(&[&v], &[vc]).unwrap();
+        let (n, a, b, ab) = (img(Value::Null), img(Value::Text("a".into())), img(Value::Text("b".into())), img(Value::Text("ab".into())));
+        assert!(n < a && a < b && b < ab);
+        // a third field pushes the length out of word 0: the NULL trails
+        let slot = SORT_REC_NULL_SLOT;
+        let img3 = |v: Value| sort_record_image(&[&v, &Value::Null, &Value::Null], &[vc, slot, slot]).unwrap();
+        assert!(img3(Value::Text("ab".into())) < img3(Value::Null));
+        // a BIGINT by its low word first, unsigned: 3, 5, -7, -1
+        let bi = Descriptor { dtype: dtype::INT64, scale: 0, length: 8, sub_type: 0, flags: 0, offset: 0 };
+        let w: Vec<Vec<u32>> =
+            [3i64, 5, -7, -1].iter().map(|x| sort_record_image(&[&Value::Int(*x)], &[bi]).unwrap()).collect();
+        assert!(w.windows(2).all(|p| p[0] < p[1]));
+        // a value the image cannot spell keeps the caller's compare
+        assert!(sort_record_image(&[&Value::Text("x".into())], &[bi]).is_none());
+        // a duplicate named window, and an offset past INTEGER
+        let dup = "select id, sum(val) over win from w window win as (order by id), win as (order by val)";
+        assert!(matches!(window_frame_lint(dup), Some(EvalErr::WindowDuplicate(n)) if n == "WIN"));
+        assert!(parse_frame_clause("ROWS BETWEEN 2147483648 PRECEDING AND CURRENT ROW").is_some_and(|f| f.too_big));
+        assert!(parse_frame_clause("ROWS 99999999999999999999999 PRECEDING").is_some_and(|f| f.too_big));
+        assert!(parse_frame_clause("ROWS BETWEEN 2147483647 PRECEDING AND CURRENT ROW").is_some_and(|f| !f.too_big));
+        // a literal's parenthesis or comma is text to the item splitter
+        assert_eq!(split_top_level_commas("grp, ')' x, 'a,b', \"c,d\", count(*)").len(), 5);
     }
 
     #[test]

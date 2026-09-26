@@ -39,6 +39,21 @@
 #     PARTITION BY name the COLUMN; a QUALIFIED key is the column. The
 #     group planner grouped five ways, and every windowed form of the
 #     shape answered that grouping through the rewrite's L1 (section 14).
+#   - THE SORT RECORD (section 16): the statement ORDER BY above a
+#     window breaks its ties by the window streams' record (the select
+#     list's fields in written order, a window's values, a PARTITION BY
+#     stream's extra slot), and every sort compares that record as the
+#     engine lays it out - NULL flag bytes, then aligned values, as
+#     little-endian words - so a NULL VARCHAR whose length shares word 0
+#     with the flags LEADS its ties. fc/integ 6ec54c8 sorted the windows'
+#     delivery order stably (a different row set under OFFSET/FETCH and
+#     FIRST) and numbered a NULL group or a LEFT JOIN's NULL key after
+#     its peers. VAR/STDDEV over a derived or rewritten column holding a
+#     computed scaled INT128 (SUM of a NUMERIC(18,2), X + 0 over a
+#     NUMERIC(38,4)) answered the DECFLOAT 0E-6176. A string literal
+#     holding a parenthesis or a comma, a duplicate named window (-204)
+#     and a frame offset past INTEGER (22003 at execute) - refused or
+#     answered on fc/integ.
 #
 # RECORDED, not fixed (section 12 and the refused/differs cells): CREATE
 # VIEW over an aggregate, a GROUP BY or a window; LAG/LEAD/NTH_VALUE with
@@ -87,6 +102,16 @@ INSERT INTO CS VALUES ('yy');
 INSERT INTO CS VALUES (NULL);
 INSERT INTO CS VALUES ('x');
 CREATE VIEW VW (ID, GRP, VAL) AS SELECT ID, GRP, VAL FROM W;
+CREATE TABLE RT (ID INTEGER, K INTEGER, S VARCHAR(10), V INTEGER);
+INSERT INTO RT VALUES (1,1,'b',3); INSERT INTO RT VALUES (2,2,'a',1); INSERT INTO RT VALUES (3,1,'a',2); INSERT INTO RT VALUES (4,2,'c',3); INSERT INTO RT VALUES (5,1,NULL,1); INSERT INTO RT VALUES (6,NULL,'b',2); INSERT INTO RT VALUES (7,2,'b',NULL); INSERT INTO RT VALUES (8,1,'c',3); INSERT INTO RT VALUES (9,NULL,'a',1); INSERT INTO RT VALUES (10,2,'a',2);
+CREATE TABLE RH (ID INTEGER, X NUMERIC(38,4), Z NUMERIC(18,2));
+INSERT INTO RH VALUES (1,1.5,1.5); INSERT INTO RH VALUES (2,2.25,2.25); INSERT INTO RH VALUES (3,0,0);
+CREATE TABLE RC (ID INTEGER, T VARCHAR(10), N NUMERIC(18,4), B BIGINT);
+INSERT INTO RC VALUES (1,'x',1.5,9000000000000000000); INSERT INTO RC VALUES (2,'y',2.25,9000000000000000000); INSERT INTO RC VALUES (3,'x',NULL,1); INSERT INTO RC VALUES (4,'y',-1.125,-1); INSERT INTO RC VALUES (5,NULL,0,2);
+CREATE TABLE RW (ID INTEGER, GRP VARCHAR(5), VAL INTEGER);
+INSERT INTO RW VALUES (1,'A',10); INSERT INTO RW VALUES (2,'A',20); INSERT INTO RW VALUES (3,'B',20); INSERT INTO RW VALUES (4,'B',NULL); INSERT INTO RW VALUES (5,NULL,5); INSERT INTO RW VALUES (6,'C',10); INSERT INTO RW VALUES (7,'A',10);
+CREATE TABLE RG (GRP VARCHAR(5), NAME VARCHAR(10));
+INSERT INTO RG VALUES ('A','alpha'); INSERT INTO RG VALUES ('B','beta'); INSERT INTO RG VALUES ('D','delta');
 COMMIT;
 SQL
 } | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/aggplan-build.log 2>&1
@@ -410,11 +435,44 @@ pin  "15 a select-list subquery's frame" "SELECT ID, (SELECT SUM(VAL) OVER (ORDE
 pin  "15 CONTROL: a legal frame in an UPDATE" "UPDATE W SET VAL = 0 WHERE ID IN (SELECT ID FROM (SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) S FROM W) WHERE S IS NULL); SELECT ID, VAL FROM W ORDER BY ID; ROLLBACK;" "ID VAL|1 10|2 20|3 20|4 <null>|5 5"
 differs "15 RECORDED an illegal frame inside EXECUTE BLOCK (engine's bound rule)" "EXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN FOR SELECT SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM W INTO :N DO SUSPEND; END"
 
+echo "--- 16. THE SORT RECORD'S TIES ABOVE AND INSIDE A WINDOW; VAR/STDDEV OVER A COMPUTED INT128; LITERALS, DUPLICATE WINDOWS, OFFSETS PAST INTEGER"
+pin  "16 ORDER BY above a window ties by the select list's field" "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID DESC) FROM RT ORDER BY K;" "ID ROW_NUMBER|6 5|9 2|1 10|3 8|5 6|8 3|2 9|4 7|7 4|10 1"
+pin  "16 ...an expression's field breaks the tie, not its value" "SELECT 11 - ID R, ROW_NUMBER() OVER (ORDER BY ID DESC) FROM RT ORDER BY K;" "R ROW_NUMBER|5 5|2 2|10 10|8 8|6 6|3 3|9 9|7 7|4 4|1 1"
+pin  "16 ...the fields in written order, S before ID" "SELECT S, ID, ROW_NUMBER() OVER (ORDER BY ID DESC) FROM RT ORDER BY K;" "S ID ROW_NUMBER|a 9 2|b 6 5|a 3 8|b 1 10|c 8 3|<null> 5 6|a 2 9|a 10 1|b 7 4|c 4 7"
+pin  "16 CONTROL: the window's stream written first leads the record" "SELECT ROW_NUMBER() OVER (ORDER BY ID DESC) RN, ID FROM RT ORDER BY K;" "RN ID|2 9|5 6|3 8|6 5|8 3|10 1|1 10|4 7|7 4|9 2"
+pin  "16 ...a NULL VARCHAR shares word 0 with its length: it leads" "SELECT S, ROW_NUMBER() OVER (ORDER BY ID) FROM RT ORDER BY K;" "S ROW_NUMBER|a 9|b 6|<null> 5|a 3|b 1|c 8|a 2|a 10|b 7|c 4"
+pin  "16 ...a PARTITION BY stream's extra slot moves the length out: it trails" "SELECT S, COUNT(*) OVER (PARTITION BY V) FROM RT ORDER BY K;" "S COUNT|a 3|b 3|a 3|b 3|c 3|<null> 3|a 3|a 3|b 1|c 3"
+pin  "16 OFFSET/FETCH over the tie order: a different row set" "SELECT ID, S, ROW_NUMBER() OVER (ORDER BY V DESC) FROM RT ORDER BY S DESC NULLS LAST OFFSET 2 ROWS FETCH FIRST 4 ROWS ONLY;" "ID S ROW_NUMBER|1 b 1|6 b 5|7 b 10|2 a 7"
+pin  "16 FIRST over a grouped ORDER BY window" "SELECT FIRST 4 S, K FROM RT GROUP BY S, K ORDER BY COUNT(*) OVER (PARTITION BY S) DESC;" "S K|a 1|a 2|b 1|b 2"
+pin  "16 grouped, ORDER BY a window over an aggregate" "SELECT K, S, MAX(V) FROM RT GROUP BY K, S ORDER BY RANK() OVER (ORDER BY MAX(V) DESC);" "K S MAX|1 b 3|1 c 3|2 c 3|1 a 2|2 a 2|<null> b 2|<null> a 1|1 <null> 1|2 b <null>"
+pin  "16 a join's ORDER BY above a window" "SELECT RW.ID, RG.NAME, ROW_NUMBER() OVER (ORDER BY RW.VAL) FROM RW LEFT JOIN RG ON RG.GRP = RW.GRP ORDER BY RW.GRP;" "ID NAME ROW_NUMBER|5 <null> 2|1 alpha 3|2 alpha 6|7 alpha 4|3 beta 7|4 beta 1|6 <null> 5"
+pin  "16 a NULL group key ties by its flag and length: ROW_NUMBER over COUNT" "SELECT GRP, ROW_NUMBER() OVER (ORDER BY COUNT(*)) FROM RW GROUP BY GRP;" "GRP ROW_NUMBER|<null> 1|C 2|B 3|A 4"
+pin  "16 ...descending" "SELECT GRP, ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) FROM RW GROUP BY GRP;" "GRP ROW_NUMBER|A 1|B 2|<null> 3|C 4"
+pin  "16 ...FIRST 1 takes the NULL group" "SELECT FIRST 1 GRP, RANK() OVER (ORDER BY COUNT(*)) FROM RW GROUP BY GRP;" "GRP RANK|<null> 1"
+pin  "16 a LEFT JOIN's NULL keys tie by the ON-only fields" "SELECT RW.ID, ROW_NUMBER() OVER (ORDER BY RG.NAME) FROM RW LEFT JOIN RG ON RG.GRP = RW.GRP;" "ID ROW_NUMBER|6 1|5 2|1 3|2 4|7 5|3 6|4 7"
+pin  "16 VAR_POP over a derived SUM of NUMERIC(18,2)" "SELECT VAR_POP(S) FROM (SELECT SUM(Z) S FROM RH GROUP BY ID);" "VAR_POP|0.8750"
+pin  "16 VAR_POP over a derived X + 0 of NUMERIC(38,4)" "SELECT VAR_POP(X2) FROM (SELECT X + 0 X2 FROM RH);" "VAR_POP|0.87500000"
+pin  "16 STDDEV_SAMP / STDDEV_POP / VAR_SAMP over the same" "SELECT STDDEV_SAMP(S), STDDEV_POP(S), VAR_SAMP(S) FROM (SELECT SUM(Z) S FROM RH GROUP BY ID);" "STDDEV_SAMP STDDEV_POP VAR_SAMP|1.145643923738960001647011798432002 0.8750 1.3125"
+pin  "16 ...in a HAVING" "SELECT VAR_POP(S) FROM (SELECT SUM(Z) S FROM RH GROUP BY ID) HAVING VAR_POP(S) > 0;" "VAR_POP|0.8750"
+pin  "16 VAR_POP(SUM(N)) OVER () over a GROUP BY" "SELECT T, VAR_POP(SUM(N)) OVER () FROM RC GROUP BY T;" "T VAR_POP|<null> 0.40625000|x 0.40625000|y 0.40625000"
+pin  "16 VAR_POP(SUM(B)) OVER () over BIGINT sums" "SELECT T, VAR_POP(SUM(B)) OVER () FROM RC GROUP BY T;" "T VAR_POP|<null> 1.79999999999999999920000000000000E+37|x 1.79999999999999999920000000000000E+37|y 1.79999999999999999920000000000000E+37"
+pin  "16 STDDEV_POP / VAR_SAMP / COVAR_POP windows over a derived SUM" "SELECT STDDEV_POP(X) OVER (), VAR_SAMP(X) OVER (), COVAR_POP(X, X) OVER () FROM (SELECT T, SUM(N) X FROM RC GROUP BY T);" "STDDEV_POP VAR_SAMP COVAR_POP|0.40625000 0.60937500 0.40625000|0.40625000 0.60937500 0.40625000|0.40625000 0.60937500 0.40625000"
+pin  "16 a running VAR_POP over a derived computed INT128" "SELECT ID, VAR_POP(X2) OVER (ORDER BY ID) FROM (SELECT ID, X + 0 X2 FROM RH);" "ID VAR_POP|1 0E-8|2 0.14062500|3 0.87500000"
+pin  "16 a string literal's ')' in a grouped windowed select" "SELECT GRP, ')' X, COUNT(*), ROW_NUMBER() OVER (ORDER BY GRP DESC) FROM RW GROUP BY GRP;" "GRP X COUNT ROW_NUMBER|C ) 1 1|B ) 2 2|A ) 3 3|<null> ) 1 4"
+pin  "16 ...'a,b'" "SELECT GRP, 'a,b' X, ROW_NUMBER() OVER (ORDER BY GRP DESC) FROM RW GROUP BY GRP;" "GRP X ROW_NUMBER|C a,b 1|B a,b 2|A a,b 3|<null> a,b 4"
+pin  "16 ...'OVER (' on the plain path" "SELECT ID, 'OVER (', ROW_NUMBER() OVER (ORDER BY ID DESC) FROM RW;" "ID CONSTANT ROW_NUMBER|7 OVER ( 1|6 OVER ( 2|5 OVER ( 3|4 OVER ( 4|3 OVER ( 5|2 OVER ( 6|1 OVER ( 7"
+pin  "16 ...'(' over a join" "SELECT RW.ID, '(' X, ROW_NUMBER() OVER (ORDER BY RW.ID DESC) FROM RW JOIN RW W2 ON W2.ID = RW.ID;" "ID X ROW_NUMBER|7 ( 1|6 ( 2|5 ( 3|4 ( 4|3 ( 5|2 ( 6|1 ( 7"
+pin  "16 a duplicate named window is -204" "SELECT ID, SUM(VAL) OVER WIN FROM RW WINDOW WIN AS (ORDER BY ID), WIN AS (ORDER BY VAL);" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -204|-Duplicate window definition for WIN"
+pin  "16 a frame offset past INTEGER raises 22003 at execute" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 3000000000 PRECEDING AND CURRENT ROW) FROM RW;" "ID SUM|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range"
+pin  "16 ...2147483648, over no rows too" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN CURRENT ROW AND 2147483648 FOLLOWING) FROM RW WHERE 1 = 0;" "ID SUM|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range"
+pin  "16 ...the shorthand" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS 3000000000 PRECEDING) FROM RW;" "ID SUM|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range"
+pin  "16 CONTROL: 2147483647 answers" "SELECT ID, SUM(VAL) OVER (ORDER BY ID ROWS BETWEEN 2147483647 PRECEDING AND CURRENT ROW) FROM RW;" "ID SUM|1 10|2 30|3 50|4 50|5 55|6 65|7 75"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-aggplan-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 229 ]; then echo "FAIL only $ran checks ran (floor 229)"; fail=1; fi
+if [ "$ran" -lt 260 ]; then echo "FAIL only $ran checks ran (floor 260)"; fail=1; fi
 exit $fail
