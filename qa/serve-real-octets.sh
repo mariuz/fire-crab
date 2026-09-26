@@ -192,7 +192,9 @@ refuses() { # <label> <sql>
         *) echo "DIFF boundary MOVED: $1"; echo "     fc: $r"; fail=1 ;;
     esac
 }
-refuses "a LIKE pattern that is not a LITERAL against a binary side refuses" \
+# PROMOTED (it was a recorded refusal): a literal that a `||` follows is
+# the first operand of an EXPRESSION pattern, read like `P LIKE V || ''`
+both "a LIKE pattern that is 'a' || '' against a binary side (it refused)" \
   "SELECT ID FROM OC WHERE P LIKE 'a' || '';"
 both "a cast INTO the binary set keeps the padded bytes" \
   "SELECT CAST(P AS VARCHAR(6) CHARACTER SET OCTETS), CAST(U AS CHAR(4) CHARACTER SET OCTETS) FROM OC ORDER BY ID;"

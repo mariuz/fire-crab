@@ -98,6 +98,23 @@
 #     attachment was stored unconverted and the fetch HUNG, where the
 #     engine raises 22018 (9e).
 #
+# SECTION 10 - EVERY LITERAL OF A STORED BODY, ASCII INCLUDED, IS OF THE
+# SET THE BODY WAS COMPILED IN. Found by two adversarial reviews of
+# section 9's fix, which typed only the NON-ASCII literals: an ASCII
+# 'ab' was still read in the caller's set, and as the first operand of
+# a concatenation it decided the result's set - `OCTET_LENGTH('ab' ||
+# Y)` over a WIN1252 Y in a UTF8-created body answered 3 under NONE and
+# 4 under WIN1252 for the engine's 6 (10a). The BLR records the set of
+# every text literal, so it is read off every one of them now; a
+# CAST to a text type that names no set is the DATABASE default's in a
+# stored body (measured against databases with no default, UTF8 and
+# WIN1252), not the caller's; an EXECUTE STATEMENT's text MOVES from
+# its own set into the attachment's before it is prepared, where it was
+# refused or - built from a UTF8 literal and a WIN1252 local - run with
+# the wrong octets (10b); and a body's `LIKE :A || '%'` reaches the
+# planner as an expression pattern, which the literal-first parse
+# refused (10c). Section 9's cells all stand.
+#
 # Usage: qa/serve-real-psqlassign.sh [port]   (default 5400)
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
@@ -195,6 +212,7 @@ CREATE PROCEDURE ZD8 (X VARCHAR(10) CHARACTER SET UTF8, Y VARCHAR(10) CHARACTER 
 CREATE PROCEDURE ZN6 (X VARCHAR(10) CHARACTER SET UTF8 = 'é') RETURNS (R VARCHAR(10) CHARACTER SET UTF8, O INTEGER) AS BEGIN R = X; O = OCTET_LENGTH(X); SUSPEND; END^
 CREATE PROCEDURE ZN7 RETURNS (C INTEGER) AS BEGIN SELECT COUNT(*) FROM XTU WHERE W = 'é' INTO :C; SUSPEND; END^
 CREATE PROCEDURE ZN3 (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R INTEGER) AS BEGIN IF (X = 'é') THEN R = 1; ELSE R = 0; SUSPEND; END^
+CREATE PROCEDURE SNF7 (Y VARCHAR(10) CHARACTER SET UTF8) RETURNS (O INTEGER) AS BEGIN O = OCTET_LENGTH('ab' || Y); SUSPEND; END^
 SET TERM ;^
 COMMIT;
 SQL
@@ -222,6 +240,40 @@ CREATE FUNCTION YF2 (X VARCHAR(10) CHARACTER SET UTF8 = 'é') RETURNS VARCHAR(40
 CREATE FUNCTION YFU (X VARCHAR(10) CHARACTER SET UTF8) RETURNS VARCHAR(40) CHARACTER SET UTF8 AS BEGIN RETURN UPPER(X) || '!'; END^
 CREATE FUNCTION YFP (X VARCHAR(10) CHARACTER SET UTF8) RETURNS INTEGER AS BEGIN RETURN POSITION('é' IN X); END^
 SET TERM ;^
+CREATE TABLE STT (ID INTEGER, U VARCHAR(10) CHARACTER SET UTF8, W VARCHAR(10) CHARACTER SET WIN1252, N VARCHAR(10));
+INSERT INTO STT VALUES (1, 'é', 'é', 'a');
+INSERT INTO STT VALUES (2, 'ab', 'Ü', 'b');
+INSERT INTO STT VALUES (3, 'ab%', 'ab', 'c');
+SET TERM ^;
+CREATE PROCEDURE SF1 (Y VARCHAR(10) CHARACTER SET WIN1252) RETURNS (O INTEGER) AS BEGIN O = OCTET_LENGTH('ab' || Y); SUSPEND; END^
+CREATE PROCEDURE SF2 (Y VARCHAR(10) CHARACTER SET WIN1252) RETURNS (O INTEGER) AS DECLARE Z VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN O = OCTET_LENGTH('ab' || Y); SUSPEND; END^
+CREATE PROCEDURE SF3 RETURNS (O INTEGER) AS DECLARE Y VARCHAR(10) CHARACTER SET WIN1252; BEGIN Y = 'é'; O = OCTET_LENGTH('ab' || Y); SUSPEND; END^
+CREATE PROCEDURE SF5 RETURNS (O INTEGER) AS DECLARE Y VARCHAR(10) CHARACTER SET WIN1252 = 'é'; BEGIN SELECT OCTET_LENGTH('ab' || :Y) FROM RDB$DATABASE INTO O; SUSPEND; END^
+CREATE PROCEDURE SF6 RETURNS (O INTEGER) AS DECLARE Y VARCHAR(10) CHARACTER SET WIN1252 = 'é'; BEGIN FOR SELECT OCTET_LENGTH('ab' || W) FROM STT WHERE ID = 1 INTO O DO SUSPEND; END^
+CREATE PROCEDURE SF7 (Y VARCHAR(10) CHARACTER SET UTF8) RETURNS (O INTEGER) AS BEGIN O = OCTET_LENGTH('ab' || Y); SUSPEND; END^
+CREATE FUNCTION SG1 (Y VARCHAR(10) CHARACTER SET WIN1252) RETURNS INTEGER AS BEGIN RETURN OCTET_LENGTH('ab' || Y); END^
+CREATE FUNCTION SFX RETURNS INTEGER AS BEGIN RETURN OCTET_LENGTH('x' || 'é'); END^
+CREATE PROCEDURE SM1 RETURNS (R INTEGER, T VARCHAR(10)) AS BEGIN T = 'é'; FOR SELECT OCTET_LENGTH('ab' || W) FROM STT ORDER BY ID INTO :R DO SUSPEND; END^
+CREATE PROCEDURE SM2 RETURNS (R INTEGER, T VARCHAR(10)) AS BEGIN T = 'é'; FOR SELECT OCTET_LENGTH('ab' || U) FROM STT ORDER BY ID INTO :R DO SUSPEND; END^
+CREATE PROCEDURE SM3 RETURNS (R INTEGER) AS BEGIN IF ('x' = 'é') THEN R = 0; R = OCTET_LENGTH('ab' || 'é' || 'c'); SUSPEND; R = OCTET_LENGTH(CAST('ab' AS VARCHAR(5)) || 'é'); SUSPEND; R = OCTET_LENGTH(COALESCE('ab', 'é') || 'é'); SUSPEND; R = OCTET_LENGTH(TRIM('ab') || 'é'); SUSPEND; R = OCTET_LENGTH(UPPER('ab') || 'é'); SUSPEND; END^
+CREATE FUNCTION SM13 RETURNS INTEGER AS BEGIN RETURN OCTET_LENGTH('x' || (SELECT MAX(U) FROM STT WHERE ID < 3) || 'é'); END^
+CREATE PROCEDURE SPB RETURNS (O INTEGER, O2 INTEGER) AS DECLARE Y VARCHAR(10) CHARACTER SET WIN1252 = 'é'; BEGIN O = OCTET_LENGTH(CAST('ab' AS VARCHAR(5)) || Y); O2 = OCTET_LENGTH(COALESCE('ab', Y) || Y); SUSPEND; END^
+CREATE PROCEDURE SE1 RETURNS (C INTEGER, H VARCHAR(200) CHARACTER SET OCTETS, N INTEGER) AS DECLARE E VARCHAR(10) CHARACTER SET WIN1252 = 'é'; DECLARE S VARCHAR(200); BEGIN S = 'select count(*) from stt where w = ''' || E || ''''; H = CAST(S AS VARCHAR(200) CHARACTER SET OCTETS); N = OCTET_LENGTH(S); EXECUTE STATEMENT S INTO C; SUSPEND; END^
+CREATE PROCEDURE SE2 RETURNS (C INTEGER) AS DECLARE E VARCHAR(10) CHARACTER SET WIN1252 = 'é'; DECLARE S VARCHAR(200) CHARACTER SET UTF8; BEGIN S = 'select count(*) from stt where w = ''' || E || ''''; EXECUTE STATEMENT S INTO C; SUSPEND; END^
+CREATE PROCEDURE SE3 RETURNS (C INTEGER) AS DECLARE E VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE S VARCHAR(200); BEGIN S = 'select count(*) from stt where u = ''' || E || ''''; EXECUTE STATEMENT S INTO C; SUSPEND; END^
+CREATE PROCEDURE SE4 RETURNS (C INTEGER) AS DECLARE E VARCHAR(10) CHARACTER SET UTF8 = 'é'; DECLARE S VARCHAR(200) CHARACTER SET UTF8; BEGIN S = 'select count(*) from stt where u = ''' || E || ''''; EXECUTE STATEMENT S INTO C; SUSPEND; END^
+CREATE PROCEDURE SE5 RETURNS (C INTEGER) AS DECLARE E VARCHAR(10) CHARACTER SET UTF8 = 'é'; BEGIN EXECUTE STATEMENT 'select count(*) from stt where u = ''' || E || '''' INTO C; SUSPEND; END^
+CREATE PROCEDURE SE6 RETURNS (C INTEGER) AS DECLARE E VARCHAR(10) CHARACTER SET WIN1252 = 'é'; BEGIN EXECUTE STATEMENT 'select count(*) from stt where w = ''' || E || '''' INTO C; SUSPEND; END^
+CREATE PROCEDURE SE8 RETURNS (C INTEGER) AS DECLARE A VARCHAR(10) = 'ab'; DECLARE E VARCHAR(10) CHARACTER SET WIN1252 = 'Ü'; BEGIN EXECUTE STATEMENT 'select count(*) from stt where u = ''' || A || ''' or w = ''' || E || '''' INTO C; SUSPEND; END^
+CREATE PROCEDURE SE9 RETURNS (C INTEGER) AS DECLARE S VARCHAR(200); BEGIN S = 'select count(*) from stt where u = ''é'''; EXECUTE STATEMENT S INTO C; SUSPEND; END^
+CREATE PROCEDURE SA3 RETURNS (C INTEGER) AS DECLARE A VARCHAR(10) CHARACTER SET UTF8 = 'ab'; DECLARE E VARCHAR(10) CHARACTER SET WIN1252 = 'é'; BEGIN FOR SELECT ID FROM STT WHERE U LIKE :A || '%' ORDER BY ID INTO C DO SUSPEND; END^
+CREATE PROCEDURE SA6 RETURNS (C INTEGER) AS DECLARE A VARCHAR(10) CHARACTER SET UTF8 = 'ab'; DECLARE E VARCHAR(10) CHARACTER SET WIN1252 = 'é'; BEGIN FOR SELECT ID FROM STT WHERE U STARTING WITH :A || '' AND W <> :E ORDER BY ID INTO C DO SUSPEND; END^
+CREATE PROCEDURE SA8 RETURNS (C INTEGER) AS DECLARE A VARCHAR(10) CHARACTER SET UTF8 = 'ab'; DECLARE E VARCHAR(10) CHARACTER SET WIN1252 = 'é'; BEGIN FOR SELECT ID FROM STT WHERE U LIKE :A || '%' AND W <> 'é' ORDER BY ID INTO C DO SUSPEND; END^
+CREATE PROCEDURE SA10 RETURNS (C INTEGER) AS DECLARE A VARCHAR(10) CHARACTER SET WIN1252 = 'ab'; DECLARE E VARCHAR(10) CHARACTER SET WIN1252 = 'é'; BEGIN FOR SELECT ID FROM STT WHERE U LIKE :A || '%' ORDER BY ID INTO C DO SUSPEND; END^
+CREATE PROCEDURE SA12 RETURNS (C INTEGER) AS DECLARE A VARCHAR(10) CHARACTER SET UTF8 = 'ab'; DECLARE E VARCHAR(10) CHARACTER SET WIN1252 = 'é'; BEGIN SELECT COUNT(*) FROM STT WHERE U LIKE :A || '%' INTO C; SUSPEND; END^
+CREATE PROCEDURE SCALL (X VARCHAR(10)) RETURNS (R VARCHAR(10)) AS BEGIN R = X || '!'; SUSPEND; END^
+CREATE PROCEDURE SCALLER RETURNS (R VARCHAR(10), R2 VARCHAR(10)) AS DECLARE E VARCHAR(10) CHARACTER SET WIN1252 = 'é'; BEGIN SELECT R FROM SCALL('ab') INTO R; EXECUTE PROCEDURE SCALL('cd') RETURNING_VALUES R2; SUSPEND; END^
+SET TERM ;^
 COMMIT;
 SQL
 grep -qiE 'Statement failed|error' /tmp/psqlassign-build.log && { echo "FAIL fixture build (UTF8)"; sed 's/^/   /' /tmp/psqlassign-build.log; exit 1; }
@@ -232,6 +284,7 @@ SET TERM ^;
 CREATE PROCEDURE WL1 (X VARCHAR(10) CHARACTER SET UTF8 = 'é') RETURNS (R VARCHAR(10) CHARACTER SET UTF8, O INTEGER) AS BEGIN R = X; O = OCTET_LENGTH(X); SUSPEND; END^
 CREATE PROCEDURE WL7 RETURNS (C INTEGER) AS BEGIN SELECT COUNT(*) FROM XTU WHERE W = 'é' INTO :C; SUSPEND; END^
 CREATE PROCEDURE WL3 RETURNS (R VARCHAR(20) CHARACTER SET UTF8, O INTEGER) AS BEGIN R = 'é' || 'a'; O = OCTET_LENGTH('é'); SUSPEND; END^
+CREATE FUNCTION SH2 RETURNS INTEGER AS BEGIN RETURN OCTET_LENGTH(CAST('ab' || 'é' AS VARCHAR(10) CHARACTER SET OCTETS)); END^
 SET TERM ;^
 COMMIT;
 SQL
@@ -543,11 +596,99 @@ same $'9e FOR SELECT of a UTF8 \'Ωx\' INTO a WIN1252 output' $'SELECT * FROM YP
 same $'9e CONTROL a plain UTF8 argument through a WIN1252 attachment' $'SELECT * FROM XPU(\'ab\');'
 CH=""
 pin  $'9e ...and under NONE' $'SELECT * FROM YPFS2;' $'ID R O|1 \xe9 1|Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets|-At procedure "PUBLIC"."YPFS2" line: 1, col: 102'
+echo "--- 10a. EVERY LITERAL OF A STORED BODY IS OF THE SET IT WAS COMPILED IN - ASCII INCLUDED (it took the caller's set)"
+# under a NONE or a WIN1252 attachment the argument 'é' arrives as the two
+# octets C3 A9 - two WIN1252 characters - and moves into UTF8 as four
+for CH in "" WIN1252; do
+  pin  "10a [${CH:-NONE}] 'ab' || <WIN1252 Y> in a UTF8-created procedure (it answered 4 and 3)" $'SELECT * FROM SF1(\'é\');' $'O|6'
+  pin  "10a [${CH:-NONE}] ...with an unused UTF8 'é' local beside it" $'SELECT * FROM SF2(\'é\');' $'O|6'
+  pin  "10a [${CH:-NONE}] ...a function" $'SELECT SG1(\'é\') FROM RDB$DATABASE;' $'SG1|6'
+  pin  "10a [${CH:-NONE}] ...Y = 'é' assigned in the body (it answered 3)" $'SELECT * FROM SF3;' $'O|4'
+  pin  "10a [${CH:-NONE}] ...SELECT OCTET_LENGTH('ab' || :Y) INTO" $'SELECT * FROM SF5;' $'O|4'
+  pin  "10a [${CH:-NONE}] ...FOR SELECT OCTET_LENGTH('ab' || W)" $'SELECT * FROM SF6;' $'O|4'
+  pin  "10a [${CH:-NONE}] 'x' || 'é' in a function (it answered 2 under WIN1252)" $'SELECT SFX() FROM RDB$DATABASE;' $'SFX|3'
+  pin  "10a [${CH:-NONE}] FOR SELECT 'ab' || W with T = 'é' beside it (it answered 3)" $'SELECT R FROM SM1;' $'R|4|4|4'
+  pin  "10a [${CH:-NONE}] ...'ab' || U" $'SELECT R FROM SM2;' $'R|4|4|5'
+  pin  "10a [${CH:-NONE}] 'ab' || 'é' || 'c', and through CAST, COALESCE, TRIM and UPPER (it answered 4,3,3,3,3)" $'SELECT * FROM SM3;' $'R|5|4|4|4|4'
+  pin  "10a [${CH:-NONE}] 'x' || (SELECT MAX(U) ...) || 'é'" $'SELECT SM13() FROM RDB$DATABASE;' $'SM13|5'
+  pin  "10a [${CH:-NONE}] CAST(... AS VARCHAR(5)) without a set is the database default's (NONE, which yields); COALESCE('ab', Y) is UTF8" $'SELECT * FROM SPB;' $'O O2|3 4'
+  pin  "10a [${CH:-NONE}] a call's ASCII literal arguments still read as arguments" $'SELECT * FROM SCALLER;' $'R R2|ab! cd!'
+done
+CH=UTF8
+pin  $'10a [UTF8] \'ab\' || <WIN1252 Y> in a UTF8-created procedure' $'SELECT * FROM SF1(\'é\');' $'O|4'
+pin  $'10a [UTF8] ...with an unused UTF8 \'é\' local beside it' $'SELECT * FROM SF2(\'é\');' $'O|4'
+pin  $'10a [UTF8] ...a function' $'SELECT SG1(\'é\') FROM RDB$DATABASE;' $'SG1|4'
+pin  $'10a [UTF8] ...Y = \'é\' assigned in the body' $'SELECT * FROM SF3;' $'O|4'
+pin  $'10a [UTF8] ...SELECT OCTET_LENGTH(\'ab\' || :Y) INTO' $'SELECT * FROM SF5;' $'O|4'
+pin  $'10a [UTF8] ...FOR SELECT OCTET_LENGTH(\'ab\' || W)' $'SELECT * FROM SF6;' $'O|4'
+pin  $'10a [UTF8] \'x\' || \'é\' in a function' $'SELECT SFX() FROM RDB$DATABASE;' $'SFX|3'
+pin  $'10a [UTF8] FOR SELECT \'ab\' || W with T = \'é\' beside it' $'SELECT R FROM SM1;' $'R|4|4|4'
+pin  $'10a [UTF8] ...\'ab\' || U' $'SELECT R FROM SM2;' $'R|4|4|5'
+pin  $'10a [UTF8] \'ab\' || \'é\' || \'c\', and through CAST, COALESCE, TRIM and UPPER' $'SELECT * FROM SM3;' $'R|5|4|4|4|4'
+pin  $'10a [UTF8] \'x\' || (SELECT MAX(U) ...) || \'é\'' $'SELECT SM13() FROM RDB$DATABASE;' $'SM13|5'
+pin  $'10a [UTF8] CAST(... AS VARCHAR(5)) without a set is the database default\'s (it answered 4)' $'SELECT * FROM SPB;' $'O O2|3 4'
+pin  $'10a [UTF8] a call\'s ASCII literal arguments' $'SELECT * FROM SCALLER;' $'R R2|ab! cd!'
+# the mirror: 'ab' || <UTF8 Y> - under WIN1252 the argument is the two
+# characters 'Ã©', four UTF8 octets
+CH=WIN1252
+pin  $'10a [WIN1252] \'ab\' || <UTF8 Y>, UTF8-created' $'SELECT * FROM SF7(\'é\');' $'O|6'
+pin  $'10a [WIN1252] ...NONE-created: the NONE \'ab\' yields to Y\'s UTF8 (it answered 4)' $'SELECT * FROM SNF7(\'é\');' $'O|6'
+pin  $'10a [WIN1252] a WIN1252-created \'ab\' || \'é\' (\'Ã©\') cast to OCTETS' $'SELECT SH2() FROM RDB$DATABASE;' $'SH2|4'
+CH=UTF8
+pin  $'10a [UTF8] \'ab\' || <UTF8 Y>, UTF8-created' $'SELECT * FROM SF7(\'é\');' $'O|4'
+pin  $'10a [UTF8] ...NONE-created' $'SELECT * FROM SNF7(\'é\');' $'O|4'
+pin  $'10a [UTF8] a WIN1252-created \'ab\' || \'é\' cast to OCTETS (it answered 6)' $'SELECT SH2() FROM RDB$DATABASE;' $'SH2|4'
+CH=""
+pin  $'10a [NONE] \'ab\' || <UTF8 Y>, UTF8-created' $'SELECT * FROM SF7(\'é\');' $'O|4'
+pin  $'10a [NONE] ...NONE-created' $'SELECT * FROM SNF7(\'é\');' $'O|4'
+pin  $'10a [NONE] a WIN1252-created \'ab\' || \'é\' cast to OCTETS' $'SELECT SH2() FROM RDB$DATABASE;' $'SH2|4'
+
+echo "--- 10b. AN EXECUTE STATEMENT'S TEXT MOVES FROM ITS OWN SET INTO THE ATTACHMENT'S (refused, or run with the wrong octets)"
+# a UTF8 literal || a WIN1252 'é' is UTF8 text; into a NONE local it is the
+# octets C3 A9, which no caller reads as W's E9 (it ran E9 and counted 1)
+CH=""
+pin  $'10b [NONE] S = \'... w = \'\'\' || <WIN1252 E> || \'\'\'\', S a NONE local: 39 octets, and the count' $'SELECT C, N FROM SE1;' $'C N|0 39'
+pin  $'10b [NONE] ...S a UTF8 local (refused)' $'SELECT * FROM SE2;' $'C|0'
+pin  $'10b [NONE] ...u = <UTF8 E>, S a NONE local: C3 A9 as NONE meets U\'s C3 A9' $'SELECT * FROM SE3;' $'C|1'
+pin  $'10b [NONE] ...S a UTF8 local' $'SELECT * FROM SE4;' $'C|1'
+pin  $'10b [NONE] the text built in the EXECUTE STATEMENT itself, u = <UTF8 E>' $'SELECT * FROM SE5;' $'C|1'
+pin  $'10b [NONE] ...w = <WIN1252 E>' $'SELECT * FROM SE6;' $'C|0'
+pin  $'10b [NONE] ...u = <NONE A> or w = <WIN1252 E> (refused)' $'SELECT * FROM SE8;' $'C|1'
+pin  $'10b [NONE] a body literal \'é\' in the text' $'SELECT * FROM SE9;' $'C|1'
+CH=WIN1252
+pin  $'10b [WIN1252] S a NONE local: C3 A9 reads \'Ã©\' there' $'SELECT C, N FROM SE1;' $'C N|0 39'
+pin  $'10b [WIN1252] ...S a UTF8 local: \'é\' moves into E9' $'SELECT * FROM SE2;' $'C|1'
+pin  $'10b [WIN1252] ...u = <UTF8 E>, S a NONE local' $'SELECT * FROM SE3;' $'C|0'
+pin  $'10b [WIN1252] ...S a UTF8 local' $'SELECT * FROM SE4;' $'C|1'
+pin  $'10b [WIN1252] the text built in the EXECUTE STATEMENT, u = <UTF8 E>' $'SELECT * FROM SE5;' $'C|1'
+pin  $'10b [WIN1252] ...w = <WIN1252 E>' $'SELECT * FROM SE6;' $'C|1'
+pin  $'10b [WIN1252] ...u = <NONE A> or w = <WIN1252 E>' $'SELECT * FROM SE8;' $'C|1'
+pin  $'10b [WIN1252] a body literal \'é\' in the text, S a NONE local' $'SELECT * FROM SE9;' $'C|0'
+CH=UTF8
+pin  $'10b [UTF8] S a NONE local' $'SELECT C, N FROM SE1;' $'C N|1 39'
+pin  $'10b [UTF8] ...S a UTF8 local' $'SELECT * FROM SE2;' $'C|1'
+pin  $'10b [UTF8] ...u = <UTF8 E>, S a NONE local' $'SELECT * FROM SE3;' $'C|1'
+pin  $'10b [UTF8] ...S a UTF8 local' $'SELECT * FROM SE4;' $'C|1'
+pin  $'10b [UTF8] the text built in the EXECUTE STATEMENT, u = <UTF8 E>' $'SELECT * FROM SE5;' $'C|1'
+pin  $'10b [UTF8] ...w = <WIN1252 E>' $'SELECT * FROM SE6;' $'C|1'
+pin  $'10b [UTF8] ...u = <NONE A> or w = <WIN1252 E>' $'SELECT * FROM SE8;' $'C|1'
+pin  $'10b [UTF8] a body literal \'é\' in the text' $'SELECT * FROM SE9;' $'C|1'
+CH=""
+
+echo "--- 10c. LIKE / STARTING WITH :A || '%' IN A BODY THAT HOLDS A NON-ASCII LITERAL (the source path refused the expression pattern)"
+for CH in "" UTF8 WIN1252; do
+  pin  "10c [${CH:-NONE}] U LIKE :A || '%', an unused WIN1252 'é' local beside it" $'SELECT * FROM SA3;' $'C|2|3'
+  pin  "10c [${CH:-NONE}] ...a WIN1252 :A" $'SELECT * FROM SA10;' $'C|2|3'
+  pin  "10c [${CH:-NONE}] ...the singleton SELECT COUNT(*) INTO" $'SELECT * FROM SA12;' $'C|2'
+  pin  "10c [${CH:-NONE}] U STARTING WITH :A || '' AND W <> :E" $'SELECT * FROM SA6;' $'C|2|3'
+  pin  "10c [${CH:-NONE}] U LIKE :A || '%' AND W <> 'é'" $'SELECT * FROM SA8;' $'C|2|3'
+done
+CH=""
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-psqlassign-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 210 ]; then echo "FAIL only $ran checks ran (floor 210)"; fail=1; fi
+if [ "$ran" -lt 295 ]; then echo "FAIL only $ran checks ran (floor 295)"; fail=1; fi
 exit $fail

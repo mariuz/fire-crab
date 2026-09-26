@@ -244,7 +244,30 @@ both "column || column stays right (UTF8||WIN1252)" "SELECT U || W AS R FROM TX 
 both "column || column stays right (UTF8||OCTETS)"  "SELECT U || O AS R FROM TX WHERE ID=1"
 both "column || column stays right (WIN1252||NONE)" "SELECT W || N AS R FROM TX WHERE ID=1"
 
+echo "--- 6. a literal's value under CONTAINING, and a pattern built from literals ------"
+# The join above types `'x' || U` as the ATTACHMENT's set, and a value of
+# that set folds case in that set's law when the attachment names a real
+# one (measured under UTF8: 'é' || U CONTAINING 'É' takes the row, 'xé'
+# CONTAINING 'É' is true) - read as no set at all, the fold was NONE's,
+# which leaves 'é' alone, and every one of these found nothing. A LIKE
+# or STARTING WITH pattern that is a concatenation of literals is an
+# expression pattern; read as a literal with a `||` left over, it refused.
+both "a literal || UTF8 column CONTAINING folds in the attachment's set (it found nothing)" \
+    "SELECT COUNT(*) AS R FROM TX WHERE 'é' || U CONTAINING 'É'" "-ch UTF8"
+both "...the column's own eszett through the same fold" \
+    "SELECT COUNT(*) AS R FROM TX WHERE 'x' || U CONTAINING 'ß'" "-ch UTF8"
+both "...a literal || WIN1252 column" \
+    "SELECT COUNT(*) AS R FROM TX WHERE 'xé' || W CONTAINING 'é'" "-ch UTF8"
+both "a pure literal CONTAINING (it was false)" \
+    "SELECT COUNT(*) AS R FROM TX WHERE 'xé' CONTAINING 'É'" "-ch UTF8"
+both "...and under NONE the fold stays NONE's" \
+    "SELECT COUNT(*) AS R FROM TX WHERE 'xé' CONTAINING 'É'" "-ch NONE"
+both "a LIKE pattern that is 'str' || '%' (it refused)" \
+    "SELECT COUNT(*) AS R FROM TX WHERE U LIKE 'str' || '%'" "-ch UTF8"
+both "a STARTING WITH prefix that is 'st' || '' (it refused)" \
+    "SELECT COUNT(*) AS R FROM TX WHERE U STARTING WITH 'st' || ''" "-ch UTF8"
+
 echo "----------------------------------------------------------------------"
-[ "$ran" -ge 42 ] || { echo "FAIL only $ran checks ran"; fail=1; }
+[ "$ran" -ge 49 ] || { echo "FAIL only $ran checks ran"; fail=1; }
 [ $fail -eq 0 ] && echo "PASS $ran checks" || echo "FAIL"
 exit $fail
