@@ -5426,7 +5426,10 @@ pub fn alter_view(
         return Err(format!("View {} not found", want));
     }
     let old_id = rel as i64;
-    drop_view(file, page_size, &want)?;
+    // an ALTER keeps the relation, so a dependent view or procedure
+    // does not block it (measured: ALTER VIEW VD under VDEP passes where
+    // DROP VIEW VD is refused)
+    drop_view_rows(file, page_size, &want, false)?;
     create_view_impl(file, page_size, name, view_blr, view_source, fields, contexts, Some(old_id))
 }
 
@@ -5536,11 +5539,29 @@ fn insert_auto_field_row(file: &mut crate::Image, page_size: usize, source: &str
 /// view relations, formats, security class and privileges go; a TABLE is
 /// not a view (the engine's "does not exist" for DROP VIEW, probed).
 pub fn drop_view(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
+    drop_view_rows(file, page_size, name, true)
+}
+
+/// [drop_view]'s body; `check_deps` is false for the ALTER VIEW path,
+/// which keeps the relation and so answers to no dependent.
+fn drop_view_rows(file: &mut crate::Image, page_size: usize, name: &str, check_deps: bool) -> Result<(), String> {
     let name = name.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &name)
         .ok_or_else(|| format!("View {} not found", name))?;
     if rel < 128 || !is_view(file, page_size, &name) {
         return Err(format!("View {} not found", name));
+    }
+    // A view something still reads is not dropped - the same two checks
+    // DROP TABLE makes ([relation_dependents]), measured on 2182: a view
+    // over it is "cannot delete / TABLE "PUBLIC"."V1" / there are N
+    // dependencies" (N the RDB$VIEW_RELATIONS rows), a procedure or a
+    // trigger on another relation is "VIEW "PUBLIC"."V1"" with the
+    // distinct dependents. RECREATE VIEW meets the same wall; ALTER VIEW
+    // and CREATE OR ALTER VIEW pass (they keep the relation).
+    if check_deps {
+        if let Some((kind, n)) = relation_dependents(file, page_size, &name, true) {
+            return Err(format!("cannot delete {} {} - there are {} dependencies", kind, name, n));
+        }
     }
     let mut domain_names: Vec<String> = Vec::new();
     {
@@ -5591,6 +5612,21 @@ pub fn drop_view(file: &mut crate::Image, page_size: usize, name: &str) -> Resul
         let fid = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$VIEW_NAME")?;
         let n = name.clone();
         delete_catalog_rows(file, page_size, "RDB$VIEW_RELATIONS", move |v| text_is(v.get(fid), &n))?;
+    }
+    // the view's OWN dependency rows go with it (the engine's
+    // MET_delete_dependencies for obj_view, and obj_computed for its
+    // expression domains): left behind, a dropped dependent view still
+    // counted against its base (measured: DROP VIEW VDEP, then DROP VIEW
+    // VD answered "VIEW / 2 dependencies" where the engine drops it)
+    {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let n = name.clone();
+        let domains = domain_names.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            (text_is(v.get(dn_f), &n) && int_eq(v.get(dt_f), 1))
+                || (int_eq(v.get(dt_f), 3) && domains.iter().any(|d| text_is(v.get(dn_f), d)))
+        })?;
     }
     {
         let fid = sys_fid(file, page_size, "RDB$FORMATS", "RDB$RELATION_ID")?;
@@ -6528,6 +6564,17 @@ pub fn drop_index(file: &mut crate::Image, page_size: usize, index_name: &str) -
         return Err("system relations are read-only".into());
     }
     deferred_drop_index(file, page_size, rel, &want)?;
+    // an expression index's own RDB$DEPENDENCIES rows (dependent type 6,
+    // engine-built) go with it, or they keep counting against the table
+    // (measured: DROP INDEX, then DROP TABLE passes on 2182 - the engine
+    // leaves a renamed RDB$TEMP_DEPEND_* row behind, which this server
+    // does not imitate)
+    {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let w = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| text_is(v.get(dn_f), &w) && int_eq(v.get(dt_f), 6))?;
+    }
     advance_oldest_transactions(file, page_size)?;
     Ok(())
 }
@@ -6536,8 +6583,12 @@ pub fn drop_index(file: &mut crate::Image, page_size: usize, index_name: &str) -
 /// column is written.
 #[derive(Clone)]
 pub enum CommentTarget {
-    /// `COMMENT ON TABLE <name>` - the `RDB$RELATIONS` row
+    /// `COMMENT ON TABLE <name>` - the `RDB$RELATIONS` row of a TABLE
     Table(String),
+    /// `COMMENT ON VIEW <name>` - the `RDB$RELATIONS` row of a VIEW. The
+    /// two verbs are not interchangeable (measured on 2182): TABLE over a
+    /// view is "Table @1 not found", VIEW over a table "View @1 not found"
+    View(String),
     /// `COMMENT ON COLUMN <table>.<column>` - the `RDB$RELATION_FIELDS` row
     Column(String, String),
     /// `COMMENT ON INDEX <name>` - the `RDB$INDICES` row
@@ -6600,12 +6651,30 @@ pub fn comment_on(
     // an empty comment is a NULL comment (engine probe: IS '' clears it)
     let text = text.filter(|t| !t.is_empty());
     match target {
-        CommentTarget::Table(name) => {
+        CommentTarget::Table(name) | CommentTarget::View(name) => {
             let name = name.trim().to_string();
-            let rel = crate::resolve_relation(file, page_size, &name)
-                .ok_or_else(|| format!("Table \"{}\" not found", name))?;
+            let want_view = matches!(target, CommentTarget::View(_));
+            // the kind's own "not found", and - the engine's quirk, kept
+            // - a TABLE verb names the missing relation BARE ("NOSUCH")
+            // but a view it found QUALIFIED ("PUBLIC"."V1"); the VIEW
+            // verb qualifies both. The wire layer spells it from the
+            // message's tail
+            let rel = crate::resolve_relation(file, page_size, &name).ok_or_else(|| {
+                if want_view {
+                    format!("View {} not found (qualified)", name)
+                } else {
+                    format!("Table {} not found (bare)", name)
+                }
+            })?;
             if rel < 128 {
                 return Err("system relations are read-only".into());
+            }
+            if is_view(file, page_size, &name) != want_view {
+                return Err(if want_view {
+                    format!("View {} not found (qualified)", name)
+                } else {
+                    format!("Table {} not found (qualified)", name)
+                });
             }
             let value = description_blob(file, page_size, 6, text)?;
             let name_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
@@ -7243,27 +7312,154 @@ fn table_pk_referenced_by_fk(file: &crate::Image, page_size: usize, table: &str)
     })
 }
 
-/// The DISTINCT procedures that reference this table (RDB$DEPENDENCIES,
-/// dependent type 5). When no view blocks, these are the drop's N.
-fn procedure_dependents(file: &crate::Image, page_size: usize, table: &str) -> Vec<String> {
-    let mut procs: Vec<String> = Vec::new();
-    let Some(drel) = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES") else { return procs };
-    let Some(dfmts) = system_relation_formats(file, page_size, "RDB$DEPENDENCIES") else { return procs };
-    let Some((_, ddescs)) = dfmts.iter().max_by_key(|(n, _)| *n) else { return procs };
+/// A relation's RDB$RELATION_TYPE (0 persistent, 1 view, 2 external, 4
+/// GTT ON COMMIT PRESERVE ROWS, 5 GTT ON COMMIT DELETE ROWS), or None
+/// for a name the catalog does not hold.
+pub fn relation_type_of(file: &crate::Image, page_size: usize, name: &str) -> Option<i64> {
+    let formats = system_relation_formats(file, page_size, "RDB$RELATIONS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$RELATIONS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, type_f) = (fid("RDB$RELATION_NAME")?, fid("RDB$RELATION_TYPE")?);
+    let want = name.trim();
+    let mut out = None;
+    walk_rows(file, page_size, 6, descs, |v| {
+        if out.is_none() && text_is(v.get(name_f), want) {
+            out = Some(match v.get(type_f) {
+                Some(Value::Int(t)) => *t,
+                _ => 0,
+            });
+        }
+    });
+    out
+}
+
+/// What blocks the DROP of a relation - the engine's two checks in
+/// dfw.epp `delete_relation` phase 1, in their order, each measured on
+/// 2182 (`qa/serve-real-dmlcheck.sh`):
+///
+///   1. RDB$VIEW_RELATIONS rows naming the relation as a base: the
+///      count is the ROWS, one per view context - a view that self-joins
+///      V counts 2 - and the object is always spelled `TABLE @1`
+///      (isc_table_name), even when the relation being dropped is a
+///      view (`DROP VIEW V1` under a dependent view: "cannot delete /
+///      TABLE "PUBLIC"."V1" / there are 2 dependencies");
+///   2. otherwise `check_dependencies`: the DISTINCT (dependent name,
+///      dependent type) pairs in RDB$DEPENDENCIES whose depended-on is
+///      the relation with its own kind (type 0 a table, 1 a view), and
+///      the object is spelled by that kind - `VIEW @1` for a view read
+///      by a procedure and a trigger ("there are 2 dependencies"),
+///      `TABLE @1` for a table. Dependents that go with the relation
+///      are not counted (the engine's `find_depend_in_dfw`): its own
+///      triggers, its own computed / validation domains (types 3 and
+///      4 whose domain is a RDB$FIELD_SOURCE of the relation - ANOTHER
+///      table's computed column reading it counts: `B.CNT COMPUTED BY
+///      ((SELECT COUNT(*) FROM A))` beside C's two CHECK triggers is
+///      "there are 3 dependencies", and 1 once C is gone), and its own
+///      expression indices (type 6, engine-built: an index COMPUTED BY
+///      over the table drops with it).
+///
+/// `Some((kind, count))` when something blocks, kind being "TABLE" or
+/// "VIEW" as the message spells it.
+fn relation_dependents(file: &crate::Image, page_size: usize, name: &str, is_view: bool) -> Option<(&'static str, usize)> {
+    let name = name.trim();
+    // 1. the views built over it, one row per context
+    let mut view_rows = 0usize;
+    if let (Some(vrel), Some(vfmts)) = (
+        crate::resolve_relation(file, page_size, "RDB$VIEW_RELATIONS"),
+        system_relation_formats(file, page_size, "RDB$VIEW_RELATIONS"),
+    ) {
+        if let Some((_, vdescs)) = vfmts.iter().max_by_key(|(n, _)| *n) {
+            if let Ok(vreln_f) = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$RELATION_NAME") {
+                walk_rows(file, page_size, vrel, vdescs, |v| {
+                    if text_is(v.get(vreln_f), name) {
+                        view_rows += 1;
+                    }
+                });
+            }
+        }
+    }
+    if view_rows > 0 {
+        return Some(("TABLE", view_rows));
+    }
+    // 2. the recorded dependents of the relation's own kind
+    let own_triggers = triggers_of_relation(file, page_size, name);
+    let own_domains = relation_field_sources(file, page_size, name);
+    let drel = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES")?;
+    let dfmts = system_relation_formats(file, page_size, "RDB$DEPENDENCIES")?;
+    let (_, ddescs) = dfmts.iter().max_by_key(|(n, _)| *n)?;
     let cols = relation_columns(file, page_size, "RDB$DEPENDENCIES");
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
-    let (Some(dn_f), Some(dt_f), Some(don_f)) = (fid("RDB$DEPENDENT_NAME"), fid("RDB$DEPENDENT_TYPE"), fid("RDB$DEPENDED_ON_NAME")) else { return procs };
+    let (dn_f, dt_f, don_f, dot_f) = (
+        fid("RDB$DEPENDENT_NAME")?,
+        fid("RDB$DEPENDENT_TYPE")?,
+        fid("RDB$DEPENDED_ON_NAME")?,
+        fid("RDB$DEPENDED_ON_TYPE")?,
+    );
+    let own_type = if is_view { 1 } else { 0 };
+    let mut seen: Vec<(String, i64)> = Vec::new();
     walk_rows(file, page_size, drel, ddescs, |v| {
-        if text_is(v.get(don_f), table) && matches!(v.get(dt_f), Some(Value::Int(5))) {
-            if let Some(Value::Text(t)) = v.get(dn_f) {
-                let n = t.trim_end().to_string();
-                if !procs.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
-                    procs.push(n);
-                }
+        if !text_is(v.get(don_f), name) || !int_eq(v.get(dot_f), own_type) {
+            return;
+        }
+        let (Some(Value::Text(t)), Some(Value::Int(dt))) = (v.get(dn_f), v.get(dt_f)) else { return };
+        let dn = t.trim_end().to_string();
+        let goes_with_it = match *dt {
+            2 => own_triggers.iter().any(|x| *x == dn),
+            3 | 4 => own_domains.iter().any(|x| *x == dn),
+            6 => find_index_relation(file, page_size, &dn).is_some_and(|(t, _)| t == name),
+            _ => false,
+        };
+        if !goes_with_it && !seen.iter().any(|(n, k)| *n == dn && *k == *dt) {
+            seen.push((dn, *dt));
+        }
+    });
+    if seen.is_empty() {
+        None
+    } else {
+        Some((if is_view { "VIEW" } else { "TABLE" }, seen.len()))
+    }
+}
+
+/// The RDB$FIELD_SOURCE domains of a relation's columns - the auto
+/// domains its computed columns live in, and any named domain a column
+/// was declared with.
+fn relation_field_sources(file: &crate::Image, page_size: usize, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(fmts) = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS") else { return out };
+    let Some((_, descs)) = fmts.iter().max_by_key(|(n, _)| *n) else { return out };
+    let cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(rn_f), Some(src_f)) = (fid("RDB$RELATION_NAME"), fid("RDB$FIELD_SOURCE")) else { return out };
+    walk_rows(file, page_size, 5, descs, |v| {
+        if text_is(v.get(rn_f), name) {
+            if let Some(Value::Text(t)) = v.get(src_f) {
+                out.push(t.trim_end().to_string());
             }
         }
     });
-    procs
+    out
+}
+
+/// The names of a relation's own triggers (its RDB$TRIGGERS rows).
+fn triggers_of_relation(file: &crate::Image, page_size: usize, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let (Some(rel), Some(fmts)) = (
+        crate::resolve_relation(file, page_size, "RDB$TRIGGERS"),
+        system_relation_formats(file, page_size, "RDB$TRIGGERS"),
+    ) else { return out };
+    let Some((_, descs)) = fmts.iter().max_by_key(|(n, _)| *n) else { return out };
+    let cols = relation_columns(file, page_size, "RDB$TRIGGERS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(tn_f), Some(rn_f)) = (fid("RDB$TRIGGER_NAME"), fid("RDB$RELATION_NAME")) else { return out };
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_is(v.get(rn_f), name) {
+            if let Some(Value::Text(t)) = v.get(tn_f) {
+                out.push(t.trim_end().to_string());
+            }
+        }
+    });
+    out
 }
 
 /// The foreign key (if any) whose RDB$REF_CONSTRAINTS row names this
@@ -7723,6 +7919,16 @@ fn write_foreign_key_full(
     fk: &ForeignKeyDef,
     synth_triggers: bool,
 ) -> Result<(), String> {
+    // THE REFERENCED RELATION, before its key is looked for (measured on
+    // 2182 for CREATE TABLE and ALTER TABLE ADD alike): a name the catalog
+    // does not hold is "<verb> @1 failed / Table @2 not found"; a VIEW is
+    // "attempt to reference a view (@1) in a foreign key" (DYN 242).
+    let Some(ref_type) = relation_type_of(file, page_size, &fk.ref_table) else {
+        return Err(format!("Table {} not found (qualified)", fk.ref_table.trim()));
+    };
+    if ref_type == 1 || is_view(file, page_size, &fk.ref_table) {
+        return Err(format!("attempt to reference a view ({}) in a foreign key", fk.ref_table.trim()));
+    }
     let (uq_constraint, partner_index) =
         find_partner_key(file, page_size, &fk.ref_table, &fk.ref_columns).ok_or_else(|| {
             if fk.ref_columns.is_empty() {
@@ -7744,6 +7950,33 @@ fn write_foreign_key_full(
     // not online due to failure to activate one or more indices`), which
     // makes the database unrestorable. Refusing is the only answer.
     check_partner_compatible(file, page_size, table, fk, &partner_index)?;
+    // A KEY MAY NOT OUTLIVE THE ROWS THAT HOLD IT (DYN 232, "@1 cannot
+    // reference @2", SQLSTATE HY000; measured on 2182 after the partner
+    // checks above - a GTT whose FK names a non-key column gets "could
+    // not find UNIQUE or PRIMARY KEY", not this): a global temporary
+    // table of either kind cannot reference a persistent table, a
+    // persistent table cannot reference a GTT of either kind, and an ON
+    // COMMIT PRESERVE ROWS GTT cannot reference an ON COMMIT DELETE ROWS
+    // one. DELETE ROWS -> PRESERVE ROWS, like -> like and a
+    // self-reference pass. Both operands are spelled as the engine
+    // spells them, names already qualified and quoted, so the wire
+    // layer ships the two halves as they stand.
+    {
+        let spell = |name: &str, t: i64| match t {
+            4 => format!("global temporary table \"PUBLIC\".\"{}\" of type ON COMMIT PRESERVE ROWS", name.trim()),
+            5 => format!("global temporary table \"PUBLIC\".\"{}\" of type ON COMMIT DELETE ROWS", name.trim()),
+            _ => format!("persistent table \"PUBLIC\".\"{}\"", name.trim()),
+        };
+        let child = relation_type_of(file, page_size, table).unwrap_or(0);
+        let parent = ref_type;
+        let is_gtt = |t: i64| t == 4 || t == 5;
+        let refused = (is_gtt(child) && !is_gtt(parent))
+            || (!is_gtt(child) && is_gtt(parent))
+            || (child == 4 && parent == 5);
+        if refused {
+            return Err(format!("{} cannot reference {}", spell(table, child), spell(&fk.ref_table, parent)));
+        }
+    }
     create_index(
         file, page_size, table, index_name, &fk.columns, false, false, false,
         Some(&partner_index),
@@ -8849,6 +9082,14 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
     if rel < 128 {
         return Err("system relations cannot be dropped".into());
     }
+    // A VIEW is not a table: `DROP TABLE V1` and `RECREATE TABLE V1` over a
+    // view are the same -607 "Table @1 does not exist" the missing name
+    // gets (measured on 2182, `DROP TABLE IF EXISTS V1` included), and the
+    // view stays. Its own message, so a RECREATE does not read it as "not
+    // there, go on and create".
+    if is_view(file, page_size, &name) {
+        return Err(format!("table {} does not exist: it is a view", name));
+    }
     // FK/PK takes precedence and fires immediately, with its own vector: a
     // FOREIGN KEY on another table that references this table's PRIMARY KEY
     // or UNIQUE constraint blocks the drop before any dependency count.
@@ -8858,39 +9099,12 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
             name
         ));
     }
-    // Then the dependency count. The engine's N is DISTINCT dependent VIEWS
-    // whenever any view exists (procedures/triggers that also reference the
-    // table are recompiled, not counted); with no view, DISTINCT dependent
-    // PROCEDURES. RDB$VIEW_RELATIONS holds one row per view context (fc
-    // writes it for its own views, so this is db-agnostic); the procedure
-    // count reads RDB$DEPENDENCIES, which the engine populates. A trigger on
-    // ANOTHER table that is the SOLE dependent is a recorded boundary - this
-    // server drops there, where the engine refuses.
-    let mut views: Vec<String> = Vec::new();
-    if let Some(vrel) = crate::resolve_relation(file, page_size, "RDB$VIEW_RELATIONS") {
-        let vfmts = system_relation_formats(file, page_size, "RDB$VIEW_RELATIONS")
-            .ok_or("no RDB$VIEW_RELATIONS format")?;
-        let (_, vdescs) = vfmts.iter().max_by_key(|(n, _)| *n).ok_or("no view-relations format")?;
-        let vname_f = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$VIEW_NAME")?;
-        let vreln_f = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$RELATION_NAME")?;
-        walk_rows(file, page_size, vrel, vdescs, |v| {
-            if text_is(v.get(vreln_f), &name) {
-                if let Some(Value::Text(t)) = v.get(vname_f) {
-                    let vn = t.trim_end().to_string();
-                    if !views.iter().any(|x| *x == vn) {
-                        views.push(vn);
-                    }
-                }
-            }
-        });
-    }
-    let n = if !views.is_empty() {
-        views.len()
-    } else {
-        procedure_dependents(file, page_size, &name).len()
-    };
-    if n > 0 {
-        return Err(format!("cannot delete TABLE {} - there are {} dependencies", name, n));
+    // Then the dependency count - the engine's two checks, shared with
+    // DROP VIEW ([relation_dependents]): the RDB$VIEW_RELATIONS rows over
+    // it, else the distinct dependents RDB$DEPENDENCIES records (a
+    // procedure, a trigger on ANOTHER table, ...).
+    if let Some((kind, n)) = relation_dependents(file, page_size, &name, false) {
+        return Err(format!("cannot delete {} {} - there are {} dependencies", kind, name, n));
     }
 
     // gather what the catalog says belongs to this table BEFORE
@@ -9067,6 +9281,21 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         let fid = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
         delete_catalog_rows(file, page_size, "RDB$FIELDS",
             idx_pred(domain_names.clone(), fid))?;
+    }
+    // ...and what those domains and the table's expression indices
+    // recorded in RDB$DEPENDENCIES (a computed column reading ANOTHER
+    // table, type 3; an engine-built COMPUTED BY index, type 6): left
+    // behind they keep that other table undroppable (measured: DROP
+    // TABLE B whose CNT reads A, then DROP TABLE A passes on 2182)
+    {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let domains = domain_names.clone();
+        let indices = index_names.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            (int_eq(v.get(dt_f), 3) && domains.iter().any(|d| text_is(v.get(dn_f), d)))
+                || (int_eq(v.get(dt_f), 6) && indices.iter().any(|i| text_is(v.get(dn_f), i)))
+        })?;
     }
     {
         let fid = sys_fid(file, page_size, "RDB$FORMATS", "RDB$RELATION_ID")?;
@@ -12505,6 +12734,22 @@ pub fn drop_procedure(file: &mut crate::Image, page_size: usize, name: &str) -> 
             text_eq(v.get(rel_f), &want) && int_eq(v.get(obj_f), 5)
         })?;
     }
+    // the procedure's OWN dependency rows go with it (the engine's
+    // MET_delete_dependencies for obj_procedure): a dropped procedure
+    // must stop counting against the view it read (measured: DROP
+    // PROCEDURE PR, then DROP VIEW VP under one trigger is "VIEW / 1")
+    {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        // a packaged member shares the bare name and keeps its rows
+        let pk_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$PACKAGE_NAME").ok();
+        let want = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            text_eq(v.get(dn_f), &want)
+                && int_eq(v.get(dt_f), 5)
+                && !matches!(pk_f.and_then(|f| v.get(f)), Some(Value::Text(_)))
+        })?;
+    }
     advance_oldest_transactions(file, page_size)
 }
 
@@ -14138,6 +14383,20 @@ pub fn drop_package(file: &mut crate::Image, page_size: usize, name: &str) -> Re
         let nf = sys_fid(file, page_size, "RDB$PACKAGES", "RDB$PACKAGE_NAME")?;
         let w = want.clone();
         delete_catalog_rows(file, page_size, "RDB$PACKAGES", move |v| text_eq(v.get(nf), &w))?;
+    }
+    // the package's OWN dependency rows go with it - the engine records
+    // a body's reads under the PACKAGE's name (RDB$DEPENDENT_NAME = the
+    // package, type 18 the header, 19 the body, RDB$PACKAGE_NAME NULL;
+    // measured) and deletes them at DROP PACKAGE: left behind, the
+    // table the body read stays undroppable ("there are 1 dependencies"
+    // where the engine drops it)
+    {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let w = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            text_eq(v.get(dn_f), &w) && (int_eq(v.get(dt_f), 18) || int_eq(v.get(dt_f), 19))
+        })?;
     }
     advance_oldest_transactions(file, page_size)
 }
