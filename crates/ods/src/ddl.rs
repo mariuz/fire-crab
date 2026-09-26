@@ -742,6 +742,69 @@ fn write_format_blob(
     dml::insert_blob(file, page_size, 8, &[fmt_payload], 6)
 }
 
+/// [write_format_blob] for the NEXT format of an existing relation: its
+/// default section carries the newest format's entries forward (a
+/// field since dropped - a placeholder, or past the new end - loses
+/// its entry), plus `extra` - the default of a NOT NULL field this
+/// statement adds. Writing an empty section here, which every ALTER
+/// did, would make each record stored before such a field read it
+/// NULL again after any later ALTER of the table.
+fn write_format_blob_carried(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel: u16,
+    descs: &[Descriptor],
+    extra: Option<(u16, Descriptor, Vec<u8>)>,
+) -> Result<u64, String> {
+    let mut defaults: Vec<(u16, Descriptor, Vec<u8>)> =
+        crate::format::newest_format_default_section(file, page_size, rel)
+            .into_iter()
+            .filter(|(f, _, _)| descs.get(*f as usize).is_some_and(|d| !(d.dtype == 0 && d.length == 0)))
+            .collect();
+    if let Some(x) = extra {
+        defaults.retain(|(f, _, _)| *f != x.0);
+        defaults.push(x);
+    }
+    defaults.sort_by_key(|(f, _, _)| *f);
+    let mut fmt_payload = Vec::with_capacity(2 + descs.len() * 12 + 2);
+    fmt_payload.extend_from_slice(&(descs.len() as u16).to_le_bytes());
+    for d in descs {
+        fmt_payload.push(d.dtype);
+        fmt_payload.push(d.scale as u8);
+        fmt_payload.extend_from_slice(&d.length.to_le_bytes());
+        fmt_payload.extend_from_slice(&(d.sub_type as u16).to_le_bytes());
+        fmt_payload.extend_from_slice(&d.flags.to_le_bytes());
+        fmt_payload.extend_from_slice(&d.offset.to_le_bytes());
+    }
+    fmt_payload.extend_from_slice(&(defaults.len() as u16).to_le_bytes());
+    for (f, d, v) in &defaults {
+        fmt_payload.extend_from_slice(&f.to_le_bytes());
+        fmt_payload.push(d.dtype);
+        fmt_payload.push(d.scale as u8);
+        fmt_payload.extend_from_slice(&d.length.to_le_bytes());
+        fmt_payload.extend_from_slice(&(d.sub_type as u16).to_le_bytes());
+        fmt_payload.extend_from_slice(&d.flags.to_le_bytes());
+        fmt_payload.extend_from_slice(&0u32.to_le_bytes());
+        fmt_payload.extend_from_slice(v);
+    }
+    dml::insert_blob(file, page_size, 8, &[fmt_payload], 6)
+}
+
+/// A dropped field's placeholder is ALL ZERO, offset included, in every
+/// format the engine writes after the drop - not wherever the offset
+/// walk had got to when it passed it. Measured: `TG (K, M)`, add C, drop
+/// C, add C, add D, drop M - the engine's format 6 has BOTH holes
+/// (the first C's and M's) at offset 0; this re-walked the older hole
+/// to offset 8 in every re-format after it (ADD, DROP, a retype).
+fn zero_placeholders(mut descs: Vec<Descriptor>) -> Vec<Descriptor> {
+    for d in descs.iter_mut() {
+        if d.dtype == 0 && d.length == 0 {
+            *d = Descriptor { dtype: 0, scale: 0, length: 0, sub_type: 0, flags: 0, offset: 0 };
+        }
+    }
+    descs
+}
+
 /// Turn a relation's current descriptors back into the `(dtype, length,
 /// scale, sub_type)` tuples `compute_format` consumes. `compute_format`
 /// re-adds the VARYING count word, so it is stripped here first - without
@@ -776,6 +839,22 @@ fn col_field(dtype: u8, length: u16, scale: i8, sub_type: i16) -> (u8, u16, i8, 
 
 /// [col_field] for a column definition: an ARRAY column's storage is the
 /// 8-byte array blob id (dtype_array), whatever its element type
+/// The storage descriptor a declared column gets in its format (at
+/// offset 0) - what a value bound for it is encoded against.
+pub fn column_descriptor(c: &ColumnDef) -> Descriptor {
+    let f = col_field_of(c);
+    let mut d = compute_format(&[f]).into_iter().next().unwrap_or(Descriptor {
+        dtype: 0,
+        scale: 0,
+        length: 0,
+        sub_type: 0,
+        flags: 0,
+        offset: 0,
+    });
+    d.offset = 0;
+    d
+}
+
 fn col_field_of(c: &ColumnDef) -> (u8, u16, i8, i16) {
     if c.dtype == crate::format::dtype::BLOB && c.dims.is_empty() {
         // a blob's descriptor carries its sub_type, and its CHARACTER SET
@@ -1427,11 +1506,20 @@ fn relation_trigger_names(file: &crate::Image, page_size: usize, table: &str) ->
 /// records use the new one. The sequence mirrors the tail of
 /// [create_table] for the single new field, plus a version rewrite of the
 /// `RDB$RELATIONS` row to bump its `RDB$FORMAT` and field count.
+///
+/// A NOT NULL column (or an IDENTITY one, implicitly NOT NULL) over a
+/// table that already has rows needs a value for them: `format_default`
+/// is its DEFAULT evaluated now, as (the value's own descriptor, its
+/// bytes), and it goes into the new format's default section, where
+/// every older record reads it ([crate::format::parse_format_defaults]).
+/// With none, rows present are the engine's 22006 "Cannot make field
+/// ... NOT NULL because there are NULLs present".
 pub fn alter_table_add_column(
     file: &mut crate::Image,
     page_size: usize,
     table: &str,
     col: &ColumnDef,
+    format_default: Option<(Descriptor, Vec<u8>)>,
 ) -> Result<(), String> {
     let table = table.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &table)
@@ -1445,7 +1533,32 @@ pub fn alter_table_add_column(
     {
         return Err(format!("column {} already exists", col.name));
     }
-    let new_fid = existing.iter().map(|c| c.field_id + 1).max().unwrap_or(0);
+    // THE NEW FIELD'S ID IS THE RELATION'S NEXT-ID COUNTER, never one a
+    // dropped field had: records stored under the older formats still
+    // hold that field's bytes at that id, and they would read back
+    // under the new column. Measured, `add c integer default 4`, a row,
+    // `drop c`, `add c integer default 77`: the engine reads the old row
+    // as C NULL, with C at RDB$FIELD_ID 3 of (K 0, M 1) and the counter
+    // RDB$RELATIONS.RDB$FIELD_ID 3 -> 4 (the drop leaves it); this took
+    // max(id)+1 = 2, the dropped C's own id, and the old row read C 4.
+    // The POSITION is the next one after the highest left (a drop does
+    // not renumber: `drop m` between K 0 and C 2 puts the next ADD at 4).
+    let mut new_fid = existing.iter().map(|c| c.field_id + 1).max().unwrap_or(0);
+    if let Some((_, _, image, _)) = find_relations_row(file, page_size, &table) {
+        let sys = system_relation_formats(file, page_size, "RDB$RELATIONS");
+        let fid_f = relation_columns(file, page_size, "RDB$RELATIONS")
+            .iter()
+            .find(|c| c.name == "RDB$FIELD_ID")
+            .map(|c| c.field_id as usize);
+        if let (Some(sys), Some(fid_f)) = (sys, fid_f) {
+            if let Some((_, d)) = sys.iter().max_by_key(|(n, _)| *n) {
+                if let Some(Value::Int(n)) = decode_record(&image, d).get(fid_f) {
+                    new_fid = new_fid.max(u16::try_from(*n).unwrap_or(0));
+                }
+            }
+        }
+    }
+    let new_pos = existing.iter().map(|c| c.position + 1).max().unwrap_or(0);
 
     // a DOMAIN-typed column resolves its storage off the domain's row,
     // exactly as create_table does, and its RDB$FIELD_SOURCE is the
@@ -1526,9 +1639,16 @@ pub fn alter_table_add_column(
         .zip(cur_descs.iter())
         .map(|((dt, l, s, st), d)| (dt, l, s, st, d.offset == 0 && d.length != 0))
         .collect();
+    // the ids between the newest format's end and the new field are
+    // dropped fields' (a trailing drop truncates the format): each keeps
+    // a placeholder, as a mid-table hole does
+    new_fid = new_fid.max(fields.len() as u16);
+    while fields.len() < new_fid as usize {
+        fields.push((0, 0, 0, 0, false));
+    }
     let (dt, l, s, st) = col_field_of(col);
     fields.push((dt, l, s, st, col.computed.is_some()));
-    let new_descs = compute_format_mixed(&fields);
+    let new_descs = zero_placeholders(compute_format_mixed(&fields));
     if new_descs.len() != fields.len() {
         return Err("format computation failed".into());
     }
@@ -1555,7 +1675,29 @@ pub fn alter_table_add_column(
     let new_format_no = cur_format_no + 1;
 
     // --- write the new format version blob + RDB$FORMATS row ----------
-    let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+    // A NOT NULL (or IDENTITY) field over rows that are already there:
+    // with a default, the format carries it for them (measured: `alter
+    // table p add y integer default 5 not null` over one row writes
+    // format 2's section `0100 0100 090004000000000000000000 05000000`
+    // and the row reads Y 5 - an EMPTY table's format carries it too);
+    // without one, the engine's deferred check finds the NULLs and the
+    // whole ALTER fails (22006, measured the same for an identity
+    // column, whose generator never fills a stored row)
+    let not_null = col.not_null || col.identity.is_some();
+    let extra = match (not_null, format_default) {
+        (true, Some((d, v))) if col.identity.is_none() => Some((new_fid, d, v)),
+        (true, _) => {
+            if relation_has_rows(file, page_size, rel) {
+                return Err(format!(
+                    "Cannot make field {} of table {} NOT NULL because there are NULLs present",
+                    col.name, table
+                ));
+            }
+            None
+        }
+        (false, _) => None,
+    };
+    let fmt_blob = write_format_blob_carried(file, page_size, rel, &new_descs, extra)?;
     sys_insert(
         file,
         page_size,
@@ -1567,6 +1709,22 @@ pub fn alter_table_add_column(
             ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(8, fmt_blob))),
         ],
     )?;
+
+    // an IDENTITY column's implicit generator (system flag 6), named
+    // from the generator counter, as create_table draws it. ADD used to
+    // write neither the generator nor the column's RDB$GENERATOR_NAME /
+    // RDB$IDENTITY_TYPE, so the column was a plain nullable one that
+    // read NULL for every inserted row (measured: the engine answers
+    // ID 1, 2 for two inserts after `add id integer generated by
+    // default as identity`, RDB$NULL_FLAG 1, RDB$IDENTITY_TYPE 1)
+    let identity_gen: Option<(String, IdentityDef)> = match &col.identity {
+        Some(id) => {
+            let g = format!("RDB${}", next_generator_number(file, page_size, 1)?);
+            write_generator(file, page_size, &g, 6, id.start, id.increment)?;
+            Some((g, id.clone()))
+        }
+        None => None,
+    };
 
     // --- the new column's domain, RDB$FIELDS and RDB$RELATION_FIELDS --
     // a USER-domain column points at the domain itself; only a plain
@@ -1653,7 +1811,7 @@ pub fn alter_table_add_column(
         ("RDB$FIELD_NAME", SysVal::S(&col.name)),
         ("RDB$RELATION_NAME", SysVal::S(&table)),
         ("RDB$FIELD_SOURCE", SysVal::S(&dom)),
-        ("RDB$FIELD_POSITION", SysVal::I(new_fid as i64)),
+        ("RDB$FIELD_POSITION", SysVal::I(new_pos as i64)),
         // a computed column is read-only: RDB$UPDATE_FLAG 0 (probed)
         ("RDB$UPDATE_FLAG", SysVal::I(if col.computed.is_some() { 0 } else { 1 })),
         ("RDB$FIELD_ID", SysVal::I(new_fid as i64)),
@@ -1682,7 +1840,35 @@ pub fn alter_table_add_column(
         rf_vals.push(("RDB$DEFAULT_SOURCE", SysVal::B(blob_id_bytes(5, src))));
         rf_vals.push(("RDB$DEFAULT_VALUE", SysVal::B(blob_id_bytes(5, val))));
     }
+    // NOT NULL on the row (an identity column's too, with no constraint
+    // row - as create_table writes both)
+    if not_null {
+        rf_vals.push(("RDB$NULL_FLAG", SysVal::I(1)));
+    }
+    if let Some((g, id)) = &identity_gen {
+        rf_vals.push(("RDB$GENERATOR_NAME", SysVal::S(g)));
+        rf_vals.push(("RDB$IDENTITY_TYPE", SysVal::I(id.identity_type as i64)));
+    }
     sys_insert(file, page_size, "RDB$RELATION_FIELDS", 5, &rf_vals)?;
+    // an explicit NOT NULL is a constraint: an INTEG_<n> NOT NULL row
+    // naming the field (measured: `add x integer not null` then `add y
+    // integer default 5 not null` are INTEG_1 X and INTEG_2 Y)
+    if col.not_null {
+        let cname = next_integ_name(file, page_size)?;
+        sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
+            ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+            ("RDB$CONSTRAINT_TYPE", SysVal::S("NOT NULL")),
+            ("RDB$RELATION_NAME", SysVal::S(&table)),
+            ("RDB$DEFERRABLE", SysVal::S("NO")),
+            ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ])?;
+        sys_row_by_name(file, page_size, "RDB$CHECK_CONSTRAINTS", &[
+            ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+            ("RDB$TRIGGER_NAME", SysVal::S(&col.name)),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ])?;
+    }
 
     // --- rebuild RDB$RUNTIME for all fields (incl. the new one, now in
     // RDB$RELATION_FIELDS) so DSQL resolves the added column ------------
@@ -1945,7 +2131,7 @@ fn reformat_for_retype(
         }
         *f = (dt, l, s, st, false);
     }
-    let new_descs = compute_format_mixed(&fields);
+    let new_descs = zero_placeholders(compute_format_mixed(&fields));
 
     let (rel_page, rel_slot, mut rel_image, rec_format) =
         find_relations_row(file, page_size, table).ok_or("RDB$RELATIONS row not found")?;
@@ -1963,7 +2149,7 @@ fn reformat_for_retype(
     };
     let new_format_no = cur_format_no + 1;
 
-    let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+    let fmt_blob = write_format_blob_carried(file, page_size, rel, &new_descs, None)?;
     sys_insert(
         file,
         page_size,
@@ -2942,6 +3128,34 @@ pub fn alter_table_drop_column(
             }
         }
     }
+    // ANY OTHER OBJECT THAT READS THE COLUMN - a trigger, a view, a
+    // procedure: its RDB$DEPENDENCIES rows name the column, and the
+    // engine counts the distinct dependents and refuses (dfw.epp
+    // check_dependencies, `REDUCED TO` the dependent). Measured: a
+    // BEFORE INSERT trigger `new.b = 99` makes `alter table t drop b`
+    // "cannot delete / COLUMN "PUBLIC"."T"."B" / there are 1
+    // dependencies"; this dropped the column, and the trigger's row
+    // still named it.
+    // ...a VIEW column that IS this column is refused first, by the
+    // statement itself, with its own message (DdlNodes.epp
+    // deleteLocalField, DYN 52; measured: "ALTER TABLE "PUBLIC"."T"
+    // failed / Column "C" from table "PUBLIC"."T" is referenced in view
+    // "PUBLIC"."V"")
+    if let Some(view) = view_selecting_column(file, page_size, &table, &col_up) {
+        return Err(format!(
+            "Column {} from table {} is referenced in view {}",
+            col_up, table, view
+        ));
+    }
+    let dependents = column_dependents(file, page_size, &table, &col_up);
+    if !dependents.is_empty() {
+        return Err(format!(
+            "cannot delete COLUMN {}.{}: there are {} dependencies",
+            table,
+            col_up,
+            dependents.len()
+        ));
+    }
     // an indexed/key column would leave a dangling index - reject it
     if let Some(irt) = find_index_root(file, page_size, rel) {
         for e in irt.live_entries() {
@@ -2998,7 +3212,7 @@ pub fn alter_table_drop_column(
         .map(|((dt, l, s, st), d)| (dt, l, s, st, d.offset == 0 && d.length != 0))
         .collect();
     fields[drop_fid] = (0, 0, 0, 0, false); // dropped-field placeholder
-    let mut new_descs = compute_format_mixed(&fields);
+    let mut new_descs = zero_placeholders(compute_format_mixed(&fields));
     // the placeholder itself is all-zero at offset 0 (dfw.epp), matching
     // the engine's format blob for a dropped field
     new_descs[drop_fid] = Descriptor {
@@ -3034,7 +3248,7 @@ pub fn alter_table_drop_column(
     let new_format_no = cur_format_no + 1;
 
     // --- new format blob + RDB$FORMATS row ----------------------------
-    let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+    let fmt_blob = write_format_blob_carried(file, page_size, rel, &new_descs, None)?;
     sys_insert(
         file,
         page_size,
@@ -3092,6 +3306,89 @@ pub fn alter_table_drop_column(
 
     advance_oldest_transactions(file, page_size)?;
     Ok(())
+}
+
+/// The view one of whose columns is `table`.`column` itself: a
+/// RDB$RELATION_FIELDS row whose RDB$BASE_FIELD is the column, sharing
+/// its field source, in a view whose RDB$VIEW_RELATIONS row for that
+/// context is `table` - the engine's own join in deleteLocalField.
+fn view_selecting_column(file: &crate::Image, page_size: usize, table: &str, column: &str) -> Option<String> {
+    let src = relation_field_source(file, page_size, table, column)?;
+    let rf_rel = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS")?;
+    let rf_formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")?;
+    let (_, rf_descs) = rf_formats.iter().max_by_key(|(n, _)| *n)?;
+    let rf = |n: &str| sys_fid(file, page_size, "RDB$RELATION_FIELDS", n).ok();
+    let (rn_f, base_f, src_f, ctx_f) =
+        (rf("RDB$RELATION_NAME")?, rf("RDB$BASE_FIELD")?, rf("RDB$FIELD_SOURCE")?, rf("RDB$VIEW_CONTEXT")?);
+    let mut cands: Vec<(String, i64)> = Vec::new();
+    walk_rows(file, page_size, rf_rel, rf_descs, |v| {
+        if text_is(v.get(base_f), column) && text_is(v.get(src_f), &src) {
+            if let (Some(Value::Text(r)), Some(Value::Int(c))) = (v.get(rn_f), v.get(ctx_f)) {
+                cands.push((r.trim_end().to_string(), *c));
+            }
+        }
+    });
+    if cands.is_empty() {
+        return None;
+    }
+    let vr_rel = crate::resolve_relation(file, page_size, "RDB$VIEW_RELATIONS")?;
+    let vr_formats = system_relation_formats(file, page_size, "RDB$VIEW_RELATIONS")?;
+    let (_, vr_descs) = vr_formats.iter().max_by_key(|(n, _)| *n)?;
+    let vf = |n: &str| sys_fid(file, page_size, "RDB$VIEW_RELATIONS", n).ok();
+    let (vn_f, vrel_f, vctx_f) = (vf("RDB$VIEW_NAME")?, vf("RDB$RELATION_NAME")?, vf("RDB$VIEW_CONTEXT")?);
+    let mut hit: Option<String> = None;
+    walk_rows(file, page_size, vr_rel, vr_descs, |v| {
+        if hit.is_some() || !text_is(v.get(vrel_f), table) {
+            return;
+        }
+        if let (Some(Value::Text(vn)), Some(Value::Int(c))) = (v.get(vn_f), v.get(vctx_f)) {
+            let vn = vn.trim_end();
+            if cands.iter().any(|(r, cc)| r == vn && cc == c) {
+                hit = Some(vn.to_string());
+            }
+        }
+    });
+    hit
+}
+
+/// The distinct (dependent name, dependent type) pairs whose
+/// RDB$DEPENDENCIES rows name `table`.`column` (a relation, type 0).
+fn column_dependents(file: &crate::Image, page_size: usize, table: &str, column: &str) -> Vec<(String, i64)> {
+    let mut out: Vec<(String, i64)> = Vec::new();
+    let (Some(rel), Some(formats)) = (
+        crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES"),
+        system_relation_formats(file, page_size, "RDB$DEPENDENCIES"),
+    ) else {
+        return out;
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else { return out };
+    let cols = relation_columns(file, page_size, "RDB$DEPENDENCIES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(dep_f), Some(on_f), Some(fld_f), Some(on_ty_f), Some(dep_ty_f)) = (
+        fid("RDB$DEPENDENT_NAME"),
+        fid("RDB$DEPENDED_ON_NAME"),
+        fid("RDB$FIELD_NAME"),
+        fid("RDB$DEPENDED_ON_TYPE"),
+        fid("RDB$DEPENDENT_TYPE"),
+    ) else {
+        return out;
+    };
+    walk_rows(file, page_size, rel, descs, |v| {
+        if !text_is(v.get(on_f), table) || !text_is(v.get(fld_f), column) {
+            return;
+        }
+        if !matches!(v.get(on_ty_f), Some(Value::Int(0))) {
+            return;
+        }
+        let (Some(Value::Text(d)), Some(Value::Int(t))) = (v.get(dep_f), v.get(dep_ty_f)) else {
+            return;
+        };
+        let key = (d.trim_end().to_string(), *t);
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    });
+    out
 }
 
 /// The storage width of an integer dtype, for the widening check.
@@ -3278,7 +3575,7 @@ pub fn alter_table_alter_column_type(
         .collect();
     let (dt, l, s, st) = col_field_of(new_col);
     fields[fid] = (dt, l, s, st, false);
-    let new_descs = compute_format_mixed(&fields);
+    let new_descs = zero_placeholders(compute_format_mixed(&fields));
 
     // the column's domain (RDB$FIELD_SOURCE) - retyped in place
     let rf_formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
@@ -3320,7 +3617,7 @@ pub fn alter_table_alter_column_type(
     let new_format_no = cur_format_no + 1;
 
     // --- new format blob + RDB$FORMATS row ----------------------------
-    let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+    let fmt_blob = write_format_blob_carried(file, page_size, rel, &new_descs, None)?;
     sys_insert(
         file,
         page_size,
@@ -3751,6 +4048,23 @@ pub fn alter_column_position(
 
 /// Whether any committed primary record of `rel` has a NULL in field
 /// `fid` - the check `SET NOT NULL` makes before it can succeed.
+/// Whether a relation holds any record at all - the rows an added NOT
+/// NULL field without a default would leave NULL.
+fn relation_has_rows(file: &crate::Image, page_size: usize, rel: u16) -> bool {
+    let tips = crate::tra::TipChain::read(file, page_size);
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
+            continue;
+        };
+        for r in dp.records() {
+            if crate::data::catalog_image(file, page_size, &r, tips.as_ref()).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn column_has_nulls(file: &crate::Image, page_size: usize, rel: u16, fid: usize) -> bool {
     let formats = crate::relation_formats(file, page_size, rel);
     let tips = crate::tra::TipChain::read(file, page_size);
@@ -3921,7 +4235,7 @@ pub fn field_changed(file: &mut crate::Image, page_size: usize, field: &str) -> 
         if fields.is_empty() {
             continue;
         }
-        let new_descs = compute_format_mixed(&fields);
+        let new_descs = zero_placeholders(compute_format_mixed(&fields));
         let same = new_descs.len() == cur_descs.len()
             && new_descs.iter().zip(cur_descs.iter()).all(|(a, b)| {
                 a.dtype == b.dtype && a.length == b.length && a.scale == b.scale && a.sub_type == b.sub_type && a.offset == b.offset
@@ -3931,7 +4245,7 @@ pub fn field_changed(file: &mut crate::Image, page_size: usize, field: &str) -> 
             continue;
         }
         let new_format_no = *cur_no as i64 + 1;
-        let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+        let fmt_blob = write_format_blob_carried(file, page_size, rel, &new_descs, None)?;
         sys_insert(
             file,
             page_size,
@@ -5426,7 +5740,7 @@ pub fn append_identical_format(file: &mut crate::Image, page_size: usize, table:
     let formats = crate::relation_formats(file, page_size, rel);
     let (cur, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("relation has no format")?;
     let next = *cur as i64 + 1;
-    let fmt_blob = write_format_blob(file, page_size, descs)?;
+    let fmt_blob = write_format_blob_carried(file, page_size, rel, descs, None)?;
     sys_insert(
         file,
         page_size,
@@ -5922,6 +6236,28 @@ pub fn alter_trigger_attrs(
     }
     let nm = want.clone();
     patch_sys_row(file, page_size, "RDB$TRIGGERS", rel, move |v| text_eq(v.get(name_f), &nm), &vals)?;
+    advance_oldest_transactions(file, page_size)
+}
+
+/// `ALTER SEQUENCE <g> INCREMENT BY <k>`: the RDB$GENERATORS row's
+/// RDB$GENERATOR_INCREMENT, in place, as the engine MODIFYs it.
+pub fn alter_sequence_increment(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    step: i64,
+) -> Result<(), String> {
+    let want = name.trim().to_string();
+    let rel = crate::resolve_relation(file, page_size, "RDB$GENERATORS").ok_or("no RDB$GENERATORS")?;
+    let name_f = sys_fid(file, page_size, "RDB$GENERATORS", "RDB$GENERATOR_NAME")?;
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$GENERATORS",
+        rel,
+        move |v| text_eq(v.get(name_f), &want),
+        &[("RDB$GENERATOR_INCREMENT", SysVal::I(step))],
+    )?;
     advance_oldest_transactions(file, page_size)
 }
 
@@ -7984,6 +8320,15 @@ fn index_itype(d: &Descriptor) -> Option<u16> {
         dtype::SHORT | dtype::LONG | dtype::REAL | dtype::DOUBLE => btw::IDX_NUMERIC,
         dtype::INT64 => btw::IDX_NUMERIC2,
         dtype::INT128 => btw::IDX_BCD, // ODS >= 13.1 (dfw.epp)
+        // A TEXT COLUMN WITH A REAL COLLATION has no key this writer can
+        // build: the engine stamps it `idx_offset_intl_range + ttype`
+        // and keys it by the collation's SORT key (for UNICODE_CI the
+        // ICU key), where this stamps a byte index and keys the bytes.
+        // Measured over a UNICODE_CI column (a domain's, or declared):
+        // the engine's PRIMARY KEY refuses 'abc' beside 'AbC' (23000)
+        // and an FK child 'KEY' finds its parent 'Key'; the byte index
+        // here stored both and refused the child. Refused, not guessed.
+        dtype::TEXT | dtype::VARYING if crate::intl::collation_id(d.sub_type) != 0 => return None,
         dtype::TEXT | dtype::VARYING => btw::IDX_STRING,
         dtype::SQL_DATE => 5,  // idx_sql_date
         dtype::SQL_TIME => 6,  // idx_sql_time
