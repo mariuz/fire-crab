@@ -152,8 +152,12 @@ refuses() { # <label> <sql>
 }
 refuses "an expression over a COMPUTED column refuses" \
   "UPDATE C SET A = 5 WHERE ID = 1 RETURNING CC + 0;"
-refuses "... and the bare computed column still refuses" \
+# (the bare computed column ANSWERS since 2026-09-26 - its stored
+# expression over the after-image, qa/serve-real-ddlref.sh section 5)
+both "the bare computed column answers" \
   "UPDATE C SET A = 5 WHERE ID = 1 RETURNING CC;"
+bothd "... and describes as the engine's" \
+  "UPDATE C SET A = 6 WHERE ID = 1 RETURNING CC;"
 refuses "an aggregate in RETURNING refuses" \
   "UPDATE T SET N = 1 WHERE ID = 1 RETURNING MAX(N);"
 # (was a recorded refusal; the subquery lift in RETURNING answers it now -

@@ -359,7 +359,7 @@ same    "14 ...under FIRST alone" "select first 3 row_number() over (order by id
 refused "14 a union ORDER BY of two keys (with or without FIRST)" "select first 1 id, a from t1 union all select first 1 id, x from t2 order by 1, 2 desc;"
 refused "14 a quantified comparison over a union" "select 1 from rdb\$database where 20 = any (select first 2 a from t1 union all select x from t2);"
 pin "14 a q-string (answered since the introducer/q-string rewrite of 2026-09-26; its quote is no clause boundary)" "select q'{'}', ' order ', ' union ' from t1 rows 1;" "CONSTANT CONSTANT CONSTANT|' order union"
-refused "14 an UPDATE's own ORDER BY / ROWS" "update t3 set name = 'z' order by k rows 1; select name from t3 order by k; rollback;"
+pin "14 an UPDATE's own ORDER BY / ROWS (answered since 2026-09-26: the DML tail, qa/serve-real-ddlref.sh)" "update t3 set name = 'z' order by k rows 1; select name from t3 order by k; rollback;" "NAME|z|y"
 differs "14 COUNT(*) over a union whose value overflows its column" "select count(*) from (select n382 from tn union all select n184 from tn);" "COUNT|$OOR" "COUNT|8"
 
 echo "--- panic check"

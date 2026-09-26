@@ -1294,6 +1294,29 @@ fn rescale_present(raw: i128, from: i8, to: i8) -> Option<i128> {
 /// Everything else - a non-exact numeric with an unchanged type, a type
 /// change with no rule - is `None`, left as the record carries it.
 pub fn present_field(v: &Value, stored: &Descriptor, newest: &Descriptor) -> Option<Value> {
+    // an exact or FLOAT value under a DOUBLE PRECISION descriptor - an
+    // ALTER ... TYPE DOUBLE PRECISION over rows stored before it (the
+    // engine's MOV: INTEGER 7 reads 7.000000000000000, NUMERIC(9,2) 12.34
+    // reads 12.34)
+    if newest.dtype == dtype::DOUBLE && stored.dtype != dtype::DOUBLE {
+        return match v {
+            Value::Int(n) => Some(Value::Double(*n as f64)),
+            Value::Scaled(r, s) => Some(Value::Double(*r as f64 / 10f64.powi(-(*s as i32)))),
+            Value::Float(f) => Some(Value::Double(*f as f64)),
+            _ => None,
+        };
+    }
+    // a VARCHAR value under a CHAR descriptor pads to the new width, as
+    // the engine's MOV into CHAR does ('ab' -> 'ab    ' for CHAR(6)); a
+    // CHAR value under a VARCHAR keeps its pad (measured: CHAR(3) 'x'
+    // retyped to VARCHAR(4) reads 'x  ', CHAR_LENGTH 3)
+    if stored.dtype == dtype::VARYING && newest.dtype == dtype::TEXT {
+        let nw = crate::intl::char_length(newest.dtype, newest.length, newest.sub_type);
+        return match v {
+            Value::Text(t) => Some(Value::Text(crate::intl::fit_char(t, nw))),
+            _ => None,
+        };
+    }
     if stored.dtype == dtype::SQL_DATE && newest.dtype == dtype::TIMESTAMP {
         return match v {
             Value::Date(d) => Some(Value::Timestamp(*d, 0)),
