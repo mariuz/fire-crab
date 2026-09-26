@@ -83,6 +83,21 @@
 #     chars ('„' is three bytes) and announced 5 and 14, padding the
 #     value to that width.
 #
+#   * A SIMPLE CASE / DECODE RETURNS ITS CHOSEN BRANCH AS IT IS, in the
+#     branch's own set (DecodeNode has no cast; the searched CASE and IIF
+#     do): `LOWER(DECODE(ID, 1, W1, 'Ω'))` under UTF8 is 'àéî' for the
+#     WIN1252 row and 'ω' for the rest, HASH 52574 and 3465, CHAR_LENGTH
+#     3 and 1 - and under NONE the literal's bytes case ASCII only (CE A9).
+#     A function that reads its operand's set distributes over the
+#     branches; delivered, each branch moves into the client's field from
+#     its own set (a NONE `E9` branch is *Malformed string* under UTF8).
+#     This server moved every branch into the negotiated set first and
+#     answered 22018 for every row that took the literal; MAX over it
+#     still folds in the negotiated set (22018, as the engine).  A
+#     comparison over such a CASE where the negotiated reading could
+#     change the answer REFUSES (never answers: `CASE ID WHEN 2 THEN W1
+#     ELSE U END = N` counts 1 on the engine and counted 0 here).
+#
 # RECORDED, not fixed: the `_WIN1252 'x'` / `_UTF8 'x'` INTRODUCER on a
 # literal refuses to prepare (a bare Dynamic SQL Error), in HASH, LOWER
 # and POSITION alike - never a wrong value.  `HASH('a', 'b')`, `HASH()`,
@@ -491,11 +506,48 @@ differs "8 HASH() likewise" NONE "SET LIST ON; SELECT HASH() H FROM RDB\$DATABAS
 differs "8 HASH('abc' USING) - no algorithm at all - is the engine's syntax error, a bare 42000 here" NONE "SET LIST ON; SELECT HASH('abc' USING) H FROM RDB\$DATABASE;"
 differs "8 HASH('abc' USING 'CRC32') - a string, not a name - likewise" NONE "SET LIST ON; SELECT HASH('abc' USING 'CRC32') H FROM RDB\$DATABASE;"
 
+echo "--- 9. A SIMPLE CASE / DECODE RETURNS ITS CHOSEN BRANCH AS IT IS, IN THE BRANCH'S OWN SET"
+pin "9 LOWER / HASH over DECODE(ID, 1, W1, 'Ω'): each row in its branch's set" UTF8 "SET LIST ON; SELECT ID, LOWER(DECODE(ID, 1, W1, 'Ω')) L, HASH(DECODE(ID, 1, W1, 'Ω')) H FROM TU ORDER BY ID;" "ID 1|L <c3><a0><c3><a9><c3><ae>|H 52574|ID 2|L <cf><89>|H 3465|ID 3|L <cf><89>|H 3465|ID 4|L <cf><89>|H 3465"
+pin "9 LOWER / HASH over DECODE(ID, 1, W1, 'Ω'): each row in its branch's set" WIN1252 "SET LIST ON; SELECT ID, LOWER(DECODE(ID, 1, W1, 'Ω')) L, HASH(DECODE(ID, 1, W1, 'Ω')) H FROM TU ORDER BY ID;" "ID 1|L <e0><e9><ee>|H 52574|ID 2|L <ee><a9>|H 3465|ID 3|L <ee><a9>|H 3465|ID 4|L <ee><a9>|H 3465"
+pin "9 LOWER / HASH over DECODE(ID, 1, W1, 'Ω'): each row in its branch's set" NONE "SET LIST ON; SELECT ID, LOWER(DECODE(ID, 1, W1, 'Ω')) L, HASH(DECODE(ID, 1, W1, 'Ω')) H FROM TU ORDER BY ID;" "ID 1|L <e0><e9><ee>|H 52574|ID 2|L <ce><a9>|H 3465|ID 3|L <ce><a9>|H 3465|ID 4|L <ce><a9>|H 3465"
+pin "9 DECODE(ID, 1, W1, 2, U, 'Ω') and LOWER of it" UTF8 "SET LIST ON; SELECT ID, DECODE(ID, 1, W1, 2, U, 'Ω') D, LOWER(DECODE(ID, 1, W1, 2, U, 'Ω')) L FROM TU ORDER BY ID;" "ID 1|D <c3><80><c3><89><c3><8e>|L <c3><a0><c3><a9><c3><ae>|ID 2|D abc|L abc|ID 3|D <ce><a9>|L <cf><89>|ID 4|D <ce><a9>|L <cf><89>"
+pin "9 DECODE(ID, 1, W1, 2, U, 'Ω') and LOWER of it" NONE "SET LIST ON; SELECT ID, DECODE(ID, 1, W1, 2, U, 'Ω') D, LOWER(DECODE(ID, 1, W1, 2, U, 'Ω')) L FROM TU ORDER BY ID;" "ID 1|D <c0><c9><ce>|L <e0><e9><ee>|ID 2|D abc|L abc|ID 3|D <ce><a9>|L <ce><a9>|ID 4|D <ce><a9>|L <ce><a9>"
+pin "9 CASE ID WHEN .. ELSE 'Ω' END, and UPPER over CASE ID WHEN 1 THEN W1 ELSE 'ω' END" UTF8 "SET LIST ON; SELECT ID, CASE ID WHEN 1 THEN W1 WHEN 2 THEN U ELSE 'Ω' END D, UPPER(CASE ID WHEN 1 THEN W1 ELSE 'ω' END) U2 FROM TU ORDER BY ID;" "ID 1|D <c3><80><c3><89><c3><8e>|U2 <c3><80><c3><89><c3><8e>|ID 2|D abc|U2 <ce><a9>|ID 3|D <ce><a9>|U2 <ce><a9>|ID 4|D <ce><a9>|U2 <ce><a9>"
+pin "9 OCTET_LENGTH / CHAR_LENGTH / BIT_LENGTH over it: the literal's own octets" UTF8 "SET LIST ON; SELECT ID, OCTET_LENGTH(DECODE(ID, 1, W1, 'Ω')) O, CHAR_LENGTH(DECODE(ID, 1, W1, 'Ω')) C, BIT_LENGTH(DECODE(ID, 1, W1, 'Ω')) B FROM TU WHERE ID < 3 ORDER BY ID;" "ID 1|O 3|C 3|B 24|ID 2|O 2|C 1|B 16"
+pin "9 OCTET_LENGTH / CHAR_LENGTH / BIT_LENGTH over it: the literal's own octets" WIN1252 "SET LIST ON; SELECT ID, OCTET_LENGTH(DECODE(ID, 1, W1, 'Ω')) O, CHAR_LENGTH(DECODE(ID, 1, W1, 'Ω')) C, BIT_LENGTH(DECODE(ID, 1, W1, 'Ω')) B FROM TU WHERE ID < 3 ORDER BY ID;" "ID 1|O 3|C 3|B 24|ID 2|O 2|C 2|B 16"
+pin "9 a NONE branch is delivered by its bytes: CASE ID WHEN 2 THEN N ELSE W1 END" UTF8 "SET LIST ON; SELECT ID, CASE ID WHEN 2 THEN N ELSE W1 END D FROM TU ORDER BY ID;" "ID 1|D <c3><80><c3><89><c3><8e>|Statement failed, SQLSTATE = 22000|Malformed string"
+pin "9 a NONE branch is delivered by its bytes: CASE ID WHEN 2 THEN N ELSE W1 END" WIN1252 "SET LIST ON; SELECT ID, CASE ID WHEN 2 THEN N ELSE W1 END D FROM TU ORDER BY ID;" "ID 1|D <c0><c9><ce>|ID 2|D <e9>|ID 3|D <9f><83>|ID 4|D <null>"
+pin "9 LOWER(CASE ID WHEN 1 THEN N ELSE W1 END): the NONE row cases ASCII only, the WIN1252 row by its table" UTF8 "SET LIST ON; SELECT ID, LOWER(CASE ID WHEN 1 THEN N ELSE W1 END) L FROM TU ORDER BY ID;" "ID 1|L <c3><80><c3><89><c3><8e>|ID 2|L <c3><a3><e2><82><ac><c3><a3><e2><80><b0><c3><a3><c5><be>|ID 3|L <c3><bf><c6><92>|ID 4|L <null>"
+pin "9 LOWER(CASE ID WHEN 1 THEN N ELSE W1 END): the NONE row cases ASCII only, the WIN1252 row by its table" WIN1252 "SET LIST ON; SELECT ID, LOWER(CASE ID WHEN 1 THEN N ELSE W1 END) L FROM TU ORDER BY ID;" "ID 1|L <c3><80><c3><89><c3><8e>|ID 2|L <e3><80><e3><89><e3><9e>|ID 3|L <ff><83>|ID 4|L <null>"
+pin "9 LOWER(CASE ID WHEN 1 THEN N ELSE W1 END): the NONE row cases ASCII only, the WIN1252 row by its table" NONE "SET LIST ON; SELECT ID, LOWER(CASE ID WHEN 1 THEN N ELSE W1 END) L FROM TU ORDER BY ID;" "ID 1|L <c3><80><c3><89><c3><8e>|ID 2|L <e3><80><e3><89><e3><9e>|ID 3|L <ff><83>|ID 4|L <null>"
+pin "9 ||, LPAD and SUBSTRING over DECODE(ID, 1, W1, 'Ω')" UTF8 "SET LIST ON; SELECT ID, DECODE(ID, 1, W1, 'Ω') || 'x' C, LPAD(DECODE(ID, 1, W1, 'Ω'), 5, 'x') P, SUBSTRING(DECODE(ID, 1, W1, 'Ωab') FROM 2) S FROM TU WHERE ID < 3 ORDER BY ID;" "ID 1|C <c3><80><c3><89><c3><8e>x|P xx<c3><80><c3><89><c3><8e>|S <c3><89><c3><8e>|ID 2|C <ce><a9>x|P xxxx<ce><a9>|S ab"
+pin "9 CAST(DECODE(...) AS VARCHAR(10) CHARACTER SET UTF8) converts from the branch's set" UTF8 "SET LIST ON; SELECT ID, CAST(DECODE(ID, 1, W1, 'Ω') AS VARCHAR(10) CHARACTER SET UTF8) S FROM TU WHERE ID < 3 ORDER BY ID;" "ID 1|S <c3><80><c3><89><c3><8e>|ID 2|S <ce><a9>"
+pin "9 CAST(DECODE(...) AS VARCHAR(10) CHARACTER SET UTF8) converts from the branch's set" NONE "SET LIST ON; SELECT ID, CAST(DECODE(ID, 1, W1, 'Ω') AS VARCHAR(10) CHARACTER SET UTF8) S FROM TU WHERE ID < 3 ORDER BY ID;" "ID 1|S <c3><80><c3><89><c3><8e>|ID 2|S <ce><a9>"
+pin "9 nested: UPPER(LOWER(DECODE(...))) and a DECODE inside a DECODE" UTF8 "SET LIST ON; SELECT ID, UPPER(LOWER(DECODE(ID, 1, W1, 'Ω'))) U1, LOWER(DECODE(ID, 1, W1, LOWER(DECODE(ID, 2, U, 'Ω')))) L2 FROM TU ORDER BY ID;" "ID 1|U1 <c3><80><c3><89><c3><8e>|L2 <c3><a0><c3><a9><c3><ae>|ID 2|U1 <ce><a9>|L2 abc|ID 3|U1 <ce><a9>|L2 <cf><89>|ID 4|U1 <ce><a9>|L2 <cf><89>"
+pin "9 nested: UPPER(LOWER(DECODE(...))) and a DECODE inside a DECODE" NONE "SET LIST ON; SELECT ID, UPPER(LOWER(DECODE(ID, 1, W1, 'Ω'))) U1, LOWER(DECODE(ID, 1, W1, LOWER(DECODE(ID, 2, U, 'Ω')))) L2 FROM TU ORDER BY ID;" "ID 1|U1 <c0><c9><ce>|L2 <e0><e9><ee>|ID 2|U1 <ce><a9>|L2 abc|ID 3|U1 <ce><a9>|L2 <ce><a9>|ID 4|U1 <ce><a9>|L2 <ce><a9>"
+pin "9 the simple CASE spelling, and HASH of a WIN1252 / UTF8 pair" UTF8 "SET LIST ON; SELECT ID, CASE ID WHEN 1 THEN W1 ELSE 'Ω' END D, HASH(CASE ID WHEN 1 THEN W1 ELSE U END) H FROM TU WHERE ID < 3 ORDER BY ID;" "ID 1|D <c3><80><c3><89><c3><8e>|H 52574|ID 2|D <ce><a9>|H 26499"
+pin "9 CONTROL MAX(DECODE(ID, 1, W1, 'Ω')) folds in the negotiated set (22018 under UTF8)" UTF8 "SET LIST ON; SELECT MAX(DECODE(ID, 1, W1, 'Ω')) M FROM TU;" "Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets"
+pin "9 CONTROL MAX(DECODE(ID, 1, W1, 'Ω')) folds in the negotiated set (22018 under UTF8)" WIN1252 "SET LIST ON; SELECT MAX(DECODE(ID, 1, W1, 'Ω')) M FROM TU;" "M <ce><a9>"
+pin "9 CONTROL the SEARCHED CASE still casts into the negotiated set" UTF8 "SET LIST ON; SELECT ID, CASE WHEN ID = 1 THEN W1 ELSE 'Ω' END D FROM TU WHERE ID = 2;" "Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets"
+pin "9 CONTROL = between real sets survives the negotiated reading" UTF8 "SET LIST ON; SELECT COUNT(*) C FROM TU WHERE CASE ID WHEN 1 THEN W1 ELSE 'q' END = 'q';" "C 3"
+pin "9 CONTROL a comparison over a NONE / WIN1252 CASE against a WIN1252 or NONE literal is a byte compare either way" WIN1252 "SET LIST ON; SELECT COUNT(*) C FROM TU WHERE CASE ID WHEN 2 THEN N ELSE W1 END = 'é';" "C 0"
+pin "9 CONTROL a comparison over a NONE / WIN1252 CASE against a WIN1252 or NONE literal is a byte compare either way" NONE "SET LIST ON; SELECT COUNT(*) C FROM TU WHERE CASE ID WHEN 2 THEN N ELSE W1 END = 'é';" "C 0"
+alive "9 ...and the session survives it" UTF8 "SELECT ID, LOWER(DECODE(ID, 1, W1, 'Ω')) L FROM TU ORDER BY ID;"
+dpin "9 the describe is the negotiated one: DECODE(ID, 1, W1, 'Ω')" UTF8 "SELECT DECODE(ID, 1, W1, 'Ω') D FROM TU;" "01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 80 charset: 4 SYSTEM.UTF8"
+dpin "9 the describe is the negotiated one: DECODE(ID, 1, W1, 'Ω')" NONE "SELECT DECODE(ID, 1, W1, 'Ω') D FROM TU;" "01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 20 charset: 53 SYSTEM.WIN1252"
+dpin "9 ...and LOWER over it describes the same" NONE "SELECT LOWER(DECODE(ID, 1, W1, 'Ω')) L FROM TU;" "01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 20 charset: 53 SYSTEM.WIN1252"
+dpin "9 ...and || over it" NONE "SELECT DECODE(ID, 1, W1, 'Ω') || 'x' C FROM TU;" "01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 21 charset: 53 SYSTEM.WIN1252"
+dpin "9 ...and HASH over it is a nullable BIGINT" UTF8 "SELECT HASH(DECODE(ID, 1, W1, 'Ω')) H FROM TU;" "01: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8"
+refused "9 RECORDED a NONE branch compared with a UTF8 literal: the engine counts 0, the negotiated reading counted 1 - refused" UTF8 "SET LIST ON; SELECT COUNT(*) C FROM TU WHERE CASE ID WHEN 2 THEN N ELSE W1 END = 'é';"
+refused "9 RECORDED a WIN1252 / UTF8 CASE compared with a NONE column: the engine counts 1, the negotiated reading counted 0 - refused" UTF8 "SET LIST ON; SELECT COUNT(*) C FROM TU WHERE CASE ID WHEN 2 THEN W1 ELSE U END = N;"
+refused "9 RECORDED a WIN1252 / UTF8 CASE compared with a NONE column: the engine counts 1, the negotiated reading counted 0 - refused" WIN1252 "SET LIST ON; SELECT COUNT(*) C FROM TU WHERE CASE ID WHEN 2 THEN W1 ELSE U END = N;"
+refused "9 RECORDED a WIN1252 / UTF8 CASE compared with a NONE column: the engine counts 1, the negotiated reading counted 0 - refused" NONE "SET LIST ON; SELECT COUNT(*) C FROM TU WHERE CASE ID WHEN 2 THEN W1 ELSE U END = N;"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-csfn-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 257 ]; then echo "FAIL only $ran checks ran (floor 257)"; fail=1; fi
+if [ "$ran" -lt 292 ]; then echo "FAIL only $ran checks ran (floor 292)"; fail=1; fi
 exit $fail

@@ -116,6 +116,7 @@ agrees "an ordinary expression (control)" "SELECT ID + 1, S || 'x' FROM T ORDER 
 
 agrees "390 nested UPPER"  "SELECT CHAR_LENGTH($(python3 -c "print('UPPER('*390 + \"'a'\" + ')'*390)")) AS X FROM RDB\$DATABASE"
 agrees "390 nested TRIM || 'b'" "SELECT CHAR_LENGTH($(python3 -c "print('TRIM('*390 + \"'a'\" + \" || 'b')\"*390)")) AS X FROM RDB\$DATABASE"
+agrees "60 nested UPPER(DECODE(...))" "SELECT CHAR_LENGTH($(python3 -c "print('UPPER(DECODE(1, 1, '*60 + \"'a'\" + \", 'b'))\"*60)")) AS X FROM RDB\$DATABASE"
 
 echo "--- 3. and in BOUNDED TIME ------------------------------------------"
 # A 2000-deep || took 90 s to PREPARE: every level of resolution asked
@@ -138,9 +139,19 @@ fast "2000 chained ||"   15 "SELECT OCTET_LENGTH($(chain x '||' 2000 "'a'")) AS 
 fast "2500 chained ||"   30 "SELECT OCTET_LENGTH($(chain x '||' 2500 "'a'")) AS X FROM RDB\$DATABASE"
 fast "2000 chained || over a column" 15 "SELECT OCTET_LENGTH($(chain x '||' 2000 'S')) AS X FROM T WHERE ID = 1"
 fast "390 nested UPPER"  15 "SELECT CHAR_LENGTH($(python3 -c "print('UPPER('*390 + \"'a'\" + ')'*390)")) AS X FROM RDB\$DATABASE"
+# ...and so did 390 nested `TRIM(... || 'b')` once the run-time set
+# was modelled (2026-09-26): the set a string function's value is in
+# descended its operands, asking the whole text form at every step, and
+# a TRIM's temporal probe walked its operand at every level - over 90 s,
+# where the engine answers at once. And a function over a simple CASE
+# distributes into its branches: a draft that resolved each branch twice
+# to read its set, at every level, took 31 s over 22 nested
+# `UPPER(DECODE(...))`.
+fast "390 nested TRIM || 'b'" 15 "SELECT CHAR_LENGTH($(python3 -c "print('TRIM('*390 + \"'a'\" + \" || 'b')\"*390)")) AS X FROM RDB\$DATABASE"
+fast "60 nested UPPER(DECODE(...))" 15 "SELECT CHAR_LENGTH($(python3 -c "print('UPPER(DECODE(1, 1, '*60 + \"'a'\" + \", 'b'))\"*60)")) AS X FROM RDB\$DATABASE"
 
 echo "----------------------------------------------------------------------"
 echo "ran $ran checks"
-[ "$ran" -ge 23 ] || { echo "FAIL only $ran checks ran"; fail=1; }
+[ "$ran" -ge 26 ] || { echo "FAIL only $ran checks ran"; fail=1; }
 [ $fail -eq 0 ] && echo "PASS $ran checks" || echo "FAIL"
 exit $fail
