@@ -191,7 +191,9 @@ echo "--- 5. the CONCAT double-encode: VALUE diverges, DESCRIBE agrees ------"
 # withdrawn attempt steered by (that one broke on announced widths, 160
 # vs 64, while values stayed byte-identical).
 #
-# Recorded rather than fixed: three widths meet one join rule here (a
+# The two NONE-attachment cells are FIXED (the literal is decoded into
+# the column's set, its describe still measured in octets); the other
+# three stay recorded. Recorded rather than fixed: three widths meet one join rule here (a
 # literal carries a character count AND an octet count, resolve_text_cs
 # picks between them by the ATTACHMENT), and the divergences pull in
 # OPPOSITE directions. A rule that predicts all eighteen cells has not
@@ -212,8 +214,21 @@ known_len_diff() { # <label> <expr> [flags]
         echo "DIFF $1 now AGREES - the double-encode is fixed, update this gate"; fail=1
     fi
 }
-known_len_diff "literal || UTF8 col, NONE attachment"    "'é' || U" "-ch NONE"
-known_len_diff "UTF8 col || literal, NONE attachment"    "U || 'é'" "-ch NONE"
+# PROMOTED (qa/serve-real-psqlassign.sh 8e): under a BYTE-CARRIER
+# attachment the literal's octets are READ AS the real operand's set
+# before the join ([concat_operands]) - both servers answer the same
+# CHAR_LENGTH and OCTET_LENGTH (the literal adds one character, two octets).
+same_len() { # <label> <expr> [flags]
+    ran=$((ran + 1))
+    e=$(lenpair "$EN" "$2" "${3:-}"); c=$(lenpair "$FC" "$2" "${3:-}")
+    if [ -z "$e" ] || [ "$c" != "$e" ]; then
+        echo "FAIL $1 engine=[$e] fc=[$c]"; fail=1
+    else
+        echo "OK   $1 [$e]"
+    fi
+}
+same_len "literal || UTF8 col, NONE attachment (it doubled)" "'é' || U" "-ch NONE"
+same_len "UTF8 col || literal, NONE attachment (it doubled)" "U || 'é'" "-ch NONE"
 known_len_diff "literal || UTF8 col, WIN1252 attachment" "'é' || U" "-ch WIN1252"
 known_len_diff "literal || WIN1252 col, UTF8 attachment" "'é' || W" "-ch UTF8"
 known_len_diff "literal || OCTETS col, UTF8 attachment"  "'é' || O" "-ch UTF8"

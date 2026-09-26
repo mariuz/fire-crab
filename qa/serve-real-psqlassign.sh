@@ -38,6 +38,39 @@
 # answers since the bare local is bound into the planner's value -
 # qa/serve-real-psqlfetch.sh - and is pinned in 6b.)
 #
+# SECTION 8 - NON-ASCII TEXT THROUGH PSQL SLOTS, under the attachment a
+# default isql opens (charset NONE, where a literal 'é' is the octets
+# C3 A9). Every cell below that answered did so WRONGLY before:
+#
+#   * a stored body's SOURCE is not its BLR. Created under NONE, the
+#     engine writes a '?' into RDB$PROCEDURE_SOURCE for each octet it
+#     could not transliterate - `R = LPAD(X, L, 'é')` is stored as
+#     `LPAD(X, L, '??')` - and runs the BLR, which keeps the octets. The
+#     interpreter read the source and answered '???ab' for 'éééab',
+#     '??b' for 'éb'. Such a body now refuses (8a); a genuine '?' that
+#     the BLR carries verbatim still answers.
+#   * an argument was bound in the representation it ARRIVED in - under
+#     NONE one char per octet - whatever set its parameter declared, so a
+#     UTF8 parameter holding 'é' was two characters: UPPER 'Ã©', X || '-'
+#     || X 'Ã©-Ã©', SUBSTRING 'ãã', CHAR_LENGTH 2, and an eleven
+#     character argument passed a VARCHAR(10) that was measured in bytes.
+#     It is moved into the parameter's set now, as the engine's MOV does,
+#     and every text slot holds its value in its own set: a variable
+#     written into planner text is written TYPED when its set is not the
+#     attachment's, a stored value moves into the slot's set (a UTF8 'Ω'
+#     into WIN1252 is the 22018 at the assignment), and the BLR executor
+#     - which carries no sets at all - is left to ASCII (8b, 8c).
+#   * the statement-text rewriters copied a non-ASCII character octet by
+#     octet as characters of its own: an EXECUTE BLOCK's 'é' into a NONE
+#     output was four octets (8d); and a UTF8 operand || a NONE literal
+#     glued the literal's carrier characters on ('éÃ©' for 'éé', 8e).
+#
+# RECORDED in section 8 (the engine answers, this server refuses): the
+# lost-literal bodies; OVERLAY; a stored FUNCTION over non-ASCII text; a
+# procedure CALLED from a body's query with a non-ASCII variable; an
+# EXECUTE STATEMENT built from one; and the EXECUTE BLOCKs whose RETURNS
+# or locals name a CHARACTER SET (the block compiler refuses them).
+#
 # Usage: qa/serve-real-psqlassign.sh [port]   (default 5400)
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
@@ -66,6 +99,64 @@ CREATE PROCEDURE PN4 (A INTEGER) RETURNS (R NUMERIC(4,2)) AS BEGIN R = A; SUSPEN
 CREATE PROCEDURE PN5 RETURNS (R INTEGER) AS DECLARE X NUMERIC(10,2); BEGIN SELECT N FROM T2 WHERE ID = 1 INTO :X; R = X * 100; SUSPEND; END^
 CREATE PROCEDURE PN6 RETURNS (R VARCHAR(20)) AS DECLARE X SMALLINT; BEGIN FOR SELECT ID * 20000 FROM T2 INTO :X DO R = X; SUSPEND; END^
 CREATE FUNCTION G6F (A INTEGER) RETURNS VARCHAR(5) AS BEGIN RETURN A; END^
+SET TERM ;^
+CREATE TABLE XTU (ID INTEGER, C VARCHAR(20) CHARACTER SET UTF8, W VARCHAR(20) CHARACTER SET WIN1252, N VARCHAR(20));
+INSERT INTO XTU VALUES (1, 'é', 'é', 'é');
+CREATE TABLE XTT (ID INTEGER, C VARCHAR(20) CHARACTER SET UTF8, W VARCHAR(20) CHARACTER SET WIN1252, N VARCHAR(20));
+SET TERM ^;
+CREATE PROCEDURE XPP (X VARCHAR(10) CHARACTER SET UTF8, L INTEGER) RETURNS (R VARCHAR(100) CHARACTER SET UTF8) AS BEGIN R = LPAD(X, L, 'é'); SUSPEND; END^
+CREATE PROCEDURE XPS (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(100) CHARACTER SET UTF8) AS BEGIN R = REPLACE(X, 'a', 'é'); SUSPEND; END^
+CREATE PROCEDURE XPQ (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(100) CHARACTER SET UTF8) AS BEGIN R = REPLACE(X, 'a', '?'); SUSPEND; END^
+CREATE PROCEDURE XPU (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = UPPER(X); SUSPEND; END^
+CREATE PROCEDURE XPLO (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = LOWER(X); SUSPEND; END^
+CREATE PROCEDURE XPSB (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = SUBSTRING(X FROM 2 FOR 2); SUSPEND; END^
+CREATE PROCEDURE XPCT (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(30) CHARACTER SET UTF8) AS BEGIN R = X || '-' || X; SUSPEND; END^
+CREATE PROCEDURE XPLN (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (N INTEGER, O INTEGER) AS BEGIN N = CHAR_LENGTH(X); O = OCTET_LENGTH(X); SUSPEND; END^
+CREATE PROCEDURE XPOV (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = OVERLAY(X PLACING 'Z' FROM 2 FOR 1); SUSPEND; END^
+CREATE PROCEDURE XPRP (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = RPAD(X, 4, '*'); SUSPEND; END^
+CREATE PROCEDURE XPLP (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = LPAD(X, 4, '*'); SUSPEND; END^
+CREATE PROCEDURE XPRE (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = REPLACE(X, 'a', 'b'); SUSPEND; END^
+CREATE PROCEDURE XPID (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = X; SUSPEND; END^
+CREATE PROCEDURE XPW (X VARCHAR(10) CHARACTER SET WIN1252) RETURNS (R VARCHAR(20) CHARACTER SET WIN1252, N INTEGER) AS BEGIN R = UPPER(X); N = CHAR_LENGTH(X); SUSPEND; END^
+CREATE PROCEDURE XPN (X VARCHAR(10)) RETURNS (R VARCHAR(20), N INTEGER) AS BEGIN R = UPPER(X); N = CHAR_LENGTH(X); SUSPEND; END^
+CREATE PROCEDURE XPNU (X VARCHAR(10)) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = UPPER(X); SUSPEND; END^
+CREATE PROCEDURE XPUW (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET WIN1252) AS BEGIN R = UPPER(X); SUSPEND; END^
+CREATE PROCEDURE XPUN (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20), N INTEGER) AS BEGIN R = UPPER(X); N = CHAR_LENGTH(R); SUSPEND; END^
+CREATE PROCEDURE XPLV (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS DECLARE V VARCHAR(10) CHARACTER SET WIN1252; BEGIN V = UPPER(X); R = LOWER(V); N = OCTET_LENGTH(V); SUSPEND; END^
+CREATE PROCEDURE XPLN2 (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20), N INTEGER) AS DECLARE V VARCHAR(10); BEGIN V = UPPER(X); R = V; N = CHAR_LENGTH(V); SUSPEND; END^
+CREATE PROCEDURE XPIN (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (N INTEGER) AS BEGIN INSERT INTO XTT (ID, C) VALUES (9, UPPER(:X)); SELECT CHAR_LENGTH(C) FROM XTT WHERE ID = 9 INTO :N; SUSPEND; END^
+CREATE PROCEDURE XPSEL (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN SELECT UPPER(:X) FROM RDB$DATABASE INTO :R; SUSPEND; END^
+CREATE PROCEDURE XPIF (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (N INTEGER) AS BEGIN N = 0; IF (UPPER(X) = X) THEN N = 1; SUSPEND; END^
+CREATE PROCEDURE XPWH (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (N INTEGER) AS DECLARE I INTEGER = 0; BEGIN N = 0; WHILE (I < CHAR_LENGTH(X)) DO BEGIN I = I + 1; N = N + 1; END SUSPEND; END^
+CREATE PROCEDURE XFS1 RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS BEGIN FOR SELECT C FROM XTU INTO :R DO BEGIN N = CHAR_LENGTH(R); SUSPEND; END END^
+CREATE PROCEDURE XFS2 RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS BEGIN FOR SELECT W FROM XTU INTO :R DO BEGIN N = CHAR_LENGTH(R); SUSPEND; END END^
+CREATE PROCEDURE XFS3 RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS BEGIN FOR SELECT N FROM XTU INTO :R DO BEGIN N = CHAR_LENGTH(R); SUSPEND; END END^
+CREATE PROCEDURE XFS4 RETURNS (R VARCHAR(20), N INTEGER) AS BEGIN FOR SELECT C FROM XTU INTO :R DO BEGIN N = OCTET_LENGTH(R); SUSPEND; END END^
+CREATE PROCEDURE XFS5 RETURNS (R VARCHAR(20) CHARACTER SET WIN1252, N INTEGER) AS BEGIN FOR SELECT C FROM XTU INTO :R DO BEGIN N = OCTET_LENGTH(R); SUSPEND; END END^
+CREATE PROCEDURE XSI1 RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS BEGIN SELECT UPPER(C), CHAR_LENGTH(C) FROM XTU WHERE ID = 1 INTO :R, :N; SUSPEND; END^
+CREATE PROCEDURE XSI2 (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (N INTEGER) AS BEGIN SELECT COUNT(*) FROM XTU WHERE C = :X INTO :N; SUSPEND; END^
+CREATE PROCEDURE XSI3 (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (N INTEGER) AS BEGIN SELECT COUNT(*) FROM XTU WHERE W = :X INTO :N; SUSPEND; END^
+CREATE PROCEDURE XCU1 RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS DECLARE K CURSOR FOR (SELECT C FROM XTU); BEGIN OPEN K; FETCH K INTO :R; CLOSE K; N = CHAR_LENGTH(R); SUSPEND; END^
+CREATE PROCEDURE XIN1 (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8, S VARCHAR(20) CHARACTER SET WIN1252, T VARCHAR(20), N INTEGER) AS BEGIN INSERT INTO XTT (ID, C, W, N) VALUES (1, :X, :X, :X); SELECT C, W, N, OCTET_LENGTH(N) FROM XTT WHERE ID = 1 INTO :R, :S, :T, :N; SUSPEND; END^
+CREATE PROCEDURE XUP1 (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN INSERT INTO XTT (ID, C) VALUES (3, 'a'); UPDATE XTT SET C = :X WHERE ID = 3; SELECT C FROM XTT WHERE ID = 3 INTO :R; SUSPEND; END^
+CREATE PROCEDURE XCALLEE (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS BEGIN R = UPPER(X); N = CHAR_LENGTH(X); SUSPEND; END^
+CREATE PROCEDURE XCALLER (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS BEGIN EXECUTE PROCEDURE XCALLEE (:X) RETURNING_VALUES :R, :N; SUSPEND; END^
+CREATE PROCEDURE XCALLER2 (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS BEGIN SELECT R, N FROM XCALLEE(:X) INTO :R, :N; SUSPEND; END^
+CREATE PROCEDURE XCALLER3 (X VARCHAR(10)) RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS BEGIN EXECUTE PROCEDURE XCALLEE (:X) RETURNING_VALUES :R, :N; SUSPEND; END^
+CREATE PROCEDURE XPCH (X CHAR(3) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS BEGIN R = X || '|'; N = OCTET_LENGTH(X); SUSPEND; END^
+CREATE PROCEDURE XPCW (X CHAR(3) CHARACTER SET WIN1252) RETURNS (R VARCHAR(20) CHARACTER SET WIN1252, N INTEGER) AS BEGIN R = X || '|'; N = OCTET_LENGTH(X); SUSPEND; END^
+CREATE PROCEDURE XPLV1 (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS DECLARE V VARCHAR(3) CHARACTER SET UTF8; BEGIN V = X; R = V; N = CHAR_LENGTH(V); SUSPEND; END^
+CREATE PROCEDURE XPLV2 (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS DECLARE V VARCHAR(3); BEGIN V = X; R = V; N = CHAR_LENGTH(V); SUSPEND; END^
+CREATE PROCEDURE XPLV3 (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS DECLARE V VARCHAR(10) CHARACTER SET WIN1252; BEGIN V = X; R = V || V; N = OCTET_LENGTH(V || V); SUSPEND; END^
+CREATE PROCEDURE XPLV4 (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS DECLARE V VARCHAR(10) CHARACTER SET OCTETS; BEGIN V = X; R = V; SUSPEND; END^
+CREATE PROCEDURE XPLV5 (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET ASCII) AS BEGIN R = X; SUSPEND; END^
+CREATE PROCEDURE XPES (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN EXECUTE STATEMENT 'SELECT UPPER(''' || X || ''') FROM RDB$DATABASE' INTO :R; SUSPEND; END^
+CREATE PROCEDURE XPCOAL (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS BEGIN R = COALESCE(X, 'z'); N = CHAR_LENGTH(COALESCE(X, 'z')); SUSPEND; END^
+CREATE PROCEDURE XPCASE (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = CASE WHEN X = 'a' THEN 'b' ELSE UPPER(X) END; SUSPEND; END^
+CREATE PROCEDURE XPTRIM (X VARCHAR(10) CHARACTER SET UTF8) RETURNS (R VARCHAR(20) CHARACTER SET UTF8, N INTEGER) AS BEGIN R = TRIM(X); N = POSITION('b' IN X); SUSPEND; END^
+CREATE FUNCTION XFL (X VARCHAR(10) CHARACTER SET UTF8) RETURNS VARCHAR(20) CHARACTER SET UTF8 AS BEGIN RETURN LPAD(X, 3, 'é'); END^
+CREATE FUNCTION XFU (X VARCHAR(10) CHARACTER SET UTF8) RETURNS VARCHAR(20) CHARACTER SET UTF8 AS BEGIN RETURN UPPER(X); END^
+CREATE FUNCTION XFN (X VARCHAR(10) CHARACTER SET UTF8) RETURNS INTEGER AS BEGIN RETURN CHAR_LENGTH(X); END^
 SET TERM ;^
 COMMIT;
 SQL
@@ -216,11 +307,93 @@ refused "7 DOUBLE PRECISION arithmetic on a local" "$(eb 'EXECUTE BLOCK RETURNS 
 refused "7 DECLARE ... DEFAULT a decimal" "$(eb 'EXECUTE BLOCK RETURNS (R VARCHAR(30)) AS DECLARE X NUMERIC(10,2) DEFAULT 2.345; BEGIN R = X; SUSPEND; END')" "R|2.35"
 refused "7 a DOUBLE PRECISION output" "$(eb 'EXECUTE BLOCK RETURNS (R DOUBLE PRECISION) AS BEGIN R = 2.5; SUSPEND; END')" "R|2.500000000000000"
 
+echo "--- 8a. A STORED BODY WHOSE SOURCE LOST A LITERAL IS REFUSED - the engine keeps a '?' per octet it could not transliterate"
+refused $'8a LPAD with a body literal \'é\' - the stored source keeps \'??\' (it answered \'???ab\')' $'SELECT * FROM XPP(\'ab\', 5);' $'R|éééab'
+refused $'8a REPLACE with a body literal \'é\' (it answered \'??b\')' $'SELECT * FROM XPS(\'ab\');' $'R|éb'
+refused $'8a ...and a UTF8 argument \'é\' as well (it answered \'?Ã©\')' $'SELECT * FROM XPP(\'é\', 3);' $'R|ééé'
+pin  $'8a CONTROL a genuine \'?\' literal is in the BLR as written' $'SELECT * FROM XPQ(\'ab\');' $'R|?b'
+refused $'8a a stored FUNCTION whose literal was lost' $'SELECT XFL(\'ab\') FROM RDB$DATABASE;' $'XFL|éab'
+echo "--- 8b. AN ARGUMENT MOVES INTO ITS PARAMETER'S CHARACTER SET, and every slot holds its value in its own set"
+pin  $'8b UPPER of a UTF8 argument \'é\' (it answered \'Ã©\')' $'SELECT * FROM XPU(\'é\');' $'R|É'
+pin  $'8b CONTROL UPPER of an ASCII argument' $'SELECT * FROM XPU(\'ab\');' $'R|AB'
+pin  $'8b LOWER of \'ÉÈ\'' $'SELECT * FROM XPLO(\'ÉÈ\');' $'R|éè'
+pin  $'8b SUBSTRING counts characters (it answered \'ãã\')' $'SELECT * FROM XPSB(\'éèàx\');' $'R|èà'
+pin  $'8b X || \'-\' || X (it answered \'Ã©-Ã©\')' $'SELECT * FROM XPCT(\'é\');' $'R|é-é'
+pin  $'8b CHAR_LENGTH and OCTET_LENGTH of \'éé\' (4 and 8)' $'SELECT * FROM XPLN(\'éé\');' $'N O|2 4'
+refused $'8b OVERLAY over \'éèà\'' $'SELECT * FROM XPOV(\'éèà\');' $'R|éZà'
+pin  $'8b RPAD pads in characters (it answered \'Ã©**\')' $'SELECT * FROM XPRP(\'é\');' $'R|é***'
+pin  $'8b LPAD pads in characters' $'SELECT * FROM XPLP(\'é\');' $'R|***é'
+pin  $'8b REPLACE beside a non-ASCII character' $'SELECT * FROM XPRE(\'éa\');' $'R|éb'
+pin  $'8b a plain R = X (it answered \'Ã©\')' $'SELECT * FROM XPID(\'é\');' $'R|é'
+pin  $'8b a WIN1252 parameter reads the octets C3 A9 as two characters' $'SELECT * FROM XPW(\'é\');' $'R N|é 2'
+pin  $'8b a NONE parameter keeps the octets; UPPER cases ASCII only' $'SELECT * FROM XPN(\'é\');' $'R N|é 2'
+pin  $'8b a NONE parameter into a UTF8 output' $'SELECT * FROM XPNU(\'é\');' $'R|é'
+pin  $'8b a UTF8 value into a WIN1252 output (the octet E9)' $'SELECT * FROM XPUW(\'é\');' $'R|\xc9'
+pin  $'8b a UTF8 \'Ω\' into a WIN1252 output is 22018 at the assignment' $'SELECT * FROM XPUW(\'Ω\');' $'R|Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets|-At procedure "PUBLIC"."XPUW" line: 1, col: 113'
+pin  $'8b a UTF8 value into a NONE output' $'SELECT * FROM XPUN(\'é\');' $'R N|É 2'
+pin  $'8b a WIN1252 local between UTF8 values' $'SELECT * FROM XPLV(\'é\');' $'R N|é 1'
+pin  $'8b a local of the database default set (NONE)' $'SELECT * FROM XPLN2(\'é\');' $'R N|É 2'
+pin  $'8b INSERT of UPPER(:X) into a UTF8 column' $'SELECT * FROM XPIN(\'é\');' $'N|1'
+pin  $'8b SELECT UPPER(:X) INTO' $'SELECT * FROM XPSEL(\'é\');' $'R|É'
+pin  $'8b IF (UPPER(X) = X) over a bare variable' $'SELECT * FROM XPIF(\'é\');' $'N|0'
+pin  $'8b CONTROL ...an ASCII one' $'SELECT * FROM XPIF(\'E\');' $'N|1'
+pin  $'8b WHILE (I < CHAR_LENGTH(X)) counts characters' $'SELECT * FROM XPWH(\'éé\');' $'N|2'
+pin  $'8b an argument past its UTF8 VARCHAR(10) in characters, LOCATIONLESS (it answered)' $'SELECT * FROM XPU(\'abcdefghijk\');' $'R|Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 10, actual 11'
+pin  $'8b ...eleven two-octet characters' $'SELECT * FROM XPU(\'ééééééééééé\');' $'R|Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 10, actual 11'
+refused $'8b a stored FUNCTION over a UTF8 argument (it answered \'Ã©\')' $'SELECT XFU(\'é\') FROM RDB$DATABASE;' $'XFU|É'
+refused $'8b ...and one answering a number' $'SELECT XFN(\'éé\') FROM RDB$DATABASE;' $'XFN|2'
+refused $'8b a function over a UTF8 COLUMN' $'SELECT XFN(C) FROM XTU;' $'XFN|1'
+echo "--- 8c. VALUES FROM AND INTO THE DATABASE, CURSORS, CALLS, LOCALS AND OUTPUTS OF EACH SET"
+pin  $'8c FOR SELECT of a UTF8 column into a UTF8 output' $'SELECT * FROM XFS1;' $'R N|é 1'
+pin  $'8c ...of a WIN1252 column (which holds \'Ã©\')' $'SELECT * FROM XFS2;' $'R N|Ã© 2'
+pin  $'8c ...of a NONE column' $'SELECT * FROM XFS3;' $'R N|é 1'
+pin  $'8c ...of a UTF8 column into a NONE output (the octets C3 A9)' $'SELECT * FROM XFS4;' $'R N|é 2'
+pin  $'8c ...into a WIN1252 output' $'SELECT * FROM XFS5;' $'R N|\xe9 1'
+pin  $'8c SELECT UPPER(C), CHAR_LENGTH(C) INTO' $'SELECT * FROM XSI1;' $'R N|É 1'
+pin  $'8c a UTF8 variable compared with a UTF8 column' $'SELECT * FROM XSI2(\'é\');' $'N|1'
+pin  $'8c ...with a WIN1252 column' $'SELECT * FROM XSI3(\'é\');' $'N|0'
+pin  $'8c a cursor FETCH of a UTF8 column' $'SELECT * FROM XCU1;' $'R N|é 1'
+pin  $'8c INSERT one UTF8 variable into UTF8, WIN1252 and NONE columns' $'SELECT * FROM XIN1(\'é\');' $'R S T N|é \xe9 é 2'
+pin  $'8c UPDATE SET C = :X' $'SELECT * FROM XUP1(\'é\');' $'R|é'
+pin  $'8c EXECUTE PROCEDURE ... RETURNING_VALUES with a UTF8 argument' $'SELECT * FROM XCALLER(\'é\');' $'R N|É 1'
+refused $'8c SELECT ... FROM a procedure called with a UTF8 variable' $'SELECT * FROM XCALLER2(\'é\');' $'R N|É 1'
+pin  $'8c a NONE variable into the callee\'s UTF8 parameter' $'SELECT * FROM XCALLER3(\'é\');' $'R N|É 1'
+pin  $'8c EXECUTE PROCEDURE from the client' $'EXECUTE PROCEDURE XCALLEE(\'é\');' $'R N|É 1'
+pin  $'8c a UTF8 CHAR(3) parameter pads in characters' $'SELECT * FROM XPCH(\'é\');' $'R N|é | 4'
+pin  $'8c a WIN1252 CHAR(3) parameter' $'SELECT * FROM XPCW(\'é\');' $'R N|é | 3'
+pin  $'8c \'éé\' fits a UTF8 VARCHAR(3) local' $'SELECT * FROM XPLV1(\'éé\');' $'R N|éé 2'
+pin  $'8c \'éééé\' does not' $'SELECT * FROM XPLV1(\'éééé\');' $'R N|Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 3, actual 4|-At procedure "PUBLIC"."XPLV1" line: 1, col: 163'
+pin  $'8c \'éé\' into a NONE VARCHAR(3) local is four octets' $'SELECT * FROM XPLV2(\'éé\');' $'R N|Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 3, actual 4|-At procedure "PUBLIC"."XPLV2" line: 1, col: 144'
+pin  $'8c a WIN1252 local concatenated' $'SELECT * FROM XPLV3(\'é\');' $'R N|éé 2'
+pin  $'8c an OCTETS local between UTF8 values' $'SELECT * FROM XPLV4(\'é\');' $'R|é'
+pin  $'8c a UTF8 \'é\' into an ASCII output' $'SELECT * FROM XPLV5(\'é\');' $'R|Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets|-At procedure "PUBLIC"."XPLV5" line: 1, col: 112'
+pin  $'8c CONTROL ...\'ab\' into it' $'SELECT * FROM XPLV5(\'ab\');' $'R|ab'
+refused $'8c EXECUTE STATEMENT text built from a UTF8 variable' $'SELECT * FROM XPES(\'é\');' $'R|é'
+pin  $'8c COALESCE over a UTF8 variable' $'SELECT * FROM XPCOAL(\'é\');' $'R N|é 1'
+pin  $'8c CASE over a UTF8 variable' $'SELECT * FROM XPCASE(\'é\');' $'R|É'
+pin  $'8c TRIM and POSITION over a UTF8 variable' $'SELECT * FROM XPTRIM(\' éb \');' $'R N|éb 3'
+echo "--- 8d. AN EXECUTE BLOCK'S LITERALS ARE THE ATTACHMENT'S (octets under NONE)"
+pin  $'8d an EXECUTE BLOCK\'s literal is the attachment\'s: \'é\' into a NONE output is two octets (it stored four)' "$(eb $'EXECUTE BLOCK RETURNS (R VARCHAR(20), N INTEGER) AS BEGIN R = \'é\'; N = CHAR_LENGTH(R); SUSPEND; END')" $'R N|é 2'
+pin  $'8d ...\'é\' || \'x\' (it answered \'Ã©x\', 5)' "$(eb $'EXECUTE BLOCK RETURNS (R VARCHAR(20), N INTEGER) AS BEGIN R = \'é\' || \'x\'; N = OCTET_LENGTH(R); SUSPEND; END')" $'R N|éx 3'
+pin  $'8d ...UPPER of it cases ASCII only' "$(eb $'EXECUTE BLOCK RETURNS (R VARCHAR(20), N INTEGER) AS BEGIN R = UPPER(\'é\'); N = CHAR_LENGTH(R); SUSPEND; END')" $'R N|é 2'
+pin  $'8d ...\'éé\' into a NONE VARCHAR(3) local (it said actual 8)' "$(eb $'EXECUTE BLOCK RETURNS (R VARCHAR(20)) AS DECLARE V VARCHAR(3); BEGIN V = \'éé\'; R = V; SUSPEND; END')" $'R|Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 3, actual 4|-At block line: 1, col: 70'
+refused $'8d ...REPLACE(\'abc\', \'b\', \'é\') into a UTF8 output' "$(eb $'EXECUTE BLOCK RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = REPLACE(\'abc\', \'b\', \'é\'); SUSPEND; END')" $'R|aéc'
+refused $'8d ...LPAD(\'ab\', 5, \'é\') is Malformed string into UTF8' "$(eb $'EXECUTE BLOCK RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = LPAD(\'ab\', 5, \'é\'); SUSPEND; END')" $'R|Statement failed, SQLSTATE = 22000|Malformed string|-At block line: 1, col: 67'
+refused $'8d ...a UTF8 local holding \'é\'' "$(eb $'EXECUTE BLOCK RETURNS (R VARCHAR(20), N INTEGER) AS DECLARE V VARCHAR(10) CHARACTER SET UTF8 = \'é\'; BEGIN R = UPPER(V); N = OCTET_LENGTH(R); SUSPEND; END')" $'R N|É 2'
+refused $'8d OVERLAY with FROM (it was -204 Table unknown "2")' "$(eb $'EXECUTE BLOCK RETURNS (R VARCHAR(20)) AS BEGIN R = OVERLAY(\'abc\' PLACING \'x\' FROM 2 FOR 1); SUSPEND; END')" $'R|axc'
+refused $'8d ...and the same under a UTF8 output' "$(eb $'EXECUTE BLOCK RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = OVERLAY(\'abc\' PLACING \'é\' FROM 2 FOR 1); SUSPEND; END')" $'R|aéc'
+refused $'8d SUBSTRING of a NONE literal cuts octets: Malformed string into UTF8' "$(eb $'EXECUTE BLOCK RETURNS (R VARCHAR(20) CHARACTER SET UTF8) AS BEGIN R = SUBSTRING(\'éèà\' FROM 2 FOR 1); SUSPEND; END')" $'R|Statement failed, SQLSTATE = 22000|Malformed string|-At block line: 1, col: 67'
+echo "--- 8e. A NONE LITERAL CONCATENATED WITH A UTF8 OPERAND IS READ AS UTF8 (the planner a typed variable reaches)"
+pin  $'8e a UTF8 column || a NONE literal reads the literal\'s octets as UTF8 (it answered \'éÃ©\')' $'SELECT C || \'é\', \'é\' || C FROM XTU;' $'CONCATENATION CONCATENATION|éé éé'
+dsame $'8e ...and its describe did not move' $'SELECT C || \'é\', \'é\' || C FROM XTU;'
+pin  $'8e ...its lengths (3 and 6)' $'SELECT CHAR_LENGTH(C || \'é\'), OCTET_LENGTH(C || \'é\'), CHAR_LENGTH(\'é\' || C) FROM XTU;' $'CHAR_LENGTH OCTET_LENGTH CHAR_LENGTH|2 4 2'
+pin  $'8e ...a UTF8 CAST || a NONE literal' $'SELECT CAST(x\'C3A9\' AS VARCHAR(10) CHARACTER SET UTF8) || \'é\' FROM RDB$DATABASE;' $'CONCATENATION|éé'
+pin  $'8e CONTROL a WIN1252 column || the literal' $'SELECT OCTET_LENGTH(W || \'é\'), CHAR_LENGTH(W || \'é\') FROM XTU;' $'OCTET_LENGTH CHAR_LENGTH|4 4'
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-psqlassign-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 60 ]; then echo "FAIL only $ran checks ran (floor 60)"; fail=1; fi
+if [ "$ran" -lt 135 ]; then echo "FAIL only $ran checks ran (floor 135)"; fail=1; fi
 exit $fail
