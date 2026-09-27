@@ -48,6 +48,23 @@
 #      division by zero is the floating-point one; an AUTONOMOUS block's
 #      USER_TRANSACTION context is its own; FETCH RELATIVE 0 re-reads
 #      the row with ROW_COUNT 0; a trigger's SCROLL cursor scrolls.
+#  13. A BLOB moved into a slot of another type is its TEXT (SELECT /
+#      FOR SELECT / FETCH INTO, <cursor>.<column>, RETURNING INTO,
+#      EXECUTE STATEMENT INTO, a LIST) - the slot held '<blob 0:...>'.
+#  14. A DOUBLE past its range is 22003 *Floating-point overflow*, never
+#      an Infinity or a NaN.
+#  15. A PSQL value's own grammar at prepare: an aggregate or a window
+#      function is -104 *Invalid command*; `||` binds tighter than every
+#      arithmetic operator, and a text operand of + / - (or SUBSTRING's
+#      start) is *expression evaluation not supported*; text * / reads
+#      as a DOUBLE.
+#  16. Exact arithmetic is typed: + - is a BIGINT unless an operand is
+#      an INT128, * / an INT128 over any operand wider than 4 bytes; a
+#      BIGINT past its range is the bare *Integer overflow*, an INT128
+#      the prefixed one, a rescale *numeric value is out of range* (the
+#      BIGINT minimum / -1 PANICKED the server).
+#  17. `:SQLCODE` (any context variable) is -104 *Token unknown* at the
+#      name; SUSPEND in a block with no RETURNS is -104 at prepare.
 #
 # RECORDED (the engine answers, this server refuses - a clean refusal,
 # never a wrong value): NEXT VALUE FOR in a block; a selectable procedure
@@ -59,7 +76,8 @@
 # table's -104; SQLCODE assigned, ten USING values, a message beside
 # USING, an unknown exception, a bare expression statement, COUNT(*) over a
 # non-selectable procedure, a loop cursor's column out of its loop, and a
-# body query's unbound qualifier.
+# body query's unbound qualifier. Section 13's blob in an expression
+# (`C.B || 'x'`, `IF (C.B = ...)`) and a BLOB block output.
 #
 #   qa/serve-real-psqlgram.sh [port]     (default 5890; engine at 3050)
 
@@ -98,6 +116,8 @@ CREATE DOMAIN DD7 AS INTEGER DEFAULT 7;
 CREATE DOMAIN DV3 AS VARCHAR(3) CHECK (VALUE <> 'bad');
 CREATE DOMAIN DNUMC AS NUMERIC(5,2) CHECK (VALUE < 100);
 CREATE DOMAIN DSMALL AS INTEGER CHECK (VALUE < 3);
+CREATE TABLE TBLB (ID INTEGER, B BLOB SUB_TYPE TEXT, BB BLOB, BU BLOB SUB_TYPE TEXT CHARACTER SET UTF8);
+INSERT INTO TBLB VALUES (1, 'blobtext', 'bin', 'utf');
 CREATE TABLE TSC (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER);
 CREATE TABLE TSD (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER);
 SET TERM ^;
@@ -115,6 +135,8 @@ CREATE PROCEDURE PCODE RETURNS (M INTEGER, G INTEGER, S VARCHAR(5)) AS BEGIN BEG
 CREATE PROCEDURE PEXU (N INTEGER) RETURNS (R INTEGER) AS BEGIN R = N; EXCEPTION E_PARAM USING (:N, 'p'); SUSPEND; END^
 CREATE PROCEDURE PCTX RETURNS (R VARCHAR(20)) AS BEGIN RDB$SET_CONTEXT('USER_TRANSACTION', 'PK', 'pv'); R = RDB$GET_CONTEXT('USER_TRANSACTION', 'PK'); SUSPEND; END^
 CREATE PROCEDURE PSCR RETURNS (X INTEGER) AS DECLARE C SCROLL CURSOR FOR (SELECT ID FROM T1 ORDER BY ID); BEGIN OPEN C; FETCH LAST FROM C INTO :X; SUSPEND; FETCH PRIOR FROM C INTO :X; SUSPEND; X = C.ID * 10; SUSPEND; CLOSE C; END^
+CREATE PROCEDURE PBLOB RETURNS (R VARCHAR(40)) AS BEGIN SELECT B FROM TBLB WHERE ID = 1 INTO R; SUSPEND; END^
+CREATE FUNCTION FBLOB RETURNS VARCHAR(40) AS DECLARE R VARCHAR(40); BEGIN SELECT LIST(ID) FROM T1 INTO R; RETURN R; END^
 CREATE PROCEDURE PDOM (A INTEGER) RETURNS (R INTEGER) AS DECLARE X DPOS; BEGIN X = A; R = X; SUSPEND; END^
 CREATE TRIGGER TSC_BI FOR TSC BEFORE INSERT AS DECLARE C SCROLL CURSOR FOR (SELECT ID FROM T1 ORDER BY ID); DECLARE K INTEGER; BEGIN OPEN C; FETCH LAST FROM C INTO K; NEW.N = K; FETCH PRIOR FROM C INTO K; NEW.N = NEW.N * 10 + K; FETCH ABSOLUTE 1 FROM C INTO K; NEW.N = NEW.N * 10 + K; CLOSE C; END^
 CREATE TRIGGER TSD_BI FOR TSD BEFORE INSERT AS DECLARE C CURSOR FOR (SELECT ID FROM T1 ORDER BY ID); DECLARE K INTEGER; BEGIN OPEN C; FETCH LAST FROM C INTO K; NEW.N = K; CLOSE C; END^
@@ -387,11 +409,107 @@ pin     $'12 ...without INTO, read by <cursor>.<column>; from a local 0' $'SET T
 pin     $'12 a SCROLL cursor in a TRIGGER scrolls' $'INSERT INTO TSC (ID) VALUES (1);\nSELECT * FROM TSC;\nROLLBACK;' $'ID N|1 321'
 pin     $'12 ...a plain one there is HY106 at the FETCH' $'INSERT INTO TSD (ID) VALUES (1);\nROLLBACK;' $'Statement failed, SQLSTATE = HY106|Fetch option LAST is invalid for a non-scrollable cursor|-At trigger "PUBLIC"."TSD_BI" line: 1, col: 135'
 
+echo $'--- 13. A BLOB MOVED INTO A SLOT OF ANOTHER TYPE IS ITS TEXT'
+pin     $'13 LIST(...) INTO a VARCHAR: the text, not the id' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS BEGIN SELECT LIST(ID) FROM T1 INTO R; SUSPEND; END^\nSET TERM ;^' $'R|1,2,3'
+pin     $'13 a text blob column INTO a VARCHAR (a typed local beside it)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE X DD7; BEGIN SELECT B FROM TBLB WHERE ID = 1 INTO R; SUSPEND; END^\nSET TERM ;^' $'R|blobtext'
+pin     $'13 ...a binary one' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE X DD7; BEGIN SELECT BB FROM TBLB WHERE ID = 1 INTO R; SUSPEND; END^\nSET TERM ;^' $'R|bin'
+pin     $'13 ...a UTF8 one' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE X DD7; BEGIN SELECT BU FROM TBLB WHERE ID = 1 INTO R; SUSPEND; END^\nSET TERM ;^' $'R|utf'
+pin     $'13 ...into a CHAR(10)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R CHAR(10)) AS BEGIN SELECT BU FROM TBLB WHERE ID = 1 INTO R; SUSPEND; END^\nSET TERM ;^' $'R|utf'
+pin     $'13 the text compares: IF (R = \'1,2,3\') takes THEN' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE X DD7; BEGIN SELECT LIST(ID) FROM T1 INTO R; IF (R = \'1,2,3\') THEN R = \'eq\'; ELSE R = \'ne\'; SUSPEND; END^\nSET TERM ;^' $'R|eq'
+pin     $'13 ...and concatenates' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS BEGIN SELECT LIST(ID) FROM T1 INTO R; R = R || \'!\'; SUSPEND; END^\nSET TERM ;^' $'R|1,2,3!'
+pin     $'13 INSERT ... RETURNING <blob> INTO: the blob the statement just stored' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE X DD7; BEGIN INSERT INTO TBLB (ID, B) VALUES (2, \'ret\') RETURNING B INTO R; SUSPEND; END^\nSET TERM ;^\nROLLBACK;' $'R|ret'
+pin     $'13 FOR SELECT ... INTO' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE X DD7; BEGIN FOR SELECT B FROM TBLB ORDER BY ID INTO R DO SUSPEND; END^\nSET TERM ;^' $'R|blobtext'
+pin     $'13 FETCH ... INTO' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE C CURSOR FOR (SELECT B FROM TBLB WHERE ID = 1); BEGIN OPEN C; FETCH C INTO R; SUSPEND; END^\nSET TERM ;^' $'R|blobtext'
+pin     $'13 <cursor>.<column>' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE C CURSOR FOR (SELECT B FROM TBLB WHERE ID = 1); BEGIN OPEN C; FETCH C; R = C.B; SUSPEND; END^\nSET TERM ;^' $'R|blobtext'
+pin     $'13 EXCEPTION <name> <the text>' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS BEGIN SELECT B FROM TBLB WHERE ID = 1 INTO R; EXCEPTION E_SIMPLE R; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = HY000|exception 1|-"PUBLIC"."E_SIMPLE"|-blobtext|-At block line: 1, col: 88'
+pin     $'13 EXCEPTION ... USING (<the text>, 1)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS BEGIN SELECT B FROM TBLB WHERE ID = 1 INTO R; EXCEPTION E_PARAM USING (R, 1); END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = HY000|exception 2|-"PUBLIC"."E_PARAM"|-bad value blobtext in 1|-At block line: 1, col: 88'
+pin     $'13 EXECUTE STATEMENT ... INTO' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS BEGIN EXECUTE STATEMENT \'SELECT B FROM TBLB WHERE ID = 1\' INTO R; SUSPEND; END^\nSET TERM ;^' $'R|blobtext'
+pin     $'13 a text too long for the slot is 22001' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(4)) AS BEGIN SELECT B FROM TBLB WHERE ID = 1 INTO R; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 4, actual 8|-At block line: 1, col: 47'
+pin     $'13 into an INTEGER: the text\'s number' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INTEGER) AS BEGIN SELECT LIST(ID, \'\') FROM T1 INTO R; SUSPEND; END^\nSET TERM ;^' $'R|123'
+pin     $'13 a stored procedure\'s SELECT <blob> INTO' $'SELECT * FROM PBLOB;' $'R|blobtext'
+pin     $'13 a stored function\'s SELECT LIST(...) INTO' $'SELECT FBLOB() FROM RDB$DATABASE;' $'FBLOB|1,2,3'
+refused $'13 <cursor>.<blob column> || \'x\': refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE C CURSOR FOR (SELECT B FROM TBLB WHERE ID = 1); BEGIN OPEN C; FETCH C; R = C.B || \'x\'; SUSPEND; END^\nSET TERM ;^' $'R|blobtextx'
+refused $'13 IF (<cursor>.<blob column> = ...): refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE C CURSOR FOR (SELECT B FROM TBLB WHERE ID = 1); BEGIN OPEN C; FETCH C; IF (C.B = \'blobtext\') THEN R = \'eq\'; SUSPEND; END^\nSET TERM ;^' $'R|eq'
+refused $'13 a BLOB block output: refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R BLOB SUB_TYPE TEXT) AS BEGIN SELECT B FROM TBLB WHERE ID = 1 INTO R; SUSPEND; END^\nSET TERM ;^' $'R|88:0|R:|blobtext'
+echo $'--- 14. A DOUBLE PAST ITS RANGE IS THE FLOATING-POINT OVERFLOW'
+pin     $'14 A * A over 1e300' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R DOUBLE PRECISION) AS DECLARE A DOUBLE PRECISION = 1e300; BEGIN R = A * A; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Floating-point overflow. The exponent of a floating-point operation is greater than the magnitude allowed.|-At block line: 1, col: 89'
+pin     $'14 A + A over 1.7e308' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R DOUBLE PRECISION) AS DECLARE A DOUBLE PRECISION = 1.7e308; BEGIN R = A + A; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Floating-point overflow. The exponent of a floating-point operation is greater than the magnitude allowed.|-At block line: 1, col: 91'
+pin     $'14 a condition over it' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R DOUBLE PRECISION) AS DECLARE A DOUBLE PRECISION = 1e300; BEGIN IF (A * A > 0) THEN R = 1; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Floating-point overflow. The exponent of a floating-point operation is greater than the magnitude allowed.|-At block line: 1, col: 89'
+pin     $'14 into a VARCHAR' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(30)) AS DECLARE A DOUBLE PRECISION = 1e300; BEGIN R = A * A; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Floating-point overflow. The exponent of a floating-point operation is greater than the magnitude allowed.|-At block line: 1, col: 84'
+pin     $'14 A * A - A * A (no NaN)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R DOUBLE PRECISION) AS DECLARE A DOUBLE PRECISION = 1e300; BEGIN R = A * A - A * A; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Floating-point overflow. The exponent of a floating-point operation is greater than the magnitude allowed.|-At block line: 1, col: 89'
+pin     $'14 a handler reads SQLCODE -802' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R DOUBLE PRECISION) AS DECLARE A DOUBLE PRECISION = 1e300; BEGIN R = 0; BEGIN R = A * A; WHEN ANY DO R = SQLCODE; END SUSPEND; END^\nSET TERM ;^' $'R|-802.0000000000000'
+pin     $'14 A * I * I over a BIGINT I' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R DOUBLE PRECISION) AS DECLARE A DOUBLE PRECISION = 1e300; DECLARE I BIGINT = 9223372036854775807; BEGIN R = A * I * I; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Floating-point overflow. The exponent of a floating-point operation is greater than the magnitude allowed.|-At block line: 1, col: 129'
+pin     $'14 CONTROL an underflow is 0' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R DOUBLE PRECISION) AS DECLARE A DOUBLE PRECISION = 1e-300; BEGIN R = A * A; SUSPEND; END^\nSET TERM ;^' $'R|0.000000000000000'
+pin     $'14 a stored function\'s RETURN A * 2 over 1e308' $'SELECT FDBL(1e308) FROM RDB$DATABASE;' $'FDBL|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Floating-point overflow. The exponent of a floating-point operation is greater than the magnitude allowed.|-At function "PUBLIC"."FDBL" line: 1, col: 77'
+pin     $'14 CONTROL ...over 1e307' $'SELECT FDBL(1e307) FROM RDB$DATABASE;' $'FDBL|2.000000000000000e+307'
+echo $'--- 15. A PSQL VALUE\'S OWN GRAMMAR: NO AGGREGATE, CONCATENATION BINDS TIGHTEST'
+pin     $'15 R = SUM(1): -104 Invalid command at prepare' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INT) AS BEGIN R = SUM(1); SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command'
+pin     $'15 R = COUNT(*) (a typed local beside it)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INT) AS DECLARE X DD7; BEGIN R = COUNT(*); SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command'
+pin     $'15 R = ROW_NUMBER() OVER ()' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INT) AS DECLARE X DD7; BEGIN R = ROW_NUMBER() OVER (); SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command'
+pin     $'15 ...in a branch that never runs' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INT) AS DECLARE X DD7; BEGIN IF (1 = 0) THEN R = SUM(1); R = 2; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command'
+pin     $'15 R = R + SUM(R)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INT) AS BEGIN R = 1; R = R + SUM(R); SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command'
+pin     $'15 IF (MAX(R) = 1)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INT) AS BEGIN R = 1; IF (MAX(R) = 1) THEN R = 5; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command'
+pin     $'15 WHILE (COUNT(*) < 0)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INT) AS BEGIN R = 1; WHILE (COUNT(*) < 0) DO R = 2; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command'
+pin     $'15 EXCEPTION E COUNT(*)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INT) AS BEGIN EXCEPTION E_SIMPLE COUNT(*); END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command'
+pin     $'15 R = LIST(\'a\')' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(20)) AS BEGIN R = LIST(\'a\'); SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command'
+pin     $'15 R = SUM(1) OVER ()' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INT) AS BEGIN R = SUM(1) OVER (); SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command'
+pin     $'15 CONTROL an aggregate in a subquery of its own answers' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INT, S INT) AS BEGIN R = (SELECT SUM(ID) FROM T1); S = COALESCE((SELECT MAX(ID) FROM T1), 0) + 1; SUSPEND; END^\nSET TERM ;^' $'R S|6 4'
+pin     $'15 \'1\' || 2 + 3 is (\'1\' || 2) + 3: expression evaluation not supported' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(20)) AS DECLARE X DD7; BEGIN R = \'1\' || 2 + 3; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|expression evaluation not supported'
+pin     $'15 ...in a block with no typed local' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(20)) AS BEGIN R = \'1\' || 2 + 3; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|expression evaluation not supported'
+pin     $'15 ...1 + 2 || 3' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(20)) AS BEGIN R = 1 + 2 || 3; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|expression evaluation not supported'
+pin     $'15 ...the text sum in a branch that never runs' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(20)) AS BEGIN R = \'x\'; IF (1 = 0) THEN R = \'1\' || 2 + 3; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|expression evaluation not supported'
+pin     $'15 ...a VARCHAR local plus 1' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(20)) AS DECLARE S VARCHAR(5) = \'1\'; BEGIN R = S + 1; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|expression evaluation not supported'
+pin     $'15 2 * 3 || 4 is 2 * \'34\', a DOUBLE' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(20)) AS BEGIN R = 2 * 3 || 4; SUSPEND; END^\nSET TERM ;^' $'R|68.00000000000000'
+pin     $'15 ...a VARCHAR local times 2' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(20)) AS DECLARE S VARCHAR(5) = \'1\'; BEGIN R = S * 2; SUSPEND; END^\nSET TERM ;^' $'R|2.000000000000000'
+pin     $'15 ...8 / a VARCHAR \'4\'' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(20)) AS DECLARE S VARCHAR(5) = \'4\'; BEGIN R = 8 / S; SUSPEND; END^\nSET TERM ;^' $'R|2.000000000000000'
+pin     $'15 ...\'3x\' * 2 is the conversion error' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(20)) AS BEGIN R = \'3x\' * 2; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22018|conversion error from string "3x"|-At block line: 1, col: 48'
+pin     $'15 \'v\' || A * A is (\'v\' || A) * A' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A BIGINT = 4000000000; BEGIN R = \'v\' || A * A; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22018|conversion error from string "v4000000000"|-At block line: 1, col: 79'
+pin     $'15 SUBSTRING(... FROM \'2\') in a block' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(20)) AS BEGIN R = SUBSTRING(\'abc\' FROM \'2\'); SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|expression evaluation not supported'
+pin     $'15 ...beside a typed local' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(20)) AS DECLARE X DD7; BEGIN R = SUBSTRING(\'abc\' FROM \'2\'); SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|expression evaluation not supported'
+pin     $'15 ...FROM a VARCHAR local' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(20)) AS DECLARE S VARCHAR(3) = \'2\'; BEGIN R = SUBSTRING(\'abc\' FROM S); SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|expression evaluation not supported'
+pin     $'15 ...in a SELECT' $'SELECT SUBSTRING(\'abc\' FROM \'2\') FROM RDB$DATABASE;' $'Statement failed, SQLSTATE = 42000|expression evaluation not supported'
+pin     $'15 ...FROM a text CAST' $'SELECT SUBSTRING(\'abc\' FROM CAST(NULL AS VARCHAR(3))) FROM RDB$DATABASE;' $'Statement failed, SQLSTATE = 42000|expression evaluation not supported'
+pin     $'15 CONTROL the length converts: FOR \'2\'' $'SELECT SUBSTRING(\'abc\' FROM 1 FOR \'2\') FROM RDB$DATABASE;' $'SUBSTRING|ab'
+echo $'--- 16. EXACT ARITHMETIC IS TYPED: BIGINT, INT128 AND THEIR OVERFLOWS'
+pin     $'16 an INT128 past BIGINT, minus 1' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A INT128 = 10000000000000000000000000000000000000; BEGIN R = A - 1; SUSPEND; END^\nSET TERM ;^' $'R|9999999999999999999999999999999999999'
+pin     $'16 ...the INT128 maximum / 2' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE X DD7; DECLARE A INT128 = 170141183460469231731687303715884105727; BEGIN R = A / 2; SUSPEND; END^\nSET TERM ;^' $'R|85070591730234615865843651857942052863'
+pin     $'16 ...A + A - 1 at 2^126: the prefixed Integer overflow' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A INT128 = 85070591730234615865843651857942052864; BEGIN R = A + A - 1; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Integer overflow. The result of an integer operation caused the most significant bit of the result to carry.|-At block line: 1, col: 107'
+pin     $'16 ...the maximum * 2' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A INT128 = 170141183460469231731687303715884105727; BEGIN R = A * 2; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Integer overflow. The result of an integer operation caused the most significant bit of the result to carry.|-At block line: 1, col: 108'
+pin     $'16 an INT128 1 + the BIGINT maximum is an INT128' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A INT128 = 1; BEGIN R = A + 9223372036854775807; SUSPEND; END^\nSET TERM ;^' $'R|9223372036854775808'
+pin     $'16 BIGINT * BIGINT is an INT128' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE X DD7; DECLARE A BIGINT = 4000000000; BEGIN R = A * A; SUSPEND; END^\nSET TERM ;^' $'R|16000000000000000000'
+pin     $'16 ...a BIGINT times a literal' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS BEGIN R = 123456789012 * 1000000000; SUSPEND; END^\nSET TERM ;^' $'R|123456789012000000000'
+pin     $'16 ...A * 1 + A over 5e18' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A BIGINT = 5000000000000000000; BEGIN R = A * 1 + A; SUSPEND; END^\nSET TERM ;^' $'R|10000000000000000000'
+pin     $'16 BIGINT + BIGINT past the range: the bare Integer overflow' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A BIGINT = 5000000000000000000; BEGIN R = A + A; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|Integer overflow. The result of an integer operation caused the most significant bit of the result to carry.|-At block line: 1, col: 88'
+pin     $'16 the BIGINT minimum / -1 is 9223372036854775808 (the server panicked)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A BIGINT = -9223372036854775808; BEGIN R = A / -1; SUSPEND; END^\nSET TERM ;^' $'R|9223372036854775808'
+pin     $'16 the INTEGER minimum / -1' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A INTEGER = -2147483648; BEGIN R = A / -1; SUSPEND; END^\nSET TERM ;^' $'R|2147483648'
+pin     $'16 INTEGER cubed' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A INTEGER = 2147483647; BEGIN R = A * A * A; SUSPEND; END^\nSET TERM ;^' $'R|9903520300447984150353281023'
+pin     $'16 ...to the fifth: the prefixed overflow' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A INTEGER = 2147483647; BEGIN R = A * A * A * A * A; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Integer overflow. The result of an integer operation caused the most significant bit of the result to carry.|-At block line: 1, col: 80'
+pin     $'16 NUMERIC(18,2) squared' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A NUMERIC(18,2) = 4000000000.00; BEGIN R = A * A; SUSPEND; END^\nSET TERM ;^' $'R|16000000000000000000.0000'
+pin     $'16 NUMERIC(18,2) + itself past the range' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A NUMERIC(18,2) = 90000000000000000.00; BEGIN R = A + A; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|Integer overflow. The result of an integer operation caused the most significant bit of the result to carry.|-At block line: 1, col: 96'
+pin     $'16 a BIGINT + a NUMERIC(18,2) rescaled past the range' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A BIGINT = 9000000000000000000; DECLARE N NUMERIC(18,2) = 1.00; BEGIN R = A + N; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range|-At block line: 1, col: 120'
+pin     $'16 an INT128 + a NUMERIC(38,2) rescaled past the range' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A INT128 = 10000000000000000000000000000000000000; DECLARE N NUMERIC(38,2) = 1.50; BEGIN R = A + N; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range|-At block line: 1, col: 139'
+pin     $'16 the INT128 minimum / -1: the bare Integer overflow' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A INT128 = -170141183460469231731687303715884105728; BEGIN R = A / -1; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|Integer overflow. The result of an integer operation caused the most significant bit of the result to carry.|-At block line: 1, col: 109'
+pin     $'16 SMALLINT to the fifth' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A SMALLINT = 30000; BEGIN R = A * A * A * A * A; SUSPEND; END^\nSET TERM ;^' $'R|24300000000000000000000'
+pin     $'16 a condition over BIGINT * BIGINT' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A BIGINT = 4000000000; BEGIN IF (A * A > 9223372036854775807) THEN R = \'big\'; SUSPEND; END^\nSET TERM ;^' $'R|big'
+pin     $'16 ...A * A / A' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50)) AS DECLARE A BIGINT = 4000000000; BEGIN R = A * A / A; SUSPEND; END^\nSET TERM ;^' $'R|4000000000'
+pin     $'16 the INT128 product into a BIGINT: the prefixed overflow' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R BIGINT) AS DECLARE A BIGINT = 4000000000; BEGIN R = A * A; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Integer overflow. The result of an integer operation caused the most significant bit of the result to carry.|-At block line: 1, col: 74'
+pin     $'16 an INT128 local into an INTEGER' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INTEGER) AS DECLARE A INT128 = 3000000000; BEGIN R = A; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Integer overflow. The result of an integer operation caused the most significant bit of the result to carry.|-At block line: 1, col: 75'
+pin     $'16 ...into a SMALLINT: out of range' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R SMALLINT) AS DECLARE A INT128 = 40000; BEGIN R = A; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range|-At block line: 1, col: 71'
+pin     $'16 ...BIGINT * BIGINT into an INTEGER' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INTEGER) AS DECLARE A BIGINT = 60000; BEGIN R = A * A; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-Integer overflow. The result of an integer operation caused the most significant bit of the result to carry.|-At block line: 1, col: 70'
+pin     $'16 an INT128 local in a query and a FETCH ABSOLUTE' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(50), S VARCHAR(50)) AS DECLARE A INT128 = 5; DECLARE C SCROLL CURSOR FOR (SELECT ID FROM T1 ORDER BY ID); DECLARE K INT; BEGIN OPEN C; FETCH ABSOLUTE A - 3 FROM C INTO K; R = K; S = (SELECT :A - 3 FROM RDB$DATABASE); SUSPEND; END^\nSET TERM ;^' $'R S|2 2'
+echo $'--- 17. A CONTEXT VARIABLE IS NO PARAMETER; SUSPEND NEEDS RETURNS'
+pin     $'17 :SQLCODE in a handler\'s query: Token unknown at the name' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (M INTEGER) AS BEGIN BEGIN M = 1/0; WHEN ANY DO SELECT :SQLCODE FROM RDB$DATABASE INTO M; END SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 79|-SQLCODE'
+pin     $'17 ...M = :SQLCODE' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (M INTEGER) AS BEGIN BEGIN M = 1/0; WHEN ANY DO M = :SQLCODE; END SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 76|-SQLCODE'
+pin     $'17 ...:ROW_COUNT in a branch that never runs' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (M INTEGER) AS BEGIN M = 0; IF (M = 1) THEN SELECT :ROW_COUNT FROM RDB$DATABASE INTO M; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 75|-ROW_COUNT'
+pin     $'17 SUSPEND in a block with no RETURNS' $'SET TERM ^;\nEXECUTE BLOCK AS BEGIN IF (SQLCODE = 0) THEN SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-SUSPEND could not be used without RETURNS clause in PROCEDURE or EXECUTE BLOCK'
+pin     $'17 ...after a BREAK' $'SET TERM ^;\nEXECUTE BLOCK AS DECLARE I INT = 0; BEGIN WHILE (I < 2) DO BEGIN I = I + 1; IF (I = 1) THEN BREAK; END SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-SUSPEND could not be used without RETURNS clause in PROCEDURE or EXECUTE BLOCK'
+pin     $'17 ...a bare one' $'SET TERM ^;\nEXECUTE BLOCK AS BEGIN SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-SUSPEND could not be used without RETURNS clause in PROCEDURE or EXECUTE BLOCK'
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-psqlgram-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 184 ]; then echo "FAIL only $ran checks ran (floor 184)"; fail=1; fi
+if [ "$ran" -lt 274 ]; then echo "FAIL only $ran checks ran (floor 274)"; fail=1; fi
 exit $fail

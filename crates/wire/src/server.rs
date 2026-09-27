@@ -31025,9 +31025,9 @@ fn tokenize_expr(s: &str) -> Option<Vec<ETok>> {
 fn parse_expr(s: &str) -> Option<fire_crab_ods::expr::Expr> {
     let toks = tokenize_expr(s)?;
     let mut p = 0;
-    let e = blr_expr_concat(&toks, &mut p)?;
-    if p != toks.len() {
-        return None; // trailing tokens
+    let e = blr_expr_top(&toks, &mut p)?;
+    if p != toks.len() || expr_adds_text(&e) {
+        return None; // trailing tokens, or a text operand of + / -
     }
     Some(e)
 }
@@ -31113,7 +31113,7 @@ fn cond_unary(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Cond> {
 
 fn cond_cmp(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Cond> {
     use fire_crab_ods::expr::Cond;
-    let l = blr_expr_concat(t, p)?;
+    let l = blr_expr_top(t, p)?;
     // `<expr> IS [NOT] NULL` - blr_missing / blr_not(blr_missing)
     if matches!(t.get(*p), Some(ETok::Id(w)) if w == "IS") {
         *p += 1;
@@ -31134,7 +31134,10 @@ fn cond_cmp(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Cond> {
     };
     let op = *op;
     *p += 1;
-    let r = blr_expr_concat(t, p)?;
+    let r = blr_expr_top(t, p)?;
+    if expr_adds_text(&l) || expr_adds_text(&r) {
+        return None;
+    }
     Some(Cond::Cmp(op, l, r))
 }
 
@@ -31278,18 +31281,27 @@ fn parse_check_clause(item: &str) -> Option<(String, String)> {
     None
 }
 
-/// CONCATENATION binds LOOSER than `+ -`, so `'a' || 1 + 2` is
-/// `'a' || 3` - the engine's own precedence. Everything that parsed
-/// before still parses: a text operand was already a node, and an
-/// expression with no `||` never enters the loop.
+/// CONCATENATION BINDS TIGHTER THAN EVERY ARITHMETIC OPERATOR, the unary
+/// minus included - the engine's grammar (parse.y: CONCATENATE above
+/// UMINUS above `* /` above `+ -`), measured on engine 2182: `SELECT 'a'
+/// || 1 + 2`, `1 + 2 || 3` and `10 - 2 || 3` are *Strings cannot be added
+/// or subtracted*, `2 * 3 || 4` *Strings cannot be multiplied*, `-2 || 3`
+/// *Strings cannot be negated*; in a block `R = 2 * 3 || 4` is 68 (2 *
+/// '34'). This parser read `'a' || 1 + 2` as `'a' || 3` and answered
+/// 'a3', and `2 * 3 || 4` as '64'. An operand of `||` is a factor.
 fn blr_expr_concat(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Expr> {
     use fire_crab_ods::expr::Expr;
-    let mut left = blr_expr_add(t, p)?;
+    let mut left = blr_expr_factor(t, p)?;
     while matches!(t.get(*p), Some(ETok::Concat)) {
         *p += 1;
-        left = Expr::Concat(Box::new(left), Box::new(blr_expr_add(t, p)?));
+        left = Expr::Concat(Box::new(left), Box::new(blr_expr_factor(t, p)?));
     }
     Some(left)
+}
+
+/// The whole expression grammar: `+ -` over `* /` over `||`.
+fn blr_expr_top(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Expr> {
+    blr_expr_add(t, p)
 }
 
 fn blr_expr_add(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Expr> {
@@ -31313,16 +31325,16 @@ fn blr_expr_add(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Expr> 
 
 fn blr_expr_mul(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Expr> {
     use fire_crab_ods::expr::Expr;
-    let mut left = blr_expr_factor(t, p)?;
+    let mut left = blr_expr_concat(t, p)?;
     while let Some(op) = t.get(*p) {
         match op {
             ETok::Star => {
                 *p += 1;
-                left = Expr::Multiply(Box::new(left), Box::new(blr_expr_factor(t, p)?));
+                left = Expr::Multiply(Box::new(left), Box::new(blr_expr_concat(t, p)?));
             }
             ETok::Slash => {
                 *p += 1;
-                left = Expr::Divide(Box::new(left), Box::new(blr_expr_factor(t, p)?));
+                left = Expr::Divide(Box::new(left), Box::new(blr_expr_concat(t, p)?));
             }
             _ => break,
         }
@@ -31348,6 +31360,9 @@ fn blr_expr_factor(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Exp
             // unary minus, only on an integer literal (folded into its value)
             *p += 1;
             match t.get(*p)? {
+                // `-2 || 3` negates the concatenation - text - which the
+                // engine refuses; the fold would have answered '-23'
+                ETok::Num(_) if matches!(t.get(*p + 1), Some(ETok::Concat)) => None,
                 ETok::Num(n) => {
                     let v = -*n;
                     *p += 1;
@@ -31431,7 +31446,7 @@ fn blr_expr_factor(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Exp
             *p += 1;
             // the full expression grammar re-enters here, concatenation
             // included: a COMPUTED BY source arrives as `(a || b)`
-            let e = blr_expr_concat(t, p)?;
+            let e = blr_expr_top(t, p)?;
             if !matches!(t.get(*p)?, ETok::RParen) {
                 return None;
             }
@@ -75359,6 +75374,9 @@ const GDS_DSQL_PROCEDURE_ERR: i32 = 335544581;
 /// emitted by the DDL paths inline; named here because the derived-table
 /// column check needs the same shape.
 const GDS_DSQL_COMMAND_ERR: i32 = 335544570;
+/// isc_dsql_suspend_without_returns - "SUSPEND could not be used without
+/// RETURNS clause in PROCEDURE or EXECUTE BLOCK"
+const GDS_DSQL_SUSPEND_WITHOUT_RETURNS: i32 = 335545265;
 /// isc_order_by_err: "invalid ORDER BY clause"
 const GDS_ORDER_BY_ERR: i32 = 335544617;
 /// `isc_dsql_derived_field_unnamed` (336397220, sqlcode -104, SQLSTATE
@@ -76364,6 +76382,19 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .bytes(name.as_bytes())
                 .int(2) // isc_arg_string - @2 the derived table's alias
                 .bytes(table.as_bytes());
+        }
+        // three lines: "Dynamic SQL Error", "SQL error code = -104", the
+        // code (measured: `R = COUNT(*)` in a block is "Invalid command",
+        // a SUSPEND in a block with no RETURNS its own line)
+        EvalErr::Dsql104(code) => {
+            w.int(1) // isc_arg_gds - Dynamic SQL Error
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds - isc_sqlerr
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1) // isc_arg_gds - the code
+                .int(*code);
         }
         EvalErr::UnionOrderBy => {
             w.int(1) // isc_arg_gds - Dynamic SQL Error
@@ -80262,6 +80293,25 @@ fn array_element_of(rel: u16, num: u64, idx: &[i32], elem: &Descriptor) -> Resul
     rec.extend_from_slice(&slot);
     let d = Descriptor { offset: 1, length: elen as u16, ..elem.clone() };
     Ok(fire_crab_ods::format::decode_field(&rec, &d, 0))
+}
+
+/// A blob VALUE's text and the set it is spelled in, for the move of a
+/// blob into a PSQL slot of another type ([coerce_to_slot]): a stored
+/// blob in the set its header carries, a computed one of this statement
+/// (LIST) as NONE - and then only an ASCII one, since which set its
+/// octets were made in is not recorded.
+fn blob_value_text(rel: u16, num: u64) -> Result<(String, u8), EvalErr> {
+    if rel == 0 {
+        let t = blob_text_of(rel, num, fire_crab_ods::intl::CS_NONE)?;
+        return if t.is_ascii() { Ok((t, fire_crab_ods::intl::CS_NONE)) } else { Err(EvalErr::Unsupported) };
+    }
+    let ctx = BLOB_CTX.with(|c| c.borrow().clone());
+    let Some((image, page_size)) = ctx else {
+        return Err(EvalErr::Unsupported);
+    };
+    let b = fire_crab_blb::read_blob(&image, page_size, rel, num).map_err(|_| EvalErr::Unsupported)?;
+    let cs = b.header.charset;
+    Ok((blob_text_of(rel, num, cs)?, cs))
 }
 
 fn blob_text_of(rel: u16, num: u64, cs: u8) -> Result<String, EvalErr> {
@@ -90882,6 +90932,20 @@ fn resolve_expr_inner(
                 .iter()
                 .map(|a| resolve_expr(a, columns, descs))
                 .collect::<Option<Vec<_>>>()?;
+            // SUBSTRING's START MAY NOT BE TEXT: the engine refuses it at
+            // prepare with the bare *expression evaluation not supported*
+            // - measured on 2182: `SUBSTRING('abc' FROM '2')`, FROM a
+            // CAST(... AS VARCHAR(3)) (a NULL one too), and in a block FROM
+            // a VARCHAR local; the LENGTH converts (`FOR '2'` is 'ab'), as
+            // does LEFT's. This answered 'bc'.
+            if matches!(f, SysFn::Substring)
+                && resolved.get(1).is_some_and(|a| a.type_of(descs) == Some(ExprType::Text))
+            {
+                PREPARE_REFUSAL.with(|c| {
+                    c.borrow_mut().get_or_insert(EvalErr::Bare(GDS_EXPRESSION_EVAL_ERR, Vec::new()));
+                });
+                return None;
+            }
             // a BLOB operand of a function that reads a number is wrapped
             // in the raise the engine gives it ([fn_reads_number])
             if fn_reads_number(f) {
@@ -92623,6 +92687,12 @@ enum EvalErr {
     /// `code` one of [GDS_FORUPDATE_VIRTUALTBL] / `_SYSTBL` / `_TEMPTBL`,
     /// `name` the quoted schema-qualified relation
     ForUpdateTable { code: i32, name: String },
+    /// "Dynamic SQL Error", "SQL error code = -104", then this one code
+    /// with no argument: *Invalid command* for an aggregate or a window
+    /// function used as a PSQL value (`R = SUM(1)`, `IF (MAX(R) = 1)`, `R
+    /// = ROW_NUMBER() OVER ()`), *SUSPEND could not be used without
+    /// RETURNS clause* - both refused at the block's prepare
+    Dsql104(i32),
     /// the recursive member of a CTE is a side of an OUTER join
     CteOuterJoin,
     /// the recursive member names the CTE twice in one FROM
@@ -115056,20 +115126,29 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
     // overflow` (SQLSTATE 22003, "Integer overflow. The result of an
     // integer operation caused the most significant bit of the result to
     // carry") and a body can catch it.
-    let bin = |a: &E, b: &E, op: fn(i64, i64) -> Option<i64>, kind: char| -> Result<Value, PsqlStop> {
+    let bin = |a: &E, b: &E, kind: char| -> Result<Value, PsqlStop> {
         match (eval_psql_expr(a, f)?, eval_psql_expr(b, f)?) {
-            (Value::Int(x), Value::Int(y)) => match op(x, y) {
-                Some(v) => Ok(Value::Int(v)),
-                None => Err(PsqlStop::Raise(Thrown::Runtime {
-                    err: EvalErr::IntegerOverflow,
-                    trace: Vec::new(),
-                })),
-            },
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            // a SCALED operand: exact arithmetic at the engine's result
-            // scale (DSC_add_result / DSC_multiply_result: the wider
-            // scale for + and -, the summed scale for *)
-            (x, y) => psql_scaled_arith(kind, &x, &y),
+            // A TEXT FACTOR OF `*` OR `/` IS READ AS A DOUBLE: measured on
+            // engine 2182 in a block, `R = 2 * 3 || 4` is 68.00000000000000
+            // (2 * '34') and `S * 2` over a VARCHAR '1' 2.000000000000000;
+            // a `+` / `-` over text never reaches here ([expr_adds_text])
+            (x, y) if matches!(kind, '*' | '/') && (matches!(x, Value::Text(_)) || matches!(y, Value::Text(_))) => {
+                let dbl = |v: Value| -> Result<Value, PsqlStop> {
+                    match v {
+                        Value::Text(_) => {
+                            let e = Expr::Cast(Box::new(Expr::Col(0)), CastTarget::Approx, fire_crab_ods::intl::CS_UTF8);
+                            e.eval(&[v]).map_err(psql_raise)
+                        }
+                        v => Ok(v),
+                    }
+                };
+                psql_scaled_arith(kind, &dbl(x)?, &dbl(y)?, 8)
+            }
+            (x, y) => {
+                let width = psql_arith_width(kind, psql_exact_width(a, f, &x), psql_exact_width(b, f, &y));
+                psql_scaled_arith(kind, &x, &y, width)
+            }
         }
     };
     match e {
@@ -115086,6 +115165,8 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
         E::GenId { name, step } => {
             let step = match eval_psql_expr(step, f)? {
                 Value::Int(n) => n,
+                // a product over a BIGINT is INT128-typed ([psql_arith_width])
+                Value::Int128(n, 0) if i64::try_from(n).is_ok() => n as i64,
                 _ => return Err(PsqlStop::Unsupported),
             };
             f.gen_draw(name, Some(step))
@@ -115128,6 +115209,7 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
                 let part = |v: &Value| match v {
                     Value::Text(t) => Some(t.clone()),
                     Value::Int(n) => Some(n.to_string()),
+                    Value::Int128(n, 0) => Some(n.to_string()),
                     _ => None,
                 };
                 match (part(&x), part(&y)) {
@@ -115146,23 +115228,61 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
                 }
             }
         },
-        E::Add(a, b) => bin(a, b, |x, y| x.checked_add(y), '+'),
-        E::Subtract(a, b) => bin(a, b, |x, y| x.checked_sub(y), '-'),
-        E::Multiply(a, b) => bin(a, b, |x, y| x.checked_mul(y), '*'),
-        // division by zero is an error in SQL, not a NULL
-        E::Divide(a, b) => match (eval_psql_expr(a, f)?, eval_psql_expr(b, f)?) {
-            // it was an error already - but a REFUSAL, which no handler
-            // can catch and which reaches the client as "this server
-            // could not run that". It is the engine's arithmetic
-            // exception now, and a body may catch it.
-            (Value::Int(_), Value::Int(0)) => Err(PsqlStop::Raise(Thrown::Runtime {
-                err: EvalErr::DivideByZero,
-                trace: Vec::new(),
-            })),
-            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x / y)),
-            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            (x, y) => psql_scaled_arith('/', &x, &y),
+        E::Add(a, b) => bin(a, b, '+'),
+        E::Subtract(a, b) => bin(a, b, '-'),
+        E::Multiply(a, b) => bin(a, b, '*'),
+        // division by zero is an error in SQL, not a NULL - the engine's
+        // arithmetic exception, which a body may catch
+        E::Divide(a, b) => bin(a, b, '/'),
+    }
+}
+
+/// The storage width (2 / 4 / 8 / 16 bytes) of an EXACT PSQL operand's
+/// declared type, as the engine's compile types it: a literal is an
+/// INTEGER or a BIGINT, a variable its declared SMALLINT .. INT128 or
+/// NUMERIC(p, s), an operation the width [psql_arith_width] gave it -
+/// which its value carries, an INT128-wide result being kept an INT128
+/// value ([psql_scaled_arith]). Where the declaration is not known (a
+/// cursor's column, a trigger's field) the value speaks for itself: an
+/// INT128 is 16, one that fits 32 bits 4 - no product of two of those
+/// leaves 64 bits, so the guess moves no overflow - any other 8.
+fn psql_exact_width(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame, v: &Value) -> u8 {
+    use fire_crab_ods::expr::Expr as E;
+    let declared = match e {
+        E::IntLiteral(_) => Some(4),
+        E::Int64Literal(_) | E::GenId { .. } | E::GenId2 { .. } => Some(8),
+        E::Variable(n) => match f.types.get(*n as usize) {
+            Some(Some(CastTarget::Int { bytes } | CastTarget::Numeric { bytes, .. })) => Some(*bytes),
+            _ => None,
         },
+        E::Add(..) | E::Subtract(..) | E::Multiply(..) | E::Divide(..) => {
+            Some(if matches!(v, Value::Int128(..)) { 16 } else { 8 })
+        }
+        _ => None,
+    };
+    declared.unwrap_or(match v {
+        Value::Int128(..) => 16,
+        Value::Int(n) | Value::Scaled(n, _) if i32::try_from(*n).is_ok() => 4,
+        _ => 8,
+    })
+}
+
+/// The width of an exact `+ - * /` result, dialect 3, measured on engine
+/// 2182 in EXECUTE BLOCK: a sum or difference is a BIGINT unless an
+/// operand is an INT128 (`A + 9223372036854775807` over an INT128 A of 1
+/// is 9223372036854775808; two BIGINTs past the range raise); a product
+/// or quotient is a BIGINT only over two operands of at most 4 bytes and
+/// an INT128 otherwise - `A * A` over a BIGINT 4000000000 is
+/// 16000000000000000000, `A * 1 + A` over 5e18 is 1e19, a BIGINT
+/// -9223372036854775808 / -1 is 9223372036854775808, `123456789012 *
+/// 1000000000` is 123456789012000000000, NUMERIC(18,2) squared is
+/// 16000000000000000000.0000; an INTEGER -2147483648 / -1 is 2147483648.
+fn psql_arith_width(kind: char, wa: u8, wb: u8) -> u8 {
+    let w = wa.max(wb);
+    match kind {
+        '+' | '-' if w > 8 => 16,
+        '*' | '/' if w > 4 => 16,
+        _ => 8,
     }
 }
 
@@ -115192,8 +115312,21 @@ fn psql_num_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 /// up by the divisor's scale twice (measured: `(1000.00) * 100 /
 /// 105900.00` = 0.9442, the employee sample's PERCENT_CHANGE); a double
 /// operand makes the whole thing double.
-fn psql_scaled_arith(kind: char, a: &Value, b: &Value) -> Result<Value, PsqlStop> {
-    let overflow = || PsqlStop::Raise(Thrown::Runtime { err: EvalErr::IntegerOverflow, trace: Vec::new() });
+/// `width` is the exact result's ([psql_arith_width]): past a BIGINT's
+/// range its overflow is the bare *Integer overflow*, past an INT128's
+/// the one under *arithmetic exception* - but for a quotient, which
+/// overflows only as MIN / -1 and is the bare one at either width, and
+/// an operand's rescale to the finer scale past its range, which is
+/// *numeric value is out of range* under *arithmetic exception*
+/// (measured: `A + N` over an INT128 1e37 and a NUMERIC(38,2), and over
+/// a BIGINT 9e18 and a NUMERIC(18,2)).
+/// An INT128-wide result stays an INT128 value however small, so the
+/// next operation and a narrowing store read its type.
+fn psql_scaled_arith(kind: char, a: &Value, b: &Value, width: u8) -> Result<Value, PsqlStop> {
+    let overflow = || {
+        psql_raise(if width > 8 && kind != '/' { EvalErr::IntegerOverflowArith } else { EvalErr::IntegerOverflow })
+    };
+    let rescale = || psql_raise(EvalErr::NumericOutOfRange);
     let div0 = || PsqlStop::Raise(Thrown::Runtime { err: EvalErr::DivideByZero, trace: Vec::new() });
     if matches!(a, Value::Double(_) | Value::Rounded(..)) || matches!(b, Value::Double(_) | Value::Rounded(..)) {
         let f = |v: &Value| -> Option<f64> {
@@ -115204,7 +115337,14 @@ fn psql_scaled_arith(kind: char, a: &Value, b: &Value) -> Result<Value, PsqlStop
             }
         };
         let (x, y) = (f(a).ok_or(PsqlStop::Unsupported)?, f(b).ok_or(PsqlStop::Unsupported)?);
-        return Ok(Value::Double(match kind {
+        // A DOUBLE RESULT PAST THE RANGE IS THE FLOATING-POINT OVERFLOW,
+        // never an Infinity or a NaN the next step reads as a number:
+        // measured on engine 2182, `A * A` and `A + A` over a DOUBLE A of
+        // 1e300 / 1.7e308, a VARCHAR target, `IF (A * A > 0)`, `A * A -
+        // A * A` and a function's `RETURN A * 2` all raise 22003 *Floating-
+        // point overflow* at the statement (a handler reads SQLCODE -802);
+        // an underflow is 0.
+        let r = match kind {
             '+' => x + y,
             '-' => x - y,
             '*' => x * y,
@@ -115224,7 +115364,11 @@ fn psql_scaled_arith(kind: char, a: &Value, b: &Value) -> Result<Value, PsqlStop
                 x / y
             }
             _ => return Err(PsqlStop::Unsupported),
-        }));
+        };
+        if !r.is_finite() {
+            return Err(psql_raise(EvalErr::FloatOverflow));
+        }
+        return Ok(Value::Double(r));
     }
     let (ra, sa) = numeric_parts(a).ok_or(PsqlStop::Unsupported)?;
     let (rb, sb) = numeric_parts(b).ok_or(PsqlStop::Unsupported)?;
@@ -115233,8 +115377,11 @@ fn psql_scaled_arith(kind: char, a: &Value, b: &Value) -> Result<Value, PsqlStop
     let (raw, scale) = match kind {
         '+' | '-' => {
             let sc = sa.min(sb);
-            let x = ra.checked_mul(pow((sa - sc) as i32).ok_or_else(overflow)?).ok_or_else(overflow)?;
-            let y = rb.checked_mul(pow((sb - sc) as i32).ok_or_else(overflow)?).ok_or_else(overflow)?;
+            let x = ra.checked_mul(pow((sa - sc) as i32).ok_or_else(rescale)?).ok_or_else(rescale)?;
+            let y = rb.checked_mul(pow((sb - sc) as i32).ok_or_else(rescale)?).ok_or_else(rescale)?;
+            if width <= 8 && (i64::try_from(x).is_err() || i64::try_from(y).is_err()) {
+                return Err(rescale());
+            }
             let r = if kind == '+' { x.checked_add(y) } else { x.checked_sub(y) }.ok_or_else(overflow)?;
             (r, sc)
         }
@@ -115244,12 +115391,15 @@ fn psql_scaled_arith(kind: char, a: &Value, b: &Value) -> Result<Value, PsqlStop
                 return Err(div0());
             }
             // result scale sa + sb; R = A * 10^(2*|sb|) / B (truncating)
-            let up = pow((-2 * sb as i32).max(0)).ok_or_else(overflow)?;
-            let r = ra.checked_mul(up).ok_or_else(overflow)? / rb;
+            let up = pow((-2 * sb as i32).max(0)).ok_or_else(rescale)?;
+            let r = ra.checked_mul(up).ok_or_else(rescale)?.checked_div(rb).ok_or_else(overflow)?;
             (r, sa.checked_add(sb).ok_or_else(overflow)?)
         }
         _ => return Err(PsqlStop::Unsupported),
     };
+    if width > 8 {
+        return Ok(Value::Int128(raw, scale));
+    }
     if i64::try_from(raw).is_err() {
         return Err(overflow());
     }
@@ -118155,6 +118305,17 @@ fn psql_literal(v: &Value) -> Option<String> {
             let cut = padded.len() - places;
             format!("{}{}.{}", if neg { "-" } else { "" }, &padded[..cut], &padded[cut..])
         }
+        // an INT128 value keeps its type in the text - an INT128 local
+        // in `SELECT :A - 3` or `FETCH ABSOLUTE A - 3` refused, having
+        // no literal at all
+        Value::Int128(raw, scale) if *scale <= 0 => {
+            let text = Value::Int128(*raw, *scale).render();
+            if *scale == 0 {
+                format!("CAST('{}' AS INT128)", text)
+            } else {
+                format!("CAST('{}' AS NUMERIC(38, {}))", text, -(*scale as i32))
+            }
+        }
         // '' doubles inside a SQL string literal
         Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
         Value::Bool(b) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
@@ -118359,7 +118520,15 @@ fn exec_psql_stmt(
     db: &mut Option<Database>,
     ctx: &SessionCtx,
 ) -> Result<(), PsqlStop> {
+    // the blobs a statement moves into slots are read from the database
+    // as it stands NOW ([coerce_to_slot]) - one an INSERT of this body
+    // just stored included - not the image the op started from
+    let kept = BLOB_CTX.with(|c| c.borrow().clone());
+    if let Some(d) = db.as_ref() {
+        BLOB_CTX.with(|c| *c.borrow_mut() = Some((d.bytes(), d.page_size)));
+    }
     let r = exec_psql_stmt_inner(s, f, steps, db, ctx);
+    BLOB_CTX.with(|c| *c.borrow_mut() = kept);
     if let Err(PsqlStop::Raise(t)) = &r {
         if t.trace().is_empty() {
             let mut t = t.clone();
@@ -118600,6 +118769,10 @@ fn exec_psql_stmt_inner(
             }
             let sql = subst_body_query(text, binds, f).ok_or(PsqlStop::Unsupported)?;
             let (count, rows) = run_body_returning(&sql, db, ctx)?;
+            // a blob the statement returned is one it has just stored
+            if let Some(d) = db.as_ref() {
+                BLOB_CTX.with(|c| *c.borrow_mut() = Some((d.bytes(), d.page_size)));
+            }
             set_row_count(f, count);
             match rows.len() {
                 0 => Ok(()),
@@ -118890,6 +119063,8 @@ fn exec_psql_stmt_inner(
                 FetchOrient::Absolute((text, binds)) | FetchOrient::Relative((text, binds)) => {
                     match eval_raw_scalar(text, binds, f, db, ctx)?.0 {
                         Value::Int(n) => Some(n),
+                        // an INT128-typed operand (`A - 3` over an INT128 A)
+                        Value::Int128(n, 0) if i64::try_from(n).is_ok() => Some(n as i64),
                         _ => return Err(PsqlStop::Unsupported),
                     }
                 }
@@ -120041,6 +120216,25 @@ fn coerce_to_slot(f: &PsqlFrame, n: usize, v: Value, src: SrcCs) -> Result<Value
     if matches!(v, Value::Null) {
         return Ok(v);
     }
+    // A BLOB MOVES INTO A SLOT OF ANOTHER TYPE AS ITS CONTENT: measured on
+    // engine 2182, `SELECT B FROM TBL INTO R` over a text blob, `SELECT
+    // LIST(ID) FROM T1 INTO R`, FETCH ... INTO, `R = C.B` and RETURNING B
+    // INTO R into a VARCHAR R answer the blob's text ('blobtext', '1,2,3'),
+    // and `IF (R = '1,2,3')` then takes the THEN branch. The id itself
+    // was cast, and the slot held the placeholder '<blob 0:1073741825>'.
+    // The text is read in the blob's own set and moves as any text does;
+    // a blob that cannot be read here refuses.
+    let (v, src) = match (t, v) {
+        (CastTarget::Blob { .. }, v) => (v, src),
+        (_, Value::Blob(rel, num)) => {
+            let (text, cs) = blob_value_text(rel, num).map_err(|e| match e {
+                EvalErr::Unsupported => PsqlStop::Unsupported,
+                e => psql_raise(e),
+            })?;
+            (Value::Text(text), Some(cs))
+        }
+        (_, v) => (v, src),
+    };
     let mut from = fire_crab_ods::intl::CS_UTF8;
     let v = match (t, v) {
         (CastTarget::Text { cs: Some(dst), .. }, Value::Text(s)) => {
@@ -120055,8 +120249,22 @@ fn coerce_to_slot(f: &PsqlFrame, n: usize, v: Value, src: SrcCs) -> Result<Value
         }
         (_, v) => v,
     };
+    // an INT128 value narrowed into a smaller exact slot is the engine's
+    // prefixed *Integer overflow* ([int128_narrow_error]; measured: `R =
+    // A * A` into a BIGINT R over a BIGINT A of 4000000000 - the product
+    // an INT128)
+    let wide = match (&v, t) {
+        (Value::Int128(r, s), CastTarget::Int { bytes } | CastTarget::Numeric { bytes, .. }) if *bytes < 16 => {
+            let to = if let CastTarget::Numeric { scale, .. } = t { *scale } else { 0 };
+            Some((rescale_int_round(*r, *s, to), if *bytes == 2 { dtype::SHORT } else { dtype::LONG }))
+        }
+        _ => None,
+    };
     let e = Expr::Cast(Box::new(Expr::Col(0)), *t, from);
-    e.eval(&[v]).map_err(psql_raise)
+    match (e.eval(&[v]), wide) {
+        (Err(EvalErr::NumericOutOfRange), Some((scaled, dt))) => Err(psql_raise(int128_narrow_error(dt, scaled))),
+        (r, _) => r.map_err(psql_raise),
+    }
 }
 
 /// Write `v`, spelled in `src`'s representation, into slot `n` through
@@ -120129,6 +120337,13 @@ fn eval_raw_cond(
 /// `R = PK.PF('ab')` answer 'fab', 'fabz', 'fit''s', 3, 3 and 'pabé'
 /// under every caller. The list is taken and the caller's put back, so
 /// a body run from inside a prepare never hands its calls to it.
+thread_local! {
+    /// The engine's own prepare-time vector the planner posted for the
+    /// last body statement [psql_plan] refused, if it posted one - what
+    /// a block's prepare verdict answers with ([VerdictCx::query]).
+    static PSQL_PLAN_REFUSAL: std::cell::RefCell<Option<EvalErr>> = const { std::cell::RefCell::new(None) };
+}
+
 fn psql_plan(sql: &str, db: &Option<Database>) -> Result<(Plan, Vec<FnCall>), PsqlStop> {
     // A BODY'S QUERY IS HELD TO THE PREPARE-TIME RULES A CLIENT'S IS: the
     // limit-clause and window-frame grammar and the -206 of a qualifier
@@ -120143,6 +120358,7 @@ fn psql_plan(sql: &str, db: &Option<Database>) -> Result<(Plan, Vec<FnCall>), Ps
     // shape [eval_raw_scalar] and [eval_raw_cond] build for every raw
     // assignment and test - holds no clause these rules read unless the
     // value carries a query of its own, and is not scanned per row)
+    PSQL_PLAN_REFUSAL.with(|r| *r.borrow_mut() = None);
     let up = mask_literals(&sql.to_ascii_uppercase());
     let wrapper_only = up.matches("SELECT").count() == 1 && !up.contains(" OVER") && {
         let t = up.trim_end();
@@ -120156,8 +120372,13 @@ fn psql_plan(sql: &str, db: &Option<Database>) -> Result<(Plan, Vec<FnCall>), Ps
         return Err(PsqlStop::Unsupported);
     }
     let outer = FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    // the vector the planner posts for this statement is kept apart from
+    // the caller's ([PSQL_PLAN_REFUSAL]), and the caller's is put back
+    let outer_refusal = PREPARE_REFUSAL.with(|r| r.borrow_mut().take());
     let mut sink: Vec<Option<Descriptor>> = Vec::new();
     let plan = plan_query_inner(sql, db, &mut sink);
+    let posted = PREPARE_REFUSAL.with(|r| std::mem::replace(&mut *r.borrow_mut(), outer_refusal));
+    PSQL_PLAN_REFUSAL.with(|r| *r.borrow_mut() = if plan.is_none() { posted } else { None });
     let calls = FN_CALLS.with(|l| std::mem::replace(&mut *l.borrow_mut(), outer));
     if std::env::var("FC_SRV_TRACE").is_ok() && plan.is_none() {
         eprintln!("[srv] psql body statement refused at plan: {:?}", sql);
@@ -122899,6 +123120,9 @@ fn body_prepare(database: Option<&Database>, name: &str, meta: &ProcMeta) -> Res
 /// BLR compiler took (`compiled`) was judged there already, and only an
 /// engine vector is added to it.
 fn block_prepare_gate(meta: &ProcMeta, db: &Option<Database>, compiled: bool) -> Option<Option<Plan>> {
+    if let Some(e) = context_var_bind(meta) {
+        return Some(Some(Plan::RefusedEval(e)));
+    }
     let prep = match body_prepare(db.as_ref(), ANONYMOUS_BLOCK, meta) {
         Ok(p) => p,
         // a vector the run gives at its start ([body_call_out_mismatch])
@@ -122910,6 +123134,37 @@ fn block_prepare_gate(meta: &ProcMeta, db: &Option<Database>, compiled: bool) ->
         BlockVerdict::Raise(e) => Some(Some(Plan::RefusedEval(e))),
         BlockVerdict::Refuse { certain } => (certain || !compiled).then_some(None),
     }
+}
+
+/// A CONTEXT VARIABLE IS NO PARAMETER: `:SQLCODE`, `:GDSCODE`,
+/// `:SQLSTATE` and `:ROW_COUNT` are the engine's -104 *Token unknown* at
+/// the name, at prepare - measured on engine 2182 in a handler's `SELECT
+/// :SQLCODE FROM RDB$DATABASE INTO M` (line 1, column 79), in `M =
+/// :SQLCODE` (column 76) and in a branch that never runs. The block
+/// bound the slot and answered -802.
+fn context_var_bind(meta: &ProcMeta) -> Option<EvalErr> {
+    let (bl, bc) = meta.body_at?;
+    let up = mask_literals(&meta.source.to_ascii_uppercase());
+    let b = up.as_bytes();
+    let mut i = 0;
+    while let Some(k) = up[i..].find(':') {
+        let at = i + k + 1;
+        i = at;
+        let end = up[at..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+            .map_or(up.len(), |e| at + e);
+        let word = &up[at..end];
+        if matches!(word, "SQLCODE" | "GDSCODE" | "SQLSTATE" | "ROW_COUNT") && b.get(at).is_some() {
+            let (l, c) = source_line_col(&meta.source, at);
+            let (line, col) = if l == 1 { (bl, bc + c - 1) } else { (bl + l - 1, c) };
+            return Some(EvalErr::TokenUnknown {
+                line: line as i64,
+                col: col as i64,
+                token: meta.source[at..end].to_string(),
+            });
+        }
+    }
+    None
 }
 
 /// What a PREPARE-TIME look at an anonymous block's body says
@@ -122969,7 +123224,7 @@ fn block_prepare_verdict(prep: &BodyPrep, meta: &ProcMeta, db: &Option<Database>
             return BlockVerdict::Refuse { certain: true };
         }
     }
-    let cx = VerdictCx { prep, db, is_function: meta.is_function };
+    let cx = VerdictCx { prep, db, is_function: meta.is_function, returns: !meta.outs.is_empty() };
     // each declared cursor's query, as the derived table it is
     for (c, _) in &cursors {
         let Some(state) = prep.cursor_states.get(c) else { return BlockVerdict::Refuse { certain: false } };
@@ -122988,6 +123243,8 @@ struct VerdictCx<'a> {
     prep: &'a BodyPrep,
     db: &'a Option<Database>,
     is_function: bool,
+    /// the block has a RETURNS clause
+    returns: bool,
 }
 
 impl VerdictCx<'_> {
@@ -123054,16 +123311,28 @@ impl VerdictCx<'_> {
     /// A query the planner must take: its plan, or the refusal
     fn query(&self, sql: &str) -> Result<Plan, BlockVerdict> {
         match psql_plan(sql, self.db) {
+            // a value's own prepare-time vector is the block's too
+            // (`R = SUBSTRING('abc' FROM S)` over a VARCHAR S)
+            Ok((Plan::RefusedEval(e @ EvalErr::Bare(GDS_EXPRESSION_EVAL_ERR, _)), _)) => {
+                Err(BlockVerdict::Raise(e))
+            }
+            Err(_) if PSQL_PLAN_REFUSAL
+                .with(|r| matches!(*r.borrow(), Some(EvalErr::Bare(GDS_EXPRESSION_EVAL_ERR, _)))) =>
+            {
+                Err(BlockVerdict::Raise(EvalErr::Bare(GDS_EXPRESSION_EVAL_ERR, Vec::new())))
+            }
             Ok((Plan::Refused | Plan::RefusedEval(_), _)) | Err(_) => Err(BlockVerdict::Refuse { certain: false }),
             Ok((p, _)) => Ok(p),
         }
     }
 
     fn value(&self, (text, binds): &RawVal) -> Result<(), BlockVerdict> {
+        psql_value_verdict(text)?;
         self.query(&format!("SELECT {} FROM RDB$DATABASE", self.subst(text, binds))).map(|_| ())
     }
 
     fn cond(&self, (text, binds): &RawVal) -> Result<(), BlockVerdict> {
+        psql_value_verdict(text)?;
         self.query(&format!("SELECT COUNT(*) FROM RDB$DATABASE WHERE {}", self.subst(text, binds))).map(|_| ())
     }
 
@@ -123135,6 +123404,9 @@ impl VerdictCx<'_> {
             // the name is a variable nothing declared or a context word
             // the planner knows (its text, `fallback`, is what decides)
             TrigStmt::Assign { raw, expr, fallback, .. } => {
+                if raw.is_none() && expr_adds_text_in(expr, &self.prep.types) {
+                    return Err(BlockVerdict::Raise(EvalErr::Bare(GDS_EXPRESSION_EVAL_ERR, Vec::new())));
+                }
                 match (raw, fallback) {
                     (Some(r), _) => self.value(r),
                     (None, Some(r)) if !expr.field_refs().is_empty() => self.value(r),
@@ -123195,6 +123467,12 @@ impl VerdictCx<'_> {
                 if ok { Ok(()) } else { shape() }
             }
             TrigStmt::Return { .. } | TrigStmt::ReturnText { .. } if !self.is_function => shape(),
+            // SUSPEND in a block with no RETURNS - taken branch or not,
+            // measured: `IF (SQLCODE = 0) THEN SUSPEND`, one after a BREAK,
+            // a bare one - is -104 at prepare; the block ran it as nothing
+            TrigStmt::Suspend { .. } if !self.returns && !self.is_function => {
+                Err(BlockVerdict::Raise(EvalErr::Dsql104(GDS_DSQL_SUSPEND_WITHOUT_RETURNS)))
+            }
             TrigStmt::Store { table, cols, exprs, raw, .. } => {
                 let values = match raw {
                     Some((text, binds)) => self.subst(text, binds),
@@ -123330,6 +123608,112 @@ impl VerdictCx<'_> {
             TrigStmt::Call { raw, .. } => self.value(raw),
             _ => Ok(()),
         }
+    }
+}
+
+/// What the engine's compile says of a PSQL value's OWN grammar, before
+/// any name in it is looked up - measured on engine 2182, in EXECUTE
+/// BLOCK, in a branch that never runs too:
+///
+/// - an AGGREGATE or a WINDOW function used as the value (outside a
+///   subquery of its own) is -104 *Invalid command*: `R = SUM(1)`, `R =
+///   COUNT(*)`, `R = R + SUM(R)`, `IF (MAX(R) = 1)`, `WHILE (COUNT(*) <
+///   0)`, `EXCEPTION E COUNT(*)`, `R = LIST('a')`, `R = ROW_NUMBER() OVER
+///   ()`, `R = SUM(1) OVER ()` - where the planner, handed `SELECT <value>
+///   FROM RDB$DATABASE`, answered them as a one-row aggregate (1, 1, 2,
+///   ...). `(SELECT SUM(ID) FROM T1)` is a query and answers.
+/// - a TEXT operand of `+` or `-` is *expression evaluation not
+///   supported*, the bare line ([expr_adds_text]): `R = '1' || 2 + 3`,
+///   concatenation binding tighter than every arithmetic operator.
+fn psql_value_verdict(text: &str) -> Result<(), BlockVerdict> {
+    if psql_value_aggregate(text) {
+        return Err(BlockVerdict::Raise(EvalErr::Dsql104(GDS_DSQL_COMMAND_ERR)));
+    }
+    if tokenize_expr(text.trim()).is_some_and(|t| {
+        let mut p = 0;
+        blr_expr_top(&t, &mut p).is_some_and(|e| p == t.len() && expr_adds_text(&e))
+    }) {
+        return Err(BlockVerdict::Raise(EvalErr::Bare(GDS_EXPRESSION_EVAL_ERR, Vec::new())));
+    }
+    Ok(())
+}
+
+/// Does a PSQL value call an aggregate or a window function at its own
+/// level - not inside a `(SELECT ...)` of its own? ([psql_value_verdict])
+fn psql_value_aggregate(text: &str) -> bool {
+    let up = mask_literals(&text.to_ascii_uppercase());
+    let b = up.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let next_non_space = |mut j: usize| {
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        j
+    };
+    // one entry per open parenthesis: inside a query of its own?
+    let mut sub: Vec<bool> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'(' {
+            let j = next_non_space(i + 1);
+            let is_query = ["SELECT", "WITH"].iter().any(|w| {
+                up[j..].starts_with(w) && !b.get(j + w.len()).is_some_and(|c| ident(*c))
+            });
+            sub.push(is_query || sub.last() == Some(&true));
+            i += 1;
+            continue;
+        }
+        if c == b')' {
+            sub.pop();
+            i += 1;
+            continue;
+        }
+        if (c.is_ascii_alphabetic() || c == b'_') && (i == 0 || !ident(b[i - 1])) {
+            let st = i;
+            while i < b.len() && ident(b[i]) {
+                i += 1;
+            }
+            if sub.last() != Some(&true) {
+                let w = &up[st..i];
+                if w == "OVER" || (corr_agg_name(w) && b.get(next_non_space(i)) == Some(&b'(')) {
+                    return true;
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Does an expression add or subtract TEXT - a literal or a
+/// concatenation as an operand of `+` / `-`? Dialect 3 has no such
+/// operation, and the engine refuses it when it compiles the expression
+/// (`'1' || 2 + 3` is *expression evaluation not supported*, `SELECT 'a'
+/// || 1 + 2` adds *Strings cannot be added or subtracted in dialect 3*
+/// - measured).
+fn expr_adds_text(e: &fire_crab_ods::expr::Expr) -> bool {
+    expr_adds_text_in(e, &[])
+}
+
+/// [expr_adds_text] where the variables' declared types are known: a
+/// text-typed variable is a text operand too (`R = S + 1` over a VARCHAR
+/// S is the same bare *expression evaluation not supported* at the
+/// block's prepare, measured; `S * 2` answers 2.000000000000000).
+fn expr_adds_text_in(e: &fire_crab_ods::expr::Expr, types: &[Option<CastTarget>]) -> bool {
+    use fire_crab_ods::expr::Expr as E;
+    let text = |x: &E| match x {
+        E::TextLiteral(_) | E::Concat(..) => true,
+        E::Variable(n) => matches!(types.get(*n as usize), Some(Some(CastTarget::Text { .. }))),
+        _ => false,
+    };
+    let rec = |x: &E| expr_adds_text_in(x, types);
+    match e {
+        E::Add(a, b) | E::Subtract(a, b) => text(a) || text(b) || rec(a) || rec(b),
+        E::Multiply(a, b) | E::Divide(a, b) | E::Concat(a, b) => rec(a) || rec(b),
+        E::GenId { step, .. } => rec(step),
+        _ => false,
     }
 }
 
@@ -146949,11 +147333,10 @@ mod tests {
             build("LEFT(NAME, A) = 'x'").unwrap().matches(&row),
             Err(EvalErr::InvalidLength(-7)) // A is -7 on this row
         ));
-        assert!(matches!(
-            build("SUBSTRING(NAME FROM NAME) = 'x'").unwrap().matches(&row),
-            // the offending string travels in the vector now
-            Err(EvalErr::ConversionError(Some(ref t))) if t == "Hello"
-        ));
+        // a TEXT start is refused at prepare, before a row is read
+        // (measured on 2182: `WHERE SUBSTRING(NAME FROM NAME) = 'x'` over
+        // a VARCHAR NAME is *expression evaluation not supported*)
+        assert!(build("SUBSTRING(NAME FROM NAME) = 'x'").is_none());
         // a runtime divisor WORKS when the data allows it
         assert!(build("MOD(A, ID) = 0").is_none() || true); // ID absent here
         // CAST is admitted now and evaluates
