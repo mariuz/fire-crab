@@ -21423,6 +21423,56 @@ fn fn_answers_text(f: &SysFn) -> bool {
             | SysFn::BitLength
             | SysFn::AsciiVal
             | SysFn::AsciiValCs(_)
+            | SysFn::UnicodeVal(_)
+            | SysFn::CryptHash(..)
+            | SysFn::UuidToChar(_)
+            | SysFn::CharToUuid(_)
+            | SysFn::BlobNum
+    ) && !fn_reads_number(f)
+}
+
+/// Does this built-in read its operands as NUMBERS (MOV_get_double /
+/// MOV_get_int64 / MOV_get_long)? A blob operand there is never read:
+/// the call describes as over a string and raises 22018 *conversion
+/// error from string "BLOB"* for a non-NULL one ([SysFn::BlobNum]).
+/// Measured on 2182 over a text blob holding 'blobv': SIGN (SHORT), MOD
+/// (INT64, LONG with the blob second), ABS / SQRT / CEIL / TRUNC / EXP
+/// / SIN / POWER / ATAN2 / LOG / ACOSH / ASINH / ATANH (DOUBLE),
+/// ASCII_CHAR (CHAR(1) NONE) and UNICODE_CHAR (CHAR(1) UTF8) - where a
+/// CAST of the blob reads its content ('conversion error from string
+/// "blobv"') and ROUND refuses it outright.
+fn fn_reads_number(f: &SysFn) -> bool {
+    matches!(
+        f,
+        SysFn::Abs
+            | SysFn::Sign
+            | SysFn::Mod
+            | SysFn::Sqrt
+            | SysFn::Exp
+            | SysFn::Ln
+            | SysFn::Log
+            | SysFn::Log10
+            | SysFn::Power
+            | SysFn::Sin
+            | SysFn::Cos
+            | SysFn::Tan
+            | SysFn::Cot
+            | SysFn::Asin
+            | SysFn::Acos
+            | SysFn::Atan
+            | SysFn::Atan2
+            | SysFn::Sinh
+            | SysFn::Cosh
+            | SysFn::Tanh
+            | SysFn::Acosh
+            | SysFn::Asinh
+            | SysFn::Atanh
+            | SysFn::Ceil
+            | SysFn::Ceiling
+            | SysFn::Floor
+            | SysFn::Trunc
+            | SysFn::AsciiChar
+            | SysFn::UnicodeChar
     )
 }
 
@@ -68645,26 +68695,63 @@ fn list_text_tie_cmp(x: &str, y: &str) -> std::cmp::Ordering {
 /// distinct machinery delivers them at aggExecute, where the separator
 /// evaluates with the group's LAST row current (measured).
 /// A group's rows in its LISTAGG `WITHIN GROUP` order: each key by value,
-/// its NULLs where the key places them, ties in the rows' own order (a
-/// stable sort - measured: `ORDER BY G, K DESC` over two tied groups).
-fn list_sorted(rows: &[Vec<Value>], order: &[(Expr, bool, bool)]) -> Result<Vec<Vec<Value>>, EvalErr> {
+/// its NULLs where the key places them, and ties by the rest of the
+/// engine's sort RECORD - the aggregated VALUE, laid out and compared as
+/// [SortRecImage] does (native little-endian words, whatever the keys'
+/// direction). Measured on 2182 over rows (ID, G, V) = (1, 1, 'b'), (2,
+/// 1, 'a'), (3, 2, 'c'), (5, 1, 'B'): `LISTAGG(V) WITHIN GROUP (ORDER BY
+/// G)` is B,a,b,c and with `G DESC` c,B,a,b; `LISTAGG(-ID)` is -5,-2,-1
+/// (the unsigned words of the negatives); `LISTAGG(ID || V)` is
+/// 5B,2a,1b (a VARCHAR's SECOND byte leads its first word); a constant
+/// key ties every row the same way. A value the image cannot spell keeps
+/// the rows' own order.
+fn list_sorted(
+    rows: &[Vec<Value>],
+    order: &[(Expr, bool, bool)],
+    arg: &Expr,
+    pad: Option<(usize, usize)>,
+) -> Result<Vec<Vec<Value>>, EvalErr> {
     let mut keyed: Vec<(Vec<Value>, &Vec<Value>)> = Vec::with_capacity(rows.len());
+    let mut vals: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
     for r in rows {
         let mut ks = Vec::with_capacity(order.len());
         for (k, ..) in order {
             ks.push(k.eval(r)?);
         }
         keyed.push((ks, r));
+        vals.push(vec![arg.eval(r)?]);
     }
-    keyed.sort_by(|(a, _), (b, _)| {
+    // the value's field: a CHAR argument at its declared byte image, any
+    // other as its values describe it
+    let desc = match pad {
+        Some((_, bytes)) => Some(Descriptor {
+            dtype: dtype::TEXT,
+            scale: 0,
+            length: bytes.min(u16::MAX as usize) as u16,
+            sub_type: 0,
+            flags: 0,
+            offset: 0,
+        }),
+        None => sort_rec_desc_of_values(&vals, 0),
+    };
+    let images: Vec<Vec<u8>> = match desc {
+        Some(d) => {
+            let layout = SortRecImage::new(&[Some(d)]);
+            vals.iter().map(|v| layout.image(&[&v[0]])).collect()
+        }
+        None => vec![Vec::new(); vals.len()],
+    };
+    let mut idx: Vec<usize> = (0..keyed.len()).collect();
+    idx.sort_by(|&x, &y| {
+        let (a, b) = (&keyed[x].0, &keyed[y].0);
         for (i, (_, desc, nulls_first)) in order.iter().enumerate() {
             let null_side = if *nulls_first { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
             let o = match (&a[i], &b[i]) {
                 (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
                 (Value::Null, _) => null_side,
                 (_, Value::Null) => null_side.reverse(),
-                (x, y) => {
-                    let o = num_cmp(x, y).unwrap_or_else(|| value_cmp(x, y));
+                (p, q) => {
+                    let o = num_cmp(p, q).unwrap_or_else(|| value_cmp(p, q));
                     if *desc { o.reverse() } else { o }
                 }
             };
@@ -68672,9 +68759,9 @@ fn list_sorted(rows: &[Vec<Value>], order: &[(Expr, bool, bool)]) -> Result<Vec<
                 return o;
             }
         }
-        std::cmp::Ordering::Equal
+        SortRecImage::cmp(&images[x], &images[y])
     });
-    Ok(keyed.into_iter().map(|(_, r)| r.clone()).collect())
+    Ok(idx.into_iter().map(|x| keyed[x].1.clone()).collect())
 }
 
 fn list_fold(
@@ -69455,7 +69542,7 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                     if order.is_empty() {
                         list_fold(rows, arg, sep.as_ref(), *distinct, *pad, *coll)?
                     } else {
-                        list_fold(&list_sorted(rows, order)?, arg, sep.as_ref(), *distinct, *pad, *coll)?
+                        list_fold(&list_sorted(rows, order, arg, *pad)?, arg, sep.as_ref(), *distinct, *pad, *coll)?
                     }
                 }
                 GItem::Agg(..) => Value::Null, // MIN/MAX/SUM(*): rejected at plan
@@ -70527,7 +70614,12 @@ fn cast_source_charset(e: &Expr, t: &CastTarget, descs: &[Descriptor]) -> u8 {
     // already returns (a carrier or tabled column its own set, a UTF8
     // one CS_UTF8), which is why a COLUMN source, a named CHARACTER SET,
     // an ASCII literal and a real attachment all already agreed.
-    if matches!(t, CastTarget::Text { .. }) {
+    // ...and for a TEXT BLOB target that names a set, which transcodes
+    // exactly as a text target does (measured under a NONE attachment:
+    // `CAST('é' AS BLOB SUB_TYPE TEXT CHARACTER SET UTF8)` is one
+    // character, UNICODE_VAL 233 - read as UTF-8 it was the two carrier
+    // characters of the literal's octets, CHAR_LENGTH 2, UNICODE_VAL 195)
+    if matches!(t, CastTarget::Text { .. }) || matches!(t, CastTarget::Blob { sub_type: 1, cs } if *cs != 0) {
         // ...the set the source's VALUE is in ([value_form]): a CAST
         // over a REPLACE that ran in NONE converts the NONE bytes
         // (`CAST(REPLACE(N, 'É', 'e') AS VARCHAR(10) CHARACTER SET
@@ -77454,6 +77546,15 @@ enum SysFn {
     /// OVERLAY(s PLACING r FROM p [FOR n]) - args [s, r, p] or [s, r, p,
     /// n]; VARYING at the two operands' widths summed, in their set.
     Overlay,
+    /// A BLOB operand of a function that reads a NUMBER (SIGN, MOD, the
+    /// std-math family, ASCII_CHAR, UNICODE_CHAR - [fn_reads_number]):
+    /// the resolver wraps the operand in it. It types as the text it
+    /// reads, so the function describes as over a string (SIGN SHORT,
+    /// MOD INT64, ACOSH DOUBLE); a NULL passes, and any other value is
+    /// MOV_get_*'s 22018 *conversion error from string "BLOB"* - the
+    /// engine never reads the blob's content there (measured on 2182:
+    /// `SIGN(CAST('5' AS BLOB SUB_TYPE TEXT))` raises it too).
+    BlobNum,
 }
 
 /// Which of the evlMaxMinValue pair, and under which name the header
@@ -77670,6 +77771,7 @@ impl SysFn {
             SysFn::CharToUuid(_) => "CHAR_TO_UUID",
             SysFn::CryptHash(..) => "CRYPT_HASH",
             SysFn::Overlay => "OVERLAY",
+            SysFn::BlobNum => "CAST",
         }
     }
 
@@ -79667,6 +79769,9 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
 /// UTF-8 of its characters.
 const NO_CS: u8 = 0xFF;
 
+/// [SysFn::UuidToChar] / [SysFn::CharToUuid]'s mark for a BLOB operand.
+const BLOB_OPERAND: u8 = 0xFE;
+
 /// MAXVALUE / MINVALUE (GREATEST / LEAST) as the searched CASE that
 /// answers what evlMaxMinValue does. The engine evaluates every argument
 /// - any NULL makes the result NULL - keeps the FIRST argument that no
@@ -79721,6 +79826,52 @@ fn lower_maxmin(kind: MaxMinKind, args: &[RawExpr]) -> Option<RawExpr> {
         arms.push((c, args[i].clone()));
     }
     Some(RawExpr::Case(arms, Some(Box::new(args[n - 1].clone())), false))
+}
+
+/// The budget [maxmin_weight] allows one MAXVALUE-family call: eight
+/// nested two-argument calls (about 0.3 s to prepare and answer here;
+/// nine took 1.4 s and ten 8 s before the budget), or some 1500 plain
+/// arguments in one.
+const MAXMIN_WEIGHT_LIMIT: u64 = 5_000_000;
+
+/// About how many nodes resolving `e` visits once every MAXVALUE-family
+/// call in it is lowered by [lower_maxmin]: each argument of an
+/// n-argument call is resolved about 2n + 2 times (its IS NULL arm, its
+/// comparisons on either side, its value, the kinds pass), so a nested
+/// call MULTIPLIES its arguments' weight where every other node adds.
+fn maxmin_weight(e: &RawExpr) -> u64 {
+    let w = maxmin_weight;
+    let sum = |v: &[RawExpr]| v.iter().map(w).fold(0u64, u64::saturating_add);
+    1u64.saturating_add(match e {
+        RawExpr::Func(SysFn::MaxMin(_), args) => sum(args).saturating_mul(2 * args.len() as u64 + 2),
+        RawExpr::Neg(a) | RawExpr::Cast(a, _) | RawExpr::Collate(a, _) => w(a),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => w(a).saturating_add(w(b)),
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) | RawExpr::UserFn(_, v) | RawExpr::Subscript(_, v) => sum(v),
+        RawExpr::Iif(c, a, b) => maxmin_cond_weight(c).saturating_add(w(a)).saturating_add(w(b)),
+        RawExpr::Case(branches, else_, _) => branches
+            .iter()
+            .map(|(c, t)| maxmin_cond_weight(c).saturating_add(w(t)))
+            .fold(0u64, u64::saturating_add)
+            .saturating_add(else_.as_deref().map_or(0, w)),
+        RawExpr::Cond(c) => maxmin_cond_weight(c),
+        _ => 0,
+    })
+}
+
+/// [maxmin_weight] over a condition's operands.
+fn maxmin_cond_weight(c: &RawCond) -> u64 {
+    let w = maxmin_weight;
+    match c {
+        RawCond::Cmp(a, _, b) => w(a).saturating_add(w(b)),
+        RawCond::IsNull(a) | RawCond::IsNotNull(a) | RawCond::IsUnknown(a, _) => w(a),
+        RawCond::Like(a, ..) | RawCond::Starting(a, ..) | RawCond::Containing(a, ..) | RawCond::Similar(a, ..) => w(a),
+        RawCond::LikeExpr(a, p, ..)
+        | RawCond::StartingExpr(a, p, ..)
+        | RawCond::ContainingExpr(a, p, ..)
+        | RawCond::SimilarExpr(a, p, ..) => w(a).saturating_add(w(p)),
+        RawCond::Not(inner) => maxmin_cond_weight(inner),
+        RawCond::And(v) | RawCond::Or(v) => v.iter().map(maxmin_cond_weight).fold(0u64, u64::saturating_add),
+    }
 }
 
 /// A codec's described result width: the encoders' twice / 4-per-3 of
@@ -80082,7 +80233,8 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::DateAdd(_)
         | SysFn::DateDiff(_)
         | SysFn::CryptHash(..)
-        | SysFn::Overlay => unreachable!(),
+        | SysFn::Overlay
+        | SysFn::BlobNum => unreachable!(),
     };
     if args.len() < min || args.len() > max {
         // a table function's miscount is the engine's 39000 at prepare
@@ -85863,27 +86015,98 @@ fn resolve_expr_inner(
             // its type, width, charset and nullability are makeFromList's,
             // which is the CASE's own describe law
             if let SysFn::MaxMin(kind) = f {
+                // every argument is resolved about 2n + 2 times by the
+                // lowering, so NESTED calls multiply: past a budget the
+                // call refuses rather than go exponential in time and
+                // memory (measured on the unbudgeted lowering: depth 10
+                // took 8 s, depth 11 36 s at 4.7 GB, where the engine
+                // answers depth 12 at once) - a clean 42000 refusal
+                if maxmin_weight(&RawExpr::Func(*f, args.clone())) > MAXMIN_WEIGHT_LIMIT {
+                    return None;
+                }
+                let resolved: Vec<Option<Expr>> = args.iter().map(|a| resolve_expr(a, columns, descs)).collect();
+                let types: Vec<Option<ExprType>> =
+                    resolved.iter().map(|e| e.as_ref().and_then(|e| e.type_of(descs))).collect();
                 // ...and makeFromList refuses two DIFFERENT datetime kinds
                 // at prepare: `MINVALUE(<TIMESTAMP>, <DATE>)` is HY004
                 // *Datatypes are not comparable in expression MINVALUE*
-                // (measured on 2182)
-                let mut kinds: Vec<TKind> = Vec::new();
-                for a in args {
-                    if let Some(ExprType::Temporal(k)) =
-                        resolve_expr(a, columns, descs).and_then(|e| e.type_of(descs))
-                    {
-                        if !kinds.contains(&k) {
-                            kinds.push(k);
-                        }
-                    }
-                }
-                if kinds.len() > 1 {
+                // (measured on 2182). A type WITH time zone and its
+                // zone-less twin are one kind there: the list describes
+                // the zoned type and both the comparisons and the move
+                // read the zone-less one in the session zone (measured:
+                // `MINVALUE(TZ, TS)` answers `2024-01-01 09:30:00.0000
+                // Europe/Bucharest` for the TIMESTAMP, `MINVALUE(TIME
+                // '10:00', TIME '10:00 +02:00')` `10:00:00.0000
+                // Europe/Bucharest`) - which is the CAST of the zone-less
+                // argument to the zoned type, so that is what it lowers to
+                let family = |k: TKind| match k {
+                    TKind::TimestampTz => TKind::Timestamp,
+                    TKind::TimeTz => TKind::Time,
+                    k => k,
+                };
+                let kinds: Vec<TKind> =
+                    types.iter().filter_map(|t| if let Some(ExprType::Temporal(k)) = t { Some(*k) } else { None }).collect();
+                if kinds.iter().any(|k| family(*k) != family(kinds[0])) {
                     PREPARE_REFUSAL.with(|r| {
                         r.borrow_mut().get_or_insert(EvalErr::NotComparable(f.header()));
                     });
                     return None;
                 }
-                return resolve_expr_inner(&lower_maxmin(*kind, args)?, columns, descs);
+                let zoned = kinds.iter().find(|k| matches!(k, TKind::TimestampTz | TKind::TimeTz)).copied();
+                // evlMaxMinValue keeps its running winner and replaces it
+                // only when a LATER argument beats it, which is the CASE
+                // below only while the comparisons are transitive. A
+                // number (or a date) beside two texts is not: the texts
+                // compare as strings with each other and as numbers with
+                // it (measured: `MAXVALUE('9', '10', 9.5, 1)` and
+                // `LEAST('10', '9', 9.5, 100)` are 9.5 - '9' > '10' as
+                // text, '10' > 9.5 > '9' as numbers - where the CASE
+                // found no argument beating all the others and answered
+                // the last) - refused, not answered wrong
+                let texts = types.iter().filter(|t| matches!(t, Some(ExprType::Text))).count();
+                let others = resolved
+                    .iter()
+                    .zip(&types)
+                    .filter(|(e, t)| !matches!(e, Some(Expr::Null)) && t.is_some() && !matches!(t, Some(ExprType::Text)))
+                    .count();
+                if args.len() > 2 && texts >= 2 && others >= 1 {
+                    return None;
+                }
+                // two texts in two REAL sets compare after the engine
+                // transliterates one into the other, which this server's
+                // comparison does not do (measured: `MAXVALUE(U, W)`
+                // over a UTF8 'ω' and a WIN1252 'x' is 22018 *Cannot
+                // transliterate character between character sets*) -
+                // refused
+                let mut sets: Vec<u8> = Vec::new();
+                for (a, e) in args.iter().zip(&resolved) {
+                    if matches!(a, RawExpr::Str(_)) {
+                        continue;
+                    }
+                    if let Some((_, _, c)) = e.as_ref().filter(|e| matches!(e.type_of(descs), Some(ExprType::Text))).and_then(|e| text_form(e, descs)) {
+                        let cs = tf_charset(c);
+                        if cs > fire_crab_ods::intl::CS_OCTETS && !sets.contains(&cs) {
+                            sets.push(cs);
+                        }
+                    }
+                }
+                if sets.len() > 1 {
+                    return None;
+                }
+                let lowered_args: Vec<RawExpr> = match zoned {
+                    Some(z) => args
+                        .iter()
+                        .zip(&types)
+                        .map(|(a, t)| match t {
+                            Some(ExprType::Temporal(k)) if *k != z => {
+                                RawExpr::Cast(Box::new(a.clone()), CastTarget::Temporal(z))
+                            }
+                            _ => a.clone(),
+                        })
+                        .collect(),
+                    None => args.clone(),
+                };
+                return resolve_expr_inner(&lower_maxmin(*kind, &lowered_args)?, columns, descs);
             }
             // BIT_LENGTH is eight times OCTET_LENGTH, so it resolves AS
             // the OCTET_LENGTH of its argument (every charset and blob
@@ -85911,6 +86134,15 @@ fn resolve_expr_inner(
                 .iter()
                 .map(|a| resolve_expr(a, columns, descs))
                 .collect::<Option<Vec<_>>>()?;
+            // a BLOB operand of a function that reads a number is wrapped
+            // in the raise the engine gives it ([fn_reads_number])
+            if fn_reads_number(f) {
+                for a in resolved.iter_mut() {
+                    if blob_result(a, descs).is_some() {
+                        *a = Expr::Func(SysFn::BlobNum, vec![std::mem::replace(a, Expr::Null)]);
+                    }
+                }
+            }
             // ASCII_VAL / UNICODE_VAL / CRYPT_HASH over a NON-TEXT operand
             // read its text form (MOV_make_string2 - measured: ASCII_VAL(1)
             // 49, ASCII_VAL(12.5) 49, ASCII_VAL(DATE '2024-01-01') 50,
@@ -86269,6 +86501,12 @@ fn resolve_expr_inner(
                 (SysFn::Base64Decode(_), [a]) => {
                     SysFn::Base64Decode(expr_value_charset(a, descs).unwrap_or(NO_CS))
                 }
+                // ...and a BLOB operand is marked: the UUID pair takes only
+                // a string, and a non-NULL blob is their run-time *must be
+                // of string type* (measured on 2182, a column and a CAST
+                // literal alike; a NULL one answers NULL)
+                (SysFn::UuidToChar(_), [a]) if blob_result(a, descs).is_some() => SysFn::UuidToChar(BLOB_OPERAND),
+                (SysFn::CharToUuid(_), [a]) if blob_result(a, descs).is_some() => SysFn::CharToUuid(BLOB_OPERAND),
                 (SysFn::UuidToChar(_), [a]) => SysFn::UuidToChar(expr_value_charset(a, descs).unwrap_or(NO_CS)),
                 (SysFn::CharToUuid(_), [a]) => SysFn::CharToUuid(expr_value_charset(a, descs).unwrap_or(NO_CS)),
                 (SysFn::CryptHash(algo, _), [a]) => {
@@ -92606,6 +92844,42 @@ fn dec_math_operands(vs: &[Value]) -> Option<Vec<fire_crab_ods::decfloat::Dec>> 
         .collect()
 }
 
+/// CVT_get_double's range test on a decimal text: the scale - the
+/// fraction digits less the signed exponent - past DBL_MAX_10_EXP (308)
+/// either way, or an exponent magnitude of 3276 or more, is 22003 *numeric
+/// value is out of range* BEFORE any value is computed. So a zero or a
+/// value a double could hold refuses too (measured on 2182: '1e-307'
+/// answers, '2.3e-308', '0e-400', '0.00001e-305' and '1e-400' raise;
+/// SIGN('-1.5e-400'), SQRT('1e-400'), SIGN('1e400') alike).
+fn cvt_double_scale_out_of_range(s: &str) -> bool {
+    let t = s.trim_matches(' ');
+    let (mant, exp) = match t.find(['e', 'E']) {
+        Some(i) => (&t[..i], Some(&t[i + 1..])),
+        None => (t, None),
+    };
+    let frac = mant.split_once('.').map_or(0, |(_, f)| f.chars().filter(|c| c.is_ascii_digit()).count()) as i64;
+    let exp = match exp {
+        Some(e) => {
+            let e = e.trim_matches(' ');
+            let (neg, digits) = match e.strip_prefix('-') {
+                Some(d) => (true, d),
+                None => (false, e.strip_prefix('+').unwrap_or(e)),
+            };
+            let mut n: i64 = 0;
+            for c in digits.chars().filter(|c| c.is_ascii_digit()) {
+                n = n * 10 + i64::from(c as u8 - b'0');
+                // cvt.cpp's SHORT_LIMIT, (1 << 14) / 5
+                if n >= 3276 {
+                    return true;
+                }
+            }
+            if neg { -n } else { n }
+        }
+        None => 0,
+    };
+    (frac - exp).abs() > 308
+}
+
 /// Fold a numeric operand to f64 for the DOUBLE math functions: an
 /// approximate value passes straight through, an exact numeric goes through
 /// `exact_to_f64` (raw / 10^scale). A non-numeric refuses.
@@ -92614,21 +92888,38 @@ fn fn_f64(v: &Value) -> Result<f64, EvalErr> {
         return Ok(d);
     }
     // a DECFLOAT operand: MOV_get_double's decimal-to-double, the value's
-    // digits read as a double (the CAST to DOUBLE's own conversion)
+    // digits read as a double (the CAST to DOUBLE's own conversion). One
+    // past the double's range is the bare 22003 *Floating-point
+    // overflow* there, one below it 0 (measured on 2182: SIN / ATAN /
+    // TANH / ATAN2 / ASINH of `CAST('1e400' AS DECFLOAT(34))` all raise
+    // before the function runs, `SIN(<1e-400>)` is 0)
     if let Some(dec) = dec_of(v) {
         use fire_crab_ods::decfloat::Dec;
         return match dec {
             Dec::Infinity { .. } => Err(EvalErr::FloatOverflowBare),
             Dec::Nan => Err(EvalErr::DecfloatInvalidOperation),
-            Dec::Finite { .. } => fire_crab_ods::decfloat::to_string(&dec)
-                .parse()
-                .map_err(|_| EvalErr::ConversionError(None)),
+            Dec::Finite { .. } => match fire_crab_ods::decfloat::to_string(&dec).parse::<f64>() {
+                Ok(d) if d.is_infinite() => Err(EvalErr::FloatOverflowBare),
+                Ok(d) => Ok(d),
+                Err(_) => Err(EvalErr::ConversionError(None)),
+            },
         };
     }
     // a TEXT operand: the engine converts it to double by its numeric
     // grammar (SQRT('4') answers 2.0), and raises 22018 with the raw
-    // string when the text is not a number (SQRT('abc'))
+    // string when the text is not a number (SQRT('abc')) - and 22003
+    // *numeric value is out of range* for a number whose decimal scale
+    // is past the double's ([cvt_double_scale_out_of_range]) or which
+    // overflows it
     if let Value::Text(s) = v {
+        if let Some(TextNum::Dec { .. }) = text_number(s) {
+            if cvt_double_scale_out_of_range(s) {
+                return Err(EvalErr::NumericOutOfRange);
+            }
+            if s.trim_matches(' ').parse::<f64>().is_ok_and(|d| d.is_infinite()) {
+                return Err(EvalErr::NumericOutOfRange);
+            }
+        }
         return text_number(s)
             .and_then(|n| text_to_approx(n, s))
             .ok_or_else(|| EvalErr::ConversionError(Some(s.clone())));
@@ -94042,6 +94333,8 @@ impl Expr {
                     // the UUID pair describe on any operand: a non-text one
                     // is their run-time *... must be of string type*
                     SysFn::UuidToChar(_) | SysFn::CharToUuid(_) => Some(ExprType::Text),
+                    // the text it reads ([SysFn::BlobNum])
+                    SysFn::BlobNum => Some(ExprType::Text),
                     // OVERLAY: two strings (a number renders to its text)
                     // and two integer counts
                     SysFn::Overlay => {
@@ -96551,6 +96844,13 @@ impl Expr {
                             let f: f64 = fire_crab_ods::decfloat::to_string(&dec)
                                 .parse()
                                 .map_err(|_| EvalErr::ConversionError(None))?;
+                            // a finite value past the double's range is the
+                            // same bare float overflow (measured on 2182:
+                            // `CAST(CAST('1e400' AS DECFLOAT(34)) AS DOUBLE
+                            // PRECISION)`; '1e-400' is 0)
+                            if f.is_infinite() {
+                                return Err(EvalErr::FloatOverflowBare);
+                            }
                             Value::Double(f)
                         }
                         // the engine NEVER produces Infinity or NaN from a
@@ -96565,6 +96865,12 @@ impl Expr {
                         Value::Text(t) => match text_number(t) {
                             None | Some(TextNum::Hex { .. }) => {
                                 return Err(conv_err(*cs, t.clone()))
+                            }
+                            // ...and so is one whose decimal scale is past
+                            // the double's, however small its value
+                            // ([cvt_double_scale_out_of_range])
+                            Some(_) if cvt_double_scale_out_of_range(t) => {
+                                return Err(EvalErr::NumericOutOfRange)
                             }
                             Some(tn) => match text_to_approx(tn, t) {
                                 Some(d) => Value::Double(d),
@@ -97540,7 +97846,7 @@ impl Expr {
                     }
                     // the 16 bytes spelled `%02X` in the 8-4-4-4-12 groups
                     SysFn::UuidToChar(cs) => {
-                        let Value::Text(t) = &vs[0] else {
+                        let (Value::Text(t), false) = (&vs[0], *cs == BLOB_OPERAND) else {
                             return Err(EvalErr::EvalArgs(GDS_SYSF_BINUUID_STR, vec![ErrArg::Str("UUID_TO_CHAR".into())]));
                         };
                         let b = text_bytes_in((*cs != NO_CS).then_some(*cs), t);
@@ -97561,7 +97867,7 @@ impl Expr {
                         ))
                     }
                     SysFn::CharToUuid(cs) => {
-                        let Value::Text(t) = &vs[0] else {
+                        let (Value::Text(t), false) = (&vs[0], *cs == BLOB_OPERAND) else {
                             return Err(EvalErr::EvalArgs(GDS_SYSF_UUIDTYPE, vec![ErrArg::Str("CHAR_TO_UUID".into())]));
                         };
                         Value::Text(fire_crab_ods::intl::carrier_decode(&char_to_uuid(&text_bytes_in(
@@ -97575,6 +97881,8 @@ impl Expr {
                     }
                     // evlOverlay in characters: FROM clamps to one past the
                     // end, the length (default: the placing's characters)
+                    // a blob read as a number: never its content
+                    SysFn::BlobNum => return Err(EvalErr::ConversionError(Some("BLOB".into()))),
                     // to what is left; FROM must be positive, FOR not
                     // negative (the numbered 42000s, #3 and #4)
                     SysFn::Overlay => {
@@ -120226,6 +120534,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 | SysFn::UuidToChar(_)
                 | SysFn::CharToUuid(_)
                 | SysFn::Overlay
+                | SysFn::BlobNum
                 | SysFn::MaxMin(_) => false,
             }
         }
@@ -147436,6 +147745,36 @@ mod builtins_round {
         }
         assert!(lower_maxmin(MaxMinKind::Least, &[RawExpr::Param(0), RawExpr::Int(1)]).is_none());
         assert!(lower_maxmin(MaxMinKind::MinValue, &[]).is_none());
+    }
+
+    /// A nested MAXVALUE multiplies the weight [maxmin_weight] budgets:
+    /// eight two-argument levels fit, nine do not; a wide flat call fits.
+    #[test]
+    fn maxmin_weight_budget() {
+        let nested = |d: usize| {
+            let mut e = RawExpr::Col("ID".into());
+            for i in 0..d {
+                e = RawExpr::Func(SysFn::MaxMin(MaxMinKind::MaxValue), vec![e, RawExpr::Int(i as i64)]);
+            }
+            e
+        };
+        assert!(maxmin_weight(&nested(8)) <= MAXMIN_WEIGHT_LIMIT);
+        assert!(maxmin_weight(&nested(9)) > MAXMIN_WEIGHT_LIMIT);
+        assert!(maxmin_weight(&nested(40)) > MAXMIN_WEIGHT_LIMIT);
+        let wide = RawExpr::Func(SysFn::MaxMin(MaxMinKind::Greatest), (0..140).map(RawExpr::Int).collect());
+        assert!(maxmin_weight(&wide) <= MAXMIN_WEIGHT_LIMIT);
+    }
+
+    /// CVT_get_double's scale test: fraction digits less the exponent,
+    /// past 308 either way (measured cells in the doc comment).
+    #[test]
+    fn cvt_double_scale_range() {
+        for ok in ["1e-307", "1.7976931348623157e308", "4e-306", " -2.5e-300 ", "12.5", "0.1e308"] {
+            assert!(!cvt_double_scale_out_of_range(ok), "{ok}");
+        }
+        for bad in ["2.3e-308", "0e-400", "0.0e500", "0.00001e-305", "1e-400", "1e400", "1e309", "1E+99999"] {
+            assert!(cvt_double_scale_out_of_range(bad), "{bad}");
+        }
     }
 
     /// LISTAGG is respelled LIST at its own length; strings and quoted

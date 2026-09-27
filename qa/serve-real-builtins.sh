@@ -34,11 +34,27 @@
 #     (past INT128 a DECFLOAT(34)), so CAST(<33 digits>.123 AS
 #     NUMERIC(38,3)) and CAST(<19 digits>.5 AS DECFLOAT(34)) answer.
 #
+# Section 14 is the review of that round: LISTAGG's ties on the WITHIN
+# GROUP key go by the rest of the engine's sort record (the aggregated
+# value's native words), not by row order; MAXVALUE over a zoned and a
+# zone-less datetime is one kind (the zone-less one CAST to the zoned
+# type); a DECFLOAT past the double's range is the conversion's bare
+# 22003 float overflow in the std-math family and the CAST to DOUBLE,
+# and a text whose decimal scale is past 308 is 22003 *numeric value is
+# out of range* (CVT_get_double); CRYPT_HASH / UNICODE_VAL / the UUID
+# pair over a BLOB describe their own types, and the functions that
+# read a NUMBER raise 22018 *conversion error from string "BLOB"* over
+# one; a literal CAST to a UTF8 text blob is its characters.
+#
 # RECORDED (clean refusals kept): SUBSTRING ... SIMILAR, BLOB_APPEND, CAST
 # ... FORMAT, MAXVALUE of a number beside a non-numeric text (the engine
 # prepares and raises 22018 per row) or of a DATE beside a text (VARCHAR),
 # a HAVING over any conditional, and an intrinsic's extra argument (the
-# engine's -104 *Token unknown*).
+# engine's -104 *Token unknown*); and from section 14 MAXVALUE of a
+# number beside two texts (not transitive - the engine's left-to-right
+# scan is not the lowered CASE's), of two texts in two real character
+# sets (the engine transliterates and raises), and nested past the
+# lowering's budget (twelve deep).
 #
 # Usage: qa/serve-real-builtins.sh [port]   (default 5770)
 set -u
@@ -61,6 +77,9 @@ INSERT INTO T VALUES (2, 8, 'a', 'Q', 'ω', 'x', NULL, -1, -7.5, 2, -3, '2023-05
 INSERT INTO T VALUES (3, 9, 'c', NULL, NULL, NULL, 3.00, 0, 0, 0, 170141183460469231731687303715884105727, NULL, NULL, 'YW', 'ABC', 2, 2, 0);
 INSERT INTO T VALUES (4, 10, NULL, 'xyz', 'ab', 'ab', 2.25, 0.5, 2, 3, 7, '2024-02-29', '2024-02-29 00:00:00', '', '', 2, NULL, 1);
 INSERT INTO T VALUES (5, 11, 'd', 'z', 'z', 'z', 0.01, 1, 1, 1, 1, '2020-01-01', '2020-01-01 00:00:00', 'Y===', '0a0B', 1, NULL, 3);
+CREATE TABLE TB (ID INTEGER NOT NULL, BL BLOB SUB_TYPE TEXT, BU BLOB SUB_TYPE TEXT CHARACTER SET UTF8, BB BLOB SUB_TYPE BINARY);
+INSERT INTO TB VALUES (1, 'blobv', 'éa', 'abc');
+INSERT INTO TB VALUES (2, NULL, NULL, NULL);
 COMMIT;
 SQL
 } | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/builtins-build.log 2>&1
@@ -577,6 +596,108 @@ pin  '12 as text' 'SELECT CAST(1234567890123456789.5 AS VARCHAR(40)) FROM RDB$DA
      'CAST|1234567890123456789.5'
 pin  'CONTROL 12 a literal within INT64 is unchanged' 'SELECT CAST(12345.678 AS NUMERIC(18,3)), 123456789012345.67 FROM RDB$DATABASE;' \
      'CAST CONSTANT|12345.678 123456789012345.67'
+echo '--- 14. The review of the built-ins: LISTAGG ties, MAXVALUE'"'"'s refusals and zone kinds, the double conversions, blob operands'
+pinb '14 LISTAGG ties on the key go by the aggregated value (the sort record)' 'SELECT LISTAGG(V, '"'"','"'"') WITHIN GROUP (ORDER BY G) FROM T;' \
+     'LIST|<blob>|LIST:|a,b,d,c'
+pinb '14 ... whatever the key direction' 'SELECT LISTAGG(V, '"'"','"'"') WITHIN GROUP (ORDER BY G DESC) FROM T;' \
+     'LIST|<blob>|LIST:|c,a,b,d'
+pinb '14 ... an INTEGER value by its unsigned native word' 'SELECT LISTAGG(-ID, '"'"','"'"') WITHIN GROUP (ORDER BY G) FROM T;' \
+     'LIST|<blob>|LIST:|-5,-2,-1,-4,-3'
+pinb '14 ... a VARCHAR value by its word, second byte first' 'SELECT LISTAGG(ID || V, '"'"','"'"') WITHIN GROUP (ORDER BY G) FROM T;' \
+     'LIST|<blob>|LIST:|2a,1b,5d,3c'
+pinb '14 ... a constant key ties every row' 'SELECT LISTAGG(V, '"'"','"'"') WITHIN GROUP (ORDER BY '"'"'k'"'"') FROM T;' \
+     'LIST|<blob>|LIST:|a,b,c,d'
+pinb '14 ... per group' 'SELECT G, LISTAGG(-ID, '"'"','"'"') WITHIN GROUP (ORDER BY 1 DESC) FROM T GROUP BY G ORDER BY G;' \
+     'G LIST|1 <blob>|LIST:|-5,-2,-1|2 <blob>|LIST:|-4,-3'
+rec  '14 RECORDED MAXVALUE of a number beside two texts is not transitive: refused' 'SELECT MAXVALUE('"'"'9'"'"', '"'"'10'"'"', 9.5, 1) FROM RDB$DATABASE;' \
+     'MAXVALUE|9.5' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+rec  '14 RECORDED ... LEAST alike' 'SELECT LEAST('"'"'10'"'"', '"'"'9'"'"', 9.5, 100) FROM RDB$DATABASE;' \
+     'LEAST|9.5' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+pin  'CONTROL 14 two texts alone, or one beside numbers, answer' 'SELECT MAXVALUE('"'"'9'"'"', '"'"'10'"'"'), MAXVALUE(1, 2, '"'"'3'"'"'), MINVALUE('"'"'9'"'"', 10, 11) FROM RDB$DATABASE;' \
+     'MAXVALUE MAXVALUE MINVALUE|9 3 9'
+pin  '14 a zoned TIMESTAMP beside a zone-less one is one kind' 'SELECT MAXVALUE(CURRENT_TIMESTAMP, TIMESTAMP '"'"'2000-01-01 00:00'"'"') > TIMESTAMP '"'"'2001-01-01 00:00'"'"' FROM RDB$DATABASE;' \
+     'BOOL|<true>'
+pin  '14 ... the zone-less one read in the session zone' 'SELECT MAXVALUE(TS, TIMESTAMP '"'"'1999-01-01 00:00 +00:00'"'"') = TS, MINVALUE(TIMESTAMP '"'"'1999-01-01 00:00 +00:00'"'"', TS) = TIMESTAMP '"'"'1999-01-01 00:00 +00:00'"'"' FROM T WHERE ID = 1;' \
+     'BOOL BOOL|<true> <true>'
+dpin '14 ... describes the zoned type, TIME alike' 'SELECT MAXVALUE(TS, TIMESTAMP '"'"'1999-01-01 00:00 +00:00'"'"'), MINVALUE(TIME '"'"'10:00'"'"', TIME '"'"'10:00 +02:00'"'"') FROM T WHERE ID = 1;' \
+     '01: sqltype: 32754 TIMESTAMP WITH TIME ZONE Nullable scale: 0 subtype: 0 len: 12| : name: MAXVALUE alias: MAXVALUE|02: sqltype: 32756 TIME WITH TIME ZONE scale: 0 subtype: 0 len: 8| : name: MINVALUE alias: MINVALUE'
+pin  'CONTROL 14 a DATE beside a zoned TIMESTAMP is still HY004' 'SELECT MAXVALUE(D, CURRENT_TIMESTAMP) FROM T;' \
+     'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression MAXVALUE'
+rec  '14 RECORDED two real character sets (the engine transliterates, and raises): refused' 'SELECT ID, MAXVALUE(U, W) FROM T ORDER BY ID;' \
+     'ID MAXVALUE|1 é|Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+pin  'CONTROL 14 eight nested calls answer (inside the budget)' 'SELECT MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(ID, 0), 1), 2), 3), 4), 5), 6), 7) FROM T WHERE ID = 1;' \
+     'MAXVALUE|7'
+rec  '14 RECORDED twelve nested calls are past the lowering budget: refused at once' 'SELECT MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(MAXVALUE(ID, 0), 1), 2), 3), 4), 5), 6), 7), 8), 9), 10), 11) FROM T WHERE ID = 1;' \
+     'MAXVALUE|11' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+pin  '14 SIN of a DECFLOAT past the double'"'"'s range: the conversion'"'"'s 22003' 'SELECT SIN(CAST('"'"'1e400'"'"' AS DECFLOAT(34))) FROM RDB$DATABASE;' \
+     'SIN|Statement failed, SQLSTATE = 22003|Floating-point overflow. The exponent of a floating-point operation is greater than the magnitude allowed.'
+pin  '14 ATAN of a DECFLOAT past the double'"'"'s range: the conversion'"'"'s 22003' 'SELECT ATAN(CAST('"'"'1e400'"'"' AS DECFLOAT(34))) FROM RDB$DATABASE;' \
+     'ATAN|Statement failed, SQLSTATE = 22003|Floating-point overflow. The exponent of a floating-point operation is greater than the magnitude allowed.'
+pin  '14 ATAN2 of a DECFLOAT past the double'"'"'s range: the conversion'"'"'s 22003' 'SELECT ATAN2(CAST('"'"'1e400'"'"' AS DECFLOAT(34)), 1) FROM RDB$DATABASE;' \
+     'ATAN2|Statement failed, SQLSTATE = 22003|Floating-point overflow. The exponent of a floating-point operation is greater than the magnitude allowed.'
+pin  '14 ASINH of a DECFLOAT past the double'"'"'s range: the conversion'"'"'s 22003' 'SELECT ASINH(CAST('"'"'1e400'"'"' AS DECFLOAT(34))) FROM RDB$DATABASE;' \
+     'ASINH|Statement failed, SQLSTATE = 22003|Floating-point overflow. The exponent of a floating-point operation is greater than the magnitude allowed.'
+pin  '14 TANH of the negative' 'SELECT TANH(CAST('"'"'-1e400'"'"' AS DECFLOAT(34))) FROM RDB$DATABASE;' \
+     'TANH|Statement failed, SQLSTATE = 22003|Floating-point overflow. The exponent of a floating-point operation is greater than the magnitude allowed.'
+pin  '14 the CAST to DOUBLE PRECISION alike' 'SELECT CAST(CAST('"'"'1e400'"'"' AS DECFLOAT(34)) AS DOUBLE PRECISION) FROM RDB$DATABASE;' \
+     'CAST|Statement failed, SQLSTATE = 22003|Floating-point overflow. The exponent of a floating-point operation is greater than the magnitude allowed.'
+pin  'CONTROL 14 one below the range is 0' 'SELECT SIN(CAST('"'"'1e-400'"'"' AS DECFLOAT(34))), CAST(CAST('"'"'1e-400'"'"' AS DECFLOAT(34)) AS DOUBLE PRECISION) FROM RDB$DATABASE;' \
+     'SIN CAST|0.000000000000000 0.000000000000000'
+pin  '14 SIGN of a text whose scale is past the double: 22003' 'SELECT SIGN('"'"'-1.5e-400'"'"') FROM RDB$DATABASE;' \
+     'SIGN|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range'
+pin  '14 ... overflowing it too' 'SELECT SIGN('"'"'1e400'"'"') FROM RDB$DATABASE;' \
+     'SIGN|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range'
+pin  '14 ... a zero spelled past it too' 'SELECT SQRT('"'"'0e-400'"'"') FROM RDB$DATABASE;' \
+     'SQRT|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range'
+pin  '14 ... the CAST: a scale of 309' 'SELECT CAST('"'"'2.3e-308'"'"' AS DOUBLE PRECISION) FROM RDB$DATABASE;' \
+     'CAST|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range'
+pin  'CONTROL 14 inside the range' 'SELECT SIGN('"'"'1e308'"'"'), SIGN('"'"'-2.5e-300'"'"'), SQRT('"'"'4e-306'"'"') FROM RDB$DATABASE;' \
+     'SIGN SIGN SQRT|1 -1 2.000000000000000e-153'
+dpin '14 CRYPT_HASH over a BLOB is VARYING OCTETS' 'SELECT CRYPT_HASH(BL USING MD5), CRYPT_HASH(BL USING SHA256) FROM TB WHERE ID = 1;' \
+     '01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 16 charset: 1 SYSTEM.OCTETS| : name: CRYPT_HASH alias: CRYPT_HASH|02: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 32 charset: 1 SYSTEM.OCTETS| : name: CRYPT_HASH alias: CRYPT_HASH'
+pin  '14 ... its digest' 'SELECT CRYPT_HASH(BL USING MD5) FROM TB WHERE ID = 1;' \
+     'CRYPT_HASH|CD00020814BADF934F0912177F78751C'
+pin  '14 ... a blob-typed expression, a NULL blob' 'SELECT ID, CRYPT_HASH('"'"'x'"'"' || BL USING SHA1) FROM TB ORDER BY ID;' \
+     'ID CRYPT_HASH|1 2534DD483F9D203D87F6924ADCE0A197EF9430AC|2 <null>'
+dpin '14 HEX_ENCODE over it is VARYING ASCII' 'SELECT HEX_ENCODE(CRYPT_HASH(BU USING SHA256)) FROM TB WHERE ID = 1;' \
+     '01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 64 charset: 2 SYSTEM.ASCII| : name: HEX_ENCODE alias: HEX_ENCODE'
+pin  '14 ... the UTF8 blob'"'"'s bytes' 'SELECT HEX_ENCODE(CRYPT_HASH(BU USING SHA256)), CRYPT_HASH(BB USING SHA1) FROM TB WHERE ID = 1;' \
+     'HEX_ENCODE CRYPT_HASH|805C58E80D5A6F66D9BED65CFB771031235943EF48FBE5C18B823DF952DA92C4 A9993E364706816ABA3E25717850C26C9CD0D89D'
+dpin '14 UNICODE_VAL over a BLOB is INTEGER' 'SELECT UNICODE_VAL(BL) FROM TB WHERE ID = 1;' \
+     '01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4| : name: UNICODE_VAL alias: UNICODE_VAL'
+pin  '14 ... the first code point' 'SELECT UNICODE_VAL(BL), UNICODE_VAL(BU), UNICODE_VAL(CAST('"'"'é'"'"' AS BLOB SUB_TYPE TEXT CHARACTER SET UTF8)) FROM TB WHERE ID = 1;' \
+     'UNICODE_VAL UNICODE_VAL UNICODE_VAL|98 233 233'
+pin  '14 a CAST of a literal to a UTF8 text blob is its characters' 'SELECT CHAR_LENGTH(CAST('"'"'é'"'"' AS BLOB SUB_TYPE TEXT CHARACTER SET UTF8)) FROM RDB$DATABASE;' \
+     'CHAR_LENGTH|1'
+pin  '14 UUID_TO_CHAR of a blob: must be of string type' 'SELECT UUID_TO_CHAR(CAST(RPAD('"'"''"'"', 16, '"'"'a'"'"') AS BLOB SUB_TYPE BINARY)) FROM RDB$DATABASE;' \
+     'UUID_TO_CHAR|Statement failed, SQLSTATE = 42000|expression evaluation not supported|-Binary UUID argument for UUID_TO_CHAR must be of string type'
+pin  '14 CHAR_TO_UUID of a blob alike' 'SELECT CHAR_TO_UUID(CAST('"'"'A0BF4E45-3029-2A44-D493-4998C9B439A3'"'"' AS BLOB SUB_TYPE TEXT)) FROM RDB$DATABASE;' \
+     'CHAR_TO_UUID|Statement failed, SQLSTATE = 42000|expression evaluation not supported|-Human readable UUID argument for CHAR_TO_UUID must be of string type'
+pin  'CONTROL 14 ... a NULL blob answers NULL' 'SELECT UUID_TO_CHAR(BB), CHAR_TO_UUID(BL) FROM TB WHERE ID = 2;' \
+     'UUID_TO_CHAR CHAR_TO_UUID|<null> <null>'
+dpin '14 SIGN / MOD / ACOSH / ASCII_CHAR / UNICODE_CHAR over a BLOB describe their own types' 'SELECT SIGN(BL), MOD(BL, 2), MOD(7, BL), ACOSH(BL), ASCII_CHAR(BL), UNICODE_CHAR(BL), ABS(BL) FROM TB WHERE ID = 1;' \
+     '01: sqltype: 500 SHORT Nullable scale: 0 subtype: 0 len: 2| : name: SIGN alias: SIGN|02: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8| : name: MOD alias: MOD|03: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4| : name: MOD alias: MOD|04: sqltype: 480 DOUBLE Nullable scale: 0 subtype: 0 len: 8| : name: ACOSH alias: ACOSH|05: sqltype: 452 TEXT Nullable scale: 0 subtype: 0 len: 1 charset: 0 SYSTEM.NONE| : name: ASCII_CHAR alias: ASCII_CHAR|06: sqltype: 452 TEXT Nullable scale: 0 subtype: 0 len: 4 charset: 4 SYSTEM.UTF8| : name: UNICODE_CHAR alias: UNICODE_CHAR|07: sqltype: 480 DOUBLE Nullable scale: 0 subtype: 0 len: 8| : name: ABS alias: ABS|Statement failed, SQLSTATE = 22018'
+pin  '14 SIGN(BL): conversion error from string "BLOB"' 'SELECT SIGN(BL) FROM TB WHERE ID = 1;' \
+     'SIGN|Statement failed, SQLSTATE = 22018|conversion error from string "BLOB"'
+pin  '14 MOD(BL, 2): conversion error from string "BLOB"' 'SELECT MOD(BL, 2) FROM TB WHERE ID = 1;' \
+     'MOD|Statement failed, SQLSTATE = 22018|conversion error from string "BLOB"'
+pin  '14 MOD(7, BL): conversion error from string "BLOB"' 'SELECT MOD(7, BL) FROM TB WHERE ID = 1;' \
+     'MOD|Statement failed, SQLSTATE = 22018|conversion error from string "BLOB"'
+pin  '14 ACOSH(BL): conversion error from string "BLOB"' 'SELECT ACOSH(BL) FROM TB WHERE ID = 1;' \
+     'ACOSH|Statement failed, SQLSTATE = 22018|conversion error from string "BLOB"'
+pin  '14 ASCII_CHAR(BL): conversion error from string "BLOB"' 'SELECT ASCII_CHAR(BL) FROM TB WHERE ID = 1;' \
+     'ASCII_CHAR|Statement failed, SQLSTATE = 22018|conversion error from string "BLOB"'
+pin  '14 UNICODE_CHAR(BL): conversion error from string "BLOB"' 'SELECT UNICODE_CHAR(BL) FROM TB WHERE ID = 1;' \
+     'UNICODE_CHAR|Statement failed, SQLSTATE = 22018|conversion error from string "BLOB"'
+pin  '14 TRUNC(BL): conversion error from string "BLOB"' 'SELECT TRUNC(BL) FROM TB WHERE ID = 1;' \
+     'TRUNC|Statement failed, SQLSTATE = 22018|conversion error from string "BLOB"'
+pin  '14 ... a blob literal too - its content is never read' 'SELECT SIGN(CAST('"'"'5'"'"' AS BLOB SUB_TYPE TEXT)) FROM RDB$DATABASE;' \
+     'SIGN|Statement failed, SQLSTATE = 22018|conversion error from string "BLOB"'
+pin  'CONTROL 14 ... a NULL blob operand answers NULL' 'SELECT SIGN(BL), MOD(BL, 2) FROM TB WHERE ID = 2;' \
+     'SIGN MOD|<null> <null>'
+pin  'CONTROL 14 a CAST of the blob reads its content' 'SELECT CAST(BL AS INTEGER) FROM TB WHERE ID = 1;' \
+     'CAST|Statement failed, SQLSTATE = 22018|conversion error from string "blobv"'
+
 echo '--- 13. RECORDED: the shapes this server still refuses (clean refusals)'
 rec  '13 SUBSTRING ... SIMILAR' 'SELECT SUBSTRING('"'"'abcdef'"'"' SIMILAR '"'"'a#"bc#"%'"'"' ESCAPE '"'"'#'"'"') FROM RDB$DATABASE;' \
      'SUBSTRING|bc' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
@@ -593,5 +714,5 @@ if grep -aq 'panicked at' "/tmp/fc-serve-builtins-$PORT.log"; then echo "FAIL th
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 226 ]; then echo "FAIL only $ran checks ran (floor 226)"; fail=1; fi
+if [ "$ran" -lt 276 ]; then echo "FAIL only $ran checks ran (floor 276)"; fail=1; fi
 exit $fail
