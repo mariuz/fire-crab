@@ -304,7 +304,7 @@ echo "--- 5. RECORDED (the engine answers; this server refuses or differs)"
 pin  "5 a WINDOWED decimal fold (planned since the window planner round of 2026-09-26)" "SELECT ID, VAR_POP(I) OVER () FROM BIG2 ORDER BY ID;" "ID VAR_POP|1 1.555555555555555555555555555555557|2 1.555555555555555555555555555555557|3 1.555555555555555555555555555555557|4 1.555555555555555555555555555555557"
 refused "5 a DECFLOAT / INT128 percentile FRACTION" "SELECT PERCENTILE_CONT(CAST(0.5 AS DECFLOAT(16))) WITHIN GROUP (ORDER BY I) FROM BIG2;" "PERCENTILE_CONT|2"
 refused "5 DECODE with a mistyped search value: the engine describes, then raises at fetch" "SELECT DECODE(I, 10, 'a', 'b', 'c') FROM T;" "DECODE|a|Statement failed, SQLSTATE = 22018|conversion error from string \"b\""
-differs "5 a VIEW's literal cast runs the double conversion on the engine" "SELECT X FROM V1;" "X|1000000000000000042420637374017.961984" "X|1000000000000000000000000000000.000000"
+pin  "5 a VIEW's literal cast runs the double conversion on the engine (promoted: a view's items are never an assignment's source)" "SELECT X FROM V1;" "X|1000000000000000042420637374017.961984"
 
 echo "--- 6. A HAVING OVER A DECIMAL128 FOLD compares the exact literal in decimal (every group was dropped)"
 pin  "6 PERCENTILE_CONT over INT128 > 1: groups 2 and 3" "SELECT ID FROM BIG2 GROUP BY ID HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I) > 1 ORDER BY ID;" "ID|2|3"

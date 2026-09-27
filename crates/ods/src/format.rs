@@ -302,14 +302,28 @@ impl Value {
             Value::Timestamp(d, t) => format!("{} {}", render_date(*d), render_time(*t)),
             Value::Blob(rel, num) => format!("<blob {}:{}>", rel, num),
             Value::Int128(v, scale) => render_scaled_i128(*v, *scale),
-            Value::DecFloat16(b) => crate::decfloat::to_string(&crate::decfloat::decode_dec64(*b)),
-            Value::DecFloat34(b) => crate::decfloat::to_string(&crate::decfloat::decode_dec128(*b)),
+            // a NaN keeps its FORM in its text - `sNaN`, `-NaN` - which
+            // the decoded value no longer carries (measured on 2182:
+            // `MAXVALUE(<stored sNaN>, 1) || 'x'` is sNaNx)
+            Value::DecFloat16(b) => match crate::decfloat::decode_dec64(*b) {
+                crate::decfloat::Dec::Nan => nan_text(b >> 63 == 1, (b >> 57) & 1 == 1),
+                d => crate::decfloat::to_string(&d),
+            },
+            Value::DecFloat34(b) => match crate::decfloat::decode_dec128(*b) {
+                crate::decfloat::Dec::Nan => nan_text(b >> 127 == 1, (b >> 121) & 1 == 1),
+                d => crate::decfloat::to_string(&d),
+            },
             Value::TimeTz(t, zone) => render_time_tz(*t, *zone),
             Value::TimestampTz(d, t, zone) => render_timestamp_tz(*d, *t, *zone),
             Value::Unsupported(t) => format!("<{}>", t),
             Value::OutOfRange => "<out-of-range>".into(),
         }
     }
+}
+
+/// A DECFLOAT NaN's text by its form: `NaN`, `sNaN`, `-NaN`, `-sNaN`.
+fn nan_text(neg: bool, signalling: bool) -> String {
+    format!("{}{}NaN", if neg { "-" } else { "" }, if signalling { "s" } else { "" })
 }
 
 /// An approximate value as the engine prints it: 8 SIGNIFICANT digits for

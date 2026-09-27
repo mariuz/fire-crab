@@ -21681,6 +21681,40 @@ fn blob_result(e: &Expr, descs: &[Descriptor]) -> Option<(i16, u8)> {
     Some((sub, if sub == 0 { 0 } else { cs }))
 }
 
+/// THE ENGINE'S BINARY-TO-TEXT BLOB FILTER (sub_type 0 to 1), which a
+/// BINARY blob passes through when it moves into a string of a real set
+/// - a CAST to CHAR / VARCHAR in any set but OCTETS, and UNICODE_VAL's
+/// operand. The content is read LINE BY LINE: each line feed ends a
+/// segment and is dropped, and an EMPTY segment ends the read; within a
+/// line a byte outside 0x20..0x7E and BS / TAB / VT / FF / CR is a `.`.
+/// Measured on 2182 under UTF8 and NONE attachments: `x'00FF41'` is
+/// `..A` (UNICODE_VAL 46), every byte 0x00..0xFF maps as stated,
+/// `x'410A42'` is `AB`, `x'410A0A42'` `A`, `x'0A41'` and `x'0A0D09'`
+/// empty (UNICODE_VAL 0), `x'0D0A41'` CR A, `x'41090A'` A TAB; while a
+/// CAST to OCTETS, ASCII_VAL, POSITION, LIKE, `=`, `||`, UPPER and a CAST
+/// to a text BLOB read the raw bytes.
+fn blob_binary_text(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len());
+    for line in b.split(|&c| c == b'\n') {
+        if line.is_empty() {
+            break;
+        }
+        out.extend(line.iter().map(|&c| if matches!(c, 0x08..=0x0D | 0x20..=0x7E) { c } else { b'.' }));
+    }
+    out
+}
+
+/// [blob_binary_text] around a BINARY blob operand of a CAST to `t`, a
+/// string of any set but OCTETS.
+fn binary_blob_to_text(e: Expr, t: &CastTarget, descs: &[Descriptor]) -> Expr {
+    let octets = matches!(t, CastTarget::Text { cs: Some(fire_crab_ods::intl::CS_OCTETS), .. });
+    if matches!(t, CastTarget::Text { .. }) && !octets && blob_result(&e, descs).is_some_and(|(sub, _)| sub == 0) {
+        Expr::Func(SysFn::BlobBinText, vec![e])
+    } else {
+        e
+    }
+}
+
 /// THE CODECS OVER A BLOB answer a blob of their own type, not the
 /// operand's: HEX_ENCODE / BASE64_ENCODE a BLOB SUB_TYPE TEXT in ASCII,
 /// HEX_DECODE / BASE64_DECODE a BLOB SUB_TYPE BINARY - whatever the
@@ -22227,8 +22261,11 @@ fn build_projcols(
             // descriptor. Declared types this server does not yet cast a
             // computed column into (text, temporal, blob, DECFLOAT) keep
             // the expression's own form ([computed_cast_target] is None).
+            //
+            // ITS LITERALS ARE NEVER RE-READ: the stored expression is
+            // no assignment's source ([plan_view])
             if let Some(target) = computed_cast_target(d) {
-                let e = resolve_expr(raw, columns, descs)?;
+                let e = with_runtime_double_casts(|| resolve_expr(raw, columns, descs))?;
                 let cs = computed_cast_stamp(&target, err_spell_charset(&e, descs));
                 let (wire, sql_type, length, scale, sub_type) = wire_for(d);
                 out.push(ProjCol {
@@ -22247,7 +22284,7 @@ fn build_projcols(
                 });
                 continue;
             }
-            let mut pc = build_expr_col(raw, &rc.name, columns, descs)?;
+            let mut pc = with_runtime_double_casts(|| build_expr_col(raw, &rc.name, columns, descs))?;
             // a computed column describes as its OWN name, not the
             // expression's (probed: CC COMPUTED BY (X+1) is CC/CC)
             pc.fname = Some(rc.name.clone());
@@ -45700,6 +45737,37 @@ fn mark_hash_keys(on: &mut Predicate, offset: usize, part_width: usize) {
     }
 }
 
+/// An inner join's equalities between the part `offset..offset + width`
+/// and the streams outside it are the engine's HASH KEYS: each side is
+/// wrapped in [SysFn::DecKey], whose comparison reads a DECFLOAT NaN as
+/// the hash does ([dec_nan_key_eq]). Only a single conjunction's
+/// equalities - an OR is no key. Run after the join's access is built,
+/// whose key extraction reads the bare equality.
+fn mark_dec_nan_keys(on: &mut Predicate, offset: usize, part_width: usize) {
+    if on.groups.len() != 1 {
+        return;
+    }
+    let win = offset..offset + part_width;
+    let inside = |fid: usize| win.contains(&fid);
+    let outside = |fid: usize| !win.contains(&fid);
+    let only = |e: &Expr, here: &dyn Fn(usize) -> bool, there: &dyn Fn(usize) -> bool| {
+        expr_reads(e, here) && !expr_reads(e, there)
+    };
+    for t in on.groups[0].iter_mut() {
+        let Term::ExprCond(c) = t else { continue };
+        let Cond2::Cmp(l, Cmp::Eq, r) = c.as_mut() else { continue };
+        if matches!(**l, Expr::Func(SysFn::DecKey, _)) {
+            continue;
+        }
+        let crossing = (only(l, &inside, &outside) && only(r, &outside, &inside))
+            || (only(l, &outside, &inside) && only(r, &inside, &outside));
+        if crossing {
+            **l = Expr::Func(SysFn::DecKey, vec![std::mem::replace(&mut **l, Expr::Null)]);
+            **r = Expr::Func(SysFn::DecKey, vec![std::mem::replace(&mut **r, Expr::Null)]);
+        }
+    }
+}
+
 /// A view or derived side the engine FLATTENS to one base relation, when
 /// its inner plan is a PURE PROJECTION of a single table - no WHERE,
 /// order, generator or window, each of which is a transform the flatten
@@ -46659,6 +46727,11 @@ fn plan_join_bound(
         let outer_descs: Vec<Descriptor> =
             sides[..=k].iter().flat_map(|s| s.descs.iter().cloned()).collect();
         let access = build_join_access(db, *kind, &on, &sides[k + 1], &outer_descs);
+        // ...and its equalities across the two are HASH KEYS for a
+        // DECFLOAT NaN - see [mark_dec_nan_keys]
+        if matches!(kind, JoinKind::Inner) {
+            mark_dec_nan_keys(&mut on, sides[k + 1].offset, sides[k + 1].descs.len());
+        }
         if trace_on() {
             match (access.keys.is_empty(), access.probe.as_ref()) {
                 (false, Some(p)) => match &p.index {
@@ -46768,6 +46841,7 @@ fn plan_join_bound(
                     if !filtered {
                         mark_hash_keys(&mut p.on, at, p.width);
                     }
+                    mark_dec_nan_keys(&mut p.on, at, p.width);
                 }
                 at += p.width;
             }
@@ -46866,6 +46940,7 @@ fn plan_join_bound(
             let mut at = sides[0].descs.len();
             for p in parts.iter() {
                 mark_hash_keys(f, at, p.width);
+                mark_dec_nan_keys(f, at, p.width);
                 at += p.width;
             }
         }
@@ -54147,7 +54222,19 @@ fn plan_view(db: &Option<Database>, dbr: &Database, name: &str) -> Option<(Plan,
     let (body, _) = strip_check_option(&vd.source);
     // the body is a VIEW's, so its semi-joins are NOT hashed - see
     // [plan_query_inner_ctx]
-    let inner = plan_query_inner_ctx(body, db, &mut vparams, true)?;
+    // A VIEW's ITEMS AND A COMPUTED BY EXPRESSION ARE STORED, NOT PREPARED
+    // under an assignment: no literal of theirs is re-read from its text -
+    // a double stays cvt.cpp's runtime double whatever reads it, and the
+    // view or computed column resolves under [RUNTIME_DOUBLE_CASTS].
+    // Measured on 2182 over a view `SELECT COALESCE(0.1e0, D34), D16 +
+    // 0.1e0, CAST(0.1e0 AS DECFLOAT(34)), CAST(0.4e0 + 0.4e0 AS INT128),
+    // CAST(CAST(<35-digit literal> AS INT128) AS DECFLOAT(34)) ..` read as
+    // bare items, under `|| ''` and through a derived table:
+    // 0.10000000000000001, 1.10000000000000001, 0.10000000000000001, 1 and
+    // 1.234567890123456789012345678901235E+34 (the top-level statement
+    // folds all five: 0.1, 1.1, 0.1, 0 and 22000); a COMPUTED BY of the
+    // first, third and fourth alike.
+    let inner = with_runtime_double_casts(|| plan_query_inner_ctx(body, db, &mut vparams, true))?;
     if !vparams.is_empty() || matches!(inner, Plan::Refused) {
         return None;
     }
@@ -82215,6 +82302,14 @@ enum SysFn {
     /// before the ASCII_VAL transliteration error). The u8 is the blob's
     /// set, which counts the bytes; the value passes through unchanged.
     BlobStr(u8),
+    /// A HASH-JOIN KEY: one side of an inner join's equality between two
+    /// streams ([mark_dec_nan_keys]). The value passes through; the
+    /// comparison it sits in reads a DECFLOAT NaN as the engine's hash
+    /// does ([dec_nan_key_eq]).
+    DecKey,
+    /// A BINARY blob moved into a string of a real set: the engine's
+    /// sub_type 0 to 1 blob filter ([blob_binary_text]).
+    BlobBinText,
 }
 
 /// Which of the evlMaxMinValue pair, and under which name the header
@@ -82439,6 +82534,8 @@ impl SysFn {
             SysFn::CryptHash(..) => "CRYPT_HASH",
             SysFn::BlobNum => "CAST",
             SysFn::BlobStr(_) => "CAST",
+            SysFn::DecKey => "CAST",
+            SysFn::BlobBinText => "CAST",
         }
     }
 
@@ -85031,7 +85128,9 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::FirstLastDay(..)
         | SysFn::CryptHash(..)
         | SysFn::BlobNum
-        | SysFn::BlobStr(_) => unreachable!(),
+        | SysFn::BlobStr(_)
+        | SysFn::DecKey
+        | SysFn::BlobBinText => unreachable!(),
     };
     if args.len() < min || args.len() > max {
         // a table function's miscount is the engine's 39000 at prepare
@@ -86129,7 +86228,14 @@ fn item_literal_fold(raw: &RawExpr, e: Expr, descs: &[Descriptor]) -> Option<Exp
     if RESOLVE_DEPTH.with(|d| d.get()) != 1
         || RUNTIME_DOUBLE_CASTS.with(|c| c.get())
         || matches!(raw, RawExpr::Cast(_, CastTarget::DecFloat { .. } | CastTarget::Numeric { bytes: 16, .. }))
-        || !raw_any(raw, &|x| matches!(x, RawExpr::Double(_)))
+        || !raw_any(raw, &|x| {
+            let exact = |y: &RawExpr| {
+                matches!(y, RawExpr::Int(_) | RawExpr::Int128(_) | RawExpr::Dec(..)) || wide_scaled_literal(y)
+            };
+            matches!(x, RawExpr::Double(_))
+                || matches!(x, RawExpr::Cast(y, CastTarget::Numeric { bytes: 16, .. })
+                    if exact(y) || matches!(&**y, RawExpr::Neg(z) if exact(z)))
+        })
     {
         return Some(e);
     }
@@ -90504,7 +90610,7 @@ fn resolve_proj_expr_body(
             } else {
                 if let Some(fid) = blob_col_cast(inner, t, columns, descs) {
                     Expr::Cast(
-                        Box::new(Expr::BlobText(fid, blob_charset(descs, fid))),
+                        Box::new(binary_blob_to_text(Expr::BlobText(fid, blob_charset(descs, fid)), t, descs)),
                         *t,
                         blob_charset(descs, fid),
                     )
@@ -90514,6 +90620,7 @@ fn resolve_proj_expr_body(
                         return None;
                     }
                     let cs = cast_source_charset(&e, t, descs);
+                    let e = binary_blob_to_text(e, t, descs);
                     Expr::Cast(Box::new(assignment_literal_fold(runtime_double_cast(e, t, cs), t)?), *t, cs)
                 }
             }
@@ -90770,7 +90877,8 @@ fn resolve_expr_inner(
                 if !COMPUTED_EXPR.with(|c| c.borrow_mut().1.insert(fid)) {
                     return None;
                 }
-                let inner = resolve_expr(&raw, columns, descs);
+                // (its literals never re-read: [plan_view])
+                let inner = with_runtime_double_casts(|| resolve_expr(&raw, columns, descs));
                 COMPUTED_EXPR.with(|c| {
                     c.borrow_mut().1.remove(&fid);
                 });
@@ -90837,7 +90945,7 @@ fn resolve_expr_inner(
         RawExpr::Cast(e, t) => {
             if let Some(fid) = blob_col_cast(e, t, columns, descs) {
                 return Some(Expr::Cast(
-                    Box::new(Expr::BlobText(fid, blob_charset(descs, fid))),
+                    Box::new(binary_blob_to_text(Expr::BlobText(fid, blob_charset(descs, fid)), t, descs)),
                     *t,
                     blob_charset(descs, fid),
                 ));
@@ -90847,6 +90955,7 @@ fn resolve_expr_inner(
                 return None;
             }
             let cs = cast_source_charset(&inner, t, descs);
+            let inner = binary_blob_to_text(inner, t, descs);
             Expr::Cast(Box::new(assignment_literal_fold(runtime_double_cast(inner, t, cs), t)?), *t, cs)
         }
         RawExpr::Coalesce(args) => Expr::Coalesce(
@@ -91504,6 +91613,12 @@ fn resolve_expr_inner(
                     if let Some((sub, cs)) = blob_result(a, descs) {
                         let cs = if sub == 0 { fire_crab_ods::intl::CS_NONE } else { cs };
                         *a = Expr::Func(SysFn::BlobStr(cs), vec![std::mem::replace(a, Expr::Null)]);
+                        // UNICODE_VAL's move of a BINARY blob is the
+                        // text filter's ([blob_binary_text]); ASCII_VAL
+                        // reads the raw first byte
+                        if sub == 0 && matches!(f, SysFn::UnicodeVal(_)) {
+                            *a = Expr::Func(SysFn::BlobBinText, vec![std::mem::replace(a, Expr::Null)]);
+                        }
                     }
                 }
             }
@@ -92099,8 +92214,13 @@ impl Cond2 {
                 } else if dec_is_nan(&x) || dec_is_nan(&y) {
                     // a DECFLOAT NaN compares by [dec_nan_cmp]: EQUAL to
                     // anything in a DECFLOAT(16) comparison, 22000 in a
-                    // DECFLOAT(34) one
-                    Some(ord_ok(dec_nan_cmp(&x, &y)?, *op))
+                    // DECFLOAT(34) one - but a HASH-JOIN key's equality
+                    // by [dec_nan_key_eq]
+                    if matches!(**a, Expr::Func(SysFn::DecKey, _)) {
+                        Some(dec_nan_key_eq(&x, &y)?)
+                    } else {
+                        Some(ord_ok(dec_nan_cmp(&x, &y)?, *op))
+                    }
                 } else {
                     // A NaN ON EITHER SIDE has the engine's own order,
                     // which `value_cmp` cannot give: its approximate arm
@@ -94624,16 +94744,25 @@ fn derived_item_folds(
 /// INT128))` reads the literals as DECFLOAT 0.4 and stores 1), and one
 /// assigned to anything else not at all - its item resolved under
 /// [RUNTIME_DOUBLE_CASTS], which never reaches here.
+///
+/// An EXACT literal is re-read too, where it matters: directly under a
+/// CAST to an INT128-backed type in a DECFLOAT item it is made as that
+/// DECFLOAT first ([exact_lit_to_dec]), and a DECFLOAT of more than 34
+/// digits at the target's scale has no INT128 - the engine's 22000.
 fn assignment_literal_fold(inner: Expr, t: &CastTarget) -> Option<Expr> {
     if RUNTIME_DOUBLE_CASTS.with(|c| c.get()) || RESOLVE_DEPTH.with(|d| d.get()) != 1 {
         return Some(inner);
     }
+    let cast_t = *t;
     let own = matches!(t, CastTarget::Numeric { bytes: 16, .. } | CastTarget::DecFloat { .. });
     let t = &match CUR_ITEM_FOLD.with(|c| c.get()) {
         ItemFold::To(u) => u,
         ItemFold::Own if own => *t,
         _ => return Some(inner),
     };
+    if let Some(e) = exact_lit_to_dec(&inner, &cast_t, t) {
+        return Some(e);
+    }
     fn is_lit(e: &Expr) -> bool {
         match e {
             Expr::Double(_) => true,
@@ -94662,7 +94791,10 @@ fn assignment_literal_fold(inner: Expr, t: &CastTarget) -> Option<Expr> {
                 Expr::Cast(Box::new(e), *t, CS_LIT_FOLD)
             }
             Expr::Cast(x, _, CS_LIT_FOLD) => Expr::Cast(x, *t, CS_LIT_FOLD),
-            Expr::Cast(x, tt, cs) => Expr::Cast(w(x), tt, cs),
+            Expr::Cast(x, tt, cs) => match exact_lit_to_dec(&x, &tt, t) {
+                Some(d) => Expr::Cast(Box::new(d), tt, cs),
+                None => Expr::Cast(w(x), tt, cs),
+            },
             Expr::Neg(x) => Expr::Neg(w(x)),
             Expr::Bin(a, op, b) => Expr::Bin(w(a), op, w(b)),
             Expr::Coalesce(v) => Expr::Coalesce(v.into_iter().map(|x| walk(x, t, ok)).collect()),
@@ -94693,6 +94825,38 @@ fn assignment_literal_fold(inner: Expr, t: &CastTarget) -> Option<Expr> {
     let ok = std::cell::Cell::new(true);
     let out = walk(inner, t, &ok);
     ok.get().then_some(out)
+}
+
+/// AN EXACT LITERAL UNDER A CAST TO INT128 IN A DECFLOAT ITEM is made as
+/// the item's DECFLOAT (`csb_preferredDesc`) before that CAST reads it,
+/// so a coefficient of more than 34 digits at the target's scale has no
+/// INT128 there - DECFLOAT to INT128 is the 22000 *Decimal float invalid
+/// operation* - even where the value is exact. Measured on 2182:
+/// `CAST(CAST(<35-digit literal> AS INT128) AS DECFLOAT(34))`, `..(16))`,
+/// `CAST(10^37 AS INT128)`, `CAST(<33-digit literal> AS NUMERIC(38,2))`,
+/// the literal cast plus a DECFLOAT(34), its MAXVALUE / COALESCE beside
+/// one, `-CAST(..)`, `CAST(CAST(..) + 0 AS DECFLOAT(34))` and a derived
+/// table's item read as `CAST(X AS DECFLOAT(34))` all raise, a 34-digit
+/// one answers; while the same value from a column, from a text
+/// (`CAST('<35 digits>' AS INT128)`), in a UNION branch or under `||
+/// ''`, and `CAST(<35-digit literal> AS DECFLOAT(34))` with no INT128
+/// cast, all round and answer 1.234567890123456789012345678901235E+34.
+/// `Some` for the operand `x` of a CAST to `tt` under a fold to `t` that
+/// takes this reading.
+fn exact_lit_to_dec(x: &Expr, tt: &CastTarget, t: &CastTarget) -> Option<Expr> {
+    // (a scaled literal past INT64 is the exact CAST of its spelling,
+    // [wide_scaled_literal])
+    let exact = |e: &Expr| {
+        matches!(e, Expr::Int(_) | Expr::Int128(_) | Expr::Dec(..))
+            || matches!(e, Expr::Cast(y, CastTarget::Numeric { scale, bytes: 16, sub_type: 0 }, _)
+                if *scale < 0 && matches!(**y, Expr::Str(_)))
+    };
+    let lit = match x {
+        Expr::Neg(y) => exact(y),
+        e => exact(e),
+    };
+    (lit && matches!(tt, CastTarget::Numeric { bytes: 16, .. }) && matches!(t, CastTarget::DecFloat { .. }))
+        .then(|| Expr::Cast(Box::new(x.clone()), *t, fire_crab_ods::intl::CS_UTF8))
 }
 
 /// A double LITERAL under a CAST to DECFLOAT folds from its spelling
@@ -94905,22 +95069,6 @@ fn numeric_parts(v: &Value) -> Option<(i128, i8)> {
         Value::Scaled(r, s) => Some((*r as i128, *s)),
         Value::Int128(r, s) => Some((*r, *s)),
         _ => None,
-    }
-}
-
-/// AN INT128 WHOSE COEFFICIENT HAS MORE THAN 34 DIGITS HAS NO DECIMAL128:
-/// the engine's Int128-to-decimal move raises 22000 *Decimal float invalid
-/// operation* rather than round - even where the value is exact (measured
-/// on 2182: `CAST(CAST(10^37 AS INT128) AS DECFLOAT(34))`, 35-digit
-/// `..12340`, the INT128 maximum, a NUMERIC(38,1) / (38,2) of 35 digits,
-/// `<35-digit INT128> + CAST(0 AS DECFLOAT(34))` and MAXVALUE of one
-/// beside a DECFLOAT all raise; 34 digits answer, and a 23-digit
-/// INT128 to DECFLOAT(16) rounds). [value_as_dec] rounds such a value,
-/// so the CAST to DECFLOAT and the decimal arithmetic ask this first.
-fn int128_dec_fits(v: &Value) -> Result<(), EvalErr> {
-    match v {
-        Value::Int128(r, _) if r.unsigned_abs() >= 10u128.pow(34) => Err(EvalErr::DecfloatInvalidOperation),
-        _ => Ok(()),
     }
 }
 
@@ -98650,6 +98798,57 @@ fn dec_nan_cmp(x: &Value, y: &Value) -> Result<std::cmp::Ordering, EvalErr> {
     Ok(std::cmp::Ordering::Equal)
 }
 
+/// THE EQUALITY OF A HASH-JOIN KEY over a DECFLOAT NaN: the engine hashes
+/// an inner join's equality between two streams (PLAN HASH) and compares
+/// only the rows whose keys hash alike, so a NaN meets only a NaN of its
+/// own form ([dec_nan_form]) and never a number - and a pair that meets
+/// compares as [dec_nan_cmp] does (equal, or 22000 with a DECFLOAT(34)
+/// side). Measured on 2182 over DECFLOAT(16) NaN / sNaN / -NaN rows: `JOIN
+/// .. ON N1.A16 = N2.B16` pairs the NaN with the other NaN only, the sNaN
+/// and -NaN with an sNaN / -NaN of another table, `N1.A16 = N2.A16` each
+/// NaN with itself, `N1.A16 = N2.I` (an INTEGER) no NaN row, `ON N1.ID =
+/// N2.ID WHERE N1.A16 = N2.I` (the WHERE's equality is a key too) and
+/// `ON N1.ID = N2.ID AND N1.A16 = N2.B16` no NaN row; a DECFLOAT(34) NaN
+/// against an INTEGER no row and no raise, against another NaN 22000;
+/// while a LEFT JOIN, or an ON under an OR, is a nested loop whose
+/// equality is [dec_nan_cmp]'s (a DECFLOAT(16) NaN pairs with every row).
+fn dec_nan_key_eq(x: &Value, y: &Value) -> Result<bool, EvalErr> {
+    match (dec_nan_form(x), dec_nan_form(y)) {
+        (Some(f), Some(g)) if f == g => Ok(dec_nan_cmp(x, y)? == std::cmp::Ordering::Equal),
+        _ => Ok(false),
+    }
+}
+
+/// THE FORM OF A DECFLOAT NaN - (negative, signalling) - read off its
+/// bits, which [Dec::Nan] does not keep. A conditional's DECFLOAT result
+/// is its branch moved into the common type, and the move keeps the form:
+/// measured on 2182 over stored DECFLOAT(16) sNaN and -NaN, `IIF(1 = 1,
+/// A, 0)`, `COALESCE(A, 1)`, `CASE WHEN .. THEN A END` and the MAXVALUE /
+/// MINVALUE that answer A (beside 1, 9, 0.5e0, an INT128, A itself, and
+/// under `|| 'é'`) print sNaN and -NaN - they printed NaN here.
+///
+/// [Dec::Nan]: fire_crab_ods::decfloat::Dec::Nan
+fn dec_nan_form(v: &Value) -> Option<(bool, bool)> {
+    if !dec_is_nan(v) {
+        return None;
+    }
+    match v {
+        Value::DecFloat16(b) => Some((b >> 63 == 1, (b >> 57) & 1 == 1)),
+        Value::DecFloat34(b) => Some((b >> 127 == 1, (b >> 121) & 1 == 1)),
+        _ => None,
+    }
+}
+
+/// The NaN of `form` ([dec_nan_form]) at a width.
+fn dec_nan_of_form((neg, signalling): (bool, bool), wide: bool) -> Value {
+    use fire_crab_ods::decfloat::{encode_dec128_special, encode_dec64_special};
+    if wide {
+        Value::DecFloat34(encode_dec128_special(neg, true) | ((signalling as u128) << 121))
+    } else {
+        Value::DecFloat16(encode_dec64_special(neg, true) | ((signalling as u64) << 57))
+    }
+}
+
 /// A DECFLOAT value holding a NaN (either width).
 fn dec_is_nan(v: &Value) -> bool {
     matches!(dec_of(v), Some(fire_crab_ods::decfloat::Dec::Nan))
@@ -99454,6 +99653,8 @@ impl Expr {
                     // the text it reads ([SysFn::BlobNum])
                     SysFn::BlobNum => Some(ExprType::Text),
                     SysFn::BlobStr(_) => Some(ExprType::Text),
+                    SysFn::DecKey => args.first().and_then(|a| a.type_of(descs)),
+                    SysFn::BlobBinText => Some(ExprType::Text),
                     SysFn::MaxMin(_) => None,
                     // ASCII_VAL(text) -> SMALLINT (an integer); a wrong-typed
                     // operand refuses (an unpinned conversion).
@@ -100635,8 +100836,6 @@ impl Expr {
                     let promote = |v: &Value| {
                         value_as_dec(v).or_else(|| approx_of(v).and_then(|f| f64_to_dec(f, 17)))
                     };
-                    int128_dec_fits(&va)?;
-                    int128_dec_fits(&vb)?;
                     let da = promote(&va).ok_or(EvalErr::ConversionError(None))?;
                     let db = promote(&vb).ok_or(EvalErr::ConversionError(None))?;
                     let r = match op {
@@ -101049,6 +101248,12 @@ impl Expr {
                                 return Err(EvalErr::Unsupported);
                             }
                         }
+                        // a DECFLOAT NaN keeps its FORM through the
+                        // cast - a signalling or negative one is not the
+                        // quiet NaN its decoded value is ([dec_nan_form])
+                        if let Some(form) = dec_nan_form(&v) {
+                            return Ok(dec_nan_of_form(form, *wide));
+                        }
                         let dec = if let Value::Text(s) = &v {
                             // an exponent past decimal128's range CLAMPS
                             // ('1E-6177' is 0E-6176, '1E+6112' 1.0E+6112) and
@@ -101118,7 +101323,6 @@ impl Expr {
                             let sig = if *wide { 17 } else { 16 };
                             f64_to_dec(x, sig).ok_or(EvalErr::ConversionError(None))?
                         } else {
-                            int128_dec_fits(&v)?;
                             value_as_dec(&v).ok_or(EvalErr::ConversionError(None))?
                         };
                         if *wide {
@@ -103086,6 +103290,14 @@ impl Expr {
                     }
                     // a blob read as a number: never its content
                     SysFn::BlobNum => return Err(EvalErr::ConversionError(Some("BLOB".into()))),
+                    SysFn::DecKey => vs.swap_remove(0),
+                    SysFn::BlobBinText => match vs.swap_remove(0) {
+                        Value::Text(t) => {
+                            let b = fire_crab_ods::intl::carrier_encode(&t).unwrap_or_else(|| t.into_bytes());
+                            Value::Text(fire_crab_ods::intl::carrier_decode(&blob_binary_text(&b)))
+                        }
+                        v => v,
+                    },
                     SysFn::BlobStr(cs) => {
                         if let Value::Text(t) = &vs[0] {
                             if text_bytes_in(Some(*cs), t).len() > 32767 {
@@ -114562,6 +114774,14 @@ impl Thrown {
 
 /// Write an assignment's value into its target - a slot, through the
 /// slot's declared type, or a BEFORE trigger's `NEW.<col>`.
+/// The declared type of an assignment's target, when it has one.
+fn slot_type(target: &TrigTarget, f: &PsqlFrame) -> Option<CastTarget> {
+    match target {
+        TrigTarget::Var(n) => f.types.get(*n as usize).copied().flatten(),
+        TrigTarget::Field(_) => None,
+    }
+}
+
 fn assign_value(target: &TrigTarget, v: Value, src: SrcCs, f: &mut PsqlFrame) -> Result<(), PsqlStop> {
     match target {
         TrigTarget::Var(n) => store_slot_cs(f, *n as usize, v, src),
@@ -118777,7 +118997,7 @@ fn exec_psql_stmt_inner(
                 // by the planner (COALESCE/CASE/NULLIF/CAST/scalar
                 // subquery, incl. over a system table or after a DML) -
                 // then assigned to the target exactly like the parsed form
-                Some((text, binds)) => eval_raw_scalar(text, binds, f, db, ctx)?,
+                Some((text, binds)) => eval_raw_scalar_to(text, binds, f, db, ctx, slot_type(target, f))?,
                 None => {
                     let v = match expr {
                 fire_crab_ods::expr::Expr::GenId { name, step }
@@ -118797,7 +119017,7 @@ fn exec_psql_stmt_inner(
                 _ => match (eval_psql_expr(expr, f), fallback) {
                     // no arithmetic rule for these values: the planner's
                     (Err(PsqlStop::Unsupported), Some((text, binds))) => {
-                        let (v, cs) = eval_raw_scalar(text, binds, f, db, ctx)?;
+                        let (v, cs) = eval_raw_scalar_to(text, binds, f, db, ctx, slot_type(target, f))?;
                         return assign_value(target, v, cs, f);
                     }
                     (r, _) => r?,
@@ -118969,7 +119189,9 @@ fn exec_psql_stmt_inner(
             })
             .ok_or(PsqlStop::Unsupported)?;
             let (rows, cs, cols) = {
-                let (plan, calls) = psql_plan(&q, db)?;
+                let dests: Vec<Option<CastTarget>> =
+                    into.iter().map(|n| f.types.get(*n as usize).copied().flatten()).collect();
+                let (plan, calls) = psql_plan_into(&q, db, &dests)?;
                 let cols: Vec<String> = output_cols_of(&plan).iter().map(|c| c.name.to_ascii_uppercase()).collect();
                 (psql_plan_rows_then(&plan, &calls, db, ctx, *src_off)?, plan_out_cs(&plan), cols)
             };
@@ -119435,7 +119657,8 @@ fn exec_psql_stmt_inner(
         // -313 the engine raises at prepare).
         TrigStmt::SelectInto { sql, into, binds, src_off, .. } => {
             let sql = subst_body_query(sql, binds, f).ok_or(PsqlStop::Unsupported)?;
-            let (plan, calls) = psql_plan(&sql, db)?;
+            let dests: Vec<Option<CastTarget>> = into.iter().map(|n| f.types.get(*n as usize).copied().flatten()).collect();
+            let (plan, calls) = psql_plan_into(&sql, db, &dests)?;
             // A PLAN THAT PROJECTS NOTHING IS A MISREAD, not a count: no
             // SELECT has zero columns, and `SELECT R FROM PY((-2) - 1)`
             // (a variable spliced into an argument EXPRESSION) was planned
@@ -120348,6 +120571,28 @@ fn eval_raw_cond(
 /// under every caller. The list is taken and the caller's put back, so
 /// a body run from inside a prepare never hands its calls to it.
 fn psql_plan(sql: &str, db: &Option<Database>) -> Result<(Plan, Vec<FnCall>), PsqlStop> {
+    psql_plan_into(sql, db, &[])
+}
+
+/// THE ITEMS OF A BODY QUERY THAT ASSIGNS ARE ITS TARGETS' SOURCES: the
+/// literal fold of each ([ItemFold]) is the one an assignment into the
+/// slot's declared type gives - a DECFLOAT or INT128-backed variable
+/// re-reads the item's literals from their text, any other type keeps
+/// cvt.cpp's runtime double, whatever the item's own type. Measured on
+/// 2182 in EXECUTE BLOCK into a VARCHAR: `X = COALESCE(0.1e0, CAST(1 AS
+/// DECFLOAT(34)))`, `MAXVALUE(0.1e0, CAST(0.05 AS DECFLOAT(34)))`,
+/// `0.1e0 + CAST(0 AS DECFLOAT(34))`, `CASE .. 0.1e0 ELSE <DECFLOAT(34)>
+/// END`, `CAST(0.1e0 AS DECFLOAT(34))` and `FOR SELECT` / `SELECT ..
+/// INTO :X` of `COALESCE(0.1e0, D34)` are all 0.10000000000000001,
+/// `CAST(0.4e0 + 0.4e0 AS INT128)` 1; into a DECFLOAT(34) the same
+/// sources are 0.1, and the INT128 cast into an INT128 0. `dests` is
+/// positional over the select list; `None` (a slot of no declared type,
+/// a trigger's NEW field) leaves an item to its own type.
+fn psql_plan_into(
+    sql: &str,
+    db: &Option<Database>,
+    dests: &[Option<CastTarget>],
+) -> Result<(Plan, Vec<FnCall>), PsqlStop> {
     // A BODY'S QUERY IS HELD TO THE PREPARE-TIME RULES A CLIENT'S IS: the
     // limit-clause and window-frame grammar and the -206 of a qualifier
     // nothing binds ([plan_query]). The engine judges them when it
@@ -120375,7 +120620,29 @@ fn psql_plan(sql: &str, db: &Option<Database>) -> Result<(Plan, Vec<FnCall>), Ps
     }
     let outer = FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut()));
     let mut sink: Vec<Option<Descriptor>> = Vec::new();
+    if dests.iter().any(Option::is_some) {
+        if let Some(Proj::Items(items)) = split_query(sql).and_then(|(p, ..)| parse_projection(p)) {
+            let folds: Vec<(RawExpr, ItemFold)> = items
+                .iter()
+                .zip(dests)
+                .filter_map(|(it, d)| {
+                    let raw = match it {
+                        SelItem::Col(c, _) => RawExpr::Col(c.clone()),
+                        SelItem::Expr(raw, ..) => raw.clone(),
+                        _ => return None,
+                    };
+                    let fold = match (*d)? {
+                        t @ (CastTarget::DecFloat { .. } | CastTarget::Numeric { bytes: 16, .. }) => ItemFold::To(t),
+                        _ => ItemFold::Runtime,
+                    };
+                    Some((raw, fold))
+                })
+                .collect();
+            PENDING_ITEM_FOLDS.with(|p| *p.borrow_mut() = Some(folds));
+        }
+    }
     let plan = plan_query_inner(sql, db, &mut sink);
+    PENDING_ITEM_FOLDS.with(|p| p.borrow_mut().take());
     let calls = FN_CALLS.with(|l| std::mem::replace(&mut *l.borrow_mut(), outer));
     if std::env::var("FC_SRV_TRACE").is_ok() && plan.is_none() {
         eprintln!("[srv] psql body statement refused at plan: {:?}", sql);
@@ -120435,12 +120702,25 @@ fn eval_raw_scalar(
     db: &mut Option<Database>,
     ctx: &SessionCtx,
 ) -> Result<(Value, SrcCs), PsqlStop> {
+    eval_raw_scalar_to(text, binds, f, db, ctx, None)
+}
+
+/// [eval_raw_scalar] for the source of an assignment into a slot of type
+/// `dest`, which decides its literal fold ([psql_plan_into]).
+fn eval_raw_scalar_to(
+    text: &str,
+    binds: &[(String, u16)],
+    f: &PsqlFrame,
+    db: &mut Option<Database>,
+    ctx: &SessionCtx,
+    dest: Option<CastTarget>,
+) -> Result<(Value, SrcCs), PsqlStop> {
     for (_, n) in binds {
         cursor_field_guard(f, *n as usize)?;
     }
     let expr = subst_body_query(text, binds, f).ok_or(PsqlStop::Unsupported)?;
     let sql = format!("SELECT {} FROM RDB$DATABASE", expr);
-    let (plan, calls) = psql_plan(&sql, db)?;
+    let (plan, calls) = psql_plan_into(&sql, db, &[dest])?;
     // the value comes back in the set the planner typed it in
     let cs = plan_out_cs(&plan).first().copied().flatten();
     let rows = psql_rows(&plan, &calls, db, ctx)?;
@@ -127531,6 +127811,8 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 | SysFn::CharToUuid(_)
                 | SysFn::BlobNum
                 | SysFn::BlobStr(_)
+                | SysFn::DecKey
+                | SysFn::BlobBinText
                 | SysFn::MaxMin(_) => false,
             }
         }
@@ -154893,8 +155175,7 @@ mod builtins_round {
         assert!(lower_maxmin(MaxMinKind::MinValue, &[], &[]).is_none());
     }
 
-    /// A DECFLOAT NaN compares by its comparison type ([dec_nan_cmp]), an
-    /// INT128 past 34 digits has no DECFLOAT(34) ([int128_dec_fits]), and
+    /// A DECFLOAT NaN compares by its comparison type ([dec_nan_cmp]) and
     /// MAXVALUE's lowering guards a later DECFLOAT argument ([lower_maxmin]).
     #[test]
     fn decfloat_nan_law() {
@@ -154907,10 +155188,6 @@ mod builtins_round {
         // ... a DECFLOAT(34) side makes it the trapped Invalid
         assert_eq!(dec_nan_cmp(&nan34, &Value::Int(1)), Err(EvalErr::DecfloatInvalidOperation));
         assert_eq!(dec_nan_cmp(&nan16, &nan34), Err(EvalErr::DecfloatInvalidOperation));
-        // an INT128 past 34 digits has no decimal128
-        assert!(int128_dec_fits(&Value::Int128(10i128.pow(34) - 1, 0)).is_ok());
-        assert_eq!(int128_dec_fits(&Value::Int128(-(10i128.pow(34)), 0)), Err(EvalErr::DecfloatInvalidOperation));
-        assert!(int128_dec_fits(&Value::Int(i64::MAX)).is_ok());
         // the lowering guards a DECFLOAT argument after the first against a NaN
         let args = [RawExpr::Int(1), RawExpr::Col("A".into()), RawExpr::Int(2)];
         let guarded = |e: &RawExpr| {
@@ -154919,6 +155196,71 @@ mod builtins_round {
         };
         assert_eq!(guarded(&lower_maxmin(MaxMinKind::MaxValue, &args, &[false, true, false]).unwrap()), 1);
         assert_eq!(guarded(&lower_maxmin(MaxMinKind::MaxValue, &args, &[true, false, false]).unwrap()), 0);
+    }
+
+    /// A NaN keeps its form ([dec_nan_form]) through a cast and in its
+    /// text, and a hash-join key meets only a NaN of its own form
+    /// ([dec_nan_key_eq]).
+    #[test]
+    fn decfloat_nan_forms() {
+        let snan16 = dec_nan_of_form((false, true), false);
+        let mnan16 = dec_nan_of_form((true, false), false);
+        let nan16 = dec_nan_of_form((false, false), false);
+        assert_eq!(snan16.render(), "sNaN");
+        assert_eq!(mnan16.render(), "-NaN");
+        assert_eq!(nan16.render(), "NaN");
+        assert_eq!(dec_nan_of_form((true, true), true).render(), "-sNaN");
+        assert_eq!(dec_nan_form(&snan16), Some((false, true)));
+        assert_eq!(dec_nan_form(&Value::Int(1)), None);
+        let cast = Expr::Cast(Box::new(Expr::Col(0)), CastTarget::DecFloat { wide: false }, 0);
+        assert_eq!(cast.eval(&[snan16.clone()]).unwrap().render(), "sNaN");
+        let wide = Expr::Cast(Box::new(Expr::Col(0)), CastTarget::DecFloat { wide: true }, 0);
+        assert_eq!(wide.eval(&[mnan16.clone()]).unwrap().render(), "-NaN");
+        // the key: a NaN meets its own form only, never a number
+        assert_eq!(dec_nan_key_eq(&nan16, &nan16), Ok(true));
+        assert_eq!(dec_nan_key_eq(&nan16, &snan16), Ok(false));
+        assert_eq!(dec_nan_key_eq(&nan16, &Value::Int(1)), Ok(false));
+        assert_eq!(dec_nan_key_eq(&Value::Int(1), &mnan16), Ok(false));
+        // ...and a met pair beside a DECFLOAT(34) is the trapped Invalid
+        let nan34 = dec_nan_of_form((false, false), true);
+        assert_eq!(dec_nan_key_eq(&nan16, &nan34), Err(EvalErr::DecfloatInvalidOperation));
+        assert_eq!(dec_nan_key_eq(&nan34, &Value::Int(1)), Ok(false));
+    }
+
+    /// The binary-to-text blob filter: line by line, an empty line ends
+    /// it, a byte outside the printable set is a `.` ([blob_binary_text]).
+    #[test]
+    fn binary_blob_text_filter() {
+        assert_eq!(blob_binary_text(&[0x00, 0xFF, 0x41]), b"..A");
+        assert_eq!(blob_binary_text(&[0x41, 0x0A, 0x42]), b"AB");
+        assert_eq!(blob_binary_text(&[0x41, 0x0A, 0x0A, 0x42]), b"A");
+        assert_eq!(blob_binary_text(&[0x0A, 0x41]), b"");
+        assert_eq!(blob_binary_text(&[0x0D, 0x0A, 0x41]), b"\rA");
+        assert_eq!(blob_binary_text(&[0x41, 0x09, 0x0A]), b"A\t");
+        assert_eq!(blob_binary_text(&[0x07, 0x08, 0x0B, 0x0C, 0x7E, 0x7F]), b".\x08\x0B\x0C~.");
+        assert_eq!(blob_binary_text(&[]), b"");
+    }
+
+    /// An exact literal under a CAST to INT128 in a DECFLOAT fold is read
+    /// as that DECFLOAT first; anywhere else it is left alone
+    /// ([exact_lit_to_dec]).
+    #[test]
+    fn int128_literal_under_decfloat_fold() {
+        let i128t = CastTarget::Numeric { scale: 0, bytes: 16, sub_type: 0 };
+        let d34 = CastTarget::DecFloat { wide: true };
+        let lit = Expr::Int128(12345678901234567890123456789012345);
+        assert!(matches!(
+            exact_lit_to_dec(&lit, &i128t, &d34),
+            Some(Expr::Cast(_, CastTarget::DecFloat { wide: true }, _))
+        ));
+        assert!(exact_lit_to_dec(&Expr::Neg(Box::new(Expr::Int(5))), &i128t, &d34).is_some());
+        // a column, a DECFLOAT cast, an INT128 fold: no reading
+        assert!(exact_lit_to_dec(&Expr::Col(0), &i128t, &d34).is_none());
+        assert!(exact_lit_to_dec(&lit, &d34, &d34).is_none());
+        assert!(exact_lit_to_dec(&lit, &i128t, &i128t).is_none());
+        // ...and the DECFLOAT of 35 digits has no INT128
+        let e = Expr::Cast(Box::new(exact_lit_to_dec(&lit, &i128t, &d34).unwrap()), i128t, 0);
+        assert_eq!(e.eval(&[]), Err(EvalErr::DecfloatInvalidOperation));
     }
 
     /// A nested MAXVALUE multiplies the weight [maxmin_weight] budgets:

@@ -56,10 +56,20 @@
 # DECFLOAT(34) side raises 22000), so MAXVALUE keeps a first-argument NaN
 # and passes a later one over; ASCII_VAL / UNICODE_VAL move a blob into a
 # string (22001 past 32767 bytes); UNICODE_VAL of bytes that are no
-# UTF-8 is the bare 22000 Malformed string; an INT128 of more than 34
-# digits has no DECFLOAT(34) (22000); a blob at a NUMBER position of LPAD
-# / LEFT / SUBSTRING's FOR / DATEADD / OVERLAY / POSITION describes as a
-# text there and raises 22018 "BLOB".
+# UTF-8 is the bare 22000 Malformed string; a literal of more than 34
+# digits under a CAST to INT128 in a DECFLOAT item has no INT128 (22000);
+# a blob at a NUMBER position of LPAD / LEFT / SUBSTRING's FOR / DATEADD /
+# OVERLAY / POSITION describes as a text there and raises 22018 "BLOB".
+#
+# Section 16 is the review of section 15: only a LITERAL under a CAST to
+# INT128 is re-read as the DECFLOAT (a column, a text, a UNION branch and
+# a non-DECFLOAT item round); a PSQL assignment folds by its TARGET's type
+# (into a VARCHAR the runtime double); a view's items and a COMPUTED BY
+# expression never fold; an inner join's equality between two streams is
+# a HASH KEY, where a DECFLOAT NaN meets only a NaN of its own form; a
+# NaN keeps its sNaN / -NaN form through a conditional and in its text;
+# a BINARY blob moved into a string of a real set passes the engine's
+# text filter (line by line, `.` for a non-printable byte).
 #
 # RECORDED (clean refusals kept): SUBSTRING ... SIMILAR, BLOB_APPEND, CAST
 # ... FORMAT, MAXVALUE of a number beside a non-numeric text (the engine
@@ -71,7 +81,8 @@
 # sets (the engine transliterates and raises), and nested past the
 # lowering's budget (twelve deep); from section 15 a signalling or
 # negative NaN literal cast, SUBSTRING FROM a blob (the engine's -607 at
-# prepare) and ROUND's places from a blob.
+# prepare) and ROUND's places from a blob; from section 16 a double
+# literal beside a DECFLOAT under no fold (a VARCHAR assignment, a view).
 #
 # Usage: qa/serve-real-builtins.sh [port]   (default 5770)
 set -u
@@ -101,6 +112,25 @@ CREATE TABLE TN (ID INTEGER NOT NULL, A DECFLOAT(16), B DECFLOAT(34), I INTEGER,
 INSERT INTO TN VALUES (1, 'NaN', 1, 1, 1, 1);
 INSERT INTO TN VALUES (2, 1, 'NaN', 1, 1, 1);
 INSERT INTO TN VALUES (3, 5, 2, 5, 5, 5);
+CREATE TABLE TK (ID INTEGER NOT NULL, I128 INT128, N381 NUMERIC(38,1), D34 DECFLOAT(34), D16 DECFLOAT(16));
+INSERT INTO TK VALUES (1, 12345678901234567890123456789012345, 1234567890123456789012345678901234.5, 1, 1);
+CREATE VIEW VK (X, Y, Z, W) AS SELECT COALESCE(0.1e0, D34), MAXVALUE(0.1e0, CAST(0.05 AS DECFLOAT(34))), CAST(0.4e0 + 0.4e0 AS INT128),
+  CAST(CAST(12345678901234567890123456789012345 AS INT128) AS DECFLOAT(34)) FROM TK;
+CREATE VIEW VK2 (X, Y) AS SELECT COALESCE(0.1e0, D34), D16 + 0.1e0 FROM TK;
+ALTER TABLE TK ADD C COMPUTED BY (COALESCE(0.1e0, D34));
+ALTER TABLE TK ADD C2 COMPUTED BY (CAST(0.1e0 AS DECFLOAT(34)));
+CREATE TABLE TJ (ID INTEGER NOT NULL, A16 DECFLOAT(16), B16 DECFLOAT(16), I INTEGER, A34 DECFLOAT(34));
+INSERT INTO TJ VALUES (1, 'NaN', 1, 1, 'NaN');
+INSERT INTO TJ VALUES (2, 'sNaN', 'NaN', 2, 2);
+INSERT INTO TJ VALUES (3, '-NaN', 3, 3, 3);
+INSERT INTO TJ VALUES (4, 4, 4, 4, 4);
+INSERT INTO TJ VALUES (5, 1.0, 1.00, 5, 5);
+CREATE TABLE TBB (ID INTEGER NOT NULL, BB BLOB SUB_TYPE BINARY, BT BLOB SUB_TYPE TEXT CHARACTER SET UTF8);
+INSERT INTO TBB VALUES (1, x'00FF41', 'éa');
+INSERT INTO TBB VALUES (2, x'410A42', 'x');
+INSERT INTO TBB VALUES (3, x'410A0A42', 'x');
+INSERT INTO TBB VALUES (4, x'0A41', 'x');
+INSERT INTO TBB VALUES (5, x'0D0A417F09', 'x');
 CREATE TABLE TC (ID INTEGER NOT NULL, BT BLOB SUB_TYPE TEXT, BN BLOB SUB_TYPE BINARY, BU BLOB SUB_TYPE TEXT CHARACTER SET UTF8);
 INSERT INTO TC VALUES (1, '4142', x'4142', '4142');
 INSERT INTO TC VALUES (2, 'QUJD', x'0102', 'QUJD');
@@ -830,6 +860,83 @@ rec  '15 RECORDED SUBSTRING FROM a blob (-607 at prepare) is refused' 'SELECT SU
      'Statement failed, SQLSTATE = HY000|Dynamic SQL Error|-SQL error code = -607|-Array/BLOB/DATE data types not allowed in arithmetic' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
 rec  '15 RECORDED ROUND'"'"'s places from a blob is refused' 'SELECT ROUND(1.55, BL) FROM TB WHERE ID = 1;' \
      'ROUND|Statement failed, SQLSTATE = 22018|conversion error from string "BLOB"' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+echo '--- 16. The review of section 15: which literal an INT128 cast re-reads, an assignment'"'"'s target, a stored view or computed column, a join key over a NaN, a NaN'"'"'s form, the binary-to-text filter'
+pin  '16 an INT128 or NUMERIC(38,1) COLUMN of 35 digits rounds into a DECFLOAT' 'SELECT CAST(I128 AS DECFLOAT(34)), CAST(I128 AS DECFLOAT(16)), I128 + D34, MAXVALUE(I128, D34), CAST(N381 AS DECFLOAT(34)) FROM TK;' \
+     'CAST CAST ADD MAXVALUE CAST|1.234567890123456789012345678901235E+34 1.234567890123457E+34 1.234567890123456789012345678901235E+34 1.234567890123456789012345678901235E+34 1234567890123456789012345678901235'
+pin  '16 ... in the arithmetic, COALESCE, IIF, SUM, POWER' 'SELECT I128 * D16, I128 - D34, COALESCE(I128, D34), IIF(1 = 0, D34, I128), POWER(I128, 1) FROM TK;' \
+     'MULTIPLY SUBTRACT COALESCE CASE POWER|1.234567890123456789012345678901235E+34 1.234567890123456789012345678901235E+34 1.234567890123456789012345678901235E+34 1.234567890123456789012345678901235E+34 1.234567890123456789012345678901235E+34'
+pin  '16 ... SUM over one' 'SELECT SUM(D34 + I128) FROM TK;' \
+     'SUM|1.234567890123456789012345678901235E+34'
+pin  '16 ... from a text, a bare literal, the INT128 maximum' 'SELECT CAST(CAST('"'"'12345678901234567890123456789012345'"'"' AS INT128) AS DECFLOAT(34)), CAST(12345678901234567890123456789012345 AS DECFLOAT(34)), CAST(170141183460469231731687303715884105727 AS DECFLOAT(34)) FROM RDB$DATABASE;' \
+     'CAST CAST CAST|1.234567890123456789012345678901235E+34 1.234567890123456789012345678901235E+34 1.701411834604692317316873037158841E+38'
+pin  '16 ... a literal INT128 cast under || (no DECFLOAT item)' 'SELECT CAST(CAST(12345678901234567890123456789012345 AS INT128) AS DECFLOAT(34)) || '"'"''"'"' FROM RDB$DATABASE;' \
+     'CONCATENATION|1.234567890123456789012345678901235E+34'
+pin  '16 ... in a UNION branch' 'SELECT CAST(CAST(12345678901234567890123456789012345 AS INT128) AS DECFLOAT(34)) FROM RDB$DATABASE UNION ALL SELECT 1 FROM RDB$DATABASE;' \
+     '1.234567890123456789012345678901235E+34|1'
+pin  'CONTROL 16 a literal under a CAST to INT128 in a DECFLOAT item is that DECFLOAT: a scaled one' 'SELECT CAST(CAST(12345678901234567890123456789012345.0 AS INT128) AS DECFLOAT(34)) FROM RDB$DATABASE;' \
+     'CAST|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.'
+pin  'CONTROL 16 ... NUMERIC(38,1) of a 34-digit literal' 'SELECT CAST(CAST(1234567890123456789012345678901234 AS NUMERIC(38,1)) AS DECFLOAT(34)) FROM RDB$DATABASE;' \
+     'CAST|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.'
+pin  'CONTROL 16 ... under + 0 inside the cast' 'SELECT CAST(CAST(12345678901234567890123456789012345 AS INT128) + 0 AS DECFLOAT(34)) FROM RDB$DATABASE;' \
+     'CAST|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.'
+pin  'CONTROL 16 ... through a derived table' 'SELECT CAST(X AS DECFLOAT(34)) FROM (SELECT CAST(12345678901234567890123456789012345 AS INT128) X FROM RDB$DATABASE);' \
+     'CAST|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.'
+pin  '16 an assignment into a VARCHAR keeps the runtime double: COALESCE' 'SET TERM ^; EXECUTE BLOCK RETURNS (X VARCHAR(40)) AS BEGIN X = COALESCE(0.1e0, CAST(1 AS DECFLOAT(34))); SUSPEND; END^ SET TERM ;^' \
+     'X|0.10000000000000001'
+pin  '16 ... MAXVALUE' 'SET TERM ^; EXECUTE BLOCK RETURNS (X VARCHAR(40)) AS BEGIN X = MAXVALUE(0.1e0, CAST(0.05 AS DECFLOAT(34))); SUSPEND; END^ SET TERM ;^' \
+     'X|0.10000000000000001'
+pin  '16 ... CASE' 'SET TERM ^; EXECUTE BLOCK RETURNS (X VARCHAR(40)) AS BEGIN X = CASE WHEN 1 = 1 THEN 0.1e0 ELSE CAST(1 AS DECFLOAT(34)) END; SUSPEND; END^ SET TERM ;^' \
+     'X|0.10000000000000001'
+pin  '16 ... a written CAST' 'SET TERM ^; EXECUTE BLOCK RETURNS (X VARCHAR(40)) AS BEGIN X = CAST(0.1e0 AS DECFLOAT(34)); SUSPEND; END^ SET TERM ;^' \
+     'X|0.10000000000000001'
+pin  '16 ... FOR SELECT INTO' 'SET TERM ^; EXECUTE BLOCK RETURNS (X VARCHAR(60)) AS BEGIN FOR SELECT COALESCE(0.1e0, D34) FROM TK INTO :X DO SUSPEND; END^ SET TERM ;^' \
+     'X|0.10000000000000001'
+pin  '16 ... SELECT INTO' 'SET TERM ^; EXECUTE BLOCK RETURNS (X VARCHAR(60)) AS BEGIN SELECT COALESCE(0.1e0, D34) FROM TK INTO :X; SUSPEND; END^ SET TERM ;^' \
+     'X|0.10000000000000001'
+pin  '16 ... an INT128 cast' 'SET TERM ^; EXECUTE BLOCK RETURNS (X VARCHAR(40)) AS BEGIN X = CAST(0.4e0 + 0.4e0 AS INT128); SUSPEND; END^ SET TERM ;^' \
+     'X|1'
+rec  '16 RECORDED a double literal beside a DECFLOAT under a VARCHAR assignment is refused' 'SET TERM ^; EXECUTE BLOCK RETURNS (X VARCHAR(40)) AS BEGIN X = 0.1e0 + CAST(0 AS DECFLOAT(34)); SUSPEND; END^ SET TERM ;^' \
+     'X|0.10000000000000001' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+pin  '16 a view'"'"'s items are stored: no literal is re-read' 'SELECT X, Y, Z, W, X || '"'"''"'"' FROM VK;' \
+     'X Y Z W CONCATENATION|0.10000000000000001 0.10000000000000001 1 1.234567890123456789012345678901235E+34 0.10000000000000001'
+pin  '16 ... through a derived table' 'SELECT * FROM (SELECT X, Z FROM VK);' \
+     'X Z|0.10000000000000001 1'
+pin  '16 a computed column likewise' 'SELECT C, C2 FROM TK;' \
+     'C C2|0.10000000000000001 0.10000000000000001'
+rec  '16 RECORDED a view with a double literal beside a DECFLOAT is refused' 'SELECT X FROM VK2;' \
+     'X|0.10000000000000001' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+pin  '16 an inner join key: a NaN meets only a NaN of its own form' 'SELECT N1.ID, N2.ID FROM TJ N1 JOIN TJ N2 ON N1.A16 = N2.B16 ORDER BY 1, 2;' \
+     'ID ID|1 2|4 4|5 1|5 5'
+pin  '16 ... never a number' 'SELECT N1.ID, N2.ID FROM TJ N1 JOIN TJ N2 ON N1.A16 = N2.I ORDER BY 1, 2;' \
+     'ID ID|4 4|5 1'
+pin  '16 ... itself' 'SELECT N1.ID, N2.ID FROM TJ N1 JOIN TJ N2 ON N1.A16 = N2.A16 ORDER BY 1, 2;' \
+     'ID ID|1 1|2 2|3 3|4 4|5 5'
+pin  '16 ... a WHERE equality between the streams is a key too' 'SELECT N1.ID, N2.ID FROM TJ N1 JOIN TJ N2 ON N1.ID = N2.ID WHERE N1.A16 = N2.I ORDER BY 1, 2;' \
+     'ID ID|4 4'
+pin  '16 ... a second ON conjunct' 'SELECT N1.ID, N2.ID FROM TJ N1 JOIN TJ N2 ON N1.ID = N2.ID AND N1.A16 = N2.B16 ORDER BY 1, 2;' \
+     'ID ID|4 4|5 5'
+pin  '16 ... a comma join' 'SELECT N1.ID, N2.ID FROM TJ N1, TJ N2 WHERE N1.A16 = N2.B16 ORDER BY 1, 2;' \
+     'ID ID|1 2|4 4|5 1|5 5'
+pin  '16 ... a DECFLOAT(34) NaN against an INTEGER: no row, no raise' 'SELECT N1.ID, N2.ID FROM TJ N1 JOIN TJ N2 ON N1.A34 = N2.I ORDER BY 1, 2;' \
+     'ID ID|2 2|3 3|4 4|5 5'
+pin  'CONTROL 16 a LEFT join is a nested loop: a DECFLOAT(16) NaN pairs with every row' 'SELECT N1.ID, N2.ID FROM TJ N1 LEFT JOIN TJ N2 ON N1.A16 = N2.B16 WHERE N1.ID = 1 ORDER BY 1, 2;' \
+     'ID ID|1 1|1 2|1 3|1 4|1 5'
+pin  'CONTROL 16 ... an OR is no key' 'SELECT N1.ID, N2.ID FROM TJ N1 JOIN TJ N2 ON N1.A16 = N2.B16 OR 1 = 0 WHERE N1.ID = 1 ORDER BY 1, 2;' \
+     'ID ID|1 1|1 2|1 3|1 4|1 5'
+pin  '16 a NaN keeps its form: MAXVALUE / MINVALUE' 'SELECT ID, MAXVALUE(A16, 1), MINVALUE(A16, 9), MAXVALUE(A16, A16), MAXVALUE(A16, 0.5e0), MAXVALUE(A16, CAST(2 AS INT128)) FROM TJ WHERE ID < 4 ORDER BY ID;' \
+     'ID MAXVALUE MINVALUE MAXVALUE MAXVALUE MAXVALUE|1 NaN NaN NaN NaN NaN|2 sNaN sNaN sNaN sNaN sNaN|3 -NaN -NaN -NaN -NaN -NaN'
+pin  '16 ... IIF, COALESCE, CASE' 'SELECT ID, IIF(1 = 1, A16, 0), COALESCE(A16, 1), CASE WHEN ID > 0 THEN A16 END FROM TJ WHERE ID < 4 ORDER BY ID;' \
+     'ID CASE COALESCE CASE|1 NaN NaN NaN|2 sNaN sNaN sNaN|3 -NaN -NaN -NaN'
+pin  '16 ... in its text' 'SELECT ID, MAXVALUE(A16, 1) || '"'"'x'"'"', CAST(A16 AS VARCHAR(10)) FROM TJ WHERE ID < 4 ORDER BY ID;' \
+     'ID CONCATENATION CAST|1 NaNx NaN|2 sNaNx sNaN|3 -NaNx -NaN'
+pin  '16 a binary blob moved into a string passes the text filter: UNICODE_VAL' 'SELECT ID, UNICODE_VAL(BB), ASCII_VAL(BB) FROM TBB ORDER BY ID;' \
+     'ID UNICODE_VAL ASCII_VAL|1 46 0|2 65 65|3 65 65|4 0 10|5 13 13'
+pin  '16 ... a CAST to VARCHAR: line by line, an empty line ends it' 'SELECT ID, HEX_ENCODE(CAST(BB AS VARCHAR(20))), HEX_ENCODE(CAST(BB AS VARCHAR(20) CHARACTER SET NONE)) FROM TBB ORDER BY ID;' \
+     'ID HEX_ENCODE HEX_ENCODE|1 2E2E41 2E2E41|2 4142 4142|3 41 41|4|5 0D412E09 0D412E09'
+pinu '16 ... a decoded blob' 'SELECT CAST(HEX_DECODE(HEX_ENCODE(BT)) AS VARCHAR(20)) FROM TBB WHERE ID = 1;' \
+     'CAST|..a'
+pin  'CONTROL 16 ... OCTETS, POSITION, a text blob: the raw bytes' 'SELECT ID, HEX_ENCODE(CAST(BB AS VARCHAR(20) CHARACTER SET OCTETS)), POSITION('"'"'B'"'"' IN BB) FROM TBB WHERE ID < 4 ORDER BY ID;' \
+     'ID HEX_ENCODE POSITION|1 00FF41 0|2 410A42 3|3 410A0A42 4'
 echo '--- 13. RECORDED: the shapes this server still refuses (clean refusals)'
 rec  '13 SUBSTRING ... SIMILAR' 'SELECT SUBSTRING('"'"'abcdef'"'"' SIMILAR '"'"'a#"bc#"%'"'"' ESCAPE '"'"'#'"'"') FROM RDB$DATABASE;' \
      'SUBSTRING|bc' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
@@ -846,5 +953,5 @@ if grep -aq 'panicked at' "/tmp/fc-serve-builtins-$PORT.log"; then echo "FAIL th
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 325 ]; then echo "FAIL only $ran checks ran (floor 325)"; fail=1; fi
+if [ "$ran" -lt 363 ]; then echo "FAIL only $ran checks ran (floor 363)"; fail=1; fi
 exit $fail
