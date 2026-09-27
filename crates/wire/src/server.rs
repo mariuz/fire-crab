@@ -14245,17 +14245,22 @@ impl Term {
             // stored DECFLOAT decoded), decfloat::cmp orders them.
             Term::NumCmp(fid, op, Rhs::DecFloat34(bits)) => match values.get(*fid) {
                 Some(v) => match value_as_dec(v) {
-                    // a NaN on EITHER side traps per row (probed), it is not
-                    // UNKNOWN - so raise, not skip. The column NaN is caught
-                    // here; a NaN LITERAL (the `'NaN'` text form) is caught
-                    // once the row is known non-NULL, below.
+                    // a NaN on EITHER side is [dec_nan_cmp]'s, never
+                    // UNKNOWN: over a DECFLOAT(34) column it traps per row
+                    // (probed), over a DECFLOAT(16) one - whose literal is
+                    // narrowed to its width - it is equal to everything.
+                    // The column NaN is caught here; a NaN LITERAL (the
+                    // `'NaN'` text form) once the row is known non-NULL,
+                    // below.
                     Some(fire_crab_ods::decfloat::Dec::Nan) => {
-                        return Err(EvalErr::DecfloatInvalidOperation)
+                        dec_nan_cmp(v, &Value::Null)?;
+                        Some(ord_ok(std::cmp::Ordering::Equal, *op))
                     }
                     Some(d) => {
                         let lit = fire_crab_ods::decfloat::decode_dec128(*bits);
                         if matches!(lit, fire_crab_ods::decfloat::Dec::Nan) {
-                            return Err(EvalErr::DecfloatInvalidOperation);
+                            dec_nan_cmp(v, &Value::Null)?;
+                            return Ok(Some(ord_ok(std::cmp::Ordering::Equal, *op)));
                         }
                         Some(ord_ok(fire_crab_ods::decfloat::cmp(&d, &lit), *op))
                     }
@@ -21635,6 +21640,15 @@ fn blob_result(e: &Expr, descs: &[Descriptor]) -> Option<(i16, u8)> {
                     walk(x, descs, sub, found);
                 }
             }
+            // a codec over a blob is a blob of its OWN type: a binary
+            // decoder result makes the whole operation binary, an
+            // encoder's text never does
+            e @ Expr::Func(..) if codec_blob_result(e, descs).is_some() => {
+                *found = true;
+                if codec_blob_result(e, descs).is_some_and(|(s, _)| s == 0) {
+                    *sub = 0;
+                }
+            }
             // a function's result is a blob only where the function
             // ANSWERS TEXT: the lengths, POSITION and the numeric
             // family answer scalars over a blob argument just as they
@@ -21649,6 +21663,12 @@ fn blob_result(e: &Expr, descs: &[Descriptor]) -> Option<(i16, u8)> {
     if let Expr::Cast(_, CastTarget::Blob { sub_type, cs }, _) = e {
         return Some((*sub_type, *cs));
     }
+    // ...and so does a codec over a blob: an encoder answers a TEXT blob
+    // in ASCII, a decoder a BINARY one, whatever the operand's sub_type
+    // ([codec_blob_result])
+    if let Some(r) = codec_blob_result(e, descs) {
+        return Some(r);
+    }
     let (mut sub, mut found) = (1i16, false);
     walk(e, descs, &mut sub, &mut found);
     if !found {
@@ -21659,6 +21679,29 @@ fn blob_result(e: &Expr, descs: &[Descriptor]) -> Option<(i16, u8)> {
         _ => 0,
     };
     Some((sub, if sub == 0 { 0 } else { cs }))
+}
+
+/// THE CODECS OVER A BLOB answer a blob of their own type, not the
+/// operand's: HEX_ENCODE / BASE64_ENCODE a BLOB SUB_TYPE TEXT in ASCII,
+/// HEX_DECODE / BASE64_DECODE a BLOB SUB_TYPE BINARY - whatever the
+/// operand's sub_type and set (makeEncodeHex / makeDecode64 ...,
+/// measured on 2182 with SQLDA: `HEX_ENCODE(<binary blob>)` is 520
+/// subtype 1 charset 2 ASCII, `HEX_DECODE(<text blob>)` 520 subtype 0,
+/// and `HEX_ENCODE(<binary blob>) || ''` stays the ASCII text blob).
+fn codec_blob_result(e: &Expr, descs: &[Descriptor]) -> Option<(i16, u8)> {
+    match e {
+        Expr::Func(SysFn::HexEncode(_) | SysFn::Base64Encode(_), args)
+            if args.first().is_some_and(|a| blob_result(a, descs).is_some()) =>
+        {
+            Some((1, fire_crab_ods::intl::CS_ASCII))
+        }
+        Expr::Func(SysFn::HexDecode(_) | SysFn::Base64Decode(_), args)
+            if args.first().is_some_and(|a| blob_result(a, descs).is_some()) =>
+        {
+            Some((0, 0))
+        }
+        _ => None,
+    }
 }
 
 /// Does this built-in answer TEXT (as opposed to a number, a boolean or
@@ -74842,6 +74885,9 @@ impl From<ExecErr> for EmitErr {
 /// iberror.h). isql renders it "arithmetic exception ... / Integer divide
 /// by zero".
 const GDS_ARITH_EXCEPT: i32 = 335544321;
+/// isc_blob_truncation - *blob truncation when converting to a string:
+/// length limit exceeded* (22001 under the arithmetic exception)
+const GDS_BLOB_TRUNCATION: i32 = 335544915;
 /// isc_transliteration_failed - "Cannot transliterate character between
 /// character sets" (SQLSTATE 22018)
 const GDS_TRANSLITERATION_FAILED: i32 = 335544565;
@@ -82160,6 +82206,15 @@ enum SysFn {
     /// engine never reads the blob's content there (measured on 2182:
     /// `SIGN(CAST('5' AS BLOB SUB_TYPE TEXT))` raises it too).
     BlobNum,
+    /// A BLOB operand of ASCII_VAL / UNICODE_VAL, which MOVE it into a
+    /// string before reading its first character: a stored value past
+    /// 32767 BYTES is the move's 22001 *blob truncation when converting
+    /// to a string: length limit exceeded* (measured on 2182 at 32767 /
+    /// 32768 bytes for NONE, WIN1252, UTF8 and binary blobs alike - a
+    /// UTF8 blob of 16383 two-byte characters answers, of 16384 raises,
+    /// before the ASCII_VAL transliteration error). The u8 is the blob's
+    /// set, which counts the bytes; the value passes through unchanged.
+    BlobStr(u8),
 }
 
 /// Which of the evlMaxMinValue pair, and under which name the header
@@ -82383,6 +82438,7 @@ impl SysFn {
             SysFn::CharToUuid(_) => "CHAR_TO_UUID",
             SysFn::CryptHash(..) => "CRYPT_HASH",
             SysFn::BlobNum => "CAST",
+            SysFn::BlobStr(_) => "CAST",
         }
     }
 
@@ -84475,7 +84531,21 @@ const BLOB_OPERAND: u8 = 0xFE;
 /// A NULL literal's arm answers it at once. Every argument is read more
 /// than once, so one whose second read could differ - a generator step,
 /// a subquery, a stored function, a `?` the CASE cannot type - refuses.
-fn lower_maxmin(kind: MaxMinKind, args: &[RawExpr]) -> Option<RawExpr> {
+///
+/// A DECFLOAT argument (`nan_capable`) can be a NaN, which a DECFLOAT(16)
+/// comparison finds EQUAL to everything ([dec_nan_cmp]) - so the
+/// comparisons stop being transitive, and a NaN past the first argument
+/// would satisfy every `>=` of its own arm. The engine's running winner
+/// never takes such a NaN (nothing strictly beats the winner through it)
+/// while a first-argument NaN is never replaced: `MAXVALUE(NaN, 1)` NaN,
+/// `MAXVALUE(1, NaN)` 1, `MAXVALUE(1, NaN, 2)` 2, `MAXVALUE(NaN, Inf)`
+/// NaN, `MAXVALUE(sNaN, 1)` sNaN (measured on 2182). So the arm of such
+/// an argument after the first also asks that it is no NaN, as `NOT (a
+/// = 0 AND a = 1)` - no number equals both, a DECFLOAT(16) NaN equals
+/// each - and then the arm that answers is the first greatest of the
+/// non-NaN arguments, which is the engine's winner. In a DECFLOAT(34)
+/// comparison any NaN raises 22000 on both sides.
+fn lower_maxmin(kind: MaxMinKind, args: &[RawExpr], nan_capable: &[bool]) -> Option<RawExpr> {
     if args.is_empty()
         || args.iter().any(|a| {
             raw_any(a, &|y| {
@@ -84502,6 +84572,10 @@ fn lower_maxmin(kind: MaxMinKind, args: &[RawExpr]) -> Option<RawExpr> {
             .filter(|&j| j != i)
             .map(|j| RawCond::Cmp(Box::new(args[i].clone()), op, Box::new(args[j].clone())))
             .collect();
+        if i > 0 && nan_capable.get(i).copied().unwrap_or(false) {
+            let eq = |k: i64| RawCond::Cmp(Box::new(args[i].clone()), Cmp::Eq, Box::new(RawExpr::Int(k)));
+            conds.push(RawCond::Not(Box::new(RawCond::And(vec![eq(0), eq(1)]))));
+        }
         let c = if conds.len() == 1 { conds.pop()? } else { RawCond::And(conds) };
         arms.push((c, args[i].clone()));
     }
@@ -84956,7 +85030,8 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::Overlay
         | SysFn::FirstLastDay(..)
         | SysFn::CryptHash(..)
-        | SysFn::BlobNum => unreachable!(),
+        | SysFn::BlobNum
+        | SysFn::BlobStr(_) => unreachable!(),
     };
     if args.len() < min || args.len() > max {
         // a table function's miscount is the engine's 39000 at prepare
@@ -86027,9 +86102,41 @@ fn resolve_expr(
     let _depth = ResolveDepth::enter();
     // an ITEM: resolved under what it is assigned to ([ItemFold])
     if let Some(fold) = item_fold_of(raw) {
-        return resolve_item_folded(raw, fold, || resolve_expr_body(raw, columns, descs));
+        return resolve_item_folded(raw, fold, || {
+            resolve_expr_body(raw, columns, descs).and_then(|e| item_literal_fold(raw, e, descs))
+        });
     }
-    resolve_expr_body(raw, columns, descs)
+    resolve_expr_body(raw, columns, descs).and_then(|e| item_literal_fold(raw, e, descs))
+}
+
+/// [assignment_literal_fold] for an ITEM WHOSE OWN TYPE IS DECFLOAT that
+/// is no written CAST: the engine's `csb_preferredDesc` is the item's
+/// descriptor whatever expression makes it, so every double literal in a
+/// DECFLOAT COALESCE / CASE / IIF / DECODE / MAXVALUE, or an arithmetic
+/// over one, is re-read from its text at that width - its conditions'
+/// literals too. Measured on 2182: `COALESCE(0.1e0, <DECFLOAT(34)>)` 0.1
+/// (0.10000000000000001 was the runtime double), `(.., <DECFLOAT(16)>)`
+/// 0.1, `COALESCE(1.0e-1, ..)` 0.10, `COALESCE(1e0/3, ..)` 34 threes,
+/// `-COALESCE(0.1e0, ..)` -0.1, `COALESCE(0.1e0, ..) + 0` 0.1,
+/// `MAXVALUE(0.3e0, CAST(0.1 AS DECFLOAT(34)))` 0.3, `MAXVALUE(0.1e0,
+/// CAST(0.10000000000000001 AS DECFLOAT(34)))` the cast (the literal is
+/// the decimal 0.1 in the comparison), `CASE WHEN 0.1e0 < <that cast>
+/// THEN D ELSE D + 1 END` D, `SELECT * FROM (SELECT COALESCE(0.1e0, D)
+/// ..)` 0.1; while `IIF(<that test>, 'T', 'F')` (a text item) is F,
+/// `COALESCE(0.1e0, D) || ''`, its CAST to VARCHAR, MAX over it and a
+/// UNION branch keep the runtime double's 0.10000000000000001.
+fn item_literal_fold(raw: &RawExpr, e: Expr, descs: &[Descriptor]) -> Option<Expr> {
+    if RESOLVE_DEPTH.with(|d| d.get()) != 1
+        || RUNTIME_DOUBLE_CASTS.with(|c| c.get())
+        || matches!(raw, RawExpr::Cast(_, CastTarget::DecFloat { .. } | CastTarget::Numeric { bytes: 16, .. }))
+        || !raw_any(raw, &|x| matches!(x, RawExpr::Double(_)))
+    {
+        return Some(e);
+    }
+    match decfloat_width(&e, descs) {
+        Some(wide) => assignment_literal_fold(e, &CastTarget::DecFloat { wide }),
+        None => Some(e),
+    }
 }
 
 fn resolve_expr_body(
@@ -90854,7 +90961,11 @@ fn resolve_expr_inner(
                         .collect(),
                     None => args.clone(),
                 };
-                return resolve_expr_inner(&lower_maxmin(*kind, &lowered_args)?, columns, descs);
+                let nan_capable: Vec<bool> = resolved
+                    .iter()
+                    .map(|e| e.as_ref().is_some_and(|e| decfloat_width(e, descs).is_some()))
+                    .collect();
+                return resolve_expr_inner(&lower_maxmin(*kind, &lowered_args, &nan_capable)?, columns, descs);
             }
             // BIT_LENGTH is eight times OCTET_LENGTH, so it resolves AS
             // the OCTET_LENGTH of its argument (every charset and blob
@@ -90889,6 +91000,35 @@ fn resolve_expr_inner(
                     if blob_result(a, descs).is_some() {
                         *a = Expr::Func(SysFn::BlobNum, vec![std::mem::replace(a, Expr::Null)]);
                     }
+                }
+            }
+            // ...and so is one at the NUMBER position of a string or date
+            // function: the call describes as over a text there (LPAD
+            // VARYING(65533) NONE, LEFT the string's width, DATEADD a
+            // DATE) and a non-NULL blob is 22018 *conversion error from
+            // string "BLOB"* (measured on 2182: LPAD / RPAD's length,
+            // LEFT / RIGHT's count, SUBSTRING's FOR, DATEADD's amount,
+            // OVERLAY's FROM, POSITION's start; ROUND's places too, which
+            // with a text places stays refused here). A blob SUBSTRING
+            // FROM is the engine's -607 *Array/BLOB/DATE data types not
+            // allowed in arithmetic* at prepare - refused. They answered
+            // the blob's content as the number, and a blob result.
+            let number_at: &[usize] = match f {
+                SysFn::Lpad | SysFn::Rpad | SysFn::Left | SysFn::Right => &[1],
+                SysFn::Substring => &[1, 2],
+                SysFn::DateAdd(_) => &[0],
+                SysFn::Round => &[0, 1],
+                SysFn::Overlay => &[2, 3],
+                SysFn::Position => &[2],
+                _ => &[],
+            };
+            for &i in number_at {
+                let Some(a) = resolved.get_mut(i) else { continue };
+                if blob_result(a, descs).is_some() {
+                    if matches!(f, SysFn::Substring) && i == 1 {
+                        return None;
+                    }
+                    *a = Expr::Func(SysFn::BlobNum, vec![std::mem::replace(a, Expr::Null)]);
                 }
             }
             // ASCII_VAL / UNICODE_VAL / CRYPT_HASH over a NON-TEXT operand
@@ -90933,7 +91073,15 @@ fn resolve_expr_inner(
                     });
                     return None;
                 }
-                if matches!(a, Expr::Null) || a.type_of(descs) != Some(ExprType::Text) {
+                // a BLOB operand has no described length: the decoders
+                // check the one they read, per row ([hex_decode] /
+                // [base64_decode] - measured: HEX_DECODE of a text blob
+                // '414' is *Invalid hex text length 3* at fetch, of an
+                // empty one an empty blob, BASE64_DECODE of an empty one
+                // *Wrong base64 text length 0*), and the result is a blob
+                // ([codec_blob_result])
+                let blob = blob_result(a, descs).is_some();
+                if !blob && (matches!(a, Expr::Null) || a.type_of(descs) != Some(ExprType::Text)) {
                     if a.type_of(descs).is_some() {
                         PREPARE_REFUSAL.with(|r| {
                             r.borrow_mut().get_or_insert(EvalErr::Bare(GDS_TOM_STRBLOB, vec![]));
@@ -90941,8 +91089,9 @@ fn resolve_expr_inner(
                     }
                     return None;
                 }
-                let chars = text_form(a, descs).map(|(_, w, _)| w)?;
+                let chars = if blob { 0 } else { text_form(a, descs).map(|(_, w, _)| w)? };
                 let bad = match f {
+                    _ if blob => None,
                     SysFn::HexDecode(_) => (chars % 2 != 0 || chars == 0).then_some(GDS_ODD_HEX_LEN),
                     SysFn::Base64Decode(_) => (chars % 4 != 0 || chars == 0).then_some(GDS_TOM_DECODE64LEN),
                     _ => None,
@@ -90955,7 +91104,7 @@ fn resolve_expr_inner(
                 }
                 // an encoded text past MAX_VARY_COLUMN_SIZE is a BLOB on the
                 // engine - not a shape this server describes
-                if codec_width(*f, a, descs)? > 32765 {
+                if !blob && codec_width(*f, a, descs)? > 32765 {
                     return None;
                 }
             }
@@ -91346,7 +91495,18 @@ fn resolve_expr_inner(
                 _ => *f,
             };
             // a decimal DblDec call reads its arguments as DECFLOAT(34)
-            let resolved = dec_math_wrap(&f, resolved, descs);
+            let mut resolved = dec_math_wrap(&f, resolved, descs);
+            // ASCII_VAL / UNICODE_VAL move a BLOB operand into a string
+            // first ([SysFn::BlobStr]) - wrapped after the call took its
+            // set from the operand itself
+            if matches!(f, SysFn::AsciiVal | SysFn::AsciiValCs(_) | SysFn::UnicodeVal(_)) {
+                if let Some(a) = resolved.first_mut() {
+                    if let Some((sub, cs)) = blob_result(a, descs) {
+                        let cs = if sub == 0 { fire_crab_ods::intl::CS_NONE } else { cs };
+                        *a = Expr::Func(SysFn::BlobStr(cs), vec![std::mem::replace(a, Expr::Null)]);
+                    }
+                }
+            }
             Expr::Func(f, resolved)
         }
         RawExpr::UserFn(name, args) => {
@@ -91937,14 +92097,10 @@ impl Cond2 {
                 if matches!(x, Value::Null) || matches!(y, Value::Null) {
                     None
                 } else if dec_is_nan(&x) || dec_is_nan(&y) {
-                    // a DECFLOAT NaN compares through Decimal128::compare,
-                    // whose decQuadToInt32 of the NaN answer is the
-                    // context's Invalid: 22000 for any operator (measured
-                    // on 2182: `CAST('NaN' AS DECFLOAT(34)) > 1`,
-                    // `IIF(ID = 2, <NaN>, D34) > 1`, a scalar subquery
-                    // answering NaN) - where the total order below ranked
-                    // it above everything and answered the rows
-                    return Err(EvalErr::DecfloatInvalidOperation);
+                    // a DECFLOAT NaN compares by [dec_nan_cmp]: EQUAL to
+                    // anything in a DECFLOAT(16) comparison, 22000 in a
+                    // DECFLOAT(34) one
+                    Some(ord_ok(dec_nan_cmp(&x, &y)?, *op))
                 } else {
                     // A NaN ON EITHER SIDE has the engine's own order,
                     // which `value_cmp` cannot give: its approximate arm
@@ -94511,11 +94667,23 @@ fn assignment_literal_fold(inner: Expr, t: &CastTarget) -> Option<Expr> {
             Expr::Bin(a, op, b) => Expr::Bin(w(a), op, w(b)),
             Expr::Coalesce(v) => Expr::Coalesce(v.into_iter().map(|x| walk(x, t, ok)).collect()),
             Expr::NullIf(a, b) => Expr::NullIf(w(a), w(b)),
-            Expr::Iif(c, a, b) => Expr::Iif(c, w(a), w(b)),
-            Expr::Case(arms, els) => {
-                Expr::Case(arms.into_iter().map(|(c, x)| (c, walk(x, t, ok))).collect(), els.map(w))
-            }
+            Expr::Iif(c, a, b) => Expr::Iif(Box::new(walk_cond(*c, t, ok)), w(a), w(b)),
+            Expr::Case(arms, els) => Expr::Case(
+                arms.into_iter().map(|(c, x)| (walk_cond(c, t, ok), walk(x, t, ok))).collect(),
+                els.map(w),
+            ),
             Expr::Func(f, args) => Expr::Func(f, args.into_iter().map(|x| walk(x, t, ok)).collect()),
+            other => other,
+        }
+    }
+    // the conditions of a conditional are part of the assignment's source
+    // too (`CASE WHEN 0.1e0 < <DECFLOAT> ..` compares the decimal 0.1)
+    fn walk_cond(c: Cond2, t: &CastTarget, ok: &std::cell::Cell<bool>) -> Cond2 {
+        match c {
+            Cond2::Cmp(a, op, b) => Cond2::Cmp(Box::new(walk(*a, t, ok)), op, Box::new(walk(*b, t, ok))),
+            Cond2::Not(x) => Cond2::Not(Box::new(walk_cond(*x, t, ok))),
+            Cond2::And(v) => Cond2::And(v.into_iter().map(|x| walk_cond(x, t, ok)).collect()),
+            Cond2::Or(v) => Cond2::Or(v.into_iter().map(|x| walk_cond(x, t, ok)).collect()),
             other => other,
         }
     }
@@ -94737,6 +94905,22 @@ fn numeric_parts(v: &Value) -> Option<(i128, i8)> {
         Value::Scaled(r, s) => Some((*r as i128, *s)),
         Value::Int128(r, s) => Some((*r, *s)),
         _ => None,
+    }
+}
+
+/// AN INT128 WHOSE COEFFICIENT HAS MORE THAN 34 DIGITS HAS NO DECIMAL128:
+/// the engine's Int128-to-decimal move raises 22000 *Decimal float invalid
+/// operation* rather than round - even where the value is exact (measured
+/// on 2182: `CAST(CAST(10^37 AS INT128) AS DECFLOAT(34))`, 35-digit
+/// `..12340`, the INT128 maximum, a NUMERIC(38,1) / (38,2) of 35 digits,
+/// `<35-digit INT128> + CAST(0 AS DECFLOAT(34))` and MAXVALUE of one
+/// beside a DECFLOAT all raise; 34 digits answer, and a 23-digit
+/// INT128 to DECFLOAT(16) rounds). [value_as_dec] rounds such a value,
+/// so the CAST to DECFLOAT and the decimal arithmetic ask this first.
+fn int128_dec_fits(v: &Value) -> Result<(), EvalErr> {
+    match v {
+        Value::Int128(r, _) if r.unsigned_abs() >= 10u128.pow(34) => Err(EvalErr::DecfloatInvalidOperation),
+        _ => Ok(()),
     }
 }
 
@@ -98445,6 +98629,27 @@ fn cvt_dec_to_int64(d: &fire_crab_ods::decfloat::Dec, scale: i32) -> Result<i64,
     i64::try_from(raw).map_err(|_| EvalErr::FloatInvalidOperand)
 }
 
+/// THE COMPARISON OF A DECFLOAT NaN is its comparison type's: CVT2's
+/// compare runs in DECFLOAT(34) when EITHER side is a DECFLOAT(34), and
+/// Decimal128::compare's decQuadToInt32 of the NaN answer is the
+/// context's trapped Invalid - 22000 for any operator (`CAST('NaN' AS
+/// DECFLOAT(34)) > 1`, `IIF(ID = 2, <NaN>, D34) > 1`, a scalar subquery
+/// answering NaN). With no DECFLOAT(34) side it runs in DECFLOAT(16),
+/// whose compare answers 0 for a NaN: a NaN, sNaN or -NaN is EQUAL TO
+/// EVERYTHING - `=`, `<=`, `>=` TRUE, `<`, `>`, `<>` FALSE, never a
+/// raise. Measured on 2182 over a DECFLOAT(16) NaN against an INTEGER
+/// literal and column, a BIGINT, an INT128, a NUMERIC, a DOUBLE, a text
+/// '1', another DECFLOAT(16) and itself (`IIF(A > 1, ..)` F, `A = 1` T,
+/// `1 >= A` T, `WHERE A = 5` / `A <= 5` / `A BETWEEN 0 AND 5` the row,
+/// `A < 5` / `A <> 5` none), and against a DECFLOAT(34) column or cast
+/// 22000. `Err` for the raise, else the (always Equal) order.
+fn dec_nan_cmp(x: &Value, y: &Value) -> Result<std::cmp::Ordering, EvalErr> {
+    if matches!(x, Value::DecFloat34(_)) || matches!(y, Value::DecFloat34(_)) {
+        return Err(EvalErr::DecfloatInvalidOperation);
+    }
+    Ok(std::cmp::Ordering::Equal)
+}
+
 /// A DECFLOAT value holding a NaN (either width).
 fn dec_is_nan(v: &Value) -> bool {
     matches!(dec_of(v), Some(fire_crab_ods::decfloat::Dec::Nan))
@@ -99248,6 +99453,7 @@ impl Expr {
                     SysFn::UuidToChar(_) | SysFn::CharToUuid(_) => Some(ExprType::Text),
                     // the text it reads ([SysFn::BlobNum])
                     SysFn::BlobNum => Some(ExprType::Text),
+                    SysFn::BlobStr(_) => Some(ExprType::Text),
                     SysFn::MaxMin(_) => None,
                     // ASCII_VAL(text) -> SMALLINT (an integer); a wrong-typed
                     // operand refuses (an unpinned conversion).
@@ -100429,6 +100635,8 @@ impl Expr {
                     let promote = |v: &Value| {
                         value_as_dec(v).or_else(|| approx_of(v).and_then(|f| f64_to_dec(f, 17)))
                     };
+                    int128_dec_fits(&va)?;
+                    int128_dec_fits(&vb)?;
                     let da = promote(&va).ok_or(EvalErr::ConversionError(None))?;
                     let db = promote(&vb).ok_or(EvalErr::ConversionError(None))?;
                     let r = match op {
@@ -100910,6 +101118,7 @@ impl Expr {
                             let sig = if *wide { 17 } else { 16 };
                             f64_to_dec(x, sig).ok_or(EvalErr::ConversionError(None))?
                         } else {
+                            int128_dec_fits(&v)?;
                             value_as_dec(&v).ok_or(EvalErr::ConversionError(None))?
                         };
                         if *wide {
@@ -102810,18 +103019,19 @@ impl Expr {
                     }
                     // the first code point of the value moved to UTF8: a
                     // byte carrier's bytes are read AS UTF-8 (the move is a
-                    // copy), a bad lead is 22018; every other set's
+                    // copy), and bytes that are no UTF-8 are the bare
+                    // 22000 *Malformed string* (measured: `UNICODE_VAL(x'FF')`,
+                    // `(x'41FF')`, `(ASCII_CHAR(233))` under NONE); every other set's
                     // characters are already the code points
                     SysFn::UnicodeVal(cs) => {
                         let t = fn_text(&vs[0]);
                         if *cs != NO_CS && fire_crab_ods::intl::byte_carrier(*cs) {
                             let b = text_bytes_in(Some(*cs), &t);
+                            // the move validates the WHOLE value, not its
+                            // lead (`UNICODE_VAL(x'41FF')` is Malformed too)
                             let lead = match std::str::from_utf8(&b) {
                                 Ok(x) => x.chars().next(),
-                                Err(e) if e.valid_up_to() > 0 => {
-                                    std::str::from_utf8(&b[..e.valid_up_to()]).ok().and_then(|x| x.chars().next())
-                                }
-                                Err(_) => return Err(EvalErr::TransliterationFailed),
+                                Err(_) => return Err(EvalErr::Bare(GDS_MALFORMED_STRING, vec![])),
                             };
                             Value::Int(lead.map_or(0, |c| c as i64))
                         } else {
@@ -102876,6 +103086,14 @@ impl Expr {
                     }
                     // a blob read as a number: never its content
                     SysFn::BlobNum => return Err(EvalErr::ConversionError(Some("BLOB".into()))),
+                    SysFn::BlobStr(cs) => {
+                        if let Value::Text(t) = &vs[0] {
+                            if text_bytes_in(Some(*cs), t).len() > 32767 {
+                                return Err(EvalErr::Bare(GDS_ARITH_EXCEPT, vec![ErrArg::Gds(GDS_BLOB_TRUNCATION)]));
+                            }
+                        }
+                        vs.swap_remove(0)
+                    }
                     // lowered at resolution
                     SysFn::MaxMin(_) => return Err(EvalErr::Unsupported),
                     SysFn::BitLength => match vs[0] {
@@ -127312,6 +127530,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 | SysFn::UuidToChar(_)
                 | SysFn::CharToUuid(_)
                 | SysFn::BlobNum
+                | SysFn::BlobStr(_)
                 | SysFn::MaxMin(_) => false,
             }
         }
@@ -154661,7 +154880,7 @@ mod builtins_round {
     #[test]
     fn maxvalue_lowering() {
         let args = vec![RawExpr::Col("A".into()), RawExpr::Int(5), RawExpr::Col("B".into())];
-        match lower_maxmin(MaxMinKind::MaxValue, &args) {
+        match lower_maxmin(MaxMinKind::MaxValue, &args, &[]) {
             Some(RawExpr::Case(arms, Some(els), false)) => {
                 assert_eq!(arms.len(), 2 + 2);
                 assert!(matches!(&arms[0].0, RawCond::IsNull(_)));
@@ -154670,8 +154889,36 @@ mod builtins_round {
             }
             _ => panic!("MAXVALUE did not lower to a CASE"),
         }
-        assert!(lower_maxmin(MaxMinKind::Least, &[RawExpr::Param(0), RawExpr::Int(1)]).is_none());
-        assert!(lower_maxmin(MaxMinKind::MinValue, &[]).is_none());
+        assert!(lower_maxmin(MaxMinKind::Least, &[RawExpr::Param(0), RawExpr::Int(1)], &[]).is_none());
+        assert!(lower_maxmin(MaxMinKind::MinValue, &[], &[]).is_none());
+    }
+
+    /// A DECFLOAT NaN compares by its comparison type ([dec_nan_cmp]), an
+    /// INT128 past 34 digits has no DECFLOAT(34) ([int128_dec_fits]), and
+    /// MAXVALUE's lowering guards a later DECFLOAT argument ([lower_maxmin]).
+    #[test]
+    fn decfloat_nan_law() {
+        use fire_crab_ods::decfloat::{dec_to_bits, dec_to_dec64_bits, Dec};
+        let nan16 = Value::DecFloat16(dec_to_dec64_bits(&Dec::Nan));
+        let nan34 = Value::DecFloat34(dec_to_bits(&Dec::Nan));
+        // a DECFLOAT(16) comparison finds a NaN equal to anything ...
+        assert_eq!(dec_nan_cmp(&nan16, &Value::Int(1)), Ok(std::cmp::Ordering::Equal));
+        assert_eq!(dec_nan_cmp(&Value::Double(2.5), &nan16), Ok(std::cmp::Ordering::Equal));
+        // ... a DECFLOAT(34) side makes it the trapped Invalid
+        assert_eq!(dec_nan_cmp(&nan34, &Value::Int(1)), Err(EvalErr::DecfloatInvalidOperation));
+        assert_eq!(dec_nan_cmp(&nan16, &nan34), Err(EvalErr::DecfloatInvalidOperation));
+        // an INT128 past 34 digits has no decimal128
+        assert!(int128_dec_fits(&Value::Int128(10i128.pow(34) - 1, 0)).is_ok());
+        assert_eq!(int128_dec_fits(&Value::Int128(-(10i128.pow(34)), 0)), Err(EvalErr::DecfloatInvalidOperation));
+        assert!(int128_dec_fits(&Value::Int(i64::MAX)).is_ok());
+        // the lowering guards a DECFLOAT argument after the first against a NaN
+        let args = [RawExpr::Int(1), RawExpr::Col("A".into()), RawExpr::Int(2)];
+        let guarded = |e: &RawExpr| {
+            let RawExpr::Case(arms, ..) = e else { return 0 };
+            arms.iter().filter(|(c, _)| matches!(c, RawCond::And(v) if v.iter().any(|x| matches!(x, RawCond::Not(_))))).count()
+        };
+        assert_eq!(guarded(&lower_maxmin(MaxMinKind::MaxValue, &args, &[false, true, false]).unwrap()), 1);
+        assert_eq!(guarded(&lower_maxmin(MaxMinKind::MaxValue, &args, &[true, false, false]).unwrap()), 0);
     }
 
     /// A nested MAXVALUE multiplies the weight [maxmin_weight] budgets:
