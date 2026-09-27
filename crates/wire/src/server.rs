@@ -44911,6 +44911,46 @@ fn merged_coalesce(merged: &[(usize, usize)], li: usize) -> Option<Expr> {
     Some(Expr::Coalesce(std::iter::once(Expr::Col(li)).chain(partners).collect()))
 }
 
+/// The describe of a merged column's COALESCE ([merged_coalesce]) over
+/// the combined row's descriptors: the COMMON type of the left column
+/// and its partners, as the engine's CoalesceNode makes it
+/// (DataTypeUtil::makeFromList), never the left column's alone -
+/// measured on 2182, `SELECT * FROM (SELECT * FROM IB FULL JOIN DD USING
+/// (K)) D` over an INTEGER K and a DOUBLE K describes 480 DOUBLE and
+/// answers the right-only 2.5 and 7.4 (SUM 12.9; the left type read them
+/// 0), an INTEGER beside a NUMERIC(10,2) is 580 INT64 scale -2 even over
+/// an inner step (1.00), a VARCHAR(5) beside a VARCHAR(20) and an INTEGER
+/// beside a BIGINT widen (no 22001 / 22003 at fetch). A pair with no
+/// common type is Err(Some): a DATE beside a TIMESTAMP is the prepare's
+/// HY004 -104 "Datatypes are not comparable in expression COALESCE",
+/// under a star, as a bare item and inside a derived table or CTE alike.
+/// Err(None): a mix this server cannot type (the caller refuses).
+fn merged_col(coalesce: Expr, name: &str, comb_descs: &[Descriptor]) -> Result<ProjCol, Option<EvalErr>> {
+    if let Expr::Coalesce(args) = &coalesce {
+        let fams: Option<Vec<Fam>> = args
+            .iter()
+            .map(|a| match a {
+                Expr::Col(i) => comb_descs.get(*i).and_then(fam_of_desc),
+                _ => None,
+            })
+            .collect();
+        if fams.is_some_and(|f| incomparable(&f)) {
+            return Err(Some(EvalErr::Status(vec![
+                StatusItem::Gds(GDS_SQLERR),
+                StatusItem::Num(-104),
+                StatusItem::Gds(GDS_DSQL_DATATYPES_NOT_COMPARABLE),
+                StatusItem::Str(String::new()),
+                StatusItem::Str("COALESCE".to_string()),
+            ])));
+        }
+    }
+    let mut pc = build_expr_col_from(coalesce, name, comb_descs).ok_or(None)?;
+    pc.fname = Some("COALESCE".to_string());
+    pc.relation = None;
+    pc.rel_alias = None;
+    Ok(pc)
+}
+
 /// Resolve a (possibly qualified) column name against the two join sides
 /// to (combined row index, descriptor, canonical column name). A bare
 /// name must be unambiguous - present on exactly one side.
@@ -47047,6 +47087,7 @@ fn plan_join_bound(
     let mut cols = Vec::new();
     match proj {
         Proj::Star => {
+            let (_, star_descs) = combined_view(&sides);
             // all left columns then all right, each in declared order
             for side in &sides {
                 for rc in &side.columns {
@@ -47069,6 +47110,17 @@ fn plan_join_bound(
                     // other's value (probed on `NATURAL RIGHT JOIN`).
                     let expr = merged_coalesce(&merged, idx);
                     let is_merged = expr.is_some();
+                    // ...typed as the COALESCE it is ([merged_col])
+                    if let Some(co) = expr.clone() {
+                        let mut pc = match merged_col(co, &rc.name, &star_descs) {
+                            Ok(pc) => pc,
+                            Err(Some(e)) => return Some(Plan::RefusedEval(e)),
+                            Err(None) => return None,
+                        };
+                        pc.field_id = idx;
+                        cols.push(pc);
+                        continue;
+                    }
                     cols.push(ProjCol {
                         name: rc.name.clone(),
                         // EVERY STARRED COLUMN HAS A NAME: a field is
@@ -47165,22 +47217,14 @@ fn plan_join_bound(
                     _ => None,
                 };
                 if let Some((side, rc, coalesce)) = bare_merged {
-                    let d = side.descs.get(rc.field_id as usize)?;
-                    let (wire, sql_type, length, scale, sub_type) = wire_for(d);
-                    cols.push(ProjCol {
-                        name: alias.clone().unwrap_or_else(|| rc.name.clone()),
-                        fname: Some("COALESCE".to_string()),
-                        relation: None,
-                        rel_alias: None,
-                        field_id: side.offset + rc.field_id as usize,
-                        wire,
-                        sql_type: nullable(sql_type),
-                        length,
-                        oct_length: length,
-                        scale,
-                        sub_type,
-                        expr: Some(coalesce),
-                    });
+                    let out = alias.clone().unwrap_or_else(|| rc.name.clone());
+                    let mut pc = match merged_col(coalesce, &out, &comb_descs) {
+                        Ok(pc) => pc,
+                        Err(Some(e)) => return Some(Plan::RefusedEval(e)),
+                        Err(None) => return None,
+                    };
+                    pc.field_id = side.offset + rc.field_id as usize;
+                    cols.push(pc);
                     continue;
                 }
                 let (idx, d, colname) = resolve_join_col(&sides, name)?;
@@ -51864,6 +51908,22 @@ enum Fam {
     Null,
 }
 
+/// [Fam] of a stored descriptor.
+fn fam_of_desc(d: &Descriptor) -> Option<Fam> {
+    Some(match d.dtype {
+        1..=3 => Fam::Text,
+        17 => Fam::Blob,
+        7..=13 | 19 | 22..=24 => Fam::Num,
+        14 => Fam::Date,
+        15 => Fam::Time,
+        16 => Fam::Timestamp,
+        21 => Fam::Bool,
+        25 | 27 => Fam::TimeTz,
+        26 | 28 => Fam::TimestampTz,
+        _ => return None,
+    })
+}
+
 impl QualCtx<'_> {
     /// [Fam] of `e` at the level under judgement: a literal, a typed
     /// literal, a context value, a CAST, a column of the level's
@@ -51935,18 +51995,7 @@ impl QualCtx<'_> {
         let meta = self.db.relation_meta(&rel)?;
         let fid = find_col(&meta.columns, &col)?.field_id as usize;
         let d = meta.formats.last()?.1.get(fid)?;
-        Some(match d.dtype {
-            1..=3 => Fam::Text,
-            17 => Fam::Blob,
-            7..=13 | 19 | 22..=24 => Fam::Num,
-            14 => Fam::Date,
-            15 => Fam::Time,
-            16 => Fam::Timestamp,
-            21 => Fam::Bool,
-            25 | 27 => Fam::TimeTz,
-            26 | 28 => Fam::TimestampTz,
-            _ => return None,
-        })
+        fam_of_desc(d)
     }
 
     /// The refusals the engine's DESCRIBE of a select list raises, after
@@ -61777,6 +61826,25 @@ fn plan_query_inner_at_body(
             let self_referencing = ctes.len() == 1
                 && split_recursive_body(&ctes[0].1.source)
                     .is_some_and(|(_, rec)| bound_refs(&rec, &ctes[0].0) > 0);
+            // A SELF-REFERENCING CTE BESIDE OTHERS is not materialised:
+            // only the one-CTE WITH binds its accumulated rows (below),
+            // so beside a second CTE the recursive one was spliced as a
+            // plain derived table whose self-reference then resolved as
+            // a TABLE - a same-named base table's rows, silently, or the
+            // 42S02 "Table unknown". Measured on 2182: `WITH RECURSIVE R
+            // (N) AS (<1..5>), S AS (SELECT N * 2 M FROM R) SELECT SUM(M)
+            // FROM S` is 30 (the CTE shadows the table; this answered 12
+            // over a base R of 1, 2), `.. S AS (SELECT N FROM R WHERE N >
+            // 2)` is 3, 4, 5 INTEGER. Refused, never misread, while such
+            // a CTE is read at all (an unread one plans nothing).
+            if recursive
+                && ctes.len() > 1
+                && ctes.iter().zip(&used).any(|((n, def), u)| {
+                    *u && split_recursive_body(&def.source).is_some_and(|(_, rec)| bound_refs(&rec, n) > 0)
+                })
+            {
+                return Some({ if trace { eprintln!("[srv] recursive CTE refused: a self-referencing CTE beside another CTE"); } Plan::Refused });
+            }
             if recursive && self_referencing {
                 if ctes.len() != 1 {
                     return Some({ if trace { eprintln!("[srv] recursive CTE refused: a recursive WITH may declare one CTE here"); } Plan::Refused }); // one recursive CTE at a time

@@ -58,11 +58,18 @@
 #      unknown at it; OFFSET / FETCH answer); a derived table's body may
 #      be a parenthesised query or union; `IN ((SELECT ..))`, `EXISTS
 #      ((..))` and `= ANY ((..))` are the subquery, not a one-item list.
+#  15. A merged column is typed as the COALESCE it is: the common type
+#      of both sides (an INTEGER beside a DOUBLE is DOUBLE, beside a
+#      NUMERIC(10,2) scale -2, a VARCHAR(5) beside a VARCHAR(20) is 20
+#      wide), and a DATE beside a TIMESTAMP is the prepare's HY004 -104
+#      "Datatypes are not comparable in expression COALESCE". A recursive
+#      CTE beside another CTE is refused while read (it read a same-named
+#      base table's rows).
 #
 # Section 12 RECORDS what stays refused (or answers with another error),
 # each cell checked to still refuse. `CONTROL` cells agreed before this
 # gate; every other cell was red on master db71a0e (sections 13 and 14:
-# on the round-4 integration binary cff0432).
+# on the round-4 integration binary cff0432; section 15 on 466e374).
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
 ISQL="${ISQL:-isql}"
@@ -120,6 +127,29 @@ insert into qq values (3, 'q3', 30);
 insert into qq values (null, 'qn', 40);
 insert into rs values (3, 'r3');
 insert into rs values (5, 'r5');
+create table ib (k integer, v varchar(5));
+create table dd (k double precision, w varchar(5));
+create table bb (k bigint, w varchar(5));
+create table nk (k numeric(10,2), z varchar(5));
+create table da (k date, v varchar(5));
+create table ts (k timestamp, w varchar(5));
+create table a5 (s varchar(5) character set utf8, x integer);
+create table b20 (s varchar(20) character set utf8, y integer);
+create table r (n integer, s varchar(10) character set utf8);
+insert into ib values (1, 'i1');
+insert into ib values (2, 'i2');
+insert into dd values (1, 'd1');
+insert into dd values (2.5, 'd25');
+insert into dd values (7.4, 'd74');
+insert into bb values (9000000000, 'b9');
+insert into nk values (1.00, 'n1');
+insert into da values (date '2020-01-01', 'a');
+insert into ts values (timestamp '2020-01-01 00:00:00', 't0');
+insert into ts values (timestamp '2021-05-05 13:45:00', 't1');
+insert into a5 values ('ab', 1);
+insert into b20 values ('Ærø ünï longer', 30);
+insert into r values (1, 'é');
+insert into r values (2, 'ß');
 COMMIT;
 SQL
 } | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/qshape-build.log 2>&1
@@ -502,11 +532,30 @@ pin  "14 EXISTS ((SELECT ..))" "select * from pp where exists ((select 1 from qq
 pin  "14 = ANY ((SELECT ..))" "select * from pp where id = any ((select k from qq)) order by 1;" "ID K V|1 1 p1|3 <null> p3"
 pin  "14 > ALL ((SELECT ..))" "select * from pp where id > all ((select k from qq where k < 3)) order by 1;" "ID K V|2 2 p2|3 <null> p3"
 pin  "14 CONTROL IN of a parenthesised subquery beside a value is a list" "select * from pp where id in ((select max(k) from qq), 2) order by 1;" "ID K V|2 2 p2|3 <null> p3"
+echo "--- 15. a merged column is typed as its COALESCE: the common type of both sides; a recursive CTE beside another"
+pin  "15 a right-only DOUBLE through a derived table over FULL USING" "select * from (select * from ib full join dd using (k)) d order by 2;" "K V W|2.500000000000000 <null> d25|7.400000000000000 <null> d74|1.000000000000000 i1 d1|2.000000000000000 i2 <null>"
+pin  "15 ...its SUM" "select sum(k) from (select * from ib full join dd using (k)) d;" "SUM|12.90000000000000"
+pin  "15 ...a CTE over RIGHT USING" "with c as (select * from ib right join dd using (k)) select k, w from c order by 2;" "K W|1.000000000000000 d1|2.500000000000000 d25|7.400000000000000 d74"
+pin  "15 ...a bare merged name over NATURAL FULL" "select k, v, w from ib natural full join dd order by 2;" "K V W|2.500000000000000 <null> d25|7.400000000000000 <null> d74|1.000000000000000 i1 d1|2.000000000000000 i2 <null>"
+dpin "15 ...described DOUBLE under a star" "select * from ib full join dd using (k) where 1=0;" "01: sqltype: 480 DOUBLE Nullable scale: 0 subtype: 0 len: 8|02: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 5 charset: 0 SYSTEM.NONE|03: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 5 charset: 0 SYSTEM.NONE"
+pin  "15 a BIGINT partner widens (no integer overflow)" "select * from (select * from ib full join bb using (k)) d order by 1;" "K V W|1 i1 <null>|2 i2 <null>|9000000000 <null> b9"
+pin  "15 a VARCHAR(20) partner widens (no truncation)" "select * from (select * from a5 full join b20 using (s)) d order by 1;" "S X Y|ab 1 <null>|Ærø ünï longer <null> 30"
+pin  "15 INT USING NUMERIC(10,2) over an INNER step is scale -2" "select * from (select * from ib join nk using (k)) d;" "K V Z|1.00 i1 n1"
+npin "15 ...described INT64 scale -2, COALESCE" "select k from ib join nk using (k) where 1=0;" "01: sqltype: 580 INT64 Nullable scale: -2 subtype: 1 len: 8|: name: COALESCE alias: K|: table: schema: owner: "
+pin  "15 DATE beside TIMESTAMP has no common type: HY004" "select * from (select * from da full join ts using (k)) d order by 2;" "Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE"
+pin  "15 ...the bare merged name" "select k from da full join ts using (k);" "Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE"
+pin  "15 ...NATURAL under a star" "select * from da natural full join ts;" "Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE"
+refused "15 a later CTE reading a recursive one that shadows a table" "with recursive r (n) as (select 1 from rdb\$database union all select n + 1 from r where n < 5), s as (select n * 2 m from r) select sum(m) from s;"
+refused "15 ...filtering it" "with recursive r (n) as (select 1 from rdb\$database union all select n + 1 from r where n < 5), s as (select n from r where n > 2) select * from s order by 1;"
+refused "15 CONTROL ...with no table of its name, refused before too" "with recursive q (n) as (select 1 from rdb\$database union all select n + 1 from q where n < 5), s as (select n from q) select count(*) from s;"
+refused "15 ...read directly, an unread sibling beside it" "with recursive r (n) as (select 1 from rdb\$database union all select n + 1 from r where n < 4), s as (select 1 x from rdb\$database) select * from r order by 1;"
+pin  "15 CONTROL the recursive CTE alone" "with recursive r (n) as (select 1 from rdb\$database union all select n + 1 from r where n < 5) select sum(n) from r;" "SUM|15"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-qshape-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 282 ]; then echo "FAIL only $ran checks ran (floor 282)"; fail=1; fi
+if [ "$ran" -lt 299 ]; then echo "FAIL only $ran checks ran (floor 299)"; fail=1; fi
 exit $fail
