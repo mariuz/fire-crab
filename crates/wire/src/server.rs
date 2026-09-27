@@ -36156,6 +36156,18 @@ fn insert_literal_error(d: &Descriptor, v: &InsVal) -> Option<EvalErr> {
             let opens = n.bytes().next().is_some_and(|c| c.is_ascii_digit());
             (!opens || n.bytes().all(|c| c.is_ascii_digit() || c == b':')).then(|| EvalErr::ConversionError(Some(t.clone())))
         }
+        // an English-month TIMESTAMP of a date and a plain time the
+        // grammar refuses (measured on 2182: `'1-JAN-0000 99:00'` is 22018,
+        // judged on its time before its year - [string_to_datetime_why])
+        InsVal::Str(t)
+            if d.dtype == dtype::TIMESTAMP
+                && matches!(t.split_whitespace().collect::<Vec<_>>().as_slice(), [day, time]
+                    if day.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'/' | b'.'))
+                        && time.bytes().all(|c| c.is_ascii_digit() || matches!(c, b':' | b'.')))
+                && string_to_datetime_why(t, ExpectTemporal::Timestamp, session_now(), true) == Err(CvtFail::Conv) =>
+        {
+            conv(t.clone())
+        }
         // a TIMESTAMP with no digit, one that opens with a time (`'10:00
         // AM'`, `'10:00:00 +03:00'`), or a plain one of at most a date and
         // a time with no zone-like part
@@ -49532,8 +49544,10 @@ struct QualCtx<'a> {
     /// engine raises only when it TYPES the node - after every pass and
     /// judgement ([QualCtx::conditional_verdict]) - the first met
     deferred: std::cell::RefCell<Option<EvalErr>>,
-    /// ...and one whose typing point this reader cannot place (inside an
-    /// aggregate, which types it when the aggregate is typed, or in a
+    /// ...and one INSIDE an aggregate, at its offset: typed when the
+    /// aggregate is, with the SUM / AVG law ([QualCtx::agg_arg_verdict])
+    in_agg: std::cell::RefCell<Vec<(usize, EvalErr)>>,
+    /// ...and one whose typing point this reader cannot place (in a
     /// nested query): the diagnosis stands aside
     unsure: std::cell::Cell<bool>,
 }
@@ -49569,6 +49583,7 @@ fn first_unresolved_qualifier(sql: &str, dbo: &Option<Database>) -> Option<EvalE
         check_top,
         bare: false,
         deferred: std::cell::RefCell::new(None),
+        in_agg: std::cell::RefCell::new(Vec::new()),
         unsure: std::cell::Cell::new(false),
     };
     // the row-locking / optimizer tail is not a clause of the query, and
@@ -50335,7 +50350,18 @@ impl QualCtx<'_> {
     fn agg_arg_verdict(&self, texts: &[&str], scopes: &[Vec<ScopeQual>], windowed: bool) -> Option<EvalErr> {
         for text in texts {
             let (toks, _) = agg_tokens(text)?;
+            // the text's place in the statement, for the conditionals
+            // met inside its aggregates ([QualCtx::in_agg])
+            let base = (text.as_ptr() as usize).checked_sub(self.sql.as_ptr() as usize).filter(|b| *b <= self.sql.len());
             for t in &toks {
+                if t.is_agg() && t.windowed == windowed {
+                    if let Some(base) = base {
+                        let inner = self.in_agg.borrow();
+                        if let Some((_, e)) = inner.iter().find(|(at, _)| base + t.start < *at && *at < base + t.close) {
+                            return Some(e.clone());
+                        }
+                    }
+                }
                 let Some(name @ ("SUM" | "AVG")) = t.name() else { continue };
                 if !t.call || t.windowed != windowed {
                     continue;
@@ -50926,6 +50952,22 @@ impl QualCtx<'_> {
                 return self.window(&rest[1..rest.len() - 1], scopes);
             }
         }
+        // `agg(args) FILTER (WHERE cond)`: the call, then the condition,
+        // whose searched CASE / IIF is typed late like one outside the
+        // aggregate ([QualCtx::conditional_verdict])
+        if let Some(f) = find_word_depth0(up, "FILTER", 0) {
+            let rest = text[f + "FILTER".len()..].trim_start();
+            if rest.starts_with('(') && matching_paren(rest.as_bytes(), 0) == Some(rest.len() - 1) {
+                let inner = rest[1..rest.len() - 1].trim_start();
+                if self.up_of(inner).starts_with("WHERE") && word_end("WHERE", self.off_of(inner) - self.off_of(text)) {
+                    match self.operand(&text[..f], scopes) {
+                        QualScan::Clean => {}
+                        other => return other,
+                    }
+                    return self.boolean(&inner["WHERE".len()..], scopes);
+                }
+            }
+        }
         if let Some(open) = up.find('(') {
             let head = up[..open].trim_end();
             let is_name = !head.is_empty()
@@ -51050,8 +51092,13 @@ impl QualCtx<'_> {
     /// AND IIF(..) = 1`), after a SUM's own error (`IIF(..), SUM(V)` names
     /// SUM) and the grouping law (`SELECT IIF(..) .. GROUP BY ID` is
     /// "Invalid expression"), alone the HY004 (`WHERE IIF(ID = 1, D, 1) =
-    /// 1`), and within an aggregate when the aggregate is typed
-    /// (`SUM(IIF(..))`). The late one is kept for the end of the scan,
+    /// 1`), and within an aggregate when the aggregate is typed - as its
+    /// clause is remapped, where a SUM of a non-number is judged
+    /// ([QualCtx::in_agg]; measured: `SUM(IIF(..)) .. GROUP BY NOPE` and
+    /// `.. ORDER BY NOPE` are the -206, `SELECT ID, SUM(IIF(..)) FROM T1`
+    /// and `SUM(IIF(..)) .. HAVING NOPE = 1` the HY004, `SUM(IIF(..)),
+    /// SUM(NAME)` the HY004 and `SUM(NAME), SUM(IIF(..))` the SUM). The
+    /// late one outside an aggregate is kept for the end of the scan,
     /// where no other law fired ([QualCtx::deferred]).
     fn conditional_verdict(&self, name: &str, values: &[&str], scopes: &[Vec<ScopeQual>], late: Option<usize>) -> QualScan {
         if !self.bare {
@@ -51059,11 +51106,21 @@ impl QualCtx<'_> {
         }
         let Some(e) = self.hy004_verdict(name, values, scopes) else { return QualScan::Clean };
         let Some(at) = late else { return QualScan::Err(e) };
+        // inside the aggregate's own parenthesis: a FILTER's condition is
+        // typed with the query's other late nodes (measured: `SELECT ID,
+        // COUNT(*) FILTER (WHERE IIF(..) = 1) FROM T1` is "Invalid
+        // expression", `SELECT ID, SUM(IIF(..)) FROM T1` the HY004)
+        let b = self.up.as_bytes();
         let in_agg = agg_tokens(self.sql).is_none_or(|(toks, _)| {
-            toks.iter().any(|t| t.is_agg() && t.start < at && at < t.close)
+            toks.iter().any(|t| {
+                let open = t.end + b[t.end..].iter().take_while(|c| c.is_ascii_whitespace()).count();
+                t.is_agg() && t.start < at && at < matching_paren(b, open).unwrap_or(t.close)
+            })
         });
-        if scopes.len() > 1 || in_agg {
+        if scopes.len() > 1 {
             self.unsure.set(true);
+        } else if in_agg {
+            self.in_agg.borrow_mut().push((at, e));
         } else if self.deferred.borrow().is_none() {
             *self.deferred.borrow_mut() = Some(e);
         }
@@ -52528,6 +52585,7 @@ fn diagnose_refusal_inner(sql: &str, dbo: &Option<Database>) -> Option<EvalErr> 
         check_top: false,
         bare: true,
         deferred: std::cell::RefCell::new(None),
+        in_agg: std::cell::RefCell::new(Vec::new()),
         unsure: std::cell::Cell::new(false),
     };
     let scan = match head.as_str() {
@@ -52540,6 +52598,9 @@ fn diagnose_refusal_inner(sql: &str, dbo: &Option<Database>) -> Option<EvalErr> 
         return None;
     }
     let deferred = ctx.deferred.borrow_mut().take();
+    // a conditional inside an aggregate that no remap typed (an
+    // aggregate this reader did not judge): its point is unplaced
+    let agg_pending = !ctx.in_agg.borrow().is_empty();
     match scan {
         QualScan::Hit { at, len, name } => {
             let (line, col) = text_line_col(sql, &sql[at..at + len])?;
@@ -52574,6 +52635,7 @@ fn diagnose_refusal_inner(sql: &str, dbo: &Option<Database>) -> Option<EvalErr> 
             // two comes first is not measured
             match (ctx.agg_arg_verdict(&bodies, &[level], true), deferred) {
                 (Some(_), Some(_)) => None,
+                (None, _) if agg_pending => None,
                 (e, d) => e.or(d),
             }
         }
@@ -52600,6 +52662,7 @@ fn insert_verdict(sql: &str, body: &str, dbo: &Option<Database>) -> Option<EvalE
         check_top: false,
         bare: true,
         deferred: std::cell::RefCell::new(None),
+        in_agg: std::cell::RefCell::new(Vec::new()),
         unsure: std::cell::Cell::new(false),
     };
     let ub = ctx.up_of(body);
@@ -97508,6 +97571,12 @@ fn string_to_datetime_why(
     }
 
     let date_days: i32;
+    // A year outside 1..=9999 is 22008, judged before the day and the
+    // month's lower bound but AFTER the time part: the engine checks a
+    // timestamp's time components first (measured on 2182:
+    // '0000-01-01 25:00', '0000-01-01 10:60', '0000-01-01 10' and
+    // '0000-02-30 25:00' are 22018; '0000-01-01 10:00:00:00' is 22008).
+    let mut out_of_range = false;
     if expect != ExpectTemporal::Time {
         // figure out what format the user typed the date in
         let (py, pm, pd) = if description[0] >= 3 {
@@ -97550,14 +97619,16 @@ fn string_to_datetime_why(
             return Err(CvtFail::Conv);
         }
         if !(1..=9999).contains(&year) {
-            return Err(CvtFail::Range);
-        }
-        if month == 0 || day == 0 {
-            return Err(CvtFail::Conv);
-        }
-        date_days = days_of_civil(year, month, day);
-        if civil_of(date_days) != (year, month, day) {
-            return Err(CvtFail::Conv);
+            out_of_range = true;
+            date_days = 0;
+        } else {
+            if month == 0 || day == 0 {
+                return Err(CvtFail::Conv);
+            }
+            date_days = days_of_civil(year, month, day);
+            if civil_of(date_days) != (year, month, day) {
+                return Err(CvtFail::Conv);
+            }
         }
     } else {
         date_days = 0;
@@ -97589,6 +97660,9 @@ fn string_to_datetime_why(
         time_units = ((h * 60 + m) * 60 + sec) * 10000 + thou;
     } else if expect == ExpectTemporal::Time {
         return Err(CvtFail::Conv);
+    }
+    if out_of_range {
+        return Err(CvtFail::Range);
     }
 
     Ok((date_days, time_units))
@@ -138598,6 +138672,29 @@ mod tests {
         assert_eq!(why("0000-01-01 10:00", ExpectTemporal::Date), Some(CvtFail::Conv));
         assert_eq!(why("2020-02-30", ExpectTemporal::Date), Some(CvtFail::Conv));
         assert_eq!(why("2020-01-01", ExpectTemporal::Date), None);
+    }
+
+    /// ...but a timestamp's TIME part is judged before its year (measured
+    /// on 2182: a year-0 timestamp with a bad time is 22018).
+    #[test]
+    fn a_year_zero_timestamp_judges_its_time_first() {
+        let now = (0, 0);
+        let why = |s: &str| string_to_datetime_why(s, ExpectTemporal::Timestamp, now, true).err();
+        for bad in [
+            "0000-01-01 25:00:00",
+            "0000-01-01 10:60:00",
+            "0000-01-01 10:00:61",
+            "0000-01-01 24:00",
+            "0000-01-01 10:00:00.12345",
+            "0000-01-01 10",
+            "0000-02-30 25:00",
+            "1-JAN-0000 99:00",
+        ] {
+            assert_eq!(why(bad), Some(CvtFail::Conv), "{bad}");
+        }
+        assert_eq!(why("0000-01-01 10:00:00:00"), Some(CvtFail::Range));
+        assert_eq!(why("0000-02-30 10:00"), Some(CvtFail::Range));
+        assert_eq!(why("1-JAN-0000 10:00"), Some(CvtFail::Range));
     }
 
     /// A bare `*` beside another select item is the parser's Token

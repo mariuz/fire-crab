@@ -75,8 +75,10 @@
 #      (the select list's before its judgement and the HAVING, the ORDER
 #      BY's before its own, the HAVING's after its -206); COALESCE /
 #      DECODE / a simple CASE / MAXVALUE's HY004 as they are passed, a
-#      searched CASE / IIF's once typed; two FROM items under one alias;
-#      a year 0 date is 22008.
+#      searched CASE / IIF's once typed - inside an aggregate as the
+#      aggregate's clause is remapped, beside its SUM / AVG law, and in a
+#      FILTER late; two FROM items under one alias; a year 0 date is
+#      22008, but a timestamp's time part is judged first (22018).
 #
 # RECORDED, not fixed (section 10 - refusals, never a wrong answer): a
 # window over an aggregate, COALESCE of a DATE and a text, DATEADD
@@ -626,7 +628,34 @@ pin '12 ...after the grouping law' 'SELECT IIF(ID = 1, D, 1) FROM T1 GROUP BY ID
 pin '12 ...after a SUM'\''s own error' 'SELECT IIF(ID = 1, D, 1), SUM(V) FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for SUM in dialect 3 must be numeric'
 pin '12 ...after a -206 left of it' 'SELECT ID FROM T1 WHERE NOPE = 1 AND IIF(ID = 1, D, 1) = 1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 25'
 pin '12 ...alone the HY004 CASE' 'SELECT ID FROM T1 WHERE IIF(ID = 1, D, 1) = 1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
-bare '12 REFUSED BARE: ...inside an aggregate: typed with it (not placed)' 'SELECT SUM(IIF(ID = 1, D, 1)) FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 ...inside an aggregate: typed as the aggregate'\''s clause is remapped' 'SELECT SUM(IIF(ID = 1, D, 1)) FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 ...inside MAX' 'SELECT MAX(IIF(ID = 1, D, 1)) FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 ...inside COUNT' 'SELECT COUNT(IIF(ID = 1, D, 1)) FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 ...a searched CASE inside SUM' 'SELECT SUM(CASE WHEN ID = 1 THEN D ELSE 1 END) FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 ...inside MAX over a GROUP BY' 'SELECT V, MAX(CASE WHEN ID = 1 THEN D ELSE 1 END) FROM T1 GROUP BY V;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 ...in an aggregate'\''s FILTER' 'SELECT COUNT(*) FILTER (WHERE IIF(ID = 1, D, 1) = 1) FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 ...a FILTER'\''s is typed late, after the grouping law' 'SELECT ID, COUNT(*) FILTER (WHERE IIF(ID = 1, D, 1) = 1) FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)'
+pin '12 ...inside an aggregate, after a GROUP BY -206' 'SELECT SUM(IIF(ID = 1, D, 1)) FROM T1 GROUP BY NOPE;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 48'
+pin '12 ...after an ORDER BY -206' 'SELECT SUM(IIF(ID = 1, D, 1)) FROM T1 ORDER BY NOPE;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 48'
+pin '12 ...before the select list'\''s judgement' 'SELECT ID, SUM(IIF(ID = 1, D, 1)) FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 ...before a HAVING'\''s -206' 'SELECT SUM(IIF(ID = 1, D, 1)) FROM T1 HAVING NOPE = 1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 ...before a later SUM'\''s own error' 'SELECT SUM(IIF(ID = 1, D, 1)), SUM(V) FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 ...after an earlier SUM'\''s own error' 'SELECT SUM(V), SUM(IIF(ID = 1, D, 1)) FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for SUM in dialect 3 must be numeric'
+pin '12 ...before a HAVING'\''s SUM' 'SELECT SUM(IIF(ID = 1, D, 1)) FROM T1 GROUP BY ID HAVING SUM(V) > 0;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 ...in an ORDER BY aggregate' 'SELECT ID FROM T1 GROUP BY ID ORDER BY MAX(IIF(ID = 1, D, 1));' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 ...under a window' 'SELECT SUM(IIF(ID = 1, D, 1)) OVER () FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 a year 0 TIMESTAMP: its time is judged first: 0000-01-01 25:00:00' 'INSERT INTO LD (TS) VALUES ('\''0000-01-01 25:00:00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "0000-01-01 25:00:00"'
+pin '12 a year 0 TIMESTAMP: its time is judged first: 0000-01-01 10:60:00' 'INSERT INTO LD (TS) VALUES ('\''0000-01-01 10:60:00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "0000-01-01 10:60:00"'
+pin '12 a year 0 TIMESTAMP: its time is judged first: 0000-01-01 10:00:61' 'INSERT INTO LD (TS) VALUES ('\''0000-01-01 10:00:61'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "0000-01-01 10:00:61"'
+pin '12 a year 0 TIMESTAMP: its time is judged first: 0000-01-01 24:00' 'INSERT INTO LD (TS) VALUES ('\''0000-01-01 24:00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "0000-01-01 24:00"'
+pin '12 a year 0 TIMESTAMP: its time is judged first: 0000-01-01 10:00:00.12345' 'INSERT INTO LD (TS) VALUES ('\''0000-01-01 10:00:00.12345'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "0000-01-01 10:00:00.12345"'
+pin '12 a year 0 TIMESTAMP: its time is judged first: 0000-01-01 10' 'INSERT INTO LD (TS) VALUES ('\''0000-01-01 10'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "0000-01-01 10"'
+pin '12 a year 0 TIMESTAMP: its time is judged first: 0000-02-30 25:00' 'INSERT INTO LD (TS) VALUES ('\''0000-02-30 25:00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "0000-02-30 25:00"'
+pin '12 a year 0 TIMESTAMP: its time is judged first: 1-JAN-0000 99:00' 'INSERT INTO LD (TS) VALUES ('\''1-JAN-0000 99:00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "1-JAN-0000 99:00"'
+pin '12 a year 0 TIMESTAMP: its time is judged first: 1-JAN-2020 99:00' 'INSERT INTO LD (TS) VALUES ('\''1-JAN-2020 99:00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "1-JAN-2020 99:00"'
+pin '12 ...not the first column' 'INSERT INTO LD (TS, D) VALUES ('\''0000-01-01 25:00'\'', '\''0000-01-01'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "0000-01-01 25:00"'
+pin '12 ...a time the grammar reads is the range' 'INSERT INTO LD (TS) VALUES ('\''0000-01-01 10:00:00:00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22008|value exceeds the range for valid timestamps'
+pin '12 ...a month name' 'INSERT INTO LD (TS) VALUES ('\''1-JAN-0000 10:00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22008|value exceeds the range for valid timestamps'
 pin '12 a simple CASE is passed like a DECODE' 'SELECT CASE ID WHEN 1 THEN D ELSE 1 END FROM T1 ORDER BY NOPE;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
 pin '12 MAXVALUE at its pass' 'SELECT MAXVALUE(D, 1) FROM T1 ORDER BY NOPE;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression MAXVALUE'
 pin '12 HY004 of a DECODE' 'SELECT DECODE(ID, 1, D, 1) FROM T1 ORDER BY NOPE;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression DECODE'
@@ -648,5 +677,5 @@ CS=UTF8 pin '12 non-ASCII: ...at a character'\''s edge' 'INSERT INTO KL VALUES (
 if grep -aq 'panicked at' "/tmp/fc-serve-errvec-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 else echo "OK   no panic"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 401 ]; then echo "FAIL only $ran checks ran (floor 401)"; fail=1; fi
+if [ "$ran" -lt 428 ]; then echo "FAIL only $ran checks ran (floor 428)"; fail=1; fi
 exit $fail
