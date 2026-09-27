@@ -131078,8 +131078,17 @@ fn after_auth(
                         // its RETURNING: a subquery item that raises (a
                         // 21000) undoes the write (probed: `SET A = 999
                         // ... RETURNING (SELECT NM FROM D)` leaves A at
-                        // 10 and counts 0 rows)
-                        let mark = has_corr.then(|| undo_window_push(&mut database, WindowKind::Nested));
+                        // 10 and counts 0 rows). SO DOES ANY OTHER ITEM
+                        // (probed on engine 2182: `DELETE ... WHERE ID IN
+                        // (1,2) RETURNING ID, A` over a row whose A an
+                        // ALTER TYPE rescale overflows raises 22003,
+                        // streams no row and keeps both rows through a
+                        // later COMMIT; `RETURNING 1/(ID-3)` the same
+                        // with 22012, for DELETE and UPDATE alike). The
+                        // window is therefore opened for every RETURNING
+                        // statement, and the projection below is always
+                        // made here, before the cursor opens
+                        let mark = Some(undo_window_push(&mut database, WindowKind::Nested));
                         // RETURNING waits and re-reads too - the write
                         // inside it is the same write
                         match with_conflict_wait(&mut database, |db| {
@@ -131152,16 +131161,19 @@ fn after_auth(
                                 // so the columns are re-indexed
                                 // POSITIONALLY like every other
                                 // materialised plan.
-                                let eager = has_corr
-                                    || (!new_cols.is_empty() && affected.deleted.iter().any(|d| *d));
-                                let (cols, rows) = if !eager {
-                                    (cols, rows)
-                                } else {
+                                let (cols, rows) = {
                                     let del = &affected.deleted;
                                     // the image guard lives for the
                                     // projection ALONE: a write after it
                                     // (the undo below) must take the
                                     // published image, not the stand-in
+                                    // a blob item reads the blob the write
+                                    // just stored: the op armed BLOB_CTX with
+                                    // the image from BEFORE it (`SET B =
+                                    // 'x' RETURNING CAST(B AS VARCHAR(9))`
+                                    // refused once the projection moved
+                                    // here from the fetch)
+                                    BLOB_CTX.with(|c| *c.borrow_mut() = database.as_ref().map(|d| (d.bytes(), d.page_size)));
                                     let projected: Result<Vec<Vec<Value>>, EvalErr> = {
                                     let _pre = pre_img.as_ref().map(|i| SubqImageGuard::arm(i.clone()));
                                     rows
@@ -131206,7 +131218,7 @@ fn after_auth(
                                         // arrives at the FETCH (isql prints
                                         // the vector, then `Records
                                         // affected: 0` - probed)
-                                        Err(e) if has_corr => {
+                                        Err(e) => {
                                             if let Some(m) = mark {
                                                 undo_window(&mut database, m);
                                             }
@@ -131215,7 +131227,6 @@ fn after_auth(
                                             respond(&mut s, &mut enc, resp_tx)?;
                                             continue;
                                         }
-                                        Err(_) => (cols, rows),
                                     }
                                 };
                                 if let Some(m) = mark {
@@ -134313,8 +134324,11 @@ fn after_auth(
                     // the op_execute arm ([SUBQ_IMAGE])
                     let has_corr = rcols.iter().any(|c| c.expr.as_ref().is_some_and(expr_has_corr));
                     let pre_img = if has_corr { database.as_ref().map(|d| d.bytes()) } else { None };
-                    // all or nothing with its RETURNING, as the cursor arm
-                    let mark = has_corr.then(|| undo_window_push(&mut database, WindowKind::Nested));
+                    // all or nothing with its RETURNING, as the cursor
+                    // arm, whatever the item (probed on engine 2182:
+                    // `INSERT ... VALUES (9) RETURNING 1/(ID-9)` raises
+                    // 22012 and stores no row)
+                    let mark = Some(undo_window_push(&mut database, WindowKind::Nested));
                     match timed("execute(returning)", || {
                         with_conflict_wait(&mut database, |db| {
                             execute_dml_collecting(&inner, db, &exec2_args, &ctx, Some(&mut affected))
@@ -134337,6 +134351,9 @@ fn after_auth(
                                 .images
                                 .first()
                                 .map(|img| affected.poisoned(0, decode_record(img, &affected.descs)));
+                            // ...reading a blob the write just stored,
+                            // as the cursor arm
+                            BLOB_CTX.with(|c| *c.borrow_mut() = database.as_ref().map(|d| (d.bytes(), d.page_size)));
                             let projected: Result<Vec<Value>, EvalErr> = {
                                 let _pre = pre_img.as_ref().map(|i| SubqImageGuard::arm(i.clone()));
                                 match &record {

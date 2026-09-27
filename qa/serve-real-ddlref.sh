@@ -65,6 +65,8 @@
 #      is neither read nor enforced; an index build keys the visible
 #      version (a rolled-back duplicate refused CREATE UNIQUE INDEX);
 #      DROP DEFAULT of a default the column does not own is DYN 229/230.
+#      A DSQL RETURNING whose item raises undoes its statement (a DELETE
+#      RETURNING the overflowing column stayed deleted through a COMMIT).
 #
 # Usage: qa/serve-real-ddlref.sh [port]   (default 5950)
 set -u
@@ -439,6 +441,13 @@ pin "11 update or insert and merge matching the row: 22003" "UPDATE OR INSERT IN
 pin "11 a PSQL update of the row: 22003" "SET TERM ^; EXECUTE BLOCK RETURNS (R INTEGER) AS BEGIN UPDATE W76 SET B = 11 WHERE ID = 1; R = ROW_COUNT; SUSPEND; END^ SET TERM ;^" "R|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range|-At block line: 1, col: 44"
 pin "11 the row that fits updates, the other keeps its values" "UPDATE W76 SET B = 6 WHERE ID = 2; COMMIT; SELECT ID, B FROM W76 ORDER BY ID;" "ID B|1 2000000000|2 6"
 pin "11 delete returning the id deletes; returning the column raises" "DELETE FROM W76 WHERE ID = 1 RETURNING ID; ROLLBACK; DELETE FROM W76 WHERE ID = 1 RETURNING A; ROLLBACK; SELECT COUNT(*) FROM W76;" "ID|1|A|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range|COUNT|2"
+# ...and a RETURNING that raises undoes its statement, whatever the item:
+# the engine streams no row and keeps every one through a later COMMIT
+# (here the delete stayed, a COMMIT made it durable, and the rows before
+# the raise were streamed)
+pin "11 delete returning the overflowing column: the row survives a commit" "DELETE FROM W76 WHERE ID = 1 RETURNING A; COMMIT; SELECT COUNT(*) FROM W76;" "A|Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range|COUNT|2"
+pin "11 a many-row delete whose second returning row raises: nothing streamed, nothing deleted" "DELETE FROM W76 RETURNING ID, 1/(ID-2); COMMIT; SELECT COUNT(*) FROM W76;" "ID DIVIDE|Statement failed, SQLSTATE = 22012|arithmetic exception, numeric overflow, or string truncation|-Integer divide by zero. The code attempted to divide an integer value by an integer divisor of zero.|COUNT|2"
+pin "11 update and insert returning an item that raises: nothing written" "UPDATE W76 SET B = 8 WHERE ID = 2 RETURNING ID, 1/(ID-2); INSERT INTO W76 (ID) VALUES (9) RETURNING 1/(ID-9); COMMIT; SELECT ID, B FROM W76 ORDER BY ID;" "ID DIVIDE|Statement failed, SQLSTATE = 22012|arithmetic exception, numeric overflow, or string truncation|-Integer divide by zero. The code attempted to divide an integer value by an integer divisor of zero.|Statement failed, SQLSTATE = 22012|arithmetic exception, numeric overflow, or string truncation|-Integer divide by zero. The code attempted to divide an integer value by an integer divisor of zero.|ID B|1 2000000000|2 6"
 pin "11 integer 2000000000 -> numeric(9,3), update by id: 22003" "ALTER TABLE W76 ALTER B TYPE NUMERIC(9,3); COMMIT; UPDATE W76 SET ID = 11 WHERE ID = 1; SELECT ID FROM W76 ORDER BY ID;" "Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range|ID|1|2"
 # a rolled-back ALTER leaves a DEAD head on the catalog row; the next
 # patch of that row starts from the version the catalog sees (here it
@@ -496,5 +505,5 @@ ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-ddlref-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 else echo "OK   no panic"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 212 ]; then echo "FAIL only $ran checks ran (floor 212)"; fail=1; fi
+if [ "$ran" -lt 215 ]; then echo "FAIL only $ran checks ran (floor 215)"; fail=1; fi
 exit $fail
