@@ -59,6 +59,25 @@
 #      name (the engine answers, or raises a 22009 zone error) stays the
 #      BARE refusal - `bare` cells, which fail on any other vector.
 #
+#  12. the review of the merged binary, each measured: a refused
+#      statement with multi-byte text a few bytes after a call (`ABS(1) =
+#      'éé'`, OVERLAY, a CAST to a collated domain, FIRST_DAY) dropped the
+#      attachment (08006, a slice inside a character) - it is the bare
+#      refusal and the next statement answers; a non-ASCII literal next to
+#      every diagnosis path (UTF8 cells: the -206 column counts BYTES); a
+#      truncation into a NONE column counts its bytes, a NONE key value
+#      prints its bytes; a GROUP BY / ORDER BY name is looked up in the
+#      select list first (one item answers - the bare refusal here - two
+#      are 42702 "between a field | an alias and a field | an alias in the
+#      select list", in list order; an alias inside an expression is
+#      -206); an alias glued to its item (`COUNT(*)X`, `'a'X`, `ID"X"`) is
+#      no column; SUM / AVG of a non-number when its clause is remapped
+#      (the select list's before its judgement and the HAVING, the ORDER
+#      BY's before its own, the HAVING's after its -206); COALESCE /
+#      DECODE / a simple CASE / MAXVALUE's HY004 as they are passed, a
+#      searched CASE / IIF's once typed; two FROM items under one alias;
+#      a year 0 date is 22008.
+#
 # RECORDED, not fixed (section 10 - refusals, never a wrong answer): a
 # window over an aggregate, COALESCE of a DATE and a text, DATEADD
 # (WEEKDAY), a UNION of incomparable types (HY004 "UNION"), a numeric
@@ -108,11 +127,16 @@ CREATE TABLE KW (F DOUBLE PRECISION PRIMARY KEY);
 CREATE TABLE KZ (V VARCHAR(5) PRIMARY KEY);
 CREATE TABLE TC (A VARCHAR(5), B COMPUTED BY (A || 'x'));
 CREATE TABLE TT (I INTEGER, TM TIME, TSP TIMESTAMP, DC DECFLOAT(16), DD DECFLOAT(34), DT DATE);
+CREATE DOMAIN DCOLL AS VARCHAR(5) CHARACTER SET UTF8 COLLATE UNICODE_CI;
+CREATE TABLE CU (ID INTEGER, U VARCHAR(10) CHARACTER SET UTF8, W VARCHAR(10) CHARACTER SET WIN1252);
+CREATE TABLE LD (D DATE, TS TIMESTAMP);
+CREATE TABLE KL (V VARCHAR(300) CHARACTER SET UTF8, B INTEGER, UNIQUE (V, B));
 COMMIT;
 INSERT INTO KX VALUES (DATE '2020-01-02', 'it''s', 1.25e-5, 'ab', 3.14);
 INSERT INTO KW VALUES (1.5);
 INSERT INTO KW VALUES (-2e300);
 INSERT INTO KZ VALUES ('a  ');
+INSERT INTO CU VALUES (1, 'abc', 'def');
 COMMIT;
 SQL
 } | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/errvec-build.log 2>&1
@@ -138,7 +162,7 @@ fail=0
 ran=0
 # a SCRIPT (a session), its lines squeezed and joined; errors included,
 # so an error cell compares the engine's whole message
-sess() { printf '%s\n' "$2" | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
+sess() { printf '%s\n' "$2" | timeout 25 "$ISQL" -q ${CS:+-ch "$CS"} -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
     | grep -av '^ *$' | grep -av '^=' | grep -av '^After line' | sed 's/^ *//;s/ *$//;s/  */ /g' | paste -sd'|'; }
 # the phase rig over one statement: PREPARED|EXECUTED|COMMITTED, or the
 # phase that raised and its vector
@@ -179,13 +203,15 @@ refused() { # <label> <script> <engine-output>
 # REFUSED BARE: where the diagnosis cannot name the engine's answer or
 # vector, the refusal stays the bare `42000 / Dynamic SQL Error` - never a
 # wrong vector. The engine's output pinned, this server's the bare one.
-bare() { # <label> <script> <engine-output>
+# A 4th argument is what the script's LATER statements answer on this
+# server after the refusal - the attachment must live on.
+bare() { # <label> <script> <engine-output> [<the rest of the script>]
     ran=$((ran + 1))
     local ev fv
     ev=$(sess "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2")
     if [ "$ev" != "$3" ]; then echo "FAIL $1 - THE ENGINE ANSWERS [$ev], not the pinned [$3]"; fail=1
     elif [ "$ev" = "$fv" ]; then echo "FAIL $1 - THIS SERVER NOW AGREES; promote the cell"; fail=1
-    elif [ "$fv" != 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error' ]; then
+    elif [ "$fv" != "Statement failed, SQLSTATE = 42000|Dynamic SQL Error${4:+|$4}" ]; then
         echo "FAIL $1 - not the bare refusal"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
     else echo "OK   $1 (bare refusal; the engine [${ev:0:70}])"; fi
 }
@@ -452,10 +478,12 @@ ppin '11 phase: ...with an offset after the time' 'INSERT INTO TT (TSP) VALUES (
 ppin '11 phase: a plain TIMESTAMP that is no date' 'INSERT INTO TT (TSP) VALUES ('\''2020-13-01'\'')' 'PREPARED|EXECUTE ERR: |conversion error from string "2020-13-01"'
 ppin '11 phase: a DATE with a zone suffix is 22018' 'INSERT INTO TT (DT) VALUES ('\''2020-01-01 10:00:00 +03:00'\'')' 'PREPARED|EXECUTE ERR: |conversion error from string "2020-01-01 10:00:00 +03:00"'
 ppin '11 phase: '\''1e999'\'' into an INTEGER is 22003' 'INSERT INTO TT (I) VALUES ('\''1e999'\'')' 'PREPARED|EXECUTE ERR: |arithmetic exception, numeric overflow, or string truncation |numeric value is out of range'
-bare '11 REFUSED BARE (the engine answers): a blob SUB_TYPE TEXT' 'SELECT UNICODE_CHAR(65), CAST(V AS BLOB SUB_TYPE TEXT) FROM T1;' 'UNICODE_CHAR CAST|A 0:1|CAST:|apple|A 0:3|CAST:|banana|A 0:5|CAST:|cherry'
-bare '11 REFUSED BARE: CRYPT_HASH .. USING SHA512' 'SELECT UNICODE_CHAR(65), CRYPT_HASH(V USING SHA512) FROM T1;' 'UNICODE_CHAR CRYPT_HASH|A 844D8779103B94C18F4AA4CC0C3B4474058580A991FBA85D3CA698A0BC9E52C5940FEB7A65A3A290E17E6B23EE943ECC4F73E7490327245B4FE5D5EFB590FEB2|A F8E3183D38E6C51889582CB260AB825252F395B4AC8FB0E6B13E9A71F7C10A80D5301E4A949F2783CB0C20205F1D850F87045F4420AD2271C8FD5F0CD8944BE3|A 22FDC354BD8871C8A5F3B1005071146C076A1530F8EBC239EC657FAC7446517B25DC9612DC16C568E79441A4C2B34AA741DBB3690146CFFB9635A6D9348A8BA8'
-bare '11 REFUSED BARE: HASH .. USING CRC32' 'SELECT UNICODE_CHAR(65), HASH(V USING CRC32) FROM T1;' 'UNICODE_CHAR HASH|A 1355820713|A -815297789|A 948551161'
-bare '11 REFUSED BARE: ...in a WHERE' 'SELECT UNICODE_CHAR(65) FROM T1 WHERE HASH(V USING CRC32) <> 0;' 'UNICODE_CHAR|A|A|A'
+# answered since the builtins merge; isql prints the blob ids, and this
+# server's are its own temporary ones (cosmetic, the values agree)
+differs '11 answered: a blob SUB_TYPE TEXT (the blob ids differ)' 'SELECT UNICODE_CHAR(65), CAST(V AS BLOB SUB_TYPE TEXT) FROM T1;' 'UNICODE_CHAR CAST|A 0:1|CAST:|apple|A 0:3|CAST:|banana|A 0:5|CAST:|cherry' 'UNICODE_CHAR CAST|A 0:40000001|CAST:|apple|A 0:40000002|CAST:|banana|A 0:40000003|CAST:|cherry'
+pin '11 answered (the builtins merge): CRYPT_HASH .. USING SHA512' 'SELECT UNICODE_CHAR(65), CRYPT_HASH(V USING SHA512) FROM T1;' 'UNICODE_CHAR CRYPT_HASH|A 844D8779103B94C18F4AA4CC0C3B4474058580A991FBA85D3CA698A0BC9E52C5940FEB7A65A3A290E17E6B23EE943ECC4F73E7490327245B4FE5D5EFB590FEB2|A F8E3183D38E6C51889582CB260AB825252F395B4AC8FB0E6B13E9A71F7C10A80D5301E4A949F2783CB0C20205F1D850F87045F4420AD2271C8FD5F0CD8944BE3|A 22FDC354BD8871C8A5F3B1005071146C076A1530F8EBC239EC657FAC7446517B25DC9612DC16C568E79441A4C2B34AA741DBB3690146CFFB9635A6D9348A8BA8'
+pin '11 answered (the builtins merge): HASH .. USING CRC32' 'SELECT UNICODE_CHAR(65), HASH(V USING CRC32) FROM T1;' 'UNICODE_CHAR HASH|A 1355820713|A -815297789|A 948551161'
+pin '11 answered (the builtins merge): ...in a WHERE' 'SELECT UNICODE_CHAR(65) FROM T1 WHERE HASH(V USING CRC32) <> 0;' 'UNICODE_CHAR|A|A|A'
 bare '11 REFUSED BARE: ENCRYPT .. USING CHACHA20 KEY .. IV' 'SELECT UNICODE_CHAR(65), ENCRYPT('\''abc'\'' USING CHACHA20 KEY '\''01234567890123456789012345678901'\'' IV '\''01234567'\'') FROM T1;' 'UNICODE_CHAR ENCRYPT|A 0E59F0|A 0E59F0|A 0E59F0'
 bare '11 REFUSED BARE: DECRYPT .. USING AES MODE OFB' 'SELECT UNICODE_CHAR(65), DECRYPT(x'\''903EFD'\'' USING AES MODE OFB KEY '\''0123456701234567'\'' IV '\''0123456789012345'\'') FROM T1;' 'UNICODE_CHAR DECRYPT|A 616263|A 616263|A 616263'
 bare '11 REFUSED BARE: ENCRYPT .. KEY <column>' 'SELECT UNICODE_CHAR(65), ENCRYPT(V USING RC4 KEY V) FROM T1;' 'UNICODE_CHAR ENCRYPT|A 790FA27019|A 36C7029312DE|A 0FC656A82C7F'
@@ -463,16 +491,16 @@ bare '11 REFUSED BARE: LISTAGG .. ON OVERFLOW ERROR' 'SELECT UNICODE_CHAR(65), L
 bare '11 REFUSED BARE: LISTAGG .. ON OVERFLOW TRUNCATE' 'SELECT UNICODE_CHAR(65), LISTAGG(V, '\'','\'' ON OVERFLOW TRUNCATE '\''...'\'' WITH COUNT) WITHIN GROUP (ORDER BY V) FROM T1;' 'UNICODE_CHAR LIST|A 0:1|LIST:|apple,banana,cherry'
 bare '11 REFUSED BARE: RSA_SIGN_HASH .. KEY .. HASH SHA256' 'SELECT UNICODE_CHAR(65), RSA_SIGN_HASH(V KEY V HASH SHA256) FROM T1;' 'UNICODE_CHAR RSA_SIGN_HASH|Statement failed, SQLSTATE = 22023|TomCrypt library error: Invalid input packet.|-Importing RSA key'
 bare '11 REFUSED BARE: COALESCE of a DATE and a text beside SUB_TYPE TEXT' 'SELECT COALESCE(D, '\''text'\''), CAST(V AS BLOB SUB_TYPE TEXT) FROM T1;' 'COALESCE CAST|2020-01-01 0:1|CAST:|apple|2021-06-15 0:3|CAST:|banana|text 0:5|CAST:|cherry'
-bare '11 REFUSED BARE: a DELETE over CRYPT_HASH' 'DELETE FROM T3 WHERE CRYPT_HASH(NAME USING SHA256) = '\''x'\''; ROLLBACK;' ''
+pin '11 answered (the builtins merge): a DELETE over CRYPT_HASH' 'DELETE FROM T3 WHERE CRYPT_HASH(NAME USING SHA256) = '\''x'\''; ROLLBACK;' ''
 bare '11 REFUSED BARE: an INSERT of ENCRYPT' 'INSERT INTO T3 (K, NAME) VALUES (1, ENCRYPT('\''abc'\'' USING RC4 KEY '\''0123456701234567'\'')); ROLLBACK;' ''
 bare '11 REFUSED BARE (Token unknown USING): SUBSTRING .. USING CHARACTERS' 'SELECT UNICODE_CHAR(65), SUBSTRING(V FROM 1 USING CHARACTERS) FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 45|-USING'
-bare '11 REFUSED BARE: SUM .. FILTER' 'SELECT UNICODE_CHAR(65), SUM(A) FILTER (WHERE B > 1) FROM T1;' 'UNICODE_CHAR SUM|A 10'
-bare '11 REFUSED BARE: COUNT(*) FILTER beside MAX' 'SELECT UNICODE_CHAR(65), COUNT(*) FILTER (WHERE A > 1), MAX(V) FROM T1;' 'UNICODE_CHAR COUNT MAX|A 2 cherry'
-bare '11 REFUSED BARE: FILTER over a GROUP BY' 'SELECT A, UNICODE_CHAR(65), COUNT(*) FILTER (WHERE B > 1) FROM T1 GROUP BY A;' 'A UNICODE_CHAR COUNT|<null> A 1|10 A 1|20 A 0'
-bare '11 REFUSED BARE: PERCENTILE_CONT WITHIN GROUP' 'SELECT UNICODE_CHAR(65), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY A) FROM T1;' 'UNICODE_CHAR PERCENTILE_CONT|A 15.00000000000000'
-bare '11 REFUSED BARE: PERCENTILE_DISC WITHIN GROUP DESC' 'SELECT UNICODE_CHAR(65), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY A DESC) FROM T1;' 'UNICODE_CHAR PERCENTILE_DISC|A 20'
-bare '11 REFUSED BARE: a HAVING'\''s FILTER' 'SELECT UNICODE_CHAR(65), COUNT(*) FROM T1 GROUP BY A HAVING COUNT(*) FILTER (WHERE B > 0) >= 0;' 'UNICODE_CHAR COUNT|A 1|A 1|A 1'
-bare '11 REFUSED BARE: one value for a table with a COMPUTED column' 'INSERT INTO TC VALUES (UNICODE_CHAR(65)); ROLLBACK;' ''
+pin '11 answered (the builtins merge): SUM .. FILTER' 'SELECT UNICODE_CHAR(65), SUM(A) FILTER (WHERE B > 1) FROM T1;' 'UNICODE_CHAR SUM|A 10'
+pin '11 answered (the builtins merge): COUNT(*) FILTER beside MAX' 'SELECT UNICODE_CHAR(65), COUNT(*) FILTER (WHERE A > 1), MAX(V) FROM T1;' 'UNICODE_CHAR COUNT MAX|A 2 cherry'
+pin '11 answered (the builtins merge): FILTER over a GROUP BY' 'SELECT A, UNICODE_CHAR(65), COUNT(*) FILTER (WHERE B > 1) FROM T1 GROUP BY A;' 'A UNICODE_CHAR COUNT|<null> A 1|10 A 1|20 A 0'
+pin '11 answered (the builtins merge): PERCENTILE_CONT WITHIN GROUP' 'SELECT UNICODE_CHAR(65), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY A) FROM T1;' 'UNICODE_CHAR PERCENTILE_CONT|A 15.00000000000000'
+pin '11 answered (the builtins merge): PERCENTILE_DISC WITHIN GROUP DESC' 'SELECT UNICODE_CHAR(65), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY A DESC) FROM T1;' 'UNICODE_CHAR PERCENTILE_DISC|A 20'
+pin '11 answered (the builtins merge): a HAVING'\''s FILTER' 'SELECT UNICODE_CHAR(65), COUNT(*) FROM T1 GROUP BY A HAVING COUNT(*) FILTER (WHERE B > 0) >= 0;' 'UNICODE_CHAR COUNT|A 1|A 1|A 1'
+pin '11 answered (the builtins merge): one value for a table with a COMPUTED column' 'INSERT INTO TC VALUES (UNICODE_CHAR(65)); ROLLBACK;' ''
 bare '11 REFUSED BARE: a TIMESTAMP with an offset' 'INSERT INTO TT (TSP) VALUES ('\''2020-01-01 10:00:00 +03:00'\''); ROLLBACK;' ''
 bare '11 REFUSED BARE: a TIMESTAMP with a region' 'INSERT INTO TT (TSP) VALUES ('\''2020-01-01 10:00 Europe/Paris'\''); ROLLBACK;' ''
 bare '11 REFUSED BARE: a TIMESTAMP with a negative offset' 'INSERT INTO TT (TSP) VALUES ('\''2020-01-01 -03:00'\''); ROLLBACK;' ''
@@ -485,8 +513,140 @@ bare '11 REFUSED BARE (22009 region T10:00:00): an ISO T' 'INSERT INTO TT (TSP) 
 bare '11 REFUSED BARE (22009 region ,10:00): a comma' 'INSERT INTO TT (TSP) VALUES ('\''2020-01-01,10:00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22009|Invalid time zone region: ,10:00'
 bare '11 REFUSED BARE (22009 offset +3): a short offset' 'INSERT INTO TT (TSP) VALUES ('\''2020-01-01 10:00 +3'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22009|Invalid time zone offset: +3 - must use format +/-hours:minutes and be between -14:00 and +14:00'
 
+echo '--- 12. THE REVIEW OF THE MERGED BINARY: MULTI-BYTE TEXT NEVER DROPS THE ATTACHMENT, THE SELECT LIST FIRST, THE LAWS IN THEIR PHASE'
+CS=UTF8 bare '12 REFUSED BARE: a call then a multi-byte character within a word'\''s length (the panic: 08006)' 'SELECT 1 FROM RDB$DATABASE WHERE ABS(1) = '\''éé'\''; SELECT 1 FROM RDB$DATABASE;' 'CONSTANT|Statement failed, SQLSTATE = 22018|conversion error from string "#xc3#xa9#xc3#xa9"|CONSTANT|1' 'CONSTANT|1'
+bare '12 REFUSED BARE: ...under NONE' 'SELECT 1 FROM RDB$DATABASE WHERE ABS(1) = '\''éé'\''; SELECT 1 FROM RDB$DATABASE;' 'CONSTANT|Statement failed, SQLSTATE = 22018|conversion error from string "#xc3#xa9#xc3#xa9"|CONSTANT|1' 'CONSTANT|1'
+CS=UTF8 bare '12 REFUSED BARE: ...after OVERLAY' 'SELECT ID FROM CU WHERE OVERLAY(W PLACING '\''é'\'' FROM 1) = '\''éé'\''; SELECT 1 FROM RDB$DATABASE;' 'CONSTANT|1' 'CONSTANT|1'
+CS=UTF8 bare '12 REFUSED BARE: ...after a CAST to a collated domain' 'SELECT CAST('\''a'\'' AS DCOLL) = '\''é'\'' FROM RDB$DATABASE; SELECT 1 FROM RDB$DATABASE;' 'BOOL|<false>|CONSTANT|1' 'CONSTANT|1'
+CS=UTF8 bare '12 REFUSED BARE: ...after FIRST_DAY' 'SELECT ID FROM CU WHERE FIRST_DAY(OF MONTH FROM CAST(NULL AS DATE)) = '\''éé'\''; SELECT 1 FROM RDB$DATABASE;' 'Statement failed, SQLSTATE = 22018|conversion error from string "#xc3#xa9#xc3#xa9"|CONSTANT|1' 'CONSTANT|1'
+CS=UTF8 bare '12 REFUSED BARE: ...after an unquoted multi-byte name in a parenthesis' 'SELECT (é€€) FROM T1; SELECT 1 FROM RDB$DATABASE;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 9|-�|CONSTANT|1' 'CONSTANT|1'
+CS=UTF8 bare '12 REFUSED BARE: ...a multi-byte byte glued to a call' 'SELECT ABS(1)é, NOPE FROM T1; SELECT 1 FROM RDB$DATABASE;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 14|-�|CONSTANT|1' 'CONSTANT|1'
+CS=UTF8 bare '12 REFUSED BARE: ...a multi-byte byte in a name' 'SELECT IDé FROM T1; SELECT 1 FROM RDB$DATABASE;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 10|-�|CONSTANT|1' 'CONSTANT|1'
+CS=UTF8 pin '12 non-ASCII: the -206 column counts bytes' 'SELECT '\''éé'\'', NOSUCH FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOSUCH"|-At line 1, column 16'
+CS=UTF8 pin '12 non-ASCII: ...on a later line' 'SELECT '\''éé'\'',
+ '\''é'\'', NOSUCH FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOSUCH"|-At line 3, column 8'
+CS=UTF8 pin '12 non-ASCII: a quoted multi-byte name' 'SELECT "é" FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"é"|-At line 1, column 8'
+CS=UTF8 pin '12 non-ASCII: -206 beside a literal' 'SELECT NOSUCH, '\''é'\'' FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOSUCH"|-At line 1, column 8'
+CS=UTF8 pin '12 non-ASCII: the tables'\'' 42702' 'SELECT '\''é'\'', ID FROM T1, T2;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T1" and table "PUBLIC"."T2"|-ID'
+CS=UTF8 pin '12 non-ASCII: the select list'\''s 42702' 'SELECT ID, ID, '\''é'\'' FROM T1 ORDER BY ID;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between a field and a field in the select list with name|-ID'
+CS=UTF8 pin '12 non-ASCII: a position' 'SELECT '\''é'\'' FROM T1 ORDER BY 2;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid column position used in the ORDER BY clause'
+CS=UTF8 pin '12 non-ASCII: an aggregate in the WHERE' 'SELECT ID FROM T1 WHERE COUNT(*) > 0 AND V = '\''é'\'';' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Cannot use an aggregate or window function in a WHERE clause, use HAVING (for aggregate only) instead'
+CS=UTF8 pin '12 non-ASCII: an aggregate in the GROUP BY' 'SELECT '\''é'\'' FROM T1 GROUP BY COUNT(*);' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Cannot use an aggregate or window function in a GROUP BY clause'
+CS=UTF8 pin '12 non-ASCII: a nested aggregate' 'SELECT SUM(SUM(A)), '\''é'\'' FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Nested aggregate and window functions are not allowed'
+CS=UTF8 pin '12 non-ASCII: SUM of a text' 'SELECT SUM(V) FROM T1 WHERE V <> '\''é'\'';' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for SUM in dialect 3 must be numeric'
+CS=UTF8 pin '12 non-ASCII: HY004 COALESCE' 'SELECT COALESCE(D, 1), '\''é'\'' FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE'
+CS=UTF8 pin '12 non-ASCII: HY004 CASE' 'SELECT CASE WHEN ID = 1 THEN D ELSE 1 END, '\''é'\'' FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+CS=UTF8 pin '12 non-ASCII: COUNT(DISTINCT *)' 'SELECT '\''é'\'', COUNT(DISTINCT *) FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 29|-*'
+CS=UTF8 pin '12 non-ASCII: a bare star' 'SELECT '\''é'\'', * FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 14|-*'
+CS=UTF8 pin '12 non-ASCII: an INSERT'\''s -206' 'INSERT INTO T3 (K, NAME, NOPE) VALUES (1, '\''é'\'', 2);' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 26'
+CS=UTF8 pin '12 non-ASCII: an INSERT'\''s count' 'INSERT INTO T3 (K) VALUES (1, '\''é'\'');' 'Statement failed, SQLSTATE = 21S01|Dynamic SQL Error|-SQL error code = -804|-Count of read-write columns does not equal count of values'
+CS=UTF8 pin '12 non-ASCII: an UPDATE'\''s -206' 'UPDATE T3 SET NAME = '\''é'\'' WHERE NOPE = 1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 33'
+CS=UTF8 pin '12 non-ASCII: a DELETE'\''s -206' 'DELETE FROM T3 WHERE NAME = '\''é'\'' AND NOPE = 1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 38'
+CS=UTF8 pin '12 non-ASCII: a literal into a DATE' 'INSERT INTO TS (D) VALUES ('\''é'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "#xc3#xa9"'
+CS=UTF8 pin '12 non-ASCII: a literal into a SMALLINT' 'INSERT INTO TS (S) VALUES ('\''é'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "#xc3#xa9"'
+CS=UTF8 pin '12 non-ASCII: a truncation counts a NONE column'\''s bytes' 'INSERT INTO TS (V) VALUES ('\''éééé'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 3, actual 8'
+CS=UTF8 pin '12 non-ASCII: a NONE key value prints its bytes' 'INSERT INTO KZ VALUES ('\''é'\''); INSERT INTO KZ VALUES ('\''é'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 23000|violation of PRIMARY or UNIQUE KEY constraint "INTEG_11" on table "PUBLIC"."KZ"|-Problematic key value is ("V" = '\''é'\'')'
+CS=UTF8 pin '12 non-ASCII: after a FILTER' 'SELECT COUNT(*) FILTER (WHERE V = '\''é'\''), NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 42'
+CS=UTF8 pin '12 non-ASCII: after WITHIN GROUP' 'SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY A) || '\''é'\'', NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 64'
+CS=UTF8 pin '12 non-ASCII: after OVER' 'SELECT SUM(A) OVER ()||'\''é'\'', NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 30'
+CS=UTF8 pin '12 non-ASCII: after a call' 'SELECT ABS(1)||'\''é'\'', NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 22'
+CS=UTF8 pin '12 non-ASCII: after GEN_ID' 'SELECT GEN_ID(SM, 0) || '\''é'\'', NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 31'
+CS=UTF8 pin '12 non-ASCII: in a CASE' 'SELECT CASE WHEN ID = 1 THEN '\''é'\'' ELSE D END, NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 47'
+CS=UTF8 pin '12 non-ASCII: in an IIF' 'SELECT IIF(ID = 1, '\''é'\'', D), NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 30'
+CS=UTF8 pin '12 non-ASCII: in an ORDER BY' 'SELECT ID FROM T1 ORDER BY '\''é'\'', NOPE;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 34'
+CS=UTF8 pin '12 non-ASCII: in a GROUP BY and HAVING' 'SELECT ID FROM T1 GROUP BY ID, '\''é'\'' HAVING NOPE > '\''é'\'';' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 44'
+CS=UTF8 pin '12 non-ASCII: in a window' 'SELECT ROW_NUMBER() OVER (ORDER BY '\''é'\''), NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 43'
+CS=UTF8 pin '12 non-ASCII: in an ON' 'SELECT T1.ID FROM T1 JOIN T2 ON T2.S = '\''é'\'' AND ID = 1;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T1" and table "PUBLIC"."T2"|-ID'
+CS=UTF8 pin '12 non-ASCII: in a subquery' 'SELECT (SELECT '\''é'\'' FROM T2 WHERE NOPE = '\''é'\'') FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 35'
+CS=UTF8 pin '12 non-ASCII: in a CAST' 'SELECT CAST('\''é'\'' AS VARCHAR(5)), NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 34'
+CS=UTF8 pin '12 non-ASCII: in a SUBSTRING' 'SELECT SUBSTRING('\''éé'\'' FROM 1 FOR 1), NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 40'
+CS=UTF8 pin '12 non-ASCII: in a TRIM' 'SELECT TRIM(BOTH '\''é'\'' FROM V), NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 32'
+CS=UTF8 pin '12 non-ASCII: in HASH .. USING' 'SELECT HASH('\''é'\'' USING CRC32), NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 32'
+CS=UTF8 pin '12 non-ASCII: in LISTAGG' 'SELECT LISTAGG(V, '\''é'\'') WITHIN GROUP (ORDER BY V), NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 52'
+CS=UTF8 bare '12 REFUSED BARE: non-ASCII: a glued alias after a literal' 'SELECT '\''é'\''X FROM T1;' 'X|é|é|é'
+CS=UTF8 bare '12 REFUSED BARE: non-ASCII: a glued quoted alias' 'SELECT COUNT(*)"é" FROM T1;' 'é|3'
+bare '12 REFUSED BARE: GROUP BY a bare name: the select list first (a qualified item answers)' 'SELECT T1.ID, COUNT(*) FROM T1, T2 GROUP BY ID;' 'ID COUNT|1 3|2 3|3 3'
+bare '12 REFUSED BARE: ...over a JOIN' 'SELECT T1.ID FROM T1 JOIN T2 ON T1.ID = T2.ID GROUP BY ID;' 'ID|1|2|3'
+bare '12 REFUSED BARE: ...an aliased FROM' 'SELECT A.ID FROM T1 A, T2 B GROUP BY ID;' 'ID|1|2|3'
+bare '12 REFUSED BARE: ...a parenthesised field' 'SELECT (T1.ID) FROM T1, T2 GROUP BY ID;' 'ID|1|2|3'
+bare '12 REFUSED BARE: ...with a HAVING' 'SELECT T1.ID FROM T1, T2 GROUP BY ID HAVING COUNT(*) > 0;' 'ID|1|2|3'
+pin '12 GROUP BY: two fields of the name' 'SELECT T1.ID, T2.ID FROM T1, T2 GROUP BY ID;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between a field and a field in the select list with name|-ID'
+pin '12 GROUP BY: the same field twice' 'SELECT ID, ID FROM T1 GROUP BY ID;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between a field and a field in the select list with name|-ID'
+pin '12 GROUP BY: two stars' 'SELECT T1.*, T2.* FROM T1, T2 GROUP BY ID;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between a field and a field in the select list with name|-ID'
+pin '12 GROUP BY: two aliases' 'SELECT T1.A X, T2.X X FROM T1, T2 GROUP BY X;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between an alias and an alias in the select list with name|-X'
+pin '12 GROUP BY: an alias, then a field' 'SELECT T2.X ID, T1.ID FROM T1, T2 GROUP BY ID;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between an alias and a field in the select list with name|-ID'
+pin '12 GROUP BY: a field, then an alias' 'SELECT T1.ID, T2.X ID FROM T1, T2 GROUP BY ID;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between a field and an alias in the select list with name|-ID'
+pin '12 GROUP BY: an aggregate'\''s alias, then a field' 'SELECT COUNT(*) ID, T1.ID FROM T1, T2 GROUP BY ID;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between an alias and a field in the select list with name|-ID'
+pin '12 GROUP BY: one field matches, the other item is ungrouped' 'SELECT T1.A, T2.ID FROM T1, T2 GROUP BY ID;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)'
+pin '12 GROUP BY: an expression is no field' 'SELECT T1.ID + 0 FROM T1, T2 GROUP BY ID;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T1" and table "PUBLIC"."T2"|-ID'
+pin '12 GROUP BY: an alias inside an expression is -206' 'SELECT A X FROM T1 GROUP BY X + 0;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"X"|-At line 1, column 29'
+pin '12 ORDER BY: an alias inside an expression is -206' 'SELECT A X FROM T1 ORDER BY X + 0;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"X"|-At line 1, column 29'
+pin '12 ORDER BY: two fields of the name (answered before)' 'SELECT ID, ID FROM T1 ORDER BY ID;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between a field and a field in the select list with name|-ID'
+pin '12 ORDER BY: two stars (answered before)' 'SELECT * FROM T1, T2 ORDER BY ID;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between a field and a field in the select list with name|-ID'
+pin '12 ORDER BY: two aliases' 'SELECT T1.A X, T2.X X FROM T1, T2 ORDER BY X;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between an alias and an alias in the select list with name|-X'
+pin '12 ORDER BY: one qualified field answers' 'SELECT T1.ID FROM T1, T2 ORDER BY ID;' 'ID|1|1|1|2|2|2|3|3|3'
+pin '12 HAVING: no select-list lookup' 'SELECT T1.ID FROM T1, T2 GROUP BY T1.ID HAVING ID > 0;' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T1" and table "PUBLIC"."T2"|-ID'
+bare '12 REFUSED BARE: a glued alias after a call' 'SELECT COUNT(*)X FROM T1;' 'X|3'
+bare '12 REFUSED BARE: a glued alias after a literal' 'SELECT '\''a'\''X FROM T1;' 'X|a|a|a'
+bare '12 REFUSED BARE: a glued alias after a quoted name' 'SELECT "ID"X FROM T1;' 'X|1|2|3'
+bare '12 REFUSED BARE: a glued quoted alias after a name' 'SELECT ID"X" FROM T1;' 'X|1|2|3'
+bare '12 REFUSED BARE: a glued alias over a GROUP BY' 'SELECT SUM(A)X FROM T1 GROUP BY ID;' 'X|10|20|<null>'
+bare '12 REFUSED BARE: a glued alias after a parenthesis' 'SELECT (A)X FROM T1;' 'X|10|20|<null>'
+pin '12 SUM of a text before a HAVING'\''s -206' 'SELECT SUM(V) FROM T1 HAVING NOPE = 1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for SUM in dialect 3 must be numeric'
+pin '12 AVG of a date before a HAVING'\''s -206' 'SELECT AVG(D) FROM T1 GROUP BY ID HAVING NOPE > 0;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for AVG in dialect 3 must be numeric'
+pin '12 SUM of a text before the select list'\''s judgement' 'SELECT ID, SUM(V) FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for SUM in dialect 3 must be numeric'
+pin '12 ...before the HAVING'\''s judgement' 'SELECT SUM(V) FROM T1 HAVING A > 1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for SUM in dialect 3 must be numeric'
+pin '12 ...before a nested aggregate' 'SELECT SUM(SUM(V)) FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for SUM in dialect 3 must be numeric'
+pin '12 ...and after a nested one'\''s own SUM' 'SELECT SUM(SUM(A)), SUM(V) FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for SUM in dialect 3 must be numeric'
+pin '12 ORDER BY'\''s SUM before its judgement' 'SELECT COUNT(*) FROM T1 ORDER BY ID, SUM(V);' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for SUM in dialect 3 must be numeric'
+pin '12 ...after the select list'\''s judgement' 'SELECT ID FROM T1 ORDER BY SUM(V);' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)'
+pin '12 ...after the ORDER BY'\''s -206' 'SELECT COUNT(*) FROM T1 ORDER BY SUM(V), NOPE;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 42'
+pin '12 a HAVING'\''s SUM after the HAVING'\''s -206' 'SELECT COUNT(*) FROM T1 HAVING SUM(V) > 0 AND NOPE = 1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 47'
+pin '12 a HAVING'\''s SUM' 'SELECT COUNT(*) FROM T1 HAVING SUM(V) > 0;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for SUM in dialect 3 must be numeric'
+pin '12 a HAVING'\''s SUM before its judgement' 'SELECT ID FROM T1 GROUP BY ID HAVING SUM(V) > 0 AND A > 1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for SUM in dialect 3 must be numeric'
+pin '12 the ORDER BY'\''s judgement before the HAVING'\''s SUM' 'SELECT COUNT(*) FROM T1 HAVING SUM(V) > 0 ORDER BY ID;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the ORDER BY clause (not contained in either an aggregate function or the GROUP BY clause)'
+pin '12 a window'\''s SUM after the ORDER BY'\''s -206' 'SELECT SUM(V) OVER () FROM T1 ORDER BY NOPE;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 40'
+pin '12 a window'\''s SUM' 'SELECT SUM(V) OVER () FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for SUM in dialect 3 must be numeric'
+pin '12 HY004 before an ORDER BY -206' 'SELECT COALESCE(D, 1) FROM T1 ORDER BY NOPE;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE'
+pin '12 HY004 in the ORDER BY, before its next item' 'SELECT ID FROM T1 ORDER BY COALESCE(D, 1), NOPE;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE'
+pin '12 HY004 before the grouping law' 'SELECT ID, COALESCE(D, 1) FROM T1 GROUP BY ID;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE'
+pin '12 HY004 before SUM' 'SELECT SUM(V), COALESCE(D, 1) FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE'
+pin '12 HY004 in a HAVING' 'SELECT ID FROM T1 GROUP BY ID HAVING COALESCE(D, 1) = 1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE'
+pin '12 HY004 in a GROUP BY' 'SELECT ID FROM T1 GROUP BY COALESCE(D, 1);' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE'
+pin '12 HY004 in a WHERE, right operand first' 'SELECT ID FROM T1 WHERE NOPE = 1 AND COALESCE(D, 1) = 1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE'
+pin '12 ...the -206 of the right operand first' 'SELECT ID FROM T1 WHERE COALESCE(D, 1) = 1 AND NOPE = 1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 48'
+pin '12 HY004 inside SUM' 'SELECT SUM(COALESCE(D, 1)) FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE'
+pin '12 HY004 after a later position' 'SELECT COALESCE(D, 1) FROM T1 ORDER BY 5;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE'
+pin '12 HY004 over a SUM' 'SELECT COALESCE(SUM(A), D) FROM T1 GROUP BY D;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE'
+pin '12 HY004 over a COUNT' 'SELECT COALESCE(COUNT(*), D) FROM T1 GROUP BY D;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE'
+pin '12 HY004 over a MAX' 'SELECT COALESCE(MAX(D), 1) FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression COALESCE'
+pin '12 an IIF is typed late: after the ORDER BY'\''s -206' 'SELECT IIF(ID = 1, D, 1) FROM T1 ORDER BY NOPE;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 43'
+pin '12 ...a searched CASE too' 'SELECT CASE WHEN ID = 1 THEN D ELSE 1 END FROM T1 ORDER BY NOPE;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 60'
+pin '12 ...after the grouping law' 'SELECT IIF(ID = 1, D, 1) FROM T1 GROUP BY ID;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)'
+pin '12 ...after a SUM'\''s own error' 'SELECT IIF(ID = 1, D, 1), SUM(V) FROM T1;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-expression evaluation not supported|-Argument for SUM in dialect 3 must be numeric'
+pin '12 ...after a -206 left of it' 'SELECT ID FROM T1 WHERE NOPE = 1 AND IIF(ID = 1, D, 1) = 1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 25'
+pin '12 ...alone the HY004 CASE' 'SELECT ID FROM T1 WHERE IIF(ID = 1, D, 1) = 1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+bare '12 REFUSED BARE: ...inside an aggregate: typed with it (not placed)' 'SELECT SUM(IIF(ID = 1, D, 1)) FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 a simple CASE is passed like a DECODE' 'SELECT CASE ID WHEN 1 THEN D ELSE 1 END FROM T1 ORDER BY NOPE;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression CASE'
+pin '12 MAXVALUE at its pass' 'SELECT MAXVALUE(D, 1) FROM T1 ORDER BY NOPE;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression MAXVALUE'
+pin '12 HY004 of a DECODE' 'SELECT DECODE(ID, 1, D, 1) FROM T1 ORDER BY NOPE;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression DECODE'
+pin '12 the -206 of a plain field before HY004' 'SELECT COALESCE(D, 1), NOPE FROM T1;' 'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOPE"|-At line 1, column 24'
+pin '12 two FROM items under one alias' 'SELECT ID FROM T1 WHERE ID = ANY (SELECT ID FROM T1 X, T2 X);' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -204|-alias "X" conflicts with an alias in the same statement'
+pin '12 ...before the level'\''s -206' 'SELECT ID FROM T1 WHERE ID = ANY (SELECT NOPE FROM T1 X, T2 X);' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -204|-alias "X" conflicts with an alias in the same statement'
+pin '12 an unaliased name beside the alias is no conflict' 'SELECT ID FROM T1 WHERE ID = ANY (SELECT ID FROM T1, T2 T1);' 'Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table "PUBLIC"."T1" and table "PUBLIC"."T2"|-ID'
+bare '12 REFUSED BARE: the clauses out of order: the parser'\''s Token unknown' 'SELECT COUNT(*) FROM T1 ORDER BY SUM(V) HAVING NOPE > 0;' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 41|-HAVING'
+pin '12 a year 0 DATE is 22008' 'INSERT INTO LD (D) VALUES ('\''0000-01-01'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22008|value exceeds the range for valid dates'
+pin '12 ...an impossible day of year 0 too' 'INSERT INTO LD (D) VALUES ('\''0000-02-30'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22008|value exceeds the range for valid dates'
+pin '12 ...a month name' 'INSERT INTO LD (D) VALUES ('\''1-JAN-0000'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22008|value exceeds the range for valid dates'
+pin '12 ...a month 13 is the conversion' 'INSERT INTO LD (D) VALUES ('\''0000-13-01'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "0000-13-01"'
+pin '12 ...a five-digit year the conversion' 'INSERT INTO LD (D) VALUES ('\''10000-01-01'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "10000-01-01"'
+pin '12 a year 0 TIMESTAMP is 22008 timestamps' 'INSERT INTO LD (TS) VALUES ('\''0000-01-01 10:00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22008|value exceeds the range for valid timestamps'
+pin '12 a year 0 DATE with a time is the conversion' 'INSERT INTO LD (D) VALUES ('\''0000-01-01 10:00'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "0000-01-01 10:00"'
+
+pin '12 a long key value is cut to 250 bytes and marked, the next segment whole' 'INSERT INTO KL VALUES ('\''aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\'', 1); INSERT INTO KL VALUES ('\''aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\'', 1); ROLLBACK;' 'Statement failed, SQLSTATE = 23000|violation of PRIMARY or UNIQUE KEY constraint "INTEG_12" on table "PUBLIC"."KL"|-Problematic key value is ("V" = '\''aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..., "B" = 1)'
+CS=UTF8 pin '12 non-ASCII: ...at a character'\''s edge' 'INSERT INTO KL VALUES ('\''éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé'\'', 1); INSERT INTO KL VALUES ('\''éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé'\'', 1); ROLLBACK;' 'Statement failed, SQLSTATE = 23000|violation of PRIMARY or UNIQUE KEY constraint "INTEG_12" on table "PUBLIC"."KL"|-Problematic key value is ("V" = '\''éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé..., "B" = 1)'
 if grep -aq 'panicked at' "/tmp/fc-serve-errvec-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 else echo "OK   no panic"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 272 ]; then echo "FAIL only $ran checks ran (floor 272)"; fail=1; fi
+if [ "$ran" -lt 401 ]; then echo "FAIL only $ran checks ran (floor 401)"; fail=1; fi
 exit $fail

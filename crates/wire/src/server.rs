@@ -20388,7 +20388,7 @@ fn line_col_of(before: &str) -> (i64, i64) {
 }
 
 /// The engine's `print_key` (btr.cpp ~7128): `("COL" = v[, ...])`,
-/// the whole text capped at 250 chars. None when a value cannot render
+/// each value capped at 250 bytes (see below). None when a value cannot render
 /// as a literal - the engine omits the key item when print_key throws,
 /// and inventing a rendering would diverge from it.
 ///
@@ -20405,14 +20405,37 @@ fn constraint_key_text(parts: &[(String, &Value)]) -> Option<String> {
         // NULL prints BARE (probed P15: a partial-NULL compound key is
         // refused and its key text says `"B" = NULL`); everything else
         // renders as DescPrinter prints it ([key_value_text])
-        let rendered = key_value_text(v)?;
+        let mut rendered = key_value_text(v)?;
+        // EACH VALUE is cut, not the whole text: a rendering past 250
+        // bytes keeps its first 250 - at a character's edge - and gains
+        // `...` (measured on 2182: 300 `a`s print `'a..a...` with 249 of
+        // them and no closing quote, a UTF8 run of 130 `é`s 124 of them,
+        // a second segment after it in full, a 259-byte key of two short
+        // segments whole). The whole text was cut at byte 250 here, which
+        // `String::truncate` does by panicking inside a multi-byte
+        // character.
+        if rendered.len() > 250 {
+            let cut = (0..=250).rev().find(|i| rendered.is_char_boundary(*i)).unwrap_or(0);
+            rendered.truncate(cut);
+            rendered.push_str("...");
+        }
         segs.push(format!("\"{}\" = {}", name.trim_end(), rendered));
     }
-    let mut s = format!("({})", segs.join(", "));
-    if s.len() > 250 {
-        s.truncate(250);
+    Some(format!("({})", segs.join(", ")))
+}
+
+/// A key text of a BYTE-CARRIER column (NONE, OCTETS, ASCII) as the
+/// engine prints it: its stored BYTES, which the record decode spelled one
+/// char per byte - so a `'é'` a UTF8 client stored in a NONE column read
+/// back `'Ã©'` in the message (found by review; measured on 2182: `("V" =
+/// 'é')`). Bytes that are no UTF-8 keep the decode's spelling.
+fn carrier_key_text(t: &str, d: &Descriptor) -> String {
+    if !fire_crab_ods::intl::byte_carrier(fire_crab_ods::intl::charset_id(d.sub_type)) {
+        return t.to_string();
     }
-    Some(s)
+    fire_crab_ods::intl::carrier_encode(t)
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| t.to_string())
 }
 
 /// One key value as the engine's DescPrinter prints it (mov.cpp, over
@@ -36110,6 +36133,21 @@ fn insert_literal_error(d: &Descriptor, v: &InsVal) -> Option<EvalErr> {
                 None
             }
         }
+        // a date read whole whose YEAR is out of range is the range error,
+        // not the conversion's (measured: `'0000-01-01'` into a DATE is
+        // 22008 "value exceeds the range for valid dates", into a
+        // TIMESTAMP "... valid timestamps" - [string_to_datetime_why])
+        InsVal::Str(t)
+            if matches!(d.dtype, dtype::SQL_DATE | dtype::TIMESTAMP)
+                && string_to_datetime_why(
+                    t,
+                    if d.dtype == dtype::SQL_DATE { ExpectTemporal::Date } else { ExpectTemporal::Timestamp },
+                    session_now(),
+                    true,
+                ) == Err(CvtFail::Range) =>
+        {
+            Some(if d.dtype == dtype::SQL_DATE { EvalErr::DateRange } else { EvalErr::DatetimeRange })
+        }
         // a TIME that does not open with a digit, or is digits and colons
         // only, fails before any zone is read (`'JAN-1-2020'`, `'- 10'`,
         // `'25:00'`, `'10::00'`)
@@ -42760,6 +42798,12 @@ fn text_bytes_for_r(
             _ => fire_crab_ods::intl::decode_text(dest_cs, b)
                 .map_or(text.chars().count(), |t| t.chars().count()),
         }
+    } else if fire_crab_ods::intl::byte_carrier(dest_cs) {
+        // ...and a byte-carrier DESTINATION counts the bytes it would
+        // store (measured on 2182: 'éééé' from a UTF8 attachment into a
+        // VARCHAR(3) NONE is "expected length 3, actual 8", where the
+        // source's characters said 4)
+        b.len()
     } else {
         text.chars().count()
     };
@@ -44005,7 +44049,8 @@ fn unique_violation_err(
         .iter()
         .enumerate()
         .map(|(fid, v)| match (v, descs.get(fid)) {
-            (Value::Text(t), Some(d)) if d.dtype == dtype::TEXT => Value::Text(t.trim_end_matches(' ').to_string()),
+            (Value::Text(t), Some(d)) if d.dtype == dtype::TEXT => Value::Text(carrier_key_text(t.trim_end_matches(' '), d)),
+            (Value::Text(t), Some(d)) if d.dtype == dtype::VARYING => Value::Text(carrier_key_text(t, d)),
             _ => v.clone(),
         })
         .collect();
@@ -47690,6 +47735,9 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<(String, 
                 };
                 let mut body_of: Option<&str> = None;
                 let mut field_item = false;
+                // the two are named in LIST order (measured: `SELECT VAL
+                // ID, ID .. GROUP BY ID` is "an alias and a field")
+                let mut field_first = false;
                 for it in &items_raw {
                     let (body, alias) = split_alias(it.trim());
                     let body = body.trim();
@@ -47708,6 +47756,7 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<(String, 
                                 canon_ident(body)
                             };
                             if own.as_deref() == Some(name.as_str()) {
+                                field_first |= !field_item && body_of.is_none();
                                 field_item = true;
                             }
                         }
@@ -47715,10 +47764,11 @@ fn rewrite_windowed_select(sql: &str, db: &Option<Database>) -> Option<(String, 
                 }
                 match body_of {
                     Some(_) if field_item => {
+                        let (first, second) = if field_first { ("a field", "an alias") } else { ("an alias", "a field") };
                         PREPARE_REFUSAL.with(|r| {
                             *r.borrow_mut() = Some(EvalErr::AmbiguousField {
-                                first: "a field".to_string(),
-                                second: "an alias in the select list with name".to_string(),
+                                first: first.to_string(),
+                                second: format!("{} in the select list with name", second),
                                 name: name.clone(),
                             })
                         });
@@ -49478,11 +49528,14 @@ struct QualCtx<'a> {
     /// the DIAGNOSIS of a refused statement ([diagnose_refusal]): read
     /// BARE names too, and the aggregate / position laws beside them
     bare: bool,
-    /// the select-list aliases a bare name of the clause under scan may
-    /// name - an ORDER BY's or a GROUP BY's, never a WHERE's or a
-    /// HAVING's (measured: `WHERE X`, `HAVING X` over `SELECT ID X` are
-    /// -206, `ORDER BY X` / `GROUP BY X` answer)
-    aliases: std::cell::RefCell<Vec<String>>,
+    /// the diagnosis's HY004 of a searched CASE or an IIF, which the
+    /// engine raises only when it TYPES the node - after every pass and
+    /// judgement ([QualCtx::conditional_verdict]) - the first met
+    deferred: std::cell::RefCell<Option<EvalErr>>,
+    /// ...and one whose typing point this reader cannot place (inside an
+    /// aggregate, which types it when the aggregate is typed, or in a
+    /// nested query): the diagnosis stands aside
+    unsure: std::cell::Cell<bool>,
 }
 
 /// The -206 the engine raises for `sql` at prepare, if any: the first
@@ -49515,7 +49568,8 @@ fn first_unresolved_qualifier(sql: &str, dbo: &Option<Database>) -> Option<EvalE
         ctes: Vec::new(),
         check_top,
         bare: false,
-        aliases: std::cell::RefCell::new(Vec::new()),
+        deferred: std::cell::RefCell::new(None),
+        unsure: std::cell::Cell::new(false),
     };
     // the row-locking / optimizer tail is not a clause of the query, and
     // it is cut off the text before the scan the way the planner cuts it
@@ -49800,6 +49854,30 @@ impl QualCtx<'_> {
         // the level and the order the engine stacked them in
         // ([from_push_order]); a shape it cannot place stands aside
         let proj = if self.bare {
+            // the clauses in the grammar's order, or the parser's Token
+            // unknown comes first (measured: `.. ORDER BY SUM(NAME) HAVING
+            // NOPE > 0` is Token unknown "having"), which this reader does
+            // not place
+            let at = |c: Option<&str>| c.map(|c| self.off_of(c));
+            let placed: Vec<usize> = [at(wh), at(group), at(having), at(order)].into_iter().flatten().collect();
+            if placed.windows(2).any(|w| w[0] > w[1]) {
+                return QualScan::Aside;
+            }
+            // TWO FROM items of the level under ONE alias are
+            // PASS1_make_context's -204 "alias "X" conflicts with an alias
+            // in the same statement", raised as the FROM is passed, before
+            // any name of the level is read (measured on 2182: `(SELECT ID
+            // FROM T1 X, T2 X)` and `(SELECT NOPE FROM T1 X, T2 X)` are the
+            // conflict, not 42702 or -206); an unaliased item's own name
+            // is no alias (`FROM T1, T2 T1` resolves, and is the tables'
+            // 42702 over ID)
+            for (i, a) in items.iter().enumerate() {
+                if let Some(an) = a.alias.as_ref().filter(|n| !n.is_empty()) {
+                    if items[..i].iter().any(|b| b.alias.as_ref() == Some(an)) {
+                        return QualScan::Err(EvalErr::AliasConflict(format!("\"{}\"", an)));
+                    }
+                }
+            }
             if find_word_depth0(self.up_of(text), "PLAN", 0).is_some()
                 || ["USING", "NATURAL"].iter().any(|w| find_word_depth0(self.up_of(table_s), w, 0).is_some())
                 || quals.len() != items.len()
@@ -49961,18 +50039,26 @@ impl QualCtx<'_> {
     /// The diagnosis's ORDER BY, GROUP BY and HAVING, in pass1_rse_impl's
     /// order (measured on 2182 member by member): the ORDER BY items in
     /// turn - a position outside the select list is -104 "Invalid column
-    /// position used in the ORDER BY clause", a select-list alias is the
-    /// item, anything else is passed (-206); the GROUP BY items the same
-    /// way, then an aggregate or window function among them (a position
-    /// naming an aggregate item included) is "Cannot use an aggregate or
-    /// window function in a GROUP BY clause"; then, over an AGGREGATED
-    /// query (a GROUP BY, a HAVING, or an aggregate in the select list or
-    /// the ORDER BY), each select item in turn - a nested aggregate is
-    /// "Nested aggregate and window functions are not allowed", a column
-    /// neither grouped nor aggregated "Invalid expression in the select
-    /// list" - then each ORDER BY item ("in the ORDER BY clause"), then
-    /// the HAVING is passed and judged ("Invalid expression in the HAVING
-    /// clause"). A shape the judgement cannot read stands aside.
+    /// position used in the ORDER BY clause", an item that IS one bare
+    /// name is looked up in the select list first ([QualCtx::select_lookup]),
+    /// anything else is passed (-206); the GROUP BY items the same way,
+    /// then an aggregate or window function among them (a position naming
+    /// an aggregate item included) is "Cannot use an aggregate or window
+    /// function in a GROUP BY clause". Then, over an AGGREGATED query (a
+    /// GROUP BY, a HAVING, or an aggregate in the select list or the ORDER
+    /// BY), clause by clause as the engine remaps it: the select list's
+    /// SUM / AVG of a non-number ([QualCtx::agg_arg_verdict] - before
+    /// every judgement of the list, measured: `SELECT ID, SUM(NAME)`,
+    /// `SUM(SUM(NAME))`, `SUM(NAME) .. HAVING NOPE = 1` all name SUM),
+    /// then each select item in turn - a nested aggregate is "Nested
+    /// aggregate and window functions are not allowed", a column neither
+    /// grouped nor aggregated "Invalid expression in the select list" -
+    /// then the ORDER BY's SUM / AVG (`ORDER BY ID, SUM(NAME)` names SUM,
+    /// `SELECT ID .. ORDER BY SUM(NAME)` the select list), each ORDER BY
+    /// item ("in the ORDER BY clause"), then the HAVING is passed, its SUM
+    /// / AVG judged (`HAVING SUM(NAME) > 0 AND NOPE = 1` is the -206), and
+    /// the HAVING itself ("Invalid expression in the HAVING clause"). A
+    /// shape the judgement cannot read stands aside.
     fn diagnose_tail(
         &self,
         proj: &str,
@@ -49982,17 +50068,7 @@ impl QualCtx<'_> {
         scopes: &[Vec<ScopeQual>],
     ) -> QualScan {
         let items: Vec<&str> = split_top_level_commas(proj).into_iter().map(|i| i.trim()).collect();
-        let bodies: Vec<&str> = items.iter().map(|i| split_alias(i).0.trim()).collect();
-        let aliases: Vec<String> = items
-            .iter()
-            .filter_map(|i| split_alias(i).1)
-            .filter_map(canon_ident)
-            .collect();
-        let alias_body = |name: &str| -> Option<&str> {
-            items.iter().zip(&bodies).find_map(|(i, b)| {
-                split_alias(i).1.and_then(canon_ident).filter(|a| a == name).map(|_| *b)
-            })
-        };
+        let bodies: Vec<&str> = items.iter().map(|i| diag_split_alias(i).0.trim()).collect();
         // the select list's width, `*` and `X.*` expanded
         let level = scopes.last().map(|l| &l[..]).unwrap_or(&[]);
         let width = || -> Option<usize> {
@@ -50015,21 +50091,23 @@ impl QualCtx<'_> {
             Some(n)
         };
         let has_star = bodies.iter().any(|b| b.ends_with('*') && !b.ends_with("(*)"));
-        // ORDER BY, then GROUP BY: positions, aliases, the pass
-        let mut group_keys: Vec<&str> = Vec::new();
+        // ORDER BY, then GROUP BY: positions, select-list names, the pass;
+        // an ORDER BY item the lookup resolved is the select item's, and
+        // judged with it (`ordered_items`)
+        // each GROUP BY key as the judgement compares it (None: a key it
+        // cannot place, which stands aside once the query is judged), and
+        // its text as the aggregate check reads it
+        let mut group_keys: Vec<Option<GroupKey>> = Vec::new();
+        let mut group_texts: Vec<&str> = Vec::new();
+        let mut looked_up: Vec<&str> = Vec::new();
         for (clause, what) in [(order, "ORDER BY"), (group, "GROUP BY")] {
             let Some(c) = clause else { continue };
-            *self.aliases.borrow_mut() = aliases.clone();
             for item in split_top_level_commas(c) {
                 let item = item.trim();
                 if let Some(pos) = sort_position(item) {
                     let n = if has_star { width() } else { Some(bodies.len()) };
-                    let Some(n) = n else {
-                        self.aliases.borrow_mut().clear();
-                        return QualScan::Aside;
-                    };
+                    let Some(n) = n else { return QualScan::Aside };
                     if pos < 1 || pos as usize > n {
-                        self.aliases.borrow_mut().clear();
                         return QualScan::Err(dsql_status(
                             -104,
                             GDS_DSQL_COLUMN_POS_ERR,
@@ -50038,27 +50116,41 @@ impl QualCtx<'_> {
                     }
                     if what == "GROUP BY" {
                         if has_star {
-                            self.aliases.borrow_mut().clear();
                             return QualScan::Aside;
                         }
-                        group_keys.push(bodies[pos as usize - 1]);
+                        group_keys.push(self.group_key(bodies[pos as usize - 1], scopes));
+                        group_texts.push(bodies[pos as usize - 1]);
                     }
                     continue;
                 }
+                let key_text = if what == "ORDER BY" { strip_sort_words(item) } else { item };
+                if let Some(name) = lone_name(key_text) {
+                    match self.select_lookup(&name, &items, scopes) {
+                        Lookup::Aside => return QualScan::Aside,
+                        Lookup::Ambiguous(e) => return QualScan::Err(e),
+                        Lookup::Item(key, body) => {
+                            looked_up.push(item);
+                            if what == "GROUP BY" {
+                                group_keys.push(Some(key));
+                                group_texts.push(body);
+                            }
+                            continue;
+                        }
+                        Lookup::None => {}
+                    }
+                }
                 let r = self.boolean(item, scopes);
                 if !matches!(r, QualScan::Clean) {
-                    self.aliases.borrow_mut().clear();
                     return r;
                 }
                 if what == "GROUP BY" {
-                    let key = canon_ident(item).and_then(|n| alias_body(&n)).unwrap_or(item);
-                    group_keys.push(key);
+                    group_keys.push(self.group_key(item, scopes));
+                    group_texts.push(item);
                 }
             }
-            self.aliases.borrow_mut().clear();
         }
         if group.is_some() {
-            for k in &group_keys {
+            for k in &group_texts {
                 match agg_tokens(k) {
                     Some((toks, _)) if toks.iter().any(|t| t.is_agg() || t.is_win()) => {
                         return QualScan::Err(dsql_status(-104, GDS_DSQL_AGG_GROUP_ERR, Vec::new()));
@@ -50079,12 +50171,14 @@ impl QualCtx<'_> {
             }
         }
         if aggregated {
-            let keys: Vec<GroupKey> = match group_keys.iter().map(|k| self.group_key(k, scopes)).collect() {
-                Some(k) => k,
-                None => return QualScan::Aside,
+            let Some(keys) = group_keys.into_iter().collect::<Option<Vec<GroupKey>>>() else {
+                return QualScan::Aside;
             };
+            if let Some(e) = self.agg_arg_verdict(&bodies, scopes, false) {
+                return QualScan::Err(e);
+            }
             for b in &bodies {
-                match self.agg_item_verdict(b, &keys, scopes, &[]) {
+                match self.agg_item_verdict(b, &keys, scopes) {
                     Some(AggVerdict::Valid) => {}
                     Some(AggVerdict::Nested) => {
                         return QualScan::Err(dsql_status(-104, GDS_DSQL_AGG_NESTED_ERR, Vec::new()))
@@ -50100,11 +50194,16 @@ impl QualCtx<'_> {
                 }
             }
             if let Some(c) = order {
-                for item in split_top_level_commas(c) {
-                    if sort_position(item.trim()).is_some() {
-                        continue;
-                    }
-                    match self.agg_item_verdict(item, &keys, scopes, &aliases) {
+                let judged: Vec<&str> = split_top_level_commas(c)
+                    .into_iter()
+                    .map(|i| i.trim())
+                    .filter(|i| sort_position(i).is_none() && !looked_up.contains(i))
+                    .collect();
+                if let Some(e) = self.agg_arg_verdict(&judged, scopes, false) {
+                    return QualScan::Err(e);
+                }
+                for item in judged {
+                    match self.agg_item_verdict(item, &keys, scopes) {
                         Some(AggVerdict::Valid) => {}
                         Some(AggVerdict::Nested) => {
                             return QualScan::Err(dsql_status(-104, GDS_DSQL_AGG_NESTED_ERR, Vec::new()))
@@ -50125,7 +50224,10 @@ impl QualCtx<'_> {
                     QualScan::Clean => {}
                     other => return other,
                 }
-                match self.agg_item_verdict(h, &keys, scopes, &[]) {
+                if let Some(e) = self.agg_arg_verdict(&[h], scopes, false) {
+                    return QualScan::Err(e);
+                }
+                match self.agg_item_verdict(h, &keys, scopes) {
                     Some(AggVerdict::Valid) => {}
                     Some(AggVerdict::Invalid) => {
                         return QualScan::Err(dsql_status(
@@ -50139,6 +50241,124 @@ impl QualCtx<'_> {
             }
         }
         QualScan::Clean
+    }
+
+    /// pass1_lookup_alias: an ORDER BY or GROUP BY item that is ONE bare
+    /// name is first looked for in the select list - an item ALIASED to
+    /// that name, or an unaliased FIELD of that column name, qualified or
+    /// not, parenthesised or not, `*` and `X.*` expanded to their fields
+    /// (measured on 2182: `SELECT T1.ID .. FROM T1, T2 GROUP BY ID`
+    /// answers, grouped by T1.ID, where the FROM alone would be 42702; so
+    /// does `(T1.ID)`, while `T1.ID + 0` is no field and `GROUP BY ID` is
+    /// the tables' 42702 again). TWO matches are 42702 "Ambiguous field
+    /// name between <a field | an alias> and <a field | an alias> in the
+    /// select list with name" naming the first two in list order (`T1.ID,
+    /// T2.ID`, `T1.*, T2.*`: a field and a field; `T1.A X, T2.A X`: an
+    /// alias and an alias; `T2.A ID, T1.ID`: an alias and a field) - even
+    /// the same column twice (`ID, ID`). The name must be the WHOLE item:
+    /// `GROUP BY X + 0` over `SELECT A X` is -206 "X", and so is ORDER BY's
+    /// (measured). A select list over a context whose columns this reader
+    /// does not know stands aside.
+    fn select_lookup<'t>(&self, name: &str, items: &[&'t str], scopes: &[Vec<ScopeQual>]) -> Lookup<'t> {
+        let level = scopes.last().map(|l| &l[..]).unwrap_or(&[]);
+        if level.iter().any(|q| q.relation.is_none()) {
+            return Lookup::Aside;
+        }
+        let mut hits: Vec<(&'static str, GroupKey, &'t str)> = Vec::new();
+        for item in items {
+            let (body, alias) = diag_split_alias(item);
+            let body = body.trim();
+            if let Some(a) = alias {
+                if canon_ident(a.trim()).as_deref() == Some(name) {
+                    match self.group_key(body, scopes) {
+                        Some(k) => hits.push(("an alias", k, body)),
+                        None => return Lookup::Aside,
+                    }
+                }
+                continue;
+            }
+            // `*` and `X.*`: the fields of every context, or of one
+            let star_of: Option<Vec<usize>> = if body == "*" {
+                Some((0..level.len()).collect())
+            } else if let Some(qual) = body.strip_suffix('*').map(|q| q.trim_end()).and_then(|q| q.strip_suffix('.')) {
+                let Some(qn) = canon_ident(qual.trim()) else { return Lookup::Aside };
+                match level.iter().position(|q| q.name == qn) {
+                    Some(qi) => Some(vec![qi]),
+                    None => return Lookup::Aside,
+                }
+            } else {
+                None
+            };
+            if let Some(ctxs) = star_of {
+                for qi in ctxs {
+                    let Some(meta) = level[qi].relation.as_deref().and_then(|r| self.db.relation_meta(r)) else {
+                        return Lookup::Aside;
+                    };
+                    if find_col(&meta.columns, name).is_some() {
+                        let key = GroupKey { norm: String::new(), col: Some(Placed::At(qi, name.to_string())) };
+                        hits.push(("a field", key, ""));
+                    }
+                }
+                continue;
+            }
+            if !self.is_plain_field(body) {
+                continue;
+            }
+            let Some((toks, _)) = agg_tokens(body) else { return Lookup::Aside };
+            let [t] = toks.as_slice() else { continue };
+            if t.parts.last().map(|p| p.0.as_str()) == Some(name) {
+                match self.group_key(body, scopes) {
+                    Some(k) => hits.push(("a field", k, body)),
+                    None => return Lookup::Aside,
+                }
+            }
+        }
+        let mut hits = hits.into_iter();
+        match (hits.next(), hits.next()) {
+            (None, _) => Lookup::None,
+            (Some((_, k, body)), None) => Lookup::Item(k, body),
+            (Some((first, ..)), Some((second, ..))) => Lookup::Ambiguous(EvalErr::AmbiguousField {
+                first: first.to_string(),
+                second: format!("{} in the select list with name", second),
+                name: name.to_string(),
+            }),
+        }
+    }
+
+    /// The SUM / AVG of a non-number among `texts`, in order - the first
+    /// such call of the first text holding one: "Argument for SUM in
+    /// dialect 3 must be numeric", under the DSQL wrapper and "expression
+    /// evaluation not supported" (measured). `windowed` picks the calls
+    /// under an OVER, which the engine types only once the whole query is
+    /// passed ([diagnose_refusal]'s describe), or the plain aggregates,
+    /// typed as their clause is remapped ([QualCtx::diagnose_tail]).
+    fn agg_arg_verdict(&self, texts: &[&str], scopes: &[Vec<ScopeQual>], windowed: bool) -> Option<EvalErr> {
+        for text in texts {
+            let (toks, _) = agg_tokens(text)?;
+            for t in &toks {
+                let Some(name @ ("SUM" | "AVG")) = t.name() else { continue };
+                if !t.call || t.windowed != windowed {
+                    continue;
+                }
+                let args = call_args(text, t)?;
+                let [a] = args.as_slice() else { continue };
+                let a = a.trim();
+                let ua = a.to_ascii_uppercase();
+                let a = ["DISTINCT ", "ALL "].iter().find(|w| ua.starts_with(*w)).map_or(a, |w| a[w.len()..].trim());
+                match self.fam_of(a, scopes) {
+                    Some(Fam::Num | Fam::Null) | None => {}
+                    Some(_) => {
+                        return Some(EvalErr::Status(vec![
+                            StatusItem::Gds(GDS_DSQL_ERROR),
+                            StatusItem::Gds(335544606), // isc_expression_eval_err
+                            StatusItem::Gds(GDS_DSQL_AGG2_WRONGARG),
+                            StatusItem::Str(name.to_string()),
+                        ]))
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// A bare name's standing in the diagnosis: a reserved word or a
@@ -50155,9 +50375,6 @@ impl QualCtx<'_> {
     /// a CTE, a procedure) stands aside.
     fn bare_verdict(&self, name: &str, quoted: bool, scopes: &[Vec<ScopeQual>]) -> BareVerdict {
         if !quoted && RESERVED_WORDS.binary_search(&name).is_ok() {
-            return BareVerdict::Pass;
-        }
-        if self.aliases.borrow().iter().any(|a| a == name) {
             return BareVerdict::Pass;
         }
         for level in scopes.iter().rev() {
@@ -50261,7 +50478,6 @@ impl QualCtx<'_> {
         item: &str,
         keys: &[GroupKey],
         scopes: &[Vec<ScopeQual>],
-        aliases: &[String],
     ) -> Option<AggVerdict> {
         let (toks, subq) = agg_tokens(item)?;
         if subq {
@@ -50291,9 +50507,6 @@ impl QualCtx<'_> {
             }
             if inside(&win_ranges, t.start) {
                 return None;
-            }
-            if t.parts.len() == 1 && aliases.iter().any(|a| *a == t.parts[0].0) {
-                continue;
             }
             match self.place_column(&t.parts, scopes)? {
                 Placed::Outer => {}
@@ -50376,7 +50589,7 @@ impl QualCtx<'_> {
     fn select_items(&self, text: &str, scopes: &[Vec<ScopeQual>], plain: bool) -> QualScan {
         for item in split_top_level_commas(text) {
             // the diagnosis reads bare names, and an item's alias is none
-            let item = if self.bare { split_alias(item).0 } else { item };
+            let item = if self.bare { diag_split_alias(item).0 } else { item };
             if self.is_plain_field(item) != plain {
                 continue;
             }
@@ -50732,20 +50945,38 @@ impl QualCtx<'_> {
                                 other => return other,
                             }
                         }
-                        return self.boolean(args[0], scopes);
+                        match self.boolean(args[0], scopes) {
+                            QualScan::Clean => {}
+                            other => return other,
+                        }
+                        return self.conditional_verdict(head, &args[1..], scopes, Some(self.off_of(text)));
                     }
-                    "DECODE" if args.len() >= 3 => return self.decode(args[0], &args[1..], scopes),
+                    "DECODE" if args.len() >= 3 => {
+                        match self.decode(args[0], &args[1..], scopes) {
+                            QualScan::Clean => {}
+                            other => return other,
+                        }
+                        let rest = &args[1..];
+                        let mut values: Vec<&str> = (0..rest.len() / 2).map(|k| rest[2 * k + 1]).collect();
+                        if rest.len() % 2 == 1 {
+                            values.push(rest[rest.len() - 1]);
+                        }
+                        return self.conditional_verdict(head, &values, scopes, None);
+                    }
                     "SUBSTRING" => match self.substring_parts(inner) {
                         Some(parts) => parts.into_iter().rev().collect(),
-                        None => args,
+                        None => args.clone(),
                     },
-                    _ => args,
+                    _ => args.clone(),
                 };
                 for a in ordered {
                     match self.value(a, scopes) {
                         QualScan::Clean => {}
                         other => return other,
                     }
+                }
+                if matches!(head, "COALESCE" | "MAXVALUE" | "MINVALUE") {
+                    return self.conditional_verdict(head, &args, scopes, None);
                 }
                 return QualScan::Clean;
             }
@@ -50793,6 +51024,54 @@ impl QualCtx<'_> {
     /// T1.B, `CASE WHEN T.A = 1 THEN (SELECT T1.B ..) ELSE T1.ID END`
     /// T1.ID).
     fn case_expr(&self, text: &str, scopes: &[Vec<ScopeQual>]) -> QualScan {
+        match self.case_parts(text, scopes) {
+            QualScan::Clean => match case_values(text) {
+                Some(values) => {
+                    // a SEARCHED CASE is typed late, a simple one (a
+                    // DECODE to the parser) as it is passed
+                    let searched = self.up_of(text)["CASE".len()..].trim_start().starts_with("WHEN")
+                        && self.up_of(text)["CASE".len()..].trim_start()["WHEN".len()..].starts_with(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+                    self.conditional_verdict("CASE", &values, scopes, searched.then(|| self.off_of(text)))
+                }
+                None => QualScan::Clean,
+            },
+            other => other,
+        }
+    }
+
+    /// The HY004 of a conditional just passed ([QualCtx::hy004_verdict]),
+    /// read by the diagnosis only. COALESCE, DECODE, a simple CASE,
+    /// MAXVALUE and MINVALUE raise it AS THEY ARE PASSED (measured on
+    /// 2182: `DECODE(ID, 1, D, 1) .. ORDER BY NOPE`, `CASE ID WHEN 1 THEN D
+    /// ELSE 1 END .. ORDER BY NOPE`, `MAXVALUE(D, 1) .. ORDER BY NOPE` are
+    /// the HY004); a searched CASE and an IIF (`late`, the node's offset)
+    /// only when the node is TYPED - after the ORDER BY's -206 (`IIF(ID =
+    /// 1, D, 1) .. ORDER BY NOPE` is the -206, and so is `WHERE NOPE = 1
+    /// AND IIF(..) = 1`), after a SUM's own error (`IIF(..), SUM(V)` names
+    /// SUM) and the grouping law (`SELECT IIF(..) .. GROUP BY ID` is
+    /// "Invalid expression"), alone the HY004 (`WHERE IIF(ID = 1, D, 1) =
+    /// 1`), and within an aggregate when the aggregate is typed
+    /// (`SUM(IIF(..))`). The late one is kept for the end of the scan,
+    /// where no other law fired ([QualCtx::deferred]).
+    fn conditional_verdict(&self, name: &str, values: &[&str], scopes: &[Vec<ScopeQual>], late: Option<usize>) -> QualScan {
+        if !self.bare {
+            return QualScan::Clean;
+        }
+        let Some(e) = self.hy004_verdict(name, values, scopes) else { return QualScan::Clean };
+        let Some(at) = late else { return QualScan::Err(e) };
+        let in_agg = agg_tokens(self.sql).is_none_or(|(toks, _)| {
+            toks.iter().any(|t| t.is_agg() && t.start < at && at < t.close)
+        });
+        if scopes.len() > 1 || in_agg {
+            self.unsure.set(true);
+        } else if self.deferred.borrow().is_none() {
+            *self.deferred.borrow_mut() = Some(e);
+        }
+        QualScan::Clean
+    }
+
+    /// [QualCtx::case_expr]'s pass over the CASE's parts.
+    fn case_parts(&self, text: &str, scopes: &[Vec<ScopeQual>]) -> QualScan {
         let up = self.up_of(text);
         let b = up.as_bytes();
         let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
@@ -51410,6 +51689,103 @@ const WIN_FN_NAMES: &[&str] = &[
     "PERCENT_RANK", "RANK", "ROW_NUMBER",
 ];
 
+/// [QualCtx::select_lookup]'s outcome.
+enum Lookup<'t> {
+    /// no select item answers to the name: it is resolved as a column
+    None,
+    /// one item does: the key it makes, and its text (empty for a field
+    /// of an expanded `*`)
+    Item(GroupKey, &'t str),
+    /// two do: 42702
+    Ambiguous(EvalErr),
+    /// a list this reader cannot expand
+    Aside,
+}
+
+/// An ORDER BY item without its trailing sort words (`ID DESC NULLS
+/// LAST` is `ID`).
+fn strip_sort_words(item: &str) -> &str {
+    let mut t = item.trim_end();
+    loop {
+        let Some(cut) = t.rfind(|c: char| c.is_ascii_whitespace()) else { return t };
+        if !matches!(t[cut + 1..].to_ascii_uppercase().as_str(), "ASC" | "ASCENDING" | "DESC" | "DESCENDING" | "NULLS" | "FIRST" | "LAST") {
+            return t;
+        }
+        t = t[..cut].trim_end();
+    }
+}
+
+/// The canonical name of an item that is ONE bare name and nothing else
+/// (quoted or not; a keyword or grammar word is none).
+fn lone_name(item: &str) -> Option<String> {
+    let item = item.trim();
+    let (toks, subq) = agg_tokens(item)?;
+    match toks.as_slice() {
+        [t] if !subq && t.start == 0 && t.end == item.len() && t.parts.len() == 1 && t.is_column() => Some(t.parts[0].0.clone()),
+        _ => None,
+    }
+}
+
+/// A call token's arguments, split at their top-level commas.
+fn call_args<'t>(text: &'t str, t: &AggTok) -> Option<Vec<&'t str>> {
+    let open = text.get(t.end..)?.find('(')? + t.end;
+    Some(split_top_level_commas(text.get(open + 1..t.close)?))
+}
+
+/// A select item's body and alias as the PARSER splits them: the shared
+/// [split_alias], and beside it an alias GLUED to its body with no blank
+/// between - after a closing quote or parenthesis, or a quoted alias
+/// after a name (measured on 2182, each answers under the alias X:
+/// `COUNT(*)X`, `SUM(A)X`, `'a'X`, `"low"X`, `(A)X`, `CAST(A AS
+/// INTEGER)X`, `ID"X"`, `T1.A"X"`, `'a'"X"`). The review found the
+/// diagnosis reading such an alias as a column - a -206 "X", or the
+/// grouping law over it - where the engine answers. A reserved word is
+/// never an alias (`.. ELSE (B)END`).
+fn diag_split_alias(item: &str) -> (&str, Option<&str>) {
+    let split = split_alias(item);
+    if split.1.is_some() {
+        return split;
+    }
+    let t = item.trim_end();
+    let b = t.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let start = if b.last() == Some(&b'"') {
+        // the trailing quoted name's opening quote (`""` is an escape)
+        let mut j = b.len() - 1;
+        loop {
+            if j == 0 {
+                return split;
+            }
+            j -= 1;
+            if b[j] == b'"' {
+                if j > 0 && b[j - 1] == b'"' {
+                    j -= 1;
+                    continue;
+                }
+                break j;
+            }
+        }
+    } else if b.last().is_some_and(|c| ident(*c)) {
+        let mut j = b.len();
+        while j > 0 && ident(b[j - 1]) {
+            j -= 1;
+        }
+        if !b[j].is_ascii_alphabetic() || RESERVED_WORDS.binary_search(&t[j..].to_ascii_uppercase().as_str()).is_ok() {
+            return split;
+        }
+        j
+    } else {
+        return split;
+    };
+    let glued = start > 0
+        && (matches!(b[start - 1], b'\'' | b'"' | b')') || (b[start] == b'"' && ident(b[start - 1])));
+    if glued {
+        (&t[..start], Some(&t[start..]))
+    } else {
+        split
+    }
+}
+
 /// A bare name's standing ([QualCtx::bare_verdict]).
 enum BareVerdict {
     /// resolved, or no reference at all
@@ -51535,8 +51911,7 @@ fn agg_tokens(text: &str) -> Option<(Vec<AggTok>, bool)> {
             continue;
         }
         if c == b'(' {
-            let rest = text[i + 1..].trim_start();
-            if rest.len() >= 6 && rest[..6].eq_ignore_ascii_case("SELECT") && !rest.as_bytes().get(6).is_some_and(|c| ident(*c)) {
+            if word_at_bytes(b, ws(i + 1), "SELECT") {
                 i = matching_paren(b, i)? + 1;
                 subq = true;
                 continue;
@@ -51598,11 +51973,7 @@ fn agg_tokens(text: &str) -> Option<(Vec<AggTok>, bool)> {
             // FILTER (WHERE B > 1)`, `PERCENTILE_CONT(0.5) WITHIN GROUP
             // (ORDER BY A)` and a HAVING's `COUNT(*) FILTER (WHERE B > 0)`
             // answer over an ungrouped B / A)
-            let word_at = |k: usize, w: &str| {
-                text.len() >= k + w.len()
-                    && text[k..k + w.len()].eq_ignore_ascii_case(w)
-                    && !b.get(k + w.len()).is_some_and(|c| ident(*c))
-            };
+            let word_at = |k: usize, w: &str| word_at_bytes(b, k, w);
             while call {
                 let k = ws(close + 1);
                 let o = if word_at(k, "FILTER") {
@@ -51621,7 +51992,7 @@ fn agg_tokens(text: &str) -> Option<(Vec<AggTok>, bool)> {
             let mut over = None;
             if call {
                 let k = ws(close + 1);
-                if text.len() >= k + 4 && text[k..k + 4].eq_ignore_ascii_case("OVER") && !b.get(k + 4).is_some_and(|c| ident(*c)) {
+                if word_at(k, "OVER") {
                     windowed = true;
                     let o = ws(k + 4);
                     if b.get(o) == Some(&b'(') {
@@ -51660,6 +52031,18 @@ fn agg_tokens(text: &str) -> Option<(Vec<AggTok>, bool)> {
         i += 1;
     }
     Some((toks, subq))
+}
+
+/// Does the ASCII word `w` stand at byte `k` of `b` - any case, and not
+/// the head of a longer identifier? Compared as BYTES: the text is the
+/// statement as sent, and a slice `text[k..k + w.len()]` ends inside a
+/// multi-byte character whenever one follows within the word's length
+/// (`ABS(1) = 'éé'` panicked the attachment in the refusal diagnosis,
+/// 08006 on every later statement - found by review, measured on 2182:
+/// the engine answers 22018 there).
+fn word_at_bytes(b: &[u8], k: usize, w: &str) -> bool {
+    b.get(k..k + w.len()).is_some_and(|s| s.eq_ignore_ascii_case(w.as_bytes()))
+        && !b.get(k + w.len()).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$')
 }
 
 /// A text as the aggregate laws compare it: upper case outside quotes,
@@ -51868,6 +52251,26 @@ impl QualCtx<'_> {
             };
         }
         let (toks, subq) = agg_tokens(t)?;
+        // an aggregate's own type: COUNT a number, SUM / AVG a number over
+        // a number, MIN / MAX their argument's (measured on 2182:
+        // `COALESCE(SUM(A), D)`, `COALESCE(COUNT(*), D)` and
+        // `COALESCE(MAX(D), 1)` are all the HY004)
+        if let Some(f) = toks.first().filter(|f| f.is_agg() && f.start == 0 && f.close + 1 == t.len() && !subq) {
+            let args = call_args(t, f)?;
+            let arg = || -> Option<Fam> {
+                let [a] = args.as_slice() else { return None };
+                let a = a.trim();
+                let ua = a.to_ascii_uppercase();
+                let a = ["DISTINCT ", "ALL "].iter().find(|w| ua.starts_with(*w)).map_or(a, |w| a[w.len()..].trim());
+                self.fam_of(a, scopes)
+            };
+            return match f.name()? {
+                "COUNT" => Some(Fam::Num),
+                "SUM" | "AVG" => (arg()? == Fam::Num).then_some(Fam::Num),
+                "MIN" | "MAX" => arg().filter(|f| *f != Fam::Null),
+                _ => None,
+            };
+        }
         if subq || toks.len() != 1 || !toks[0].is_column() || toks[0].end - toks[0].start != t.len() {
             return None;
         }
@@ -51890,89 +52293,31 @@ impl QualCtx<'_> {
         })
     }
 
-    /// The refusals the engine's DESCRIBE of a select list raises, after
-    /// every pass: SUM / AVG over a non-number ("Argument for SUM in
-    /// dialect 3 must be numeric", under the DSQL wrapper and "expression
-    /// evaluation not supported" - measured, and after every -206 of the
-    /// statement, an ORDER BY's included), and a COALESCE / IIF / CASE /
-    /// DECODE / MAXVALUE / MINVALUE whose values have no common type
-    /// (DataTypeUtil::makeFromList: no text among them and a DATE beside
-    /// a TIMESTAMP, a date-time kind beside a number or a BOOLEAN, a
-    /// BOOLEAN beside a number - "Datatypes are not comparable in
-    /// expression COALESCE", HY004, the bare `-104` with no DSQL wrapper;
-    /// IIF is named CASE, measured). The first such call of each item, in
-    /// text order, items in order.
-    fn describe_verdict(&self, bodies: &[&str], scopes: &[Vec<ScopeQual>]) -> Option<EvalErr> {
-        for body in bodies {
-            let (toks, _) = agg_tokens(body)?;
-            let mut calls: Vec<(usize, EvalErr)> = Vec::new();
-            for t in &toks {
-                let Some(name) = t.name() else { continue };
-                // CASE .. END: its THEN and ELSE values
-                let args: Vec<&str> = if name == "CASE" && !t.call {
-                    let Some(values) = case_values(&body[t.start..]) else { continue };
-                    values
-                } else if t.call {
-                    let open = body[t.end..].find('(')? + t.end;
-                    split_top_level_commas(&body[open + 1..t.close])
-                } else {
-                    continue;
-                };
-                let verdict = match name {
-                    "SUM" | "AVG" if t.call && args.len() == 1 => {
-                        let a = args[0].trim();
-                        let ua = a.to_ascii_uppercase();
-                        let a = ["DISTINCT ", "ALL "]
-                            .iter()
-                            .find(|w| ua.starts_with(*w))
-                            .map_or(a, |w| a[w.len()..].trim());
-                        match self.fam_of(a, scopes) {
-                            Some(Fam::Num | Fam::Null) | None => None,
-                            Some(_) => Some(EvalErr::Status(vec![
-                                StatusItem::Gds(GDS_DSQL_ERROR),
-                                StatusItem::Gds(335544606), // isc_expression_eval_err
-                                StatusItem::Gds(GDS_DSQL_AGG2_WRONGARG),
-                                StatusItem::Str(name.to_string()),
-                            ])),
-                        }
-                    }
-                    "COALESCE" | "IIF" | "DECODE" | "MAXVALUE" | "MINVALUE" | "CASE" => {
-                        let values: Vec<&str> = match name {
-                            "IIF" if args.len() == 3 => args[1..].to_vec(),
-                            "DECODE" if args.len() >= 3 => {
-                                let rest = &args[1..];
-                                let mut v: Vec<&str> = (0..rest.len() / 2).map(|k| rest[2 * k + 1]).collect();
-                                if rest.len() % 2 == 1 {
-                                    v.push(rest[rest.len() - 1]);
-                                }
-                                v
-                            }
-                            "IIF" | "DECODE" => continue,
-                            _ => args,
-                        };
-                        let fams: Option<Vec<Fam>> = values.iter().map(|v| self.fam_of(v, scopes)).collect();
-                        match fams {
-                            Some(f) if incomparable(&f) => Some(EvalErr::Status(vec![
-                                StatusItem::Gds(GDS_SQLERR),
-                                StatusItem::Num(-104),
-                                StatusItem::Gds(GDS_DSQL_DATATYPES_NOT_COMPARABLE),
-                                StatusItem::Str(String::new()),
-                                StatusItem::Str(if name == "IIF" { "CASE" } else { name }.to_string()),
-                            ])),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some(e) = verdict {
-                    calls.push((t.start, e));
-                }
-            }
-            if let Some((_, e)) = calls.into_iter().min_by_key(|(at, _)| *at) {
-                return Some(e);
-            }
-        }
-        None
+    /// makeFromList's HY004 over a conditional's VALUES - COALESCE's
+    /// arguments, IIF's two branches, DECODE's results and default, a
+    /// CASE's THEN and ELSE, MAXVALUE / MINVALUE's arguments - when they
+    /// have no common type ([incomparable]): "Datatypes are not comparable
+    /// in expression COALESCE", HY004, the bare `-104` with no DSQL
+    /// wrapper, IIF named CASE. The engine raises it as it PASSES the node,
+    /// right after the node's own arguments, wherever the node stands
+    /// (measured on 2182: `SELECT COALESCE(D, 1) .. ORDER BY NOPE`, `ORDER
+    /// BY COALESCE(D, 1), NOPE`, `GROUP BY COALESCE(D, 1)`, `HAVING
+    /// COALESCE(D, 1) = 1`, `SUM(COALESCE(D, 1))` and `COALESCE(D, 1),
+    /// SUM(NAME)` are all the HY004; `COALESCE(NOPE, 1)`, `COALESCE(D, 1),
+    /// NOPE` - a plain field, passed first - and `WHERE COALESCE(D, 1) = 1
+    /// AND NOPE = 1` - the right operand first - the -206). `values` are
+    /// the texts the result is made from.
+    fn hy004_verdict(&self, name: &str, values: &[&str], scopes: &[Vec<ScopeQual>]) -> Option<EvalErr> {
+        let fams: Vec<Fam> = values.iter().map(|v| self.fam_of(v, scopes)).collect::<Option<_>>()?;
+        incomparable(&fams).then(|| {
+            EvalErr::Status(vec![
+                StatusItem::Gds(GDS_SQLERR),
+                StatusItem::Num(-104),
+                StatusItem::Gds(GDS_DSQL_DATATYPES_NOT_COMPARABLE),
+                StatusItem::Str(String::new()),
+                StatusItem::Str(if name == "IIF" { "CASE" } else { name }.to_string()),
+            ])
+        })
     }
 }
 
@@ -52135,8 +52480,27 @@ fn bare_star_token(sql: &str) -> Option<usize> {
 /// section comment. `sql` is the text as the client sent it. SELECT /
 /// WITH / UPDATE / DELETE are read by the qualifier scan in its bare
 /// mode; an INSERT by [insert_verdict].
+///
+/// The diagnosis reads the text as SENT, multi-byte characters and all,
+/// and it only ever improves a refusal: a reader that trips over a shape
+/// (a panic) must leave the bare refusal standing, never take the
+/// attachment down with it - the 08006 a slice inside a character cost
+/// every later statement of the connection. The panic still reaches the
+/// server log.
 fn diagnose_refusal(sql: &str, dbo: &Option<Database>) -> Option<EvalErr> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| diagnose_refusal_inner(sql, dbo))).ok().flatten()
+}
+
+fn diagnose_refusal_inner(sql: &str, dbo: &Option<Database>) -> Option<EvalErr> {
     let db = dbo.as_ref()?;
+    // a byte past ASCII outside every literal and quoted name is the
+    // lexer's Token unknown AT THAT BYTE, before any pass (measured on
+    // 2182: `SELECT ABS(1)é, NOPE ..` and `SELECT IDé ..` name the lone
+    // lead byte), a token no text of this server can spell: the bare
+    // refusal stays
+    if !mask_literals(sql).is_ascii() {
+        return None;
+    }
     if let Some(e) = token_unknown_verdict(sql) {
         return Some(e);
     }
@@ -52163,7 +52527,8 @@ fn diagnose_refusal(sql: &str, dbo: &Option<Database>) -> Option<EvalErr> {
         ctes: Vec::new(),
         check_top: false,
         bare: true,
-        aliases: std::cell::RefCell::new(Vec::new()),
+        deferred: std::cell::RefCell::new(None),
+        unsure: std::cell::Cell::new(false),
     };
     let scan = match head.as_str() {
         "SELECT" => ctx.select(body, &[]),
@@ -52171,6 +52536,10 @@ fn diagnose_refusal(sql: &str, dbo: &Option<Database>) -> Option<EvalErr> {
         "DELETE" => ctx.delete(body),
         _ => QualScan::Aside,
     };
+    if ctx.unsure.get() {
+        return None;
+    }
+    let deferred = ctx.deferred.borrow_mut().take();
     match scan {
         QualScan::Hit { at, len, name } => {
             let (line, col) = text_line_col(sql, &sql[at..at + len])?;
@@ -52178,7 +52547,10 @@ fn diagnose_refusal(sql: &str, dbo: &Option<Database>) -> Option<EvalErr> {
         }
         QualScan::Err(e) => Some(e),
         QualScan::Clean if head == "SELECT" => {
-            // THE DESCRIBE, after every pass: the outermost query's list
+            // THE DESCRIBE, after every pass: a WINDOW's SUM / AVG of the
+            // outermost list is typed last (measured: `SUM(D) OVER ()`
+            // names SUM after an ORDER BY's or a HAVING's -206, and over a
+            // grouped query after the list's own judgement)
             let (proj, table_s, ..) = split_query(body)?;
             let proj = strip_select_head(proj)?;
             if find_word_depth0(ctx.up_of(body), "UNION", 0).is_some() {
@@ -52197,8 +52569,13 @@ fn diagnose_refusal(sql: &str, dbo: &Option<Database>) -> Option<EvalErr> {
                     push: 0,
                 });
             }
-            let bodies: Vec<&str> = split_top_level_commas(proj).into_iter().map(|i| split_alias(i).0.trim()).collect();
-            ctx.describe_verdict(&bodies, &[level])
+            let bodies: Vec<&str> = split_top_level_commas(proj).into_iter().map(|i| diag_split_alias(i).0.trim()).collect();
+            // ...and a searched CASE / IIF typed then too; which of the
+            // two comes first is not measured
+            match (ctx.agg_arg_verdict(&bodies, &[level], true), deferred) {
+                (Some(_), Some(_)) => None,
+                (e, d) => e.or(d),
+            }
         }
         QualScan::Clean | QualScan::Aside => None,
     }
@@ -52222,7 +52599,8 @@ fn insert_verdict(sql: &str, body: &str, dbo: &Option<Database>) -> Option<EvalE
         ctes: Vec::new(),
         check_top: false,
         bare: true,
-        aliases: std::cell::RefCell::new(Vec::new()),
+        deferred: std::cell::RefCell::new(None),
+        unsure: std::cell::Cell::new(false),
     };
     let ub = ctx.up_of(body);
     let into = find_word_depth0(ub, "INTO", 0)?;
@@ -52916,6 +53294,22 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     if armed && matches!(out.0, Plan::Refused) {
         if let Some(e) = diagnose_refusal(sql, db) {
             out = (Plan::RefusedEval(e), Vec::new());
+        }
+    } else if armed && !matches!(out.0, Plan::RefusedEval(_)) {
+        // ...and ANSWERED, it is still the engine's 42702 when an ORDER BY
+        // or GROUP BY name matches two select items ([QualCtx::select_lookup])
+        // and nothing the engine passes before it refuses: the diagnosis
+        // is asked, and only that answer of it is taken (measured on
+        // 2182: `SELECT ID, ID FROM T1 ORDER BY ID` and `SELECT * FROM T1,
+        // T2 ORDER BY ID` are "between a field and a field in the select
+        // list", where this server answered the rows)
+        let up = sql.to_ascii_uppercase();
+        if up.contains("ORDER") || up.contains("GROUP") {
+            if let Some(e @ EvalErr::AmbiguousField { .. }) = diagnose_refusal(sql, db) {
+                if matches!(&e, EvalErr::AmbiguousField { second, .. } if second.ends_with("in the select list with name")) {
+                    out = (Plan::RefusedEval(e), Vec::new());
+                }
+            }
         }
     }
     if armed {
@@ -67570,15 +67964,24 @@ fn parse_group_by(
             // (measured; `GROUP BY ID, VAL` and a list without any
             // aggregate raise it too). Posted for the outermost refusal
             // arm to serve.
-            let field_item = items.iter().any(|it| match it {
+            // The two are named in LIST order (measured: `SELECT T2.A ID,
+            // T1.ID .. GROUP BY ID` is "an alias and a field", `T1.ID,
+            // T2.A ID` "a field and an alias").
+            let field_at = items.iter().position(|it| match it {
                 SelItem::Col(c, None) => col_name_is(c.rsplit('.').next().unwrap_or(c), name),
                 _ => false,
             });
-            if aliased.is_some() && field_item {
+            let alias_at = items.iter().position(|it| match it {
+                SelItem::Col(_, Some(a)) => a == name,
+                SelItem::Expr(_, n, sym) => n == name && n != sym,
+                _ => false,
+            });
+            if let (Some(f), Some(a)) = (field_at, alias_at) {
+                let (first, second) = if f < a { ("a field", "an alias") } else { ("an alias", "a field") };
                 PREPARE_REFUSAL.with(|r| {
                     *r.borrow_mut() = Some(EvalErr::AmbiguousField {
-                        first: "a field".to_string(),
-                        second: "an alias in the select list with name".to_string(),
+                        first: first.to_string(),
+                        second: format!("{} in the select list with name", second),
                         name: name.to_string(),
                     })
                 });
@@ -96900,6 +97303,32 @@ fn string_to_datetime(
     now: (i32, u32),
     allow_special: bool,
 ) -> Option<(i32, u32)> {
+    string_to_datetime_why(s, expect, now, allow_special).ok()
+}
+
+/// Why a string is no date-time ([string_to_datetime_why]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CvtFail {
+    /// the engine's 22018 "conversion error from string"
+    Conv,
+    /// a date read whole whose YEAR is outside 1..9999: 22008 "value
+    /// exceeds the range for valid dates" (or "timestamps")
+    Range,
+}
+
+/// [string_to_datetime], saying why a string fails. The year range is
+/// judged BEFORE the day and the month's lower bound (measured on 2182:
+/// `'0000-01-01'`, `'0000-02-30'`, `'0000-01-32'`, `'0000-00-01'`,
+/// `'000-01-01'`, `'1-JAN-0000'`, `'01.01.0000'` into a DATE are all the
+/// range error, `'0000-13-01'` and `'10000-01-01'` the conversion error,
+/// and a DATE string with a time part the conversion error whatever its
+/// year).
+fn string_to_datetime_why(
+    s: &str,
+    expect: ExpectTemporal,
+    now: (i32, u32),
+    allow_special: bool,
+) -> Result<(i32, u32), CvtFail> {
     let b = s.as_bytes();
     let end = b.len();
     let mut p = 0usize;
@@ -96947,7 +97376,7 @@ fn string_to_datetime(
             }
             // at least 3 characters for a month name
             if temp.len() < 3 {
-                return None;
+                return Err(CvtFail::Conv);
             }
             // month names are only allowed in the first two positions
             let month = if i < 2 {
@@ -96979,26 +97408,26 @@ fn string_to_datetime(
                     // was written (confirmed against the previous
                     // binary, so it is not this chunk's regression).
                     if !allow_special || i != start {
-                        return None;
+                        return Err(CvtFail::Conv);
                     }
                     while p < end {
                         if b[p] != b' ' && b[p] != b'\t' && b[p] != 0 {
-                            return None;
+                            return Err(CvtFail::Conv);
                         }
                         p += 1;
                     }
                     let (nd, nt) = now;
                     if temp == "NOW" {
-                        return Some((nd, nt));
+                        return Ok((nd, nt));
                     }
                     if expect == ExpectTemporal::Time {
-                        return None;
+                        return Err(CvtFail::Conv);
                     }
                     return match temp.as_str() {
-                        "TODAY" => Some((nd, 0)),
-                        "TOMORROW" => Some((nd + 1, 0)),
-                        "YESTERDAY" => Some((nd - 1, 0)),
-                        _ => None,
+                        "TODAY" => Ok((nd, 0)),
+                        "TOMORROW" => Ok((nd + 1, 0)),
+                        "YESTERDAY" => Ok((nd - 1, 0)),
+                        _ => Err(CvtFail::Conv),
                     };
                 }
             }
@@ -97006,7 +97435,7 @@ fn string_to_datetime(
             // a non-digit, non-letter start: after a timestamp's date the
             // engine reads a TIMEZONE here; fc refuses it below (boundary)
             if expect == ExpectTemporal::Date || i != 3 {
-                return None;
+                return Err(CvtFail::Conv);
             }
             break;
         }
@@ -97039,7 +97468,7 @@ fn string_to_datetime(
                 }
             }
             if !advanced {
-                return None;
+                return Err(CvtFail::Conv);
             }
         } else if i == 2 {
             // day to hours: the whitespace already skipped is the separator
@@ -97062,18 +97491,18 @@ fn string_to_datetime(
 
     // at least two components
     if (i as i32) - (start as i32) - 1 < 1 {
-        return None;
+        return Err(CvtFail::Conv);
     }
     let last = i - 1; // the last component read
     // dates cannot have a time portion
     if expect == ExpectTemporal::Date && last > 2 {
-        return None;
+        return Err(CvtFail::Conv);
     }
     // no random trash after the recognized string (a trailing timezone
     // the engine would accept refuses here too - the recorded boundary)
     while p < end {
         if b[p] != b' ' && b[p] != b'\t' && b[p] != 0 {
-            return None;
+            return Err(CvtFail::Conv);
         }
         p += 1;
     }
@@ -97098,7 +97527,7 @@ fn string_to_datetime(
             || description[pd] > 2
             || description[pd] <= 0
         {
-            return None;
+            return Err(CvtFail::Conv);
         }
         let mut year = components[py] as i32;
         let month = components[pm];
@@ -97117,12 +97546,18 @@ fn string_to_datetime(
         }
         // round-trip to reject impossible dates (Feb 30, month 13), and
         // the engine's own year range
-        if !(1..=12).contains(&month) || day == 0 || !(1..=9999).contains(&year) {
-            return None;
+        if month > 12 {
+            return Err(CvtFail::Conv);
+        }
+        if !(1..=9999).contains(&year) {
+            return Err(CvtFail::Range);
+        }
+        if month == 0 || day == 0 {
+            return Err(CvtFail::Conv);
         }
         date_days = days_of_civil(year, month, day);
         if civil_of(date_days) != (year, month, day) {
-            return None;
+            return Err(CvtFail::Conv);
         }
     } else {
         date_days = 0;
@@ -97143,7 +97578,7 @@ fn string_to_datetime(
             || description[5] > 2
             || description[6] > 4
         {
-            return None;
+            return Err(CvtFail::Conv);
         }
         let mut thou = components[6];
         let mut d6 = description[6];
@@ -97153,10 +97588,10 @@ fn string_to_datetime(
         }
         time_units = ((h * 60 + m) * 60 + sec) * 10000 + thou;
     } else if expect == ExpectTemporal::Time {
-        return None;
+        return Err(CvtFail::Conv);
     }
 
-    Some((date_days, time_units))
+    Ok((date_days, time_units))
 }
 
 /// A DATE literal's text - the full engine grammar WITHOUT the specials
@@ -138098,6 +138533,73 @@ mod tests {
         assert_eq!(cols, vec!["V"]);
     }
 
+    /// The aggregate lexer reads the text AS SENT: a call followed within
+    /// a keyword's length by a multi-byte character (`ABS(1) = 'éé'`, a
+    /// `'€'` right after a `(`) must not slice inside the character -
+    /// that panic dropped the attachment (08006).
+    #[test]
+    fn the_aggregate_lexer_never_slices_inside_a_character() {
+        for text in [
+            "ABS(1) = 'éé'",
+            "ABS(1)é",
+            "ABS(1)€€",
+            "ABS(1) é€",
+            "SUM(A)€ FILTER",
+            "COUNT(*) WITHIN€",
+            "(é€€)",
+            "(€SELECT 1)",
+            "GEN_ID(G, 0) || 'é'",
+            "OVERLAY(W PLACING 'é' FROM 1) = 'éé'",
+        ] {
+            for cut in 0..=text.len() {
+                if let Some(t) = text.get(..cut) {
+                    let _ = agg_tokens(t);
+                    let _ = diag_split_alias(t);
+                    let _ = lone_name(t);
+                    let _ = strip_sort_words(t);
+                }
+            }
+        }
+        assert!(word_at_bytes("x OVER (".as_bytes(), 2, "OVER"));
+        assert!(!word_at_bytes("x OVERS".as_bytes(), 2, "OVER"));
+        assert!(!word_at_bytes("x OVé".as_bytes(), 2, "OVER"));
+    }
+
+    /// An alias glued to its item is the parser's alias (measured: each
+    /// of these answers under X); a reserved word never is one.
+    #[test]
+    fn a_glued_alias_is_an_alias() {
+        assert_eq!(diag_split_alias("COUNT(*)X"), ("COUNT(*)", Some("X")));
+        assert_eq!(diag_split_alias("'a'X"), ("'a'", Some("X")));
+        assert_eq!(diag_split_alias("\"low\"X"), ("\"low\"", Some("X")));
+        assert_eq!(diag_split_alias("ID\"X\""), ("ID", Some("\"X\"")));
+        assert_eq!(diag_split_alias("(A)X"), ("(A)", Some("X")));
+        assert_eq!(diag_split_alias("T1.\"A\"").1, None);
+        assert_eq!(diag_split_alias("CASE WHEN A = 1 THEN (B) ELSE (C)END").1, None);
+        assert_eq!(diag_split_alias("1X").1, None);
+        assert_eq!(strip_sort_words("ID DESC NULLS LAST"), "ID");
+        assert_eq!(lone_name("\"ID\"").as_deref(), Some("ID"));
+        assert_eq!(lone_name("X + 0"), None);
+    }
+
+    /// A year outside 1..9999 is the range error, judged before the day
+    /// (measured on 2182), a month past 12 the conversion error.
+    #[test]
+    fn a_year_zero_date_is_out_of_range() {
+        let now = (0, 0);
+        let why = |s: &str, e| string_to_datetime_why(s, e, now, true).err();
+        assert_eq!(why("0000-01-01", ExpectTemporal::Date), Some(CvtFail::Range));
+        assert_eq!(why("0000-02-30", ExpectTemporal::Date), Some(CvtFail::Range));
+        assert_eq!(why("0000-00-01", ExpectTemporal::Date), Some(CvtFail::Range));
+        assert_eq!(why("1-JAN-0000", ExpectTemporal::Date), Some(CvtFail::Range));
+        assert_eq!(why("0000-01-01 10:00", ExpectTemporal::Timestamp), Some(CvtFail::Range));
+        assert_eq!(why("0000-13-01", ExpectTemporal::Date), Some(CvtFail::Conv));
+        assert_eq!(why("10000-01-01", ExpectTemporal::Date), Some(CvtFail::Conv));
+        assert_eq!(why("0000-01-01 10:00", ExpectTemporal::Date), Some(CvtFail::Conv));
+        assert_eq!(why("2020-02-30", ExpectTemporal::Date), Some(CvtFail::Conv));
+        assert_eq!(why("2020-01-01", ExpectTemporal::Date), None);
+    }
+
     /// A bare `*` beside another select item is the parser's Token
     /// unknown - at the `*`, or at the comma after a leading one.
     #[test]
@@ -149167,10 +149669,17 @@ mod tests {
         let blob = Value::Blob(0, 0);
         let parts = vec![("B".to_string(), &blob)];
         assert_eq!(constraint_key_text(&parts), None);
-        // the 250-char cap, like btr.cpp print_key's
+        // each VALUE capped at 250 bytes and marked `...` (measured on
+        // 2182), at a character's edge
         let long = Value::Text("x".repeat(300));
         let parts = vec![("T".to_string(), &long)];
-        assert_eq!(constraint_key_text(&parts).unwrap().len(), 250);
+        assert_eq!(constraint_key_text(&parts).unwrap(), format!("(\"T\" = '{}...)", "x".repeat(249)));
+        let wide = Value::Text("é".repeat(130));
+        let parts = vec![("T".to_string(), &wide), ("B".to_string(), &long)];
+        assert_eq!(
+            constraint_key_text(&parts).unwrap(),
+            format!("(\"T\" = '{}..., \"B\" = '{}...)", "é".repeat(124), "x".repeat(249))
+        );
     }
 
     #[test]
