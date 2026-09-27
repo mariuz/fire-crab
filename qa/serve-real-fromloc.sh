@@ -41,21 +41,42 @@
 #      BLR, so CREATE VIEW over the predicate answers now too, its
 #      RDB$VIEW_BLR byte-identical to the engine's (read back by 2182).
 #
+#   6. (round 5) A PART WORD the grammar lacks - EXTRACT(fortnight ..),
+#      FIRST_DAY(OF day ..), NTH_VALUE(..) FROM middle - is the parser's
+#      -104 Token unknown at that word, spelled as sent ([part_word_lint];
+#      it was a made-up -206 Column unknown).
+#   7. (round 5) A UNION column is as wide as its widest branch in
+#      CHARACTERS: an expression's width already counts them, and the
+#      union divided it by its charset's bytes again, so OVERLAY / `||` /
+#      LPAD / RPAD in a branch beside a literal described too narrow and
+#      died at fetch with a 22001. A NONE column yields to the
+#      attachment's set of a literal. A LATERAL's outer text column stands
+#      in at its character width in its own set (it was four times too
+#      wide under UTF8), and the body's literals keep their characters.
+#   8. (round 6) A NONE branch arrives in a union column of a real set
+#      as a BYTE COPY read in that set (a UTF8 'é' stored in a NONE
+#      column had come back 'Ã©', a lone E9 is 22000 Malformed string,
+#      and under WIN1252 a C4 83 dropped the connection); a literal
+#      under a real attachment is of the attachment's set in the
+#      first-wins order. An OCTETS column first takes each literal / NONE
+#      sibling's own bytes. A row that fails in the encoder (a UTF8 value
+#      WIN1252 cannot hold) is taken back, and the 22018 follows the rows
+#      before it - it desynchronised the wire (08006).
+#
 # RECORDED, not fixed (every one a refusal here, never a wrong answer):
 # LIST() inside an expression (a blob result, the recorded boundary of
 # the aggregate router); a VIEW whose select item is the predicate, or
-# over OVERLAY (the view compiler has neither); OVERLAY / EXTRACT / FIRST_DAY in a PSQL
-# assignment (the procedure compiler knows none of the system functions
-# but SUBSTRING / TRIM / the casts - EXTRACT(YEAR ..) refuses there the
-# same way); OVERLAY over two different character sets; DATEADD /
-# DATEDIFF with QUARTER (the engine's fetch-time "Invalid part");
-# an unordered NTH_VALUE window; a TRUE / FALSE literal in an EXECUTE
-# BLOCK (the procedure compiler has none - `IF (TRUE IS DISTINCT FROM
-# FALSE)` refuses for that, no longer as -204 "FALSE"); and the engine's
-# parser -104s (an
-# unknown EXTRACT part, FIRST_DAY(OF DAY ..), a direction on another
-# window function, FOO(1 FROM 2)) where this server says a bare 42000 or
-# -804.
+# over OVERLAY (the view compiler has neither); OVERLAY over two
+# different character sets; DATEADD / DATEDIFF with QUARTER (the
+# engine's fetch-time "Invalid part"); an unordered NTH_VALUE window; a
+# UNION whose OCTETS column follows a text branch, or sits beside a
+# real-charset column (the engine converts that sibling by rules this
+# server does not reproduce); a VIEW over a NONE column and a literal
+# read under another attachment than the one that created it (the view
+# keeps its creator's set there, this server re-plans in the reader's); a non-ASCII LATERAL body
+# under a NONE attachment; and the parser -104s of a direction on
+# another window function and of FOO(1 FROM 2), where this server says a
+# bare 42000 or -804.
 #
 # Usage: qa/serve-real-fromloc.sh [port]   (default 5710)
 set -u
@@ -75,6 +96,7 @@ create table d (id integer, dt date, ts timestamp, s varchar(20), n integer, tz 
 create table t (v varchar(5));
 create table "FROM" (id integer, "FROM" varchar(10));
 create table u8 (u varchar(10) character set utf8, w varchar(10) character set win1252);
+create table un (id integer, s varchar(20) character set utf8, b varchar(10) character set win1252, z varchar(8) character set none, o varchar(4) character set octets);
 insert into w values (1, 1, 10);
 insert into w values (2, 1, 20);
 insert into w values (3, 1, 30);
@@ -88,11 +110,17 @@ insert into t values ('b');
 insert into t values ('a');
 insert into "FROM" values (1, 'x');
 insert into u8 values ('abc', 'def');
+insert into un values (1, 'abcdefghijklmnopqrst', 'x', 'zz', 'oo');
+insert into un values (2, 'ăîșțâăîșțâăîșțâăîșțâ', 'y', 'zz', 'oo');
+create table nn (id integer, x varchar(6) character set none, c char(4) character set none);
+insert into nn values (1, 'ab', 'ăb');
+insert into nn values (2, 'é', null);
+insert into nn values (3, cast(x'E9' as varchar(1) character set none), null);
 COMMIT;
 create view vo as select id, overlay(s placing 'Z' from 1 for 1) o, extract(quarter from dt) q, first_day(of month from dt) f from d;
 COMMIT;
 SQL
-} | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/fromloc-build.log 2>&1
+} | "$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" > /tmp/fromloc-build.log 2>&1
 grep -qiE 'Statement failed|error' /tmp/fromloc-build.log && { echo "FAIL fixture build"; sed 's/^/   /' /tmp/fromloc-build.log; exit 1; }
 cp "$ENG" "$FC"; chmod 666 "$FC"
 
@@ -108,7 +136,8 @@ kill -0 $srv 2>/dev/null || { echo "FAIL fcwire is not running - port $PORT alre
 fail=0
 ran=0
 # a SCRIPT (a session), its lines squeezed and joined; errors included
-sess() { printf '%s\n' "$2" | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
+# (CH=<set> before a cell attaches in that character set; NONE otherwise)
+sess() { printf '%s\n' "$2" | timeout 25 "$ISQL" -q ${CH:+-ch "$CH"} -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
     | grep -av '^ *$' | grep -av '^=' | grep -av '^After line' | grep -av '^At line' \
     | sed 's/^ *//;s/ *$//;s/  */ /g' | paste -sd'|'; }
 # an EXECUTE BLOCK script, terminators switched
@@ -286,6 +315,12 @@ pin  "7b CREATE VIEW ... IS DISTINCT FROM" "create view vd1 as select id from w 
 pin  "7b CREATE VIEW ... IS NOT DISTINCT FROM NULL" "create view vd2 as select id from w where val is not distinct from null; commit; select id from vd2 order by id; select octet_length(rdb\$view_blr) from rdb\$relations where rdb\$relation_name = 'VD2';" "ID|5|OCTET_LENGTH|18"
 pin  "7b CREATE VIEW ... NOT (IS DISTINCT FROM): the NOT cancels" "create view vd3 as select id from w where not (val is distinct from 20); commit; select id from vd3 order by id; select octet_length(rdb\$view_blr) from rdb\$relations where rdb\$relation_name = 'VD3';" "ID|2|OCTET_LENGTH|24"
 
+echo "--- 8b. OVERLAY / EXTRACT / FIRST_DAY in a PSQL assignment (the procedure compiler learnt them since; recorded refusals before)"
+pin  "8b OVERLAY in a PSQL assignment" "$(eb "execute block returns (r varchar(10)) as begin r = overlay('abcdef' placing 'Z' from 2 for 3); suspend; end")" "R|aZef"
+pin  "8b EXTRACT QUARTER in a PSQL assignment" "$(eb "execute block returns (r integer) as begin r = extract(quarter from date '2024-11-01'); suspend; end")" "R|4"
+pin  "8b FIRST_DAY in a PSQL assignment (was -204 \"DATE\")" "$(eb "execute block returns (r date) as begin r = first_day(of month from date '2024-11-11'); suspend; end")" "R|2024-11-01"
+pin  "8b EXTRACT(YEAR) in a PSQL assignment" "$(eb "execute block returns (r integer) as begin r = extract(year from date '2024-11-01'); suspend; end")" "R|2024"
+
 echo "--- 8. RECORDED: the engine answers, this server refuses"
 refused "8 a VIEW whose select item is IS NOT DISTINCT (the compiler has no boolean item)" "create view vd4 as select id, val is not distinct from 20 b from w; commit; select count(*) from rdb\$relations where rdb\$relation_name = 'VD4';" "COUNT|1"
 refused "8 a VIEW over OVERLAY (the compiler knows no OVERLAY)" "create view vd5 as select overlay(s placing 'x' from 1) o from d; commit; select count(*) from rdb\$relations where rdb\$relation_name = 'VD5';" "COUNT|1"
@@ -293,19 +328,73 @@ refused "8 LIST cast" "select cast(list(v) as varchar(50)) from t;" "CAST|b,a"
 refused "8 LIST concatenated" "select list(v) || '!' from t;" "CONCATENATION|0:2|CONCATENATION:|b,a!"
 refused "8 LIST measured" "select char_length(list(v)) from t;" "CHAR_LENGTH|3"
 refused "8 SUBSTRING over LIST (was -204 \"1\")" "select substring(list(v) from 1 for 3) from t;" "SUBSTRING|0:2|SUBSTRING:|b,a"
-pin "8 OVERLAY in a PSQL assignment" "$(eb "execute block returns (r varchar(10)) as begin r = overlay('abcdef' placing 'Z' from 2 for 3); suspend; end")" "R|aZef"
-pin "8 EXTRACT QUARTER in a PSQL assignment" "$(eb "execute block returns (r integer) as begin r = extract(quarter from date '2024-11-01'); suspend; end")" "R|4"
-pin "8 FIRST_DAY in a PSQL assignment (was -204 \"DATE\")" "$(eb "execute block returns (r date) as begin r = first_day(of month from date '2024-11-11'); suspend; end")" "R|2024-11-01"
 pin "8 ...as EXTRACT(YEAR) is (the compiler's boundary)" "$(eb "execute block returns (r integer) as begin r = extract(year from date '2024-11-01'); suspend; end")" "R|2024"
 refused "8 OVERLAY over two sets" "select overlay(u placing w from 1) from u8;" "OVERLAY|def"
 refused "8 an unordered NTH_VALUE FROM LAST" "select id, nth_value(val, 1) from last over (partition by g) from w order by id;" "ID NTH_VALUE|1 30|2 30|3 30|4 <null>|5 <null>|6 <null>"
 err_differs "8 DATEADD QUARTER" "select dateadd(1 quarter to date '2024-01-31') from rdb\$database;" "DATEADD|Statement failed, SQLSTATE = 42000|expression evaluation not supported|-Invalid part QUARTER to be added to a DATE/TIME/TIMESTAMP value in DATEADD"
 err_differs "8 DATEDIFF QUARTER" "select datediff(quarter, date '2024-01-01', date '2024-12-01') from rdb\$database;" "DATEDIFF|Statement failed, SQLSTATE = 42000|expression evaluation not supported|-Invalid part QUARTER to express the difference between two DATE/TIME/TIMESTAMP values in DATEDIFF"
-err_differs "8 an unknown EXTRACT part" "select extract(bogus from dt) from d;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 16|-bogus"
-err_differs "8 FIRST_DAY OF DAY" "select first_day(of day from date '2024-05-17') from rdb\$database;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 21|-day"
 err_differs "8 FIRST_VALUE FROM LAST (was -204 \"LAST\")" "select id, first_value(val) from last over (order by id) from w;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 29|-from"
-err_differs "8 NTH_VALUE FROM MIDDLE (was -204 \"MIDDLE\")" "select id, nth_value(val, 2) from middle over (order by id) from w;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 35|-middle"
 err_differs "8 an unknown function with a FROM" "select foo(1 from 2) from d;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 14|-from"
+
+echo "--- 9. a part word the grammar lacks is the parser's -104 at that word (was a made-up -206 Column unknown)"
+pin  "9 an unknown EXTRACT part" "select extract(bogus from dt) from d;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 16|-bogus"
+pin  "9 FIRST_DAY OF DAY" "select first_day(of day from date '2024-05-17') from rdb\$database;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 21|-day"
+pin  "9 NTH_VALUE FROM MIDDLE (was -204 \"MIDDLE\")" "select id, nth_value(val, 2) from middle over (order by id) from w;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 35|-middle"
+pin  "9 EXTRACT(fortnight) in WHERE, at its own column" "select id from d where extract(fortnight from dt) = 1;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 32|-fortnight"
+pin  "9 EXTRACT(foo.bar) names foo" "select extract(foo.bar from dt) from d;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 16|-foo"
+pin  "9 EXTRACT(<a column>) names it" "select extract(dt from dt) from d;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 16|-dt"
+pin  "9 FIRST_DAY(OF fortnight)" "select last_day(of fortnight from dt) from d;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 20|-fortnight"
+pin  "9 NTH_VALUE FROM a quoted word keeps its quotes" "select id, nth_value(val, 2) from \"MIDDLE\" over (order by id) from w;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 35|-\"MIDDLE\""
+pin  "9 NTH_VALUE FROM a table name" "select nth_value(val, 1) from w;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 31|-w"
+pin  "9 every real part still answers" "select extract(year from dt), extract(quarter from dt), extract(weekday from dt), extract(yearday from dt), first_day(of week from dt), last_day(of quarter from dt) from d where id = 1;" "EXTRACT EXTRACT EXTRACT EXTRACT FIRST_DAY LAST_DAY|2024 2 5 137 2024-05-12 2024-06-30"
+
+echo "--- 10. A UNION column is as wide as its widest branch IN CHARACTERS - an expression's width already counts them"
+CH=UTF8 pin "10 OVERLAY beside a literal: VARCHAR(21), no 22001 at fetch" "$SQLDA select overlay(s placing 'Q' from 21) from un union all select 'x' from rdb\$database;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 84 charset: 4 SYSTEM.UTF8|: name: alias:|: table: schema: owner:|abcdefghijklmnopqrstQ|ăîșțâăîșțâăîșțâăîșțâQ|x"
+CH=UTF8 pin "10 OVERLAY under a distinct UNION" "select overlay(s placing 'QRS' from 21) r from un union select 'x' from rdb\$database;" "R|abcdefghijklmnopqrstQRS|x|ăîșțâăîșțâăîșțâăîșțâQRS"
+CH=UTF8 pin "10 a concatenation, either branch order" "$SQLDA select 'x' from rdb\$database union all select s || 'QRS' from un;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 92 charset: 4 SYSTEM.UTF8|: name: alias:|: table: schema: owner:|x|abcdefghijklmnopqrstQRS|ăîșțâăîșțâăîșțâăîșțâQRS"
+CH=UTF8 pin "10 LPAD / RPAD / SUBSTRING widths" "$SQLDA select lpad(s, 25), rpad(s, 22, '-'), substring(s from 1 for 3) from un union all select 'x', 'y', 'z' from rdb\$database;" "INPUT message field count: 0|OUTPUT message field count: 3|01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 100 charset: 4 SYSTEM.UTF8|: name: alias:|: table: schema: owner:|02: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 88 charset: 4 SYSTEM.UTF8|: name: alias:|: table: schema: owner:|03: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 12 charset: 4 SYSTEM.UTF8|: name: alias:|: table: schema: owner:|abcdefghijklmnopqrst abcdefghijklmnopqrst-- abc|ăîșțâăîșțâăîșțâăîșțâ ăîșțâăîșțâăîșțâăîșțâ-- ăîș|x y z"
+CH=UTF8 pin "10 beside a WIN1252 column: 23 characters, not 40" "$SQLDA select s || 'QRS' from un union all select b from un;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 92 charset: 4 SYSTEM.UTF8|: name: alias:|: table: schema: owner:|abcdefghijklmnopqrstQRS|ăîșțâăîșțâăîșțâăîșțâQRS|x|y"
+CH=WIN1252 pin "10 under a WIN1252 attachment" "$SQLDA select b || 'QRS' from un union all select 'x' from rdb\$database;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 13 charset: 53 SYSTEM.WIN1252|: name: alias:|: table: schema: owner:|xQRS|yQRS|x"
+CH=UTF8 pin "10 a NONE column yields to a literal (the attachment's set)" "$SQLDA select z from un where id = 1 union all select 'abc' from rdb\$database;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 32 charset: 4 SYSTEM.UTF8|: name: alias: Z|: table: schema: owner:|Z|zz|abc"
+CH=UTF8 pin "10 ...and to a NONE concatenation" "$SQLDA select z from un where id = 1 union all select z || 'Q' from un where id = 1;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 36 charset: 4 SYSTEM.UTF8|: name: alias: Z|: table: schema: owner:|Z|zz|zzQ"
+pin  "10 under a NONE attachment the NONE column keeps its name" "$SQLDA select z from un where id = 1 union all select 'abc' from rdb\$database;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 8 charset: 0 SYSTEM.NONE|: name: Z alias: Z|: table: UN schema: PUBLIC owner: SYSDBA|Z|zz|abc"
+CH=UTF8 refused "10 OCTETS beside a literal (the engine converts; this answered the text)" "select 'abc' from rdb\$database union all select o from un where id = 1;" "616263|6F6F"
+CH=UTF8 refused "10 OCTETS beside a WIN1252 column" "select o from un where id = 1 union all select b from un where id = 1;" "O|6F6F|78"
+
+echo "--- 11. LATERAL: an outer text column stands in at its CHARACTER width, and a literal's characters survive"
+CH=UTF8 pin "11 a concatenation over the outer column: VARCHAR(21)" "$SQLDA select r from un cross join lateral (select un.s || 'L' r from rdb\$database) x where un.id = 1;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 84 charset: 4 SYSTEM.UTF8|: name: CONCATENATION alias: R|: table: schema: owner:|R|abcdefghijklmnopqrstL"
+CH=WIN1252 pin "11 OVERLAY over it under WIN1252" "$SQLDA select r from un cross join lateral (select overlay(un.b placing 'L' from 1) r from rdb\$database) x where un.id = 1;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 11 charset: 53 SYSTEM.WIN1252|: name: OVERLAY alias: R|: table: schema: owner:|R|L"
+CH=UTF8 pin "11 a multi-byte literal in the body (was 'Ã©')" "select r from un cross join lateral (select un.b || 'é' r from rdb\$database) x where un.id = 1;" "R|xé"
+refused "11 a non-ASCII body under a NONE attachment" "select r from un cross join lateral (select un.b || 'é' r from rdb\$database) x where un.id = 1;" "R|xé"
+
+echo "--- 12. (round 6) a NONE branch arrives in the union's set AS BYTES, an OCTETS column takes its siblings' bytes, and a failed row takes itself back"
+CH=UTF8 pin "12 a NONE column beside a literal: its bytes read as UTF8 (was 'Ã©')" "select x from nn where id < 3 union all select 'ă' from rdb\$database;" "X|ab|é|ă"
+CH=UTF8 pin "12 ...the literal first" "select 'ă' from rdb\$database union all select x from nn where id < 3;" "ă|ab|é"
+CH=UTF8 pin "12 ...under a distinct UNION" "select x from nn where id < 3 union select 'abc' from rdb\$database;" "X|ab|abc|é"
+CH=UTF8 pin "12 ...measured through a derived table (was 2 / 4)" "select char_length(r), octet_length(r) from (select x r from nn where id < 3 union all select 'abc' from rdb\$database);" "CHAR_LENGTH OCTET_LENGTH|2 2|1 2|3 3"
+CH=UTF8 pin "12 ...three branches" "select x from nn where id = 2 union all select 'a' from rdb\$database union all select x from nn where id = 2;" "X|é|a|é"
+CH=UTF8 pin "12 a NONE byte that is no UTF8 is Malformed string" "select x from nn where id = 3 union all select 'a' from rdb\$database;" "X|Statement failed, SQLSTATE = 22000|Malformed string"
+CH=UTF8 pin "12 a NONE CHAR beside a literal (was 'Äb')" "select c from nn where id = 1 union all select 'ab' from rdb\$database;" "C|ăb|ab"
+CH=UTF8 pin "12 ...padded to the column in a derived table, every branch" "select char_length(c), octet_length(c) from (select c from nn where id = 1 union all select 'ab' from rdb\$database);" "CHAR_LENGTH OCTET_LENGTH|4 5|4 4"
+CH=UTF8 pin "12 ...beside a NONE concatenation" "select c from nn where id = 1 union all select c || 'Q' from nn where id = 1;" "C|ăb|ăb Q"
+CH=WIN1252 pin "12 a NONE CHAR under WIN1252: the bytes are WIN1252 letters (was 08006)" "select c from nn where id = 1 union all select 'ab' from rdb\$database;" "C|ăb|ab"
+CH=UTF8 pin "12 a literal before a WIN1252 column: the NONE bytes read as UTF8" "select x from nn where id = 2 union all select 'a' from rdb\$database union all select b from un where id = 1;" "X|é|a|x"
+CH=UTF8 pin "12 a WIN1252 column before the literal: read as WIN1252" "select x from nn where id = 2 union all select b from un where id = 1 union all select 'a' from rdb\$database;" "X|Ã©|x|a"
+CH=UTF8 pin "12 OCTETS first beside a literal" "select o from un where id = 1 union all select 'abc' from rdb\$database;" "O|6F6F|616263"
+CH=WIN1252 pin "12 ...under WIN1252" "select o from un where id = 1 union all select 'abc' from rdb\$database;" "O|6F6F|616263"
+pin  "12 ...under NONE" "select o from un where id = 1 union all select 'abc' from rdb\$database;" "O|6F6F|616263"
+CH=UTF8 pin "12 OCTETS beside a non-ASCII literal: its UTF8 bytes (was E9)" "select o from un where id = 1 union all select 'é' from rdb\$database;" "O|6F6F|C3A9"
+CH=UTF8 pin "12 ...and the width stays the literal's characters" "select o from un where id = 1 union all select 'éaaa' from rdb\$database;" "O|6F6F|Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 4, actual 5"
+CH=WIN1252 pin "12 OCTETS beside a non-ASCII literal under WIN1252" "select o from un where id = 1 union all select 'é' from rdb\$database;" "O|6F6F|C3A9"
+CH=UTF8 pin "12 OCTETS beside a wider OCTETS cast" "select o from un where id = 1 union all select cast(o as varchar(6) character set octets) from un where id = 1;" "O|6F6F|6F6F"
+CH=UTF8 pin "12 CHAR(2) OCTETS beside CHAR(3) OCTETS: zero-padded" "select cast('ab' as char(2) character set octets) from rdb\$database union all select cast('abc' as char(3) character set octets) from rdb\$database;" "616200|616263"
+CH=UTF8 pin "12 OCTETS beside a NONE column" "select o from un where id = 1 union all select x from nn where id < 3;" "O|6F6F|6162|C3A9"
+CH=UTF8 pin "12 an OCTETS concatenation beside a literal" "select o || 'é' from un where id = 1 union all select 'x' from rdb\$database;" "6F6FC3A9|78"
+CH=UTF8 pin "12 OCTETS beside a NONE concatenation (was 7A7AE9)" "select o from un where id = 1 union all select z || 'é' from un where id = 1;" "O|6F6F|7A7AC3A9"
+CH=WIN1252 pin "12 a UTF8 branch WIN1252 cannot hold: 22018 at that row (was 08006)" "select x from nn where id = 1 union all select s from un; select 1 from rdb\$database;" "X|ab|abcdefghijklmnopqrst|Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets|CONSTANT|1"
+CH=WIN1252 pin "12 ...and a LATERAL body returning it (was 08006)" "select r from un cross join lateral (select un.s r from rdb\$database) x; select 1 from rdb\$database;" "R|abcdefghijklmnopqrst|Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets|CONSTANT|1"
+CH=UTF8 refused "12 a text branch before OCTETS (the engine describes OCTETS)" "select 'abc' from rdb\$database union all select o from un where id = 1;" "616263|6F6F"
+CH=UTF8 refused "12 OCTETS beside a UTF8 column" "select o from un where id = 1 union all select s from un;" "O|6F6F|6162636465666768696A6B6C6D6E6F7071727374|Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 20, actual 40"
 
 echo "--- panic check"
 ran=$((ran + 1))
@@ -313,5 +402,5 @@ if grep -aq 'panicked at' "/tmp/fc-serve-fromloc-$PORT.log"; then echo "FAIL the
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 140 ]; then echo "FAIL only $ran checks ran (floor 140)"; fail=1; fi
+if [ "$ran" -lt 189 ]; then echo "FAIL only $ran checks ran (floor 189)"; fail=1; fi
 exit $fail
