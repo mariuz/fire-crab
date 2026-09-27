@@ -45246,8 +45246,21 @@ fn desc_type_sql(d: &Descriptor) -> String {
         dtype::SQL_TIME => "TIME".into(),
         dtype::TIMESTAMP => "TIMESTAMP".into(),
         dtype::BOOLEAN => "BOOLEAN".into(),
-        dtype::VARYING => format!("VARCHAR({})", (d.length as usize).saturating_sub(2).max(1)),
-        dtype::TEXT => format!("CHAR({})", (d.length as usize).max(1)),
+        // A TEXT COLUMN IS DECLARED IN CHARACTERS, IN ITS OWN SET: the
+        // descriptor's length is BYTES, and spelling those as the
+        // character count made a UTF8 VARCHAR(20) stand in as a
+        // VARCHAR(80) - `SELECT T.S || 'L' O` inside the LATERAL
+        // described VARCHAR(81) where 2182 says VARCHAR(21) (84 bytes
+        // under UTF8, 21 under WIN1252), and OVERLAY / SUBSTRING / UPPER
+        // over the reference likewise, four times too wide
+        dtype::VARYING | dtype::TEXT => {
+            let chars = fire_crab_ods::intl::char_length(d.dtype, d.length, d.sub_type).max(1);
+            let kw = if d.dtype == dtype::VARYING { "VARCHAR" } else { "CHAR" };
+            match charset_id_name(fire_crab_ods::intl::charset_id(d.sub_type)) {
+                Some(cs) => format!("{}({}) CHARACTER SET {}", kw, chars, cs),
+                None => format!("{}({})", kw, chars),
+            }
+        }
         _ => "VARCHAR(32000)".into(),
     }
 }
@@ -45275,17 +45288,24 @@ fn subst_lateral(
             out.push('\'');
             i += 1;
             while i < sub.len() {
-                out.push(b[i] as char);
-                if b[i] == b'\'' {
-                    if b.get(i + 1) == Some(&b'\'') {
-                        out.push('\'');
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
+                if b[i] != b'\'' {
+                    // a WHOLE character: pushing the byte as a char spelt
+                    // a UTF-8 'é' as 'Ã©' (a wrong value), and under a
+                    // single-byte attachment the widened text then broke
+                    // the wire (08006)
+                    let ch = sub[i..].chars().next()?;
+                    out.push(ch);
+                    i += ch.len_utf8();
+                    continue;
+                }
+                out.push('\'');
+                if b.get(i + 1) == Some(&b'\'') {
+                    out.push('\'');
+                    i += 2;
+                    continue;
                 }
                 i += 1;
+                break;
             }
             continue;
         }
@@ -45318,8 +45338,9 @@ fn subst_lateral(
                 continue;
             }
         }
-        out.push(b[i] as char);
-        i += 1;
+        let ch = sub[i..].chars().next()?;
+        out.push(ch);
+        i += ch.len_utf8();
     }
     Some(out)
 }
@@ -45438,6 +45459,13 @@ fn plan_lateral(
     // pads the row, which is an EXECUTION concern carried by `left`. (fc's
     // join planner does not accept a derived side under LEFT JOIN ON TRUE,
     // so the comma form is also the one that plans.)
+    // UNDER A NONE ATTACHMENT the statement's bytes travel one char per
+    // byte, and the per-row re-plan ([lateral_rows]) splices them beside
+    // a decoded outer value: `T.S || 'é'` answered 'abcdefÃ©' where 2182
+    // answers the two bytes it was sent. A non-ASCII body there refuses.
+    if CURRENT_ATT_CS.with(|a| a.get()) == 0 && !sub.is_ascii() {
+        return None;
+    }
     let null_sub = subst_lateral(&sub, &outer_alias, &columns, &outer_descs, None)?;
     let describe_from = format!("{} , ({}) {}", base_s, null_sub, lat_alias);
     let (from, join) = parse_from(&describe_from)?;
@@ -52880,7 +52908,9 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     // ...and the window-frame grammar ([window_frame_lint]) is the
     // parser's too: judged on the text as sent, after the limit lint
     let lint = lint.map(|l| match l {
-        LimitLint { err: None, unknown } => LimitLint { err: window_frame_lint(sql), unknown },
+        LimitLint { err: None, unknown } => {
+            LimitLint { err: window_frame_lint(sql).or_else(|| part_word_lint(sql)), unknown }
+        }
         other => other,
     });
     // THE ENGINE'S -206 FOR A QUALIFIER NOTHING BINDS, judged on the text
@@ -61012,8 +61042,36 @@ fn plan_union(
             let real = |st: i32| {
                 st <= -2 || (st >= 0 && fire_crab_ods::intl::charset_id(st as i16) > 1)
             };
+            // NONE YIELDS TO THE LITERAL TOO: with no real charset in
+            // play, an attachment-set branch (a literal, `Z || 'Q'`)
+            // takes the column from a NONE one in either order (measured
+            // on 2182: NONE VARCHAR(8) beside 'abc' is VARCHAR(8) UTF8,
+            // 32 bytes, under a UTF8 attachment and WIN1252 under a
+            // WIN1252 one, and a NONE CHAR(3) beside 'ab' is CHAR(3) in
+            // the attachment's set) - this kept the NONE column's own.
+            //
+            // OCTETS BEATS EVERYTHING, and converts its siblings in ways
+            // this server does not reproduce: 'abc', a UTF8 or a WIN1252
+            // column beside an OCTETS one describe OCTETS in either
+            // order, but a WIN1252 'éf' arrives as E966 under a UTF8
+            // attachment and as C3A966 under a WIN1252 one, and a UTF8
+            // 'ăb' is a 22001 under WIN1252 (all measured). This answered
+            // the siblings' text in the attachment's set - a wrong
+            // answer - so a mix with OCTETS refuses; an all-OCTETS
+            // column agrees already and never reaches here.
+            let octets = |st: i32| st >= 0 && fire_crab_ods::intl::charset_id(st as i16) == 1;
+            if shapes.iter().any(|(_, _, st)| octets(*st)) {
+                return Some(Plan::Refused);
+            }
             if let Some((_, _, st)) = shapes.iter().find(|(_, _, st)| real(*st)) {
                 c.sub_type = *st;
+            } else if CURRENT_ATT_CS.with(|a| a.get()) != 0
+                && shapes.iter().any(|(_, _, st)| *st == ATT_SUBTYPE)
+            {
+                // (under a NONE attachment the literal IS a NONE one, and
+                // the column keeps the first branch's own descriptor -
+                // and so its name: `Z UNION 'abc'` is Z / Z / T there)
+                c.sub_type = ATT_SUBTYPE;
             }
             let varying = shapes.iter().any(|(t, ..)| *t == 448);
             c.sql_type = (if varying { 448 } else { 452 }) | (c.sql_type & 1);
@@ -61024,21 +61082,31 @@ fn plan_union(
             // 24 - taking the raw maximum of those announced a
             // six-character WIN1252 union as 24 bytes. Normalise each
             // branch to characters, take the widest, and express it in
-            // the WINNING charset's bytes, which is what makes the same
+            // the WINNING charset's units, which is what makes the same
             // union 6 under WIN1252 and 24 under UTF8 (both probed).
+            //
+            // AN EXPRESSION ALREADY COUNTS CHARACTERS. Every negative
+            // sub_type - the attachment sentinel and the `-2 - cs` real
+            // charset one alike - carries a CHARACTER width that
+            // [resolve_text_cs] multiplies out at emission, so it divides
+            // by nothing here. Dividing the real-charset sentinel by its
+            // charset's bytes made `S || 'QRS'` (23 characters, UTF8) a
+            // 5-character branch: beside `'x'` the union announced
+            // VARCHAR(20) from the plain column and the 23-character row
+            // died at fetch with a 22001, and so did LPAD, RPAD, OVERLAY,
+            // UPPER(..) || 'Z' and `S || N` (measured on 2182, UTF8
+            // attachment: VARCHAR(21) for OVERLAY(S PLACING 'Q' FROM 21),
+            // 23 for `S || 'QRS'` in either branch order and beside a
+            // CHAR(5) or a WIN1252 VARCHAR(10), 25 for LPAD(S, 25), 3 for
+            // SUBSTRING(S FROM 1 FOR 3) - makeFromList's widest
+            // character count, whatever the operands' units).
             let bpc = |st: i32| -> i32 {
-                let n = if st <= ATT_SUBTYPE {
-                    if st == ATT_SUBTYPE {
-                        1 // the attachment sentinel already counts characters
-                    } else {
-                        fire_crab_ods::intl::bytes_per_char((-2 - st) as u8) as i32
-                    }
+                if st < 0 {
+                    1
                 } else {
-                    fire_crab_ods::intl::bytes_per_char(
-                        fire_crab_ods::intl::charset_id(st as i16),
-                    ) as i32
-                };
-                n.max(1)
+                    (fire_crab_ods::intl::bytes_per_char(fire_crab_ods::intl::charset_id(st as i16)) as i32)
+                        .max(1)
+                }
             };
             let chars = shapes
                 .iter()
@@ -61047,7 +61115,19 @@ fn plan_union(
                 .max()
                 .unwrap_or(c.length);
             c.length = chars * bpc(c.sub_type);
-            c.oct_length = widths.iter().map(|(_, o)| *o).max().unwrap_or(c.oct_length);
+            // the OCTET width a single-byte attachment reads for a
+            // sentinel ([ProjCol::oct_length]): an expression's own, a
+            // plain column's characters (one octet each there)
+            c.oct_length = if c.sub_type < 0 {
+                shapes
+                    .iter()
+                    .zip(widths.iter())
+                    .map(|((_, _, st), (l, o))| if *st < 0 { *o } else { *l / bpc(*st) })
+                    .max()
+                    .unwrap_or(c.oct_length)
+            } else {
+                c.length
+            };
             continue;
         }
         // a DECFLOAT branch DOMINATES exact numerics and DOUBLE/FLOAT
@@ -109279,6 +109359,119 @@ fn parse_frame_bound(s: &str) -> Option<(FrameBound, bool, bool)> {
     }
 }
 
+/// A PART WORD THE GRAMMAR DOES NOT HAVE is the parser's -104 *Token
+/// unknown* at that word, spelled as sent - never a column the scans
+/// then fail to bind. Three places spell a part: EXTRACT(<part> FROM ..),
+/// FIRST_DAY / LAST_DAY(OF <part> FROM ..), and NTH_VALUE(..) FROM
+/// FIRST | LAST. Measured on 2182: `EXTRACT(fortnight FROM D)` is Token
+/// unknown "fortnight" at column 16 (in WHERE too, at its own column),
+/// `EXTRACT(foo.bar ..)` names "foo", `EXTRACT(D FROM D)` names "d",
+/// `FIRST_DAY(OF DAY FROM D)` names "day", `NTH_VALUE(N, 2) FROM middle
+/// OVER` names "middle" and a quoted `"MIDDLE"` names it with its quotes.
+/// This server raised a made-up -206 *Column unknown* "FORTNIGHT" there.
+fn part_word_lint(sql: &str) -> Option<EvalErr> {
+    const EXTRACT_PARTS: [&str; 13] = [
+        "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "MILLISECOND", "WEEKDAY",
+        "YEARDAY", "WEEK", "QUARTER", "TIMEZONE_HOUR", "TIMEZONE_MINUTE",
+    ];
+    const DAY_PARTS: [&str; 4] = ["YEAR", "QUARTER", "MONTH", "WEEK"];
+    const NTH_DIRS: [&str; 2] = ["FIRST", "LAST"];
+    let up = sql.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let b = masked.as_bytes();
+    let raw = sql.as_bytes();
+    let ws = |mut j: usize| {
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        j
+    };
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    // the word at `a` against `allowed`: Some(end) when it is a word the
+    // grammar refuses there, None when it is allowed or not a word
+    let refused = |a: usize, allowed: &[&str]| -> Option<usize> {
+        if raw.get(a) == Some(&b'"') {
+            let close = sql[a + 1..].find('"')?;
+            return Some(a + 1 + close + 1);
+        }
+        if !raw.get(a).is_some_and(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        let mut e = a;
+        while e < b.len() && ident(raw[e]) {
+            e += 1;
+        }
+        (!allowed.contains(&&up[a..e])).then_some(e)
+    };
+    let mut hit: Option<(usize, usize)> = None;
+    let mut note = |a: usize, e: usize| {
+        if hit.is_none_or(|(h, _)| a < h) {
+            hit = Some((a, e));
+        }
+    };
+    let mut from = 0;
+    while let Some(k) = find_word(&masked, "EXTRACT", from) {
+        from = k + 7;
+        let o = ws(k + 7);
+        if b.get(o) == Some(&b'(') {
+            let a = ws(o + 1);
+            if let Some(e) = refused(a, &EXTRACT_PARTS) {
+                note(a, e);
+            }
+        }
+    }
+    for f in ["FIRST_DAY", "LAST_DAY"] {
+        let mut from = 0;
+        while let Some(k) = find_word(&masked, f, from) {
+            from = k + f.len();
+            let o = ws(k + f.len());
+            if b.get(o) != Some(&b'(') {
+                continue;
+            }
+            let of = ws(o + 1);
+            if masked[of..].starts_with("OF") && b.get(of + 2).is_some_and(|c| c.is_ascii_whitespace()) {
+                let a = ws(of + 2);
+                if let Some(e) = refused(a, &DAY_PARTS) {
+                    note(a, e);
+                }
+            }
+        }
+    }
+    let mut from = 0;
+    while let Some(k) = find_word(&masked, "NTH_VALUE", from) {
+        from = k + 9;
+        let o = ws(k + 9);
+        if b.get(o) != Some(&b'(') {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut c = o;
+        while c < b.len() {
+            match b[c] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            c += 1;
+        }
+        let f = ws(c + 1);
+        if masked[f.min(masked.len())..].starts_with("FROM") && b.get(f + 4).is_some_and(|c| c.is_ascii_whitespace()) {
+            let a = ws(f + 4);
+            if let Some(e) = refused(a, &NTH_DIRS) {
+                note(a, e);
+            }
+        }
+    }
+    let (a, e) = hit?;
+    let (line, col) = text_line_col(sql, &sql[a..e])?;
+    Some(EvalErr::TokenUnknown { line, col, token: sql[a..e].to_string() })
+}
+
 /// THE ENGINE'S WINDOW-FRAME GRAMMAR AND ITS BOUND RULE, judged once on
 /// the statement as sent - every `OVER (...)` at any depth (a derived
 /// table's, a CTE's, a subquery's), in text order. Measured on engine
@@ -153371,6 +153564,23 @@ mod tests {
         // a q-string's quotes are its own
         assert_eq!(limit_clause_lint("select q'{'}', ' order ', ' union ' from t1 rows 1"), None);
         assert_eq!(tok("select q'{x}' from t1 order by 1 union select 'a' from t2"), Some((1, 34, "union".into())));
+    }
+
+    /// [part_word_lint] names the word the grammar refuses, as sent, and
+    /// passes every real part (measured on 2182: `extract(fortnight from
+    /// d)` is Token unknown "fortnight" at column 16).
+    #[test]
+    fn a_part_word_the_grammar_lacks_is_token_unknown_at_it() {
+        let tok = |sql: &str| match part_word_lint(sql) {
+            Some(EvalErr::TokenUnknown { col, token, .. }) => Some((col, token)),
+            _ => None,
+        };
+        assert_eq!(tok("select extract(fortnight from d) from t"), Some((16, "fortnight".into())));
+        assert_eq!(tok("select extract(foo.bar from d) from t"), Some((16, "foo".into())));
+        assert_eq!(tok("select first_day(of day from d) from t"), Some((21, "day".into())));
+        assert_eq!(tok("select nth_value(n, 2) from \"MIDDLE\" over (order by id) from t"), Some((29, "\"MIDDLE\"".into())));
+        assert_eq!(tok("select extract(quarter from d), last_day(of week from d), nth_value(n, 1) from last over (order by id) from t"), None);
+        assert_eq!(tok("select 'extract(fortnight from d)' from t"), None);
     }
 
     /// Which of FIRST/SKIP-with-ROWS and an unknown FROM item the engine
