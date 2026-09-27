@@ -3542,6 +3542,120 @@ fn column_in_constraint_index(
     Ok(hit)
 }
 
+/// The column's (RDB$FIELD_SUB_TYPE, RDB$FIELD_PRECISION) off its
+/// domain's RDB$FIELDS row - what the engine's numeric check reads.
+fn column_field_precision(file: &crate::Image, page_size: usize, table: &str, col: &str) -> (i64, i64) {
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+        _ => None,
+    };
+    let int = |v: Option<&Value>| match v {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let (Some(rf_formats), Some(f_formats)) = (
+        system_relation_formats(file, page_size, "RDB$RELATION_FIELDS"),
+        system_relation_formats(file, page_size, "RDB$FIELDS"),
+    ) else {
+        return (0, 0);
+    };
+    let (Some((_, rf_descs)), Some((_, f_descs))) =
+        (rf_formats.iter().max_by_key(|(n, _)| *n), f_formats.iter().max_by_key(|(n, _)| *n))
+    else {
+        return (0, 0);
+    };
+    let (Ok(rel_f), Ok(name_f), Ok(src_f), Ok(fn_f), Ok(sub_f), Ok(prec_f)) = (
+        sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME"),
+        sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_NAME"),
+        sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_SOURCE"),
+        sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME"),
+        sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_SUB_TYPE"),
+        sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_PRECISION"),
+    ) else {
+        return (0, 0);
+    };
+    let mut source = None;
+    walk_rows(file, page_size, 5, rf_descs, |v| {
+        if text_is(v.get(rel_f), table) && text_is(v.get(name_f), col) {
+            source = text(v.get(src_f));
+        }
+    });
+    let Some(source) = source else { return (0, 0) };
+    let mut out = (0, 0);
+    walk_rows(file, page_size, 2, f_descs, |v| {
+        if text_is(v.get(fn_f), &source) {
+            out = (int(v.get(sub_f)), int(v.get(prec_f)));
+        }
+    });
+    out
+}
+
+/// The part of the engine's type-change matrix (DdlNodes.epp
+/// AlterDomainNode::checkUpdate) whose stored values this server
+/// PRESENTS in the new type ([crate::format::present_field]), measured
+/// on 2182 over rows written before the ALTER:
+///
+/// - an exact numeric to a same-or-wider exact one (SMALLINT only from
+///   SMALLINT, INTEGER from SMALLINT/INTEGER, BIGINT from those, INT128
+///   from any), with checkUpdateNumericType's rule when both are
+///   NUMERIC/DECIMAL - the integral digits (precision + scale) may not
+///   shrink: `numeric(10,2)` -> `numeric(18,4)` reads 12.3400,
+///   `numeric(5,2)` -> `numeric(9,4)` 1.2500, `integer` ->
+///   `numeric(9,3)` 1.000;
+/// - SMALLINT, INTEGER (at any scale) and FLOAT to DOUBLE PRECISION
+///   (7.000000000000000) - but NOT BIGINT, the engine's "Conversion from
+///   base type BIGINT to DOUBLE PRECISION is not supported";
+/// - DATE to TIMESTAMP (midnight);
+/// - CHAR / VARCHAR to CHAR / VARCHAR of the same character set holding
+///   at least as many characters: `varchar(5)` 'ab' -> `char(6)` reads
+///   'ab    ', `char(3)` 'x' -> `varchar(4)` keeps its pad, 'x  '.
+///
+/// A scale that shallows would round the stored values the engine keeps
+/// exact, so only a scale that deepens or stays is taken; everything
+/// else keeps the refusal it had. The ALTER is taken whatever the rows
+/// hold: a stored value whose rescale no longer fits the new type's
+/// storage word (SMALLINT 32000 to NUMERIC(4,2)) raises 22003 when it is
+/// read, as on 2182 ([crate::format::present_field]).
+fn column_type_change_extended(old: &Descriptor, new: &ColumnDef, (old_sub, old_prec): (i64, i64)) -> bool {
+    use crate::format::dtype;
+    let (o, n) = (old.dtype, new.dtype);
+    match n {
+        dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 => {
+            let from: &[u8] = match n {
+                dtype::SHORT => &[dtype::SHORT],
+                dtype::LONG => &[dtype::SHORT, dtype::LONG],
+                dtype::INT64 => &[dtype::SHORT, dtype::LONG, dtype::INT64],
+                _ => &[dtype::SHORT, dtype::LONG, dtype::INT64, dtype::INT128],
+            };
+            if !from.contains(&o) {
+                return false;
+            }
+            // checkUpdateNumericType: both NUMERIC/DECIMAL - the integral
+            // width may not shrink
+            let new_prec = new.precision.map_or(0, |p| p as i64);
+            if old_sub != 0 && new.sub_type != 0 && old_prec + old.scale as i64 > new_prec + new.scale as i64 {
+                return false;
+            }
+            new.scale <= old.scale
+        }
+        dtype::DOUBLE => matches!(o, dtype::SHORT | dtype::LONG | dtype::REAL | dtype::DOUBLE),
+        dtype::TIMESTAMP => o == dtype::SQL_DATE || o == dtype::TIMESTAMP,
+        dtype::TEXT | dtype::VARYING => {
+            if !matches!(o, dtype::TEXT | dtype::VARYING) {
+                return false;
+            }
+            let old_cs = (old.sub_type as u16 & 0xFF) as u8;
+            if new.charset_id.is_some_and(|c| c != old_cs) {
+                return false;
+            }
+            let old_chars = crate::intl::char_length(o, old.length, old.sub_type);
+            let new_chars = crate::intl::char_length(n, new.length, old.sub_type);
+            new_chars >= old_chars
+        }
+        _ => false,
+    }
+}
+
 fn type_change_supported(old: &Descriptor, new: &ColumnDef) -> bool {
     use crate::format::dtype;
     // integer family: same or wider, both scale 0
@@ -3597,7 +3711,17 @@ pub fn alter_table_alter_column_type(
         .max_by_key(|(n, _)| *n)
         .ok_or("relation has no format")?;
     let old_desc = cur_descs.get(fid).ok_or("field beyond format")?;
-    if !type_change_supported(old_desc, new_col) {
+    // the widenings this path always took, or - over a column no index
+    // reads, whose stored values the readers PRESENT in the new type
+    // (crate::format::present_field) - the engine's wider matrix
+    // ([column_type_change_extended])
+    // (...and no view, CHECK or computed column reads - whose own
+    // formats and compiled expressions were built over the old type)
+    if !type_change_supported(old_desc, new_col)
+        && !(column_type_change_extended(old_desc, new_col, column_field_precision(file, page_size, &table, &col_up))
+            && indices_containing(file, page_size, &table, &col_up)?.is_empty()
+            && column_dependent(file, page_size, &table, &col_up)?.is_none())
+    {
         return Err(format!(
             "cannot change datatype for {}; conversion not supported",
             col_name
@@ -3726,9 +3850,28 @@ pub fn alter_table_alter_column_type(
         Ok(())
     };
     patch_field(&mut f_image, "RDB$FIELD_TYPE", SysVal::I(new_col.field_type as i64))?;
-    patch_field(&mut f_image, "RDB$FIELD_LENGTH", SysVal::I(new_col.length as i64))?;
+    // RDB$FIELD_LENGTH is the BYTE length - a VARCHAR's without the
+    // 2-byte count word its descriptor carries (measured on 2182:
+    // `alter v type varchar(8)` reads 8; this wrote 10, a width the
+    // engine would lay the field out by)
+    // ([catalog_field_length], the rule ALTER DOMAIN ... TYPE already
+    // keeps)
+    patch_field(&mut f_image, "RDB$FIELD_LENGTH", SysVal::I(catalog_field_length(new_col)))?;
     patch_field(&mut f_image, "RDB$FIELD_SCALE", SysVal::I(new_col.scale as i64))?;
     patch_field(&mut f_image, "RDB$FIELD_SUB_TYPE", SysVal::I(new_col.sub_type as i64))?;
+    // AN APPROXIMATE OR TEMPORAL TYPE HAS NEITHER: the engine leaves
+    // RDB$FIELD_SUB_TYPE and RDB$FIELD_PRECISION NULL on a column retyped
+    // to DOUBLE PRECISION (measured on 2182, from INTEGER, SMALLINT and
+    // FLOAT alike) or to TIMESTAMP (from DATE)
+    if matches!(
+        new_col.dtype,
+        crate::format::dtype::DOUBLE | crate::format::dtype::REAL | crate::format::dtype::TIMESTAMP
+    ) {
+        for name in ["RDB$FIELD_SUB_TYPE", "RDB$FIELD_PRECISION"] {
+            let fid = f_fid(name).ok_or_else(|| format!("no {} column", name))?;
+            f_image[fid / 8] |= 1 << (fid % 8);
+        }
+    }
     if let Some(p) = new_col.precision {
         // the engine retypes precision too (probed: INTEGER ->
         // NUMERIC(12) sets 12; int -> int keeps 0)
@@ -3877,6 +4020,196 @@ fn column_identity_generator(
         }
     });
     out
+}
+
+/// `ALTER TABLE <t> ALTER [COLUMN] <c> SET INCREMENT [BY] <n>` - the
+/// identity column's backing generator takes the new step on its
+/// RDB$GENERATORS row (MET_update_generator_increment), its value is
+/// left where it is (measured on 2182: over an identity that has drawn
+/// 1, `set increment by 10` makes the next insert 11). A column with no
+/// identity is the engine's "Column V is not an identity column", and
+/// a zero step its isc_dyn_cant_use_zero_inc_ident - both errors here.
+pub fn alter_column_identity_increment(
+    file: &mut crate::Image,
+    page_size: usize,
+    table: &str,
+    column: &str,
+    step: i64,
+) -> Result<(), String> {
+    let gen = column_identity_generator(file, page_size, table.trim(), column.trim())
+        .ok_or_else(|| format!("Column {} is not an identity column", column))?;
+    if step == 0 {
+        return Err(format!("INCREMENT BY 0 is an illegal option for identity column {}", column));
+    }
+    alter_sequence_increment(file, page_size, &gen, step)
+}
+
+/// The first object RDB$DEPENDENCIES says reads this column - a view, a
+/// CHECK constraint's trigger, a computed column's field - or None.
+fn column_dependent(file: &crate::Image, page_size: usize, table: &str, col: &str) -> Result<Option<String>, String> {
+    let Some(dep_rel) = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES") else {
+        return Ok(None);
+    };
+    let formats = system_relation_formats(file, page_size, "RDB$DEPENDENCIES").ok_or("no RDB$DEPENDENCIES format")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let on_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDED_ON_NAME")?;
+    let fld_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$FIELD_NAME")?;
+    let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+    let mut by: Option<String> = None;
+    walk_rows(file, page_size, dep_rel, descs, |v| {
+        if by.is_none() && text_is(v.get(on_f), table) && text_is(v.get(fld_f), col) {
+            if let Some(Value::Text(t)) = v.get(dn_f) {
+                by = Some(t.trim_end().to_string());
+            }
+        }
+    });
+    Ok(by)
+}
+
+/// `ALTER TABLE <t> ALTER [COLUMN] <old> TO <new>` - rename a column, the
+/// engine's law measured on 2182: the RDB$RELATION_FIELDS row takes the
+/// new name, and so does every RDB$INDEX_SEGMENTS row of a plain index
+/// over it and the RDB$CHECK_CONSTRAINTS link of its NOT NULL (whose
+/// RDB$TRIGGER_NAME is the column); the relation's runtime summary is
+/// rebuilt. A column some other object DEPENDS on - a view, a CHECK
+/// constraint's trigger, a computed column - is the engine's "Column "V"
+/// from table ... is referenced in ..." (RDB$DEPENDENCIES names it), a
+/// column in a PRIMARY KEY / UNIQUE / FOREIGN KEY index its "Cannot
+/// update index segment used by an Integrity Constraint", a new name the
+/// table already has its "A column with that name already exists": each
+/// an error here, before anything is written.
+pub fn alter_column_rename(
+    file: &mut crate::Image,
+    page_size: usize,
+    table: &str,
+    old: &str,
+    new: &str,
+) -> Result<(), String> {
+    let table = table.trim().to_string();
+    crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    let cols = relation_columns(file, page_size, &table);
+    if !cols.iter().any(|c| c.name == old) {
+        return Err(format!("column {} does not exist in table/view {}", old, table));
+    }
+    if cols.iter().any(|c| c.name == new) {
+        return Err(format!(
+            "Cannot rename column {} to {}.  A column with that name already exists in table {}.",
+            old, new, table
+        ));
+    }
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+        _ => None,
+    };
+    // anything that depends on the column refuses the rename
+    if let Some(d) = column_dependent(file, page_size, &table, old)? {
+        return Err(format!("Column \"{}\" from table {} is referenced in {}", old, table, d));
+    }
+    // the table's indices over the column, and whether a constraint owns one
+    let ix_rel = crate::resolve_relation(file, page_size, "RDB$INDICES").ok_or("no RDB$INDICES")?;
+    let ix_formats = system_relation_formats(file, page_size, "RDB$INDICES").ok_or("no RDB$INDICES format")?;
+    let (_, ix_descs) = ix_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let ix_name_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+    let ix_rel_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$RELATION_NAME")?;
+    let mut indices: Vec<String> = Vec::new();
+    walk_rows(file, page_size, ix_rel, ix_descs, |v| {
+        if text_is(v.get(ix_rel_f), &table) {
+            if let Some(n) = text(v.get(ix_name_f)) {
+                indices.push(n);
+            }
+        }
+    });
+    let seg_rel = crate::resolve_relation(file, page_size, "RDB$INDEX_SEGMENTS").ok_or("no RDB$INDEX_SEGMENTS")?;
+    let seg_formats =
+        system_relation_formats(file, page_size, "RDB$INDEX_SEGMENTS").ok_or("no RDB$INDEX_SEGMENTS format")?;
+    let (_, seg_descs) = seg_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let seg_ix_f = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$INDEX_NAME")?;
+    let seg_fld_f = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$FIELD_NAME")?;
+    let mut over: Vec<String> = Vec::new();
+    walk_rows(file, page_size, seg_rel, seg_descs, |v| {
+        if text_is(v.get(seg_fld_f), old) {
+            if let Some(ix) = text(v.get(seg_ix_f)).filter(|ix| indices.contains(ix)) {
+                over.push(ix);
+            }
+        }
+    });
+    if !over.is_empty() {
+        let rc_rel = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS")
+            .ok_or("no RDB$RELATION_CONSTRAINTS")?;
+        let rc_formats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")
+            .ok_or("no RDB$RELATION_CONSTRAINTS format")?;
+        let (_, rc_descs) = rc_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let rc_ix_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$INDEX_NAME")?;
+        let mut owned = false;
+        walk_rows(file, page_size, rc_rel, rc_descs, |v| {
+            if text(v.get(rc_ix_f)).is_some_and(|ix| over.contains(&ix)) {
+                owned = true;
+            }
+        });
+        if owned {
+            return Err("Cannot update index segment used by an Integrity Constraint".into());
+        }
+    }
+    // the writes: the column row, its plain index segments, its NOT NULL link
+    let rf_rel = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS").ok_or("no RDB$RELATION_FIELDS")?;
+    let rf_rel_f = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
+    let rf_name_f = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_NAME")?;
+    {
+        let (t, o) = (table.clone(), old.to_string());
+        patch_sys_row(
+            file,
+            page_size,
+            "RDB$RELATION_FIELDS",
+            rf_rel,
+            move |v| text_is(v.get(rf_rel_f), &t) && text_is(v.get(rf_name_f), &o),
+            &[("RDB$FIELD_NAME", SysVal::S(new))],
+        )?;
+    }
+    for ix in &over {
+        let (i, o) = (ix.clone(), old.to_string());
+        patch_sys_row(
+            file,
+            page_size,
+            "RDB$INDEX_SEGMENTS",
+            seg_rel,
+            move |v| text_is(v.get(seg_ix_f), &i) && text_is(v.get(seg_fld_f), &o),
+            &[("RDB$FIELD_NAME", SysVal::S(new))],
+        )?;
+    }
+    // the NOT NULL link: the RDB$CHECK_CONSTRAINTS row of one of THIS
+    // table's NOT NULL constraints whose trigger name is the column
+    if let (Some(cc_rel), Some(rc_rel)) = (
+        crate::resolve_relation(file, page_size, "RDB$CHECK_CONSTRAINTS"),
+        crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS"),
+    ) {
+        let rc_formats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")
+            .ok_or("no RDB$RELATION_CONSTRAINTS format")?;
+        let (_, rc_descs) = rc_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let rc_name_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+        let rc_type_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_TYPE")?;
+        let rc_tab_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$RELATION_NAME")?;
+        let mut nn: Vec<String> = Vec::new();
+        walk_rows(file, page_size, rc_rel, rc_descs, |v| {
+            if text_is(v.get(rc_tab_f), &table) && text_is(v.get(rc_type_f), "NOT NULL") {
+                if let Some(n) = text(v.get(rc_name_f)) {
+                    nn.push(n);
+                }
+            }
+        });
+        let cc_name_f = sys_fid(file, page_size, "RDB$CHECK_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+        let cc_trig_f = sys_fid(file, page_size, "RDB$CHECK_CONSTRAINTS", "RDB$TRIGGER_NAME")?;
+        let o = old.to_string();
+        let hit = move |v: &[Value]| {
+            text_is(v.get(cc_trig_f), &o)
+                && matches!(v.get(cc_name_f), Some(Value::Text(t)) if nn.iter().any(|n| n == t.trim_end()))
+        };
+        if find_sys_row_slot(file, page_size, "RDB$CHECK_CONSTRAINTS", cc_rel, &hit).is_some() {
+            patch_sys_row(file, page_size, "RDB$CHECK_CONSTRAINTS", cc_rel, hit, &[("RDB$TRIGGER_NAME", SysVal::S(new))])?;
+        }
+    }
+    refresh_runtime(file, page_size, &table)?;
+    advance_oldest_transactions(file, page_size)
 }
 
 /// A generator's `(RDB$GENERATOR_ID, RDB$GENERATOR_INCREMENT,
@@ -4426,19 +4759,51 @@ pub fn alter_table_drop_not_null(
         Some(Value::Text(t)) => Some(t.trim_end().to_string()),
         _ => None,
     };
+    // THIS TABLE'S NOT NULL constraints: a link names only the COLUMN, so
+    // a column of the same name in another table carries a row just like
+    // it - and taking the first one by column name alone dropped THAT
+    // table's NOT NULL (measured: `alter table at1 alter k drop not null`
+    // took RN.K's RDB$CHECK_CONSTRAINTS row, which the engine keeps)
+    let nn_rel = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS")
+        .ok_or("no RDB$RELATION_CONSTRAINTS")?;
+    let nn_formats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")
+        .ok_or("no RDB$RELATION_CONSTRAINTS format")?;
+    let (_, nn_descs) = nn_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let nn_name_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+    let nn_type_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_TYPE")?;
+    let nn_tab_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$RELATION_NAME")?;
+    let mut mine: Vec<String> = Vec::new();
+    walk_rows(file, page_size, nn_rel, nn_descs, |v| {
+        if text_is(v.get(nn_tab_f), &table) && text_is(v.get(nn_type_f), "NOT NULL") {
+            if let Some(n) = text(v.get(nn_name_f)) {
+                mine.push(n);
+            }
+        }
+    });
+    let ours = |vals: &[Value]| {
+        text(vals.get(cc_trig)).as_deref() == Some(col_up.as_str())
+            && text(vals.get(cc_name)).is_some_and(|n| mine.contains(&n))
+    };
     let mut constraint: Option<String> = None;
     walk_rows(file, page_size, cc_rel, cc_descs, |vals| {
-        if text(vals.get(cc_trig)).as_deref() == Some(col_up.as_str()) {
+        if ours(vals) {
             constraint = text(vals.get(cc_name));
         }
     });
-    let constraint = constraint
-        .ok_or_else(|| format!("column {} has no NOT NULL constraint", col_name))?;
+    // A COLUMN THAT IS ALREADY NULLABLE: the engine's DROP NOT NULL finds
+    // no constraint to drop and succeeds, changing nothing (measured on
+    // 2182: `alter table t1 alter column f drop not null` over a plain
+    // DOUBLE PRECISION column is silent; RDB$NULL_FLAG stays NULL and
+    // RDB$RELATION_CONSTRAINTS keeps its rows). It was an error here.
+    let Some(constraint) = constraint else {
+        return Ok(());
+    };
 
     patch_rf_null_flag(file, page_size, &table, &col_up, None)?;
 
-    // delete the RDB$CHECK_CONSTRAINTS row (by trigger = column)
-    let cc_pred = |vals: &[Value]| text(vals.get(cc_trig)).as_deref() == Some(col_up.as_str());
+    // delete the RDB$CHECK_CONSTRAINTS row (by trigger = column, among
+    // this table's own)
+    let cc_pred = |vals: &[Value]| ours(vals);
     if let Some(slot) = find_sys_row_slot(file, page_size, "RDB$CHECK_CONSTRAINTS", cc_rel, cc_pred) {
         dml::delete_records(file, page_size, cc_rel, &[slot])?;
     }

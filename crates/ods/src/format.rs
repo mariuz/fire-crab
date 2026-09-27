@@ -1244,6 +1244,23 @@ mod tests {
         assert_eq!(relay_image(&img, &old, &old).unwrap(), img);
     }
 
+    /// A rescale that keeps the storage word is judged against THAT word:
+    /// SMALLINT 32000 read as NUMERIC(4,2) is 3200000, past i16, and the
+    /// engine raises 22003 at the read (measured on 2182) - it wrapped to
+    /// -112.64 here. A value that fits is re-expressed.
+    #[test]
+    fn a_rescale_is_judged_by_the_new_storage_word() {
+        let d = |dtype: u8, scale: i8, length: u16| Descriptor { dtype, scale, length, sub_type: 0, flags: 0, offset: 4 };
+        let (s, n42) = (d(dtype::SHORT, 0, 2), d(dtype::SHORT, -2, 2));
+        assert_eq!(present_field(&Value::Int(32000), &s, &n42), Some(Value::OutOfRange));
+        assert_eq!(present_field(&Value::Int(327), &s, &n42), Some(Value::Scaled(32700, -2)));
+        let (i, n92) = (d(dtype::LONG, 0, 4), d(dtype::LONG, -2, 4));
+        assert_eq!(present_field(&Value::Int(30000000), &i, &n92), Some(Value::OutOfRange));
+        assert_eq!(present_field(&Value::Int(-21474836), &i, &n92), Some(Value::Scaled(-2147483600, -2)));
+        let n182 = d(dtype::INT64, -2, 8);
+        assert_eq!(present_field(&Value::Int(30000000), &i, &n182), Some(Value::Scaled(3000000000, -2)));
+    }
+
     #[test]
     fn per_page_formulas_match_ods_cpp() {
         // 8K pages: ((8192-32)*8/40) & ~7 = 1632; (8192-28)/17 = 480
@@ -1294,6 +1311,29 @@ fn rescale_present(raw: i128, from: i8, to: i8) -> Option<i128> {
 /// Everything else - a non-exact numeric with an unchanged type, a type
 /// change with no rule - is `None`, left as the record carries it.
 pub fn present_field(v: &Value, stored: &Descriptor, newest: &Descriptor) -> Option<Value> {
+    // an exact or FLOAT value under a DOUBLE PRECISION descriptor - an
+    // ALTER ... TYPE DOUBLE PRECISION over rows stored before it (the
+    // engine's MOV: INTEGER 7 reads 7.000000000000000, NUMERIC(9,2) 12.34
+    // reads 12.34)
+    if newest.dtype == dtype::DOUBLE && stored.dtype != dtype::DOUBLE {
+        return match v {
+            Value::Int(n) => Some(Value::Double(*n as f64)),
+            Value::Scaled(r, s) => Some(Value::Double(*r as f64 / 10f64.powi(-(*s as i32)))),
+            Value::Float(f) => Some(Value::Double(*f as f64)),
+            _ => None,
+        };
+    }
+    // a VARCHAR value under a CHAR descriptor pads to the new width, as
+    // the engine's MOV into CHAR does ('ab' -> 'ab    ' for CHAR(6)); a
+    // CHAR value under a VARCHAR keeps its pad (measured: CHAR(3) 'x'
+    // retyped to VARCHAR(4) reads 'x  ', CHAR_LENGTH 3)
+    if stored.dtype == dtype::VARYING && newest.dtype == dtype::TEXT {
+        let nw = crate::intl::char_length(newest.dtype, newest.length, newest.sub_type);
+        return match v {
+            Value::Text(t) => Some(Value::Text(crate::intl::fit_char(t, nw))),
+            _ => None,
+        };
+    }
     if stored.dtype == dtype::SQL_DATE && newest.dtype == dtype::TIMESTAMP {
         return match v {
             Value::Date(d) => Some(Value::Timestamp(*d, 0)),
@@ -1332,9 +1372,20 @@ pub fn present_field(v: &Value, stored: &Descriptor, newest: &Descriptor) -> Opt
         }
         Some(Value::Int128(n, to))
     } else {
+        // the rescaled mantissa must fit the NEW type's storage word, not
+        // just an i64 - the declared precision does not bound what the
+        // record holds, the word does (measured on 2182: SMALLINT 32000
+        // retyped to NUMERIC(4,2), INTEGER 30000000 to NUMERIC(9,2) and
+        // NUMERIC(3,1) 3276.7 to NUMERIC(4,2) each raise 22003 "numeric
+        // value is out of range" when the row is read, SUM too)
+        let fits = match newest.dtype {
+            dtype::SHORT => i16::try_from(n).is_ok(),
+            dtype::LONG => i32::try_from(n).is_ok(),
+            _ => i64::try_from(n).is_ok(),
+        };
         match i64::try_from(n) {
-            Ok(m) => Some(if to == 0 { Value::Int(m) } else { Value::Scaled(m, to) }),
-            Err(_) => Some(Value::OutOfRange),
+            Ok(m) if fits => Some(if to == 0 { Value::Int(m) } else { Value::Scaled(m, to) }),
+            _ => Some(Value::OutOfRange),
         }
     }
 }

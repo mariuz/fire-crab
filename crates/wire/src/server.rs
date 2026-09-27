@@ -1906,7 +1906,10 @@ fn ddl_relation_target(plan: &Plan) -> Option<&str> {
 fn alter_table_target(plan: &Plan) -> Option<&str> {
     match plan {
         Plan::DropTable { .. } => None,
-        Plan::AlterColumnDropIdentity { table, .. } | Plan::AlterColumnPosition { table, .. } => Some(table),
+        Plan::AlterColumnDropIdentity { table, .. }
+        | Plan::AlterColumnPosition { table, .. }
+        | Plan::AlterColumnRename { table, .. }
+        | Plan::AlterColumnIdentity { table, .. } => Some(table),
         _ => ddl_relation_target(plan),
     }
 }
@@ -2173,6 +2176,48 @@ fn respond_ddl_meta(
     // "DROP TABLE @1 failed" wrapper the engine adds isc_dsql_command_err
     // (-607, "Invalid command") and a "-Table @1 does not exist" string
     // - four items, not the three the others carry.
+    // A COLUMN RENAME OR AN IDENTITY OPTION THE ENGINE REFUSES
+    // ([fire_crab_ods::ddl::alter_column_rename] /
+    // [fire_crab_ods::ddl::alter_column_identity_increment] spell the
+    // reason): "unsuccessful metadata update / ALTER TABLE @1 failed /
+    // <reason>", each reason measured on 2182 - DYN 176 column does not
+    // exist (42S22), DYN 205 a column with that name already exists
+    // (42S21), DYN 206 referenced in a view / check / computed column,
+    // JRD 218 an index segment of an integrity constraint, DYN 285 not an
+    // identity column (42000)
+    if let Plan::AlterColumnRename { table, column, .. } | Plan::AlterColumnIdentity { table, column, .. } = plan {
+        let qt = format!("\"PUBLIC\".\"{}\"", table.trim_end());
+        let reason: Option<(i32, Vec<String>)> = if lc.ends_with("is not an identity column") {
+            Some((336068893, vec![column.clone()]))
+        } else if lc.contains("does not exist in table/view") {
+            Some((336068784, vec![column.clone(), qt.clone()]))
+        } else if lc.starts_with("cannot rename column") {
+            match plan {
+                Plan::AlterColumnRename { new_name, .. } => {
+                    Some((336068813, vec![column.clone(), new_name.clone(), qt.clone()]))
+                }
+                _ => None,
+            }
+        } else if let Some((_, dep)) = err_text.split_once(" is referenced in ") {
+            Some((336068814, vec![format!("\"{}\"", column), qt.clone(), format!("\"PUBLIC\".\"{}\"", dep.trim())]))
+        } else if lc == "cannot update index segment used by an integrity constraint" {
+            Some((335544538, Vec::new()))
+        } else {
+            None
+        };
+        if let Some((code, args)) = reason {
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE).int(1).int(ALTER_TABLE_FAILED).int(2).bytes(qt.as_bytes());
+            w.int(1).int(code);
+            for a in &args {
+                w.int(2).bytes(a.as_bytes());
+            }
+            w.int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
     if let Plan::AlterDomainCheck { domain, .. } = plan {
         // ADD CONSTRAINT over an existing one: "unsuccessful metadata
         // update / ALTER DOMAIN @1 failed / "Only one constraint
@@ -10140,6 +10185,9 @@ AlterDomainRename {
     /// (`1 / distinct` per key prefix over the current rows) into the
     /// catalog and the index root descriptor
     SetStatistics { name: String },
+    /// A DDL statement whose `IF [NOT] EXISTS` guard decided it does
+    /// nothing ([if_exists_rewrite]): answered as DDL, writes nothing
+    DdlNoop,
     /// `COMMENT ON TABLE|COLUMN <target> IS <text>`: write (or clear) the
     /// target row's RDB$DESCRIPTION text blob
     Comment {
@@ -10303,6 +10351,20 @@ AlterDomainRename {
         column: String,
         position: i64,
     },
+    /// `ALTER TABLE <t> ALTER [COLUMN] <c> TO <new>`: rename a column
+    /// ([fire_crab_ods::ddl::alter_column_rename])
+    AlterColumnRename { table: String, column: String, new_name: String },
+    /// `ALTER TABLE <t> ALTER [COLUMN] <c>` with identity options the two
+    /// single-option plans above do not take - `SET INCREMENT [BY] n`,
+    /// alone or beside `RESTART [WITH n]` and a leading `SET GENERATED`
+    /// (parse.y alter_identity_clause_spec)
+    AlterColumnIdentity {
+        table: String,
+        column: String,
+        identity_type: Option<i16>,
+        restart: Option<Option<i64>>,
+        step: Option<i64>,
+    },
     /// `INSERT INTO <t> [(cols)] VALUES (...)`: the record image is
     /// built at prepare (nulls flagged, literal fields at their
     /// descriptor offsets); `param_fields` lists the (field id,
@@ -10406,6 +10468,8 @@ AlterDomainRename {
         /// set instead of `filter` when the WHERE holds a generator
         /// draw - see [Plan::Delete]'s field of the same name
         gen_filter: Option<GenFilter>,
+        /// the statement's `ORDER BY` / `ROWS` tail ([DmlLimit])
+        limit: Option<Box<DmlLimit>>,
     },
     /// `UPDATE OR INSERT INTO <t> (cols) VALUES (...) [MATCHING
     /// (cols)]`: the engine's own execution plan - try the update whose
@@ -10493,6 +10557,8 @@ AlterDomainRename {
         /// draw: the walk must ADVANCE the generator once per row it
         /// compares, which the [Predicate] machinery cannot do
         gen_filter: Option<GenFilter>,
+        /// the statement's `ORDER BY` / `ROWS` tail ([DmlLimit])
+        limit: Option<Box<DmlLimit>>,
     },
     /// A statement through a VIEW that has a USER TRIGGER for the event:
     /// the engine runs ONLY the triggers - no base write - whatever the
@@ -15677,6 +15743,12 @@ enum DefaultVal {
     /// column stored milliseconds where the engine stores whole seconds.
     CurrentTime(u8),
     CurrentTimestamp(u8),
+    /// `DEFAULT DATE '...'` / `TIME '...'` / `TIMESTAMP '...'` - a typed
+    /// literal, blr_literal blr_sql_date (4 bytes, MJD days) / blr_sql_time
+    /// (4 bytes, 1/10000 s) / blr_timestamp (the two), measured on 2182
+    Date(i32),
+    Time(u32),
+    Timestamp(i32, u32),
     /// `DEFAULT USER` / `CURRENT_USER` (blr_user_name) - the
     /// attachment's validated login, upper-cased as the engine stores it
     User,
@@ -15741,6 +15813,13 @@ fn decode_default_blr(b: &[u8]) -> Option<DefaultVal> {
                 let text = std::str::from_utf8(b.get(5..5 + n)?).ok()?;
                 DefaultVal::Double(text.parse().ok().filter(|f: &f64| f.is_finite())?)
             }
+            // the typed temporal literals ([DefaultVal::Date])
+            12 => DefaultVal::Date(i32::from_le_bytes(b.get(3..7)?.try_into().ok()?)),
+            13 => DefaultVal::Time(u32::from_le_bytes(b.get(3..7)?.try_into().ok()?)),
+            35 => DefaultVal::Timestamp(
+                i32::from_le_bytes(b.get(3..7)?.try_into().ok()?),
+                u32::from_le_bytes(b.get(7..11)?.try_into().ok()?),
+            ),
             23 => DefaultVal::Bool(match *b.get(3)? {
                 0 => false,
                 1 => true,
@@ -15965,6 +16044,45 @@ fn now_date_time() -> (i32, u32) {
 /// `plan:defaults` was 1277us of an 1852us plan, because the walk goes
 /// over the whole of `RDB$RELATION_FIELDS` - a row per column of every
 /// relation in the database - and then reads a blob per default.
+/// `UPDATE ... SET <col> = DEFAULT`: the column's DEFAULT - its own, or
+/// its domain's - and NULL where there is none, as the engine assigns it
+/// (measured on 2182: `set name = default` over `varchar(10) default
+/// 'dflt'` stores 'dflt', `n = default` over a plain INTEGER stores
+/// NULL). A constant default is bound once, as a literal SET value; a
+/// clock, session or blob default, and an IDENTITY column (whose
+/// default is its generator), are not taken here.
+fn update_default_setval(
+    db: &Database,
+    table: &str,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    fid: usize,
+) -> Option<SetVal> {
+    if identity_columns(db, table).iter().any(|(f, _, _)| *f == fid) {
+        return None;
+    }
+    let others: Vec<usize> =
+        columns.iter().map(|c| c.field_id as usize).filter(|f| *f != fid).collect();
+    let d = descs.get(fid)?;
+    let wp = match insert_defaults(db, table, columns, descs, &others)?
+        .into_iter()
+        .find(|(f, _)| *f == fid)
+        .map(|(_, v)| v)
+    {
+        None | Some(DefaultVal::Null) => return Some(SetVal::Lit(None)),
+        Some(DefaultVal::Int(v, sc)) => WireParam::Int(v, sc),
+        Some(DefaultVal::Int128(v, sc)) => WireParam::Int128(v, sc),
+        Some(DefaultVal::Double(f)) => WireParam::Double(f),
+        Some(DefaultVal::Bool(b)) => WireParam::Bool(b),
+        Some(DefaultVal::Date(v)) => WireParam::Date(v),
+        Some(DefaultVal::Time(v)) => WireParam::Time(v),
+        Some(DefaultVal::Timestamp(v, t)) => WireParam::Timestamp(v, t),
+        Some(DefaultVal::Text(t)) if d.dtype != dtype::BLOB => WireParam::Text(t),
+        Some(_) => return None,
+    };
+    Some(SetVal::Lit(encode_wire_value(d, &wp)?))
+}
+
 fn insert_defaults(
     db: &Database,
     table: &str,
@@ -17237,6 +17355,9 @@ fn default_as_value(d: &DefaultVal, ctx: &SessionCtx) -> Option<Value> {
         DefaultVal::Text(t) => Value::Text(t.clone()),
         DefaultVal::Null => Value::Null,
         DefaultVal::CurrentDate => Value::Date(session_now().0),
+        DefaultVal::Date(d) => Value::Date(*d),
+        DefaultVal::Time(t) => Value::Time(*t),
+        DefaultVal::Timestamp(d, t) => Value::Timestamp(*d, *t),
         DefaultVal::CurrentTime(p) => Value::Time(default_clock_time(*p)),
         DefaultVal::CurrentTimestamp(p) => {
             let (d, t) = default_clock_timestamp(*p);
@@ -17371,6 +17492,9 @@ fn default_wire_param(d: &DefaultVal, ctx: &SessionCtx) -> Option<WireParam> {
         DefaultVal::Text(t) => WireParam::Text(t.clone()),
         DefaultVal::Null => WireParam::Null,
         DefaultVal::CurrentDate => WireParam::Date(session_now().0),
+        DefaultVal::Date(d) => WireParam::Date(*d),
+        DefaultVal::Time(t) => WireParam::Time(*t),
+        DefaultVal::Timestamp(d, t) => WireParam::Timestamp(*d, *t),
         DefaultVal::CurrentTime(p) => WireParam::Time(default_clock_time(*p)),
         DefaultVal::CurrentTimestamp(p) => {
             let (d, t) = default_clock_timestamp(*p);
@@ -18898,7 +19022,9 @@ fn ddl_event_of(plan: &Plan) -> Option<(u32, String, &'static str)> {
         | P::AlterColumnRestart { table, .. }
         | P::AlterColumnGenerated { table, .. }
         | P::AlterColumnDropIdentity { table, .. }
-        | P::AlterColumnPosition { table, .. } => {
+        | P::AlterColumnPosition { table, .. }
+        | P::AlterColumnRename { table, .. }
+        | P::AlterColumnIdentity { table, .. } => {
             (DDL_ALTER_TABLE, table.clone(), "ALTER TABLE")
         }
         P::CreateView { name, .. } | P::CreateViewRefused { name, .. } => (DDL_CREATE_VIEW, name.clone(), "CREATE VIEW"),
@@ -22751,8 +22877,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
     // folded OUTSIDE quotes: a `CONSTRAINT "pk_x"` name at the tail
     // keeps its spelling
     let mut ty = if let Some(dp) = find_word(&up_ty, "DEFAULT", 0) {
-        let after = ty_orig[dp + "DEFAULT".len()..].trim_start();
-        let (def, rest) = parse_default_clause(after)?;
+        let (def, rest) = parse_default_clause(&ty_orig[dp..])?;
         default_parsed = Some(def);
         fold_bare(format!("{} {}", ty_orig[..dp].trim_end(), rest).trim())
     } else {
@@ -23210,7 +23335,8 @@ fn parse_identity_opts(opts: &str) -> Option<(i64, i64)> {
                 Some(b) if up[after..b].trim().is_empty() => b + "BY".len(),
                 _ => after,
             };
-            num_after(after)?
+            // a signed_long_integer ([sequence_step])
+            sequence_step(up[after..].split_whitespace().next()?)?
         }
         None => 1,
     };
@@ -24946,6 +25072,178 @@ fn typed_octets_literal(octets: &[u8], cs: u8) -> Option<String> {
 /// attachment's set. A DDL statement keeps its text: its source is
 /// stored as the client spelled it ([raw_source] maps the two by
 /// length), and the compiler reads the whole statement.
+/// `CAST(<v> AS <domain>)` and `CAST(<v> AS TYPE OF <domain>)` in a
+/// query or DML statement, spelled as the domain's own TYPE: a cast to a
+/// domain IS the cast to its type (the value converted, the result
+/// described as that type and named CAST), plus - for the plain form -
+/// the domain's NOT NULL and CHECK validated on the result. Measured on
+/// 2182: `cast('1.234' as d_num)` over `numeric(9,2)` is 1.23, `cast(5 as
+/// type of d_pos)` 5 and `cast(-5 as type of d_pos)` -5 whatever D_POS
+/// checks, `cast('abcdef' as d_vc)` over `varchar(5)` the 22001 truncation.
+/// A plain-form cast to a domain that CARRIES a NOT NULL or a CHECK is
+/// left alone and refuses, as does a domain with an explicit collation,
+/// an array, or a type this spelling does not name: the validation
+/// (`validation error for CAST, value "-5"`) is not reproduced here.
+/// Every such cast was a bare 42000 before.
+fn rewrite_domain_casts(sql: &str, db: &Option<Database>) -> Option<String> {
+    let head = sql.trim_start().split(|c: char| !c.is_ascii_alphabetic()).next()?.to_ascii_uppercase();
+    if !matches!(head.as_str(), "SELECT" | "WITH" | "INSERT" | "UPDATE" | "DELETE" | "MERGE") {
+        return None;
+    }
+    let up = sql.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    find_word(&masked, "CAST", 0)?;
+    let dbr = db.as_ref()?;
+    let mut out = String::with_capacity(sql.len());
+    let mut last = 0usize;
+    let mut from = 0usize;
+    let mut changed = false;
+    while let Some(c) = find_word(&masked, "CAST", from) {
+        from = c + 4;
+        // inside a cast already spelled - its value keeps its own text
+        if c < last {
+            continue;
+        }
+        let open = c + 4 + masked[c + 4..].len() - masked[c + 4..].trim_start().len();
+        if masked.as_bytes().get(open) != Some(&b'(') {
+            continue;
+        }
+        // the matching ')' and the last top-level AS inside
+        let (mut depth, mut close, mut as_at) = (0i32, None, None);
+        for (i, ch) in masked[open..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ if depth == 1 && masked[open + i..].starts_with("AS")
+                    && masked[..open + i].ends_with(|c: char| c.is_whitespace() || c == ')')
+                    && masked[open + i + 2..].starts_with(|c: char| c.is_whitespace() || c == '"') =>
+                {
+                    as_at = Some(open + i)
+                }
+                _ => {}
+            }
+        }
+        let (Some(close), Some(as_at)) = (close, as_at) else { continue };
+        let target = sql[as_at + 2..close].trim();
+        let tu = target.to_ascii_uppercase();
+        let (type_of, name_text) = match tu.strip_prefix("TYPE") {
+            Some(r) if r.starts_with(char::is_whitespace) && r.trim_start().starts_with("OF") => {
+                let r2 = r.trim_start()[2..].trim_start();
+                if !r.trim_start()[2..].starts_with(char::is_whitespace) || r2.starts_with("COLUMN") {
+                    continue;
+                }
+                (true, &target[target.len() - r2.len()..])
+            }
+            _ => (false, target),
+        };
+        let Some((name, rest)) = if_exists_name(name_text) else { continue };
+        if !rest.trim().is_empty() {
+            continue;
+        }
+        // a built-in type word is no domain - and no catalog read
+        if !type_of
+            && matches!(
+                name.as_str(),
+                "SMALLINT" | "INTEGER" | "INT" | "BIGINT" | "INT128" | "NUMERIC" | "DECIMAL" | "DEC" | "FLOAT"
+                    | "REAL" | "DOUBLE" | "DATE" | "TIME" | "TIMESTAMP" | "CHAR" | "CHARACTER" | "VARCHAR"
+                    | "NCHAR" | "BOOLEAN" | "BLOB" | "DECFLOAT" | "BINARY" | "VARBINARY"
+            )
+        {
+            continue;
+        }
+        let Some(spelled) = domain_type_spelling(dbr, &name, type_of) else { continue };
+        out.push_str(&sql[last..as_at + 2]);
+        out.push(' ');
+        out.push_str(&spelled);
+        last = close;
+        changed = true;
+    }
+    if !changed {
+        return None;
+    }
+    out.push_str(&sql[last..]);
+    // a cast NESTED in a rewritten one's value was skipped above; its
+    // text survived verbatim, so the next pass takes it
+    Some(rewrite_domain_casts(&out, db).unwrap_or(out))
+}
+
+/// A user domain's type as the SQL a CAST target spells it - None for a
+/// name no user domain carries, for a plain (not TYPE OF) domain with a
+/// NOT NULL or a CHECK to validate, and for anything this spelling does
+/// not cover ([rewrite_domain_casts]).
+fn domain_type_spelling(db: &Database, name: &str, type_of: bool) -> Option<String> {
+    let bytes = db.bytes();
+    let formats = fire_crab_ods::sysfmt::system_relation_formats(&bytes, db.page_size, "RDB$FIELDS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(&bytes, db.page_size, "RDB$FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let rel = fire_crab_ods::resolve_relation(&bytes, db.page_size, "RDB$FIELDS")?;
+    let fmts = vec![(0u8, descs.clone())];
+    let name_f = fid("RDB$FIELD_NAME")?;
+    let mut row: Option<Vec<Value>> = None;
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |v| {
+        if matches!(v.get(name_f), Some(Value::Text(t)) if t.trim_end() == name) {
+            row = Some(v.to_vec());
+        }
+    });
+    let row = row?;
+    let int = |n: &str| -> Option<i64> {
+        match row.get(fid(n)?) {
+            Some(Value::Int(i)) => Some(*i),
+            _ => None,
+        }
+    };
+    let present = |n: &str| fid(n).is_some_and(|f| !matches!(row.get(f), None | Some(Value::Null)));
+    // a system domain (RDB$...) is no user domain; an array or a computed
+    // field is no plain type
+    if int("RDB$SYSTEM_FLAG").unwrap_or(0) != 0 || int("RDB$DIMENSIONS").unwrap_or(0) != 0 || present("RDB$COMPUTED_BLR") {
+        return None;
+    }
+    if !type_of && (int("RDB$NULL_FLAG").unwrap_or(0) != 0 || present("RDB$VALIDATION_BLR")) {
+        return None;
+    }
+    if int("RDB$COLLATION_ID").unwrap_or(0) != 0 {
+        return None;
+    }
+    let scale = -int("RDB$FIELD_SCALE").unwrap_or(0);
+    let sub = int("RDB$FIELD_SUB_TYPE").unwrap_or(0);
+    let prec = int("RDB$FIELD_PRECISION").unwrap_or(0);
+    let exact = |plain: &str| -> Option<String> {
+        Some(match sub {
+            0 if scale == 0 => plain.to_string(),
+            1 => format!("NUMERIC({}, {})", prec, scale),
+            2 => format!("DECIMAL({}, {})", prec, scale),
+            _ => return None,
+        })
+    };
+    let text = |kw: &str| -> Option<String> {
+        let len = int("RDB$CHARACTER_LENGTH")?;
+        let cs = charset_id_name(int("RDB$CHARACTER_SET_ID").unwrap_or(0) as u8)?;
+        Some(format!("{}({}) CHARACTER SET {}", kw, len, cs))
+    };
+    Some(match int("RDB$FIELD_TYPE")? {
+        7 => exact("SMALLINT")?,
+        8 => exact("INTEGER")?,
+        16 => exact("BIGINT")?,
+        26 => exact("INT128")?,
+        10 => "FLOAT".into(),
+        27 => "DOUBLE PRECISION".into(),
+        12 => "DATE".into(),
+        13 => "TIME".into(),
+        35 => "TIMESTAMP".into(),
+        23 => "BOOLEAN".into(),
+        14 => text("CHAR")?,
+        37 => text("VARCHAR")?,
+        _ => return None,
+    })
+}
+
 fn rewrite_entry_literals(text: String, att: u8) -> String {
     let head = text
         .trim_start()
@@ -27218,6 +27516,208 @@ fn exception_identity(db: &Database, name: &str) -> Option<(i64, String)> {
     found
 }
 
+/// What an `IF [NOT] EXISTS` guard makes of a DDL statement
+/// ([if_exists_rewrite]).
+enum IfExists {
+    /// the guard holds: the statement does nothing, and succeeds
+    Skip,
+    /// the guard fails: the statement WITHOUT the guard runs as written
+    Run(String),
+}
+
+/// Whether a catalog relation holds a row whose named fields are these
+/// values - `Some(v)` compared with the stored text right-trimmed, `None`
+/// meaning the field is NULL (a standalone routine's RDB$PACKAGE_NAME).
+fn catalog_has(db: &Database, relation: &str, fields: &[(&str, Option<&str>)]) -> bool {
+    let bytes = db.bytes();
+    let Some(formats) = fire_crab_ods::sysfmt::system_relation_formats(&bytes, db.page_size, relation) else {
+        return false;
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else { return false };
+    let cols = relation_columns(&bytes, db.page_size, relation);
+    let mut want = Vec::new();
+    for (f, v) in fields {
+        let Some(c) = cols.iter().find(|c| c.name == *f) else { return false };
+        want.push((c.field_id as usize, *v));
+    }
+    let Some(rel) = fire_crab_ods::resolve_relation(&bytes, db.page_size, relation) else {
+        return false;
+    };
+    let fmts = vec![(0u8, descs.clone())];
+    let mut found = false;
+    for_each_catalog_record(db, rel, &fmts, usize::MAX, |values| {
+        if want.iter().all(|(fid, v)| match (values.get(*fid), v) {
+            (Some(Value::Text(t)), Some(w)) => t.trim_end() == *w,
+            (None | Some(Value::Null), None) => true,
+            _ => false,
+        }) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// One object name at the front of `t` - bare (folded) or quoted
+/// (exact), optionally `PUBLIC.`-qualified (the one schema a user object
+/// lives in here) - and the text after it.
+fn if_exists_name(t: &str) -> Option<(String, &str)> {
+    fn one(t: &str) -> Option<(String, &str)> {
+        let t = t.trim_start();
+        if t.starts_with('"') {
+            let b = t.as_bytes();
+            let mut i = 1;
+            while i < b.len() {
+                if b[i] == b'"' {
+                    if b.get(i + 1) == Some(&b'"') {
+                        i += 2;
+                        continue;
+                    }
+                    return Some((canon_ident(&t[..=i])?, &t[i + 1..]));
+                }
+                i += 1;
+            }
+            None
+        } else {
+            let end = t
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                .unwrap_or(t.len());
+            Some((canon_ident(&t[..end])?, &t[end..]))
+        }
+    }
+    let (first, rest) = one(t)?;
+    match rest.trim_start().strip_prefix('.') {
+        Some(r) if first == "PUBLIC" => one(r),
+        Some(_) => None,
+        None => Some((first, rest)),
+    }
+}
+
+/// `IF [NOT] EXISTS` on a DDL statement (parse.y if_exists_opt /
+/// if_not_exists_opt): the guard is read against the catalog and the
+/// statement either does nothing or runs WITHOUT it, through the very
+/// planner the unguarded statement takes - so a DDL that runs writes
+/// the catalog rows it always writes. Measured on 2182: every guarded
+/// CREATE over an existing name, DROP over a missing one, `ALTER TABLE
+/// .. ADD IF NOT EXISTS <col>` over an existing column and `DROP IF
+/// EXISTS` over a missing one succeed silently and change nothing
+/// (`create sequence if not exists s1 start with 99` leaves S1 at its
+/// value); the guard asks whether the NAME exists in the kind's own
+/// namespace, not whether it is that kind - `create table if not exists
+/// v1 (..)` over a VIEW V1 is skipped, while `drop table if exists v1`
+/// runs the DROP TABLE and fails as that does. The kinds taken are the
+/// ones this server plans; any other (a package body, a collation, a
+/// mapping, a user, a filter, a shadow) keeps its refusal. The guard is
+/// read when the statement is PREPARED, which is when isql and every
+/// DSQL client runs it.
+fn if_exists_rewrite(sql: &str, db: &Option<Database>) -> Option<IfExists> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let if_at = find_word_depth0(&masked, "IF", 0)?;
+    let words: Vec<&str> = masked[..if_at].split_whitespace().collect();
+    let after_if = masked[if_at + 2..].trim_start();
+    let (not, guard_len) = if after_if.starts_with("NOT ") && after_if[3..].trim_start().starts_with("EXISTS") {
+        let rest = after_if[3..].trim_start();
+        (true, masked.len() - rest.len() + "EXISTS".len() - if_at)
+    } else if after_if.starts_with("EXISTS") {
+        (false, masked.len() - after_if.len() + "EXISTS".len() - if_at)
+    } else {
+        return None;
+    };
+    let guard_end = if_at + guard_len;
+    // the word after EXISTS must end there
+    if masked[guard_end..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+        return None;
+    }
+    let (name, _) = if_exists_name(&s[guard_end..])?;
+    let db = db.as_ref()?;
+    let w: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+    let ws: Vec<&str> = w.iter().map(|w| w.as_str()).collect();
+    let routine = |rel: &str, f: &str| catalog_has(db, rel, &[(f, Some(&name)), ("RDB$PACKAGE_NAME", None)]);
+    let exists = match ws.as_slice() {
+        // CREATE [UNIQUE] [ASC[ENDING] | DESC[ENDING]] INDEX IF NOT EXISTS
+        ["CREATE", m @ .., "INDEX"] if not && m.len() <= 2 && m.iter().all(|x| {
+            matches!(*x, "UNIQUE" | "ASC" | "ASCENDING" | "DESC" | "DESCENDING")
+        }) => catalog_has(db, "RDB$INDICES", &[("RDB$INDEX_NAME", Some(&name))]),
+        ["CREATE", "TABLE"] | ["CREATE", "GLOBAL", "TEMPORARY", "TABLE"] | ["CREATE", "VIEW"] if not => {
+            catalog_has(db, "RDB$RELATIONS", &[("RDB$RELATION_NAME", Some(&name))])
+        }
+        ["DROP", "TABLE"] | ["DROP", "VIEW"] if !not => {
+            catalog_has(db, "RDB$RELATIONS", &[("RDB$RELATION_NAME", Some(&name))])
+        }
+        // (a quoted name that is not its own upper-case fold is refused -
+        // the sequence writers and lookups here fold it, see
+        // [plan_create_or_alter_sequence])
+        [_, "SEQUENCE" | "GENERATOR"] if name != name.to_ascii_uppercase() => return None,
+        ["CREATE", "SEQUENCE" | "GENERATOR"] if not => {
+            catalog_has(db, "RDB$GENERATORS", &[("RDB$GENERATOR_NAME", Some(&name))])
+        }
+        ["DROP", "SEQUENCE" | "GENERATOR"] if !not => {
+            catalog_has(db, "RDB$GENERATORS", &[("RDB$GENERATOR_NAME", Some(&name))])
+        }
+        ["DROP", "INDEX"] if !not => catalog_has(db, "RDB$INDICES", &[("RDB$INDEX_NAME", Some(&name))]),
+        // the grammar has only CREATE ... IF NOT EXISTS and DROP ... IF
+        // EXISTS on these kinds: DROP ... IF NOT EXISTS, CREATE ... IF
+        // EXISTS and any ALTER ... IF [NOT] EXISTS are -104 "Token
+        // unknown" on 2182 (measured on all six), so they fall to the
+        // refusal and never run
+        [verb @ ("CREATE" | "DROP"), kind] if (*verb == "CREATE") == not => match *kind {
+            "DOMAIN" => catalog_has(db, "RDB$FIELDS", &[("RDB$FIELD_NAME", Some(&name))]),
+            "EXCEPTION" => catalog_has(db, "RDB$EXCEPTIONS", &[("RDB$EXCEPTION_NAME", Some(&name))]),
+            "ROLE" => catalog_has(db, "RDB$ROLES", &[("RDB$ROLE_NAME", Some(&name))]),
+            "TRIGGER" => catalog_has(db, "RDB$TRIGGERS", &[("RDB$TRIGGER_NAME", Some(&name))]),
+            "PROCEDURE" => routine("RDB$PROCEDURES", "RDB$PROCEDURE_NAME"),
+            "FUNCTION" => routine("RDB$FUNCTIONS", "RDB$FUNCTION_NAME"),
+            _ => return None,
+        },
+        // ALTER TABLE <t> ADD [COLUMN] IF NOT EXISTS <col> ... / DROP
+        // [COLUMN] IF EXISTS <col> / ADD|DROP CONSTRAINT IF [NOT] EXISTS
+        ["ALTER", "TABLE", .., verb] | ["ALTER", "TABLE", .., verb, "COLUMN" | "CONSTRAINT"]
+            if (*verb == "ADD") == not && matches!(*verb, "ADD" | "DROP") =>
+        {
+            let table_at = find_word(&masked, "TABLE", 0)? + "TABLE".len();
+            let (table, rest) = if_exists_name(&s[table_at..])?;
+            // exactly one action: the table name and then this verb
+            let rest_up = mask_literals(&rest.to_ascii_uppercase());
+            let first = rest_up.split_whitespace().next()?;
+            if first != *verb {
+                return None;
+            }
+            // a second action after a comma carries a guard of its own
+            // (or none) - not taken here
+            let tail = &masked[guard_end..];
+            if find_word_depth0(tail, "ADD", 0).or_else(|| find_word_depth0(tail, "DROP", 0)).is_some() {
+                return None;
+            }
+            // on a name that is no table - missing, or a VIEW - the guard
+            // does not answer: the engine still fails the ALTER with 42S02
+            // "Table ... does not exist" in every direction (measured), which
+            // is what the unguarded statement raises here too
+            if !catalog_has(db, "RDB$RELATIONS", &[("RDB$RELATION_NAME", Some(&table)), ("RDB$VIEW_BLR", None)]) {
+                return Some(IfExists::Run(format!("{} {}", s[..if_at].trim_end(), s[guard_end..].trim_start())));
+            }
+            if ws.last() == Some(&"CONSTRAINT") {
+                catalog_has(
+                    db,
+                    "RDB$RELATION_CONSTRAINTS",
+                    &[("RDB$CONSTRAINT_NAME", Some(&name))],
+                )
+            } else {
+                catalog_has(
+                    db,
+                    "RDB$RELATION_FIELDS",
+                    &[("RDB$RELATION_NAME", Some(&table)), ("RDB$FIELD_NAME", Some(&name))],
+                )
+            }
+        }
+        _ => return None,
+    };
+    if exists == not {
+        return Some(IfExists::Skip);
+    }
+    Some(IfExists::Run(format!("{} {}", s[..if_at].trim_end(), s[guard_end..].trim_start())))
+}
+
 /// Whether a user exception of this name exists (RDB$EXCEPTIONS) - an
 /// `EXCEPTION <name>` in a trigger body must name a real one.
 fn exception_exists(db: &Database, name: &str) -> bool {
@@ -28326,13 +28826,89 @@ fn plan_create_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             } else {
                 i + 1
             };
-            increment = Some(toks.get(at)?.parse::<i64>().ok()?);
+            increment = Some(sequence_step(toks.get(at)?)?);
             i = at + 1;
         } else {
             return None; // an option this writer does not implement
         }
     }
     Some((Plan::CreateSequence { name, start, increment }, Vec::new()))
+}
+
+/// `CREATE OR ALTER SEQUENCE|GENERATOR <name> <options>` (parse.y
+/// replace_sequence_clause; DdlNodes.epp CreateAlterSequenceNode::
+/// execute): the ALTER when the name exists, else the CREATE. The
+/// options are RESTART, START WITH n and INCREMENT [BY] n, each at most
+/// once, and at least a restart or a step is required (the bare form is
+/// the engine's -104 "Unexpected end of command"). Over an existing
+/// sequence START WITH is a RESTART WITH - the value moves, its
+/// RDB$INITIAL_VALUE does not - and a step alone keeps the value; over
+/// a new one they are CREATE SEQUENCE's own options. Measured on 2182:
+/// `create or alter sequence s9 start with 50` over `start with 100`
+/// answers NEXT VALUE 50 with RDB$INITIAL_VALUE still 100; `increment
+/// by 10` over `start with 5 increment 2` (nothing drawn) answers 13; a
+/// new `sq2 start with 10` answers 10. These were a bare 42000 here.
+fn plan_create_or_alter_sequence(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() < 5
+        || !toks[0].eq_ignore_ascii_case("CREATE")
+        || !toks[1].eq_ignore_ascii_case("OR")
+        || !toks[2].eq_ignore_ascii_case("ALTER")
+        || !(toks[3].eq_ignore_ascii_case("SEQUENCE") || toks[3].eq_ignore_ascii_case("GENERATOR"))
+    {
+        return None;
+    }
+    let name = generator_ident(toks[4])?;
+    // this server's generator lookups ([generator_info], NEXT VALUE, the
+    // CREATE writer) match a name case-insensitively, so a quoted name
+    // that is not its own upper-case fold would find - and RESTART - the
+    // unquoted namesake: `create or alter sequence "s7" start with 50`
+    // over S7 moved S7 to 50, where 2182 creates "s7" and leaves S7 at
+    // its value. Such a name is refused until the lookups are exact.
+    if name != name.to_ascii_uppercase() {
+        return None;
+    }
+    let (mut restart, mut start, mut step) = (false, None::<i64>, None::<i64>);
+    let mut i = 5;
+    while i < toks.len() {
+        if toks[i].eq_ignore_ascii_case("RESTART") && !restart {
+            restart = true;
+            i += 1;
+        } else if toks[i].eq_ignore_ascii_case("START")
+            && start.is_none()
+            && toks.get(i + 1).is_some_and(|t| t.eq_ignore_ascii_case("WITH"))
+        {
+            start = Some(toks.get(i + 2)?.parse().ok()?);
+            restart = true;
+            i += 3;
+        } else if toks[i].eq_ignore_ascii_case("INCREMENT") && step.is_none() {
+            i += 1;
+            if toks.get(i).is_some_and(|t| t.eq_ignore_ascii_case("BY")) {
+                i += 1;
+            }
+            // a signed_long_integer: 32 bits
+            step = Some(sequence_step(toks.get(i)?)?);
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+    if !restart && step.is_none() {
+        return None;
+    }
+    let dbr = db.as_ref()?;
+    if generator_info(dbr, &name).is_some() {
+        return Some((
+            Plan::SetGenerator {
+                name,
+                mode: GenWrite::Alter { restart: restart.then_some(start), step },
+                stmt_type: 5, // isc_info_sql_stmt_ddl
+            },
+            Vec::new(),
+        ));
+    }
+    Some((Plan::CreateSequence { name, start, increment: step }, Vec::new()))
 }
 
 /// Parse `DROP SEQUENCE|GENERATOR <name>`.
@@ -28364,7 +28940,14 @@ fn parse_exception_stmt(sql: &str, lead: &str) -> Option<(String, String)> {
     }
     let after = exc + "EXCEPTION".len();
     let q = s[after..].find('\'')? + after;
-    let name = unquote_ident(s[after..q].trim())?;
+    // ONE identifier: [unquote_ident] takes a bare span whole, and
+    // `create exception e3 x 'y'` / `create exception if exists e2 'y'`
+    // (each -104 "Token unknown" on 2182) created "E3 X" / "IF EXISTS E2"
+    let span = s[after..q].trim();
+    if !span.starts_with('"') && span.contains(char::is_whitespace) {
+        return None;
+    }
+    let name = unquote_ident(span)?;
     let message = parse_string_literal(s[q..].trim())?;
     Some((name, message))
 }
@@ -29756,11 +30339,34 @@ fn plan_drop_role(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     Some((Plan::DropRole { name: unquote_ident(toks[2])? }, Vec::new()))
 }
 
-/// Parse a `DEFAULT <literal>` clause given the text *after* the DEFAULT
-/// keyword, in its original case. Returns the [ColumnDefault] and the text
-/// remaining after the literal. Handles an integer, a `''`-escaped string,
-/// and `NULL` - the same three a column and a domain default both accept.
+/// Parse a `DEFAULT <literal>` clause given the text *from* the DEFAULT
+/// keyword on, in its original case. Returns the [ColumnDefault] and the
+/// text remaining after the literal. Handles an integer, a `''`-escaped
+/// string, and `NULL` - the same three a column and a domain default both
+/// accept.
+///
+/// THE SOURCE IS THE TEXT AS WRITTEN, from the keyword to the value's
+/// end: RDB$DEFAULT_SOURCE on 2182 holds `DeFaUlT   42`, `default
+/// 'Ab'` with its three blanks, `Default Current_Date`, `default
+/// current_time (2)` (measured; a column, a domain, ALTER COLUMN / ALTER
+/// DOMAIN SET DEFAULT and ALTER TABLE ADD alike). It was rebuilt here as
+/// `DEFAULT <value>` - upper case, one blank, the keyword folded - which
+/// isql's SHOW and every metadata extract read back.
 fn parse_default_clause(
+    from_kw: &str,
+) -> Option<(fire_crab_ods::ddl::ColumnDefault, &str)> {
+    let from_kw = from_kw.trim_start();
+    if !from_kw.get(..7).is_some_and(|k| k.eq_ignore_ascii_case("DEFAULT")) {
+        return None;
+    }
+    let (mut def, rest) = parse_default_value(&from_kw[7..])?;
+    def.source = from_kw[..from_kw.len() - rest.len()].trim_end().to_string();
+    Some((def, rest))
+}
+
+/// [parse_default_clause]'s value, given the text after the keyword; the
+/// source it spells is replaced by the caller's.
+fn parse_default_value(
     after: &str,
 ) -> Option<(fire_crab_ods::ddl::ColumnDefault, &str)> {
     let after = after.trim_start();
@@ -29783,6 +30389,33 @@ fn parse_default_clause(
             fire_crab_ods::ddl::ColumnDefault { source: format!("DEFAULT {}", spelled), value_blr },
             rest,
         ));
+    }
+    // A TYPED TEMPORAL LITERAL, `DATE '2021-01-01'` / `TIME '10:11:12'` /
+    // `TIMESTAMP '2020-01-01 00:00:00'`: blr_literal of the type itself
+    // (measured on 2182 - 05 15 0C <days>, 05 15 0D <units>, 05 15 23
+    // <days><units>; a bare string default stays blr_text2). Refused here
+    // until 2026-09-26, and with it every CREATE TABLE / DOMAIN carrying one.
+    for (kw, op) in [("DATE", 12u8), ("TIME", 13), ("TIMESTAMP", 35)] {
+        if lit.eq_ignore_ascii_case(kw) && rest.starts_with('\'') {
+            let end = close_quote_end(rest)?;
+            let text = parse_string_literal(&rest[..end])?;
+            let mut value_blr = vec![5u8, 21, op];
+            match op {
+                12 => value_blr.extend_from_slice(&parse_date_lit(&text)?.to_le_bytes()),
+                13 => value_blr.extend_from_slice(&parse_time_lit(&text)?.to_le_bytes()),
+                _ => {
+                    let (d, t) = parse_ts_lit(&text)?;
+                    value_blr.extend_from_slice(&d.to_le_bytes());
+                    value_blr.extend_from_slice(&t.to_le_bytes());
+                }
+            }
+            value_blr.push(76); // blr_eoc
+            let spelled = format!("{} {}", lit, &rest[..end]);
+            return Some((
+                fire_crab_ods::ddl::ColumnDefault { source: format!("DEFAULT {}", spelled), value_blr },
+                rest[end..].trim_start(),
+            ));
+        }
     }
     // a context-value keyword default (CURRENT_DATE, ...) canonicalises its
     // source to the uppercase keyword, as the engine stores it
@@ -30403,8 +31036,7 @@ fn plan_alter_domain(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         .join(" ");
     if norm.starts_with("SET DEFAULT") {
         let def_kw = find_word(&tail.to_ascii_uppercase(), "DEFAULT", 0)?;
-        let after = tail[def_kw + "DEFAULT".len()..].trim_start();
-        let default = Some(parse_default_clause(after)?.0);
+        let default = Some(parse_default_clause(&tail[def_kw..])?.0);
         Some((Plan::AlterDomainDefault { domain: name, default }, Vec::new()))
     } else if norm == "DROP DEFAULT" {
         Some((Plan::AlterDomainDefault { domain: name, default: None }, Vec::new()))
@@ -31200,7 +31832,8 @@ fn plan_set_statistics(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     {
         return None;
     }
-    Some((Plan::SetStatistics { name: unquote_ident(toks[3])? }, Vec::new()))
+    // the name CANONICAL ([canon_ident]), as ALTER INDEX's below
+    Some((Plan::SetStatistics { name: canon_ident(toks[3])? }, Vec::new()))
 }
 
 /// Parse `ALTER INDEX <name> ACTIVE|INACTIVE`.
@@ -31220,8 +31853,14 @@ fn plan_alter_index(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     } else {
         return None;
     };
+    // THE NAME IS CANONICAL ([canon_ident]): a bare one folds, as the
+    // catalog stores it. `unquote_ident` kept it as written, and the
+    // catalog lookup compares exactly, so `alter index t1_n inactive` -
+    // lower case, the way a script writes it - answered a bare 42000
+    // where the engine deactivates T1_N (measured on 2182; every gate
+    // before this wrote the name in upper case)
     Some((
-        Plan::AlterIndex { name: unquote_ident(toks[2])?, active },
+        Plan::AlterIndex { name: canon_ident(toks[2])?, active },
         Vec::new(),
     ))
 }
@@ -31556,8 +32195,7 @@ fn plan_alter_column_default(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         _ => return None,
     };
     let default = if is_set {
-        let after = tail[def_kw + "DEFAULT".len()..].trim_start();
-        Some(parse_default_clause(after)?.0)
+        Some(parse_default_clause(&tail[def_kw..])?.0)
     } else {
         // DROP DEFAULT takes nothing after DEFAULT
         if !tail_masked[def_kw + "DEFAULT".len()..].trim().is_empty() {
@@ -31739,6 +32377,110 @@ fn plan_alter_column_drop_identity(sql: &str) -> Option<(Plan, Vec<Descriptor>)>
     ))
 }
 
+/// `ALTER TABLE <t> ALTER [COLUMN] <c> <tail>`: (table, column, the tail
+/// after the column) - the shared head of the column-level ALTERs below.
+fn alter_column_head(sql: &str) -> Option<(String, String, &str)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "ALTER", 0) != Some(0) {
+        return None;
+    }
+    let table_kw = find_word(&masked, "TABLE", "ALTER".len())?;
+    if masked[..table_kw].trim() != "ALTER" {
+        return None;
+    }
+    let alter2 = find_word(&masked, "ALTER", table_kw + "TABLE".len())?;
+    let table = canon_ident(&s[table_kw + "TABLE".len()..alter2])?;
+    let mut rest = s[alter2 + "ALTER".len()..].trim_start();
+    if rest.len() > 7
+        && rest[..6].eq_ignore_ascii_case("COLUMN")
+        && rest[6..].starts_with(char::is_whitespace)
+    {
+        rest = rest[6..].trim_start();
+    }
+    let (col, tail) = if_exists_name(rest)?;
+    Some((table, col, tail.trim()))
+}
+
+/// `ALTER TABLE <t> ALTER [COLUMN] <c> TO <new>` - rename a column
+/// ([fire_crab_ods::ddl::alter_column_rename], where the engine's law is
+/// stated). Measured on 2182: `alter table t1 alter column b to bb` and
+/// `alter table t1 alter n to nn` rename (an index over N follows);
+/// both were a bare 42000 here.
+fn plan_alter_column_rename(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let (table, column, tail) = alter_column_head(sql)?;
+    let rest = tail.strip_prefix(|c: char| c == 't' || c == 'T')?;
+    let rest = rest.strip_prefix(|c: char| c == 'o' || c == 'O')?;
+    if !rest.starts_with(char::is_whitespace) && !rest.starts_with('"') {
+        return None;
+    }
+    let (new_name, after) = if_exists_name(rest)?;
+    if !after.trim().is_empty() {
+        return None;
+    }
+    Some((Plan::AlterColumnRename { table, column, new_name }, Vec::new()))
+}
+
+/// `ALTER TABLE <t> ALTER [COLUMN] <c> [SET GENERATED {ALWAYS | BY
+/// DEFAULT}] {RESTART [WITH n] | SET INCREMENT [BY] n} ...` - every
+/// identity option form carrying a SET INCREMENT, or more than one
+/// option (parse.y alter_identity_clause_spec: the generation first,
+/// then the options in any order, each at most once). Measured on
+/// 2182: `set increment by 10` over an identity that has drawn 1 makes
+/// the next insert 11 and RDB$GENERATOR_INCREMENT 10; `set increment
+/// 5` (BY is noise) and `restart with 100 set increment by 3` are
+/// taken. These were a bare 42000 here.
+fn plan_alter_column_identity(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let (table, column, tail) = alter_column_head(sql)?;
+    let toks: Vec<String> = tail.split_whitespace().map(|t| t.to_ascii_uppercase()).collect();
+    let mut i = 0;
+    let mut identity_type = None;
+    if toks.get(0).map(String::as_str) == Some("SET") && toks.get(1).map(String::as_str) == Some("GENERATED") {
+        match (toks.get(2).map(String::as_str), toks.get(3).map(String::as_str)) {
+            (Some("ALWAYS"), _) => {
+                identity_type = Some(0);
+                i = 3;
+            }
+            (Some("BY"), Some("DEFAULT")) => {
+                identity_type = Some(1);
+                i = 4;
+            }
+            _ => return None,
+        }
+    }
+    let (mut restart, mut step) = (None, None);
+    while i < toks.len() {
+        match toks[i].as_str() {
+            "RESTART" if restart.is_none() => {
+                i += 1;
+                if toks.get(i).map(String::as_str) == Some("WITH") {
+                    restart = Some(Some(toks.get(i + 1)?.parse::<i64>().ok()?));
+                    i += 2;
+                } else {
+                    restart = Some(None);
+                }
+            }
+            "SET" if step.is_none() && toks.get(i + 1).map(String::as_str) == Some("INCREMENT") => {
+                i += 2;
+                if toks.get(i).map(String::as_str) == Some("BY") {
+                    i += 1;
+                }
+                // a signed_long_integer
+                step = Some(sequence_step(toks.get(i)?)?);
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+    // the single-option forms keep their own plans
+    let options = identity_type.is_some() as u8 + restart.is_some() as u8 + step.is_some() as u8;
+    if step.is_none() && options < 2 {
+        return None;
+    }
+    Some((Plan::AlterColumnIdentity { table, column, identity_type, restart, step }, Vec::new()))
+}
+
 /// Parse `ALTER TABLE <t> ALTER [COLUMN] <c> POSITION <n>` - move a column to
 /// the 1-based display position `n`.
 fn plan_alter_column_position(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
@@ -31869,6 +32611,16 @@ fn generator_ident(tok: &str) -> Option<String> {
     }
 }
 
+/// A sequence step as the grammar reads it (parse.y signed_long_integer:
+/// an optional '-' before a 32-bit NUMBER). `-2147483648` is NOT one -
+/// its 2147483648 lexes as a 64-bit number, and 2182 answers -104
+/// "Token unknown - -2147483648" for `increment by -2147483648` on
+/// CREATE / ALTER / CREATE OR ALTER SEQUENCE and on an identity's SET
+/// INCREMENT (measured) - so the range is +-2147483647.
+fn sequence_step(tok: &str) -> Option<i64> {
+    tok.parse::<i32>().ok().filter(|v| *v != i32::MIN).map(i64::from)
+}
+
 fn plan_set_generator(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';');
     let toks: Vec<&str> = s.split_whitespace().collect();
@@ -31954,7 +32706,7 @@ fn plan_alter_sequence_options(toks: &[&str]) -> Option<(Plan, Vec<Descriptor>)>
                 i += 1;
             }
             // a signed_long_integer: 32 bits
-            step = Some(toks.get(i)?.parse::<i32>().ok()? as i64);
+            step = Some(sequence_step(toks.get(i)?)?);
             i += 1;
         } else {
             return None;
@@ -32079,6 +32831,35 @@ fn returning_ident(s: &str) -> Option<(String, bool, &str)> {
 /// and a bare name folds (case-insensitive here, as everywhere else in
 /// this file). The same rule gates the table qualifier: `"rt".ID`
 /// refuses where `rt.ID` and `"RT".ID` answer.
+/// A COMPUTED column in a RETURNING list: its stored expression over the
+/// row the statement touched, cast to the column's declared type - the
+/// select list's own column ([build_projcols]), with the target table as
+/// its relation. The RETURNING rows are decoded from the STORED image,
+/// where a computed column has no bytes (its descriptor sits over the
+/// null flags), so it was refused rather than read; measured on 2182,
+/// `insert into tcomp (a, b) values (2, 3) returning c` over `c computed
+/// by (a*b)` answers 6, an UPDATE the new row's product, a DELETE the
+/// deleted row's.
+fn returning_computed(
+    db: &Database,
+    table: &str,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    name: &str,
+) -> Option<ProjCol> {
+    let computed: std::collections::HashMap<usize, RawExpr> = computed_sources(db, table)
+        .into_iter()
+        .filter_map(|(fid, src)| parse_raw_expr_any(&src).map(|r| (fid, r)))
+        .collect();
+    // one computed column may read another
+    let _guard = ComputedExprGuard::arm(computed.clone());
+    let mut pc = build_projcols(&[name.to_string()], columns, descs, &computed)?.pop()?;
+    pc.expr.as_ref()?;
+    pc.relation = Some(table.to_string());
+    pc.field_id = 0;
+    Some(pc)
+}
+
 fn wrap_returning(
     plan: Plan,
     params: Vec<Descriptor>,
@@ -32332,7 +33113,13 @@ fn wrap_returning(
             for c in columns.iter() {
                 let fid = c.field_id as usize;
                 if is_computed_fid(descs, fid) {
-                    return None; // as the spelled route refuses one
+                    // as the spelled route answers one ([returning_computed])
+                    if old_star {
+                        return None;
+                    }
+                    cols.push(returning_computed(dbr, table, &columns, descs, &c.name)?);
+                    fields.push(0);
+                    continue;
                 }
                 let d = descs.get(fid)?;
                 let (wire, sql_type, length, scale, sub_type) = wire_for(d);
@@ -32761,7 +33548,15 @@ fn wrap_returning(
         // than refusing, and this is a recorded boundary until the
         // returning path evaluates computed sources.
         if is_computed_fid(descs, fid) {
-            return None;
+            // ...and it now IS evaluated ([returning_computed]) - over
+            // the after-image, or a DELETE's row as it was. OLD. and
+            // the MERGE / UPSERT constant forms keep the refusal.
+            if old_ctx || new_qual || upsert {
+                return None;
+            }
+            cols.push(returning_computed(dbr, table, &columns, descs, &c.name)?);
+            fields.push(0);
+            continue;
         }
         let d = descs.get(fid)?;
         let (wire, sql_type, length, scale, sub_type) = wire_for(d);
@@ -36573,9 +37368,7 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         return None;
     }
     let vals_kw = find_word(&masked, "VALUES", into_kw + "INTO".len())?;
-    // between INTO and VALUES: the table name + the (column list) -
-    // the list is REQUIRED here (without it the engine reads the
-    // column set from the catalog in field order; unconverted)
+    // between INTO and VALUES: the table name + the (column list)
     let head = s[into_kw + "INTO".len()..vals_kw].trim();
     // the same head grammar an INSERT has, OVERRIDING clause included -
     // probed: `UPDATE OR INSERT INTO TA (ID,B) OVERRIDING SYSTEM VALUE
@@ -36588,7 +37381,23 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     }
     // the target is CANONICAL already (`"Order"` is Order, `t` is T)
     let table = tbl.to_string();
-    let cols = collist?;
+    // NO COLUMN LIST is every column in declared order, minus the
+    // computed ones - the implicit list an INSERT takes (measured on
+    // 2182: `update or insert into tp values (4, 'd', 1) returning *`
+    // inserts, a second with (4, 'e', 2) updates row 4 by its primary
+    // key; this refused both)
+    let cols = match collist {
+        Some(c) => c,
+        None => {
+            let meta = db.as_ref()?.relation_meta(&table)?;
+            let (_, descs) = meta.formats.iter().max_by_key(|(n, _)| *n)?;
+            meta.columns
+                .iter()
+                .filter(|c| !is_computed_fid(descs, c.field_id as usize))
+                .map(|c| c.name.clone())
+                .collect()
+        }
+    };
     // the (value list) - paren depth on the MASKED text, so parens
     // and commas inside string literals do not count
     let vopen = masked[vals_kw..].find('(')? + vals_kw;
@@ -36757,6 +37566,11 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
 }
 
 fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    // `... ORDER BY ... ROWS ...` - the statement before it, planned
+    // here, and the tail ([plan_dml_limited])
+    if let Some(p) = plan_dml_limited(sql, db_outer, true) {
+        return p;
+    }
     let db = db_outer;
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -36824,6 +37638,18 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
         return None;
     }
     for part_text in set_parts {
+        // `SET <col> = DEFAULT` ([update_default_setval])
+        if let Some(eq) = mask_literals(&part_text).find('=') {
+            if part_text[eq + 1..].trim().eq_ignore_ascii_case("DEFAULT") {
+                let col = canon_ident(part_text[..eq].trim())?;
+                let fid = find_col(&columns, &col)?.field_id as usize;
+                if sets.iter().any(|(f, _)| *f == fid) || is_computed_fid(descs, fid) {
+                    return None;
+                }
+                sets.push((fid, update_default_setval(db, table, &columns, descs, fid)?));
+                continue;
+            }
+        }
         // the predicate tokenizer does not know `+`, `||` and friends, so
         // a failure to tokenize is itself a sign this is an expression -
         // it must NOT abort the whole statement
@@ -37316,6 +38142,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
             index,
             defer,
             gen_filter,
+            limit: None,
         },
         params,
     ))
@@ -37324,6 +38151,10 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
 /// Parse `DELETE FROM <t> [WHERE <pred>]` and resolve it. Same
 /// contract as `plan_update`: None means SQL error, never a fallback.
 fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    // the ORDER BY / ROWS tail, as [plan_update]'s
+    if let Some(p) = plan_dml_limited(sql, db_outer, false) {
+        return p;
+    }
     let db = db_outer;
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -37448,6 +38279,7 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
             index,
             defer,
             gen_filter,
+            limit: None,
         },
         params,
     ))
@@ -37819,6 +38651,221 @@ fn blocking_transaction(db: &Database, targets: &[(u32, u16, u8, Vec<u8>)]) -> O
         }
     }
     None
+}
+
+/// An UPDATE's or DELETE's `ORDER BY` / `ROWS` tail (parse.y
+/// update_searched / delete_searched: `... [WHERE] [PLAN] [ORDER BY]
+/// [ROWS]`). The engine compiles it as it does a SELECT's: FIRST over
+/// SKIP over a SORT over the filtered scan, and the statement writes the
+/// rows in the order that stream yields them - so a RETURNING lists them
+/// sorted (measured on 2182: `update t1 set n = -1 order by id desc rows
+/// 2 returning id` answers 5, 4). `ROWS n` is FIRST n; `ROWS m TO n` is
+/// FIRST `(n - m) + 1` SKIP `m - 1`, the grammar's own arithmetic
+/// (parse.y rows_clause), both converted to BIGINT with MOV_get_int64's
+/// rounding - `rows 1.5` deletes two rows, `rows 2 to 1.5` the second
+/// alone, `rows '3'` three.
+#[derive(Clone)]
+struct DmlLimit {
+    order: Vec<OrderKey>,
+    /// `CAST((count) AS BIGINT)`, None without a ROWS clause
+    first: Option<Expr>,
+    /// `CAST((skip) AS BIGINT)`, None for `ROWS n`
+    skip: Option<Expr>,
+}
+
+/// The `ORDER BY` / `ROWS` tail at paren depth zero of an UPDATE or
+/// DELETE (RETURNING already split off): (the statement before it,
+/// the ORDER BY list, the ROWS operands). None when there is no tail.
+/// An ORDER BY after the ROWS is the engine's -104, so only the
+/// grammar's order is taken; anything else leaves the base statement
+/// to refuse.
+fn split_dml_limit(s: &str) -> Option<(&str, Option<&str>, Option<(&str, Option<&str>)>)> {
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let order = find_word_depth0(&masked, "ORDER", 0).filter(|&o| {
+        let after = masked[o + "ORDER".len()..].trim_start();
+        after.starts_with("BY") && !after[2..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    });
+    let rows = find_word_depth0(&masked, "ROWS", order.unwrap_or(0));
+    if order.is_none() && rows.is_none() {
+        return None;
+    }
+    let base_end = order.or(rows)?;
+    let order_text = order.map(|o| {
+        let by = masked[o..].find("BY").map(|b| o + b + 2).unwrap_or(o);
+        s[by..rows.unwrap_or(s.len())].trim()
+    });
+    let rows_text = match rows {
+        None => None,
+        Some(r) => {
+            let from = r + "ROWS".len();
+            match find_word_depth0(&masked, "TO", from) {
+                Some(t) => Some((s[from..t].trim(), Some(s[t + "TO".len()..].trim()))),
+                None => Some((s[from..].trim(), None)),
+            }
+        }
+    };
+    Some((s[..base_end].trim_end(), order_text, rows_text))
+}
+
+/// `CAST((<text>) AS BIGINT)` as a constant expression - a ROWS bound,
+/// a GEN_ID step: MOV_get_int64 at scale 0, which rounds half away from
+/// zero and converts a string by the numeric grammar. A `?` is refused
+/// (it would need a slot of its own), and so is anything that reads a
+/// column.
+fn const_bigint_expr(text: &str) -> Option<Expr> {
+    if text.is_empty() || mask_literals(text).contains('?') {
+        return None;
+    }
+    let raw = parse_raw_expr_any(&format!("CAST(({}) AS BIGINT)", text))?;
+    let e = resolve_expr(&raw, &[], &[])?;
+    e.type_of(&[])?;
+    Some(e)
+}
+
+/// Plan an UPDATE or DELETE that carries an `ORDER BY` / `ROWS` tail:
+/// the statement WITHOUT it goes through the ordinary planner - every
+/// constraint, trigger and index path stays the one the plain statement
+/// takes - and the tail rides the plan as its [DmlLimit]. None when
+/// there is no tail (the caller plans as before); `Some(None)` refuses.
+fn plan_dml_limited(
+    sql: &str,
+    db: &Option<Database>,
+    update: bool,
+) -> Option<Option<(Plan, Vec<Descriptor>)>> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let (base, order, rows) = split_dml_limit(s)?;
+    Some((|| {
+        // `ROWS 1 ORDER BY ID` - the ORDER BY after the ROWS - is the
+        // engine's -104 Token unknown at the ORDER (measured); the base
+        // statement would otherwise take the ROWS as its own tail
+        if find_word_depth0(&mask_literals(&base.to_ascii_uppercase()), "ROWS", 0).is_some() {
+            return None;
+        }
+        // THROUGH A VIEW the keys would have to name the VIEW's columns,
+        // and the plan below is the base table's - not taken
+        if let (Some(d), Some((_, name))) = (db.as_ref(), dml_target(base)) {
+            if is_view(d, &name) {
+                return None;
+            }
+        }
+        let (mut plan, params) =
+            if update { plan_update(base, db)? } else { plan_delete(base, db)? };
+        let (formats, cols, slot) = match &mut plan {
+            // a raise the base statement answers is the statement's answer
+            Plan::RefusedEval(_) => return Some((plan, params)),
+            Plan::Update { formats, trig_cols, limit, gen_filter: None, .. }
+            | Plan::Delete { formats, trig_cols, limit, gen_filter: None, .. } => {
+                (formats.clone(), trig_cols.clone(), limit)
+            }
+            // a view's rewrite, a generator drawn in the WHERE (it draws
+            // once per row COMPARED, and a count stops the compare)
+            _ => return None,
+        };
+        let descs = formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.clone())?;
+        let order = match order {
+            None => Vec::new(),
+            // a column of the target, or an expression over its row; an
+            // ORDINAL is the engine's -104 "Invalid column position" (there
+            // is no select list), refused here
+            Some(o) => parse_order_by_expr(
+                o,
+                &[],
+                &descs,
+                |n| find_col(&cols, n).map(|c| c.field_id as usize),
+                |t| parse_raw_expr_any(t).and_then(|r| resolve_expr(&r, &cols, &descs)),
+            )?,
+        };
+        let (first, skip) = match rows {
+            None => (None, None),
+            Some((n, None)) => (Some(const_bigint_expr(n)?), None),
+            Some((m, Some(n))) => (
+                Some(const_bigint_expr(&format!("(({}) - ({})) + 1", n, m))?),
+                Some(const_bigint_expr(&format!("({}) - 1", m))?),
+            ),
+        };
+        *slot = Some(Box::new(DmlLimit { order, first, skip }));
+        Some((plan, params))
+    })())
+}
+
+/// A ROWS bound's value: NULL counts as 0 (`desc ? MOV_get_int64 : 0`,
+/// FirstRowsStream.cpp / SkipRowsStream.cpp - `rows null` writes
+/// nothing and raises nothing, measured).
+fn dml_bound_value(e: &Expr) -> Result<i64, EvalErr> {
+    match e.eval(&[])? {
+        Value::Null => Ok(0),
+        Value::Int(v) => Ok(v),
+        _ => Err(EvalErr::Unsupported),
+    }
+}
+
+/// (FIRST, SKIP) of a [DmlLimit], in the engine's order: the count is
+/// read and judged first, and a count of 0 never opens the skip - `rows
+/// 3 to 2` writes nothing, `rows 0 to 2` raises the skip's 42000 and
+/// `rows 0 to -5` the count's HY000 (measured on 2182).
+fn dml_limit_bounds(limit: Option<&DmlLimit>) -> Result<Option<(u64, u64)>, EvalErr> {
+    let Some(first) = limit.and_then(|l| l.first.as_ref()) else { return Ok(None) };
+    let n = dml_bound_value(first)?;
+    if n < 0 {
+        return Err(EvalErr::BadLimitParam);
+    }
+    if n == 0 {
+        return Ok(Some((0, 0)));
+    }
+    let k = match limit.and_then(|l| l.skip.as_ref()) {
+        Some(e) => dml_bound_value(e)?,
+        None => 0,
+    };
+    if k < 0 {
+        return Err(EvalErr::BadSkipParam);
+    }
+    Ok(Some((n as u64, k as u64)))
+}
+
+/// The targets a DML walk collected, sorted by the tail's ORDER BY (a
+/// stable sort over the walk's order, ties in record order as a
+/// SELECT's are) and cut to its ROWS window.
+fn apply_dml_limit(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    limit: Option<&DmlLimit>,
+    bounds: Option<(u64, u64)>,
+    found: Vec<(u32, u16, u8, Vec<u8>)>,
+) -> Result<Vec<(u32, u16, u8, Vec<u8>)>, EvalErr> {
+    let Some(limit) = limit else { return Ok(found) };
+    let mut found = found;
+    if !limit.order.is_empty() {
+        let defaults = newest_format_defaults(db, rel);
+        let mut keyed = Vec::with_capacity(found.len());
+        for t in found {
+            let descs = formats
+                .iter()
+                .find(|(n, _)| *n == t.2)
+                .or_else(|| formats.iter().max_by_key(|(n, _)| *n))
+                .map(|(_, d)| d.as_slice())
+                .unwrap_or(&[]);
+            let values = decode_stored(&t.3, descs, formats, &defaults);
+            let mut k = Vec::with_capacity(limit.order.len());
+            for key in &limit.order {
+                k.push(key.value_of(&values)?);
+            }
+            keyed.push((k, t));
+        }
+        let flat: Vec<OrderKey> = limit
+            .order
+            .iter()
+            .enumerate()
+            .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll, coll_explicit: k.coll_explicit, own_coll: k.own_coll })
+            .collect();
+        keyed.sort_by(|a, b| order_cmp(&a.0, &b.0, &flat));
+        found = keyed.into_iter().map(|(_, t)| t).collect();
+    }
+    if let Some((n, k)) = bounds {
+        found = found.into_iter().skip(k as usize).take(n as usize).collect();
+    }
+    Ok(found)
 }
 
 fn collect_dml_targets(
@@ -39009,6 +40056,7 @@ fn execute_dml_collecting_inner(
             fire_crab_ods::ddl::set_index_statistics(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
+        Plan::DdlNoop => (0, 0, 0),
         Plan::Comment { target, text } => {
             fire_crab_ods::ddl::comment_on(&mut work, db.page_size, target, text.as_deref())?;
             (0, 0, 0)
@@ -39281,6 +40329,28 @@ fn execute_dml_collecting_inner(
             fire_crab_ods::ddl::alter_column_drop_identity(&mut work, db.page_size, table, column)?;
             (0, 0, 0)
         }
+        Plan::AlterColumnRename { table, column, new_name } => {
+            fire_crab_ods::ddl::alter_column_rename(&mut work, db.page_size, table, column, new_name)?;
+            (0, 0, 0)
+        }
+        Plan::AlterColumnIdentity { table, column, identity_type, restart, step } => {
+            // the engine's order (DdlNodes.epp AlterRelationNode, the
+            // identityOptions arm): a RESTART's value is `start - step`
+            // with the NEW step when one is given, then the type, then
+            // the step lands on the generator row
+            if let Some(st) = step {
+                fire_crab_ods::ddl::alter_column_identity_increment(&mut work, db.page_size, table, column, *st)?;
+            }
+            if let Some(t) = identity_type {
+                fire_crab_ods::ddl::alter_column_set_generated(&mut work, db.page_size, table, column, *t)?;
+            }
+            if let Some(w) = restart {
+                let (gen, stored) =
+                    fire_crab_ods::ddl::column_restart_posting(&mut work, db.page_size, table, column, *w)?;
+                post_generator_set(db, &gen, stored);
+            }
+            (0, 0, 0)
+        }
         Plan::AlterColumnPosition { table, column, position } => {
             fire_crab_ods::ddl::alter_column_position(
                 &mut work,
@@ -39425,6 +40495,9 @@ fn execute_dml_collecting_inner(
                     DefaultVal::Text(t) => WireParam::Text(t.clone()),
                     DefaultVal::Null => continue,
                     DefaultVal::CurrentDate => WireParam::Date(session_now().0),
+                    DefaultVal::Date(d) => WireParam::Date(*d),
+                    DefaultVal::Time(t) => WireParam::Time(*t),
+                    DefaultVal::Timestamp(d, t) => WireParam::Timestamp(*d, *t),
                     DefaultVal::CurrentTime(p) => WireParam::Time(default_clock_time(*p)),
                     DefaultVal::CurrentTimestamp(p) => {
                         let (dd, tt) = default_clock_timestamp(*p);
@@ -39634,7 +40707,7 @@ fn execute_dml_collecting_inner(
             }
             (1, 0, 0)
         }
-        Plan::Update { rel, triggers, trig_cols, table, format_no, formats, sets, filter, index_ops, not_null, checks, domain_checks, fk_refs, fk_children, index, defer, gen_filter } => {
+        Plan::Update { rel, triggers, trig_cols, table, format_no, formats, sets, filter, index_ops, not_null, checks, domain_checks, fk_refs, fk_children, index, defer, gen_filter, limit } => {
             // A TRIGGER BODY THAT READS OR WRITES THE DATABASE fires
             // with this statement's working copy PUBLISHED, and the
             // rows are then written one at a time as they are read -
@@ -39786,6 +40859,10 @@ fn execute_dml_collecting_inner(
                 .unwrap_or(0);
             let mut targets: Vec<(u32, u16, Vec<u8>)> = Vec::new();
             let mut old_images: Vec<Vec<u8>> = Vec::new();
+            // THE ROWS BOUNDS ARE READ FIRST: the engine's FirstRowsStream
+            // evaluates its count when it opens, before the scan below it
+            // reads a row ([dml_limit_bounds])
+            let bounds = dml_limit_bounds(limit.as_deref()).map_err(ExecErr::Eval)?;
             let found = match gen_filter {
                 Some(g) => {
                     let (rows, last) =
@@ -39802,6 +40879,10 @@ fn execute_dml_collecting_inner(
                 None => collect_dml_targets(db, *rel, formats, filter, index)
                     .map_err(ExecErr::Eval)?,
             };
+            // the ORDER BY / ROWS tail picks and orders the targets
+            // ([apply_dml_limit]) before anything is judged or written
+            let found = apply_dml_limit(db, *rel, formats, limit.as_deref(), bounds, found)
+                .map_err(ExecErr::Eval)?;
             // NOTHING HAS BEEN WRITTEN YET, which is what makes the
             // wait possible: [execute_dml] releases the database's
             // write side, waits for the transaction that holds the row,
@@ -40258,7 +41339,7 @@ fn execute_dml_collecting_inner(
             }
             (0, affected as i32, 0)
         }
-        Plan::Delete { rel, triggers, trig_cols, formats, filter, fk_children, index, defer, gen_filter } => {
+        Plan::Delete { rel, triggers, trig_cols, formats, filter, fk_children, index, defer, gen_filter, limit } => {
             // as in the UPDATE arm: a body that reads the database sees
             // each row go before the next one's trigger fires - and so
             // does a REFERENTIAL ACTION, which the engine fires from an
@@ -40287,6 +41368,10 @@ fn execute_dml_collecting_inner(
             let mut deleted = 0usize;
             // a generator drawn in the WHERE advances ONCE PER ROW
             // COMPARED, matching or not - see [collect_dml_targets_drawing]
+            // THE ROWS BOUNDS ARE READ FIRST: the engine's FirstRowsStream
+            // evaluates its count when it opens, before the scan below it
+            // reads a row ([dml_limit_bounds])
+            let bounds = dml_limit_bounds(limit.as_deref()).map_err(ExecErr::Eval)?;
             let found = match gen_filter {
                 Some(g) => {
                     let (rows, last) =
@@ -40305,6 +41390,10 @@ fn execute_dml_collecting_inner(
             };
             // the same wait an UPDATE makes: a row another transaction
             // is still holding is not this statement's to delete
+            // the ORDER BY / ROWS tail picks and orders the targets
+            // ([apply_dml_limit]) before anything is judged or written
+            let found = apply_dml_limit(db, *rel, formats, limit.as_deref(), bounds, found)
+                .map_err(ExecErr::Eval)?;
             if let Some(other) = blocking_transaction(db, &found) {
                 return Err(ExecErr::Conflict(other));
             }
@@ -60184,6 +61273,23 @@ fn plan_query_inner_at_body(
                 return Some(Plan::GenIdIncrement { name: gen_name, step: Some(step) });
             }
         }
+        // ...and a step that is a constant but no integer literal
+        // ([parse_gen_id_const_step]), converted here: its conversion
+        // error is the statement's answer, a NULL step answers NULL and
+        // moves nothing
+        if let Some((gen_name, step)) = parse_gen_id_const_step(proj_s, table_s) {
+            let dbr = db.as_ref()?;
+            read_generator_value(dbr, &gen_name)?;
+            return Some(match step.eval(&[]) {
+                Err(e) => Plan::RefusedEval(e),
+                Ok(Value::Null) => Plan::Scalar(ScalarVal::Fixed(None), "GEN_ID".into(), None, ScalarTy::int64()),
+                Ok(Value::Int(0)) => {
+                    Plan::Scalar(ScalarVal::GenRead(gen_name), "GEN_ID".into(), None, ScalarTy::int64())
+                }
+                Ok(Value::Int(n)) => Plan::GenIdIncrement { name: gen_name, step: Some(n) },
+                Ok(_) => return None,
+            });
+        }
         // `NEXT VALUE FOR <seq>` bumps the sequence by its own increment
         if db.as_ref().is_some() {
             if let Some(seq) = parse_next_value(proj_s, table_s) {
@@ -70714,6 +71820,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::AlterDomainType { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
+        | Plan::DdlNoop
         | Plan::Comment { .. }
         | Plan::Grant { .. }
         | Plan::GrantRole { .. }
@@ -70722,7 +71829,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableAddCheck { .. } | Plan::CreateTrigger { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
-        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. } => {
+        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. } | Plan::AlterColumnRename { .. } | Plan::AlterColumnIdentity { .. } => {
             describe_dml(5, params, att) // isc_info_sql_stmt_ddl
         }
         Plan::Insert { .. } => describe_dml(2, params, att), // isc_info_sql_stmt_insert
@@ -70839,6 +71946,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::AlterDomainType { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
+        | Plan::DdlNoop
         | Plan::Comment { .. }
         | Plan::Grant { .. }
         | Plan::GrantRole { .. }
@@ -70847,7 +71955,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableAddCheck { .. } | Plan::CreateTrigger { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
-        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. } => 5,
+        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. } | Plan::AlterColumnRename { .. } | Plan::AlterColumnIdentity { .. } => 5,
         Plan::SetGenerator { stmt_type, .. } => *stmt_type,
     }
 }
@@ -71882,6 +72990,8 @@ const GDS_DSQL_TOKEN_UNK_ERR: i32 = 335544634;
 /// `isc_dsql_firstskip_rows` (DSQL 271) - "FIRST/SKIP cannot be used
 /// with OFFSET/FETCH or ROWS"
 const GDS_DSQL_FIRSTSKIP_ROWS: i32 = 336397327;
+const GDS_BAD_LIMIT_PARAM: i32 = 335544817;
+const GDS_BAD_SKIP_PARAM: i32 = 335544818;
 
 /// isc_exception_integer_overflow - "Integer overflow. The result of an
 /// integer operation caused the most significant bit of the result to
@@ -73256,6 +74366,12 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(GDS_RANDOM)
                 .int(2) // isc_arg_string
                 .bytes(token.as_bytes());
+        }
+        EvalErr::BadLimitParam => {
+            w.int(1).int(GDS_BAD_LIMIT_PARAM); // isc_arg_gds
+        }
+        EvalErr::BadSkipParam => {
+            w.int(1).int(GDS_BAD_SKIP_PARAM); // isc_arg_gds
         }
         EvalErr::FirstSkipRows => {
             w.int(1) // isc_arg_gds
@@ -74959,6 +76075,7 @@ fn emit_rows_inner(
         | Plan::AlterDomainType { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
+        | Plan::DdlNoop
         | Plan::Comment { .. }
         | Plan::Grant { .. }
         | Plan::GrantRole { .. }
@@ -74967,7 +76084,7 @@ fn emit_rows_inner(
         | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableAddCheck { .. } | Plan::CreateTrigger { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
-        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. }
+        | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. } | Plan::AlterColumnRename { .. } | Plan::AlterColumnIdentity { .. }
         | Plan::GenIdIncrement { .. } | Plan::SetGenerator { .. } => {}
         Plan::Scalar(v, _, _, ty) => {
             // WORKED OUT HERE, not at prepare - see [ScalarVal]
@@ -77695,6 +78812,40 @@ fn parse_gen_id_query(proj_s: &str, table_s: &str) -> Option<(String, i64)> {
         return None;
     }
     Some((name, step))
+}
+
+/// `GEN_ID(<name>, <step>)` whose step is not an integer literal - a
+/// decimal, a string, NULL, a constant expression: (the name, the step
+/// as `CAST((step) AS BIGINT)`). GEN_ID converts its step with
+/// MOV_get_int64 at scale 0 (ExprNodes.cpp GenIdNode::execute), so on
+/// 2182 `gen_id(g, 1.7)` advances by 2, `1.2` by 1, `-1.5` by -2, `'3'`
+/// by 3, `'x'` raises 22018 conversion error from string "x", and a
+/// NULL step answers NULL WITHOUT advancing (the engine's null-argument
+/// early out). A step that reads a column or a `?` is not taken.
+fn parse_gen_id_const_step(proj_s: &str, table_s: &str) -> Option<(String, Expr)> {
+    let up = table_s.trim().to_ascii_uppercase().replace('"', "");
+    let bare = up.strip_prefix("SYSTEM.").unwrap_or(&up).trim();
+    if bare != "RDB$DATABASE" {
+        return None;
+    }
+    let p = proj_s.trim();
+    let open = p.find('(')?;
+    if !p[..open].trim().eq_ignore_ascii_case("GEN_ID") {
+        return None;
+    }
+    let close = p.rfind(')')?;
+    if close <= open || p[close + 1..].trim() != "" {
+        return None;
+    }
+    let args = &p[open + 1..close];
+    // the name never holds a comma or a paren: split on the FIRST comma,
+    // so a step that is itself a call keeps its own
+    let comma = args.find(',')?;
+    let name = strip_gen_name(args[..comma].trim());
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, const_bigint_expr(args[comma + 1..].trim())?))
 }
 
 /// The `<seq>` span of a `NEXT VALUE FOR <seq>` projection item, or None
@@ -89040,6 +90191,13 @@ enum EvalErr {
     /// `-104 FIRST/SKIP cannot be used with OFFSET/FETCH or ROWS`
     /// (`isc_dsql_error` + `isc_sqlerr`(-104) + `isc_dsql_firstskip_rows`)
     FirstSkipRows,
+    /// a NEGATIVE row count: `isc_bad_limit_param` (HY000, -204), the
+    /// bare code - "Invalid parameter to FETCH or FIRST. Only integers
+    /// >= 0 are allowed." Raised at EXECUTE by FirstRowsStream::open
+    BadLimitParam,
+    /// a NEGATIVE skip: `isc_bad_skip_param` (42000, -204), bare -
+    /// SkipRowsStream::open, reached only when the count is not 0
+    BadSkipParam,
     /// A QUALIFIED relation reference that names no relation reachable
     /// under that schema: the engine's -204 "Table unknown"
     /// (`isc_dsql_error` + `isc_sqlerr`(-204) + `isc_dsql_relation_err`
@@ -111140,6 +112298,14 @@ fn recreate_drop_plan(create: &Plan) -> Option<Plan> {
 /// DDL a client is served.
 fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let (ddl_kw, dml_kw) = immediate_verb(text);
+    // an IF [NOT] EXISTS guard ([if_exists_rewrite])
+    if ddl_kw {
+        match if_exists_rewrite(text, database) {
+            Some(IfExists::Skip) => return Some((Plan::DdlNoop, Vec::new())),
+            Some(IfExists::Run(t)) => return plan_immediate(&t, database),
+            None => {}
+        }
+    }
     // SET GENERATOR / ALTER SEQUENCE RESTART are generator writes; the
     // ALTER form also begins with a DDL verb.
     plan_set_generator(text)
@@ -111164,6 +112330,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_drop_table(text))
                     .or_else(|| plan_drop_index(text))
                     .or_else(|| plan_create_sequence(text))
+                    .or_else(|| plan_create_or_alter_sequence(text, database))
                     .or_else(|| plan_create_procedure(text, database))
                     .or_else(|| plan_drop_procedure(text))
                     .or_else(|| plan_drop_sequence(text))
@@ -111203,6 +112370,8 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_alter_column_generated(text))
                     .or_else(|| plan_alter_column_drop_identity(text))
                     .or_else(|| plan_alter_column_position(text))
+                    .or_else(|| plan_alter_column_rename(text))
+                    .or_else(|| plan_alter_column_identity(text))
                     .or_else(|| plan_alter_sequence(text))
             } else if dml_kw {
                 plan_insert(text, database)
@@ -124953,6 +126122,10 @@ fn after_auth(
                         }
                         RAW_STMT.with(|r| *r.borrow_mut() = raw_sql.clone());
                         stmt_sql = rewrite_entry_literals(entry_strip_comments(&raw_sql), att_cs.id);
+                        // a CAST to a DOMAIN spelled as its type ([rewrite_domain_casts])
+                        if let Some(t) = rewrite_domain_casts(&stmt_sql, &database) {
+                            stmt_sql = t;
+                        }
                     }
                 // ...and the text a DDL trigger reads as SQL_TEXT
                 CURRENT_USER_NAME.with(|u| *u.borrow_mut() = user.to_string());
@@ -125023,7 +126196,21 @@ fn after_auth(
                     // DDL prepares to a real plan or to an SQL error -
                     // a client must never think its DDL succeeded when
                     // the verb is one this server does not implement
-                    let planned = plan_comment(&stmt_sql)
+                    // ...and an IF [NOT] EXISTS guard is read here: the
+                    // statement does nothing, or runs without it
+                    // ([if_exists_rewrite])
+                    let guard = if_exists_rewrite(&stmt_sql, &database);
+                    let stmt_sql = match &guard {
+                        Some(IfExists::Run(t)) => t.clone(),
+                        _ => stmt_sql.clone(),
+                    };
+                    let planned = if matches!(guard, Some(IfExists::Skip)) {
+                        Some((Plan::DdlNoop, Vec::new()))
+                    } else {
+                        None
+                    };
+                    let planned = planned
+                        .or_else(|| plan_comment(&stmt_sql))
                         .or_else(|| plan_grant_procedure(&stmt_sql))
                         .or_else(|| plan_grant_usage(&stmt_sql))
                         .or_else(|| plan_grant(&stmt_sql))
@@ -125040,6 +126227,7 @@ fn after_auth(
                         .or_else(|| plan_drop_table(&stmt_sql))
                         .or_else(|| plan_drop_index(&stmt_sql))
                         .or_else(|| plan_create_sequence(&stmt_sql))
+                        .or_else(|| plan_create_or_alter_sequence(&stmt_sql, &database))
                         .or_else(|| plan_drop_sequence(&stmt_sql))
                         .or_else(|| plan_create_procedure(&stmt_sql, &database))
                         .or_else(|| plan_drop_procedure(&stmt_sql))
@@ -125079,6 +126267,8 @@ fn after_auth(
                         .or_else(|| plan_alter_column_generated(&stmt_sql))
                         .or_else(|| plan_alter_column_drop_identity(&stmt_sql))
                         .or_else(|| plan_alter_column_position(&stmt_sql))
+                        .or_else(|| plan_alter_column_rename(&stmt_sql))
+                        .or_else(|| plan_alter_column_identity(&stmt_sql))
                         .or_else(|| plan_alter_sequence(&stmt_sql))
                         // one shape for every branch: the loop adopts an
                         // Rc, whether it came from a planner or a cache
@@ -125561,6 +126751,7 @@ fn after_auth(
                         | Plan::AlterDomainType { .. }
                         | Plan::AlterIndex { .. }
                         | Plan::SetStatistics { .. }
+                        | Plan::DdlNoop
                         | Plan::Comment { .. }
                         | Plan::Grant { .. }
                         | Plan::GrantRole { .. }
@@ -125580,6 +126771,8 @@ fn after_auth(
                         | Plan::AlterColumnGenerated { .. }
                         | Plan::AlterColumnDropIdentity { .. }
                         | Plan::AlterColumnPosition { .. }
+                        | Plan::AlterColumnRename { .. }
+                        | Plan::AlterColumnIdentity { .. }
                         | Plan::SetGenerator { .. }
                         | Plan::SetTimeZone { .. }
                         | Plan::SetTimeZoneRefused(_)
@@ -143308,6 +144501,7 @@ mod tests {
             index: None,
             defer: None,
             gen_filter: None,
+            limit: None,
         };
         let wrap = |p: Plan| Plan::Returning {
             new_cols: Vec::new(),
@@ -143333,6 +144527,7 @@ mod tests {
                 index: None,
                 defer: None,
                 gen_filter: None,
+                limit: None,
             }),
             4
         );
@@ -143496,6 +144691,7 @@ mod tests {
                 index: None,
                 defer: None,
                 gen_filter: None,
+                limit: None,
             })
         };
         let upsert = Plan::UpdateOrInsert { update: update(), insert: insert(), upd_args: Vec::new() };
@@ -144159,12 +145355,14 @@ mod tests {
             v.push(76);
             v
         });
-        // context-value defaults: single-opcode BLR, canonical uppercase source
+        // context-value defaults: single-opcode BLR; the source is the
+        // clause AS WRITTEN (RDB$DEFAULT_SOURCE on 2182 keeps `default
+        // current_user` in lower case - [parse_default_clause])
         let d = parse_column_def("A DATE DEFAULT CURRENT_DATE").unwrap().0.default.unwrap();
         assert_eq!(d.source, "DEFAULT CURRENT_DATE");
         assert_eq!(d.value_blr, vec![5, 160, 76]);
         let d = parse_column_def("c varchar(30) default current_user").unwrap().0.default.unwrap();
-        assert_eq!(d.source, "DEFAULT CURRENT_USER");
+        assert_eq!(d.source, "default current_user");
         assert_eq!(d.value_blr, vec![5, 44, 76]);
         // USER is an alias for CURRENT_USER; the multi-byte ones too
         assert_eq!(parse_column_def("f varchar(30) default USER").unwrap().0.default.unwrap().value_blr, vec![5, 44, 76]);
@@ -145428,6 +146626,33 @@ mod tests {
     }
 
     #[test]
+    fn splits_the_dml_order_rows_tail() {
+        // the statement before the tail, the ORDER BY list, the ROWS operands
+        assert_eq!(
+            split_dml_limit("DELETE FROM T ORDER BY ID DESC ROWS 1"),
+            Some(("DELETE FROM T", Some("ID DESC"), Some(("1", None))))
+        );
+        assert_eq!(
+            split_dml_limit("update t set n = 0 where id > 1 rows 2 to 3"),
+            Some(("update t set n = 0 where id > 1", None, Some(("2", Some("3")))))
+        );
+        assert_eq!(split_dml_limit("UPDATE T SET N = 1 ORDER BY N"), Some(("UPDATE T SET N = 1", Some("N"), None)));
+        // a subquery's own ORDER BY / ROWS is no tail, nor is a literal
+        assert_eq!(split_dml_limit("DELETE FROM T WHERE ID IN (SELECT ID FROM T ORDER BY ID ROWS 2)"), None);
+        assert_eq!(split_dml_limit("UPDATE T SET S = 'order by rows 1'"), None);
+        // ORDER followed by something other than BY is not the clause
+        assert_eq!(split_dml_limit("DELETE FROM T"), None);
+    }
+
+    #[test]
+    fn reads_an_if_exists_object_name() {
+        assert_eq!(if_exists_name(" t1 (z integer)"), Some(("T1".to_string(), " (z integer)")));
+        assert_eq!(if_exists_name("\"t1\" (z)"), Some(("t1".to_string(), " (z)")));
+        assert_eq!(if_exists_name("PUBLIC.S1 START WITH 1"), Some(("S1".to_string(), " START WITH 1")));
+        assert_eq!(if_exists_name("OTHER.S1"), None);
+    }
+
+    #[test]
     fn parses_alter_domain_default() {
         // SET DEFAULT carries the parsed default (int)
         match plan_alter_domain("ALTER DOMAIN DOM_A SET DEFAULT 99") {
@@ -145444,7 +146669,7 @@ mod tests {
         match plan_alter_domain("alter domain dom_b set default 'Hey'") {
             Some((Plan::AlterDomainDefault { domain, default }, _)) => {
                 assert_eq!(domain, "dom_b");
-                assert_eq!(default.unwrap().source, "DEFAULT 'Hey'");
+                assert_eq!(default.unwrap().source, "default 'Hey'");
             }
             other => panic!("expected AlterDomainDefault string, got {:?}", other.is_some()),
         }
@@ -145503,7 +146728,7 @@ mod tests {
         match plan_alter_column_default("alter table t alter s set default 'Hi'") {
             Some((Plan::AlterColumnDefault { column, default, .. }, _)) => {
                 assert_eq!(column, "S");
-                assert_eq!(default.unwrap().source, "DEFAULT 'Hi'");
+                assert_eq!(default.unwrap().source, "default 'Hi'");
             }
             other => panic!("expected AlterColumnDefault string, got {:?}", other.is_some()),
         }

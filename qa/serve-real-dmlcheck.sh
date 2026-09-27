@@ -90,8 +90,8 @@
 # CONTROLS from neighbouring fixes, green before this slice: ALTER TABLE
 # DROP of a column a view reads, ALTER TABLE ADD ... IDENTITY over rows.
 #
-# RECORDED, not fixed: `DROP TABLE IF EXISTS` and `ALTER TABLE ADD <column>
-# REFERENCES` do not parse here; a key moved and ROLLED BACK leaves an
+# RECORDED, not fixed: `ALTER TABLE ADD <column> REFERENCES` does not
+# parse here (`DROP TABLE IF EXISTS` does since 2026-09-26); a key moved and ROLLED BACK leaves an
 # index entry that blinds the next same-statement duplicate check (a
 # pre-existing silent duplicate PK, section 1c); a view
 # over `SELECT *`, a union, or `(id)` refuses at prepare; a duplicate
@@ -386,7 +386,7 @@ echo "--- 2. DROP TABLE OVER A VIEW IS THE MISSING-TABLE -607, AND THE VIEW STAY
 NOTBL='|-SQL error code = -607|-Invalid command|-Table "PUBLIC"."V1" does not exist'
 pin "2 DROP TABLE V1 (a view)" "DROP TABLE V1;" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-DROP TABLE \"PUBLIC\".\"V1\" failed$NOTBL"
 pin "2 RECREATE TABLE V1 (a view)" "RECREATE TABLE V1 (ID INTEGER);" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-RECREATE TABLE \"PUBLIC\".\"V1\" failed$NOTBL"
-refused "2 RECORDED DROP TABLE IF EXISTS V1 (the engine refuses it too; IF EXISTS does not parse here)" "DROP TABLE IF EXISTS V1;" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-DROP TABLE \"PUBLIC\".\"V1\" failed$NOTBL"
+pin "2 DROP TABLE IF EXISTS V1 runs the DROP TABLE, which refuses (IF EXISTS parses since 2026-09-26 - qa/serve-real-ddlref.sh)" "DROP TABLE IF EXISTS V1;" "Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-DROP TABLE \"PUBLIC\".\"V1\" failed$NOTBL"
 pin "2 control: DROP VIEW over a table" "DROP VIEW T1;" 'Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-DROP VIEW "PUBLIC"."T1" failed|-SQL error code = -607|-Invalid command|-View "PUBLIC"."T1" does not exist'
 pin "2 control: DROP TABLE of a lower-case name that is not there" "DROP TABLE \"v1\";" 'Statement failed, SQLSTATE = 42S02|unsuccessful metadata update|-DROP TABLE "PUBLIC"."v1" failed|-SQL error code = -607|-Invalid command|-Table "PUBLIC"."v1" does not exist'
 pin "2 the view and the table are still there" "SELECT COUNT(*) FROM V1; SELECT COUNT(*) FROM T1;" "COUNT|0|COUNT|0"

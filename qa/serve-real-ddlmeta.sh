@@ -215,10 +215,10 @@ recorded "3 a non-ASCII default of a UTF8 column (CREATE TABLE too)" \
      "CREATE TABLE TI (K INTEGER, V VARCHAR(3) CHARACTER SET UTF8 DEFAULT 'é'); COMMIT; INSERT INTO TI (K) VALUES (1); SELECT V, OCTET_LENGTH(V) FROM TI; COMMIT;" "V OCTET_LENGTH|é 2"
 pin  "3 CONTROL a CREATE TABLE default was right already" \
      "CREATE TABLE TCD (A INTEGER, C INTEGER DEFAULT 4); COMMIT; INSERT INTO TCD (A) VALUES (1); SELECT C FROM TCD; COMMIT;" "C|4"
-# the SOURCE text: the engine keeps the statement's own spelling; this
-# server re-spells the keyword upper case (CREATE TABLE too, before this
-# change) - a catalog text difference, recorded
-recorded "3 RDB\$DEFAULT_SOURCE keeps the statement's spelling" \
+# the SOURCE text: the engine keeps the statement's own spelling (this
+# server re-spelled the keyword upper case until 2026-09-26 - promoted
+# with qa/serve-real-ddlref.sh section 4)
+pin "3 RDB\$DEFAULT_SOURCE keeps the statement's spelling" \
      "SET BLOB ALL; SELECT CAST(RDB\$DEFAULT_SOURCE AS VARCHAR(40)) FROM RDB\$RELATION_FIELDS WHERE RDB\$RELATION_NAME = 'TD' AND RDB\$FIELD_NAME = 'G';" \
      "CAST|default -7"
 
