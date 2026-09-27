@@ -59731,6 +59731,7 @@ fn branch_rows_res(
             // ...each value under the column the UNION announces, not
             // the one its own branch would have announced
             for r in got.iter_mut() {
+                union_branch_transcode(b, cols, r)?;
                 union_coerce_row(r, cols);
             }
             rows.append(&mut got);
@@ -61050,28 +61051,63 @@ fn plan_union(
             // WIN1252 one, and a NONE CHAR(3) beside 'ab' is CHAR(3) in
             // the attachment's set) - this kept the NONE column's own.
             //
-            // OCTETS BEATS EVERYTHING, and converts its siblings in ways
-            // this server does not reproduce: 'abc', a UTF8 or a WIN1252
-            // column beside an OCTETS one describe OCTETS in either
-            // order, but a WIN1252 'éf' arrives as E966 under a UTF8
-            // attachment and as C3A966 under a WIN1252 one, and a UTF8
-            // 'ăb' is a 22001 under WIN1252 (all measured). This answered
-            // the siblings' text in the attachment's set - a wrong
-            // answer - so a mix with OCTETS refuses; an all-OCTETS
-            // column agrees already and never reaches here.
+            // OCTETS BEATS EVERYTHING. With an OCTETS branch FIRST and
+            // only literals, NONE and OCTETS beside it the column keeps
+            // the first branch's OCTETS and each sibling arrives as its
+            // own bytes ([union_branch_transcode]: 'é' is C3A9 under a
+            // UTF8 attachment, `Z || 'é'` 7A7AC3A9, a NONE column's bytes
+            // as stored; CHAR(2) OCTETS beside CHAR(3) OCTETS is 616200 /
+            // 616263 - all measured on 2182 under UTF8, WIN1252 and NONE
+            // attachments). Two shapes still REFUSE: a text branch FIRST
+            // (the engine describes OCTETS where this would describe the
+            // text), and a REAL-charset sibling, which the engine converts
+            // by rules this server does not reproduce (a WIN1252 'éf' is
+            // E966 under a UTF8 attachment but C3A966 under a WIN1252
+            // one, a UTF8 'ăb' a 22001 under WIN1252).
             let octets = |st: i32| st >= 0 && fire_crab_ods::intl::charset_id(st as i16) == 1;
-            if shapes.iter().any(|(_, _, st)| octets(*st)) {
+            let any_octets = shapes.iter().any(|(_, _, st)| octets(*st));
+            if any_octets && (!octets(shapes[0].2) || shapes.iter().any(|(_, _, st)| real(*st))) {
                 return Some(Plan::Refused);
             }
-            if let Some((_, _, st)) = shapes.iter().find(|(_, _, st)| real(*st)) {
-                c.sub_type = *st;
-            } else if CURRENT_ATT_CS.with(|a| a.get()) != 0
-                && shapes.iter().any(|(_, _, st)| *st == ATT_SUBTYPE)
+            // A NONE BRANCH ARRIVES AS A BYTE COPY into the column's set
+            // ([union_branch_transcode]), which this server spells only
+            // into UTF8 and the tabled single-byte sets: a column that
+            // resolves elsewhere refuses rather than guess at the bytes
+            let att = CURRENT_ATT_CS.with(|a| a.get());
+            //
+            // UNDER A REAL ATTACHMENT A LITERAL IS OF A REAL SET - the
+            // attachment's - and takes its place in the first-wins order
+            // beside the columns: with a NONE VARCHAR holding C3A9 first,
+            // `.. UNION 'a' UNION <WIN1252 col>` answers 'é' under a UTF8
+            // attachment (the bytes read as UTF8) where `.. UNION <WIN1252
+            // col> UNION 'a'` answers 'Ã©' (read as WIN1252), and under a
+            // WIN1252 attachment 'a' before a UTF8 column keeps the bytes
+            // as WIN1252 (measured on 2182). Only which set a NONE
+            // branch's bytes are read in turns on it: every real set is
+            // announced in the attachment's there.
+            if any_octets {
+                // the first branch's OCTETS stands
+            } else if let Some((_, _, st)) =
+                shapes.iter().find(|(_, _, st)| real(*st) || (att != 0 && *st == ATT_SUBTYPE))
             {
+                c.sub_type = *st;
+            } else if att != 0 && shapes.iter().any(|(_, _, st)| *st == ATT_SUBTYPE) {
                 // (under a NONE attachment the literal IS a NONE one, and
                 // the column keeps the first branch's own descriptor -
                 // and so its name: `Z UNION 'abc'` is Z / Z / T there)
                 c.sub_type = ATT_SUBTYPE;
+            }
+            let none_in = shapes.iter().any(|(_, _, st)| {
+                *st >= 0 && fire_crab_ods::intl::charset_id(*st as i16) == 0
+            });
+            if none_in {
+                let dst = union_text_cs(c.sub_type, att);
+                if !fire_crab_ods::intl::byte_carrier(dst)
+                    && dst != fire_crab_ods::intl::CS_UTF8
+                    && !fire_crab_ods::intl::tabled(dst)
+                {
+                    return Some(Plan::Refused);
+                }
             }
             let varying = shapes.iter().any(|(t, ..)| *t == 448);
             c.sql_type = (if varying { 448 } else { 452 }) | (c.sql_type & 1);
@@ -61355,6 +61391,80 @@ fn is_exact_numeric_sqltype(t: i32) -> bool {
 /// UNION ALL <DOUBLE>` whose exact branch skipped this answered 0.0,
 /// because the encoder's approx_of does not know the exact forms and
 /// writes 0.0 for what it cannot read).
+/// The character set a union text column (or one branch of it) holds
+/// its values in: the attachment's behind [ATT_SUBTYPE], the operand's
+/// own behind a `-2 - cs` sentinel ([enc_real_cs]), a plain ttype's.
+fn union_text_cs(sub_type: i32, att: u8) -> u8 {
+    if sub_type == ATT_SUBTYPE {
+        att
+    } else if sub_type <= -2 {
+        (-2 - sub_type) as u8
+    } else {
+        fire_crab_ods::intl::charset_id(sub_type as i16)
+    }
+}
+
+/// ONE BRANCH'S TEXT under the union column's character set, where the
+/// two differ in the one way the engine settles by BYTES: a NONE branch
+/// in a column of a real set, or any branch in an OCTETS column. The
+/// engine converts each branch to the union's descriptor with CVT_move,
+/// which copies a byte carrier's octets and reads them in the
+/// destination ([transcode_text]). Measured on 2182 under a UTF8
+/// attachment: a NONE VARCHAR holding C3A9 beside 'ă' answers 'é'
+/// (char_length 1, octet_length 2), a NONE CHAR(4) holding C4 83 62 20
+/// answers 'ăb', and a lone E9 is 22000 *Malformed string*; under a
+/// WIN1252 one the same C4 83 are the two WIN1252 characters they
+/// spell. Beside an OCTETS column a literal is its bytes in the
+/// attachment's set ('é' C3A9 under UTF8). This server carries a NONE
+/// value one char per byte, and letting it ride a UTF8 column spelt
+/// each byte as a Latin-1 letter ('Ã©', and a dropped connection under
+/// WIN1252, where U+0083 has no image). Any other pairing - real beside
+/// real - is left to the emission's transliteration, as before.
+fn union_branch_transcode(b: &Plan, cols: &[ProjCol], row: &mut [Value]) -> Result<(), EvalErr> {
+    use fire_crab_ods::intl;
+    let bcols = union_branch_cols(b);
+    let att = CURRENT_ATT_CS.with(|a| a.get());
+    for (i, (v, c)) in row.iter_mut().zip(cols).enumerate() {
+        if !matches!(c.wire, Wire::Varying | Wire::Text) || !matches!(v, Value::Text(_)) {
+            continue;
+        }
+        let Some(bc) = bcols.get(i) else { continue };
+        if !matches!(bc.sql_type & !1, 448 | 452) {
+            continue;
+        }
+        let src = union_text_cs(bc.sub_type, att);
+        let dst = union_text_cs(c.sub_type, att);
+        let moves = (src == intl::CS_NONE && bc.sub_type >= 0 && !intl::byte_carrier(dst))
+            || (dst == intl::CS_OCTETS && src != intl::CS_OCTETS);
+        let Value::Text(mut s) = std::mem::replace(v, Value::Null) else { unreachable!() };
+        if moves {
+            s = transcode_text(src, dst, s)?;
+        }
+        // A FIXED column pads EVERY branch to its width in characters,
+        // which a derived table over the union reads (measured on 2182,
+        // UTF8 attachment: a NONE CHAR(4) holding 'ăb' beside 'ab' gives
+        // char_length 4 / octet_length 5 and 4 / 4 - the literal row
+        // padded too). Only the encoder padded here, so a consumer saw
+        // 'ab' at 2 / 2.
+        if c.wire == Wire::Text {
+            let chars = if c.sub_type >= 0 {
+                c.length / (intl::bytes_per_char(dst) as i32).max(1)
+            } else if AttCs::by_id(att).bpc == 1 {
+                c.oct_length
+            } else {
+                c.length
+            };
+            let have = s.chars().count() as i32;
+            if have < chars {
+                let pad = intl::pad_byte(dst) as char;
+                s.extend(std::iter::repeat_n(pad, (chars - have) as usize));
+            }
+        }
+        *v = Value::Text(s);
+    }
+    Ok(())
+}
+
 fn union_coerce_row(row: &mut [Value], cols: &[ProjCol]) {
     for (v, c) in row.iter_mut().zip(cols) {
         *v = union_coerce_value(std::mem::replace(v, Value::Null), c.sql_type & !1, c.scale);
@@ -78774,6 +78884,7 @@ fn emit_rows_inner(
                 if !*distinct && order_by.is_none() {
                     for b in branches {
                         branch_rows_each(b, db, args, &mut |mut row| {
+                            union_branch_transcode(b, cols, &mut row)?;
                             union_coerce_row(&mut row, cols);
                             encode_row(w, cols, &row, out)
                         })
@@ -78787,7 +78898,12 @@ fn emit_rows_inner(
                     // own vector; a branch this server cannot serve is
                     // the generic refusal [EvalErr::Unsupported] carries
                     match branch_rows_res(b, db, args) {
-                        Ok(mut r) => rows.append(&mut r),
+                        Ok(mut r) => {
+                            for row in r.iter_mut() {
+                                union_branch_transcode(b, cols, row).map_err(EmitErr::Eval)?;
+                            }
+                            rows.append(&mut r)
+                        }
                         Err(e) => return Err(EmitErr::Eval(e)),
                     }
                 }
@@ -79565,8 +79681,19 @@ fn encode_row_inline(
             }
         }
     }
+    // a value that fails IN the body (a character the destination set
+    // has no image for, [EvalErr::TransliterationFailed]) takes back the
+    // half-written row: the error response then follows the rows already
+    // sent, as 2182's 22018 does. Left in place, the partial message
+    // desynchronised the wire and the client dropped the connection
+    // (08006) - a UTF8 branch under a WIN1252 attachment in a union, or
+    // a lateral body returning such a column (measured)
+    let mark = w.buf.len();
     w.int(OP_FETCH_RESPONSE).int(0).int(1);
-    encode_row_body(w, cols, &vals, out)?;
+    if let Err(e) = encode_row_body(w, cols, &vals, out) {
+        w.buf.truncate(mark);
+        return Err(e);
+    }
     Ok(())
 }
 

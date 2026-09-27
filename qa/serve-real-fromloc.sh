@@ -53,6 +53,15 @@
 #      attachment's set of a literal. A LATERAL's outer text column stands
 #      in at its character width in its own set (it was four times too
 #      wide under UTF8), and the body's literals keep their characters.
+#   8. (round 6) A NONE branch arrives in a union column of a real set
+#      as a BYTE COPY read in that set (a UTF8 'é' stored in a NONE
+#      column had come back 'Ã©', a lone E9 is 22000 Malformed string,
+#      and under WIN1252 a C4 83 dropped the connection); a literal
+#      under a real attachment is of the attachment's set in the
+#      first-wins order. An OCTETS column first takes each literal / NONE
+#      sibling's own bytes. A row that fails in the encoder (a UTF8 value
+#      WIN1252 cannot hold) is taken back, and the 22018 follows the rows
+#      before it - it desynchronised the wire (08006).
 #
 # RECORDED, not fixed (every one a refusal here, never a wrong answer):
 # LIST() inside an expression (a blob result, the recorded boundary of
@@ -60,8 +69,11 @@
 # over OVERLAY (the view compiler has neither); OVERLAY over two
 # different character sets; DATEADD / DATEDIFF with QUARTER (the
 # engine's fetch-time "Invalid part"); an unordered NTH_VALUE window; a
-# UNION mixing OCTETS with other text (the engine converts the siblings
-# by rules this server does not reproduce); a non-ASCII LATERAL body
+# UNION whose OCTETS column follows a text branch, or sits beside a
+# real-charset column (the engine converts that sibling by rules this
+# server does not reproduce); a VIEW over a NONE column and a literal
+# read under another attachment than the one that created it (the view
+# keeps its creator's set there, this server re-plans in the reader's); a non-ASCII LATERAL body
 # under a NONE attachment; and the parser -104s of a direction on
 # another window function and of FOO(1 FROM 2), where this server says a
 # bare 42000 or -804.
@@ -100,6 +112,10 @@ insert into "FROM" values (1, 'x');
 insert into u8 values ('abc', 'def');
 insert into un values (1, 'abcdefghijklmnopqrst', 'x', 'zz', 'oo');
 insert into un values (2, 'ăîșțâăîșțâăîșțâăîșțâ', 'y', 'zz', 'oo');
+create table nn (id integer, x varchar(6) character set none, c char(4) character set none);
+insert into nn values (1, 'ab', 'ăb');
+insert into nn values (2, 'é', null);
+insert into nn values (3, cast(x'E9' as varchar(1) character set none), null);
 COMMIT;
 create view vo as select id, overlay(s placing 'Z' from 1 for 1) o, extract(quarter from dt) q, first_day(of month from dt) f from d;
 COMMIT;
@@ -350,11 +366,40 @@ CH=WIN1252 pin "11 OVERLAY over it under WIN1252" "$SQLDA select r from un cross
 CH=UTF8 pin "11 a multi-byte literal in the body (was 'Ã©')" "select r from un cross join lateral (select un.b || 'é' r from rdb\$database) x where un.id = 1;" "R|xé"
 refused "11 a non-ASCII body under a NONE attachment" "select r from un cross join lateral (select un.b || 'é' r from rdb\$database) x where un.id = 1;" "R|xé"
 
+echo "--- 12. (round 6) a NONE branch arrives in the union's set AS BYTES, an OCTETS column takes its siblings' bytes, and a failed row takes itself back"
+CH=UTF8 pin "12 a NONE column beside a literal: its bytes read as UTF8 (was 'Ã©')" "select x from nn where id < 3 union all select 'ă' from rdb\$database;" "X|ab|é|ă"
+CH=UTF8 pin "12 ...the literal first" "select 'ă' from rdb\$database union all select x from nn where id < 3;" "ă|ab|é"
+CH=UTF8 pin "12 ...under a distinct UNION" "select x from nn where id < 3 union select 'abc' from rdb\$database;" "X|ab|abc|é"
+CH=UTF8 pin "12 ...measured through a derived table (was 2 / 4)" "select char_length(r), octet_length(r) from (select x r from nn where id < 3 union all select 'abc' from rdb\$database);" "CHAR_LENGTH OCTET_LENGTH|2 2|1 2|3 3"
+CH=UTF8 pin "12 ...three branches" "select x from nn where id = 2 union all select 'a' from rdb\$database union all select x from nn where id = 2;" "X|é|a|é"
+CH=UTF8 pin "12 a NONE byte that is no UTF8 is Malformed string" "select x from nn where id = 3 union all select 'a' from rdb\$database;" "X|Statement failed, SQLSTATE = 22000|Malformed string"
+CH=UTF8 pin "12 a NONE CHAR beside a literal (was 'Äb')" "select c from nn where id = 1 union all select 'ab' from rdb\$database;" "C|ăb|ab"
+CH=UTF8 pin "12 ...padded to the column in a derived table, every branch" "select char_length(c), octet_length(c) from (select c from nn where id = 1 union all select 'ab' from rdb\$database);" "CHAR_LENGTH OCTET_LENGTH|4 5|4 4"
+CH=UTF8 pin "12 ...beside a NONE concatenation" "select c from nn where id = 1 union all select c || 'Q' from nn where id = 1;" "C|ăb|ăb Q"
+CH=WIN1252 pin "12 a NONE CHAR under WIN1252: the bytes are WIN1252 letters (was 08006)" "select c from nn where id = 1 union all select 'ab' from rdb\$database;" "C|ăb|ab"
+CH=UTF8 pin "12 a literal before a WIN1252 column: the NONE bytes read as UTF8" "select x from nn where id = 2 union all select 'a' from rdb\$database union all select b from un where id = 1;" "X|é|a|x"
+CH=UTF8 pin "12 a WIN1252 column before the literal: read as WIN1252" "select x from nn where id = 2 union all select b from un where id = 1 union all select 'a' from rdb\$database;" "X|Ã©|x|a"
+CH=UTF8 pin "12 OCTETS first beside a literal" "select o from un where id = 1 union all select 'abc' from rdb\$database;" "O|6F6F|616263"
+CH=WIN1252 pin "12 ...under WIN1252" "select o from un where id = 1 union all select 'abc' from rdb\$database;" "O|6F6F|616263"
+pin  "12 ...under NONE" "select o from un where id = 1 union all select 'abc' from rdb\$database;" "O|6F6F|616263"
+CH=UTF8 pin "12 OCTETS beside a non-ASCII literal: its UTF8 bytes (was E9)" "select o from un where id = 1 union all select 'é' from rdb\$database;" "O|6F6F|C3A9"
+CH=UTF8 pin "12 ...and the width stays the literal's characters" "select o from un where id = 1 union all select 'éaaa' from rdb\$database;" "O|6F6F|Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 4, actual 5"
+CH=WIN1252 pin "12 OCTETS beside a non-ASCII literal under WIN1252" "select o from un where id = 1 union all select 'é' from rdb\$database;" "O|6F6F|C3A9"
+CH=UTF8 pin "12 OCTETS beside a wider OCTETS cast" "select o from un where id = 1 union all select cast(o as varchar(6) character set octets) from un where id = 1;" "O|6F6F|6F6F"
+CH=UTF8 pin "12 CHAR(2) OCTETS beside CHAR(3) OCTETS: zero-padded" "select cast('ab' as char(2) character set octets) from rdb\$database union all select cast('abc' as char(3) character set octets) from rdb\$database;" "616200|616263"
+CH=UTF8 pin "12 OCTETS beside a NONE column" "select o from un where id = 1 union all select x from nn where id < 3;" "O|6F6F|6162|C3A9"
+CH=UTF8 pin "12 an OCTETS concatenation beside a literal" "select o || 'é' from un where id = 1 union all select 'x' from rdb\$database;" "6F6FC3A9|78"
+CH=UTF8 pin "12 OCTETS beside a NONE concatenation (was 7A7AE9)" "select o from un where id = 1 union all select z || 'é' from un where id = 1;" "O|6F6F|7A7AC3A9"
+CH=WIN1252 pin "12 a UTF8 branch WIN1252 cannot hold: 22018 at that row (was 08006)" "select x from nn where id = 1 union all select s from un; select 1 from rdb\$database;" "X|ab|abcdefghijklmnopqrst|Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets|CONSTANT|1"
+CH=WIN1252 pin "12 ...and a LATERAL body returning it (was 08006)" "select r from un cross join lateral (select un.s r from rdb\$database) x; select 1 from rdb\$database;" "R|abcdefghijklmnopqrst|Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets|CONSTANT|1"
+CH=UTF8 refused "12 a text branch before OCTETS (the engine describes OCTETS)" "select 'abc' from rdb\$database union all select o from un where id = 1;" "616263|6F6F"
+CH=UTF8 refused "12 OCTETS beside a UTF8 column" "select o from un where id = 1 union all select s from un;" "O|6F6F|6162636465666768696A6B6C6D6E6F7071727374|Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 20, actual 40"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-fromloc-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 162 ]; then echo "FAIL only $ran checks ran (floor 162)"; fail=1; fi
+if [ "$ran" -lt 189 ]; then echo "FAIL only $ran checks ran (floor 189)"; fail=1; fi
 exit $fail
