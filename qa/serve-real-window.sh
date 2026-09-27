@@ -421,7 +421,7 @@ both "a FOR SELECT loop"           "EXECUTE BLOCK RETURNS (R INTEGER) AS BEGIN F
 # than fixed here: it is a parser slice and a refusal, so it ranks below
 # any wrong answer, and folding a parser rewrite into this change would
 # put every measurement above back in question.
-known_diff "FOR SELECT+derived+window (split_query)" "EXECUTE BLOCK RETURNS (R INTEGER) AS BEGIN FOR SELECT W FROM (SELECT SUM(V) OVER (PARTITION BY G) AS W FROM T) Z INTO :R DO SUSPEND; END"
+both "FOR SELECT+derived+window (split_query) (agrees since the PSQL grammar round of 2026-09-27)" "EXECUTE BLOCK RETURNS (R INTEGER) AS BEGIN FOR SELECT W FROM (SELECT SUM(V) OVER (PARTITION BY G) AS W FROM T) Z INTO :R DO SUSPEND; END"
 # INSERT ... SELECT draws from the same spine: the write is compared, and
 # then the TABLE is read back, which is where a refused source shows up as
 # an empty table rather than as an error

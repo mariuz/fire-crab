@@ -18673,6 +18673,9 @@ fn fire_ddl_triggers(
                 caught: None,
                 cursors: trig_cursor_states(&d.source),
                 row_count_slot: None,
+                err_slots: [None; 3],
+                rules: Vec::new(),
+                cursor_fields: Vec::new(),
                 trig_excs: d.excs.clone(),
                 trig: None,
                 gen: Default::default(),
@@ -18776,6 +18779,9 @@ fn fire_db_triggers(
             caught: None,
             cursors: trig_cursor_states(&d.source),
             row_count_slot: None,
+            err_slots: [None; 3],
+            rules: Vec::new(),
+            cursor_fields: Vec::new(),
             trig_excs: d.excs.clone(),
             trig: None,
             gen: Default::default(),
@@ -19506,7 +19512,7 @@ fn trig_body_of(t: &TrigDef) -> Option<(TrigStmt, Vec<String>)> {
             return None;
         }
     };
-    let inits = declared_var_inits(&t.source[..begin_at], &names).ok()?;
+    let inits = declared_var_inits(&t.source[..begin_at], &names, &[]).ok()?;
     let body = if inits.is_empty() {
         body
     } else {
@@ -23566,6 +23572,93 @@ enum DynPart {
     Row(u8, String),
 }
 
+/// A FOR SELECT's tail after its query: where the query ends (the INTO,
+/// or `AS` when there is no INTO), and its `AS CURSOR <name>` - the
+/// name, where `AS` starts and where the name ends. `masked` is the
+/// upper-cased, literal-masked body. An INTO must come first when both
+/// are written (the engine's grammar).
+fn for_select_tail(masked: &str, from: usize) -> Option<(usize, Option<(String, usize, usize)>)> {
+    // the loop's DO is the first after the query (a query holds none),
+    // and everything of the tail stands before it
+    let do_at = find_word(masked, "DO", from)?;
+    let masked = &masked[..do_at];
+    let into = find_word(masked, "INTO", from);
+    // the `AS CURSOR` whose CURSOR follows an AS directly
+    let mut at = from;
+    let mut as_cursor = None;
+    while let Some(c) = find_word(masked, "CURSOR", at) {
+        let before = masked[..c].trim_end();
+        if before.ends_with(" AS") || before.ends_with("\nAS") || before.ends_with("\tAS") {
+            let as_at = before.len() - 2;
+            let rest = &masked[c + "CURSOR".len()..];
+            let lead = rest.len() - rest.trim_start().len();
+            let name: String = rest[lead..]
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .collect();
+            if !ident_ok(&name) {
+                return None;
+            }
+            as_cursor = Some((name.clone(), as_at, c + "CURSOR".len() + lead + name.len()));
+            break;
+        }
+        at = c + "CURSOR".len();
+    }
+    match (into, &as_cursor) {
+        (Some(i), Some((_, a, _))) if i < *a => Some((i, as_cursor)),
+        // an INTO after the AS CURSOR is not the engine's grammar
+        (Some(_), Some(_)) => None,
+        (None, Some((_, a, _))) => Some((*a, as_cursor)),
+        (Some(i), None) => Some((i, None)),
+        (None, None) => None,
+    }
+}
+
+/// Where a FETCH moves a cursor - see [TrigStmt::Fetch].
+#[derive(Clone)]
+enum FetchOrient {
+    Next,
+    Prior,
+    First,
+    Last,
+    /// the row number as written, for the planner ([RawVal])
+    Absolute(RawVal),
+    Relative(RawVal),
+}
+
+impl FetchOrient {
+    /// the option's name as the engine's HY106 names it
+    fn word(&self) -> &'static str {
+        match self {
+            FetchOrient::Next => "NEXT",
+            FetchOrient::Prior => "PRIOR",
+            FetchOrient::First => "FIRST",
+            FetchOrient::Last => "LAST",
+            FetchOrient::Absolute(_) => "ABSOLUTE",
+            FetchOrient::Relative(_) => "RELATIVE",
+        }
+    }
+}
+
+/// A value KEPT AS WRITTEN for the planner to answer at run time, with
+/// the `:variable` references it binds (see [TrigStmt::Assign]'s `raw`).
+type RawVal = (String, Vec<(String, u16)>);
+
+/// A PSQL value as a [RawVal]: bare declared variables marked
+/// ([colon_bare_vars]) and every `:name` bound to its slot. None when a
+/// `:name` is not a declared variable.
+fn raw_psql_value(text: &str, vars: &[String]) -> Option<RawVal> {
+    let text = colon_bare_vars(text.trim(), vars);
+    let mut binds: Vec<(String, u16)> = Vec::new();
+    for name in named_refs(&text) {
+        let slot = vars.iter().position(|v| *v == name)? as u16;
+        if !binds.iter().any(|(n, _)| *n == name) {
+            binds.push((name, slot));
+        }
+    }
+    Some((text, binds))
+}
+
 enum TrigStmt {
     /// `NEW.<col> = <expr>;` or `<var> = <expr>;`
     Assign {
@@ -23579,6 +23672,13 @@ enum TrigStmt {
         /// BLR, so a trigger CREATEd this way is refused (no faithful BLR
         /// to store) while an engine-created one fires through the source.
         raw: Option<(String, Vec<(String, u16)>)>,
+        /// THE PARSED RHS AS WRITTEN too, for the planner to answer when
+        /// the arithmetic evaluator has no rule for the values it meets
+        /// at run time - a DATE plus a number, a BOOLEAN literal, a
+        /// DOUBLE division ([eval_psql_expr] answers Unsupported for
+        /// each). `None` for a body that draws a generator, whose draws
+        /// the planner cannot own.
+        fallback: Option<RawVal>,
         src_off: usize,
     },
     /// `IF (<cond>) THEN <stmt> [ELSE <stmt>]` - the ELSE arrives as the
@@ -23610,7 +23710,19 @@ enum TrigStmt {
     /// `EXCEPTION <name> '<literal>';` overrides the message: condition 6
     /// then a blr_literal blr_text2 (a runtime EXPRESSION message or a
     /// USING clause is refused - literal only).
-    Raise { name: String, message: Option<String>, src_off: usize },
+    ///
+    /// ...and the two forms the source interpreter reads beyond that:
+    /// a MESSAGE EXPRESSION (`msg_raw`, kept as written for the planner)
+    /// and `USING (<values>)` (`using`, each kept as written) - neither
+    /// has a BLR shape here, so a trigger carrying one is not storable
+    /// ([body_has_uninterpretable_blr]).
+    Raise {
+        name: String,
+        message: Option<String>,
+        msg_raw: Option<RawVal>,
+        using: Option<Vec<RawVal>>,
+        src_off: usize,
+    },
     /// `EXECUTE PROCEDURE <name> [(<args>)] [RETURNING_VALUES :v[, :v]];`
     /// - a NESTED CALL: its own frame, its own cursors, its own
     /// transaction-visible writes, and an error that the CALLER may
@@ -23632,7 +23744,12 @@ enum TrigStmt {
     /// PAST THE END THE SLOTS ARE LEFT ALONE (probed: a variable that
     /// held 1 still holds 1 after a fetch that found nothing) and
     /// ROW_COUNT becomes 0.
-    Fetch { cursor: String, into: Vec<u16>, src_off: usize },
+    ///
+    /// `FETCH [<orientation> FROM] <cursor> [INTO ...]` - a SCROLL
+    /// cursor moves by NEXT, PRIOR, FIRST, LAST, ABSOLUTE n or RELATIVE
+    /// n; the INTO list may be left off, the record then read through
+    /// `<cursor>.<column>`.
+    Fetch { cursor: String, into: Vec<u16>, orient: FetchOrient, src_off: usize },
     /// `CLOSE <cursor>;`
     Close { cursor: String, src_off: usize },
     /// `LEAVE [label];` - end the named loop (None = the innermost).
@@ -23643,7 +23760,9 @@ enum TrigStmt {
     /// has already SUSPENDed.
     Exit { src_off: usize },
     /// `RETURN <expr>;` - a FUNCTION's answer: output 0 set, the body left
-    Return { expr: fire_crab_ods::expr::Expr, src_off: usize },
+    /// (`fallback` as [TrigStmt::Assign]'s: the RHS as written, for the
+    /// values the arithmetic evaluator has no rule for)
+    Return { expr: fire_crab_ods::expr::Expr, fallback: Option<RawVal>, src_off: usize },
     /// a FUNCTION's `RETURN <text>` - the same literal-or-variable
     /// concatenation an [TrigStmt::AssignText] takes
     ReturnText { text: Vec<DynPart>, src_off: usize },
@@ -23714,6 +23833,9 @@ enum TrigStmt {
         into: Vec<u16>,
         body: Box<TrigStmt>,
         label: Option<String>,
+        /// `AS CURSOR <name>`: the loop's record, read in the body by
+        /// `<name>.<column>` - the INTO list may then be left off
+        cursor: Option<String>,
         src_off: usize,
     },
     /// `SUSPEND;` - emit the output parameters as a row and carry on.
@@ -23770,6 +23892,23 @@ enum TrigStmt {
         handlers: Vec<(Vec<HandlerCond>, TrigStmt)>,
         src_off: usize,
     },
+    /// `<function>(<args>);` - a CALL AS A STATEMENT: the value is
+    /// computed and dropped. Measured on engine 2182: `RDB$SET_CONTEXT(
+    /// 'USER_SESSION', 'K1', 'hello');` sets the key (a later
+    /// `RDB$GET_CONTEXT` in the block and a top-level SELECT both read
+    /// 'hello'), `UPPER('x');` and a user function's call run and change
+    /// nothing, and an error the call raises is the statement's (`At
+    /// block line: 1, col: 48` for a bad namespace). Kept as written for
+    /// the planner; no BLR shape here.
+    Call { raw: RawVal, src_off: usize },
+    /// `INSERT | UPDATE | DELETE ... RETURNING <items> INTO :v[, ...]`:
+    /// the statement as written (its `:variables` bound), run by the
+    /// ordinary DML path, its returned row into the slots. Measured on
+    /// engine 2182: an INSERT's row assigns (ROW_COUNT 1); an UPDATE that
+    /// matched nothing leaves the slots alone (ROW_COUNT 0); one that
+    /// matched two rows is 21000 *multiple rows in singleton select* at
+    /// the statement; `RETURNING OLD.<col>` reads the before-image.
+    DmlInto { sql: RawVal, into: Vec<u16>, src_off: usize },
 }
 
 /// Rewrite unqualified field references that name a DECLAREd variable
@@ -23881,6 +24020,16 @@ fn colon_clean(text: &str, vars: &[String]) -> Option<(String, Vec<String>)> {
     let mut cleaned = String::with_capacity(text.len());
     let mut i = 0usize;
     while i < bytes.len() {
+        // A STRING LITERAL IS DATA: a colon inside one is text, not a
+        // variable - `NEW.V = 'I:' || NEW.V` refused whole here (the
+        // `:'` read as a nameless variable), where the engine stores
+        // 'I:a' (measured). A quoted name is copied whole as well.
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let end = quoted_span_end(bytes, i);
+            cleaned.push_str(&text[i..end]);
+            i = end;
+            continue;
+        }
         if bytes[i] == b':' {
             let start = i + 1;
             let mut j = start;
@@ -24295,7 +24444,19 @@ fn parse_trig_block(
         if !handlers.is_empty() {
             return None; // once a WHEN appears, only WHENs may follow
         }
-        stmts.push(parse_trig_stmt(s, pos, limit, vars)?);
+        let at = *pos;
+        match parse_trig_stmt(s, pos, limit, vars) {
+            Some(st) => stmts.push(st),
+            None => {
+                if trace_on() {
+                    eprintln!(
+                        "[psql] statement outside the surface: {:?}",
+                        s.get(at..limit).unwrap_or("").chars().take(80).collect::<String>()
+                    );
+                }
+                return None;
+            }
+        }
     }
     // an EMPTY body (BEGIN END) is a valid no-op - the engine runs the
     // DML unchanged; it must NOT refuse (it did, blocking every INSERT on
@@ -24350,6 +24511,9 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         // silently missing would be a trigger that does not do what its
         // own source says
         TrigStmt::Store { raw, .. } => raw.is_some(),
+        // a message expression or a USING list has no BLR shape here
+        TrigStmt::Raise { msg_raw, using, .. } => msg_raw.is_some() || using.is_some(),
+        TrigStmt::Call { .. } | TrigStmt::DmlInto { .. } => true,
         TrigStmt::Block { stmts, handlers, .. } => {
             stmts.iter().any(body_has_uninterpretable_blr)
                 || handlers.iter().any(|(conds, h)| {
@@ -25523,10 +25687,13 @@ fn parse_trig_stmt(
         {
             return None;
         }
-        // the INTO that belongs to THIS loop, then its DO
+        // the INTO that belongs to THIS loop, then its DO - and between
+        // them, or in place of the INTO, `AS CURSOR <name>`
         let masked = mask_literals(&up_all);
-        let into_kw = find_word(&masked, "INTO", after_for)?;
-        let do_kw = find_word(&masked, "DO", into_kw + "INTO".len())?;
+        let (into_kw, as_cursor) = for_select_tail(&masked, after_for)?;
+        let do_kw = find_word(&masked, "DO", as_cursor.as_ref().map_or(into_kw + "INTO".len(), |(_, _, e)| *e))?;
+        let cursor = as_cursor.as_ref().map(|(n, _, _)| n.clone());
+        let into_end = as_cursor.as_ref().map_or(do_kw, |(_, a, _)| *a);
         // A `:var` reference inside the loop's query is PSQL, not SQL, so
         // the ordinary planner cannot see it. Rewrite each one to a slot
         // marker here; the interpreter substitutes the variable's current
@@ -25551,19 +25718,21 @@ fn parse_trig_stmt(
             query.push(qb[qi]);
             qi += 1;
         }
-        let into_text = s[into_kw + "INTO".len()..do_kw].trim();
         let mut into = Vec::new();
-        for part in into_text.split(',') {
-            let name = canon_ident(part.trim().trim_start_matches(':'))?;
-            let slot = vars.iter().position(|v| *v == name)?;
-            into.push(slot as u16);
-        }
-        if into.is_empty() {
-            return None;
+        if into_kw < into_end {
+            let into_text = s[into_kw + "INTO".len()..into_end].trim();
+            for part in into_text.split(',') {
+                let name = canon_ident(part.trim().trim_start_matches(':'))?;
+                let slot = vars.iter().position(|v| *v == name)?;
+                into.push(slot as u16);
+            }
+            if into.is_empty() {
+                return None;
+            }
         }
         *pos = do_kw + "DO".len();
         let body = parse_trig_stmt(s, pos, limit, vars)?;
-        return Some(TrigStmt::ForSelect { query, into, body: Box::new(body), label: None, src_off: start });
+        return Some(TrigStmt::ForSelect { query, into, body: Box::new(body), label: None, cursor, src_off: start });
     }
     if word == "IF" || word == "WHILE" {
         *pos = start + word.len();
@@ -25664,6 +25833,27 @@ fn parse_trig_stmt(
     if find_word(&up, "SUSPEND", 0) == Some(0) && text.trim().len() == "SUSPEND".len() {
         return Some(TrigStmt::Suspend { src_off: start });
     }
+    if ["INSERT", "UPDATE", "DELETE"].iter().any(|w| find_word(&up, w, 0) == Some(0)) {
+        let masked = mask_literals(&up);
+        if let Some(ret) = find_word(&masked, "RETURNING", 0) {
+            let into = find_word(&masked, "INTO", ret)?;
+            let mut slots = Vec::new();
+            for part in text[into + "INTO".len()..].split(',') {
+                let v = canon_ident(part.trim().trim_start_matches(':'))?;
+                slots.push(vars.iter().position(|n| *n == v)? as u16);
+            }
+            // the statement's own `:variables`, each a declared one
+            let sql = text[..into].trim();
+            let mut binds: Vec<(String, u16)> = Vec::new();
+            for name in named_refs(sql) {
+                let slot = vars.iter().position(|v| *v == name)? as u16;
+                if !binds.iter().any(|(n, _)| *n == name) {
+                    binds.push((name, slot));
+                }
+            }
+            return Some(TrigStmt::DmlInto { sql: (sql.to_string(), binds), into: slots, src_off: start });
+        }
+    }
     if find_word(&up, "EXCEPTION", 0) == Some(0) {
         // EXCEPTION <name>, or BARE `EXCEPTION` - which is a RE-RAISE of
         // whatever the enclosing handler caught, and means nothing
@@ -25694,6 +25884,28 @@ fn parse_trig_stmt(
         if !ident_ok(&name) {
             return None;
         }
+        // `USING (<v>[, <v>]...)`: the values the catalog message's @1..@9
+        // take ([using_message]); more than nine is the engine's 07002 at
+        // prepare, and an empty list its -104 - both refused here
+        let msg_up = mask_literals(&msg_part.to_ascii_uppercase());
+        if find_word(&msg_up, "USING", 0) == Some(0) {
+            let list = msg_part["USING".len()..].trim();
+            let inner = list.strip_prefix('(')?.strip_suffix(')')?;
+            let mut using = Vec::new();
+            for part in split_top_level_commas(inner) {
+                if part.trim().is_empty() {
+                    return None;
+                }
+                using.push(raw_psql_value(part, vars)?);
+            }
+            if using.is_empty() || using.len() > 9 {
+                return None;
+            }
+            return Some(TrigStmt::Raise { name, message: None, msg_raw: None, using: Some(using), src_off: start });
+        }
+        if find_word(&msg_up, "USING", 0).is_some() {
+            return None; // a message AND a USING list: the engine's -104
+        }
         let message = if msg_part.is_empty() {
             None
         } else if msg_part.len() >= 2 && msg_part.starts_with('\'') && msg_part.ends_with('\'') {
@@ -25717,13 +25929,17 @@ fn parse_trig_stmt(
                 }
             }
             if !whole_literal {
-                return None;
+                let msg_raw = Some(raw_psql_value(msg_part, vars)?);
+                return Some(TrigStmt::Raise { name, message: None, msg_raw, using: None, src_off: start });
             }
             Some(lit)
         } else {
-            return None; // an expression, a USING clause, or a bare word
+            // A MESSAGE EXPRESSION - a variable, a concatenation, a call -
+            // answered by the planner when the raise runs
+            let msg_raw = Some(raw_psql_value(msg_part, vars)?);
+            return Some(TrigStmt::Raise { name, message: None, msg_raw, using: None, src_off: start });
         };
-        return Some(TrigStmt::Raise { name, message, src_off: start });
+        return Some(TrigStmt::Raise { name, message, msg_raw: None, using: None, src_off: start });
     }
     if find_word(&up, "SELECT", 0) == Some(0) {
         // SELECT ... INTO :v[, :v] - the STATIC singleton. The INTO
@@ -25918,22 +26134,54 @@ fn parse_trig_stmt(
         return Some(TrigStmt::Exit { src_off: start });
     }
     if find_word(&up, "FETCH", 0) == Some(0) {
-        // FETCH <cursor> INTO :v[, :v]
-        let into = find_word(&up, "INTO", "FETCH".len())?;
-        let name = text["FETCH".len()..into].trim().trim_matches('"').to_ascii_uppercase();
+        // FETCH [<orientation> FROM] <cursor> [INTO :v[, :v]]
+        let into = find_word(&up, "INTO", "FETCH".len());
+        let head_end = into.unwrap_or(text.len());
+        let head = text["FETCH".len()..head_end].trim();
+        let head_up = head.to_ascii_uppercase();
+        let (orient, name_text) = match find_word(&head_up, "FROM", 0) {
+            None => (FetchOrient::Next, head),
+            Some(k) => {
+                let o = head_up[..k].trim();
+                let arg = |w: &str| -> Option<RawVal> {
+                    let t = head[w.len()..k].trim();
+                    if t.is_empty() {
+                        return None;
+                    }
+                    raw_psql_value(t, vars)
+                };
+                let orient = match o.split_whitespace().next()? {
+                    "NEXT" if o == "NEXT" => FetchOrient::Next,
+                    "PRIOR" if o == "PRIOR" => FetchOrient::Prior,
+                    "FIRST" if o == "FIRST" => FetchOrient::First,
+                    "LAST" if o == "LAST" => FetchOrient::Last,
+                    "ABSOLUTE" => FetchOrient::Absolute(arg("ABSOLUTE")?),
+                    "RELATIVE" => FetchOrient::Relative(arg("RELATIVE")?),
+                    _ => return None,
+                };
+                (orient, head[k + "FROM".len()..].trim())
+            }
+        };
+        let name = name_text.trim_matches('"').to_ascii_uppercase();
         if !ident_ok(&name) {
             return None;
         }
         let mut slots = Vec::new();
-        for part in text[into + "INTO".len()..].split(',') {
-            let v = canon_ident(part.trim().trim_start_matches(':'))?;
-            let slot = vars.iter().position(|n| *n == v)?;
-            slots.push(slot as u16);
+        if let Some(into) = into {
+            for part in text[into + "INTO".len()..].split(',') {
+                let v = canon_ident(part.trim().trim_start_matches(':'))?;
+                let slot = vars.iter().position(|n| *n == v)?;
+                slots.push(slot as u16);
+            }
+            if slots.is_empty() {
+                return None;
+            }
         }
-        if slots.is_empty() {
-            return None;
-        }
-        return Some(TrigStmt::Fetch { cursor: name, into: slots, src_off: start });
+        return Some(TrigStmt::Fetch { cursor: name, into: slots, orient, src_off: start });
+    }
+    // BREAK is LEAVE of the innermost loop (the engine's own synonym)
+    if up.trim() == "BREAK" {
+        return Some(TrigStmt::Leave { target: None, src_off: start });
     }
     if find_word(&up, "POST_EVENT", 0) == Some(0) {
         // POST_EVENT <name> - a string literal, or an identifier the
@@ -26119,7 +26367,8 @@ fn parse_trig_stmt(
     if find_word(&up, "RETURN", 0) == Some(0) {
         let rhs = text["RETURN".len()..].trim();
         if let Some(e) = parse_body_expr(rhs, vars) {
-            return Some(TrigStmt::Return { expr: e, src_off: start });
+            let fallback = if expr_draws(&e) { None } else { raw_psql_value(rhs, vars) };
+            return Some(TrigStmt::Return { expr: e, fallback, src_off: start });
         }
         if let Some(text) = parse_dyn_text(rhs, vars) {
             return Some(TrigStmt::ReturnText { text, src_off: start });
@@ -26148,6 +26397,7 @@ fn parse_trig_stmt(
                     target: TrigTarget::Var(slot),
                     expr: fire_crab_ods::expr::Expr::NullLiteral,
                     raw: Some((rhs_text, binds)),
+                    fallback: None,
                     src_off: start,
                 },
                 TrigStmt::Exit { src_off: start },
@@ -26156,20 +26406,31 @@ fn parse_trig_stmt(
             src_off: start,
         });
     }
+    if let Some(raw) = call_statement(text, vars) {
+        return Some(TrigStmt::Call { raw, src_off: start });
+    }
     let eq = text.find('=')?;
     let lhs = text[..eq].trim();
     // the target CANONICAL: `NEW."a"` is column "a", `NEW.a` is A
     let target = if lhs.len() > 4 && lhs[..4].eq_ignore_ascii_case("NEW.") {
         TrigTarget::Field(canon_ident(&lhs[4..])?)
     } else {
-        // a bare target must name a DECLAREd variable
+        // a bare target must name a DECLAREd variable - and the error
+        // context variables are READ-ONLY (the engine's -104 at prepare,
+        // measured: `SQLCODE = 5` is Token unknown)
         let name = canon_ident(lhs)?;
+        if ERR_CONTEXT_VARS.contains(&name.as_str()) {
+            return None;
+        }
         let slot = vars.iter().position(|v| *v == name)?;
         TrigTarget::Var(slot as u16)
     };
     let rhs = text[eq + 1..].trim();
     match parse_body_expr(rhs, vars) {
-        Some(e) => Some(TrigStmt::Assign { target, expr: e, raw: None, src_off: start }),
+        Some(e) => {
+            let fallback = if expr_draws(&e) { None } else { raw_psql_value(rhs, vars) };
+            Some(TrigStmt::Assign { target, expr: e, raw: None, fallback, src_off: start })
+        }
         // A TEXT ASSIGNMENT. `Expr` is arithmetic - it has no string
         // literal - so `S = 'SELECT ...'` used to refuse the whole body,
         // and with it the CANONICAL EXECUTE STATEMENT: build the
@@ -26199,9 +26460,53 @@ fn parse_trig_stmt(
                     binds.push((name, slot));
                 }
             }
-            Some(TrigStmt::Assign { target, expr: fire_crab_ods::expr::Expr::NullLiteral, raw: Some((rhs.to_string(), binds)), src_off: start })
+            Some(TrigStmt::Assign { target, expr: fire_crab_ods::expr::Expr::NullLiteral, raw: Some((rhs.to_string(), binds)), fallback: None, src_off: start })
         }
     }
+}
+
+/// `<name>(<args>)` and nothing else - a function call standing as a
+/// statement ([TrigStmt::Call]) - as the value it computes.
+fn call_statement(text: &str, vars: &[String]) -> Option<RawVal> {
+    let t = text.trim();
+    let name_end = t.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))?;
+    let name = &t[..name_end];
+    if name.is_empty() || !name.as_bytes()[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let args = t[name_end..].trim_start();
+    if !args.starts_with('(') || !args.ends_with(')') {
+        return None;
+    }
+    // the first paren's match must be the LAST character: `F(1) + G(2)`
+    // is no call statement
+    let masked = mask_literals(args);
+    let mut depth = 0i32;
+    for (i, c) in masked.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 && i + 1 != masked.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    // a keyword that opens a statement of its own is not a function
+    if matches!(
+        name.to_ascii_uppercase().as_str(),
+        "IF" | "WHILE" | "BEGIN" | "EXCEPTION" | "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "EXECUTE"
+            | "RETURN" | "SUSPEND" | "EXIT" | "LEAVE" | "CONTINUE" | "OPEN" | "FETCH" | "CLOSE"
+            | "MERGE" | "FOR" | "IN" | "POST_EVENT"
+    ) {
+        return None;
+    }
+    raw_psql_value(t, vars)
 }
 
 /// A raw right-hand side with its BARE variable references written as
@@ -26337,7 +26642,9 @@ fn emit_trigger_stmt(
         | TrigStmt::ExecStmt { .. }
         | TrigStmt::SelectInto { .. }
         | TrigStmt::ForExecStmt { .. }
-        | TrigStmt::CallProc { .. } => {}
+        | TrigStmt::CallProc { .. }
+        | TrigStmt::Call { .. }
+        | TrigStmt::DmlInto { .. } => {}
         TrigStmt::Assign { target, expr, src_off, .. } => {
             dbg.push((*src_off, b.len()));
             b.push(1); // blr_assignment
@@ -26396,7 +26703,7 @@ fn emit_trigger_stmt(
             b.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
             b.extend_from_slice(bytes);
         }
-        TrigStmt::Raise { name, message, src_off } => {
+        TrigStmt::Raise { name, message, src_off, .. } => {
             dbg.push((*src_off, b.len()));
             if bracket_raises {
                 // begin / start_savepoint / abort / end_savepoint / end
@@ -27118,7 +27425,14 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             return None;
         }
         let semi = s[at..begin_kw].find(';')? + at;
-        let words: Vec<&str> = masked[at..semi].split_whitespace().collect();
+        // the VARIABLE keyword is optional (`DECLARE X INTEGER;` is the
+        // same declaration, the same BLR - measured on engine 2182)
+        let mut words: Vec<&str> = masked[at..semi].split_whitespace().collect();
+        let mut raw_words: Vec<&str> = s[at..semi].split_whitespace().collect();
+        if words.get(1) != Some(&"VARIABLE") && words.len() >= 3 {
+            words.insert(1, "VARIABLE");
+            raw_words.insert(1, "VARIABLE");
+        }
         // `DECLARE VARIABLE <name> <type>` - the integer family, or a
         // TEXT one whose length is written in CHARACTERS and stored in
         // BYTES (the database's default charset decides the factor)
@@ -27150,7 +27464,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             ["DECLARE", "VARIABLE", _, ty, size] => text_decl(ty, size)?,
             _ => return None,
         };
-        let name = s[at..semi].split_whitespace().nth(2)?.trim_matches('"').to_ascii_uppercase();
+        let name = raw_words.get(2)?.trim_matches('"').to_ascii_uppercase();
         if !ident_ok(&name) || declares.iter().any(|(n, _, _)| *n == name) {
             return None;
         }
@@ -27222,7 +27536,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::ExecStmt { .. }
             | TrigStmt::SelectInto { .. }
             | TrigStmt::ForExecStmt { .. }
-            | TrigStmt::CallProc { .. } => {}
+            | TrigStmt::CallProc { .. }
+            | TrigStmt::Call { .. }
+            | TrigStmt::DmlInto { .. } => {}
             TrigStmt::Assign { expr, .. } => out.push(expr),
             TrigStmt::If { cond, then, otherwise, .. } => {
                 out.extend(cond.operands());
@@ -27267,7 +27583,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::ExecStmt { .. }
             | TrigStmt::SelectInto { .. }
             | TrigStmt::ForExecStmt { .. }
-            | TrigStmt::CallProc { .. } => {}
+            | TrigStmt::CallProc { .. }
+            | TrigStmt::Call { .. }
+            | TrigStmt::DmlInto { .. } => {}
             TrigStmt::Assign { target, .. } => out.push(target),
             TrigStmt::If { then, otherwise, .. } => {
                 stmt_targets(then, out);
@@ -27313,7 +27631,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::ExecStmt { .. }
             | TrigStmt::SelectInto { .. }
             | TrigStmt::ForExecStmt { .. }
-            | TrigStmt::CallProc { .. } => {}
+            | TrigStmt::CallProc { .. }
+            | TrigStmt::Call { .. }
+            | TrigStmt::DmlInto { .. } => {}
             TrigStmt::Assign { .. } => {}
             TrigStmt::If { then, otherwise, .. } => {
                 stmt_specials(then, stores, raises, hexcs, dmls);
@@ -52904,6 +53224,110 @@ fn cast_ascii_text_arg(t: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// A TYPED LITERAL argument - `DATE '...'`, `TIME '...'`, `TIMESTAMP
+/// '...'`, TRUE, FALSE - as its value, the conversion a CAST of the
+/// quoted text makes (an unreadable one is not taken here, and the call
+/// refuses as before). Measured on engine 2182: `SELECT * FROM
+/// PDT(DATE '2024-12-31')` over `PDT(A DATE)` answers 2025-01-01, 2024.
+/// `DEFAULT` written as a call's argument: a marker the planner replaces
+/// with the parameter's own default once the procedure is known
+/// ([resolve_default_args]). It is a blob id no record can carry, and
+/// it never reaches a body - every planner that takes a call either
+/// resolves it or refuses.
+fn default_arg_marker() -> Value {
+    Value::Blob(u16::MAX, u64::MAX)
+}
+
+fn is_default_arg(v: &Value) -> bool {
+    matches!(v, Value::Blob(r, n) if *r == u16::MAX && *n == u64::MAX)
+}
+
+/// The arguments with each `DEFAULT` replaced by its parameter's LITERAL
+/// default. Measured on engine 2182 over `PDEF(A INTEGER = 1, B
+/// VARCHAR(10) = 'dflt')`: `PDEF(DEFAULT, 'z')` is '1z', `PDEF(7,
+/// DEFAULT)` '7dflt', and `EXECUTE PROCEDURE PDEF(DEFAULT, 'q')` '1q' -
+/// and `DEFAULT` for a parameter with NO default is NULL, raising
+/// nothing (`SELECT * FROM PSQ(DEFAULT)` is no rows, `EXECUTE PROCEDURE
+/// PSQ(DEFAULT)` answers 1, NULL). `None` is a default this planner
+/// cannot place (a context default, or a text one whose set is not
+/// plain ASCII), which refuses.
+fn resolve_default_args(meta: &ProcMeta, args: &mut [Value]) -> Option<()> {
+    for (i, a) in args.iter_mut().enumerate() {
+        if !is_default_arg(a) {
+            continue;
+        }
+        let p = meta.ins.get(i)?;
+        match (&p.default, &p.default_ctx) {
+            (Some(Value::Text(t)), _) if !t.is_ascii() => return None,
+            (Some(v), _) => *a = v.clone(),
+            (None, Some(_)) => return None,
+            (None, None) => *a = Value::Null,
+        }
+    }
+    Some(())
+}
+
+/// An argument written as integer ARITHMETIC over literals - `2 - 1`,
+/// `4 / 2`, `2 * 2 - 1` - folded to its value, the way the engine
+/// evaluates an argument expression (dialect 3: an integer quotient
+/// truncates). This is what a body's own call becomes once its
+/// variables are written in: `FOR SELECT R FROM P_REC(:N - 1)` reaches
+/// the planner as `P_REC(2 - 1)`, and a recursive procedure refused
+/// there. Anything but integers and `+ - * /` is not taken.
+fn folded_int_arg(t: &str) -> Option<i64> {
+    use fire_crab_ods::expr::Expr as E;
+    fn fold(e: &E) -> Option<i64> {
+        Some(match e {
+            E::IntLiteral(n) => *n as i64,
+            E::Int64Literal(n) => *n,
+            E::Add(l, r) => fold(l)?.checked_add(fold(r)?)?,
+            E::Subtract(l, r) => fold(l)?.checked_sub(fold(r)?)?,
+            E::Multiply(l, r) => fold(l)?.checked_mul(fold(r)?)?,
+            E::Divide(l, r) => {
+                let d = fold(r)?;
+                if d == 0 {
+                    return None;
+                }
+                fold(l)?.checked_div(d)?
+            }
+            _ => return None,
+        })
+    }
+    if !t.contains(['+', '-', '*', '/']) {
+        return None;
+    }
+    // a LEADING minus is `0 -`: the arithmetic reader takes no unary sign
+    let t = match t.strip_prefix('-') {
+        Some(rest) => format!("0 - {}", rest),
+        None => t.to_string(),
+    };
+    let v = fold(&parse_expr(&t)?)?;
+    // the result must still be an INTEGER-sized value: past it the
+    // engine's arithmetic is BIGINT, which this fold does not type
+    i32::try_from(v).ok().map(|_| v)
+}
+
+fn typed_literal_arg(t: &str) -> Option<Value> {
+    let up = t.to_ascii_uppercase();
+    match up.as_str() {
+        "TRUE" => return Some(Value::Bool(true)),
+        "FALSE" => return Some(Value::Bool(false)),
+        _ => {}
+    }
+    let (kind, rest) = [("TIMESTAMP", TKind::Timestamp), ("DATE", TKind::Date), ("TIME", TKind::Time)]
+        .into_iter()
+        .find_map(|(w, k)| {
+            let r = up.strip_prefix(w)?;
+            r.starts_with(|c: char| c.is_whitespace() || c == '\'').then(|| (k, t[w.len()..].trim()))
+        })?;
+    let inner = rest.strip_prefix('\'')?.strip_suffix('\'')?;
+    if inner.contains('\'') || !inner.is_ascii() {
+        return None;
+    }
+    let e = Expr::Cast(Box::new(Expr::Col(0)), CastTarget::Temporal(kind), fire_crab_ods::intl::CS_UTF8);
+    e.eval(&[Value::Text(inner.to_string())]).ok()
+}
+
 fn parse_call_args(text: &str, allow_placeholder: bool) -> Option<Vec<Option<Value>>> {
     let text = text.trim();
     if text.is_empty() {
@@ -52953,6 +53377,8 @@ fn parse_call_args(text: &str, allow_placeholder: bool) -> Option<Vec<Option<Val
             }
             if t == "?" && allow_placeholder {
                 Some(None)
+            } else if t.eq_ignore_ascii_case("DEFAULT") {
+                Some(Some(default_arg_marker()))
             } else if t.eq_ignore_ascii_case("NULL") {
                 Some(Some(Value::Null))
             } else if let Ok(n) = t.parse::<i64>() {
@@ -52961,6 +53387,10 @@ fn parse_call_args(text: &str, allow_placeholder: bool) -> Option<Vec<Option<Val
                 Some(Some(Value::Int(n)))
             } else if let Some(txt) = cast_ascii_text_arg(t) {
                 Some(Some(Value::Text(txt)))
+            } else if let Some(v) = typed_literal_arg(t) {
+                Some(Some(v))
+            } else if let Some(n) = folded_int_arg(t) {
+                Some(Some(Value::Int(n)))
             } else if let Some(TextNum::Dec { mantissa, exp }) =
                 (!t.starts_with('\'')).then(|| text_number(t)).flatten()
             {
@@ -61789,6 +62219,23 @@ fn plan_query_inner_at_body(
         return Some(p);
     }
     if let Some((source, body_at)) = parse_execute_block(sql) {
+        // judged before it runs, as a selectable block's body is: the BLR
+        // compiler first, and [block_prepare_verdict] where it declines
+        let synth = format!("CREATE PROCEDURE FC$BLOCK AS {}", source);
+        fire_crab_dsql::set_catalog(dsql_catalog_for(db, &synth));
+        let compiled = fire_crab_dsql::compile_procedure_full_with_funcs(&synth, &plain_function_arities(db)).is_some();
+        fire_crab_dsql::set_catalog(Vec::new());
+        let meta = ProcMeta {
+            ins: Vec::new(),
+            outs: Vec::new(),
+            source: source.clone(),
+            body_at: Some(body_at),
+            prc_type: None,
+            is_function: false,
+        };
+        if let Some(refused) = block_prepare_gate(&meta, db, compiled) {
+            return refused;
+        }
         return Some(Plan::ExecBlock { source, body_at });
     }
     // EXECUTE PROCEDURE is not a SELECT, but isql prepares and FETCHES
@@ -61874,6 +62321,27 @@ fn plan_query_inner_at_body(
                     // the placeholder's seat, overwritten at op_execute
                     args.push(Value::Null);
                 }
+            }
+        }
+        // THE ARITY IS A PREPARE-TIME CHECK, both ways, and each is the
+        // engine's 07001 without the DSQL wrapper (measured): one argument
+        // too many is *Parameter mismatch for procedure "PUBLIC"."PSQ"* /
+        // *wrong number of arguments on call*; a parameter with no default
+        // LEFT OFF is the same first line and *Parameter N has no default
+        // value and was not specified or was specified with DEFAULT* -
+        // where this answered the generic 42000 at execute
+        if args.len() > meta.ins.len() {
+            return Some(Plan::RefusedEval(EvalErr::ProcWrongArgCount(quoted_qualified_pkg(&pname))));
+        }
+        if resolve_default_args(&meta, &mut args).is_none() {
+            return Some(Plan::Refused);
+        }
+        if args.len() < meta.ins.len() {
+            if let Some(p) = meta.ins[args.len()..].iter().find(|p| p.default.is_none() && p.default_ctx.is_none()) {
+                return Some(Plan::RefusedEval(EvalErr::ProcParamNoDefault {
+                    procedure: quoted_qualified_pkg(&pname),
+                    param: p.name.clone(),
+                }));
             }
         }
         // the body runs at EXECUTE, not here: it may write
@@ -63151,6 +63619,10 @@ fn plan_query_inner_at_body(
                     // and is filled at EXECUTE (run_body_source, which has the
                     // ctx), so it is left short here - accepted as long as
                     // every remaining trailing parameter carries SOME default.
+                    let mut args = args;
+                    if resolve_default_args(&meta, &mut args).is_none() {
+                        return Some(Plan::Refused);
+                    }
                     let args = with_proc_defaults_as_args(&meta, &args);
                     // ARITY beats the not-selectable refusal (probed:
                     // `SELECT * FROM P2_RET(1)` and `SELECT * FROM
@@ -75693,6 +76165,23 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(1) // isc_arg_gds - Implementation limit exceeded
                 .int(GDS_IMP_EXC);
         }
+        EvalErr::CursorNotOpen => {
+            w.int(1).int(335544834);
+        }
+        EvalErr::CursorNotPositioned(name) => {
+            w.int(1).int(335545092).int(2).bytes(name.as_bytes());
+        }
+        EvalErr::InvalidFetchOption(word) => {
+            w.int(1).int(335544993).int(2).bytes(word.as_bytes());
+        }
+        EvalErr::NotValidVar { var, value } => {
+            w.int(1) // isc_arg_gds - isc_not_valid_for_var
+                .int(335544879)
+                .int(2) // isc_arg_string
+                .bytes(var.as_bytes())
+                .int(2) // isc_arg_string
+                .bytes(value.as_bytes());
+        }
         EvalErr::NotValid { column, value } => {
             w.int(1) // isc_arg_gds
                 .int(GDS_NOT_VALID)
@@ -76305,6 +76794,24 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(*line as i32)
                 .int(ISC_ARG_NUMBER)
                 .int(*col as i32);
+        }
+        EvalErr::ProcParamNoDefault { procedure, param } => {
+            w.int(1)
+                .int(GDS_PRCMISMAT)
+                .int(2)
+                .bytes(procedure.as_bytes())
+                .int(1) // isc_param_no_default_not_specified
+                .int(335545291)
+                .int(2)
+                .bytes(param.as_bytes());
+        }
+        EvalErr::ProcWrongArgCount(procedure) => {
+            w.int(1)
+                .int(GDS_PRCMISMAT)
+                .int(2)
+                .bytes(procedure.as_bytes())
+                .int(1) // isc_wronumarg
+                .int(335544380);
         }
         EvalErr::ProcArgMismatch(procedure) => {
             w.int(1) // isc_arg_gds
@@ -91848,6 +92355,20 @@ enum EvalErr {
     /// column and the value text - `*** null ***`, NOT quoted (the one
     /// unquoted argument in the family, per the raw capture)
     NotValid { column: String, value: String },
+    /// a PSQL variable's value its DOMAIN (or its own NOT NULL) refuses:
+    /// `isc_not_valid_for_var` (335544879, SQLSTATE 42000) with the
+    /// quoted variable name and the value text - "validation error for
+    /// variable "X", value "-1"" (evl.cpp EVL_validate)
+    NotValidVar { var: String, value: String },
+    /// a PSQL cursor read or fetched while closed: `isc_cursor_not_open`
+    /// (335544834, SQLSTATE 24000) "Cursor is not open"
+    CursorNotOpen,
+    /// `<cursor>.<column>` with no current record: `isc_cursor_not_
+    /// positioned` (335545092, HY109) - the quoted cursor name
+    CursorNotPositioned(String),
+    /// a FETCH orientation a non-SCROLL cursor does not take:
+    /// `isc_invalid_fetch_option` (335544993, HY106) - the option word
+    InvalidFetchOption(String),
     /// an explicit value into a `GENERATED ALWAYS` identity column
     /// without an OVERRIDING clause: `isc_overriding_missing`
     /// (335545137, SQLSTATE 42000), the schema-qualified table name as
@@ -91998,6 +92519,16 @@ enum EvalErr {
     /// `isc_param_no_default_not_specified` per missing parameter) and
     /// is NOT this variant
     ProcArgMismatch(String),
+    /// an EXECUTE PROCEDURE that leaves out - or passes DEFAULT for - a
+    /// parameter with no default: `isc_prcmismat` (07001) with the
+    /// procedure, then `isc_param_no_default_not_specified` with the
+    /// parameter - no DSQL wrapper (measured: `EXECUTE PROCEDURE PSQ`)
+    ProcParamNoDefault { procedure: String, param: String },
+    /// an EXECUTE PROCEDURE with MORE arguments than parameters:
+    /// `isc_prcmismat` then `isc_wronumarg` "wrong number of arguments
+    /// on call" (07001, no DSQL wrapper - measured: `EXECUTE PROCEDURE
+    /// PSQ(1, 2)`, where the SELECT form is the wrapped -170)
+    ProcWrongArgCount(String),
     /// A USER EXCEPTION that reached the client - `EXCEPTION <name>` in
     /// a body with no handler that caught it.
     ///
@@ -113198,7 +113729,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         // wire_for), so a procedure of these types is loadable now that it
         // runs through try_procedure_blr. Approx (FLOAT/DOUBLE - no f64
         // arithmetic in exe) and temporal stay refused.
-        if col_kind(&desc).is_none() && !is_numeric_col(&desc) {
+        if col_kind(&desc).is_none() && !is_numeric_col(&desc) && !source_only_param(&desc) {
             return None;
         }
         let default_cs = defval.as_ref().and_then(|(_, c)| *c);
@@ -113537,6 +114068,19 @@ struct PsqlFrame {
     cursors: std::collections::HashMap<String, CursorState>,
     /// the slot `ROW_COUNT` resolves to, if the body mentions it
     row_count_slot: Option<u16>,
+    /// the slots `SQLCODE`, `GDSCODE` and `SQLSTATE` resolve to, each
+    /// when the body mentions it - refreshed from [PsqlFrame::caught]
+    /// whenever that changes ([set_caught])
+    err_slots: [Option<u16>; 3],
+    /// a slot's VALIDATION - its domain's NOT NULL and CHECK, or its own
+    /// NOT NULL - by slot number; empty for a frame with none. Every
+    /// write into the slot passes it ([store_slot_cs]).
+    rules: Vec<Option<VarRule>>,
+    /// the `<cursor>.<column>` references the body makes, each a slot of
+    /// its own: (slot, cursor, column). Written from the cursor's record
+    /// whenever it moves ([refresh_cursor_fields]); a read with no record
+    /// raises ([cursor_field_guard]).
+    cursor_fields: Vec<(u16, String, String)>,
     /// A TRIGGER's row contexts - `None` in a procedure or an EXECUTE
     /// BLOCK, where `NEW.`/`OLD.` name nothing.
     trig: Option<TrigCtx>,
@@ -113645,7 +114189,14 @@ impl TrigCtx {
 struct CursorState {
     query: String,
     rows: Option<Vec<Vec<Value>>>,
-    at: usize,
+    /// the CURRENT record's index: -1 before the first, `rows.len()`
+    /// past the last - where a FETCH that found nothing leaves it
+    pos: i64,
+    /// declared SCROLL: FETCH may move PRIOR / FIRST / LAST / ABSOLUTE /
+    /// RELATIVE, where a plain cursor takes NEXT alone
+    scroll: bool,
+    /// the query's column names, which `<cursor>.<column>` reads by
+    cols: Vec<String>,
     /// the character set each column of `rows` is spelled in
     /// ([plan_out_cs]), for the FETCH that stores them
     cs: Vec<SrcCs>,
@@ -113791,6 +114342,689 @@ impl Thrown {
     }
 }
 
+/// Write an assignment's value into its target - a slot, through the
+/// slot's declared type, or a BEFORE trigger's `NEW.<col>`.
+fn assign_value(target: &TrigTarget, v: Value, src: SrcCs, f: &mut PsqlFrame) -> Result<(), PsqlStop> {
+    match target {
+        TrigTarget::Var(n) => store_slot_cs(f, *n as usize, v, src),
+        // `NEW.<col> = <value>` in a BEFORE trigger changes
+        // what is stored. OLD is read-only, and NEW is
+        // read-only in an AFTER trigger (the row is written) -
+        // both keep the refusal.
+        TrigTarget::Field(name) => {
+            let Some(t) = f.trig.as_mut() else {
+                return Err(PsqlStop::Unsupported);
+            };
+            if !t.writable {
+                return Err(PsqlStop::Unsupported);
+            }
+            let Some(fid) = t.fid(name) else {
+                return Err(PsqlStop::Unsupported);
+            };
+            let Some(row) = t.new.as_mut() else {
+                return Err(PsqlStop::Unsupported);
+            };
+            if row.len() <= fid {
+                row.resize(fid + 1, Value::Null);
+            }
+            row[fid] = v;
+            Ok(())
+        }
+    }
+}
+
+/// The source offset a statement reports its errors at, moved - see
+/// [declared_var_inits].
+fn set_stmt_src_off(st: &mut TrigStmt, off: usize) {
+    match st {
+        TrigStmt::Assign { src_off, .. } | TrigStmt::AssignText { src_off, .. } => *src_off = off,
+        TrigStmt::Block { stmts, src_off, .. } => {
+            *src_off = off;
+            for s in stmts {
+                set_stmt_src_off(s, off);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A local's VALIDATION: the domain's NOT NULL and CHECK, or the
+/// declaration's own NOT NULL. Measured on engine 2182 (evl.cpp
+/// EVL_validate): the check is made on EVERY write - an assignment, an
+/// initialiser, a FETCH - after the value is converted to the slot's
+/// type, and fails only when the condition is FALSE (a NULL passes a
+/// CHECK, as it does a column's); a NOT NULL refuses NULL. A local that
+/// is never written is NOT checked: `DECLARE X DNN;` over a NOT NULL
+/// domain runs, and holds NULL.
+#[derive(Clone)]
+struct VarRule {
+    /// the variable's name as the message quotes it
+    var: String,
+    not_null: bool,
+    /// the CHECK, NEGATED, over one pseudo column holding the value
+    check: Option<Predicate>,
+}
+
+impl VarRule {
+    /// `v` decides, `shown` is what the message renders
+    fn validate(&self, v: &Value, shown: &Value) -> Result<(), PsqlStop> {
+        let bad = match (v, &self.check) {
+            (Value::Null, _) => self.not_null,
+            (_, Some(p)) => p.matches(std::slice::from_ref(v)).map_err(psql_raise)?,
+            (_, None) => false,
+        };
+        if bad {
+            return Err(psql_raise(EvalErr::NotValidVar {
+                var: format!("\"{}\"", self.var),
+                value: validation_value_text(shown),
+            }));
+        }
+        Ok(())
+    }
+}
+
+
+/// The words a local's type may start with that are NOT a domain name.
+const BUILTIN_TYPE_WORDS: &[&str] = &[
+    "SMALLINT", "INTEGER", "INT", "BIGINT", "INT128", "NUMERIC", "DECIMAL", "DEC", "FLOAT", "REAL",
+    "DOUBLE", "DECFLOAT", "DATE", "TIME", "TIMESTAMP", "CHAR", "CHARACTER", "VARCHAR", "NCHAR",
+    "NATIONAL", "BINARY", "VARBINARY", "BLOB", "BOOLEAN", "CURSOR", "TYPE",
+];
+
+/// A local's type when it names the CATALOG - `<domain>`, `TYPE OF
+/// <domain>`, `TYPE OF COLUMN <rel>.<col>` - or carries a NOT NULL:
+/// its base type as a slot type, its [VarRule] (a plain domain's NOT
+/// NULL and CHECK; `TYPE OF` takes the type alone), and a plain
+/// domain's DEFAULT text. `Ok(None)` for a built-in type with nothing
+/// to validate, which the type reader alone answers.
+///
+/// Measured on engine 2182 over `DPOS` (INTEGER CHECK (VALUE > 0)),
+/// `DNN` (INTEGER NOT NULL), `DD7` (INTEGER DEFAULT 7) and `DV3`
+/// (VARCHAR(3) CHECK (VALUE <> 'bad')): `X = -1` into a DPOS local is
+/// "validation error for variable "X", value "-1"" at the assignment,
+/// `DECLARE X DPOS = -2` the same at the DECLARE, `X = NULL` into a DNN
+/// local the same with "*** null ***", a DD7 local starts as 7, 'abcd'
+/// into a DV3 local is 22001 (the domain's width), `TYPE OF DPOS`
+/// takes -1, and a `TYPE OF COLUMN T1.ID` local converts '12' to 12.
+/// Resolved against the catalog each time the body runs. A reference
+/// this server cannot type - an unknown name, a text or BLOB domain's
+/// set it does not carry, a CHECK its predicate reader does not take -
+/// is `Err`, and the body refuses rather than hold an unvalidated or
+/// untyped value.
+#[allow(clippy::type_complexity)]
+fn catalog_decl_type(
+    db: Option<&Database>,
+    var: &str,
+    text: &str,
+) -> Result<Option<(Option<CastTarget>, Option<VarRule>, Option<String>)>, String> {
+    let masked = mask_literals(&text.to_ascii_uppercase());
+    // the type ends at the initialiser
+    let init_at = [masked.find('='), find_word(&masked, "DEFAULT", 0)].into_iter().flatten().min();
+    let head = &masked[..init_at.unwrap_or(masked.len())];
+    let head_text = &text[..init_at.unwrap_or(text.len())];
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let not_null = head.trim_end().ends_with("NOT NULL") && words.len() >= 3;
+    let first = words.first().copied().unwrap_or("");
+    let first_ident = first.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).next().unwrap_or("");
+    if first.starts_with('"') {
+        return Err("names a quoted type".into());
+    }
+    if BUILTIN_TYPE_WORDS.contains(&first_ident) && first_ident != "TYPE" {
+        if !not_null {
+            return Ok(None);
+        }
+        let rule = VarRule { var: var.to_string(), not_null: true, check: None };
+        return Ok(Some((declared_type_target(head_text.trim_end()[..head_text.trim_end().len() - "NOT NULL".len()].trim()), Some(rule), None)));
+    }
+    let db = db.ok_or("names the catalog with no database")?;
+    let domain_row = |dom: &str| -> Result<(Descriptor, bool, Option<String>, Option<String>), String> {
+        domain_row_of(db, dom).ok_or_else(|| format!("names a domain {} this server cannot read", dom))
+    };
+    let slot = |d: &Descriptor| -> Result<CastTarget, String> {
+        if matches!(d.dtype, dtype::BLOB) {
+            return Err("names a BLOB type".into());
+        }
+        slot_cast_target(d).ok_or_else(|| "names a type this server has no slot for".into())
+    };
+    let (desc, rule_src) = match words.as_slice() {
+        ["TYPE", "OF", "COLUMN", rest @ ..] => {
+            let spec: String = rest.concat();
+            let (rel, col) = spec.split_once('.').ok_or("names no column")?;
+            if rel.is_empty() || col.is_empty() || !ident_ok(rel) || !ident_ok(col) {
+                return Err("names no column".into());
+            }
+            let fid = db.columns(rel).iter().find(|c| c.name.trim_end() == col).map(|c| c.field_id as usize);
+            let fid = fid.ok_or("names an unknown column")?;
+            let formats = fire_crab_ods::format::relation_formats(
+                &db.bytes(),
+                db.page_size,
+                fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, rel).ok_or("names an unknown table")?,
+            );
+            let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("names an unknown table")?;
+            (*descs.get(fid).ok_or("names an unknown column")?, None)
+        }
+        ["TYPE", "OF", dom] => (domain_row(dom)?.0, None),
+        [dom] | [dom, "NOT", "NULL"] if ident_ok(dom) => {
+            let (d, dnn, check, default) = domain_row(dom)?;
+            (d, Some((dnn, check, default)))
+        }
+        _ => return Err("has a type this server cannot read".into()),
+    };
+    if not_null && rule_src.is_none() && !matches!(words.as_slice(), ["TYPE", "OF", ..]) {
+        return Err("has a type this server cannot read".into());
+    }
+    let t = slot(&desc)?;
+    // a domain's text type is its own set; a set this server does not
+    // carry through a slot stays refused
+    let (rule, default) = match rule_src {
+        None => (not_null.then(|| VarRule { var: var.to_string(), not_null: true, check: None }), None),
+        Some((dnn, check, default)) => {
+            let check = match check {
+                None => None,
+                Some(src) => Some(var_check_predicate(&src, &desc).ok_or("has a CHECK this server cannot read")?),
+            };
+            let rule = (dnn || not_null || check.is_some())
+                .then(|| VarRule { var: var.to_string(), not_null: dnn || not_null, check });
+            (rule, default)
+        }
+    };
+    Ok(Some((Some(t), rule, default)))
+}
+
+/// A domain's descriptor (as a parameter of it is typed), its NOT NULL,
+/// its CHECK source and its DEFAULT value text (the `DEFAULT` keyword
+/// taken off), off its RDB$FIELDS row. None for no such domain.
+fn domain_row_of(db: &Database, dom: &str) -> Option<(Descriptor, bool, Option<String>, Option<String>)> {
+    use fire_crab_ods::format::Value;
+    let desc = domain_descriptor(db, dom)?;
+    let (cols, descs) = sys_rel(db, "RDB$FIELDS")?;
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, null_f, vsrc_f, vblr_f, dsrc_f) = (
+        fid("RDB$FIELD_NAME")?,
+        fid("RDB$NULL_FLAG")?,
+        fid("RDB$VALIDATION_SOURCE")?,
+        fid("RDB$VALIDATION_BLR")?,
+        fid("RDB$DEFAULT_SOURCE")?,
+    );
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$FIELDS")?;
+    let blob_text = |v: Option<&Value>| -> Option<Option<String>> {
+        match v {
+            Some(Value::Blob(r, n)) => {
+                let b = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)?;
+                Some(Some(strip_sql_comments(&String::from_utf8(b).ok()?)))
+            }
+            _ => Some(None),
+        }
+    };
+    let mut out = None;
+    let mut bad = false;
+    for_each_catalog_record(db, rel, &[(0u8, descs)], usize::MAX, |v| {
+        if !matches!(v.get(name_f), Some(Value::Text(t)) if t.trim_end() == dom) {
+            return;
+        }
+        let nn = matches!(v.get(null_f), Some(Value::Int(1)));
+        let has_blr = matches!(v.get(vblr_f), Some(Value::Blob(..)));
+        let (Some(check), Some(default)) = (blob_text(v.get(vsrc_f)), blob_text(v.get(dsrc_f))) else {
+            bad = true;
+            return;
+        };
+        // a validation BLR with no readable source is a rule this
+        // server cannot know
+        if has_blr && check.is_none() {
+            bad = true;
+            return;
+        }
+        let check = if has_blr { check } else { None };
+        let default = match default {
+            None => None,
+            Some(d) => {
+                let t = d.trim();
+                match t.get(.."DEFAULT".len()) {
+                    Some(h) if h.eq_ignore_ascii_case("DEFAULT") => Some(t["DEFAULT".len()..].trim().to_string()),
+                    _ => {
+                        bad = true;
+                        return;
+                    }
+                }
+            }
+        };
+        out = Some((desc, nn, check, default));
+    });
+    if bad {
+        return None;
+    }
+    out
+}
+
+/// A domain's descriptor off its RDB$FIELDS row, exactly as a procedure
+/// parameter of it is typed ([load_procedure]).
+fn domain_descriptor(db: &Database, dom: &str) -> Option<Descriptor> {
+    let (ft, len, scale, sub) = fire_crab_ods::ddl::domain_type_info(&db.bytes(), db.page_size, dom)?;
+    let dtype = fire_crab_ods::ddl::field_type_to_dtype(ft)?;
+    let length = if dtype == dtype::VARYING { len + 2 } else { len };
+    let sub_type = if matches!(dtype, dtype::TEXT | dtype::VARYING) {
+        fire_crab_ods::ddl::domain_charset_id(&db.bytes(), db.page_size, dom).map_or(sub, |cs| cs as i16)
+    } else {
+        sub
+    };
+    Some(Descriptor { dtype, scale, length, sub_type, flags: 0, offset: 0 })
+}
+
+/// A domain's CHECK source (`CHECK (<cond>)`) as the NEGATED predicate
+/// [VarRule] holds, over one pseudo column carrying the value - the
+/// reading a column's domain check gets ([domain_check_predicates]).
+fn var_check_predicate(src: &str, desc: &Descriptor) -> Option<Predicate> {
+    const COL: &str = "FCVARVALUE";
+    let t = src.trim_start();
+    if !t.get(..5).is_some_and(|h| h.eq_ignore_ascii_case("CHECK")) || string_literal_has_question(t) {
+        return None;
+    }
+    let negated = format!("NOT {}", substitute_value_word(&t[5..], COL));
+    let toks = tokenize(&negated)?;
+    let mut np = 0usize;
+    let raw = parse_predicate(&toks, &mut np)?;
+    if np != 0 {
+        return None;
+    }
+    let cols = vec![RelationColumn { name: COL.to_string(), field_id: 0, position: 0 }];
+    let mut params: Vec<Option<Descriptor>> = Vec::new();
+    // a STORED column's descriptor: offset 0 reads as COMPUTED BY
+    // ([is_computed_fid]), and the value is handed over, never decoded
+    let d = Descriptor { offset: 8, ..*desc };
+    let p = resolve_predicate(raw, &cols, &[d], &mut params)?;
+    params.is_empty().then_some(p)
+}
+
+/// A parameter type only the SOURCE interpreter runs: a DATE, TIME or
+/// TIMESTAMP, a DOUBLE or FLOAT, a BOOLEAN. The BLR executor declines
+/// each at its message ([fire_crab_exe]'s msg_slot has no such dtype),
+/// so a routine of them is answered from its source, where a slot of
+/// the type converts and computes (slot_cast_target) - where it was
+/// not loaded at all, and a call was "Function unknown" (measured:
+/// `G7F(DATE '2024-01-01')` over `G7F(A DATE) RETURNS DATE` answers
+/// 2024-01-01 on engine 2182).
+fn source_only_param(d: &Descriptor) -> bool {
+    matches!(
+        d.dtype,
+        dtype::SQL_DATE | dtype::SQL_TIME | dtype::TIMESTAMP | dtype::DOUBLE | dtype::REAL | dtype::BOOLEAN
+    )
+}
+
+/// Write each `<cursor>.<column>` slot of `cursor` from its current
+/// record - NULL when it has none, which [cursor_field_guard] then
+/// refuses to let a read see.
+fn refresh_cursor_fields(f: &mut PsqlFrame, cursor: &str) {
+    for i in 0..f.cursor_fields.len() {
+        let (slot, c, col) = &f.cursor_fields[i];
+        if c != cursor {
+            continue;
+        }
+        let v = f
+            .cursors
+            .get(c)
+            .and_then(|st| {
+                let row = st.rows.as_ref()?.get(usize::try_from(st.pos).ok()?)?;
+                row.get(st.cols.iter().position(|n| n == col)?).cloned()
+            })
+            .unwrap_or(Value::Null);
+        let n = *slot as usize;
+        if n >= f.vars.len() {
+            f.vars.resize(n + 1, Value::Null);
+        }
+        f.vars[n] = v;
+    }
+}
+
+/// May slot `n` be read? A `<cursor>.<column>` slot only while its
+/// cursor stands on a record. Measured on engine 2182: before the first
+/// FETCH, and after one that found nothing, the read is HY109 *Cursor
+/// "C" is not positioned in a valid record*; after CLOSE (or once a
+/// FOR SELECT ... AS CURSOR loop has ended) it is 24000 *Cursor is not
+/// open* - both at the statement that reads it. A column the cursor's
+/// query does not have refuses.
+fn cursor_field_guard(f: &PsqlFrame, n: usize) -> Result<(), PsqlStop> {
+    let Some((_, c, col)) = f.cursor_fields.iter().find(|(s, ..)| *s as usize == n) else {
+        return Ok(());
+    };
+    let st = f.cursors.get(c).filter(|st| st.rows.is_some()).ok_or_else(|| psql_raise(EvalErr::CursorNotOpen))?;
+    let len = st.rows.as_ref().map_or(0, |r| r.len()) as i64;
+    if !(0..len).contains(&st.pos) {
+        return Err(psql_raise(EvalErr::CursorNotPositioned(format!("\"{}\"", c))));
+    }
+    if !st.cols.iter().any(|x| x == col) {
+        return Err(PsqlStop::Unsupported);
+    }
+    Ok(())
+}
+
+/// The `<cursor>.<column>` references of a body, respelled IN PLACE as
+/// the variable `<cursor>$<column>` (the dot becomes a `$`, so every
+/// offset an error reports stays where it was), with the variable
+/// names that makes: (name, cursor, column). Only a cursor the body
+/// declares or opens `AS CURSOR` is read so, outside literals and
+/// quoted names, and only where the pair starts a name.
+fn rewrite_cursor_fields(src: &str, cursors: &[String]) -> (String, Vec<(String, String, String)>, Vec<(String, usize)>) {
+    let mut out = src.as_bytes().to_vec();
+    let mut fields: Vec<(String, String, String)> = Vec::new();
+    // a cursor whose name the body ALSO binds as a table alias (`FROM T1
+    // C`, `T1 AS C`) is left alone: inside that query `C.ID` is the
+    // alias's column, and which one a pair means is not this reader's
+    // to decide
+    let masked = mask_literals(&src.to_ascii_uppercase());
+    let cursors: Vec<String> = cursors.iter().filter(|c| !cursor_name_is_alias(&masked, c)).cloned().collect();
+    // where each reference stands, by cursor
+    let mut uses: Vec<(String, usize)> = Vec::new();
+    if cursors.is_empty() {
+        return (src.to_string(), fields, uses);
+    }
+    let b = src.as_bytes();
+    let is_id = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' => {
+                i = quoted_span_end(b, i);
+                continue;
+            }
+            c if is_id(c) && (i == 0 || !(is_id(b[i - 1]) || b[i - 1] == b'.' || b[i - 1] == b':')) => {
+                let mut j = i;
+                while j < b.len() && is_id(b[j]) {
+                    j += 1;
+                }
+                let word = src[i..j].to_ascii_uppercase();
+                if j + 1 < b.len() && b[j] == b'.' && is_id(b[j + 1]) && cursors.contains(&word) {
+                    let mut k = j + 1;
+                    while k < b.len() && is_id(b[k]) {
+                        k += 1;
+                    }
+                    let col = src[j + 1..k].to_ascii_uppercase();
+                    out[j] = b'$';
+                    uses.push((word.clone(), i));
+                    let name = format!("{}${}", word, col);
+                    if !fields.iter().any(|(n, ..)| *n == name) {
+                        fields.push((name, word, col));
+                    }
+                    i = k;
+                    continue;
+                }
+                i = j;
+            }
+            _ => i += 1,
+        }
+    }
+    (String::from_utf8(out).unwrap_or_else(|_| src.to_string()), fields, uses)
+}
+
+/// The byte just past the statement starting at `p` in the upper-cased,
+/// literal-masked body: a BEGIN runs to its END (a CASE's END counted
+/// against its own CASE), an IF to its THEN branch and any ELSE, a
+/// WHILE or FOR to its DO statement, anything else to its `;`.
+fn stmt_extent(masked: &str, p: usize) -> Option<usize> {
+    let b = masked.as_bytes();
+    let mut p = p;
+    while p < b.len() && b[p].is_ascii_whitespace() {
+        p += 1;
+    }
+    let word: String = masked[p..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$').collect();
+    match word.as_str() {
+        "BEGIN" => {
+            let mut depth = 0i32;
+            let mut at = p;
+            loop {
+                let next = ["BEGIN", "CASE", "END"]
+                    .iter()
+                    .filter_map(|w| find_word(masked, w, at).map(|k| (k, *w)))
+                    .min_by_key(|(k, _)| *k)?;
+                at = next.0 + next.1.len();
+                if next.1 == "END" {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(at);
+                    }
+                } else {
+                    depth += 1;
+                }
+            }
+        }
+        "IF" => {
+            let then = find_word(masked, "THEN", p)?;
+            let end = stmt_extent(masked, then + "THEN".len())?;
+            let rest = masked[end..].trim_start();
+            if find_word(rest, "ELSE", 0) == Some(0) {
+                let else_at = end + (masked[end..].len() - rest.len());
+                return stmt_extent(masked, else_at + "ELSE".len());
+            }
+            Some(end)
+        }
+        "WHILE" | "FOR" => {
+            let d = find_word(masked, "DO", p)?;
+            stmt_extent(masked, d + "DO".len())
+        }
+        _ => find_stmt_semi(masked, p, masked.len()).map(|k| k + 1),
+    }
+}
+
+/// A `<cursor>.<column>` of a FOR SELECT's `AS CURSOR <name>` is in scope
+/// in that loop's statement and nowhere else - measured on engine 2182:
+/// `X = C.ID` after the loop is the -206 *Column unknown "C"."ID"* at
+/// PREPARE, and nothing of the block runs. True when every reference
+/// stands inside one of its loops.
+fn as_cursor_refs_scoped(masked: &str, cursor: &str, uses: &[usize]) -> bool {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0usize;
+    while let Some(c) = find_word(masked, "CURSOR", at) {
+        at = c + "CURSOR".len();
+        if !masked[..c].trim_end().ends_with("AS") {
+            continue;
+        }
+        let rest = masked[at..].trim_start();
+        let name: String = rest.chars().take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_').collect();
+        if name != cursor {
+            continue;
+        }
+        let Some(d) = find_word(masked, "DO", at) else { return false };
+        let Some(end) = stmt_extent(masked, d + "DO".len()) else { return false };
+        spans.push((d, end));
+    }
+    uses.iter().all(|u| spans.iter().any(|(a, b)| a < u && u < b))
+}
+
+/// Does the (upper-cased, literal-masked) body name `cursor` as a table
+/// alias anywhere - the word standing after a relation name or after
+/// `AS` other than `AS CURSOR`?
+fn cursor_name_is_alias(masked: &str, cursor: &str) -> bool {
+    const LEADS: &[&str] = &["DECLARE", "OPEN", "CLOSE", "FETCH", "FROM", "OF", "CURSOR", "NEXT", "PRIOR", "FIRST", "LAST"];
+    let b = masked.as_bytes();
+    let is_id = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    // the previous TOKEN: a word, or one punctuation character
+    let mut prev: Option<&str> = None;
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if is_id(b[i]) {
+            let mut j = i;
+            while j < b.len() && is_id(b[j]) {
+                j += 1;
+            }
+            let w = &masked[i..j];
+            if w == cursor {
+                if let Some(p) = prev {
+                    if !LEADS.contains(&p) && p.as_bytes()[0].is_ascii_alphabetic() {
+                        return true;
+                    }
+                }
+            }
+            prev = Some(w);
+            i = j;
+        } else {
+            prev = Some(&masked[i..i + 1]);
+            i += 1;
+        }
+    }
+    false
+}
+
+/// The cursors a body opens `AS CURSOR <name>` in its FOR SELECT loops.
+fn for_select_cursor_names(src: &str) -> Vec<String> {
+    let masked = mask_literals(&src.to_ascii_uppercase());
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(c) = find_word(&masked, "CURSOR", at) {
+        at = c + "CURSOR".len();
+        if !masked[..c].trim_end().ends_with("AS") {
+            continue;
+        }
+        let rest = masked[at..].trim_start();
+        let name: String = rest.chars().take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_').collect();
+        if ident_ok(&name) && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Run a body's `... RETURNING ...` DML and answer its row count and
+/// the rows it returns - the top level's RETURNING execution, without
+/// the cursor. A RETURNING item that reads a subquery, and a MERGE's
+/// `NEW.`, are not taken here (the top level's eager projection).
+fn run_body_returning(
+    sql: &str,
+    db: &mut Option<Database>,
+    ctx: &SessionCtx,
+) -> Result<(i64, Vec<Vec<Value>>), PsqlStop> {
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] psql dml returning: {}", sql);
+    }
+    // planned as the top level plans it: the DML, then its RETURNING
+    // list wrapped round it ([wrap_returning])
+    let (dml_sql, list) = split_returning(sql);
+    let list = list.ok_or(PsqlStop::Unsupported)?;
+    let up = dml_sql.trim_start().to_ascii_uppercase();
+    let planned = if find_word(&up, "INSERT", 0) == Some(0) {
+        plan_insert(&dml_sql, db)
+    } else if find_word(&up, "UPDATE", 0) == Some(0) {
+        plan_update(&dml_sql, db)
+    } else {
+        plan_delete(&dml_sql, db)
+    };
+    let (plan, params) = planned.ok_or(PsqlStop::Unsupported)?;
+    if !params.is_empty() || matches!(plan, Plan::RefusedEval(_) | Plan::Refused) {
+        return Err(PsqlStop::Unsupported);
+    }
+    let table = dml_table_name(&dml_sql).ok_or(PsqlStop::Unsupported)?;
+    let (plan, _) = wrap_returning(
+        plan,
+        Vec::new(),
+        &list,
+        &table,
+        dml_target_alias(&dml_sql).map(|(a, _)| a).as_deref(),
+        dml_binds_alias(sql),
+        db,
+    )
+    .ok_or(PsqlStop::Unsupported)?;
+    let Plan::Returning { inner, cols, new_cols, .. } = &plan else {
+        return Err(PsqlStop::Unsupported);
+    };
+    if !new_cols.is_empty() || cols.iter().any(|c| c.expr.as_ref().is_some_and(expr_has_corr)) {
+        return Err(PsqlStop::Unsupported);
+    }
+    let mut affected = Affected::default();
+    let counts = match execute_dml_collecting(inner, db, &[], ctx, Some(&mut affected)) {
+        Ok(c) => c,
+        Err(ExecErr::Eval(ev)) => return Err(psql_raise(ev)),
+        Err(e) => return Err(PsqlStop::Failed(e.to_string())),
+    };
+    let width = affected.descs.len();
+    let mut out = Vec::with_capacity(affected.images.len());
+    for (i, img) in affected.images.iter().enumerate() {
+        let mut r = decode_record(img, &affected.descs);
+        r.resize(width, Value::Null);
+        match affected.old_images.get(i) {
+            Some(o) if !o.is_empty() => r.extend(decode_record(o, &affected.descs)),
+            _ => r.resize(width * 2, Value::Null),
+        }
+        out.push(cols.iter().map(|c| c.value_of(&r)).collect::<Result<Vec<_>, _>>().map_err(psql_raise)?);
+    }
+    Ok((i64::from(counts.0 + counts.1 + counts.2), out))
+}
+
+/// The error context variables, in [PsqlFrame::err_slots] order.
+const ERR_CONTEXT_VARS: [&str; 3] = ["SQLCODE", "GDSCODE", "SQLSTATE"];
+
+/// Set what the running handler caught, and with it the error context
+/// variables. Measured on engine 2182: inside a `WHEN` body `SQLCODE`,
+/// `GDSCODE` and `SQLSTATE` are the caught error's - its first code's
+/// SQLCODE and code, and the whole vector's state (a division by zero
+/// is -802 / 335544321 / 22012, `EXCEPTION E` -836 / 335544517 / HY000,
+/// a duplicate key -803 / 335544665 / 23000) - and everywhere else they
+/// are 0, 0 and '00000', including inside an outer handler once a
+/// NESTED handler has completed (the engine clears the in-flight error
+/// when a handler ends, the same rule a bare `EXCEPTION;` follows).
+fn set_caught(f: &mut PsqlFrame, caught: Option<Thrown>) {
+    let (code, gds, state) = match &caught {
+        Some(t) => {
+            let (codes, sqlcode, state) = eval_identity(&t.as_eval_err());
+            (sqlcode.unwrap_or(0) as i64, codes.first().copied().unwrap_or(0) as i64, state)
+        }
+        None => (0, 0, "00000"),
+    };
+    let vals = [Value::Int(code), Value::Int(gds), Value::Text(state.to_string())];
+    for (slot, v) in f.err_slots.iter().zip(vals) {
+        if let Some(n) = slot {
+            if let Some(cell) = f.vars.get_mut(*n as usize) {
+                *cell = v;
+            }
+        }
+    }
+    f.caught = caught;
+}
+
+/// A raw PSQL value as the TEXT an exception message carries - the
+/// engine's MOV_make_string, the conversion a CAST to a string makes
+/// (measured: 1.50 stays '1.50', a DATE is '2024-01-02', a DOUBLE
+/// 1e0/3 '0.3333333333333333', TRUE 'TRUE'); `None` for NULL.
+fn raw_text_value(
+    text: &str,
+    binds: &[(String, u16)],
+    f: &PsqlFrame,
+    db: &mut Option<Database>,
+    ctx: &SessionCtx,
+) -> Result<Option<String>, PsqlStop> {
+    let cast = format!("CAST(({}) AS VARCHAR(8191))", text);
+    match eval_raw_scalar(&cast, binds, f, db, ctx)?.0 {
+        Value::Null => Ok(None),
+        Value::Text(t) => Ok(Some(t)),
+        _ => Err(PsqlStop::Unsupported),
+    }
+}
+
+/// `EXCEPTION <name> USING (...)`: the message with `@1`..`@9` replaced
+/// by the values in order. Measured on engine 2182 over
+/// 'a@1b@2c@3d@10e@0f@' with the one value '1': 'a1b@2c@3d10e@0f@' - a
+/// placeholder is ONE digit 1-9 (`@10` is `@1` then a '0'), a
+/// placeholder with no value stays as written, `@0` and a trailing `@`
+/// are text, and a NULL value is '*** null ***'.
+fn using_message(msg: &str, vals: &[Option<String>]) -> String {
+    let mut out = String::with_capacity(msg.len() + 16);
+    let mut it = msg.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '@' {
+            if let Some(d) = it.peek().and_then(|d| d.to_digit(10)).filter(|d| *d >= 1) {
+                if let Some(v) = vals.get(d as usize - 1) {
+                    it.next();
+                    out.push_str(v.as_deref().unwrap_or("*** null ***"));
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// What stopped a body early.
 enum PsqlStop {
     /// a raise - user exception or runtime error - carrying the
@@ -113857,7 +115091,10 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
             f.gen_draw(name, Some(step))
         }
         E::GenId2 { name } => f.gen_draw(name, None),
-        E::Variable(n) => Ok(f.vars.get(*n as usize).cloned().unwrap_or(Value::Null)),
+        E::Variable(n) => {
+            cursor_field_guard(f, *n as usize)?;
+            Ok(f.vars.get(*n as usize).cloned().unwrap_or(Value::Null))
+        }
         // `NEW.<col>` / `OLD.<col>` inside a TRIGGER body read that
         // event's row; anywhere else (a procedure, an EXECUTE BLOCK)
         // there is no row and the reference refuses, as it always did
@@ -113971,8 +115208,17 @@ fn psql_scaled_arith(kind: char, a: &Value, b: &Value) -> Result<Value, PsqlStop
             '+' => x + y,
             '-' => x - y,
             '*' => x * y,
+            // a DOUBLE operand's division by zero is the FLOAT one
+            // (measured: `A / 0` over a DOUBLE A, and `7 / D` over a
+            // DOUBLE D, both answer *Floating-point divide by zero*)
             '/' => {
                 if y == 0.0 {
+                    if matches!(a, Value::Double(_)) || matches!(b, Value::Double(_)) {
+                        return Err(PsqlStop::Raise(Thrown::Runtime {
+                            err: EvalErr::FloatDivideByZero,
+                            trace: Vec::new(),
+                        }));
+                    }
                     return Err(div0());
                 }
                 x / y
@@ -116463,6 +117709,14 @@ fn restore_ref_action(rule: &str) -> Result<fire_crab_ods::ddl::RefAction, Strin
 /// reads as an operator rather than part of the value and the statement
 /// refuses. `(-3)` is the same value in every position.
 fn subst_literal(v: &Value) -> Option<String> {
+    // A SINGLE-PRECISION VALUE IS WRITTEN AS THE FLOAT IT IS
+    // ([dml_subq_literal]'s cast): its shortest text `1e-1` reads back as
+    // the DOUBLE 0.1, and a FLOAT local's `F * 3` answered 0.3 where the
+    // engine computes over the single and answers 0.3000000044703484
+    // (measured, FLOAT and REAL alike)
+    if let Value::Float(_) = v {
+        return dml_subq_literal(v);
+    }
     let lit = psql_literal(v)?;
     Some(if lit.starts_with('-') { format!("({})", lit) } else { lit })
 }
@@ -116483,7 +117737,7 @@ fn named_refs(sql: &str) -> Vec<String> {
         {
             let start = i + 1;
             let mut j = start;
-            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'$') {
                 j += 1;
             }
             // a bare reference FOLDS to the declared (canonical) name
@@ -116585,6 +117839,7 @@ fn psql_slot_literal(
     slot: usize,
     plain: fn(&Value) -> Option<String>,
 ) -> Option<String> {
+    cursor_field_guard(f, slot).ok()?;
     let v = f.vars.get(slot).unwrap_or(&Value::Null);
     if let (Value::Text(t), Some(Some(CastTarget::Text { len, pad, cs: Some(cs), .. }))) =
         (v, f.types.get(slot))
@@ -116817,7 +118072,7 @@ fn subst_body_query_pass(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> O
         {
             let start = i + 1;
             let mut j = start;
-            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'$') {
                 j += 1;
             }
             let name = sql[start..j].to_ascii_uppercase();
@@ -117245,6 +118500,8 @@ fn set_row_count(f: &mut PsqlFrame, n: i64) {
 fn stmt_src_off(s: &TrigStmt) -> usize {
     match s {
         TrigStmt::Assign { src_off, .. }
+        | TrigStmt::Call { src_off, .. }
+        | TrigStmt::DmlInto { src_off, .. }
         | TrigStmt::If { src_off, .. }
         | TrigStmt::While { src_off, .. }
         | TrigStmt::Continue { src_off, .. }
@@ -117285,7 +118542,7 @@ fn exec_psql_stmt_inner(
         return Err(PsqlStop::Unsupported); // runaway body
     }
     match s {
-        TrigStmt::Assign { target, expr, raw, .. } => {
+        TrigStmt::Assign { target, expr, raw, fallback, .. } => {
             // `x = gen_id(G, 0)` IS A READ, NOT A DRAW. A body that draws
             // refuses in a procedure or block ([GenMode::Refuse]) because
             // no caller can own the page write; a step of zero writes no
@@ -117319,36 +118576,44 @@ fn exec_psql_stmt_inner(
                             .ok_or(PsqlStop::Unsupported)?,
                     )
                 }
-                _ => eval_psql_expr(expr, f)?,
+                _ => match (eval_psql_expr(expr, f), fallback) {
+                    // no arithmetic rule for these values: the planner's
+                    (Err(PsqlStop::Unsupported), Some((text, binds))) => {
+                        let (v, cs) = eval_raw_scalar(text, binds, f, db, ctx)?;
+                        return assign_value(target, v, cs, f);
+                    }
+                    (r, _) => r?,
+                },
                     };
                     (v, psql_expr_src(expr, f))
                 }
             };
-            match target {
-                TrigTarget::Var(n) => store_slot_cs(f, *n as usize, v, src),
-                // `NEW.<col> = <value>` in a BEFORE trigger changes
-                // what is stored. OLD is read-only, and NEW is
-                // read-only in an AFTER trigger (the row is written) -
-                // both keep the refusal.
-                TrigTarget::Field(name) => {
-                    let Some(t) = f.trig.as_mut() else {
-                        return Err(PsqlStop::Unsupported);
-                    };
-                    if !t.writable {
+            assign_value(target, v, src, f)
+        }
+        TrigStmt::Call { raw: (text, binds), .. } => {
+            eval_raw_scalar(text, binds, f, db, ctx)?;
+            Ok(())
+        }
+        TrigStmt::DmlInto { sql: (text, binds), into, .. } => {
+            for (_, n) in binds {
+                cursor_field_guard(f, *n as usize)?;
+            }
+            let sql = subst_body_query(text, binds, f).ok_or(PsqlStop::Unsupported)?;
+            let (count, rows) = run_body_returning(&sql, db, ctx)?;
+            set_row_count(f, count);
+            match rows.len() {
+                0 => Ok(()),
+                1 => {
+                    let row = rows.into_iter().next().unwrap_or_default();
+                    if row.len() != into.len() {
                         return Err(PsqlStop::Unsupported);
                     }
-                    let Some(fid) = t.fid(name) else {
-                        return Err(PsqlStop::Unsupported);
-                    };
-                    let Some(row) = t.new.as_mut() else {
-                        return Err(PsqlStop::Unsupported);
-                    };
-                    if row.len() <= fid {
-                        row.resize(fid + 1, Value::Null);
+                    for (slot, v) in into.iter().zip(row) {
+                        store_slot_cs(f, *slot as usize, v, None)?;
                     }
-                    row[fid] = v;
                     Ok(())
                 }
+                _ => Err(psql_raise(EvalErr::SingletonSelect)),
             }
         }
         TrigStmt::If { cond, then, otherwise, raw, .. } => {
@@ -117387,7 +118652,7 @@ fn exec_psql_stmt_inner(
         // EXCEPTION <name>: the identity comes from the CATALOG, read
         // now rather than when the body was parsed, because that is
         // when the engine reads it too.
-        TrigStmt::Raise { name, message, src_off } => {
+        TrigStmt::Raise { name, message, msg_raw, using, src_off } => {
             // a TRIGGER carries its exceptions with it (resolved at
             // prepare); everything else reads the catalog
             let (number, cat_msg) = match f.trig_excs.iter().find(|(n, ..)| n == name) {
@@ -117398,7 +118663,21 @@ fn exec_psql_stmt_inner(
                 }
             };
             // an `EXCEPTION <name> '<literal>'` overrides the catalog message
-            let message = message.clone().unwrap_or(cat_msg);
+            // - and so does an expression's value, as text. AN EMPTY OR NULL
+            // OVERRIDE IS NO OVERRIDE: measured, `EXCEPTION E ''` and
+            // `EXCEPTION E S` over a NULL S both raise the catalog's text
+            let over = match msg_raw {
+                Some((text, binds)) => raw_text_value(text, binds, f, db, ctx)?,
+                None => message.clone(),
+            };
+            let mut message = over.filter(|m| !m.is_empty()).unwrap_or(cat_msg);
+            if let Some(args) = using {
+                let mut vals = Vec::with_capacity(args.len());
+                for (text, binds) in args {
+                    vals.push(raw_text_value(text, binds, f, db, ctx)?);
+                }
+                message = using_message(&message, &vals);
+            }
             Err(PsqlStop::Raise(Thrown::User(Raised {
                 name: name.clone(),
                 number,
@@ -117450,7 +118729,7 @@ fn exec_psql_stmt_inner(
         // values assigned into the INTO variables. Planning it the normal
         // way means a loop sees everything a client SELECT does - views,
         // subqueries, expressions - for free.
-        TrigStmt::ForSelect { query, into, body, label, src_off, .. } => {
+        TrigStmt::ForSelect { query, into, body, label, cursor, src_off, .. } => {
             // put each variable's current value into the query text
             // ...and the ROW the trigger fired over, for a loop query
             // that reads by it (`FOR SELECT ... WHERE K = NEW.K`)
@@ -117471,11 +118750,20 @@ fn exec_psql_stmt_inner(
                 Some(q)
             })
             .ok_or(PsqlStop::Unsupported)?;
-            let (rows, cs) = {
+            let (rows, cs, cols) = {
                 let (plan, calls) = psql_plan(&q, db)?;
-                (psql_plan_rows_then(&plan, &calls, db, ctx, *src_off)?, plan_out_cs(&plan))
+                let cols: Vec<String> = output_cols_of(&plan).iter().map(|c| c.name.to_ascii_uppercase()).collect();
+                (psql_plan_rows_then(&plan, &calls, db, ctx, *src_off)?, plan_out_cs(&plan), cols)
             };
             let (rows, then) = rows;
+            // `AS CURSOR <name>`: the loop's record, read by name in the
+            // body, and closed once the loop ends
+            if let Some(c) = cursor {
+                f.cursors.insert(
+                    c.clone(),
+                    CursorState { query: String::new(), rows: Some(rows.clone()), pos: -1, scroll: false, cols, cs: cs.clone() },
+                );
+            }
             // ROW_COUNT COUNTS THE LOOP'S FETCHES, measured: 0 once the
             // cursor opens (an UPDATE of 5 rows followed by a FOR over no
             // rows reads 0), then the running count after each fetch -
@@ -117484,29 +118772,43 @@ fn exec_psql_stmt_inner(
             // end leaves it alone (a body whose UPDATE touched 1 row
             // reads 1 after the loop). This read 0 after any loop.
             set_row_count(f, 0);
-            let mut left = false;
-            for (fetched, row) in rows.into_iter().enumerate() {
-                if row.len() != into.len() {
-                    return Err(PsqlStop::Unsupported);
-                }
-                for (i, (slot, v)) in into.iter().zip(row.into_iter()).enumerate() {
-                    store_slot_cs(f, *slot as usize, v, cs.get(i).copied().flatten())?;
-                }
-                set_row_count(f, fetched as i64 + 1);
-                match exec_psql_stmt(body, f, steps, db, ctx) {
-                    Ok(()) => {}
-                    Err(PsqlStop::Leave(t)) if t.is_none() || t.as_deref() == label.as_deref() => {
-                        left = true;
-                        break;
+            let looped = (|| -> Result<bool, PsqlStop> {
+                let mut left = false;
+                for (fetched, row) in rows.into_iter().enumerate() {
+                    if !into.is_empty() && row.len() != into.len() {
+                        return Err(PsqlStop::Unsupported);
                     }
-                    Err(PsqlStop::Continue(t)) if t.is_none() || t.as_deref() == label.as_deref() => {}
-                    Err(e) => return Err(e),
+                    if let Some(c) = cursor {
+                        if let Some(st) = f.cursors.get_mut(c) {
+                            st.pos = fetched as i64;
+                        }
+                        refresh_cursor_fields(f, c);
+                    }
+                    for (i, (slot, v)) in into.iter().zip(row.into_iter()).enumerate() {
+                        store_slot_cs(f, *slot as usize, v, cs.get(i).copied().flatten())?;
+                    }
+                    set_row_count(f, fetched as i64 + 1);
+                    match exec_psql_stmt(body, f, steps, db, ctx) {
+                        Ok(()) => {}
+                        Err(PsqlStop::Leave(t)) if t.is_none() || t.as_deref() == label.as_deref() => {
+                            left = true;
+                            break;
+                        }
+                        Err(PsqlStop::Continue(t)) if t.is_none() || t.as_deref() == label.as_deref() => {}
+                        Err(e) => return Err(e),
+                    }
+                    *steps += 1;
+                    if *steps > 1_000_000 {
+                        return Err(PsqlStop::Unsupported);
+                    }
                 }
-                *steps += 1;
-                if *steps > 1_000_000 {
-                    return Err(PsqlStop::Unsupported);
-                }
+                Ok(left)
+            })();
+            if let Some(c) = cursor {
+                f.cursors.remove(c);
+                refresh_cursor_fields(f, c);
             }
+            let left = looped?;
             // the fetch after the last delivered row is the one that
             // raises - after the body has run for every row before it,
             // and never when a LEAVE closed the cursor before that fetch
@@ -117554,49 +118856,88 @@ fn exec_psql_stmt_inner(
             let Some(state) = f.cursors.get(cursor) else {
                 return Err(PsqlStop::Unsupported); // no such cursor
             };
-            if state.rows.is_some() {
-                return Err(PsqlStop::Unsupported); // already open
-            }
+            // AN OPEN CURSOR OPENS AGAIN, from its first record - measured
+            // on engine 2182: `OPEN C; FETCH C; OPEN C; FETCH C` fetches
+            // the first row twice and raises nothing
             let query = state.query.clone();
             let query = subst_body_query(&query, &[], f).ok_or(PsqlStop::Unsupported)?;
-            let (rows, cs) = {
+            let (rows, cs, cols) = {
                 let (plan, calls) = psql_plan(&query, db)?;
-                (psql_rows(&plan, &calls, db, ctx)?, plan_out_cs(&plan))
+                let cols = output_cols_of(&plan).iter().map(|c| c.name.to_ascii_uppercase()).collect();
+                (psql_rows(&plan, &calls, db, ctx)?, plan_out_cs(&plan), cols)
             };
             let state = f.cursors.get_mut(cursor).ok_or(PsqlStop::Unsupported)?;
             state.rows = Some(rows);
             state.cs = cs;
-            state.at = 0;
+            state.cols = cols;
+            state.pos = -1;
+            refresh_cursor_fields(f, cursor);
             Ok(())
         }
-        // FETCH: the next row, or nothing. PAST THE END THE SLOTS KEEP
-        // WHAT THEY HELD - probed against the engine, which leaves a
-        // variable alone rather than nulling it - and ROW_COUNT says
-        // which of the two happened.
-        TrigStmt::Fetch { cursor, into, .. } => {
+        // FETCH: the record the orientation names, or nothing. PAST
+        // EITHER END THE SLOTS KEEP WHAT THEY HELD - probed against the
+        // engine, which leaves a variable alone rather than nulling it -
+        // and ROW_COUNT says which of the two happened. Measured on a
+        // SCROLL cursor over 1, 2, 3: LAST 3, PRIOR 2, FIRST 1, ABSOLUTE 3
+        // 3, RELATIVE -1 2, NEXT 3, NEXT (nothing, ROW_COUNT 0, still 3),
+        // ABSOLUTE 0 (before the first: nothing), PRIOR (nothing);
+        // ABSOLUTE -1 is the last record. A plain cursor takes NEXT alone
+        // - `FETCH LAST` there is HY106 *Fetch option LAST is invalid for
+        // a non-scrollable cursor* - and a FETCH from a cursor that is
+        // not open is 24000 *Cursor is not open*, both at the FETCH.
+        TrigStmt::Fetch { cursor, into, orient, .. } => {
+            let step = match orient {
+                FetchOrient::Absolute((text, binds)) | FetchOrient::Relative((text, binds)) => {
+                    match eval_raw_scalar(text, binds, f, db, ctx)?.0 {
+                        Value::Int(n) => Some(n),
+                        _ => return Err(PsqlStop::Unsupported),
+                    }
+                }
+                _ => None,
+            };
             let Some(state) = f.cursors.get_mut(cursor) else {
                 return Err(PsqlStop::Unsupported);
             };
             let Some(rows) = state.rows.as_ref() else {
-                return Err(PsqlStop::Unsupported); // fetch from a closed cursor
+                return Err(psql_raise(EvalErr::CursorNotOpen));
             };
-            let row = rows.get(state.at).cloned();
-            let cs = state.cs.clone();
-            if row.is_some() {
-                state.at += 1;
+            if !state.scroll && !matches!(orient, FetchOrient::Next) {
+                return Err(psql_raise(EvalErr::InvalidFetchOption(orient.word().to_string())));
             }
+            let len = rows.len() as i64;
+            let want = match orient {
+                FetchOrient::Next => state.pos + 1,
+                FetchOrient::Prior => state.pos - 1,
+                FetchOrient::First => 0,
+                FetchOrient::Last => len - 1,
+                FetchOrient::Absolute(_) => match step.unwrap_or(0) {
+                    0 => -1,
+                    n if n > 0 => n - 1,
+                    n => len + n,
+                },
+                FetchOrient::Relative(_) => state.pos + step.unwrap_or(0),
+            };
+            let row = (0..len).contains(&want).then(|| rows[want as usize].clone());
+            state.pos = want.clamp(-1, len);
+            let cs = state.cs.clone();
+            // RELATIVE 0 RE-READS THE CURRENT ROW AND COUNTS NONE: the
+            // INTO target is written, ROW_COUNT is 0 (measured on 2182:
+            // ABSOLUTE 2 then RELATIVE 0 answers the row 2 with
+            // ROW_COUNT 0, the RELATIVE 1 after it 3 with 1)
+            let counts = !matches!(orient, FetchOrient::Relative(_)) || step != Some(0);
             let got = match row {
                 Some(r) => {
-                    if r.len() != into.len() {
+                    if !into.is_empty() && r.len() != into.len() {
                         return Err(PsqlStop::Unsupported);
                     }
                     for (i, (slot, v)) in into.iter().zip(r.into_iter()).enumerate() {
                         store_slot_cs(f, *slot as usize, v, cs.get(i).copied().flatten())?;
                     }
-                    1
+                    i64::from(counts)
                 }
                 None => 0,
             };
+            refresh_cursor_fields(f, cursor);
             if let Some(rc) = f.row_count_slot {
                 let n = rc as usize;
                 if n >= f.vars.len() {
@@ -117606,14 +118947,14 @@ fn exec_psql_stmt_inner(
             }
             Ok(())
         }
+        // CLOSE of a cursor that is not open raises nothing (measured)
         TrigStmt::Close { cursor, .. } => {
             let Some(state) = f.cursors.get_mut(cursor) else {
                 return Err(PsqlStop::Unsupported);
             };
-            if state.rows.take().is_none() {
-                return Err(PsqlStop::Unsupported); // close of a closed cursor
-            }
-            state.at = 0;
+            state.rows = None;
+            state.pos = -1;
+            refresh_cursor_fields(f, cursor);
             Ok(())
         }
         // A NESTED CALL. `run_procedure` builds the callee its own frame
@@ -117662,10 +119003,12 @@ fn exec_psql_stmt_inner(
         TrigStmt::Leave { target, .. } => Err(PsqlStop::Leave(target.clone())),
         TrigStmt::Continue { target, .. } => Err(PsqlStop::Continue(target.clone())),
         TrigStmt::Exit { .. } => Err(PsqlStop::Exit),
-        TrigStmt::Return { expr, .. } => {
+        TrigStmt::Return { expr, fallback, .. } => {
             // a FUNCTION's RETURN: output 0 takes the value, the body ends
-            let v = eval_psql_expr(expr, f)?;
-            let src = psql_expr_src(expr, f);
+            let (v, src) = match (eval_psql_expr(expr, f), fallback) {
+                (Err(PsqlStop::Unsupported), Some((text, binds))) => eval_raw_scalar(text, binds, f, db, ctx)?,
+                (r, _) => (r?, psql_expr_src(expr, f)),
+            };
             store_slot_cs(f, f.out_at, v, src)?;
             Err(PsqlStop::Exit)
         }
@@ -117718,9 +119061,9 @@ fn exec_psql_stmt_inner(
                         // re-raise reached AFTER a nested handler (or after
                         // any handler) is a no-op, not a re-raise of the
                         // outer one (probed against the live engine).
-                        f.caught = Some(ex);
+                        set_caught(f, Some(ex));
                         let r = exec_psql_stmt(body, f, steps, db, ctx);
-                        f.caught = None;
+                        set_caught(f, None);
                         return r;
                     }
                     Err(PsqlStop::Raise(ex))
@@ -118012,7 +119355,13 @@ fn run_autonomous(
     if let Some(d) = db.as_ref() {
         d.refresh_reader_view(); // the block's own ids, not the outer's
     }
+    // ITS USER_TRANSACTION CONTEXT IS ITS OWN: empty when it starts, and
+    // gone with it - measured on 2182, a key the block sets is NULL to
+    // the outer transaction after it, a key the outer one set is NULL
+    // inside it, and the block reads back what it set itself
+    let outer_ctx = CTX_VARS.with(|c| std::mem::take(&mut c.borrow_mut().1));
     let outcome = run(f, steps, db, ctx);
+    CTX_VARS.with(|c| c.borrow_mut().1 = outer_ctx);
     if let Some(d) = db.as_ref() {
         d.refresh_reader_view();
     }
@@ -118311,6 +119660,9 @@ fn slot_cast_target(d: &Descriptor) -> Option<CastTarget> {
         dtype::SQL_DATE => Some(CastTarget::Temporal(TKind::Date)),
         dtype::SQL_TIME => Some(CastTarget::Temporal(TKind::Time)),
         dtype::TIMESTAMP => Some(CastTarget::Temporal(TKind::Timestamp)),
+        // a BOOLEAN slot converts what it takes as CAST(... AS BOOLEAN)
+        // does - `R = 'true'` is TRUE, `R = 'x'` the 22018
+        dtype::BOOLEAN => Some(CastTarget::Bool),
         _ => dest_cast_target(d),
     }
 }
@@ -118710,7 +120062,23 @@ fn coerce_to_slot(f: &PsqlFrame, n: usize, v: Value, src: SrcCs) -> Result<Value
 /// Write `v`, spelled in `src`'s representation, into slot `n` through
 /// its declared type ([coerce_to_slot]).
 fn store_slot_cs(f: &mut PsqlFrame, n: usize, v: Value, src: SrcCs) -> Result<(), PsqlStop> {
-    let v = coerce_to_slot(f, n, v, src)?;
+    // THE MESSAGE SHOWS THE SOURCE VALUE, before the move into the
+    // slot's type - the engine validates `from_desc` (measured: 150 into
+    // a NUMERIC(5,2) local reports value "150", not "150.00"). The
+    // decision is made on the converted value, the only one the
+    // predicate over the slot's type reads in its own representation;
+    // the two agree but for a CHECK that a rounding or a truncation
+    // itself decides.
+    let rule = f.rules.get(n).cloned().flatten();
+    let v = match &rule {
+        Some(rule) => {
+            let shown = v.clone();
+            let c = coerce_to_slot(f, n, v, src)?;
+            rule.validate(&c, &shown)?;
+            c
+        }
+        None => coerce_to_slot(f, n, v, src)?,
+    };
     if n >= f.vars.len() {
         f.vars.resize(n + 1, Value::Null);
     }
@@ -118737,6 +120105,9 @@ fn eval_raw_cond(
     db: &mut Option<Database>,
     ctx: &SessionCtx,
 ) -> Result<bool, PsqlStop> {
+    for (_, n) in binds {
+        cursor_field_guard(f, *n as usize)?;
+    }
     let cond = subst_body_query(text, binds, f).ok_or(PsqlStop::Unsupported)?;
     let sql = format!("SELECT COUNT(*) FROM RDB$DATABASE WHERE {}", cond);
     let (plan, calls) = psql_plan(&sql, db)?;
@@ -118759,6 +120130,31 @@ fn eval_raw_cond(
 /// under every caller. The list is taken and the caller's put back, so
 /// a body run from inside a prepare never hands its calls to it.
 fn psql_plan(sql: &str, db: &Option<Database>) -> Result<(Plan, Vec<FnCall>), PsqlStop> {
+    // A BODY'S QUERY IS HELD TO THE PREPARE-TIME RULES A CLIENT'S IS: the
+    // limit-clause and window-frame grammar and the -206 of a qualifier
+    // nothing binds ([plan_query]). The engine judges them when it
+    // compiles the body, before a statement runs, and the ordinary
+    // planner below is lenient where the engine is not - measured:
+    // `SELECT FIRST 1 T.ID FROM T1 T ORDER BY T1.ID INTO N` in an EXECUTE
+    // BLOCK is *Column unknown "T1"."ID"* on engine 2182, where the
+    // planner answered 1. The body refuses such a query - the vector
+    // belongs to the block's prepare, which this server does not make
+    // (a value's own wrapper - `SELECT <value> FROM RDB$DATABASE`, the
+    // shape [eval_raw_scalar] and [eval_raw_cond] build for every raw
+    // assignment and test - holds no clause these rules read unless the
+    // value carries a query of its own, and is not scanned per row)
+    let up = mask_literals(&sql.to_ascii_uppercase());
+    let wrapper_only = up.matches("SELECT").count() == 1 && !up.contains(" OVER") && {
+        let t = up.trim_end();
+        t.ends_with("FROM RDB$DATABASE") || up.contains("FROM RDB$DATABASE WHERE")
+    };
+    if !wrapper_only
+        && (limit_lint_scan_db(sql, db).err.is_some()
+            || window_frame_lint(sql).is_some()
+            || first_unresolved_qualifier(sql, db).is_some())
+    {
+        return Err(PsqlStop::Unsupported);
+    }
     let outer = FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut()));
     let mut sink: Vec<Option<Descriptor>> = Vec::new();
     let plan = plan_query_inner(sql, db, &mut sink);
@@ -118821,6 +120217,9 @@ fn eval_raw_scalar(
     db: &mut Option<Database>,
     ctx: &SessionCtx,
 ) -> Result<(Value, SrcCs), PsqlStop> {
+    for (_, n) in binds {
+        cursor_field_guard(f, *n as usize)?;
+    }
     let expr = subst_body_query(text, binds, f).ok_or(PsqlStop::Unsupported)?;
     let sql = format!("SELECT {} FROM RDB$DATABASE", expr);
     let (plan, calls) = psql_plan(&sql, db)?;
@@ -119198,6 +120597,9 @@ fn run_dyn_statement(
         // a `?` argument has nothing to bind to from inside a body
         let args: Vec<Value> =
             args.into_iter().collect::<Option<Vec<_>>>().ok_or(PsqlStop::Unsupported)?;
+        if args.iter().any(is_default_arg) {
+            return Err(PsqlStop::Unsupported);
+        }
         let out = psql_depth_guard(|| run_procedure(db, &name, &args, ctx, true))?;
         return match out {
             Ok((values, _rows)) => Ok(Some(vec![values])),
@@ -120319,6 +121721,29 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value], given: usize) -> 
                     }
                 }
             }
+            // A PARAMETER ONLY THE SOURCE RUNS ([source_only_param]) takes
+            // its argument through the slot's own conversion - the CAST
+            // the engine's MOV makes at the call boundary, LOCATIONLESS
+            // like every argument conversion here (measured: `G7F('bad')`
+            // is 22018 *conversion error from string "bad"* with no `At
+            // function` item, `G7F('2024-05-06')` 2024-05-06)
+            (v, _) if source_only_param(d) => {
+                let t = slot_cast_target(d).ok_or_else(|| {
+                    ProcErr::from(format!("procedure {}: parameter {} has no slot type", name, param.name))
+                })?;
+                let e = Expr::Cast(Box::new(Expr::Col(0)), t, fire_crab_ods::intl::CS_UTF8);
+                if matches!(v, Value::Text(s) if !s.is_ascii()) {
+                    return Err(ProcErr::from(format!(
+                        "procedure {}: non-ASCII text into parameter {}",
+                        name, param.name
+                    )));
+                }
+                e.eval(std::slice::from_ref(v)).map_err(|ev| ProcErr {
+                    rows: Vec::new(),
+                    text: format!("procedure {}: conversion into {}", name, param.name),
+                    status: Some(ev),
+                })?
+            }
             _ => {
                 return Err(ProcErr::from(format!(
                     "procedure {}: argument type does not match parameter {}",
@@ -120712,7 +122137,7 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
         // is loadable now that it runs through try_function_blr. Approx
         // (FLOAT/DOUBLE - the executor has no f64 arithmetic) and temporal
         // stay refused.
-        if col_kind(&desc).is_none() && !is_numeric_col(&desc) {
+        if col_kind(&desc).is_none() && !is_numeric_col(&desc) && !source_only_param(&desc) {
             return None;
         }
         let collated = fire_crab_ods::ddl::domain_collation_id(&db.bytes(), db.page_size, &fs).is_some_and(|c| {
@@ -120927,14 +122352,23 @@ fn trig_position(d: &TrigDef, off: usize) -> Option<(u32, u32)> {
 /// declares them in the same place - between `AS` and `BEGIN` - and its
 /// frame was built with an empty map, so `OPEN CU` in a trigger body had
 /// no cursor to find.
+///
+/// A `SCROLL` cursor is scrollable in a trigger exactly as in a
+/// procedure (measured on 2182: a BEFORE INSERT trigger's `FETCH LAST
+/// FROM C INTO K` over a SCROLL cursor stores 2, where every cursor
+/// built here non-scrollable raised HY106 at the FETCH).
 fn trig_cursor_states(source: &str) -> std::collections::HashMap<String, CursorState> {
     let up = source.to_ascii_uppercase();
     let Some(begin_at) = find_word(&up, "BEGIN", 0) else {
         return std::collections::HashMap::new();
     };
+    let scrolls = declared_scroll_cursors(&source[..begin_at]);
     declared_cursors(&source[..begin_at])
         .into_iter()
-        .map(|(name, query)| (name, CursorState { query, rows: None, at: 0, cs: Vec::new() }))
+        .map(|(name, query)| {
+            let scroll = scrolls.contains(&name);
+            (name, CursorState { query, rows: None, pos: -1, scroll, cols: Vec::new(), cs: Vec::new() })
+        })
         .collect()
 }
 
@@ -121039,6 +122473,9 @@ fn fire_triggers(
             caught: None,
             cursors: trig_cursor_states(&d.source),
             row_count_slot: None,
+            err_slots: [None; 3],
+            rules: Vec::new(),
+            cursor_fields: Vec::new(),
             trig_excs: d.excs.clone(),
             trig: Some(TrigCtx {
                 cols: cols.to_vec(),
@@ -121075,6 +122512,9 @@ fn fire_triggers(
                 caught: None,
                 cursors: trig_cursor_states(&d.source),
                 row_count_slot: None,
+                err_slots: [None; 3],
+                rules: Vec::new(),
+                cursor_fields: Vec::new(),
                 trig_excs: d.excs.clone(),
                 trig: frame.trig.clone(),
                 gen: std::cell::RefCell::new(GenDraws {
@@ -121266,6 +122706,674 @@ fn run_execute_block(
 /// where a procedure's carries the quoted schema-qualified one.
 const ANONYMOUS_BLOCK: &str = "";
 
+/// What [run_body_source] reads off a body before a statement runs: the
+/// slot names and declared types, the header's cursors, the parsed
+/// statement tree (header initialisers first) - everything the frame is
+/// built from, and everything a PREPARE-TIME check of the body reads
+/// ([block_prepare_verdict]). The prepare-time call-count check
+/// ([body_call_out_mismatch]) has already run.
+struct BodyPrep {
+    names: Vec<String>,
+    types: Vec<Option<CastTarget>>,
+    rules: Vec<Option<VarRule>>,
+    lit_cs: SrcCs,
+    cursor_states: std::collections::HashMap<String, CursorState>,
+    row_count_slot: Option<u16>,
+    err_slots: [Option<u16>; 3],
+    cursor_fields: Vec<(u16, String, String)>,
+    body: TrigStmt,
+    /// how many of `names` are parameters and DECLAREd locals - the
+    /// slots after them are ROW_COUNT, the error context variables and
+    /// the `<cursor>.<column>` fields this server adds
+    declared: usize,
+}
+
+fn body_prepare(database: Option<&Database>, name: &str, meta: &ProcMeta) -> Result<BodyPrep, ProcErr> {
+    // the parser numbers variables in the order it is given them:
+    // inputs, then outputs - the same order the body's identifiers
+    // resolve against
+    let mut names: Vec<String> = meta.ins.iter().map(|p| p.name.clone()).collect();
+    names.extend(meta.outs.iter().map(|p| p.name.clone()));
+
+    // an EXECUTE BLOCK's literals are the attachment's; a stored body's
+    // are the set its BLR recorded ([stored_lit_cs])
+    let lit_cs: SrcCs = if name == ANONYMOUS_BLOCK {
+        Some(CURRENT_ATT_CS.with(|c| c.get()))
+    } else {
+        database.and_then(|dbr| {
+            let kind = if meta.is_function { "srclit-fn" } else { "srclit-proc" };
+            *dbr.meta_memo(kind, name, || {
+                let img = dbr.bytes();
+                let blr = if meta.is_function {
+                    fire_crab_exe::function_blr(&img, dbr.page_size, name)
+                } else {
+                    fire_crab_exe::procedure_blr(&img, dbr.page_size, name)
+                };
+                stored_lit_cs(&meta.source, blr.ok().as_deref())
+            })
+        })
+    };
+    // a q-string or an introduced literal in the source is respelled
+    // for the parsers ([rewrite_alt_literals]), in the set the text is
+    // in; the catalog's text stays what the BLR is read against
+    let respelled = rewrite_alt_literals(&meta.source, lit_cs);
+    let source: &str = respelled.as_deref().unwrap_or(&meta.source);
+    // `<cursor>.<column>` becomes the variable `<cursor>$<column>`, in
+    // place ([rewrite_cursor_fields])
+    let (field_src, field_names) = {
+        let header_end = find_word(&source.to_ascii_uppercase(), "BEGIN", 0).unwrap_or(0);
+        let declared: Vec<String> =
+            declared_cursors(&source[..header_end]).into_iter().map(|(n, _)| n).collect();
+        let looped: Vec<String> =
+            for_select_cursor_names(source).into_iter().filter(|n| !declared.contains(n)).collect();
+        let mut cursors = declared.clone();
+        cursors.extend(looped.iter().cloned());
+        let (text, fields, uses) = rewrite_cursor_fields(source, &cursors);
+        let masked = mask_literals(&source.to_ascii_uppercase());
+        for c in &looped {
+            let at: Vec<usize> = uses.iter().filter(|(n, _)| n == c).map(|(_, p)| *p).collect();
+            if !as_cursor_refs_scoped(&masked, c, &at) {
+                return Err(ProcErr::from(format!(
+                    "procedure {}: {}.<column> outside its FOR SELECT loop",
+                    name, c
+                )));
+            }
+        }
+        (text, fields)
+    };
+    let source: &str = &field_src;
+    let up = source.to_ascii_uppercase();
+    let begin_at = find_word(&up, "BEGIN", 0)
+        .ok_or_else(|| "procedure body does not start with BEGIN".to_string())?;
+    // A procedure DECLAREs its local variables BEFORE the body's BEGIN
+    // (a trigger declares them inside it), so they are collected here and
+    // appended to the name list: the parser numbers variables by their
+    // position in that list, and the frame is indexed the same way.
+    // ...and every slot's DECLARED TYPE, in the same order: what a write
+    // into it converts through ([coerce_to_slot])
+    let locals = declared_var_texts(&source[..begin_at]);
+    let mut types: Vec<Option<CastTarget>> =
+        meta.ins.iter().chain(meta.outs.iter()).map(|p| slot_cast_target(&p.desc)).collect();
+    let params_at = types.len();
+    let mut rules: Vec<Option<VarRule>> = vec![None; params_at];
+    // what a local of a DOMAIN with a default and no initialiser starts as
+    let mut domain_defaults: Vec<(String, String)> = Vec::new();
+    for (n, text) in &locals {
+        let (t, rule, default) = match catalog_decl_type(database, n, text) {
+            Ok(Some(c)) => c,
+            Ok(None) => (declared_type_target(text), None, None),
+            Err(why) => {
+                return Err(ProcErr::from(format!("procedure {}: variable {} {}", name, n, why)))
+            }
+        };
+        types.push(t);
+        rules.push(rule);
+        if let Some(d) = default {
+            domain_defaults.push((n.clone(), d));
+        }
+    }
+    if rules.iter().all(|r| r.is_none()) {
+        rules.clear();
+    }
+    if let Some(dbr) = database {
+        fill_default_cs(&mut types[params_at..], db_default_charset(&dbr.bytes(), dbr.page_size));
+    }
+    names.extend(locals.into_iter().map(|(n, _)| n));
+    let declared = names.len();
+    // THE CURSORS the header declares, and ROW_COUNT.
+    //
+    // ROW_COUNT is not a variable the body declares, but it reads
+    // exactly like one - so it gets a slot of its own at the end of the
+    // list, and the ordinary name resolution turns `ROW_COUNT` into
+    // that slot with nothing else to teach. A body that never mentions
+    // it never pays for it.
+    let cursors = declared_cursors(&source[..begin_at]);
+    let row_count_slot = {
+        if find_word(&up, "ROW_COUNT", 0).is_some() {
+            names.push("ROW_COUNT".to_string());
+            Some((names.len() - 1) as u16)
+        } else {
+            None
+        }
+    };
+    // SQLCODE, GDSCODE AND SQLSTATE read the same way: a slot each, at
+    // the end of the list, holding what [set_caught] writes there. See
+    // there for the law.
+    let mut err_slots: [Option<u16>; 3] = [None; 3];
+    for (k, w) in ERR_CONTEXT_VARS.iter().enumerate() {
+        if find_word(&mask_literals(&up), w, 0).is_some() {
+            names.push(w.to_string());
+            err_slots[k] = Some((names.len() - 1) as u16);
+        }
+    }
+    let scrolls = declared_scroll_cursors(&source[..begin_at]);
+    let cursor_states: std::collections::HashMap<String, CursorState> = cursors
+        .into_iter()
+        .map(|(name, query)| {
+            let scroll = scrolls.contains(&name);
+            (name, CursorState { query, rows: None, pos: -1, scroll, cols: Vec::new(), cs: Vec::new() })
+        })
+        .collect();
+    // ...and each `<cursor>.<column>` a slot of its own
+    let mut cursor_fields: Vec<(u16, String, String)> = Vec::new();
+    for (n, c, col) in field_names {
+        if names.contains(&n) {
+            return Err(ProcErr::from(format!("procedure {}: {} names a variable too", name, n)));
+        }
+        names.push(n);
+        cursor_fields.push(((names.len() - 1) as u16, c, col));
+    }
+    let body = parse_trigger_body(source, begin_at, source.trim_end().len(), &names)
+        .ok_or_else(|| format!("procedure {}'s body is outside this server's PSQL surface", name))?;
+    // the header's initialisers run first, as the assignments they are
+    let inits = declared_var_inits(&source[..begin_at], &names, &domain_defaults)
+        .map_err(|e| ProcErr::from(format!("procedure {}: {}", name, e)))?;
+    let body = if inits.is_empty() {
+        body
+    } else {
+        let mut stmts = inits;
+        stmts.push(body);
+        TrigStmt::Block { stmts, handlers: Vec::new(), src_off: begin_at }
+    };
+    // THE CALLS' OUTPUT COUNTS ARE A PREPARE-TIME CHECK on the engine,
+    // so it is made here, before a statement runs - raised at the call
+    // it let a WHEN ANY around it catch an error the engine never lets
+    // the body reach, and `RETURNING_VALUES :R` over a two-output
+    // procedure bound the first and answered 8 where the engine raises
+    if let Some(dbr) = database {
+        if let Some(err) = body_call_out_mismatch(&body, dbr) {
+            return Err(ProcErr {
+                rows: Vec::new(),
+                text: format!("procedure {}: a call the engine refuses at prepare", name),
+                status: Some(err),
+            });
+        }
+    }
+    Ok(BodyPrep { names, types, rules, lit_cs, cursor_states, row_count_slot, err_slots, cursor_fields, body, declared })
+}
+
+/// An anonymous block's prepare-time verdict as the planner answers it:
+/// `None` to plan it, `Some(None)` to refuse it (the generic refusal, and
+/// the -204 of an unknown relation the refusal path names), `Some(Some(
+/// RefusedEval))` for the engine's own prepare-time vector. A body the
+/// BLR compiler took (`compiled`) was judged there already, and only an
+/// engine vector is added to it.
+fn block_prepare_gate(meta: &ProcMeta, db: &Option<Database>, compiled: bool) -> Option<Option<Plan>> {
+    let prep = match body_prepare(db.as_ref(), ANONYMOUS_BLOCK, meta) {
+        Ok(p) => p,
+        // a vector the run gives at its start ([body_call_out_mismatch])
+        Err(ProcErr { status: Some(_), .. }) => return None,
+        Err(_) => return (!compiled).then_some(None),
+    };
+    match block_prepare_verdict(&prep, meta, db) {
+        BlockVerdict::Clean => None,
+        BlockVerdict::Raise(e) => Some(Some(Plan::RefusedEval(e))),
+        BlockVerdict::Refuse { certain } => (certain || !compiled).then_some(None),
+    }
+}
+
+/// What a PREPARE-TIME look at an anonymous block's body says
+/// ([block_prepare_verdict]).
+enum BlockVerdict {
+    /// nothing the checks read is wrong
+    Clean,
+    /// the engine refuses the block at prepare, in words this server
+    /// does not reproduce - the block is refused. `certain` for a check
+    /// read off the body's shape alone (a name declared twice, a LEAVE
+    /// outside a loop), which holds whatever else judged the body; not
+    /// for one the planner answered, which is added only where the BLR
+    /// compiler did not judge the body
+    Refuse { certain: bool },
+    /// the engine refuses it at prepare with this vector
+    Raise(EvalErr),
+}
+
+/// AN EXECUTE BLOCK IS JUDGED WHOLE BEFORE A STATEMENT RUNS, and the
+/// source interpreter reads only the statements it reaches. So the
+/// checks the engine's compile makes are made here, over every
+/// statement, taken branch or not - measured on engine 2182, each in an
+/// IF branch that never runs: a table or a column nothing has (-204 /
+/// -206), a syntax error in a value (`N = 1 +;` -104), a duplicate
+/// output or local (-637), `DECLARE SQLCODE`, a nested duplicate loop
+/// label, RETURN in a block, LEAVE / CONTINUE outside a loop, FETCH from
+/// a cursor nothing declares, `UPDATE .. SET <no such column>`, an
+/// INSERT whose values do not count the columns, a two-column singleton
+/// SELECT into one variable (-313) - every one fails the block at
+/// prepare, where the interpreter answered rows.
+///
+/// A named cursor - `DECLARE C CURSOR FOR (...)` or `FOR SELECT .. AS
+/// CURSOR C` - is a derived table by the engine's reading: an unnamed
+/// column in it is *no column name specified for column number 2 in
+/// derived table C* at prepare, whether or not `C.<column>` is read
+/// (measured: over `FETCH C INTO R, R`, a bare `FETCH C` and a COUNT(*)
+/// alike).
+///
+/// Every query and value goes to the ORDINARY planner with each
+/// variable written as a NULL of its declared type, which is the check
+/// the engine's compile makes of it: its names, its grammar, its
+/// arity. What the planner cannot read refuses the block - the same
+/// bare refusal the interpreter gave when it reached the statement.
+fn block_prepare_verdict(prep: &BodyPrep, meta: &ProcMeta, db: &Option<Database>) -> BlockVerdict {
+    // THE HEADER: a name declared twice, or a name the grammar keeps
+    let declared = &prep.names[..prep.declared.min(prep.names.len())];
+    for (i, n) in declared.iter().enumerate() {
+        if declared[..i].contains(n) || matches!(n.as_str(), "SQLCODE" | "GDSCODE" | "SQLSTATE" | "ROW_COUNT") {
+            return BlockVerdict::Refuse { certain: true };
+        }
+    }
+    let up = meta.source.to_ascii_uppercase();
+    let header_end = find_word(&mask_literals(&up), "BEGIN", 0).unwrap_or(0);
+    let cursors = declared_cursors(&meta.source[..header_end]);
+    for (i, (c, _)) in cursors.iter().enumerate() {
+        if declared.contains(c) || cursors[..i].iter().any(|(d, _)| d == c) {
+            return BlockVerdict::Refuse { certain: true };
+        }
+    }
+    let cx = VerdictCx { prep, db, is_function: meta.is_function };
+    // each declared cursor's query, as the derived table it is
+    for (c, _) in &cursors {
+        let Some(state) = prep.cursor_states.get(c) else { return BlockVerdict::Refuse { certain: false } };
+        if let Err(v) = cx.cursor_query(&state.query, c) {
+            return v;
+        }
+    }
+    let mut loops: Vec<Option<String>> = Vec::new();
+    match cx.walk(&prep.body, &mut loops) {
+        Ok(()) => BlockVerdict::Clean,
+        Err(v) => v,
+    }
+}
+
+struct VerdictCx<'a> {
+    prep: &'a BodyPrep,
+    db: &'a Option<Database>,
+    is_function: bool,
+}
+
+impl VerdictCx<'_> {
+    /// Slot `i` as a NULL of its declared type - what the engine's compile
+    /// knows of a variable when it checks a statement over it.
+    fn standin(&self, i: usize) -> String {
+        if let Some(Some(t)) = self.prep.types.get(i) {
+            if let Some(ty) = cast_target_sql(t) {
+                return format!("CAST(NULL AS {})", ty);
+            }
+        }
+        match self.prep.names.get(i).map(String::as_str) {
+            Some("ROW_COUNT" | "SQLCODE" | "GDSCODE") => "CAST(NULL AS INTEGER)".to_string(),
+            Some("SQLSTATE") => "CAST(NULL AS CHAR(5))".to_string(),
+            _ => "NULL".to_string(),
+        }
+    }
+
+    /// `text` with its variables - `:name` binds and the parser's
+    /// [PSQL_VAR_MARK] slots - written as their stand-ins
+    fn subst(&self, text: &str, binds: &[(String, u16)]) -> String {
+        let mut t = text.to_string();
+        for i in (0..self.prep.names.len()).rev() {
+            let mark = format!("{}{}", PSQL_VAR_MARK, i);
+            if t.contains(&mark) {
+                t = t.replace(&mark, &self.standin(i));
+            }
+        }
+        let b = t.as_bytes();
+        let mut out = String::with_capacity(t.len() + 16);
+        let mut in_str = false;
+        let mut i = 0usize;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'\'' {
+                in_str = !in_str;
+                out.push('\'');
+                i += 1;
+                continue;
+            }
+            if !in_str && c == b':' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_') {
+                let mut j = i + 1;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'$') {
+                    j += 1;
+                }
+                let name = t[i + 1..j].to_ascii_uppercase();
+                let slot = binds
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, s)| *s as usize)
+                    .or_else(|| self.prep.names.iter().position(|n| *n == name));
+                match slot {
+                    Some(s) => out.push_str(&self.standin(s)),
+                    None => out.push_str(&t[i..j]),
+                }
+                i = j;
+                continue;
+            }
+            i = push_char_at(&mut out, &t, i);
+        }
+        out
+    }
+
+    /// A query the planner must take: its plan, or the refusal
+    fn query(&self, sql: &str) -> Result<Plan, BlockVerdict> {
+        match psql_plan(sql, self.db) {
+            Ok((Plan::Refused | Plan::RefusedEval(_), _)) | Err(_) => Err(BlockVerdict::Refuse { certain: false }),
+            Ok((p, _)) => Ok(p),
+        }
+    }
+
+    fn value(&self, (text, binds): &RawVal) -> Result<(), BlockVerdict> {
+        self.query(&format!("SELECT {} FROM RDB$DATABASE", self.subst(text, binds))).map(|_| ())
+    }
+
+    fn cond(&self, (text, binds): &RawVal) -> Result<(), BlockVerdict> {
+        self.query(&format!("SELECT COUNT(*) FROM RDB$DATABASE WHERE {}", self.subst(text, binds))).map(|_| ())
+    }
+
+    /// A NAMED cursor's query: planned, and its columns held to the
+    /// derived-table rules under the cursor's name
+    fn cursor_query(&self, query: &str, name: &str) -> Result<usize, BlockVerdict> {
+        let q = self.subst(query, &[]);
+        let p = self.query(&q)?;
+        let mut cols = output_cols_of(&p);
+        match derived_columns_verdict(&mut cols, &[], name) {
+            Some(e @ EvalErr::DerivedFieldUnnamed { .. }) => Err(BlockVerdict::Raise(e)),
+            Some(_) => Err(BlockVerdict::Refuse { certain: false }),
+            None => Ok(cols.len()),
+        }
+    }
+
+    /// A DML statement the body renders: planned, not run
+    fn dml(&self, sql: &str, kind: DmlKind) -> Result<(), BlockVerdict> {
+        let planned = match kind {
+            DmlKind::Insert => plan_insert(sql, self.db),
+            DmlKind::Update => plan_update(sql, self.db),
+            DmlKind::Delete => plan_delete(sql, self.db),
+        };
+        match planned {
+            Some((Plan::Refused | Plan::RefusedEval(_), _)) | None => Err(BlockVerdict::Refuse { certain: false }),
+            Some((_, params)) if !params.is_empty() => Err(BlockVerdict::Refuse { certain: false }),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// A frame of NULLs of the declared types, for the statements this
+    /// server renders from their parsed form ([render_psql_expr])
+    fn null_frame(&self) -> PsqlFrame {
+        PsqlFrame {
+            stop_after: None,
+            types: self.prep.types.clone(),
+            cast_cs: None,
+            lit_cs: self.prep.lit_cs,
+            vars: vec![Value::Null; self.prep.names.len()],
+            out_at: 0,
+            out_len: 0,
+            suspended: Vec::new(),
+            caught: None,
+            cursors: std::collections::HashMap::new(),
+            row_count_slot: None,
+            err_slots: [None; 3],
+            rules: Vec::new(),
+            cursor_fields: Vec::new(),
+            trig: None,
+            gen: Default::default(),
+            trig_excs: Vec::new(),
+        }
+    }
+
+    fn walk(&self, s: &TrigStmt, loops: &mut Vec<Option<String>>) -> Result<(), BlockVerdict> {
+        let refuse = || Err(BlockVerdict::Refuse { certain: false });
+        let shape = || Err(BlockVerdict::Refuse { certain: true });
+        // a loop label may not repeat one it is nested in
+        let enter = |loops: &mut Vec<Option<String>>, label: &Option<String>| -> Result<(), BlockVerdict> {
+            if label.is_some() && loops.contains(label) {
+                return Err(BlockVerdict::Refuse { certain: true });
+            }
+            loops.push(label.clone());
+            Ok(())
+        };
+        match s {
+            // a value the arithmetic grammar read is checked where it
+            // names a COLUMN - no block has a row to read one from, so
+            // the name is a variable nothing declared or a context word
+            // the planner knows (its text, `fallback`, is what decides)
+            TrigStmt::Assign { raw, expr, fallback, .. } => {
+                match (raw, fallback) {
+                    (Some(r), _) => self.value(r),
+                    (None, Some(r)) if !expr.field_refs().is_empty() => self.value(r),
+                    _ => Ok(()),
+                }
+            }
+            TrigStmt::If { then, otherwise, raw, .. } => {
+                if let Some(r) = raw {
+                    self.cond(r)?;
+                }
+                self.walk(then, loops)?;
+                match otherwise {
+                    Some(e) => self.walk(e, loops),
+                    None => Ok(()),
+                }
+            }
+            TrigStmt::While { body, label, raw, .. } => {
+                if let Some(r) = raw {
+                    self.cond(r)?;
+                }
+                enter(loops, label)?;
+                let r = self.walk(body, loops);
+                loops.pop();
+                r
+            }
+            TrigStmt::Raise { name, msg_raw, using, .. } => {
+                if self.db.as_ref().and_then(|d| exception_identity(d, name)).is_none() {
+                    return refuse();
+                }
+                if let Some(r) = msg_raw {
+                    self.value(r)?;
+                }
+                for r in using.iter().flatten() {
+                    self.value(r)?;
+                }
+                Ok(())
+            }
+            TrigStmt::Open { cursor, .. } | TrigStmt::Close { cursor, .. } => {
+                if !self.prep.cursor_states.contains_key(cursor) {
+                    return shape();
+                }
+                Ok(())
+            }
+            TrigStmt::Fetch { cursor, orient, .. } => {
+                if !self.prep.cursor_states.contains_key(cursor) {
+                    return shape();
+                }
+                match orient {
+                    FetchOrient::Absolute(r) | FetchOrient::Relative(r) => self.value(r),
+                    _ => Ok(()),
+                }
+            }
+            TrigStmt::Leave { target, .. } | TrigStmt::Continue { target, .. } => {
+                let ok = match target {
+                    None => !loops.is_empty(),
+                    Some(_) => loops.contains(target),
+                };
+                if ok { Ok(()) } else { shape() }
+            }
+            TrigStmt::Return { .. } | TrigStmt::ReturnText { .. } if !self.is_function => shape(),
+            TrigStmt::Store { table, cols, exprs, raw, .. } => {
+                let values = match raw {
+                    Some((text, binds)) => self.subst(text, binds),
+                    None => {
+                        if cols.len() != exprs.len() {
+                            return refuse();
+                        }
+                        let f = self.null_frame();
+                        match exprs.iter().map(|e| render_psql_expr(e, &f)).collect::<Option<Vec<_>>>() {
+                            Some(v) => v.join(", "),
+                            None => return refuse(),
+                        }
+                    }
+                };
+                let sql = if cols.is_empty() {
+                    format!("INSERT INTO {} VALUES ({})", render_canon_ref(table), values)
+                } else {
+                    format!(
+                        "INSERT INTO {} ({}) VALUES ({})",
+                        render_canon_ref(table),
+                        cols.iter().map(|c| render_canon_ref(c)).collect::<Vec<_>>().join(", "),
+                        values
+                    )
+                };
+                self.dml(&sql, DmlKind::Insert)
+            }
+            TrigStmt::Update { table, sets, wher, .. } => {
+                let f = self.null_frame();
+                let Some(assigns) = sets
+                    .iter()
+                    .map(|(c, e)| render_psql_expr(e, &f).map(|v| format!("{} = {}", render_canon_ref(c), v)))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return refuse();
+                };
+                let mut sql = format!("UPDATE {} SET {}", render_canon_ref(table), assigns.join(", "));
+                if let Some(c) = wher {
+                    let Some(w) = render_psql_cond(c, &f) else { return refuse() };
+                    sql.push_str(" WHERE ");
+                    sql.push_str(&w);
+                }
+                self.dml(&sql, DmlKind::Update)
+            }
+            TrigStmt::Delete { table, wher, .. } => {
+                let f = self.null_frame();
+                let mut sql = format!("DELETE FROM {}", render_canon_ref(table));
+                if let Some(c) = wher {
+                    let Some(w) = render_psql_cond(c, &f) else { return refuse() };
+                    sql.push_str(" WHERE ");
+                    sql.push_str(&w);
+                }
+                self.dml(&sql, DmlKind::Delete)
+            }
+            TrigStmt::DmlInto { sql: (text, binds), .. } => {
+                let sql = self.subst(text, binds);
+                let (dml_sql, _) = split_returning(&sql);
+                let up = dml_sql.trim_start().to_ascii_uppercase();
+                let kind = if find_word(&up, "INSERT", 0) == Some(0) {
+                    DmlKind::Insert
+                } else if find_word(&up, "UPDATE", 0) == Some(0) {
+                    DmlKind::Update
+                } else {
+                    DmlKind::Delete
+                };
+                // planned, and its RETURNING list wrapped over the target,
+                // as the run does it ([run_body_returning])
+                let planned = match kind {
+                    DmlKind::Insert => plan_insert(&dml_sql, self.db),
+                    DmlKind::Update => plan_update(&dml_sql, self.db),
+                    DmlKind::Delete => plan_delete(&dml_sql, self.db),
+                };
+                let planned = planned.filter(|(p, params)| {
+                    params.is_empty() && !matches!(p, Plan::Refused | Plan::RefusedEval(_))
+                });
+                let (Some((plan, _)), (_, Some(list)), Some(table)) =
+                    (planned, split_returning(&sql), dml_table_name(&dml_sql))
+                else {
+                    return refuse();
+                };
+                match wrap_returning(
+                    plan,
+                    Vec::new(),
+                    &list,
+                    &table,
+                    dml_target_alias(&dml_sql).map(|(a, _)| a).as_deref(),
+                    dml_binds_alias(&sql),
+                    self.db,
+                ) {
+                    Some((Plan::Returning { .. }, _)) => Ok(()),
+                    _ => refuse(),
+                }
+            }
+            TrigStmt::SelectInto { sql, into, binds, .. } => {
+                let p = self.query(&self.subst(sql, binds))?;
+                let projected = output_cols_of(&p).len();
+                if projected == 0 {
+                    return refuse();
+                }
+                if projected != into.len() {
+                    return Err(BlockVerdict::Raise(EvalErr::DsqlCountMismatch));
+                }
+                Ok(())
+            }
+            TrigStmt::ForSelect { query, into, body, label, cursor, .. } => {
+                let n = match cursor {
+                    Some(c) => self.cursor_query(query, c)?,
+                    None => output_cols_of(&self.query(&self.subst(query, &[]))?).len(),
+                };
+                if n == 0 || (!into.is_empty() && n != into.len()) {
+                    return refuse();
+                }
+                enter(loops, label)?;
+                let r = self.walk(body, loops);
+                loops.pop();
+                r
+            }
+            TrigStmt::ForExecStmt { body, label, .. } => {
+                enter(loops, label)?;
+                let r = self.walk(body, loops);
+                loops.pop();
+                r
+            }
+            TrigStmt::Block { stmts, handlers, .. } => {
+                for st in stmts {
+                    self.walk(st, loops)?;
+                }
+                for (_, h) in handlers {
+                    self.walk(h, loops)?;
+                }
+                Ok(())
+            }
+            TrigStmt::Autonomous { body, .. } => self.walk(body, loops),
+            TrigStmt::Call { raw, .. } => self.value(raw),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A [CastTarget] spelled as the SQL type it is, for a stand-in NULL.
+fn cast_target_sql(t: &CastTarget) -> Option<String> {
+    Some(match t {
+        CastTarget::Int { bytes } => match bytes {
+            2 => "SMALLINT".to_string(),
+            4 => "INTEGER".to_string(),
+            8 => "BIGINT".to_string(),
+            _ => "INT128".to_string(),
+        },
+        CastTarget::Text { len, pad, cs, .. } => {
+            let kind = if *pad { "CHAR" } else { "VARCHAR" };
+            match cs {
+                Some(cs) => format!("{}({}) CHARACTER SET {}", kind, (*len).max(1), charset_id_name(*cs)?),
+                None => format!("{}({})", kind, (*len).max(1)),
+            }
+        }
+        CastTarget::Numeric { scale, bytes, sub_type } => {
+            let p = match bytes {
+                2 => 4,
+                4 => 9,
+                8 => 18,
+                _ => 38,
+            };
+            format!("{}({}, {})", if *sub_type == 2 { "DECIMAL" } else { "NUMERIC" }, p, -(*scale as i32))
+        }
+        CastTarget::Approx => "DOUBLE PRECISION".to_string(),
+        CastTarget::Float => "FLOAT".to_string(),
+        CastTarget::Temporal(k) => match k {
+            TKind::Date => "DATE",
+            TKind::Time => "TIME",
+            TKind::Timestamp => "TIMESTAMP",
+            TKind::TimeTz => "TIME WITH TIME ZONE",
+            TKind::TimestampTz => "TIMESTAMP WITH TIME ZONE",
+        }
+        .to_string(),
+        CastTarget::Blob { sub_type, .. } => format!("BLOB SUB_TYPE {}", sub_type),
+        CastTarget::DecFloat { wide } => (if *wide { "DECFLOAT(34)" } else { "DECFLOAT(16)" }).to_string(),
+        CastTarget::Bool => "BOOLEAN".to_string(),
+    })
+}
+
 /// Run a body the caller already holds the metadata for - the whole of
 /// [run_procedure] once the catalog lookup is done, and what an
 /// anonymous block borrows.
@@ -121296,99 +123404,8 @@ fn run_body_source(
             args.len()
         )));
     }
-    // the parser numbers variables in the order it is given them:
-    // inputs, then outputs - the same order the body's identifiers
-    // resolve against
-    let mut names: Vec<String> = meta.ins.iter().map(|p| p.name.clone()).collect();
-    names.extend(meta.outs.iter().map(|p| p.name.clone()));
-
-    // an EXECUTE BLOCK's literals are the attachment's; a stored body's
-    // are the set its BLR recorded ([stored_lit_cs])
-    let lit_cs: SrcCs = if name == ANONYMOUS_BLOCK {
-        Some(CURRENT_ATT_CS.with(|c| c.get()))
-    } else {
-        database.as_ref().and_then(|dbr| {
-            let kind = if meta.is_function { "srclit-fn" } else { "srclit-proc" };
-            *dbr.meta_memo(kind, name, || {
-                let img = dbr.bytes();
-                let blr = if meta.is_function {
-                    fire_crab_exe::function_blr(&img, dbr.page_size, name)
-                } else {
-                    fire_crab_exe::procedure_blr(&img, dbr.page_size, name)
-                };
-                stored_lit_cs(&meta.source, blr.ok().as_deref())
-            })
-        })
-    };
-    // a q-string or an introduced literal in the source is respelled
-    // for the parsers ([rewrite_alt_literals]), in the set the text is
-    // in; the catalog's text stays what the BLR is read against
-    let respelled = rewrite_alt_literals(&meta.source, lit_cs);
-    let source: &str = respelled.as_deref().unwrap_or(&meta.source);
-    let up = source.to_ascii_uppercase();
-    let begin_at = find_word(&up, "BEGIN", 0)
-        .ok_or_else(|| "procedure body does not start with BEGIN".to_string())?;
-    // A procedure DECLAREs its local variables BEFORE the body's BEGIN
-    // (a trigger declares them inside it), so they are collected here and
-    // appended to the name list: the parser numbers variables by their
-    // position in that list, and the frame is indexed the same way.
-    // ...and every slot's DECLARED TYPE, in the same order: what a write
-    // into it converts through ([coerce_to_slot])
-    let locals = declared_vars(&source[..begin_at]);
-    let mut types: Vec<Option<CastTarget>> =
-        meta.ins.iter().chain(meta.outs.iter()).map(|p| slot_cast_target(&p.desc)).collect();
-    let params_at = types.len();
-    types.extend(locals.iter().map(|(_, t)| *t));
-    if let Some(dbr) = database.as_ref() {
-        fill_default_cs(&mut types[params_at..], db_default_charset(&dbr.bytes(), dbr.page_size));
-    }
-    names.extend(locals.into_iter().map(|(n, _)| n));
-    // THE CURSORS the header declares, and ROW_COUNT.
-    //
-    // ROW_COUNT is not a variable the body declares, but it reads
-    // exactly like one - so it gets a slot of its own at the end of the
-    // list, and the ordinary name resolution turns `ROW_COUNT` into
-    // that slot with nothing else to teach. A body that never mentions
-    // it never pays for it.
-    let cursors = declared_cursors(&source[..begin_at]);
-    let row_count_slot = {
-        if find_word(&up, "ROW_COUNT", 0).is_some() {
-            names.push("ROW_COUNT".to_string());
-            Some((names.len() - 1) as u16)
-        } else {
-            None
-        }
-    };
-    let cursor_states: std::collections::HashMap<String, CursorState> = cursors
-        .into_iter()
-        .map(|(name, query)| (name, CursorState { query, rows: None, at: 0, cs: Vec::new() }))
-        .collect();
-    let body = parse_trigger_body(source, begin_at, source.trim_end().len(), &names)
-        .ok_or_else(|| format!("procedure {}'s body is outside this server's PSQL surface", name))?;
-    // the header's initialisers run first, as the assignments they are
-    let inits = declared_var_inits(&source[..begin_at], &names)
-        .map_err(|e| ProcErr::from(format!("procedure {}: {}", name, e)))?;
-    let body = if inits.is_empty() {
-        body
-    } else {
-        let mut stmts = inits;
-        stmts.push(body);
-        TrigStmt::Block { stmts, handlers: Vec::new(), src_off: begin_at }
-    };
-    // THE CALLS' OUTPUT COUNTS ARE A PREPARE-TIME CHECK on the engine,
-    // so it is made here, before a statement runs - raised at the call
-    // it let a WHEN ANY around it catch an error the engine never lets
-    // the body reach, and `RETURNING_VALUES :R` over a two-output
-    // procedure bound the first and answered 8 where the engine raises
-    if let Some(dbr) = database.as_ref() {
-        if let Some(err) = body_call_out_mismatch(&body, dbr) {
-            return Err(ProcErr {
-                rows: Vec::new(),
-                text: format!("procedure {}: a call the engine refuses at prepare", name),
-                status: Some(err),
-            });
-        }
-    }
+    let BodyPrep { names, types, rules, lit_cs, cursor_states, row_count_slot, err_slots, cursor_fields, body, .. } =
+        body_prepare(database.as_ref(), name, meta)?;
 
     // A STORED BODY WHOSE SOURCE LOST ITS LITERALS IS NOT ITS BODY. See
     // [source_literals_lost]: the engine answers from the BLR, where the
@@ -121435,6 +123452,9 @@ fn run_body_source(
         caught: None,
         cursors: cursor_states,
         row_count_slot,
+        err_slots,
+        rules,
+        cursor_fields,
         trig: None,
         gen: Default::default(),
         trig_excs: Vec::new(),
@@ -121452,6 +123472,7 @@ fn run_body_source(
     if let Some(rc) = row_count_slot {
         frame.vars[rc as usize] = Value::Int(0);
     }
+    set_caught(&mut frame, None);
 
     // A BODY IS ALL-OR-NOTHING, and a transaction of its own to say so:
     // a statement that fails partway undoes everything the body wrote
@@ -121616,7 +123637,12 @@ fn declared_cursor_at(header: &str, at: usize) -> Option<(String, String)> {
         return None;
     }
     let cursor = find_word(rest_up, "CURSOR", name_end)?;
-    if rest_up[name_end..cursor].trim() != "" {
+    // `SCROLL` / `NO SCROLL` may stand between the name and CURSOR
+    // ([declared_scroll_cursors] reads which)
+    if !matches!(
+        rest_up[name_end..cursor].split_whitespace().collect::<Vec<_>>().as_slice(),
+        [] | ["SCROLL"] | ["NO", "SCROLL"]
+    ) {
         return None;
     }
     let for_kw = find_word(rest_up, "FOR", cursor + "CURSOR".len())?;
@@ -121644,6 +123670,27 @@ fn declared_cursor_at(header: &str, at: usize) -> Option<(String, String)> {
 }
 
 /// Every cursor a procedure's header declares, in order.
+/// The declared cursors that are SCROLL - the ones a FETCH may move in
+/// any direction ([TrigStmt::Fetch]).
+fn declared_scroll_cursors(header: &str) -> Vec<String> {
+    let up = header.to_ascii_uppercase();
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(d) = find_word(&up, "DECLARE", at) {
+        if let Some((name, _)) = declared_cursor_at(header, d) {
+            let rest = &up[d + "DECLARE".len()..];
+            if let Some(c) = find_word(rest, "CURSOR", 0) {
+                let words: Vec<&str> = rest[..c].split_whitespace().collect();
+                if words.len() == 2 && words[1] == "SCROLL" {
+                    out.push(name);
+                }
+            }
+        }
+        at = d + "DECLARE".len();
+    }
+    out
+}
+
 fn declared_cursors(header: &str) -> Vec<(String, String)> {
     let up = header.to_ascii_uppercase();
     let mut out = Vec::new();
@@ -121668,6 +123715,12 @@ fn declared_var_names(header: &str) -> Vec<String> {
 /// name ([declared_type_target]), in the same order - what the frame's
 /// [PsqlFrame::types] is filled from for the local slots.
 fn declared_vars(header: &str) -> Vec<(String, Option<CastTarget>)> {
+    declared_var_texts(header).into_iter().map(|(n, t)| (n, declared_type_target(&t))).collect()
+}
+
+/// Each DECLAREd variable's name and TYPE TEXT - everything from the
+/// name to the declaration's `;`, its initialiser included.
+fn declared_var_texts(header: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let up = header.to_ascii_uppercase();
     let mut at = 0usize;
@@ -121710,7 +123763,7 @@ fn declared_vars(header: &str) -> Vec<(String, Option<CastTarget>)> {
                     _ => {}
                 }
             }
-            out.push((name, declared_type_target(tail[..stop].trim())));
+            out.push((name, tail[..stop].trim().to_string()));
         }
         at = d + "DECLARE".len();
     }
@@ -121749,7 +123802,13 @@ fn canonical_var_name(raw: &str) -> String {
 /// (arithmetic through [parse_expr], a text literal through the
 /// AssignText arm), and an initialiser this server cannot read REFUSES
 /// the body rather than starting the variable NULL.
-fn declared_var_inits(header: &str, names: &[String]) -> Result<Vec<TrigStmt>, String> {
+fn declared_var_inits(
+    header: &str,
+    names: &[String],
+    // a DOMAIN's default, by variable name - what a local of the domain
+    // with no initialiser of its own starts as
+    defaults: &[(String, String)],
+) -> Result<Vec<TrigStmt>, String> {
     let up = header.to_ascii_uppercase();
     let mut out = Vec::new();
     let mut at = 0usize;
@@ -121811,12 +123870,22 @@ fn declared_var_inits(header: &str, names: &[String]) -> Result<Vec<TrigStmt>, S
                 rhs = Some(&decl[k + "DEFAULT".len()..]);
             }
         }
-        let Some(rhs) = rhs else { continue };
+        let rhs = match rhs {
+            Some(r) => r,
+            None => match defaults.iter().find(|(n, _)| *n == name) {
+                Some((_, d)) => d.as_str(),
+                None => continue,
+            },
+        };
         let text = format!("{} = {};", name, rhs.trim());
         let mut pos = 0usize;
-        let stmt = parse_trig_stmt(&text, &mut pos, text.len(), names).ok_or_else(|| {
+        let mut stmt = parse_trig_stmt(&text, &mut pos, text.len(), names).ok_or_else(|| {
             format!("the initialiser of variable {} is outside this server's PSQL surface", name)
         })?;
+        // AN INITIALISER'S ERROR IS THE DECLARATION'S: measured, `DECLARE
+        // X DPOS = -2` raises its validation error at the DECLARE's line
+        // and column, not the body's
+        set_stmt_src_off(&mut stmt, d);
         out.push(stmt);
     }
     Ok(out)
@@ -121893,22 +123962,110 @@ fn parse_execute_block_select(sql: &str, db: &Option<Database>) -> Option<Plan> 
     fire_crab_dsql::set_catalog(dsql_catalog_for(db, &synth));
     let c = fire_crab_dsql::compile_procedure_full_with_funcs(&synth, &plain_funcs);
     fire_crab_dsql::set_catalog(Vec::new());
-    let c = c?;
-    if !c.ins.is_empty() || c.outs.is_empty() {
-        return None; // no input params here; a RETURNS with columns
+    // A BODY THE BLR COMPILER CANNOT HOLD IS NOT A BLOCK THE ENGINE
+    // REFUSES. The compile above is asked for the RETURNS metadata; the
+    // body is RUN by the source interpreter, which knows forms the BLR
+    // compiler has no node for (the error context variables, EXCEPTION
+    // ... USING, a BREAK, a function call as a statement). So when the
+    // whole compile fails the header alone is compiled over a stand-in
+    // body (the compiler takes no empty one). The body is then judged by
+    // [block_prepare_verdict] - the compile was the only prepare-time
+    // check of it, and the interpreter reads only the statements it
+    // reaches - and a body it cannot read still refuses, at execute,
+    // with the same bare 42000.
+    let compiled = c.is_some();
+    let c = match c {
+        Some(c) => Some(c),
+        None => {
+            let head = format!("CREATE PROCEDURE FC$BLOCK {} AS BEGIN SUSPEND; END", returns_text);
+            fire_crab_dsql::compile_procedure_full_with_funcs(&head, &plain_funcs)
+        }
+    };
+    let (out_names, out_descs) = match c {
+        Some(c) => {
+            if !c.ins.is_empty() || c.outs.is_empty() {
+                return None; // no input params here; a RETURNS with columns
+            }
+            let mut names = Vec::new();
+            let mut descs = Vec::new();
+            for m in &c.outs {
+                names.push(m.name.clone());
+                descs.push(desc_from_proc_meta(m)?);
+            }
+            (names, descs)
+        }
+        // ...and a header the compiler has no type for - BOOLEAN, DOUBLE
+        // PRECISION, FLOAT - is read by the column-type reader
+        None => block_returns_scalar(returns_text)?,
+    };
+    // ...and the body the compiler did not judge is judged here, before
+    // a statement of it runs ([block_prepare_verdict])
+    let meta = ProcMeta {
+        ins: Vec::new(),
+        outs: out_names
+            .iter()
+            .zip(out_descs.iter())
+            .map(|(n, d)| ProcParam { name: n.clone(), desc: *d, collated: false, default: None, default_ctx: None, default_cs: None })
+            .collect(),
+        source: body.to_string(),
+        body_at: Some(at),
+        prc_type: None,
+        is_function: false,
+    };
+    if let Some(refused) = block_prepare_gate(&meta, db, compiled) {
+        return refused;
     }
-    let mut out_names = Vec::new();
-    let mut out_descs = Vec::new();
     let mut cols = Vec::new();
-    for (i, m) in c.outs.iter().enumerate() {
-        let d = desc_from_proc_meta(m)?;
+    for (i, (n, d)) in out_names.iter().zip(out_descs.iter()).enumerate() {
         // the engine describes a block column with an EMPTY table/owner
-        cols.push(proc_out_col(m.name.clone(), Some(m.name.clone()), "", None, i, &d));
-        out_names.push(m.name.clone());
-        out_descs.push(d);
+        cols.push(proc_out_col(n.clone(), Some(n.clone()), "", None, i, d));
     }
     Some(Plan::ExecBlockSelect { source: body.to_string(), body_at: at, out_names, out_descs, cols })
 }
+
+/// An EXECUTE BLOCK's `RETURNS (<name> <type>, ...)` read by the COLUMN
+/// type reader ([parse_column_def]), for the headers the BLR compiler
+/// declines. Only the types with no character set, no domain and no
+/// scale to resolve are taken - BOOLEAN, DOUBLE PRECISION, FLOAT and the
+/// plain integers and temporals - so the descriptor is the type itself;
+/// anything else stays refused.
+fn block_returns_scalar(returns_text: &str) -> Option<(Vec<String>, Vec<Descriptor>)> {
+    let t = returns_text.trim();
+    let rest = t.get(.."RETURNS".len()).filter(|h| h.eq_ignore_ascii_case("RETURNS")).map(|_| &t["RETURNS".len()..])?;
+    let inner = rest.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let mut names = Vec::new();
+    let mut descs = Vec::new();
+    for item in split_top_level_commas(inner) {
+        let (c, _) = parse_column_def(item.trim())?;
+        if c.domain.is_some() || c.default.is_some() || !c.dims.is_empty() || c.scale != 0 || c.not_null {
+            return None;
+        }
+        if !matches!(
+            c.dtype,
+            dtype::SHORT
+                | dtype::LONG
+                | dtype::INT64
+                | dtype::REAL
+                | dtype::DOUBLE
+                | dtype::BOOLEAN
+                | dtype::SQL_DATE
+                | dtype::SQL_TIME
+                | dtype::TIMESTAMP
+        ) {
+            return None;
+        }
+        if names.contains(&c.name) {
+            return None;
+        }
+        names.push(c.name.clone());
+        descs.push(Descriptor { dtype: c.dtype, scale: 0, length: c.length, sub_type: 0, flags: 0, offset: 0 });
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some((names, descs))
+}
+
 
 fn parse_execute_block(sql: &str) -> Option<(String, (usize, usize))> {
     let s = sql.trim().trim_end_matches(';').trim();
@@ -129196,13 +131353,18 @@ fn after_auth(
                             plan = std::rc::Rc::new(Plan::ProcRows { cols: bcols, rows, then: Some(ev) });
                             respond(&mut s, &mut enc, resp_tx)?;
                         }
-                        Err(e) => match e.status {
-                            Some(ev) => {
-                                plan = std::rc::Rc::new(Plan::RefusedEval(ev));
-                                respond(&mut s, &mut enc, resp_tx)?;
+                        Err(e) => {
+                            if trace_on() {
+                                eprintln!("[srv] execute block failed: {}", e.text);
                             }
-                            None => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
-                        },
+                            match e.status {
+                                Some(ev) => {
+                                    plan = std::rc::Rc::new(Plan::RefusedEval(ev));
+                                    respond(&mut s, &mut enc, resp_tx)?;
+                                }
+                                None => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                            }
+                        }
                     }
                     continue;
                 } else if plan_has_procselect(&plan) {
@@ -145321,6 +147483,9 @@ mod tests {
                 caught: None,
                 cursors: std::collections::HashMap::new(),
                 row_count_slot: None,
+                err_slots: [None; 3],
+                rules: Vec::new(),
+                cursor_fields: Vec::new(),
                 trig: None,
                 gen: Default::default(),
                 trig_excs: Vec::new(),
