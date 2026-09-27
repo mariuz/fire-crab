@@ -1998,7 +1998,10 @@ boundary_err "R12 boundary: conversion error by design (K2): F CASE b.ID WHEN ? 
 both "F CASE b.ID WHEN ? ['2'] -> 2 (control)" "SELECT ID FROM T WHERE ID IN (SELECT b.ID FROM T b WHERE CASE b.ID WHEN ? THEN 1 ELSE 0 END = 1)" '["2"]'
 both "F CASE b.ID WHEN ? ['2.4'] -> none (a whole side keeps its fraction)" "SELECT ID FROM T WHERE ID IN (SELECT b.ID FROM T b WHERE CASE b.ID WHEN ? THEN 1 ELSE 0 END = 1)" '["2.4"]'
 both_err "F CASE b.ID WHEN ? ['abc'] (conversion error from string on both)" "SELECT ID FROM T WHERE ID IN (SELECT b.ID FROM T b WHERE CASE b.ID WHEN ? THEN 1 ELSE 0 END = 1)" '["abc"]'
-eng_only "F design boundary: DECODE(b.ID, ?, 1, 0) = 1 in a body ['2'] (engine 2; the DECODE spelling is refused on both binaries)" "SELECT ID FROM T WHERE ID IN (SELECT b.ID FROM T b WHERE DECODE(b.ID, ?, 1, 0) = 1)" '["2"]'
+# promoted by the built-ins round: a DECODE in a WHERE answers (the `?`
+# searched FOR is typed from the subject); one whose RESULT is a `?`
+# still refuses (the B and J boundaries)
+both "F DECODE(b.ID, ?, 1, 0) = 1 in a body ['2']" "SELECT ID FROM T WHERE ID IN (SELECT b.ID FROM T b WHERE DECODE(b.ID, ?, 1, 0) = 1)" '["2"]'
 boundary_err "R12 boundary: conversion error by design (K2): F IIF(b.ID = ?, 1, 0) = 1 in an IN body [39 nines] -> none (a 39-digit text is the double class; round 4 failed at execute)" "SELECT ID FROM T WHERE ID IN (SELECT b.ID FROM T b WHERE IIF(b.ID = ?, 1, 0) = 1)" '["999999999999999999999999999999999999999"]'
 boundary_err "R12 boundary: conversion error by design (K2): F IIF(b.NM = ?, 1, 0) = 1 [39 nines] -> none" "SELECT ID FROM T WHERE ID IN (SELECT b.ID FROM T b WHERE IIF(b.NM = ?, 1, 0) = 1)" '["999999999999999999999999999999999999999"]'
 boundary_err "R12 boundary: conversion error by design (K2): F IIF(b.D = ?, 1, 0) = 1 [39 nines] -> none" "SELECT ID FROM T WHERE ID IN (SELECT b.ID FROM T b WHERE IIF(b.D = ?, 1, 0) = 1)" '["999999999999999999999999999999999999999"]'

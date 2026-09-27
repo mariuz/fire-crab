@@ -187,12 +187,12 @@ both "inside a CAST" \
      "SELECT ID, CAST(DECODE(DEPT_ID, 1, 10, 20) AS VARCHAR(4)) FROM EMP ORDER BY ID"
 both "as an ORDER BY key" \
      "SELECT ID FROM EMP ORDER BY DECODE(DEPT_ID, 1, 9, 0), ID"
-# DECODE inside a WHERE refuses: the predicate tokenizer spans a CASE by
-# its balancing END (`matching_case_end`) and has no rule for a DECODE
-# call, so the desugar the select list gets never reaches it. Named here
-# rather than left as an unexplained gap.
-refuses "DECODE inside a WHERE" \
-        "SELECT COUNT(*) FROM EMP WHERE DECODE(DEPT_ID, 1, 10, 20) = 10"
+# DECODE inside a WHERE answers: the predicate tokenizer hands a DECODE
+# call to the expression parser as it does IIF and COALESCE (it used to
+# read the name as a column and refuse - promoted by the built-ins round,
+# serve-real-builtins.sh section 5)
+both "DECODE inside a WHERE" \
+     "SELECT COUNT(*) FROM EMP WHERE DECODE(DEPT_ID, 1, 10, 20) = 10"
 both "under an aggregate" "SELECT SUM(DECODE(DEPT_ID, 1, 10, 0)) FROM EMP"
 
 # --- 5. EXISTS as a select-list VALUE ---------------------------------
