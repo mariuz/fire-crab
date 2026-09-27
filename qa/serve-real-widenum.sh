@@ -304,7 +304,7 @@ echo "--- 5. RECORDED (the engine answers; this server refuses or differs)"
 pin  "5 a WINDOWED decimal fold (planned since the window planner round of 2026-09-26)" "SELECT ID, VAR_POP(I) OVER () FROM BIG2 ORDER BY ID;" "ID VAR_POP|1 1.555555555555555555555555555555557|2 1.555555555555555555555555555555557|3 1.555555555555555555555555555555557|4 1.555555555555555555555555555555557"
 refused "5 a DECFLOAT / INT128 percentile FRACTION" "SELECT PERCENTILE_CONT(CAST(0.5 AS DECFLOAT(16))) WITHIN GROUP (ORDER BY I) FROM BIG2;" "PERCENTILE_CONT|2"
 refused "5 DECODE with a mistyped search value: the engine describes, then raises at fetch" "SELECT DECODE(I, 10, 'a', 'b', 'c') FROM T;" "DECODE|a|Statement failed, SQLSTATE = 22018|conversion error from string \"b\""
-differs "5 a VIEW's literal cast runs the double conversion on the engine" "SELECT X FROM V1;" "X|1000000000000000042420637374017.961984" "X|1000000000000000000000000000000.000000"
+pin  "5 a VIEW's literal cast runs the double conversion on the engine (promoted: a view's items are never an assignment's source)" "SELECT X FROM V1;" "X|1000000000000000042420637374017.961984"
 
 echo "--- 6. A HAVING OVER A DECIMAL128 FOLD compares the exact literal in decimal (every group was dropped)"
 pin  "6 PERCENTILE_CONT over INT128 > 1: groups 2 and 3" "SELECT ID FROM BIG2 GROUP BY ID HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I) > 1 ORDER BY ID;" "ID|2|3"
@@ -341,7 +341,7 @@ pin  "9 ...and a 16 / 17-digit spelling folds to ITS digits under an INT128 targ
 pin  "9 CONTROL: in a UNION branch the literal stays the double" "SELECT SQRT(CAST(1e-30 AS DECFLOAT(34))) X $DUAL UNION ALL SELECT 1 $DUAL; SELECT CAST(1.5e0 AS DECFLOAT(34)) X $DUAL UNION ALL SELECT 1 $DUAL;" "X|9.999999999999999549999999999999990E-16|1|X|1.5000000000000000|1"
 
 echo "--- 10. RECORDED (the review round): the engine answers, this server refuses or differs"
-refused "10 a decfloat beside a DOUBLE LITERAL - the assignment fold under a DECFLOAT output, the runtime double elsewhere" "SELECT SQRT(I) * 1.5e0, D34 + 0.1e0 FROM FX WHERE ID = 1;" "MULTIPLY ADD|3.354101966249684544613760503096914 2.1"
+pin  "10 a decfloat beside a DOUBLE LITERAL - the assignment fold under a DECFLOAT output (promoted: the literal is its text in any DECFLOAT item)" "SELECT SQRT(I) * 1.5e0, D34 + 0.1e0 FROM FX WHERE ID = 1;" "MULTIPLY ADD|3.354101966249684544613760503096914 2.1"
 refused "10 GROUP BY a decfloat expression" "SELECT SQRT(I), COUNT(*) FROM FX GROUP BY 1 ORDER BY 1;" "SQRT COUNT|<null> 1|2.236067977499789696409173668731276 1"
 refused "10 a TEXT places count (the exact family refuses it too)" "SELECT ROUND(CAST('1.5' AS DECFLOAT(34)), '2') $DUAL;" "ROUND|1.50"
 pin  "10 a derived table's literal cast under an AGGREGATE runs the double conversion (recorded; the assignment's fold agrees now)" "SELECT SUM(X) FROM (SELECT CAST(1e30 AS NUMERIC(38,6)) X $DUAL);" "SUM|1000000000000000042420637374017.961984"
