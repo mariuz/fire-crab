@@ -984,18 +984,10 @@ for spec in "N9:NUMERIC(9,2):INTEGER" "N18:NUMERIC(18,2):BIGINT" "N20:NUMERIC(20
           SELECT ID PID FROM MP$n; SELECT B CB FROM MC$n;"
     dsql="DELETE FROM MP$n WHERE ID = 7.00; COMMIT;
           SELECT COUNT(*) NP FROM MP$n; SELECT B CB FROM MC$n;"
-    if [ "$n" = "N20" ]; then
-        # an INT128-backed key loses the `-Problematic key value` line
-        # in this server's refusal - PRE-EXISTING (byte-identical on the
-        # previous round's binary for a plain no-rule child, and for
-        # NUMERIC(19,2) and INT128 alike), recorded in docs/roadmap.md.
-        # Both answers are pinned rather than skipped.
-        gap "16a/$n DELETE the key the default writes back - both REFUSE" "$dsql" \
-            'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "MKN20" on table "PUBLIC"."MCN20"|-Foreign key references are present for the record|NP 1|CB 7.00|' \
-            'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "MKN20" on table "PUBLIC"."MCN20"|-Foreign key references are present for the record|-Problematic key value is ("ID" = 7.00)|NP 1|CB 7.00|'
-    else
-        both "16a/$n DELETE the key the default writes back - both REFUSE" "$dsql"
-    fi
+    # (an INT128-backed key lost its `-Problematic key value` line here,
+    # then spelled it as a CAST; it prints the plain digits since
+    # 2026-09-27 and the N20 gap cell was promoted)
+    both "16a/$n DELETE the key the default writes back - both REFUSE" "$dsql"
     eboth "16a/$n the ENGINE reads both files: the parent kept, NO orphan" \
           "SELECT COUNT(*) NPAR FROM MP$n;
            SELECT COUNT(*) ORPH FROM MC$n c WHERE c.B IS NOT NULL
@@ -1010,14 +1002,7 @@ for spec in "N9:NUMERIC(9,2):INTEGER" "N18:NUMERIC(18,2):BIGINT" "N20:NUMERIC(20
           COMMIT; INSERT INTO XP$n VALUES (7.00); COMMIT;
           INSERT INTO XC$n VALUES (1, 7); COMMIT; SELECT COUNT(*) NXC FROM XC$n;"
     xsql="DELETE FROM XP$n WHERE ID = 7.00; COMMIT; SELECT COUNT(*) NXP FROM XP$n;"
-    if [ "$n" = "N20" ]; then
-        # the same PRE-EXISTING INT128 message gap as 16a/N20
-        gap "16b/$n ...and the parent DELETE is then REFUSED by both" "$xsql" \
-            'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "XKN20" on table "PUBLIC"."XCN20"|-Foreign key references are present for the record|NXP 1|' \
-            'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "XKN20" on table "PUBLIC"."XCN20"|-Foreign key references are present for the record|-Problematic key value is ("ID" = 7.00)|NXP 1|'
-    else
-        both "16b/$n ...and the parent DELETE is then REFUSED by both" "$xsql"
-    fi
+    both "16b/$n ...and the parent DELETE is then REFUSED by both" "$xsql"
     eboth "16b/$n the ENGINE reads both files: the parent kept, NO orphan" \
           "SELECT COUNT(*) NXP FROM XP$n; SELECT COUNT(*) NXC FROM XC$n;
            SELECT COUNT(*) ORPH FROM XC$n c WHERE c.B IS NOT NULL

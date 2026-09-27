@@ -20489,6 +20489,10 @@ fn key_value_text(v: &Value) -> Option<String> {
         }
         Value::Double(x) if x.is_finite() => approx_fit_text(*x, false, 23)?,
         Value::Float(x) if x.is_finite() => approx_fit_text(*x as f64, true, 23)?,
+        // an INT128-backed key prints its plain digits (`("ID" = 7.00)`
+        // for a NUMERIC(20,2), measured) - the PSQL literal wraps it in a
+        // CAST to keep its type, which the message never shows
+        Value::Int128(..) => v.render(),
         _ => psql_literal(v)?,
     })
 }
@@ -110883,9 +110887,9 @@ fn parse_frame_bound(s: &str) -> Option<(FrameBound, bool, bool)> {
 /// OVER` names "middle" and a quoted `"MIDDLE"` names it with its quotes.
 /// This server raised a made-up -206 *Column unknown* "FORTNIGHT" there.
 fn part_word_lint(sql: &str) -> Option<EvalErr> {
-    const EXTRACT_PARTS: [&str; 13] = [
+    const EXTRACT_PARTS: [&str; 14] = [
         "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "MILLISECOND", "WEEKDAY",
-        "YEARDAY", "WEEK", "QUARTER", "TIMEZONE_HOUR", "TIMEZONE_MINUTE",
+        "YEARDAY", "WEEK", "QUARTER", "TIMEZONE_HOUR", "TIMEZONE_MINUTE", "TIMEZONE_NAME",
     ];
     const DAY_PARTS: [&str; 4] = ["YEAR", "QUARTER", "MONTH", "WEEK"];
     const NTH_DIRS: [&str; 2] = ["FIRST", "LAST"];

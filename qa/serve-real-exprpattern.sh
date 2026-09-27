@@ -205,8 +205,8 @@ agree "NOT LIKE over a NULL pattern"  "select count(*) n from t where id = 3 and
 # this server whatever the predicate is - measured on the PREVIOUS binary
 # (4af9add), where `(U LIKE 'caf%') IS UNKNOWN` and even `(U IS NULL) IS
 # UNKNOWN` refuse identically. Nothing to do with expression patterns; kept
-# here as a `gap` because this gate is where it was found.
-gap "IS UNKNOWN over a predicate (pre-existing)" \
+# here because this gate is where it was found (a `gap` until 2026-09-27).
+agree "IS UNKNOWN over a predicate (answers since the query-shape round of 2026-09-27)" \
     "select count(*) n from t where (u like pu) is unknown;"
 
 echo "-- 5. the LITERAL and ? forms must not move --"

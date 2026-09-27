@@ -857,7 +857,7 @@ pin  '15 OVERLAY'"'"'s FROM' 'SELECT OVERLAY('"'"'abc'"'"' PLACING '"'"'x'"'"' F
 pin  'CONTROL 15 ... a NULL blob answers NULL' 'SELECT LPAD('"'"'a'"'"', BL), DATEADD(BL DAY TO DATE '"'"'2020-01-01'"'"') FROM TB WHERE ID = 2;' \
      'LPAD DATEADD|<null> <null>'
 rec  '15 RECORDED SUBSTRING FROM a blob (-607 at prepare) is refused' 'SELECT SUBSTRING('"'"'abcdef'"'"' FROM BL) FROM TB WHERE ID = 1;' \
-     'Statement failed, SQLSTATE = HY000|Dynamic SQL Error|-SQL error code = -607|-Array/BLOB/DATE data types not allowed in arithmetic' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+     'Statement failed, SQLSTATE = HY000|Dynamic SQL Error|-SQL error code = -607|-Array/BLOB/DATE data types not allowed in arithmetic' 'Statement failed, SQLSTATE = 42000|expression evaluation not supported'
 rec  '15 RECORDED ROUND'"'"'s places from a blob is refused' 'SELECT ROUND(1.55, BL) FROM TB WHERE ID = 1;' \
      'ROUND|Statement failed, SQLSTATE = 22018|conversion error from string "BLOB"' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
 echo '--- 16. The review of section 15: which literal an INT128 cast re-reads, an assignment'"'"'s target, a stored view or computed column, a join key over a NaN, a NaN'"'"'s form, the binary-to-text filter'

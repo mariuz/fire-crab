@@ -1646,10 +1646,10 @@ both "4l(g) HAVING ? * (MIN(ID)) -> 2" "SELECT ID FROM T GROUP BY ID HAVING ? * 
 # (g) BOUNDARY: a parenthesised COLUMN as the LEFT operand of the `*`
 # refuses on both binaries (a parse boundary, not the width helper's:
 # `(2) * ?` and `? * (ID)` answer) - recorded with the engine's value
-eng_only "4l(g) boundary: (ID) * ? = CAST(2.8 ..) ['1.4'] (engine 2; a parenthesised column before the * is a parse boundary on both binaries)" "SELECT ID FROM T WHERE (ID) * ? = CAST(2.8 AS NUMERIC(9,1))" '["1.4"]'
-eng_only "4l(g) boundary: (BI) * ? = CAST(8.0 ..) ['1.4'] (engine 2)" "SELECT ID FROM T WHERE (BI) * ? = CAST(8.0 AS NUMERIC(9,1))" '["1.4"]'
-eng_only "4l(g) boundary: ((ID)) * ? = CAST(2.8 ..) ['1.4'] (engine 2)" "SELECT ID FROM T WHERE ((ID)) * ? = CAST(2.8 AS NUMERIC(9,1))" '["1.4"]'
-eng_only "4l(g) boundary: NN > 0 AND (ID) * ? = CAST(2.8 ..) ['1.4'] (engine 2)" "SELECT ID FROM T WHERE NN > 0 AND (ID) * ? = CAST(2.8 AS NUMERIC(9,1))" '["1.4"]'
+both "4l(g) (agrees since 2026-09-27) (ID) * ? = CAST(2.8 ..) ['1.4'] (engine 2; a parenthesised column before the * is a parse boundary on both binaries)" "SELECT ID FROM T WHERE (ID) * ? = CAST(2.8 AS NUMERIC(9,1))" '["1.4"]'
+both "4l(g) (agrees since 2026-09-27) (BI) * ? = CAST(8.0 ..) ['1.4'] (engine 2)" "SELECT ID FROM T WHERE (BI) * ? = CAST(8.0 AS NUMERIC(9,1))" '["1.4"]'
+both "4l(g) (agrees since 2026-09-27) ((ID)) * ? = CAST(2.8 ..) ['1.4'] (engine 2)" "SELECT ID FROM T WHERE ((ID)) * ? = CAST(2.8 AS NUMERIC(9,1))" '["1.4"]'
+both "4l(g) (agrees since 2026-09-27) NN > 0 AND (ID) * ? = CAST(2.8 ..) ['1.4'] (engine 2)" "SELECT ID FROM T WHERE NN > 0 AND (ID) * ? = CAST(2.8 AS NUMERIC(9,1))" '["1.4"]'
 eng_only "4l(g) boundary: IIF((ID) * ? = CAST(2.8 ..), 1, 0) = 1 ['1.4'] (engine 2)" "SELECT ID FROM T WHERE IIF((ID) * ? = CAST(2.8 AS NUMERIC(9,1)), 1, 0) = 1" '["1.4"]'
 # an APPROXIMATE sibling is never sized: the node is DOUBLE and no
 # operand rounds (the approximate rung, unchanged by the whitelist)
