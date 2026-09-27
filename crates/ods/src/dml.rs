@@ -1064,8 +1064,7 @@ pub fn apply_ddl_deferred(
                 let page = crate::page_mut(file, page_size, irt_page).ok_or("irt page out of range")?;
                 let at = 24 + slot * 24;
                 if at + 24 <= page.len() {
-                    put_u16(page, at + 18, 0); // irt_flags
-                    page[at + 20] = 6; // irt_drop (ods.h:456)
+                    crate::btr::set_irt_drop(page, at);
                 }
             }
             crate::DdlDeferred::FreeBlob { rel, recno } => {
