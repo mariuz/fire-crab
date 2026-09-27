@@ -2290,6 +2290,32 @@ fn respond_ddl_meta(
             return Ok(true);
         }
     }
+    // DROP DEFAULT of a default the column does not own
+    // ([fire_crab_ods::ddl::alter_column_default]): DYN 229 names the
+    // column bare, DYN 230 quotes it and qualifies the domain (both
+    // measured on 2182)
+    if let Plan::AlterColumnDefault { table, column, default: None } = plan {
+        let qt = format!("\"PUBLIC\".\"{}\"", table.trim_end());
+        let reason = if lc.ends_with("doesn't have a default") {
+            Some((336068837, vec![column.clone()]))
+        } else if let Some((_, dom)) = err_text.split_once(" default belongs to domain ") {
+            Some((336068838, vec![format!("\"{}\"", column), format!("\"PUBLIC\".\"{}\"", dom.trim())]))
+        } else {
+            None
+        };
+        if let Some((code, args)) = reason {
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE).int(1).int(ALTER_TABLE_FAILED).int(2).bytes(qt.as_bytes());
+            w.int(1).int(code);
+            for a in &args {
+                w.int(2).bytes(a.as_bytes());
+            }
+            w.int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
     if let Plan::AlterDomainCheck { domain, .. } = plan {
         // ADD CONSTRAINT over an existing one: "unsuccessful metadata
         // update / ALTER DOMAIN @1 failed / "Only one constraint
@@ -13512,6 +13538,7 @@ fn index_key_fids(db: &Database, rel: u16, descs: &[Descriptor]) -> Vec<usize> {
     resolve_index_ops(db, rel, descs)
         .unwrap_or_default()
         .iter()
+        .filter(|op| op.retrievable)
         .filter_map(|op| op.segs.first().map(|(fid, _, _, _)| *fid))
         .collect()
 }
@@ -35664,6 +35691,19 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
 /// the new format is NULL. The image length follows the same rule an
 /// INSERT's does (fmt_length exactly; a live sample only sanity-checks
 /// it), so the stored record is indistinguishable from a fresh one.
+///
+/// A field an ALTER TYPE rescale pushed past the new storage word
+/// ([fire_crab_ods::format::present_field] gives [Value::OutOfRange])
+/// has no bytes in the new format. The engine's update path MOV_moves
+/// the whole old record into the new format before it applies a single
+/// SET, so ANY write of that row raises 22003 "numeric value is out of
+/// range", whichever column the statement sets, `SET A = NULL` over the
+/// overflowing column itself included (measured on 2182: SMALLINT 32000
+/// retyped to NUMERIC(4,2), then `update t set b = 5`, `set a = 1`, `set
+/// a = null`, an UPDATE OR INSERT and a MERGE matching the row, and a
+/// PSQL UPDATE each raise, and the row keeps 32000). This used to leave
+/// the field NULL and the UPDATE committed it. See [upgrade_image_poisoned]
+/// for the one reader that must NOT raise here.
 fn upgrade_image(
     image: &[u8],
     old: &[Descriptor],
@@ -35671,7 +35711,29 @@ fn upgrade_image(
     db: &Database,
     rel: u16,
     format_no: u8,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, ExecErr> {
+    match upgrade_image_poisoned(image, old, new, db, rel, format_no) {
+        None => Err("a matching record is in an older format".into()),
+        Some((_, poison)) if !poison.is_empty() => Err(ExecErr::Eval(EvalErr::NumericOutOfRange)),
+        Some((img, _)) => Ok(img),
+    }
+}
+
+/// [upgrade_image] for a row that is READ, not rewritten: a DELETE's
+/// RETURNING list. The overflowing fields come back NULL in the image
+/// and their ids beside it, so the caller can poison exactly those slots
+/// ([Affected::poison]); the engine raises only if RETURNING presents
+/// one (measured on 2182: `delete ... returning id` over the overflowing
+/// row answers the id and deletes it, `returning a` raises 22003).
+fn upgrade_image_poisoned(
+    image: &[u8],
+    old: &[Descriptor],
+    new: &[Descriptor],
+    db: &Database,
+    rel: u16,
+    format_no: u8,
+) -> Option<(Vec<u8>, Vec<usize>)> {
+    let mut poison = Vec::new();
     let mut stored_end = 0usize;
     for d in new.iter() {
         if d.offset != 0 {
@@ -35726,6 +35788,12 @@ fn upgrade_image(
             // an array) still falls through to NULL rather than
             // guessing at bytes.
             let vals = old_vals.get_or_insert_with(|| decode_record(image, old));
+            if let Some(v) = vals.get(fid) {
+                if fire_crab_ods::format::present_field(v, o, d) == Some(Value::OutOfRange) {
+                    poison.push(fid);
+                    continue;
+                }
+            }
             let Some(wp) = vals.get(fid).and_then(value_to_wireparam) else {
                 continue;
             };
@@ -35770,7 +35838,7 @@ fn upgrade_image(
         out[at..at + b.len()].copy_from_slice(&b);
         out[fid / 8] &= !(1 << (fid % 8));
     }
-    Some(out)
+    Some((out, poison))
 }
 
 /// Build the record image: every field NULL except the provided ones,
@@ -39600,6 +39668,29 @@ struct Affected {
     /// - what `RETURNING <source alias>.<col>` projects. Empty for
     /// every other statement, which has no second table.
     src_rows: Vec<Vec<Value>>,
+    /// The field ids of each row that an ALTER TYPE rescale pushed out
+    /// of range, parallel to `images` and SHORTER when the tail has none
+    /// ([upgrade_image_poisoned], a DELETE's before-image). The image
+    /// carries NULL there; [Affected::poisoned] turns the slot back into
+    /// [Value::OutOfRange] so RETURNING raises only if it presents it.
+    poison: Vec<Vec<usize>>,
+}
+
+impl Affected {
+    /// Row `i` decoded as a RETURNING list reads it (`width` new fields,
+    /// then `width` old ones when the caller extended it), with its
+    /// overflowing fields poisoned in both halves.
+    fn poisoned(&self, i: usize, mut r: Vec<Value>) -> Vec<Value> {
+        let width = self.descs.len();
+        for &fid in self.poison.get(i).map(Vec::as_slice).unwrap_or(&[]) {
+            for at in [fid, width + fid] {
+                if let Some(v) = r.get_mut(at) {
+                    *v = Value::OutOfRange;
+                }
+            }
+        }
+        r
+    }
 }
 
 /// The relation a DML statement writes, through the wrappers that carry
@@ -41530,8 +41621,7 @@ fn execute_dml_collecting_inner(
                         .find(|(n, _)| *n == fmt)
                         .map(|(_, d)| d)
                         .ok_or("no format for a matching record")?;
-                    upgrade_image(&image, old, descs, db, *rel, *format_no)
-                        .ok_or("a matching record is in an older format")?
+                    upgrade_image(&image, old, descs, db, *rel, *format_no)?
                 } else {
                     image
                 };
@@ -42061,8 +42151,13 @@ fn execute_dml_collecting_inner(
                             .find(|(n, _)| *n == fmt)
                             .map(|(_, d)| d)
                             .ok_or("no format for a matching record")?;
-                        upgrade_image(&image, old, newest, db, *rel, newest_no)
-                            .ok_or("a matching record is in an older format")?
+                        let (img, poison) = upgrade_image_poisoned(&image, old, newest, db, *rel, newest_no)
+                            .ok_or("a matching record is in an older format")?;
+                        if !poison.is_empty() {
+                            a.poison.resize(a.images.len(), Vec::new());
+                            a.poison.push(poison);
+                        }
+                        img
                     };
                     a.descs = newest.clone();
                     a.images.push(img.clone());
@@ -42799,6 +42894,15 @@ struct IndexOp {
     segs: Vec<(usize, u16, i8, u8)>,
     descending: bool,
     unique: bool,
+    /// false for a slot on its way out ([IndexRootEntry::is_dropping]) -
+    /// an INACTIVE or dropped index:
+    /// every writer still keys its tree ([IndexRootPage::live_entries]),
+    /// but no retrieval reads through it, as the engine's optimizer
+    /// never does (measured on 2182: `alter index i34 inactive` plans
+    /// `where a = 7` NATURAL). Reading one here chose the dropped slot
+    /// over the reactivated one, and with the slot's flags gone a DESC
+    /// tree was read as ascending and missed rows.
+    retrievable: bool,
 }
 
 impl IndexOp {
@@ -43311,6 +43415,9 @@ fn pick_for_terms(
         // The LEADING segment is what a predicate can match - a compound
         // index orders by its first column, then within that by the
         // second, so an equality on the first names a CONTIGUOUS BAND.
+        if !op.retrievable {
+            continue;
+        }
         let Some((seg_fid, itype, _, _)) = op.segs.first() else { continue };
         let compound = op.segs.len() > 1;
         // A DESCENDING index IS keyed now, and the arithmetic was read
@@ -43566,7 +43673,9 @@ fn resolve_index_ops_uncached(db: &Database, rel: u16, descs: &[Descriptor]) -> 
         return Some(Vec::new());
     };
     let mut ops = Vec::new();
+    let tips = fire_crab_ods::tra::TipChain::read(&db_image, db.page_size);
     for e in irt.live_entries() {
+        let dropping = e.is_dropping(tips.as_ref());
         let (segs, iflags) = btw::index_segments(
             &db.bytes(),
             db.page_size,
@@ -43618,7 +43727,8 @@ fn resolve_index_ops_uncached(db: &Database, rel: u16, descs: &[Descriptor]) -> 
             id: e.id,
             segs: op_segs,
             descending: iflags & btw::IRT_DESCENDING != 0,
-            unique: iflags & btw::IRT_UNIQUE != 0,
+            unique: iflags & btw::IRT_UNIQUE != 0 && !dropping,
+            retrievable: !dropping,
         });
     }
     Some(ops)
@@ -114946,6 +115056,7 @@ fn run_body_returning(
             Some(o) if !o.is_empty() => r.extend(decode_record(o, &affected.descs)),
             _ => r.resize(width * 2, Value::Null),
         }
+        let r = affected.poisoned(i, r);
         out.push(cols.iter().map(|c| c.value_of(&r)).collect::<Result<Vec<_>, _>>().map_err(psql_raise)?);
     }
     Ok((i64::from(counts.0 + counts.1 + counts.2), out))
@@ -131013,7 +131124,7 @@ fn after_auth(
                                             r.resize(width * 2, Value::Null);
                                             r.extend(sr.iter().cloned());
                                         }
-                                        r
+                                        affected.poisoned(i, r)
                                     })
                                     .collect();
                                 if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -134225,7 +134336,7 @@ fn after_auth(
                             let record = affected
                                 .images
                                 .first()
-                                .map(|img| decode_record(img, &affected.descs));
+                                .map(|img| affected.poisoned(0, decode_record(img, &affected.descs)));
                             let projected: Result<Vec<Value>, EvalErr> = {
                                 let _pre = pre_img.as_ref().map(|i| SubqImageGuard::arm(i.clone()));
                                 match &record {
@@ -150987,10 +151098,10 @@ mod tests {
     /// makes fire-crab's patch-then-write order indistinguishable.
     #[test]
     fn filter_pins_one_row_wants_a_full_unique_key_equality() {
-        let uniq = IndexOp { id: 1, segs: vec![(0, 8, 0, 0)], descending: false, unique: true };
+        let uniq = IndexOp { id: 1, segs: vec![(0, 8, 0, 0)], descending: false, unique: true , retrievable: true };
         let compound =
-            IndexOp { id: 2, segs: vec![(0, 8, 0, 0), (1, 8, 0, 0)], descending: false, unique: true };
-        let nonuniq = IndexOp { id: 3, segs: vec![(0, 8, 0, 0)], descending: false, unique: false };
+            IndexOp { id: 2, segs: vec![(0, 8, 0, 0), (1, 8, 0, 0)], descending: false, unique: true , retrievable: true };
+        let nonuniq = IndexOp { id: 3, segs: vec![(0, 8, 0, 0)], descending: false, unique: false , retrievable: true };
         let eq0 = || Term::Cmp(0, Cmp::Eq, Rhs::Int(3));
         let eq1 = || Term::Cmp(1, Cmp::Eq, Rhs::Int(4));
         // no WHERE at all is the whole table
@@ -151121,7 +151232,7 @@ mod tests {
         // scan and an index retrieval differ in what they READ, and the
         // Filter/Sort above them is identical either way
         let pick = IndexPick {
-            op: IndexOp { id: 2, segs: vec![(0, 8, 0, 0)], descending: false, unique: true },
+            op: IndexOp { id: 2, segs: vec![(0, 8, 0, 0)], descending: false, unique: true , retrievable: true },
             lo: Some((vec![0xC0, 8], true)),
             hi: Some((vec![0xC0, 8], true)),
             navigate: false,
@@ -151215,6 +151326,7 @@ mod tests {
             segs: vec![(0, fire_crab_ods::btw::IDX_NUMERIC, 0, 0)],
             descending: false,
             unique: true,
+            retrievable: true,
         };
         let pick = IndexPick { op: op.clone(), lo: None, hi: None, navigate: false };
         let row_now = vec![Value::Int(20)];

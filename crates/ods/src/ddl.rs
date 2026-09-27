@@ -3063,11 +3063,9 @@ pub fn alter_domain_type(
         (*n, d.clone())
     };
     let mut f_image = {
-        let dp = DataPage::decode(crate::page_at(file, page_size, fpage).ok_or("bad page")?)
-            .ok_or("bad data page")?;
-        dp.record(fslot)
-            .and_then(|r| r.image())
-            .ok_or("no field image")?
+        catalog_patch_base(file, page_size, fpage, fslot)
+            .map_err(|_| "no field image")?
+            .0
     };
     let patch_field = |image: &mut [u8], nm: &str, v: SysVal<'_>| -> Result<(), String> {
         let fid = f_fid(nm).ok_or_else(|| format!("no {} column", nm))?;
@@ -3828,17 +3826,12 @@ pub fn alter_table_alter_column_type(
         (*n, d.clone())
     };
     let mut f_image = {
-        let dp = DataPage::decode(crate::page_at(file, page_size, fpage).ok_or("bad page")?)
-            .ok_or("bad data page")?;
-        // `image()`, NOT `assembled_image` - ON PURPOSE. This reads a
-        // record it is about to REWRITE IN PLACE, and a fragmented one
-        // cannot be rewritten in place: its bytes live on several pages
-        // and the pieces would have to be re-split. `image()` answers
-        // None for a fragmented record, so this errors out instead of
-        // patching the head and leaving the tail describing the old
-        // shape. Refusing is the boundary; the other patch sites in this
-        // file are the same, and the roadmap names them.
-        dp.record(fslot).and_then(|r| r.image()).ok_or("no field image")?
+        // the version the catalog sees, whole - a fragmented one too:
+        // the rewrite below is a versioned [dml::update_records], which
+        // clones the old head, pieces and all, and lays a fresh one
+        catalog_patch_base(file, page_size, fpage, fslot)
+            .map_err(|_| "no field image")?
+            .0
     };
     let patch_field = |image: &mut [u8], name: &str, v: SysVal<'_>| -> Result<(), String> {
         let fid = f_fid(name).ok_or_else(|| format!("no {} column", name))?;
@@ -3962,6 +3955,9 @@ pub fn alter_column_default(
             }
         }
     }
+    if default.is_none() {
+        drop_default_guard(file, page_size, &table, &column)?;
+    }
     let (src_val, val_val) = match default {
         Some(def) => {
             let src =
@@ -3991,6 +3987,51 @@ pub fn alter_column_default(
     // rebuild the runtime so the engine applies (or stops applying) the default
     update_relation_runtime(file, page_size, &table)?;
     advance_oldest_transactions(file, page_size)
+}
+
+/// DROP DEFAULT drops the column's OWN default and nothing else. Measured
+/// on 2182, AUTODDL on or off: a column with no local default is DYN 229
+/// "Local column A doesn't have a default", and one whose default comes
+/// from its domain is DYN 230 "Local column "C" default belongs to domain
+/// "PUBLIC"."D74"" - so a second DROP DEFAULT of a column that had a
+/// local default over a defaulted domain answers the latter. Both were
+/// accepted silently here (the catalog was left as it was).
+fn drop_default_guard(file: &crate::Image, page_size: usize, table: &str, column: &str) -> Result<(), String> {
+    let rf_row = |name: &str, pred: &dyn Fn(&[Value], &dyn Fn(&str) -> Option<usize>) -> bool| {
+        let rel = crate::resolve_relation(file, page_size, name)?;
+        let formats = system_relation_formats(file, page_size, name)?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+        let cols = relation_columns(file, page_size, name);
+        let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+        let mut out = None;
+        walk_rows(file, page_size, rel, descs, |v| {
+            if out.is_none() && pred(v, &fid) {
+                out = Some((v.to_vec(), fid("RDB$DEFAULT_VALUE"), fid("RDB$FIELD_SOURCE")));
+            }
+        });
+        out
+    };
+    let has_default = |row: &(Vec<Value>, Option<usize>, Option<usize>)| {
+        row.1.and_then(|f| row.0.get(f)).is_some_and(|v| !matches!(v, Value::Null))
+    };
+    let Some(rf) = rf_row("RDB$RELATION_FIELDS", &|v, fid| {
+        fid("RDB$RELATION_NAME").is_some_and(|f| text_is(v.get(f), table))
+            && fid("RDB$FIELD_NAME").is_some_and(|f| text_is(v.get(f), column))
+    }) else {
+        return Ok(());
+    };
+    if has_default(&rf) {
+        return Ok(());
+    }
+    let source = match rf.2.and_then(|f| rf.0.get(f)) {
+        Some(Value::Text(t)) => t.trim_end().to_string(),
+        _ => String::new(),
+    };
+    let domain = rf_row("RDB$FIELDS", &|v, fid| fid("RDB$FIELD_NAME").is_some_and(|f| text_is(v.get(f), &source)));
+    if !source.starts_with("RDB$") && domain.as_ref().is_some_and(has_default) {
+        return Err(format!("Local column {} default belongs to domain {}", column, source));
+    }
+    Err(format!("Local column {} doesn't have a default", column))
 }
 
 /// The identity generator backing a column - its `RDB$GENERATOR_NAME` when
@@ -4509,9 +4550,9 @@ fn patch_rf_null_flag(
     let (page, slot) = find_sys_row_slot(file, page_size, "RDB$RELATION_FIELDS", 5, pred)
         .ok_or("RDB$RELATION_FIELDS row not found")?;
     let mut image = {
-        let dp = DataPage::decode(crate::page_at(file, page_size, page).ok_or("bad page")?)
-            .ok_or("bad data page")?;
-        dp.record(slot).and_then(|r| r.image()).ok_or("no field image")?
+        catalog_patch_base(file, page_size, page, slot)
+            .map_err(|_| "no field image")?
+            .0
     };
     let d = rf_descs.get(null_fid).ok_or("field beyond format")?;
     let at = d.offset as usize;
@@ -7554,8 +7595,7 @@ fn mark_index_slot_dropped(
     if at + 24 > page.len() {
         return Err("index slot beyond the root page".into());
     }
-    dml::put_u16(page, at + 18, 0); // irt_flags
-    page[at + 20] = 6; // irt_drop (ods.h:456)
+    crate::btr::set_irt_drop(page, at);
     Ok(())
 }
 
@@ -8076,9 +8116,9 @@ fn deferred_drop_index(
     })
     .ok_or_else(|| format!("index {} not found", index_name))?;
     let mut image = {
-        let dp = DataPage::decode(crate::page_at(file, page_size, page).ok_or("bad page")?)
-            .ok_or("bad data page")?;
-        dp.record(slot).and_then(|r| r.image()).ok_or("no index image")?
+        catalog_patch_base(file, page_size, page, slot)
+            .map_err(|_| "no index image")?
+            .0
     };
     // RDB$INDEX_ID is the irt slot + 1 (both here and in the engine)
     let index_id = {
@@ -8135,16 +8175,18 @@ fn deferred_drop_index(
     if at + 24 > page.len() {
         return Err("index slot beyond the root page".into());
     }
-    // irt_drop (6) with the flags cleared: the SETTLED shape an
-    // engine-dropped index reaches (fcstat reads exactly this back off
-    // an engine file once the dropping transaction is old). The engine
+    // irt_drop (6) with the enforcing flags cleared ([btr::set_irt_drop]
+    // keeps irt_descending, which the writers still keying this tree
+    // need): the SETTLED shape an engine-dropped index reaches before
+    // the sweep frees its slot (measured on 2182: a dropped DESC index's
+    // slot reads state 6, flags 0x0002, until a later attachment turns
+    // it irt_unused with root 0). The engine
     // passes through irt_commit (5) first because its DDL runs inside a
     // transaction that has yet to commit; this writer's statement is
     // already committed when it returns, so the settled state is the
     // honest one - and it is the one gfix validates as clean, since a
     // state-5 index is still scanned while its segment rows are gone
-    dml::put_u16(page, at + 18, 0); // irt_flags
-    page[at + 20] = 6; // irt_drop (ods.h:456)
+    crate::btr::set_irt_drop(page, at);
     Ok(())
 }
 
@@ -9364,11 +9406,13 @@ pub fn create_expression_index(
             continue;
         };
         let seq = dp.sequence as u64;
+        // the chain state read per page: the loop below writes the file
+        let tips = crate::tra::TipChain::read(file, page_size);
         let rows: Vec<(u16, Vec<Value>)> = dp
             .records()
-            .filter(|r| r.is_primary_record())
             .filter_map(|r| {
-                crate::data::assembled_image(file, page_size, &r)
+                // the version the catalog view sees, as [backfill_index_inner]
+                crate::data::catalog_image(file, page_size, &r, tips.as_ref())
                     .map(|img| (r.slot, decode_record(&img, &descs)))
             })
             .collect();
@@ -9516,6 +9560,7 @@ fn backfill_index_inner(
     primary: bool,
 ) -> Result<(), String> {
     let recs = max_recs_per_dp(page_size);
+    let tips = crate::tra::TipChain::read(file, page_size);
     // (key, recno) for every row, then sorted in the tree's order
     let mut keyed: Vec<(Vec<u8>, u64, bool)> = Vec::new();
     for dp_no in relation_data_pages(file, page_size, rel) {
@@ -9525,13 +9570,21 @@ fn backfill_index_inner(
         let seq = dp.sequence as u64;
         let rows: Vec<(u16, Vec<Value>)> = dp
             .records()
-            .filter(|r| r.is_primary_record())
             .filter_map(|r| {
                 // ASSEMBLED, not `image()`. A fragmented row skipped here is
                 // a row MISSING FROM THE INDEX THIS WRITES - and that index is
                 // then read by the REAL engine, which returns nothing for a key
                 // whose row plainly exists. Durable wrong state, not a bad plan.
-                crate::data::assembled_image(file, page_size, &r)
+                //
+                // And the VISIBLE version, not the head: a rolled-back
+                // INSERT or UPDATE leaves a DEAD head in the slot, and
+                // keying it made `alter index i37 active` over a UNIQUE
+                // index refuse "duplicate key" for a row the engine never
+                // counts (measured on 2182: `insert into t20 values (4, 1)`
+                // beside a committed id 4 under the inactive index,
+                // rollback, then ACTIVE succeeds). A dead DELETE stub gives
+                // its row back; a committed one has no row.
+                crate::data::catalog_image(file, page_size, &r, tips.as_ref())
                     .map(|img| (r.slot, decode_record(&img, descs)))
             })
             .collect();
@@ -10782,6 +10835,55 @@ pub enum SysValue<'a> {
     Null,
 }
 
+/// The image a catalog PATCH starts from, for the row whose chain is
+/// headed at `(page, slot)` ([find_sys_row_slot] found it by what the
+/// catalog SEES): that version's image, its format, and whether it is a
+/// fragmented head (only then can the caller poke it in place).
+///
+/// NOT THE PHYSICAL HEAD. The head can be a version the catalog walks
+/// past: a rolled-back DROP's stub, or a rolled-back ALTER's rewrite,
+/// whose transaction is DEAD. Patching the head's bytes resurrected the
+/// rolled-back change and committed it with the new one (measured on the
+/// 2182 file this server writes: `set autoddl off; alter table t47 alter
+/// column b to bb; rollback; alter table t47 alter b set default 'z2';
+/// commit` left RDB$FIELD_NAME 'BB', and a rolled-back `alter column b
+/// position 1` followed by `alter a set default 1` left A at position 2;
+/// the engine keeps B, and A at 1). The patch reads what the finder read
+/// - the visible version under the same view as [crate::data::catalog_image]
+/// - and the new head goes on top of the chain as any update's does.
+///
+/// A FRAGMENTED visible head is read whole too. The sites that rewrite
+/// through [dml::update_records] used to refuse one ("no field image",
+/// read with `image()`), but that write clones the head as the back
+/// version, forward pointer and all, and lays a fresh head - measured:
+/// `alter table w47 alter aa set not null` and `drop index w34` over
+/// rows a long session had grown refused with a bare 42000 where 2182
+/// answers.
+fn catalog_patch_base(
+    file: &crate::Image,
+    page_size: usize,
+    page: u32,
+    slot: u16,
+) -> Result<(Vec<u8>, u8, bool), String> {
+    let dp = DataPage::decode(crate::page_at(file, page_size, page).ok_or("bad page")?)
+        .ok_or("bad data page")?;
+    let r = dp.record(slot).ok_or("no row image")?;
+    let tips = crate::tra::TipChain::read(file, page_size).ok_or("no TIP")?;
+    let own = crate::tra::reader_view().unwrap_or_else(crate::tra::OwnTx::catalog);
+    let v = crate::tra::visible_version(file, page_size, &r, &tips, &own).ok_or("no row image")?;
+    if v.walked > 0 {
+        // a back version: a whole image, never patched in place
+        return Ok((v.image, v.format, false));
+    }
+    let frag = r.flags & crate::data::flags::INCOMPLETE != 0;
+    // A FRAGMENTED ROW IS READ WHOLE and patched in its head. Reading
+    // with `image()` answered None here, which is what refused 88
+    // COMMENT ON and 92 DROP INDEX statements on an ordinary restored
+    // database - see [dml::patch_head_in_place] for why the head is
+    // enough and what happens when it is not.
+    Ok((v.image, r.format, frag))
+}
+
 fn patch_sys_row(
     file: &mut crate::Image,
     page_size: usize,
@@ -10809,33 +10911,7 @@ fn patch_sys_row(
     // It needs a system relation carrying more than one format to fire,
     // so it has been latent rather than absent - and it is reachable on
     // ORDINARY rows, nothing to do with fragmentation.
-    let (mut image, format_no, fragmented) = {
-        let dp = DataPage::decode(crate::page_at(file, page_size, page).ok_or("bad page")?)
-            .ok_or("bad data page")?;
-        let r = dp.record(slot).ok_or("no row image")?;
-        let frag = r.flags & crate::data::flags::INCOMPLETE != 0;
-        // A FRAGMENTED ROW IS READ WHOLE and patched in its head. Reading
-        // with `image()` answered None here, which is what refused 88
-        // COMMENT ON and 92 DROP INDEX statements on an ordinary restored
-        // database - see [dml::patch_head_in_place] for why the head is
-        // enough and what happens when it is not.
-        // A DEAD DELETE STUB at the head (a rolled-back DROP) carries no
-        // data: the row is the version behind it, which is what the
-        // patch starts from ([dml::update_records] links the new head
-        // past the stub). Read off the stub, the image was empty and the
-        // patch "image shorter than its format" - `ALTER EXCEPTION E1`
-        // after a rolled-back `DROP EXCEPTION E1` refused where 2182
-        // alters (measured)
-        if r.flags & crate::data::flags::DELETED != 0 {
-            let tips = crate::tra::TipChain::read(file, page_size).ok_or("no TIP")?;
-            let v = crate::tra::visible_version(file, page_size, &r, &tips, &crate::tra::OwnTx::catalog())
-                .ok_or("no row image")?;
-            (v.image, v.format, false)
-        } else {
-            let img = crate::data::assembled_image(file, page_size, &r).ok_or("no row image")?;
-            (img, r.format, frag)
-        }
-    };
+    let (mut image, format_no, fragmented) = catalog_patch_base(file, page_size, page, slot)?;
     let descs = formats
         .iter()
         .find(|(n, _)| *n == format_no)
