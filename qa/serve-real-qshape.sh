@@ -28,6 +28,10 @@
 #      TWO-VALUED: FALSE, never NULL, for a NULL left side or a set whose
 #      NULL leaves the verdict unknown (a literal IN list stays three-
 #      valued); over no rows IN / ANY are FALSE and NOT IN / ALL TRUE.
+#      A set of UNICODE_CI texts compares under UNICODE_CI (`V IN (SELECT
+#      S FROM CI)` finds 'apple' by 'APPLE'); a GROUP BY key naming such
+#      an item covers nothing - alone it is the -104 "Invalid expression
+#      in the select list", beside the item's column it answers.
 #   7. A parenthesised predicate is a BOOLEAN operand - `(P) IS [NOT]
 #      TRUE / FALSE / UNKNOWN`, `B = (P)`, `COALESCE(P, FALSE)` - and a
 #      COALESCE / NULLIF / IIF / CASE whose value is BOOLEAN is a search
@@ -83,6 +87,16 @@ create table b (id int, bo boolean, i int);
 insert into b values (1,true,1);
 insert into b values (2,false,null);
 insert into b values (3,null,3);
+create table ci (id integer, s varchar(10) character set utf8 collate unicode_ci);
+create table cai (id integer, s varchar(10) character set utf8 collate unicode_ci_ai);
+create table u8 (id integer, s varchar(10) character set utf8);
+insert into ci values (1, 'APPLE');
+insert into ci values (2, 'Straße');
+insert into cai values (1, 'ÁPPLE');
+insert into cai values (2, 'b');
+insert into u8 values (1, 'apple');
+insert into u8 values (2, 'STRASSE');
+insert into u8 values (3, 'straße');
 COMMIT;
 SQL
 } | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/qshape-build.log 2>&1
@@ -252,6 +266,27 @@ pin  "6 IN OR a boolean column" "select id, a in (select x from t2) or bo r from
 pin  "6 compared with a boolean column" "select id, (a in (select x from t2)) = bo r from t1 order by 1;" "ID R|1 <true>|2 <true>|3 <null>|4 <true>|5 <true>|6 <false>"
 pin  "6 CONTROL a literal IN list stays three-valued" "select id, a in (10, null) r1, a not in (10, null) r2 from t1 order by 1;" "ID R1 R2|1 <true> <false>|2 <null> <null>|3 <null> <null>|4 <true> <false>|5 <null> <null>|6 <null> <null>"
 pin  "6 CONTROL WHERE NOT (IN) drops the unknown rows" "select id from t1 where not (a in (select x from t2)) order by 1;" ""
+pin  "6 a UNICODE_CI set compares case-blind: IN" "select id, v in (select s from ci) from t1 order by 1;" "ID BOOL|1 <true>|2 <false>|3 <false>|4 <false>|5 <false>|6 <true>"
+pin  "6 ...a literal left side" "select id, 'apple' in (select s from ci) r from t1 where id < 3 order by 1;" "ID R|1 <true>|2 <true>"
+pin  "6 ...NOT IN" "select id, v not in (select s from ci) r from t1 order by 1;" "ID R|1 <false>|2 <true>|3 <true>|4 <false>|5 <true>|6 <false>"
+pin  "6 ...= ANY and <> ALL" "select id, v = any (select s from ci) r1, v <> all (select s from ci) r2 from t1 order by 1;" "ID R1 R2|1 <true> <false>|2 <false> <true>|3 <false> <true>|4 <false> <false>|5 <false> <true>|6 <true> <false>"
+pin  "6 ...a one-row set" "select id, v in (select s from ci where id = 1) r from t1 order by 1;" "ID R|1 <true>|2 <false>|3 <false>|4 <false>|5 <false>|6 <true>"
+pin  "6 ...under IIF" "select id, iif(v in (select s from ci), 'y', 'n') r from t1 order by 1;" "ID R|1 y|2 n|3 n|4 n|5 n|6 y"
+pin  "6 ...> ANY" "select id, v > any (select s from ci) r from t1 order by 1;" "ID R|1 <false>|2 <true>|3 <true>|4 <false>|5 <false>|6 <false>"
+pin  "6 ...a plain UTF8 column left" "select id, s in (select s from ci) r from u8 order by 1;" "ID R|1 <true>|2 <false>|3 <true>"
+pin  "6 ...an UPPER over the CI column keeps it" "select id, s in (select upper(s) from ci) r from u8 order by 1;" "ID R|1 <true>|2 <false>|3 <true>"
+pin  "6 ...the CI column left, a plain UTF8 set" "select id, s in (select s from u8) r from ci order by 1;" "ID R|1 <true>|2 <true>"
+pin  "6 CONTROL a COLLATE UNICODE set is case-bound" "select id, v in (select s collate unicode from ci) r from t1 order by 1;" "ID R|1 <false>|2 <false>|3 <false>|4 <false>|5 <false>|6 <false>"
+pin  "6 GROUP BY the ordinal of an IN item alone: the -104" "select a in (select x from t2), count(*) from t1 group by 1;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)"
+pin  "6 ...of a > ALL item" "select a > all (select x from t2 where x is not null), count(*) from t1 group by 1;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)"
+pin  "6 ...by its alias" "select a in (select x from t2) as bb, count(*) from t1 group by bb;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)"
+pin  "6 ...over an empty set" "select a in (select id from e), count(*) from t1 group by 1;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)"
+pin  "6 ...beside the item's column it answers" "select a in (select x from t2) bb, count(*) from t1 group by a, bb;" "BB COUNT|<false> 1|<true> 2|<false> 2|<false> 1"
+pin  "6 ...the ordinal after the column" "select a, count(*), a in (select x from t2) from t1 group by 3, 1 order by 1;" "A COUNT BOOL|<null> 1 <false>|10 2 <true>|20 2 <false>|30 1 <false>"
+pin  "6 CONTROL a constant left side groups by 1" "select 1 in (select id from e), count(*) from t1 group by 1;" "BOOL COUNT|<false> 6"
+pin  "6 CONTROL GROUP BY the column under the item" "select a, a in (select x from t2), count(*) from t1 group by a order by 1;" "A BOOL COUNT|<null> <false> 1|10 <true> 2|20 <false> 2|30 <false> 1"
+pin  "6 an item folded to a constant is still described BOOL: over no rows" "set sqlda_display on; select 1 not in (select id from e) from rdb\$database;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 32764 BOOLEAN Nullable scale: 0 subtype: 0 len: 1|: name: BOOL alias: BOOL|: table: schema: owner:|BOOL|<true>"
+pin  "6 ...> ALL over a set holding NULL, aliased" "set sqlda_display on; select a > all (select x from t2) r from t1 where 1=0;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 32764 BOOLEAN Nullable scale: 0 subtype: 0 len: 1|: name: BOOL alias: R|: table: schema: owner:"
 dpin "6 the describe of a projected IN" "select a in (select x from t2) from t1 where id = 1;" "01: sqltype: 32764 BOOLEAN Nullable scale: 0 subtype: 0 len: 1"
 
 echo "--- 7. a predicate is a BOOLEAN value: IS TRUE / UNKNOWN, compared, a COALESCE / IIF / CASE of one as a search condition"
@@ -371,6 +406,11 @@ differs "12 T1.ID over T1 NATURAL JOIN T1 is the engine's -204 ambiguity; this s
 differs "12 a BOOLEAN UNION a number is the engine's HY004; this server's bare refusal" "select bo from t1 union select 1 from rdb\$database;" "Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression UNION" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
 differs "12 a star beside a column is the engine's -104 at the comma; this server's bare refusal" "select * , t3.k from t3;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 10|-," "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
 differs "12 a text-only IN list against an INTEGER: the engine's message pads the item to the list's CHAR(2)" "select id from t1 where a in ('10', 'x') order by 1;" "ID|Statement failed, SQLSTATE = 22018|conversion error from string \"x \"" "ID|Statement failed, SQLSTATE = 22018|conversion error from string \"x\""
+refused "12 two ICU collations meet: a UNICODE_CI_AI column IN a UNICODE_CI set" "select id, s in (select s from ci) r from cai order by 1;"
+refused "12 ...a UNICODE_CI column IN a UNICODE_CI_AI set" "select id, s in (select s from cai) r from ci order by 1;"
+refused "12 ...a QUOTED name on the left side of a UNICODE_CI set (not typed)" "select id, \"V\" in (select s from ci) r from t1 order by 1;"
+refused "12 ...a COLLATE on the left side" "select id, s collate unicode_ci_ai in (select s from ci) r from u8 order by 1;"
+differs "12 GROUP BY the TEXT of a subquery-predicate item is the engine's -104; this server's bare refusal" "select a in (select x from t2) from t1 group by a in (select x from t2);" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
 differs "12 a two-column IN subquery as a value is the engine's 07002; this server's bare refusal" "select id, a in (select x, id from t2) r from t1 order by 1;" "Statement failed, SQLSTATE = 07002|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-count of column list and variable list do not match" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
 
 echo "--- panic check"
@@ -379,5 +419,5 @@ if grep -aq 'panicked at' "/tmp/fc-serve-qshape-$PORT.log"; then echo "FAIL the 
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 207 ]; then echo "FAIL only $ran checks ran (floor 207)"; fail=1; fi
+if [ "$ran" -lt 233 ]; then echo "FAIL only $ran checks ran (floor 233)"; fail=1; fi
 exit $fail

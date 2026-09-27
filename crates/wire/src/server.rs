@@ -50117,6 +50117,14 @@ fn expand_qualified_stars(proj_s: &str, table_s: &str, db: &Database, db_opt: &O
 /// / ANY), and an EMPTY set is FALSE for IN / ANY and TRUE for NOT IN /
 /// ALL, whatever x is (measured).
 ///
+/// The rewritten text comes with the item's select-list POSITION, and
+/// whether its left operand reads a column (a GROUP BY key naming such an
+/// item does not cover it in the engine - see the select-list fold) and
+/// whether the predicate is the WHOLE item, aliased or not (described
+/// BOOL even when it folds to a constant: measured on 2182, `1 IN (SELECT
+/// ID FROM E)` and `A > ALL (SELECT X FROM T2)` are name BOOL, where the
+/// folded TRUE / FALSE would say CONSTANT).
+///
 /// Under a NOT the engine turns the quantifier over (NOT IN is `<> ALL`,
 /// still two-valued), which this reading does not model - an item
 /// holding any other NOT refuses. So does a correlated subquery, a `?`
@@ -50127,9 +50135,10 @@ fn subq_pred_value(
     mark: &str,
     sub: &str,
     is_corr: bool,
+    scope: Option<&CorrScope>,
     dbr: &Database,
     db: &Option<Database>,
-) -> Option<Option<String>> {
+) -> Option<Option<(String, usize, bool, bool)>> {
     let up = mask_literals(&text.to_ascii_uppercase());
     // the marker itself - `FC$SUBQ1` is a prefix of `FC$SUBQ10`
     let at = {
@@ -50267,9 +50276,65 @@ fn subq_pred_value(
         return Some(None);
     };
     let has_null = rows.values.iter().any(|v| matches!(v, Value::Null));
+    // A text column under an ICU collation keeps it: the members are
+    // compared under the SET's collation. Measured on 2182 (a NONE
+    // attachment): with CI.S UTF8 UNICODE_CI holding 'apple', `V IN
+    // (SELECT S FROM CI)` is TRUE for a plain V = 'APPLE', as is `'APPLE'
+    // IN (..)`, `= ANY`, and FALSE under `NOT IN` / `<> ALL` - where the
+    // members spliced as bare literals compared bytes. Each member is
+    // spelled `CAST(x'..' AS .. CHARACTER SET <cs>) COLLATE <name>`, the
+    // literal-list form the engine answers alike.
+    // An operand of ANOTHER ICU collation meets two, and the engine's
+    // choice between them is not modelled (measured: CAI.S (UNICODE_CI_AI)
+    // `IN (SELECT S FROM CI)` and CI.S `IN (SELECT S FROM CAI)` both
+    // compare accent-blind) - refused, as is an operand with its own
+    // COLLATE or one whose columns the scope cannot type.
+    let set_tt = subq_icu_ttype(sub, db);
+    if let Some(tt) = set_tt {
+        let lu = mask_literals(&lhs.to_ascii_uppercase());
+        // (a quoted name is masked like a literal: not typed here)
+        if find_word(&lu, "COLLATE", 0).is_some() || lhs.contains('"') {
+            return Some(None);
+        }
+        let words: Vec<&str> = lu
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+            .filter(|w| w.starts_with(|c: char| c.is_ascii_alphabetic()))
+            .collect();
+        let icu = |t: u16| fire_crab_ods::coll::icu_strength_of_ttype(t).is_some();
+        let other_icu = |d: &Option<Descriptor>| {
+            d.as_ref().is_some_and(|d| {
+                matches!(col_kind(d), Some(ColKind::Text))
+                    && d.sub_type >= 0
+                    && icu(d.sub_type as u16)
+                    && d.sub_type as u16 != tt
+            })
+        };
+        match scope {
+            Some(sc) => {
+                let hit = sc.rels.iter().flat_map(|r| r.cols.iter()).any(|(n, d)| {
+                    words.iter().any(|w| w.eq_ignore_ascii_case(n)) && (d.is_none() || other_icu(d))
+                });
+                if hit {
+                    return Some(None);
+                }
+            }
+            None if !words.is_empty() => return Some(None),
+            None => {}
+        }
+    }
+    let coll = set_tt.map(icu_coll_name);
     let mut lits: Vec<String> = Vec::with_capacity(rows.values.len());
     for v in rows.values.iter().filter(|v| !matches!(v, Value::Null)) {
-        match subq_text_literal(v, sub, db).or_else(|| value_literal(v)) {
+        let lit = match (&coll, v) {
+            (Some(name), Value::Text(_)) => {
+                let (Some(name), Some(l)) = (name, subq_text_literal(v, sub, db)) else {
+                    return Some(None);
+                };
+                Some(format!("{} COLLATE {}", l, name))
+            }
+            _ => subq_text_literal(v, sub, db).or_else(|| value_literal(v)),
+        };
+        match lit {
             Some(l) => lits.push(l),
             None => return Some(None),
         }
@@ -50302,7 +50367,18 @@ fn subq_pred_value(
     let span = squash(&text[lhs_stop..at + mark.len()]);
     let alone = split_top_level_commas(text).iter().any(|item| squash(item) == span);
     let repl = if alone { format!("({}) AS BOOL", pred) } else { format!("({})", pred) };
-    Some(Some(format!("{}{}{}", &text[..lhs_stop], repl, &text[at + mark.len()..])))
+    let reads_col = !parse_raw_expr_any(lhs).is_some_and(|e| raw_is_constant(&e));
+    let pos = (0..item_start).filter(|&p| depth0_comma(p)).count();
+    // ... or it with an alias: `AS <name>` or a bare `<name>` after it
+    let whole = alone || {
+        let it = squash(&text[item_start..item_end]);
+        it.strip_prefix(span.as_str()).is_some_and(|tail| {
+            let t = tail.trim();
+            let t = if t.len() > 3 && t[..3].eq_ignore_ascii_case("AS ") { t[3..].trim() } else { t };
+            !t.is_empty() && !t.contains(' ') && !t.contains(['(', ')', '+', '-', '*', '/', '|', '=', '<', '>'])
+        })
+    };
+    Some(Some((format!("{}{}{}", &text[..lhs_stop], repl, &text[at + mark.len()..]), pos, reads_col, whole)))
 }
 
 /// A WHERE the token grammar cannot read, read instead as ONE BOOLEAN
@@ -59179,6 +59255,11 @@ fn plan_query_inner_at_body(
                 // (select-list position, name) of each whole-item folded
                 // or per-row subquery - its describe name, never an alias
                 let mut name_patches: Vec<(usize, String)> = Vec::new();
+                // select-list positions of subquery-predicate items whose
+                // left operand reads a column ([subq_pred_value])
+                let mut pred_items: Vec<usize> = Vec::new();
+                // ... and of those that are a WHOLE item, described BOOL
+                let mut pred_whole: Vec<usize> = Vec::new();
                 for (i, sub) in subs.iter().enumerate() {
                     let mark = format!("{}{}", SUBQ_MARK, i);
                     let scan = scope.as_ref().and_then(|sc| corr_scan(sub, sc, dbr, db));
@@ -59192,14 +59273,34 @@ fn plan_query_inner_at_body(
                     // `<x> [NOT] IN (SELECT ..)` and `<x> <op> ALL | ANY |
                     // SOME (SELECT ..)` lift as a subquery too, and are a
                     // SET, never a scalar ([subq_pred_value])
-                    if let Some(done) = subq_pred_value(&proj_out, &mark, sub, is_corr, dbr, db) {
-                        let Some(text) = done else {
+                    if let Some(done) = subq_pred_value(&proj_out, &mark, sub, is_corr, scope.as_ref(), dbr, db) {
+                        let Some((text, pos, reads_col, whole)) = done else {
                             if trace {
                                 eprintln!("[srv] plan: select-list subquery predicate {:?} not answerable", sub);
                             }
                             return Some(Plan::Refused);
                         };
                         proj_out = text;
+                        // a STAR item spreads over many columns, so an item's
+                        // position is no column's: grouped, that refuses
+                        let starred = split_top_level_commas(&proj_out)
+                            .iter()
+                            .any(|it| {
+                                let t = it.trim();
+                                t == "*" || t.ends_with(".*")
+                            });
+                        if starred {
+                            if reads_col && group_s.is_some() {
+                                return Some(Plan::Refused);
+                            }
+                        } else {
+                            if reads_col {
+                                pred_items.push(pos);
+                            }
+                            if whole {
+                                pred_whole.push(pos);
+                            }
+                        }
                         continue;
                     }
                     // `EXISTS (SELECT ...)` lifts as a subquery too - the
@@ -59430,6 +59531,48 @@ fn plan_query_inner_at_body(
                         }
                     }
                 }
+                // A GROUP BY key naming a SUBQUERY-PREDICATE item - its
+                // ordinal or its alias - groups by nothing the item can
+                // match: the engine's subquery never equals another, so
+                // the item must still be covered by the other keys.
+                // Measured on 2182: `SELECT A IN (SELECT X FROM T2),
+                // COUNT(*) FROM T1 GROUP BY 1` (or `.. AS BB .. GROUP BY
+                // BB`) is the -104 "Invalid expression in the select
+                // list", `.. GROUP BY A, 1` answers A's groups, and a
+                // CONSTANT left side (`1 IN (SELECT ..)`) groups by 1.
+                // Folded to a literal list, the item WAS its own key and
+                // answered. So such a key is dropped when another stays
+                // (the item's columns then answer to the usual check),
+                // and alone it is that -104.
+                let group_kept: Option<String> = match group_s {
+                    Some(g) if !pred_items.is_empty() => {
+                        let items = split_top_level_commas(&proj_out);
+                        let names_pred = |k: &str| -> bool {
+                            if let Ok(n) = k.parse::<usize>() {
+                                return n >= 1 && pred_items.contains(&(n - 1));
+                            }
+                            pred_items.iter().any(|&p| {
+                                items.get(p).is_some_and(|it| {
+                                    split_alias(it).1.is_some_and(|a| {
+                                        canon_ident(a).is_some() && canon_ident(a) == canon_ident(k)
+                                    })
+                                })
+                            })
+                        };
+                        let keys = split_top_level_commas(g);
+                        let kept: Vec<&str> = keys.iter().map(|k| k.trim()).filter(|k| !names_pred(k)).collect();
+                        if kept.is_empty() {
+                            if trace {
+                                eprintln!("[srv] plan: GROUP BY names only a subquery-predicate item - the engine's -104");
+                            }
+                            PREPARE_REFUSAL.with(|r| *r.borrow_mut() = Some(EvalErr::AggColumnSelectList));
+                            return Some(Plan::Refused);
+                        }
+                        Some(kept.join(", "))
+                    }
+                    g => g.map(str::to_string),
+                };
+                let group_s = group_kept.as_deref();
                 let mut out = format!("SELECT {} FROM {}", proj_out, table_s);
                 if let Some(w) = where_s {
                     out.push_str(&format!(" WHERE {}", w));
@@ -59517,6 +59660,20 @@ fn plan_query_inner_at_body(
                     {
                         if let Some(c) = cols.get_mut(*idx) {
                             c.name = n.clone();
+                        }
+                    }
+                }
+                for idx in &pred_whole {
+                    if let Plan::Project { cols, .. }
+                    | Plan::Join { cols, .. }
+                    | Plan::JoinGroup { cols, .. }
+                    | Plan::Group { cols, .. }
+                    | Plan::Union { cols, .. }
+                    | Plan::Derived { cols, .. }
+                    | Plan::Rows { cols, .. } = &mut plan
+                    {
+                        if let Some(c) = cols.get_mut(*idx) {
+                            c.fname = Some("BOOL".to_string());
                         }
                     }
                 }
@@ -71578,6 +71735,9 @@ const GDS_DSQL_CTE_WRONG_CLAUSE: i32 = 336397231;
 const GDS_DSQL_CTE_UNION_ALL: i32 = 336397232;
 /// isc_dsql_cte_nested_with (SQLERR 946): "WITH clause can't be nested"
 const GDS_DSQL_CTE_NESTED_WITH: i32 = 336397234;
+/// isc_dsql_agg_column_err (JRD 504): "Invalid expression in the @1 (not
+/// contained in either an aggregate function or the GROUP BY clause)"
+const GDS_DSQL_AGG_COLUMN_ERR: i32 = 335544824;
 /// isc_dsql_col_more_than_once_using (SQLERR 947): "column @1 appears
 /// more than once in USING clause"
 const GDS_DSQL_COL_MORE_THAN_ONCE_USING: i32 = 336397235;
@@ -72430,6 +72590,7 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
         | EvalErr::CteUnionAll(_)
         | EvalErr::UsingColTwice(_)
         | EvalErr::CteNestedWith
+        | EvalErr::AggColumnSelectList
         | EvalErr::CteNonRecursAfterRecurs(_) => {
             w.int(1)
                 .int(GDS_DSQL_ERROR)
@@ -72467,6 +72628,11 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 }
                 EvalErr::CteNestedWith => {
                     w.int(GDS_DSQL_CTE_NESTED_WITH);
+                }
+                EvalErr::AggColumnSelectList => {
+                    w.int(GDS_DSQL_AGG_COLUMN_ERR)
+                        .int(2) // isc_arg_string - @1
+                        .bytes(b"select list");
                 }
                 EvalErr::UsingColTwice(name) => {
                     w.int(GDS_DSQL_COL_MORE_THAN_ONCE_USING)
@@ -87761,6 +87927,11 @@ enum EvalErr {
     /// isc_dsql_cte_nested_with under the -104 wrapper, "WITH clause
     /// can't be nested" (measured on 2182)
     CteNestedWith,
+    /// a select item no GROUP BY key covers - isc_dsql_agg_column_err
+    /// under the -104 wrapper, @1 "select list": "Invalid expression in
+    /// the select list (not contained in either an aggregate function or
+    /// the GROUP BY clause)" (measured on 2182)
+    AggColumnSelectList,
     /// a UNION's ORDER BY key that is not an ordinal of its columns -
     /// isc_dsql_command_err + isc_order_by_err under the -104 wrapper,
     /// "Invalid command / invalid ORDER BY clause" (measured on 2182 for
