@@ -1075,18 +1075,19 @@ both "16f contrast NUMERIC(9,1) parent / NUMERIC(9,3) child - both sides scaled"
       COMMIT; INSERT INTO ZS1 VALUES (7.0); COMMIT; INSERT INTO ZC1 VALUES (1, 7.000); COMMIT;
       DELETE FROM ZS1 WHERE ID = 7.0; COMMIT; SELECT COUNT(*) N FROM ZS1;"
 # a DOUBLE PRECISION key is APPROXIMATE: both servers refuse and both
-# files keep the same rows, and they differ only in how the refusal
-# RENDERS the key - `7e0` against the engine's `7.000000000000000`.
-# PRE-EXISTING (identical on the previous round's binary); both answers
-# are pinned rather than skipped.
-gap "16f contrast DOUBLE PRECISION key, DEFAULT 7 - approximate, not exact" \
-    "CREATE TABLE DPP (ID DOUBLE PRECISION NOT NULL PRIMARY KEY);
+# files keep the same rows. They differed in how the refusal RENDERED the
+# key - `7e0` here against the engine's `7.000000000000000` - until the
+# key value took DescPrinter's own form (CVT's `%#.16g`,
+# qa/serve-real-errvec.sh section 9); both answers are pinned.
+DPQ="CREATE TABLE DPP (ID DOUBLE PRECISION NOT NULL PRIMARY KEY);
      CREATE TABLE DPC (X INTEGER, B DOUBLE PRECISION DEFAULT 7,
                        CONSTRAINT DPK FOREIGN KEY (B) REFERENCES DPP ON DELETE SET DEFAULT);
      COMMIT; INSERT INTO DPP VALUES (7); INSERT INTO DPC VALUES (100, 7); COMMIT;
      DELETE FROM DPP WHERE ID = 7; COMMIT;
-     SELECT COUNT(*) NP FROM DPP; SELECT B CB FROM DPC;" \
-    'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "DPK" on table "PUBLIC"."DPC"|-Foreign key references are present for the record|-Problematic key value is ("ID" = 7e0)|NP 1|CB 7.000000000000000|' \
+     SELECT COUNT(*) NP FROM DPP; SELECT B CB FROM DPC;"
+check "16f contrast DOUBLE PRECISION key, DEFAULT 7 - approximate, not exact - fire-crab's answer" "$(crabq "$DPQ")" \
+    'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "DPK" on table "PUBLIC"."DPC"|-Foreign key references are present for the record|-Problematic key value is ("ID" = 7.000000000000000)|NP 1|CB 7.000000000000000|'
+check "16f contrast DOUBLE PRECISION key, DEFAULT 7 - the ENGINE's own answer" "$(engineq "$DPQ")" \
     'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "DPK" on table "PUBLIC"."DPC"|-Foreign key references are present for the record|-Problematic key value is ("ID" = 7.000000000000000)|NP 1|CB 7.000000000000000|'
 both "16f contrast a default that is a DIFFERENT key still lets the DELETE through" \
      "CREATE TABLE OKP (ID NUMERIC(9,2) NOT NULL PRIMARY KEY);

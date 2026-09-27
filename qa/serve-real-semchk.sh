@@ -76,9 +76,8 @@
 #
 # RECORDED, not fixed (every one a refusal on this server, never a wrong
 # answer): a quoted CTE name; a CTE referenced only inside a subquery or
-# a derived table; a nested WITH; a bare (unqualified) unknown column,
-# whose -206 this server does not spell; a UNION's ORDER BY and a plain
-# column beside a HAVING (the engine's -104s); a statement whose SYNTAX
+# a derived table; a nested WITH; a UNION's ORDER BY (the engine's -104);
+# a statement whose SYNTAX
 # the engine's parser refuses (a Token unknown) carrying a -206 here; an
 # EXECUTE BLOCK or a CREATE VIEW / PROCEDURE carrying any of the five
 # (the engine's vector, sometimes under "unsuccessful metadata update");
@@ -94,6 +93,10 @@
 # alias-first law's refusal); under a NONE attachment a non-ASCII name in
 # an error text (re-encoded here, the engine echoes its bytes); a window
 # defined over another one (the engine's -204 comes first).
+# (A bare unknown column and a plain column beside a HAVING - the -206
+# and the -104 this server did not spell - and the bare ORDER / GROUP BY
+# of a name only a select-list subquery carries were recorded here; the
+# refusal diagnosis of qa/serve-real-errvec.sh names them now, pins.)
 #
 # THE QSHAPE ROUND (qa/serve-real-qshape.sh) closed eleven RECORDED cells,
 # pinned now with the engine's answer: a qualified star over a join or
@@ -458,8 +461,8 @@ pin  "3b ...a select-list subquery AFTER the plain items" "select (select t1.a f
 pin  "3b ...the first UNION member first" "select t.id from t1 t where t1.a = 1 union all select t.id from t1 t where t1.b = 2;" "$E206|-\"T1\".\"A\"|-At line 1, column 29"
 pin  "3 the THEN branch of a CASE is read before its condition (promoted: recorded in the first round)" "select t.id from t1 t where case when t1.a = 1 then t1.b else 0 end > 0;" "$E206|-\"T1\".\"B\"|-At line 1, column 53"
 pin  "3 RECORDED a UNION's ORDER BY is the union's -104 (answers since the qshape chunk)" "select t.id from t1 t union all select t.id from t1 t order by t1.id;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-invalid ORDER BY clause"
-err_differs "3 RECORDED a plain column beside a HAVING is the select list's -104" "select t.id from t1 t having t1.id = 1;" "Invalid expression in the select list"
-err_differs "3 RECORDED a bare unknown column" "select t.id from t1 t where nosuch = 1;" "Column unknown|-\"NOSUCH\""
+pin "3 a plain column beside a HAVING is the select list's -104" "select t.id from t1 t having t1.id = 1;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)"
+pin "3 a bare unknown column" "select t.id from t1 t where nosuch = 1;" "Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-\"NOSUCH\"|-At line 1, column 29"
 err_differs "3 RECORDED inside an EXECUTE BLOCK" "$(eb 'execute block returns (n integer) as begin select first 1 t.id from t1 t order by t1.id into n; suspend; end')" "\"T1\".\"ID\"|-At line 1, column 83"
 err_differs "3 RECORDED CREATE VIEW" "create view vsem as select t.id from t1 t order by t1.id;" "\"T1\".\"ID\"|-At line 1, column 52"
 
@@ -847,9 +850,9 @@ pin  "1d ...ORDER BY 1, T.ID" "select (select x.id from t2 x where x.id = 1) fro
 pin  "1d ...under a WHERE" "select (select x.id from t2 x where x.id = 1) from t1 t where t.id = 1 order by t.id;" "ID|1"
 pin  "1d ...beside a field item" "select (select x.id from t2 x where x.id = 1), t.a from t1 t order by t.id;" "ID A|1 10|1 20|1 <null>|1 10|1 30|1 20"
 pin  "1d a bare GROUP BY of its name is the COLUMN: six groups (one here before)" "select (select x.id from t2 x where x.id = 1) from t1 t group by id;" "ID|1|1|1|1|1|1"
-err_differs "1d ...a bare ORDER BY of a name only the subquery carries is -206 (answered here before)" "select (select x.x from t2 x where x.id = 2) from t1 t order by x;" "-\"X\"|-At line 1, column 65"
-err_differs "1d ...GROUP BY" "select (select x.x from t2 x where x.id = 2) from t1 t group by x;" "-\"X\"|-At line 1, column 65"
-err_differs "1d ...a text one" "select (select x.s from t2 x where x.id = 2) from t1 t where t.id < 3 order by s;" "-\"S\"|-At line 1, column 80"
+pin "1d ...a bare ORDER BY of a name only the subquery carries is -206 (answered here before)" "select (select x.x from t2 x where x.id = 2) from t1 t order by x;" "Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-\"X\"|-At line 1, column 65"
+pin "1d ...GROUP BY" "select (select x.x from t2 x where x.id = 2) from t1 t group by x;" "Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-\"X\"|-At line 1, column 65"
+pin "1d ...a text one" "select (select x.s from t2 x where x.id = 2) from t1 t where t.id < 3 order by s;" "Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-\"S\"|-At line 1, column 80"
 pin  "1d a derived table's subquery column is named" "select * from (select (select x.x from t2 x where x.id = 2), t.id from t1 t where t.id < 3) d;" "X ID|6 1|6 2"
 pin  "1d ...correlated" "select * from (select (select x.x from t2 x where x.id = t.id) from t1 t where t.id < 3) d;" "X|5|6"
 pin  "1d ...an unqualified inner" "select * from (select (select name from t3 where k = 2) from t1 t where t.id < 3) d;" "NAME|y|y"
@@ -887,13 +890,13 @@ pin  "1e ...ROWS" "select (select x.a from t1 x where x.id = 7 - t.id) from t1 t
 pin  "1e ...over a derived table" "select (select x.a from t1 x where x.id = 7 - d.id) from (select id, a from t1) d order by a;" "A|10|20|<null>|30|10|20"
 pin  "1e ...over a CTE" "with c as (select id, a from t1) select (select x.a from t1 x where x.id = 7 - c.id) from c order by a;" "A|10|20|<null>|30|10|20"
 pin  "1e ...over a join" "select (select x.a from t1 x where x.id = 7 - t.id) from t1 t join t2 u on u.id = t.id order by a;" "A|10|20|<null>|30|10|20"
-err_differs "1e ...a name only the subquery carries is -206 (answered here before)" "select (select x.x from t2 x where x.id = t.id) from t1 t order by x;" "-\"X\"|-At line 1, column 68"
-err_differs "1e ...a text one" "select (select x.s from t2 x where x.id = t.id) from t1 t order by s;" "-\"S\"|-At line 1, column 68"
-err_differs "1e ...an inner alias" "select (select x.x as q from t2 x where x.id = t.id) from t1 t order by q;" "-\"Q\"|-At line 1, column 73"
-err_differs "1e ...DISTINCT" "select distinct (select x.x from t2 x where x.id = t.id) from t1 t order by x;" "-\"X\"|-At line 1, column 77"
-err_differs "1e ...beside an EXISTS" "select (select x.s from t2 x where x.id = t.id) from t1 t where exists (select 1 from t2 z where z.t1id = t.id) order by s;" "-\"S\"|-At line 1, column 122"
-err_differs "1e ...grouped" "select (select x.s from t2 x where x.id = t.id) from t1 t group by t.id order by s;" "-\"S\"|-At line 1, column 82"
-err_differs "1e ...GROUP BY" "select (select x.x from t2 x where x.id = t.id) from t1 t group by x;" "-\"X\"|-At line 1, column 68"
+pin "1e ...a name only the subquery carries is -206 (answered here before)" "select (select x.x from t2 x where x.id = t.id) from t1 t order by x;" "Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-\"X\"|-At line 1, column 68"
+pin "1e ...a text one" "select (select x.s from t2 x where x.id = t.id) from t1 t order by s;" "Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-\"S\"|-At line 1, column 68"
+pin "1e ...an inner alias" "select (select x.x as q from t2 x where x.id = t.id) from t1 t order by q;" "Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-\"Q\"|-At line 1, column 73"
+pin "1e ...DISTINCT" "select distinct (select x.x from t2 x where x.id = t.id) from t1 t order by x;" "Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-\"X\"|-At line 1, column 77"
+pin "1e ...beside an EXISTS" "select (select x.s from t2 x where x.id = t.id) from t1 t where exists (select 1 from t2 z where z.t1id = t.id) order by s;" "Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-\"S\"|-At line 1, column 122"
+pin "1e ...grouped" "select (select x.s from t2 x where x.id = t.id) from t1 t group by t.id order by s;" "Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-\"S\"|-At line 1, column 82"
+pin "1e ...GROUP BY" "select (select x.x from t2 x where x.id = t.id) from t1 t group by x;" "Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-\"X\"|-At line 1, column 68"
 err_differs "1e ...over a derived table" "select (select x.x from t2 x where x.id = d.id) from (select id, a from t1) d order by x;" "-\"X\"|-At line 1, column 88"
 pin  "1e CONTROL a real alias of its name still sorts by the subquery" "select (select x.x from t2 x where x.id = t.id) as x from t1 t order by x;" "X|<null>|5|6|8|9|10"
 pin  "1e CONTROL ...ORDER BY 1 DESC" "select (select x.x from t2 x where x.id = t.id) from t1 t order by 1 desc;" "X|10|9|8|6|5|<null>"

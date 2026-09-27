@@ -2215,18 +2215,21 @@ fn domain_dependents(
 /// The first table.column that uses a domain as its `RDB$FIELD_SOURCE`
 /// (None if the domain is unused) - a `DROP DOMAIN` is refused while it
 /// is in use.
-fn domain_user(file: &crate::Image, page_size: usize, name: &str) -> Option<String> {
+/// The first `RDB$RELATION_FIELDS` row whose source is the domain, in
+/// storage order - the one the engine's DROP DOMAIN names: its relation
+/// and its local (column) name.
+fn domain_user(file: &crate::Image, page_size: usize, name: &str) -> Option<(String, String)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS")?;
     let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     let cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
-    let (rn_f, src_f) = (fid("RDB$RELATION_NAME")?, fid("RDB$FIELD_SOURCE")?);
+    let (rn_f, src_f, fn_f) = (fid("RDB$RELATION_NAME")?, fid("RDB$FIELD_SOURCE")?, fid("RDB$FIELD_NAME")?);
     let mut used = None;
     walk_rows(file, page_size, rel, descs, |v| {
         if used.is_none() && text_eq(v.get(src_f), name) {
-            if let Some(Value::Text(t)) = v.get(rn_f) {
-                used = Some(t.trim_end().to_string());
+            if let (Some(Value::Text(t)), Some(Value::Text(f))) = (v.get(rn_f), v.get(fn_f)) {
+                used = Some((t.trim_end().to_string(), f.trim_end().to_string()));
             }
         }
     });
@@ -2539,8 +2542,8 @@ pub fn drop_domain(file: &mut crate::Image, page_size: usize, name: &str) -> Res
     if !domain_exists(file, page_size, &want) {
         return Err(format!("Domain {} not found", want));
     }
-    if let Some(user) = domain_user(file, page_size, &want) {
-        return Err(format!("Domain {} is used in table {}", want, user));
+    if let Some((user, local)) = domain_user(file, page_size, &want) {
+        return Err(format!("Domain {} is used in table {} (local name {})", want, user, local));
     }
     // the domain's security class and its owner privilege go with it (the
     // engine drops both), then the RDB$FIELDS row

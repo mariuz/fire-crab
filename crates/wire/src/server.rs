@@ -2006,6 +2006,78 @@ fn respond_ddl_meta(
             _ => ddl_relation_target(plan).map(|t| (ALTER_TABLE_FAILED, q(t))),
         }
     };
+    // THREE REFUSALS OF THE CATALOG WRITE ITSELF, each at EXECUTE and
+    // under "<VERB> @1 failed" (measured on 2182 through the two-phase
+    // rig; they answered a bare Dynamic SQL Error here):
+    //   * CREATE TABLE naming a column twice - the engine's second
+    //     RDB$RELATION_FIELDS row violates that table's unique index
+    //     RDB$INDEX_72, and the vector says so, key value and all (23000);
+    //   * DROP DOMAIN of a domain a column is built on - DYN 43 "Domain @1
+    //     is used in table @2 (local name @3) and cannot be dropped", the
+    //     first such column in storage order;
+    //   * CREATE INDEX over a column its table lacks - DYN 120 "Unknown
+    //     columns in index @1".
+    let quoted = |n: &str| format!("\"PUBLIC\".\"{}\"", n.trim_end());
+    let ddl_failed = |verb: i32, object: String, inner: Vec<StatusItem>| EvalErr::DdlFailed {
+        verb,
+        object,
+        inner: Box::new(EvalErr::Status(inner)),
+    };
+    if let Plan::CreateTable { name, cols, .. } = plan {
+        let dup = cols.iter().enumerate().find_map(|(i, c)| cols[..i].iter().any(|p| p.name == c.name).then_some(&c.name));
+        if let (Some(col), "duplicate key in unique index") = (dup, err_text) {
+            let key = format!(
+                "(\"RDB$FIELD_NAME\" = '{}', \"RDB$SCHEMA_NAME\" = 'PUBLIC', \"RDB$PACKAGE_NAME\" = NULL, \"RDB$RELATION_NAME\" = '{}')",
+                col.replace('\'', "''"),
+                name.trim_end().replace('\'', "''")
+            );
+            let e = ddl_failed(
+                336397286, // isc_dsql_create_table_failed
+                quoted(name),
+                vec![
+                    StatusItem::Gds(GDS_UNIQUE_KEY_VIOLATION),
+                    StatusItem::Str("\"RDB$INDEX_72\"".to_string()),
+                    StatusItem::Str("\"SYSTEM\".\"RDB$RELATION_FIELDS\"".to_string()),
+                    StatusItem::Gds(GDS_IDX_KEY_VALUE),
+                    StatusItem::Str(key),
+                ],
+            );
+            respond_eval_error(s, enc, &e)?;
+            return Ok(true);
+        }
+    }
+    if let Plan::DropDomain { name } = plan {
+        let used = err_text.strip_prefix("Domain ").and_then(|r| r.split_once(" is used in table ")).and_then(|(d, rest)| {
+            let (table, local) = rest.strip_suffix(')')?.split_once(" (local name ")?;
+            Some((d, table, local))
+        });
+        if let Some((d, table, local)) = used {
+            let e = ddl_failed(
+                336397279, // isc_dsql_drop_domain_failed
+                q(name),
+                vec![
+                    StatusItem::Gds(336068651), // DYN 43
+                    StatusItem::Str(quoted(d)),
+                    StatusItem::Str(quoted(table)),
+                    StatusItem::Str(format!("\"{}\"", local)),
+                ],
+            );
+            respond_eval_error(s, enc, &e)?;
+            return Ok(true);
+        }
+    }
+    if let Plan::CreateIndex { name, .. } = plan {
+        if err_text.starts_with("unknown column ") {
+            let qn = q(name);
+            let e = ddl_failed(
+                336397316, // isc_dsql_create_index_failed
+                qn.clone(),
+                vec![StatusItem::Gds(336068728), StatusItem::Str(qn)], // DYN 120
+            );
+            respond_eval_error(s, enc, &e)?;
+            return Ok(true);
+        }
+    }
     // A VIEW THE ENGINE REFUSES TO WRITE ([Plan::CreateViewRefused]):
     // "unsuccessful metadata update / <VERB> @1 failed / SQL error code =
     // -607 / Invalid command / <reason>" - the reason isc_specify_field_err
@@ -10079,6 +10151,19 @@ enum Plan {
     /// columns does not match select list", SQLSTATE 07002). Planned so
     /// the refusal fires in the engine's phase; nothing is written.
     CreateViewRefused { name: String, reason: String, verb: i32 },
+    /// A `CREATE TABLE` the engine refuses when it RUNS - the two-phase
+    /// rig's measurement: PREPARE succeeds, EXECUTE answers "unsuccessful
+    /// metadata update / CREATE TABLE @1 failed / <inner>". One reason
+    /// today: a SECOND PRIMARY KEY ("Attempt to define a second PRIMARY
+    /// KEY for the same table", 42S11), which refused bare at prepare.
+    /// Nothing is written.
+    CreateTableRefused { name: String, inner: EvalErr },
+    /// An `INSERT .. VALUES` whose literal the engine cannot store in its
+    /// column: PREPARE succeeds and EXECUTE raises (the two-phase rig,
+    /// measured on 2182) - "conversion error from string ..." (22018),
+    /// "numeric value is out of range" (22003), "string right truncation"
+    /// (22001). The row is never written.
+    InsertRefused(EvalErr),
     DropView { name: String },
     /// `CREATE`/`ALTER MAPPING` - a local (database) name mapping row.
     CreateMapping(MappingSpec),
@@ -11769,7 +11854,7 @@ enum WinFunc {
     Rank(RankFn),
     /// (function, argument, offset, default) - `LAG(arg [, offset
     /// [, default]])`; offset defaults to 1, default to NULL
-    Nav(NavFn, RawExpr, usize, Option<RawExpr>),
+    Nav(NavFn, RawExpr, i64, Option<RawExpr>),
     /// (function, argument, N) - `FIRST_VALUE(arg)`, `LAST_VALUE(arg)`,
     /// `NTH_VALUE(arg, n)`; N is Some only for NTH_VALUE
     Val(ValFn, RawExpr, Option<usize>),
@@ -20313,10 +20398,8 @@ fn constraint_key_text(parts: &[(String, &Value)]) -> Option<String> {
     for (name, v) in parts {
         // NULL prints BARE (probed P15: a partial-NULL compound key is
         // refused and its key text says `"B" = NULL`); everything else
-        // renders as the SQL literal that names it - which is the same
-        // rule [psql_literal] already encodes (text single-quoted,
-        // scaled with its decimals, booleans by keyword)
-        let rendered = psql_literal(v)?;
+        // renders as DescPrinter prints it ([key_value_text])
+        let rendered = key_value_text(v)?;
         segs.push(format!("\"{}\" = {}", name.trim_end(), rendered));
     }
     let mut s = format!("({})", segs.join(", "));
@@ -20324,6 +20407,29 @@ fn constraint_key_text(parts: &[(String, &Value)]) -> Option<String> {
         s.truncate(250);
     }
     Some(s)
+}
+
+/// One key value as the engine's DescPrinter prints it (mov.cpp, over
+/// MOV_make_string2 - the CVT text of the value): a text or a date-time
+/// value between single quotes with NO quote doubling and no type word,
+/// a DOUBLE PRECISION as CVT's `%#.16g` and a FLOAT as `%#.8g`, anything
+/// else as its literal. Measured on 2182: `("D" = '2020-01-02', "V" =
+/// 'it's', "F" = 1.250000000000000e-05, "W" = 3.1400001)`, `1.5` prints
+/// `1.500000000000000`, `-2e300` `-2.000000000000000e+300`, a TIMESTAMP
+/// '2020-01-02 03:04:05.6789'. A CHAR's pad is trimmed by the caller,
+/// which knows the column ([unique_violation_err]).
+fn key_value_text(v: &Value) -> Option<String> {
+    Some(match v {
+        Value::Text(t) => format!("'{}'", t),
+        Value::Date(_) | Value::Time(_) | Value::Timestamp(..) | Value::TimeTz(..) | Value::TimestampTz(..) => {
+            let lit = psql_literal(v)?;
+            let q = lit.find('\'')?;
+            lit[q..].to_string()
+        }
+        Value::Double(x) if x.is_finite() => approx_fit_text(*x, false, 23)?,
+        Value::Float(x) if x.is_finite() => approx_fit_text(*x as f64, true, 23)?,
+        _ => psql_literal(v)?,
+    })
 }
 
 /// Build the projected-column list from a select list and the relation's
@@ -28349,7 +28455,15 @@ fn plan_create_table(sql: &str, db: Option<&Database>) -> Option<(Plan, Vec<Desc
         };
         if k.primary {
             if has_pk {
-                return None; // more than one PRIMARY KEY
+                // more than one PRIMARY KEY: the engine's refusal, at
+                // EXECUTE ([Plan::CreateTableRefused])
+                return Some((
+                    Plan::CreateTableRefused {
+                        name,
+                        inner: EvalErr::Status(vec![StatusItem::Gds(335544548)]), // isc_primary_key_exists
+                    },
+                    Vec::new(),
+                ));
             }
             has_pk = true;
         }
@@ -35004,14 +35118,24 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // here rather than plumbed out of the builder, so the question is
     // always put to [set_value_fit_error] itself and no second copy of
     // the fit rule exists to go stale.
+    // ...and a literal the column cannot take at all is the engine's
+    // 22018 ([insert_literal_error]). Both are EXECUTE-time on the engine
+    // (the two-phase rig: PREPARE succeeds), so the plan carries the
+    // vector to the execute ([Plan::InsertRefused]); the first failing
+    // value in the VALUES list's order is the one named (measured: `(S,
+    // D) VALUES ('x', 'y')` names "x", `(D, S) VALUES ('y', 'x')` "y").
     let image = match build_insert_image(&landing, descs, db, rel, *format_no) {
         Some(img) => img,
         None => {
             for &(rc, v) in &landing {
                 let d = descs.get(rc.field_id as usize)?;
-                if let Some(err) = set_value_fit_error(d, v) {
-                    return Some((Plan::RefusedEval(err), Vec::new()));
+                if encode_set_value(d, v).is_some() {
+                    continue;
                 }
+                if let Some(err) = insert_literal_error(d, v) {
+                    return Some((Plan::InsertRefused(err), Vec::new()));
+                }
+                return None;
             }
             return None;
         }
@@ -35586,6 +35710,115 @@ fn set_value_fit_error(d: &Descriptor, v: &InsVal) -> Option<EvalErr> {
         return None;
     }
     wire_value_fit_error(d, &set_value_wireparam(d, v)?)
+}
+
+/// Why a GENERATOR's drawn value does not store in its column: the
+/// engine's fit vector where [wire_value_fit_error] knows it, the old
+/// text otherwise.
+fn gen_fit_error(d: &Descriptor, v: i64) -> ExecErr {
+    match wire_value_fit_error(d, &WireParam::Int(v, 0)) {
+        Some(e) => ExecErr::Eval(e),
+        None => ExecErr::Text("generator value does not fit its column".to_string()),
+    }
+}
+
+/// Why a LITERAL of an `INSERT .. VALUES` does not store in its column,
+/// as the engine raises it at execute (measured on 2182 through the
+/// two-phase rig): the fit errors first ([set_value_fit_error] - a text
+/// too long, an exact value out of range), then the CONVERSION law -
+/// "conversion error from string "<text>"" (22018) for a string no
+/// number, date-time or boolean reads (`'x'`, `''`, `'yes'`,
+/// `'2020-13-01'`), for a number a date-time or boolean column cannot
+/// take (`12`, `1.5`), for a number whose digits do not fit a text
+/// column (`12345` into VARCHAR(3) - a conversion error there, not a
+/// truncation), and for a BOOLEAN into anything but text or boolean,
+/// whose string is the word "BOOLEAN"; a string that IS a number out of
+/// the column's range is 22003 (`'70000'`, `'-40000'` into SMALLINT).
+/// A DECFLOAT column raises its own pair: `Decimal float invalid
+/// operation` over the conversion error, and `Decimal float overflow`
+/// (22003) for a number past its exponent (`'1e385'` into DECFLOAT(16)).
+/// None where this law does not reach, and the refusal stays bare: a
+/// numeric string of more than 22 characters (the engine's own
+/// truncation), a zero with a huge exponent (`'0e999'` stores 0), a
+/// DECFLOAT's special value (`'snan'` stores sNaN) or a small or long
+/// one, a TIME string with more than digits and colons or a TIMESTAMP
+/// one with a letter, a sign, a comma or a third part - the engine reads
+/// a zone out of those (`'2020-01-01 10:00:00 +03:00'`, `'.. -03:00'`,
+/// `'.. Europe/Paris'` into a TIMESTAMP store; `'10:00 AM'` into a TIME
+/// is 22009 "Invalid time zone region: AM", `'2020-01-01T10:00'` into a
+/// TIMESTAMP "Invalid time zone region: T10:00", `'2020-01-01 10:00 +3'`
+/// 22009 "Invalid time zone offset: +3 ..." - all measured).
+fn insert_literal_error(d: &Descriptor, v: &InsVal) -> Option<EvalErr> {
+    if let Some(e) = set_value_fit_error(d, v) {
+        return Some(e);
+    }
+    let decfloat = matches!(d.dtype, dtype::DEC64 | dtype::DEC128);
+    let numeric = decfloat
+        || matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 | dtype::REAL | dtype::DOUBLE);
+    let temporal = matches!(d.dtype, dtype::SQL_DATE | dtype::SQL_TIME | dtype::TIMESTAMP);
+    let boolean = d.dtype == dtype::BOOLEAN;
+    let text = matches!(d.dtype, dtype::TEXT | dtype::VARYING);
+    let conv = |t: String| Some(EvalErr::ConversionError(Some(t)));
+    match v {
+        InsVal::Str(t) if numeric => {
+            let n = t.trim();
+            let looks_numeric = !n.is_empty()
+                && n.bytes().all(|c| c.is_ascii_digit() || b".eE+-".contains(&c))
+                && n.parse::<f64>().is_ok();
+            // the mantissa and the exponent of an exponent form
+            let (mant, exp) = match n.find(['e', 'E']) {
+                Some(e) => (&n[..e], n[e + 1..].parse::<i64>().ok()),
+                None => (n, None),
+            };
+            let zero = !mant.bytes().any(|c| (b'1'..=b'9').contains(&c));
+            if !looks_numeric {
+                let special = n.trim_start_matches(['-', '+']).to_ascii_lowercase();
+                if decfloat && matches!(special.as_str(), "nan" | "snan" | "inf" | "infinity") {
+                    return None;
+                }
+                if decfloat {
+                    return Some(EvalErr::DecfloatConvError(t.clone()));
+                }
+                conv(t.clone())
+            } else if zero && exp.is_some() {
+                None
+            } else if decfloat {
+                exp.is_some_and(|e| e > 0).then_some(EvalErr::DecfloatOverflow)
+            } else if t.len() <= 22 {
+                Some(EvalErr::NumericOutOfRange)
+            } else {
+                None
+            }
+        }
+        // a TIME that does not open with a digit, or is digits and colons
+        // only, fails before any zone is read (`'JAN-1-2020'`, `'- 10'`,
+        // `'25:00'`, `'10::00'`)
+        InsVal::Str(t) if d.dtype == dtype::SQL_TIME => {
+            let n = t.trim();
+            let opens = n.bytes().next().is_some_and(|c| c.is_ascii_digit());
+            (!opens || n.bytes().all(|c| c.is_ascii_digit() || c == b':')).then(|| EvalErr::ConversionError(Some(t.clone())))
+        }
+        // a TIMESTAMP with no digit, one that opens with a time (`'10:00
+        // AM'`, `'10:00:00 +03:00'`), or a plain one of at most a date and
+        // a time with no zone-like part
+        InsVal::Str(t) if d.dtype == dtype::TIMESTAMP => {
+            let n = t.trim();
+            let digits = n.bytes().any(|c| c.is_ascii_digit());
+            let parts: Vec<&str> = n.split_whitespace().collect();
+            let time_first = parts
+                .first()
+                .is_some_and(|p| p.contains(':') && p.bytes().all(|c| c.is_ascii_digit() || c == b':' || c == b'.'));
+            let plain = !n.bytes().any(|c| c.is_ascii_alphabetic() || c == b'+' || c == b',')
+                && parts.len() <= 2
+                && !parts.get(1).is_some_and(|p| p.starts_with('-'));
+            (!digits || time_first || plain).then(|| EvalErr::ConversionError(Some(t.clone())))
+        }
+        InsVal::Str(t) if temporal || boolean => conv(t.clone()),
+        InsVal::Int(n) if temporal || boolean || text => conv(n.to_string()),
+        InsVal::Dec(r, sc) if temporal || boolean || text => conv(render_exact(*r as i128, *sc)),
+        InsVal::Bool(_) if numeric || temporal => conv("BOOLEAN".to_string()),
+        _ => None,
+    }
 }
 
 /// One parameter value as decoded from the op_execute message, in the
@@ -37556,7 +37789,7 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // (4242,'uoi') MATCHING (ID)` answers 335545137 - so ship the
     // typed refusal at PREPARE, which is also correct because the
     // update half must not have run.
-    if let Plan::RefusedEval(e) = insert {
+    if let Plan::RefusedEval(e) | Plan::InsertRefused(e) = insert {
         return Some((Plan::RefusedEval(e), Vec::new()));
     }
     Some((
@@ -39352,6 +39585,7 @@ fn ddl_firing_for(
     if matches!(
         plan,
         Plan::Insert { .. }
+            | Plan::InsertRefused(_)
             | Plan::Update { .. }
             | Plan::Delete { .. }
             | Plan::ViewTrig { .. }
@@ -39381,6 +39615,7 @@ fn plan_is_ddl(plan: &Plan) -> bool {
     !matches!(
         plan,
         Plan::Insert { .. }
+            | Plan::InsertRefused(_)
             | Plan::Update { .. }
             | Plan::Delete { .. }
             | Plan::ViewTrig { .. }
@@ -39495,6 +39730,11 @@ fn execute_dml_collecting_inner(
     // statement's own writes stay invisible to it (the engine's stable
     // cursor)
     let _subq_db = SubqDbGuard::arm(&*database);
+    // a literal the column cannot take raises before anything is read or
+    // written ([Plan::InsertRefused])
+    if let Plan::InsertRefused(e) = plan {
+        return Err(ExecErr::Eval(e.clone()));
+    }
     // RETURNING wraps a DML: run the inner statement, keeping the rows it
     // touched
     if let Plan::Returning { inner, .. } = plan {
@@ -39861,6 +40101,13 @@ fn execute_dml_collecting_inner(
         // VIEW of a name the catalog holds is "Table @1 already exists"
         // (42S01), ALTER VIEW of a name that is not a view is "View @1
         // not found", RECREATE VIEW over a table "View @1 does not exist"
+        Plan::CreateTableRefused { name, inner } => {
+            return Err(ExecErr::Eval(EvalErr::DdlFailed {
+                verb: 336397286, // isc_dsql_create_table_failed
+                object: format!("\"PUBLIC\".\"{}\"", name.trim_end()),
+                inner: Box::new(inner.clone()),
+            }));
+        }
         Plan::CreateViewRefused { name, reason, verb } => {
             let kind = fire_crab_ods::ddl::relation_type_of(&work, db.page_size, name);
             let qn = name.trim_end();
@@ -40471,8 +40718,12 @@ fn execute_dml_collecting_inner(
                 let new_val =
                     gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))?;
                 let d = descs.get(*fid).ok_or("field beyond format")?;
+                // a drawn value the column cannot hold is the engine's own
+                // vector - 22003 *numeric value is out of range* for a
+                // SMALLINT past 32767 (measured `VALUES (GEN_ID(S,
+                // 100000))`, the draw kept) - not a bare Dynamic SQL Error
                 match encode_wire_value(d, &WireParam::Int(new_val, 0))
-                    .ok_or("generator value does not fit its column")?
+                    .ok_or_else(|| gen_fit_error(d, new_val))?
                 {
                     None => {}
                     Some(bytes) => {
@@ -41030,7 +41281,7 @@ fn execute_dml_collecting_inner(
                     )?;
                     let d = descs.get(*fid).ok_or("field beyond format")?;
                     match encode_wire_value(d, &WireParam::Int(new_val, 0))
-                        .ok_or("generator value does not fit its column")?
+                        .ok_or_else(|| gen_fit_error(d, new_val))?
                     {
                         None => {}
                         Some(b) => {
@@ -43427,13 +43678,24 @@ fn unique_violation_err(
 ) -> Option<EvalErr> {
     let (ix_name, constraint) = index_error_names(db, table, op.id)?;
     let cols = db.columns(table);
+    // a CHAR prints without its pad (DescPrinter rtrims dtype_text,
+    // measured: a CHAR(3) 'ab' is 'ab'), a VARCHAR's trailing blanks stay
+    let descs = db.relation_meta(table).and_then(|m| m.formats.last().map(|f| f.1.clone())).unwrap_or_default();
+    let trimmed: Vec<Value> = values
+        .iter()
+        .enumerate()
+        .map(|(fid, v)| match (v, descs.get(fid)) {
+            (Value::Text(t), Some(d)) if d.dtype == dtype::TEXT => Value::Text(t.trim_end_matches(' ').to_string()),
+            _ => v.clone(),
+        })
+        .collect();
     let parts: Option<Vec<(String, &Value)>> = op
         .segs
         .iter()
         .map(|(fid, _, _, _)| {
             cols.iter()
                 .find(|c| c.field_id as usize == *fid)
-                .map(|c| (c.name.clone(), values.get(*fid).unwrap_or(&Value::Null)))
+                .map(|c| (c.name.clone(), trimmed.get(*fid).unwrap_or(&Value::Null)))
         })
         .collect();
     let key = parts.as_deref().and_then(constraint_key_text);
@@ -48858,6 +49120,10 @@ struct ScopeQual {
     /// -206 `"T"."NOPE"` too); None for a CTE, a procedure, a derived
     /// table - shapes whose columns this reader does not know
     relation: Option<String>,
+    /// where the engine's pass PUSHED this context on its level's stack
+    /// ([from_push_order]) - the order an ambiguous bare name lists its
+    /// candidates in; `usize::MAX` where the diagnosis did not work it out
+    push: usize,
 }
 
 /// A scan's outcome: an offender, a clean text, or "stand aside" - a
@@ -48889,6 +49155,14 @@ struct QualCtx<'a> {
     /// lock checks (measured: `(SELECT ID, ID FROM T) WITH LOCK` is the
     /// duplicate, not the lock message)
     check_top: bool,
+    /// the DIAGNOSIS of a refused statement ([diagnose_refusal]): read
+    /// BARE names too, and the aggregate / position laws beside them
+    bare: bool,
+    /// the select-list aliases a bare name of the clause under scan may
+    /// name - an ORDER BY's or a GROUP BY's, never a WHERE's or a
+    /// HAVING's (measured: `WHERE X`, `HAVING X` over `SELECT ID X` are
+    /// -206, `ORDER BY X` / `GROUP BY X` answer)
+    aliases: std::cell::RefCell<Vec<String>>,
 }
 
 /// The -206 the engine raises for `sql` at prepare, if any: the first
@@ -48913,7 +49187,16 @@ fn first_unresolved_qualifier(sql: &str, dbo: &Option<Database>) -> Option<EvalE
         }
         locks
     };
-    let mut ctx = QualCtx { sql, up, db, dbo, ctes: Vec::new(), check_top };
+    let mut ctx = QualCtx {
+        sql,
+        up,
+        db,
+        dbo,
+        ctes: Vec::new(),
+        check_top,
+        bare: false,
+        aliases: std::cell::RefCell::new(Vec::new()),
+    };
     // the row-locking / optimizer tail is not a clause of the query, and
     // it is cut off the text before the scan the way the planner cuts it
     // ([strip_row_locking]); it holds no reference and no position moves
@@ -48961,6 +49244,17 @@ fn first_unresolved_qualifier(sql: &str, dbo: &Option<Database>) -> Option<EvalE
 /// PUBLIC.D`, `TYPE OF COLUMN T.C`), a collation, a PLAN's index, a
 /// character set.
 const QUAL_SKIP_AFTER: [&str; 8] = ["FOR", "AS", "COLLATE", "COLUMN", "INDEX", "ORDER", "OF", "SET"];
+
+/// Words a BARE name may follow without naming a column, read by the
+/// diagnosis only ([diagnose_refusal]): the grammar spells a word of its
+/// own there - the algorithm of `HASH | CRYPT_HASH | ENCRYPT | DECRYPT
+/// (.. USING SHA256 | CRC32 | AES | RC4 | CHACHA20 ..)` and RSA's `HASH
+/// SHA256`, a cipher's `MODE OFB`, a blob's `SUB_TYPE TEXT`, LISTAGG's `ON
+/// OVERFLOW ERROR` (measured on 2182: each of these answers, and was read
+/// as a -206 "SHA512" / "TEXT" / "OVERFLOW" here). SUBSTRING's `USING
+/// CHARACTERS` is the parser's Token unknown at USING; skipped, it keeps
+/// the bare refusal.
+const BARE_SKIP_AFTER: [&str; 6] = ["USING", "SUB_TYPE", "MODE", "HASH", "ON", "OVERFLOW"];
 
 /// Does `s` open a parenthesised subquery - `(SELECT ..`, whitespace
 /// aside?
@@ -49153,7 +49447,7 @@ impl QualCtx<'_> {
         for tr in &items {
             if tr.table.starts_with('(') {
                 if let Some(a) = tr.alias.as_ref().filter(|a| !a.is_empty()) {
-                    quals.push(ScopeQual { name: a.clone(), schema: None, relation: None });
+                    quals.push(ScopeQual { name: a.clone(), schema: None, relation: None, push: usize::MAX });
                 }
                 continue;
             }
@@ -49178,10 +49472,41 @@ impl QualCtx<'_> {
             };
             let relation = is_relation.then(|| tr.table.clone());
             match &tr.alias {
-                Some(a) => quals.push(ScopeQual { name: a.clone(), schema: None, relation }),
-                None => quals.push(ScopeQual { name: tr.table.clone(), schema, relation }),
+                Some(a) => quals.push(ScopeQual { name: a.clone(), schema: None, relation, push: usize::MAX }),
+                None => quals.push(ScopeQual { name: tr.table.clone(), schema, relation, push: usize::MAX }),
             }
         }
+        // THE DIAGNOSIS resolves bare names, so it needs every context of
+        // the level and the order the engine stacked them in
+        // ([from_push_order]); a shape it cannot place stands aside
+        let proj = if self.bare {
+            if find_word_depth0(self.up_of(text), "PLAN", 0).is_some()
+                || ["USING", "NATURAL"].iter().any(|w| find_word_depth0(self.up_of(table_s), w, 0).is_some())
+                || quals.len() != items.len()
+                || items.iter().any(|tr| tr.table.starts_with('(') && !self.up_of(tr.span).trim_start_matches('(').trim_start().starts_with("SELECT"))
+            {
+                return QualScan::Aside;
+            }
+            let Some(order) = from_push_order(self.up_of(table_s)).filter(|o| o.len() == quals.len()) else {
+                return QualScan::Aside;
+            };
+            for (pos, ti) in order.into_iter().enumerate() {
+                quals[ti].push = pos;
+            }
+            match strip_select_head(proj) {
+                Some(p) => p,
+                None => return QualScan::Aside,
+            }
+        } else {
+            proj
+        };
+        // each ON's own scope, by item; usable only where every item bound
+        // a context (an unaliased derived table binds none)
+        let on_orders: Vec<Option<Vec<usize>>> = if quals.len() == items.len() {
+            from_stack_orders(self.up_of(table_s)).1
+        } else {
+            Vec::new()
+        };
         let mut scopes: Vec<Vec<ScopeQual>> = outer.to_vec();
         scopes.push(quals);
         // the FROM: a derived body where it sits, then the step's ON
@@ -49220,7 +49545,26 @@ impl QualCtx<'_> {
             if i >= 1 {
                 let on = joins[i - 1].2;
                 if !on.is_empty() && !on.starts_with('\u{0}') {
-                    match self.boolean(on, &scopes) {
+                    // the ON sees its own join tree only, stacked in its
+                    // own order ([from_stack_orders])
+                    let on_scopes: Vec<Vec<ScopeQual>> = match on_orders.get(i) {
+                        Some(Some(ord)) if on_orders.len() == scopes[scopes.len() - 1].len() => {
+                            let level = &scopes[scopes.len() - 1];
+                            let mut s = outer.to_vec();
+                            s.push(
+                                ord.iter()
+                                    .enumerate()
+                                    .map(|(p, ti)| ScopeQual {
+                                        push: if self.bare { p } else { usize::MAX },
+                                        ..level[*ti].clone()
+                                    })
+                                    .collect(),
+                            );
+                            s
+                        }
+                        _ => scopes.clone(),
+                    };
+                    match self.boolean(on, &on_scopes) {
                         QualScan::Clean => {}
                         other => return other,
                     }
@@ -49231,6 +49575,17 @@ impl QualCtx<'_> {
             match self.boolean(w, &scopes) {
                 QualScan::Clean => {}
                 other => return other,
+            }
+            // an aggregate or window function of THIS level in the WHERE,
+            // checked once the WHERE is passed (pass1_rse_impl)
+            if self.bare {
+                match agg_tokens(w) {
+                    Some((toks, _)) if toks.iter().any(|t| t.is_agg() || t.is_win()) => {
+                        return QualScan::Err(dsql_status(-104, GDS_DSQL_AGG_WHERE_ERR, Vec::new()));
+                    }
+                    Some(_) => {}
+                    None => return QualScan::Aside,
+                }
             }
         }
         // the select list's PLAIN FIELD items, then the WINDOW clause's
@@ -49258,6 +49613,9 @@ impl QualCtx<'_> {
             QualScan::Clean => {}
             other => return other,
         }
+        if self.bare {
+            return self.diagnose_tail(proj, order, group, having, &scopes);
+        }
         for clause in [order, group] {
             if let Some(c) = clause {
                 match self.list(c, &scopes, false) {
@@ -49278,6 +49636,359 @@ impl QualCtx<'_> {
             return self.boolean(h, &scopes);
         }
         QualScan::Clean
+    }
+
+    /// The diagnosis's ORDER BY, GROUP BY and HAVING, in pass1_rse_impl's
+    /// order (measured on 2182 member by member): the ORDER BY items in
+    /// turn - a position outside the select list is -104 "Invalid column
+    /// position used in the ORDER BY clause", a select-list alias is the
+    /// item, anything else is passed (-206); the GROUP BY items the same
+    /// way, then an aggregate or window function among them (a position
+    /// naming an aggregate item included) is "Cannot use an aggregate or
+    /// window function in a GROUP BY clause"; then, over an AGGREGATED
+    /// query (a GROUP BY, a HAVING, or an aggregate in the select list or
+    /// the ORDER BY), each select item in turn - a nested aggregate is
+    /// "Nested aggregate and window functions are not allowed", a column
+    /// neither grouped nor aggregated "Invalid expression in the select
+    /// list" - then each ORDER BY item ("in the ORDER BY clause"), then
+    /// the HAVING is passed and judged ("Invalid expression in the HAVING
+    /// clause"). A shape the judgement cannot read stands aside.
+    fn diagnose_tail(
+        &self,
+        proj: &str,
+        order: Option<&str>,
+        group: Option<&str>,
+        having: Option<&str>,
+        scopes: &[Vec<ScopeQual>],
+    ) -> QualScan {
+        let items: Vec<&str> = split_top_level_commas(proj).into_iter().map(|i| i.trim()).collect();
+        let bodies: Vec<&str> = items.iter().map(|i| split_alias(i).0.trim()).collect();
+        let aliases: Vec<String> = items
+            .iter()
+            .filter_map(|i| split_alias(i).1)
+            .filter_map(canon_ident)
+            .collect();
+        let alias_body = |name: &str| -> Option<&str> {
+            items.iter().zip(&bodies).find_map(|(i, b)| {
+                split_alias(i).1.and_then(canon_ident).filter(|a| a == name).map(|_| *b)
+            })
+        };
+        // the select list's width, `*` and `X.*` expanded
+        let level = scopes.last().map(|l| &l[..]).unwrap_or(&[]);
+        let width = || -> Option<usize> {
+            let cols_of = |q: &ScopeQual| -> Option<usize> {
+                Some(self.db.relation_meta(q.relation.as_deref()?)?.columns.len())
+            };
+            let mut n = 0usize;
+            for b in &bodies {
+                if *b == "*" {
+                    for q in level {
+                        n += cols_of(q)?;
+                    }
+                } else if let Some(qual) = b.strip_suffix(".*").or_else(|| b.strip_suffix(". *")) {
+                    let q = level.iter().find(|q| Some(q.name.as_str()) == canon_ident(qual.trim()).as_deref())?;
+                    n += cols_of(q)?;
+                } else {
+                    n += 1;
+                }
+            }
+            Some(n)
+        };
+        let has_star = bodies.iter().any(|b| b.ends_with('*') && !b.ends_with("(*)"));
+        // ORDER BY, then GROUP BY: positions, aliases, the pass
+        let mut group_keys: Vec<&str> = Vec::new();
+        for (clause, what) in [(order, "ORDER BY"), (group, "GROUP BY")] {
+            let Some(c) = clause else { continue };
+            *self.aliases.borrow_mut() = aliases.clone();
+            for item in split_top_level_commas(c) {
+                let item = item.trim();
+                if let Some(pos) = sort_position(item) {
+                    let n = if has_star { width() } else { Some(bodies.len()) };
+                    let Some(n) = n else {
+                        self.aliases.borrow_mut().clear();
+                        return QualScan::Aside;
+                    };
+                    if pos < 1 || pos as usize > n {
+                        self.aliases.borrow_mut().clear();
+                        return QualScan::Err(dsql_status(
+                            -104,
+                            GDS_DSQL_COLUMN_POS_ERR,
+                            vec![StatusItem::Str(what.to_string())],
+                        ));
+                    }
+                    if what == "GROUP BY" {
+                        if has_star {
+                            self.aliases.borrow_mut().clear();
+                            return QualScan::Aside;
+                        }
+                        group_keys.push(bodies[pos as usize - 1]);
+                    }
+                    continue;
+                }
+                let r = self.boolean(item, scopes);
+                if !matches!(r, QualScan::Clean) {
+                    self.aliases.borrow_mut().clear();
+                    return r;
+                }
+                if what == "GROUP BY" {
+                    let key = canon_ident(item).and_then(|n| alias_body(&n)).unwrap_or(item);
+                    group_keys.push(key);
+                }
+            }
+            self.aliases.borrow_mut().clear();
+        }
+        if group.is_some() {
+            for k in &group_keys {
+                match agg_tokens(k) {
+                    Some((toks, _)) if toks.iter().any(|t| t.is_agg() || t.is_win()) => {
+                        return QualScan::Err(dsql_status(-104, GDS_DSQL_AGG_GROUP_ERR, Vec::new()));
+                    }
+                    Some(_) => {}
+                    None => return QualScan::Aside,
+                }
+            }
+        }
+        // is the query AGGREGATED?
+        let has_plain_agg = |t: &str| agg_tokens(t).map(|(toks, _)| toks.iter().any(|t| t.is_agg() && !t.windowed));
+        let mut aggregated = group.is_some() || having.is_some();
+        for t in bodies.iter().copied().chain(order) {
+            match has_plain_agg(t) {
+                Some(true) => aggregated = true,
+                Some(false) => {}
+                None => return QualScan::Aside,
+            }
+        }
+        if aggregated {
+            let keys: Vec<GroupKey> = match group_keys.iter().map(|k| self.group_key(k, scopes)).collect() {
+                Some(k) => k,
+                None => return QualScan::Aside,
+            };
+            for b in &bodies {
+                match self.agg_item_verdict(b, &keys, scopes, &[]) {
+                    Some(AggVerdict::Valid) => {}
+                    Some(AggVerdict::Nested) => {
+                        return QualScan::Err(dsql_status(-104, GDS_DSQL_AGG_NESTED_ERR, Vec::new()))
+                    }
+                    Some(AggVerdict::Invalid) => {
+                        return QualScan::Err(dsql_status(
+                            -104,
+                            GDS_DSQL_AGG_COLUMN_ERR,
+                            vec![StatusItem::Str("select list".to_string())],
+                        ))
+                    }
+                    None => return QualScan::Aside,
+                }
+            }
+            if let Some(c) = order {
+                for item in split_top_level_commas(c) {
+                    if sort_position(item.trim()).is_some() {
+                        continue;
+                    }
+                    match self.agg_item_verdict(item, &keys, scopes, &aliases) {
+                        Some(AggVerdict::Valid) => {}
+                        Some(AggVerdict::Nested) => {
+                            return QualScan::Err(dsql_status(-104, GDS_DSQL_AGG_NESTED_ERR, Vec::new()))
+                        }
+                        Some(AggVerdict::Invalid) => {
+                            return QualScan::Err(dsql_status(
+                                -104,
+                                GDS_DSQL_AGG_COLUMN_ERR,
+                                vec![StatusItem::Str("ORDER BY clause".to_string())],
+                            ))
+                        }
+                        None => return QualScan::Aside,
+                    }
+                }
+            }
+            if let Some(h) = having {
+                match self.boolean(h, scopes) {
+                    QualScan::Clean => {}
+                    other => return other,
+                }
+                match self.agg_item_verdict(h, &keys, scopes, &[]) {
+                    Some(AggVerdict::Valid) => {}
+                    Some(AggVerdict::Invalid) => {
+                        return QualScan::Err(dsql_status(
+                            -104,
+                            GDS_DSQL_AGG_HAVING_ERR,
+                            vec![StatusItem::Str("HAVING clause".to_string())],
+                        ))
+                    }
+                    Some(AggVerdict::Nested) | None => return QualScan::Aside,
+                }
+            }
+        }
+        QualScan::Clean
+    }
+
+    /// A bare name's standing in the diagnosis: a reserved word or a
+    /// grammar word is no reference; a select-list alias where the clause
+    /// allows one is the item; otherwise the name resolves level by
+    /// level, innermost first, against every context of the level - ONE
+    /// context holding the column resolves it, TWO or more are the
+    /// engine's 42702 (PASS1_ambiguity_check: the contexts in the order
+    /// they were pushed, the first on its own and the rest joined by
+    /// "and"; measured `FROM T1, T2` lists T1 then T2, `FROM T1 JOIN T2`
+    /// T2 then T1, a relation named by its table even when aliased), and
+    /// none at any level is -206 "Column unknown". A level holding a
+    /// context whose columns this reader does not know (a derived table,
+    /// a CTE, a procedure) stands aside.
+    fn bare_verdict(&self, name: &str, quoted: bool, scopes: &[Vec<ScopeQual>]) -> BareVerdict {
+        if !quoted && RESERVED_WORDS.binary_search(&name).is_ok() {
+            return BareVerdict::Pass;
+        }
+        if self.aliases.borrow().iter().any(|a| a == name) {
+            return BareVerdict::Pass;
+        }
+        for level in scopes.iter().rev() {
+            let mut hits: Vec<&ScopeQual> = Vec::new();
+            for q in level {
+                let Some(meta) = q.relation.as_deref().and_then(|r| self.db.relation_meta(r)) else {
+                    return BareVerdict::Aside;
+                };
+                if find_col(&meta.columns, name).is_some() {
+                    hits.push(q);
+                }
+            }
+            match hits.len() {
+                0 => continue,
+                1 => return BareVerdict::Pass,
+                _ => {
+                    if hits.iter().any(|q| q.push == usize::MAX) {
+                        return BareVerdict::Aside;
+                    }
+                    hits.sort_by_key(|q| q.push);
+                    let mut named: Vec<String> = Vec::new();
+                    for q in &hits {
+                        let rel = q.relation.as_deref().unwrap_or_default();
+                        let Some(sch) = relation_schema(self.db, rel) else { return BareVerdict::Aside };
+                        let kind = if is_view(self.db, rel) { "view" } else { "table" };
+                        named.push(format!("{} \"{}\".\"{}\"", kind, sch, rel));
+                    }
+                    return BareVerdict::Err(EvalErr::AmbiguousField {
+                        first: named[0].clone(),
+                        second: named[1..].join(" and "),
+                        name: name.to_string(),
+                    });
+                }
+            }
+        }
+        if !quoted && BARE_GRAMMAR_WORDS.contains(&name) {
+            return BareVerdict::Pass;
+        }
+        BareVerdict::Unknown
+    }
+
+    /// A GROUP BY key as the aggregate laws compare it: its text,
+    /// normalised, and - for a plain column - the context and column it
+    /// resolves to. None when a column in it cannot be placed.
+    fn group_key(&self, key: &str, scopes: &[Vec<ScopeQual>]) -> Option<GroupKey> {
+        let (toks, subq) = agg_tokens(key)?;
+        if subq {
+            return None;
+        }
+        let cols: Vec<&AggTok> = toks.iter().filter(|t| t.is_column()).collect();
+        let whole = cols.len() == 1 && toks.len() == 1 && key.trim().len() == cols[0].end - cols[0].start;
+        let col = if whole { Some(self.place_column(&cols[0].parts, scopes)?) } else { None };
+        Some(GroupKey { norm: normalize_sql(key), col })
+    }
+
+    /// Where a column reference of the level under judgement resolves:
+    /// one of its contexts (by index) and the column, or an OUTER level -
+    /// a constant to this one. None where it cannot be placed.
+    fn place_column(&self, parts: &[(String, bool)], scopes: &[Vec<ScopeQual>]) -> Option<Placed> {
+        let last = scopes.len().checked_sub(1)?;
+        match parts {
+            [(name, _)] => {
+                for (li, level) in scopes.iter().enumerate().rev() {
+                    let mut hit = None;
+                    for (qi, q) in level.iter().enumerate() {
+                        let meta = self.db.relation_meta(q.relation.as_deref()?)?;
+                        if find_col(&meta.columns, name).is_some() {
+                            if hit.is_some() {
+                                return None;
+                            }
+                            hit = Some(qi);
+                        }
+                    }
+                    if let Some(qi) = hit {
+                        return Some(if li == last { Placed::At(qi, name.clone()) } else { Placed::Outer });
+                    }
+                }
+                None
+            }
+            [(qual, _), (name, _)] => {
+                for (li, level) in scopes.iter().enumerate().rev() {
+                    if let Some(qi) = level.iter().position(|q| &q.name == qual) {
+                        return Some(if li == last { Placed::At(qi, name.clone()) } else { Placed::Outer });
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// The aggregate laws over one item of an aggregated query: a
+    /// non-window aggregate holding another aggregate or window function
+    /// is NESTED; a column of this level outside every aggregate that is
+    /// no GROUP BY key (and is not inside a key the item equals) is
+    /// INVALID. An item equal to a key as a whole is valid. None - stand
+    /// aside - for a subquery, a column inside a window, or an item that
+    /// could match a GROUP BY EXPRESSION part-wise.
+    fn agg_item_verdict(
+        &self,
+        item: &str,
+        keys: &[GroupKey],
+        scopes: &[Vec<ScopeQual>],
+        aliases: &[String],
+    ) -> Option<AggVerdict> {
+        let (toks, subq) = agg_tokens(item)?;
+        if subq {
+            return None;
+        }
+        for t in toks.iter().filter(|t| t.is_agg() && !t.windowed) {
+            if toks.iter().any(|u| (u.is_agg() || u.is_win()) && u.start > t.start && u.start < t.close) {
+                return Some(AggVerdict::Nested);
+            }
+        }
+        let norm = normalize_sql(item);
+        if keys.iter().any(|k| k.norm == norm) {
+            return Some(AggVerdict::Valid);
+        }
+        let agg_ranges: Vec<(usize, usize)> =
+            toks.iter().filter(|t| t.is_agg() && !t.windowed).map(|t| (t.start, t.close)).collect();
+        let win_ranges: Vec<(usize, usize)> = toks
+            .iter()
+            .filter(|t| t.windowed || t.is_win() || t.over.is_some())
+            .map(|t| (t.start, t.over.map_or(t.close, |o| o.1)))
+            .collect();
+        let inside = |r: &[(usize, usize)], at: usize| r.iter().any(|(a, b)| at > *a && at < *b);
+        let expr_keys = keys.iter().any(|k| k.col.is_none());
+        for t in toks.iter().filter(|t| t.is_column()) {
+            if inside(&agg_ranges, t.start) {
+                continue;
+            }
+            if inside(&win_ranges, t.start) {
+                return None;
+            }
+            if t.parts.len() == 1 && aliases.iter().any(|a| *a == t.parts[0].0) {
+                continue;
+            }
+            match self.place_column(&t.parts, scopes)? {
+                Placed::Outer => {}
+                at => {
+                    if keys.iter().any(|k| k.col.as_ref() == Some(&at)) {
+                        continue;
+                    }
+                    if expr_keys {
+                        return None;
+                    }
+                    return Some(AggVerdict::Invalid);
+                }
+            }
+        }
+        Some(AggVerdict::Valid)
     }
 
     /// Does a select list carry a bare column reference at its top level
@@ -49344,6 +50055,8 @@ impl QualCtx<'_> {
     /// (`plain`), or every other item in text order.
     fn select_items(&self, text: &str, scopes: &[Vec<ScopeQual>], plain: bool) -> QualScan {
         for item in split_top_level_commas(text) {
+            // the diagnosis reads bare names, and an item's alias is none
+            let item = if self.bare { split_alias(item).0 } else { item };
             if self.is_plain_field(item) != plain {
                 continue;
             }
@@ -50049,7 +50762,38 @@ impl QualCtx<'_> {
                         return QualScan::Hit { at: base + start, len: end - start, name: name.join(".") };
                     }
                 }
-                let bare = if parts.len() == 1 && !parts[0].1 { word } else { String::new() };
+                // THE BARE NAME, in the diagnosis only ([diagnose_refusal]):
+                // not a call, not a `:variable`, not a literal's type word
+                // (`DATE '..'`, `X'..'`, `_UTF8 '..'`), not a name the
+                // grammar spells after a keyword (a cast target, a
+                // collation, a named window after OVER)
+                if self.bare
+                    && parts.len() == 1
+                    && !star
+                    && !is_call
+                    && !skipped
+                    && !BARE_SKIP_AFTER.contains(&prev_word.as_str())
+                    && prev_word != "OVER"
+                    && !(start > 0 && sb[start - 1] == b':')
+                    && sb.get(j) != Some(&b'\'')
+                {
+                    match self.bare_verdict(&parts[0].0, parts[0].1, scopes) {
+                        BareVerdict::Pass => {}
+                        BareVerdict::Unknown => {
+                            return QualScan::Hit {
+                                at: base + start,
+                                len: end - start,
+                                name: format!("\"{}\"", parts[0].0),
+                            }
+                        }
+                        BareVerdict::Err(e) => return QualScan::Err(e),
+                        BareVerdict::Aside => return QualScan::Aside,
+                    }
+                }
+                // a call's name is no keyword: `HASH(V ..)` is not the
+                // `HASH <algorithm>` of RSA_SIGN_HASH (`OVER (W ..)` still
+                // names a window)
+                let bare = if parts.len() == 1 && !parts[0].1 && (!is_call || word == "OVER") { word } else { String::new() };
                 prev2 = std::mem::replace(&mut prev_word, bare);
                 continue;
             }
@@ -50154,7 +50898,7 @@ impl QualCtx<'_> {
         let schema = relation_schema(self.db, &tr.table)?;
         let relation = Some(tr.table.clone());
         Some(vec![match &tr.alias {
-            Some(a) => ScopeQual { name: a.clone(), schema: None, relation },
+            Some(a) => ScopeQual { name: a.clone(), schema: None, relation, push: 0 },
             None => ScopeQual {
                 name: tr.table.clone(),
                 schema: Some(match tr.schema {
@@ -50163,6 +50907,7 @@ impl QualCtx<'_> {
                     None => schema,
                 }),
                 relation,
+                push: 0,
             },
         }])
     }
@@ -50176,9 +50921,12 @@ impl QualCtx<'_> {
             .unwrap_or(up.len())
     }
 
-    /// `UPDATE <table> [alias] SET ... [WHERE ...]`: the WHERE first (the
-    /// engine passes it before the assignments - measured), then each
-    /// assignment's value.
+    /// `UPDATE <table> [alias] SET ... [WHERE ...]`: EVERY assignment's
+    /// target first, across the whole list, then the WHERE, then each
+    /// assignment's value (measured on 2182: `SET NOPE1 = NOPE2 WHERE
+    /// NOPE3 = 1` names NOPE1, `SET K = NOPE2, NOPE1 = 1` NOPE1, `SET K =
+    /// NOPE2 WHERE NOPE3 = 1` NOPE3; qualified the same, `SET T3.NOPE1 = 1
+    /// WHERE T3.NOPE3 = 1` names T3.NOPE1).
     fn update(&self, body: &str) -> QualScan {
         let up = self.up_of(body);
         if up["UPDATE".len()..].trim_start().starts_with("OR") {
@@ -50190,15 +50938,25 @@ impl QualCtx<'_> {
         let after = set + "SET".len();
         let end = self.dml_tail(up, after);
         let wh = find_word_depth0(up, "WHERE", after).filter(|w| *w < end);
+        let mut assigns: Vec<(&str, &str)> = Vec::new();
+        for a in split_top_level_commas(&body[after..wh.unwrap_or(end)]) {
+            let Some(eq) = a.find('=') else { return QualScan::Aside };
+            assigns.push((&a[..eq], &a[eq + 1..]));
+        }
+        for (target, _) in &assigns {
+            match self.operand(target, &scopes) {
+                QualScan::Clean => {}
+                other => return other,
+            }
+        }
         if let Some(w) = wh {
             match self.boolean(&body[w + "WHERE".len()..end], &scopes) {
                 QualScan::Clean => {}
                 other => return other,
             }
         }
-        let assigns = &body[after..wh.unwrap_or(end)];
-        for a in split_top_level_commas(assigns) {
-            match self.value(a, &scopes) {
+        for (_, value) in &assigns {
+            match self.value(value, &scopes) {
                 QualScan::Clean => {}
                 other => return other,
             }
@@ -50221,6 +50979,989 @@ impl QualCtx<'_> {
             None => QualScan::Clean,
         }
     }
+}
+
+// -------------------------------------------------------------------
+// THE DIAGNOSIS OF A REFUSED STATEMENT
+//
+// A statement the planners refuse without posting a vector used to reach
+// the client as a bare `42000 Dynamic SQL Error` - and many of them are
+// statements the ENGINE refuses too, with a vector of its own: an
+// unknown BARE column (42S22 -206, not 42000), a name two contexts hold
+// (42702), a sort position outside the select list, an aggregate where
+// the grammar forbids one, a column neither grouped nor aggregated, an
+// aggregate of a non-number, a conditional over incomparable types
+// (HY004). [diagnose_refusal] runs AFTER the refusal, over the text as
+// sent, and names the engine's vector when it can place it exactly -
+// the same pass order as the -206 of a qualifier ([QualCtx]), read in
+// its BARE mode - and otherwise leaves the refusal as it was. It never
+// turns an answer into an error: only a statement already refused
+// reaches it.
+// -------------------------------------------------------------------
+
+/// `isc_dsql_column_pos_err` - "Invalid column position used in the @1
+/// clause"
+const GDS_DSQL_COLUMN_POS_ERR: i32 = 335544821;
+/// `isc_dsql_agg_where_err` - "Cannot use an aggregate or window
+/// function in a WHERE clause, use HAVING (for aggregate only) instead"
+const GDS_DSQL_AGG_WHERE_ERR: i32 = 335544822;
+/// `isc_dsql_agg_group_err` - "Cannot use an aggregate or window
+/// function in a GROUP BY clause"
+const GDS_DSQL_AGG_GROUP_ERR: i32 = 335544823;
+/// `isc_dsql_agg_column_err` - "Invalid expression in the @1 (not
+/// contained in either an aggregate function or the GROUP BY clause)"
+const GDS_DSQL_AGG_COLUMN_ERR: i32 = 335544824;
+/// `isc_dsql_agg_having_err` - "Invalid expression in the @1 (neither an
+/// aggregate function nor a part of the GROUP BY clause)"
+const GDS_DSQL_AGG_HAVING_ERR: i32 = 335544825;
+/// `isc_dsql_agg_nested_err` - "Nested aggregate and window functions
+/// are not allowed"
+const GDS_DSQL_AGG_NESTED_ERR: i32 = 335544826;
+/// `isc_dsql_agg2_wrongarg` - "Argument for @1 in dialect 3 must be
+/// numeric"
+const GDS_DSQL_AGG2_WRONGARG: i32 = 336397242;
+/// `isc_dsql_datatypes_not_comparable` - "Datatypes @1are not comparable
+/// in expression @2" (HY004)
+const GDS_DSQL_DATATYPES_NOT_COMPARABLE: i32 = 336003088;
+/// `isc_dsql_var_count_err` - "Count of read-write columns does not
+/// equal count of values" (21S01)
+const GDS_DSQL_VAR_COUNT_ERR: i32 = 335544584;
+
+/// The parser's RESERVED words (ParserTokens.h, `nonReserved` false):
+/// none of them is ever a column reference. Sorted, for a binary search.
+const RESERVED_WORDS: &[&str] = &[
+    "ADD", "ADMIN", "ALL", "ALTER", "AND", "ANY", "AS", "AT", "AVG", "BEGIN", "BETWEEN",
+    "BIGINT", "BINARY", "BIT_LENGTH", "BLOB", "BOOLEAN", "BOTH", "BTRIM", "BY", "CALL", "CASE",
+    "CAST", "CHAR", "CHARACTER", "CHARACTER_LENGTH", "CHAR_LENGTH", "CHECK", "CLOSE", "COLLATE",
+    "COLUMN", "COMMENT", "COMMIT", "CONNECT", "CONSTRAINT", "CORR", "COUNT", "COVAR_POP",
+    "COVAR_SAMP", "CREATE", "CROSS", "CURRENT", "CURRENT_CONNECTION", "CURRENT_DATE",
+    "CURRENT_ROLE", "CURRENT_SCHEMA", "CURRENT_TIME", "CURRENT_TIMESTAMP",
+    "CURRENT_TRANSACTION", "CURRENT_USER", "CURSOR", "DATE", "DAY", "DEC", "DECFLOAT",
+    "DECIMAL", "DECLARE", "DEFAULT", "DELETE", "DELETING", "DETERMINISTIC", "DISCONNECT",
+    "DISTINCT", "DOUBLE", "DROP", "ELSE", "END", "ESCAPE", "EXECUTE", "EXISTS", "EXTERNAL",
+    "EXTRACT", "FALSE", "FETCH", "FILTER", "FLOAT", "FOR", "FOREIGN", "FROM", "FULL",
+    "FUNCTION", "GDSCODE", "GLOBAL", "GRANT", "GREATEST", "GROUP", "GROUPS", "HAVING", "HOUR",
+    "IN", "INDEX", "INNER", "INSENSITIVE", "INSERT", "INSERTING", "INT", "INT128", "INTEGER",
+    "INTO", "IS", "JOIN", "LATERAL", "LEADING", "LEAST", "LEFT", "LIKE", "LISTAGG", "LOCAL",
+    "LOCALTIME", "LOCALTIMESTAMP", "LONG", "LOWER", "LTRIM", "MAX", "MERGE", "MIN", "MINUTE",
+    "MONTH", "NATIONAL", "NATURAL", "NCHAR", "NO", "NOT", "NULL", "NUMERIC", "OCTET_LENGTH",
+    "OF", "OFFSET", "ON", "ONLY", "OPEN", "OR", "ORDER", "OUTER", "OVER", "PARAMETER",
+    "PERCENTILE_CONT", "PERCENTILE_DISC", "PLAN", "POSITION", "POST_EVENT", "PRECISION",
+    "PRIMARY", "PROCEDURE", "PUBLICATION", "RDB$DB_KEY", "RDB$ERROR", "RDB$GET_CONTEXT",
+    "RDB$GET_TRANSACTION_CN", "RDB$RECORD_VERSION", "RDB$RESET_CONTEXT", "RDB$ROLE_IN_USE",
+    "RDB$SET_CONTEXT", "RDB$SYSTEM_PRIVILEGE", "REAL", "RECORD_VERSION", "RECREATE",
+    "RECURSIVE", "REFERENCES", "REGR_AVGX", "REGR_AVGY", "REGR_COUNT", "REGR_INTERCEPT",
+    "REGR_R2", "REGR_SLOPE", "REGR_SXX", "REGR_SXY", "REGR_SYY", "RELEASE", "RESETTING",
+    "RETURN", "RETURNING_VALUES", "RETURNS", "REVOKE", "RIGHT", "ROLLBACK", "ROW", "ROWS",
+    "ROW_COUNT", "RTRIM", "SAVEPOINT", "SCHEMA", "SCROLL", "SECOND", "SELECT", "SENSITIVE",
+    "SET", "SIMILAR", "SMALLINT", "SOME", "SQLCODE", "SQLSTATE", "START", "STDDEV_POP",
+    "STDDEV_SAMP", "SUM", "TABLE", "THEN", "TIME", "TIMESTAMP", "TIMEZONE_HOUR",
+    "TIMEZONE_MINUTE", "TO", "TRAILING", "TRIGGER", "TRIM", "TRUE", "TRUNCATE", "UNBOUNDED",
+    "UNION", "UNIQUE", "UNKNOWN", "UPDATE", "UPDATING", "UPPER", "USER", "USING", "VALUE",
+    "VALUES", "VARBINARY", "VARCHAR", "VARIABLE", "VARYING", "VAR_POP", "VAR_SAMP", "VIEW",
+    "WHEN", "WHERE", "WHILE", "WINDOW", "WITH", "WITHIN", "WITHOUT", "YEAR",
+];
+
+/// NON-reserved words that the value grammar spells as syntax - a sort
+/// direction, a frame bound, a date part, a type word - and so are no
+/// reference where they stand unresolved. Any OTHER non-reserved word is
+/// an identifier to the parser (measured: `SELECT NAME FROM T1` is -206
+/// "NAME").
+const BARE_GRAMMAR_WORDS: &[&str] = &[
+    "ASC", "ASCENDING", "CONTAINING", "COUNTER", "CTR_BIG_ENDIAN", "CTR_LENGTH", "CTR_LITTLE_ENDIAN",
+    "DESC", "DESCENDING", "EXCLUDE", "FIRST", "FOLLOWING", "IV", "KEY", "LAST", "LPARAM", "MATCHING",
+    "HASH", "MILLISECOND", "MODE", "NAMES", "NEXT", "NULLS", "OTHERS", "PARTITION", "PKCS_1_5", "PLACING",
+    "PRECEDING", "QUARTER", "RANGE", "SALT_LENGTH", "SEGMENT", "SIGNATURE", "SIZE", "SKIP", "STARTING",
+    "SUB_TYPE", "TIES", "TIMEZONE_NAME", "TYPE", "VALUE", "WEEK", "WEEKDAY", "YEARDAY", "ZONE",
+];
+
+/// The aggregate functions - a call of one is an aggregate, or a window
+/// function under an OVER.
+const AGG_FN_NAMES: &[&str] = &[
+    "ANY_VALUE", "AVG", "BIN_AND_AGG", "BIN_OR_AGG", "BIN_XOR_AGG", "CORR", "COUNT", "COVAR_POP",
+    "COVAR_SAMP", "LIST", "LISTAGG", "MAX", "MIN", "PERCENTILE_CONT", "PERCENTILE_DISC", "REGR_AVGX",
+    "REGR_AVGY", "REGR_COUNT", "REGR_INTERCEPT", "REGR_R2", "REGR_SLOPE", "REGR_SXX", "REGR_SXY",
+    "REGR_SYY", "STDDEV_POP", "STDDEV_SAMP", "SUM", "VAR_POP", "VAR_SAMP",
+];
+
+/// The window-only functions.
+const WIN_FN_NAMES: &[&str] = &[
+    "CUME_DIST", "DENSE_RANK", "FIRST_VALUE", "LAG", "LAST_VALUE", "LEAD", "NTH_VALUE", "NTILE",
+    "PERCENT_RANK", "RANK", "ROW_NUMBER",
+];
+
+/// A bare name's standing ([QualCtx::bare_verdict]).
+enum BareVerdict {
+    /// resolved, or no reference at all
+    Pass,
+    /// -206 "Column unknown"
+    Unknown,
+    /// another refusal met on the way (42702)
+    Err(EvalErr),
+    /// a shape the diagnosis cannot judge
+    Aside,
+}
+
+/// Where a column of the level under judgement resolves
+/// ([QualCtx::place_column]).
+#[derive(PartialEq)]
+enum Placed {
+    /// the level's context at this index, and the column
+    At(usize, String),
+    /// an outer level: a constant to this one
+    Outer,
+}
+
+/// A GROUP BY key ([QualCtx::group_key]).
+struct GroupKey {
+    norm: String,
+    col: Option<Placed>,
+}
+
+/// [QualCtx::agg_item_verdict]'s outcome.
+enum AggVerdict {
+    Valid,
+    Nested,
+    Invalid,
+}
+
+/// One identifier chain of a clause, as the aggregate laws read it
+/// ([agg_tokens]). Offsets are into the text lexed.
+struct AggTok {
+    start: usize,
+    end: usize,
+    /// the dotted parts: canonical, and whether written quoted
+    parts: Vec<(String, bool)>,
+    /// followed by `(`: a call, closing at `close`
+    call: bool,
+    close: usize,
+    /// a call followed by `OVER (..)`, whose parenthesis spans `over`
+    windowed: bool,
+    over: Option<(usize, usize)>,
+    /// the bare word before it, and the one before that
+    prev: String,
+    prev2: String,
+    /// followed by a quote (a literal's type word), after a colon (a
+    /// variable), or the `X` of `X.*`
+    not_ref: bool,
+}
+
+impl AggTok {
+    fn name(&self) -> Option<&str> {
+        match self.parts.as_slice() {
+            [(n, false)] => Some(n.as_str()),
+            _ => None,
+        }
+    }
+    fn is_agg(&self) -> bool {
+        self.call && self.name().is_some_and(|n| AGG_FN_NAMES.contains(&n))
+    }
+    fn is_win(&self) -> bool {
+        self.call && self.name().is_some_and(|n| WIN_FN_NAMES.contains(&n))
+    }
+    /// a column reference: no call, no keyword, not a name the grammar
+    /// spells after a keyword
+    fn is_column(&self) -> bool {
+        if self.call || self.not_ref || self.parts.is_empty() {
+            return false;
+        }
+        if let Some(n) = self.name() {
+            if RESERVED_WORDS.binary_search(&n).is_ok() || BARE_GRAMMAR_WORDS.contains(&n) {
+                return false;
+            }
+        }
+        let skipped = QUAL_SKIP_AFTER.contains(&self.prev.as_str()) && (self.prev != "FOR" || self.prev2 == "VALUE")
+            || BARE_SKIP_AFTER.contains(&self.prev.as_str());
+        !skipped && self.prev != "OVER"
+    }
+}
+
+/// The identifier chains of `text` outside its string literals, and
+/// whether it holds a subquery (whose own names are skipped). None for a
+/// text this lexer cannot read (an unterminated quote or parenthesis).
+fn agg_tokens(text: &str) -> Option<(Vec<AggTok>, bool)> {
+    let b = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let ws = |mut j: usize| {
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        j
+    };
+    let mut toks: Vec<AggTok> = Vec::new();
+    let mut subq = false;
+    let (mut prev, mut prev2) = (String::new(), String::new());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' {
+            i += 1;
+            loop {
+                if i >= b.len() {
+                    return None;
+                }
+                if b[i] == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+            prev.clear();
+            prev2.clear();
+            continue;
+        }
+        if c == b'(' {
+            let rest = text[i + 1..].trim_start();
+            if rest.len() >= 6 && rest[..6].eq_ignore_ascii_case("SELECT") && !rest.as_bytes().get(6).is_some_and(|c| ident(*c)) {
+                i = matching_paren(b, i)? + 1;
+                subq = true;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' || c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            let mut parts: Vec<(String, bool)> = Vec::new();
+            let mut star = false;
+            loop {
+                if b.get(i) == Some(&b'"') {
+                    let mut j = i + 1;
+                    loop {
+                        if j >= b.len() {
+                            return None;
+                        }
+                        if b[j] == b'"' {
+                            if b.get(j + 1) == Some(&b'"') {
+                                j += 2;
+                                continue;
+                            }
+                            break;
+                        }
+                        j += 1;
+                    }
+                    parts.push((text[i + 1..j].replace("\"\"", "\""), true));
+                    i = j + 1;
+                } else {
+                    let st = i;
+                    while i < b.len() && ident(b[i]) {
+                        i += 1;
+                    }
+                    parts.push((text[st..i].to_ascii_uppercase(), false));
+                }
+                let j = ws(i);
+                if b.get(j) != Some(&b'.') {
+                    break;
+                }
+                let k = ws(j + 1);
+                if b.get(k) == Some(&b'*') {
+                    star = true;
+                    i = k + 1;
+                    break;
+                }
+                if !b.get(k).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_' || *c == b'"') {
+                    break;
+                }
+                i = k;
+            }
+            let end = i;
+            let j = ws(end);
+            let call = b.get(j) == Some(&b'(');
+            let mut close = if call { matching_paren(b, j)? } else { end };
+            // an aggregate's own clauses are part of it: `WITHIN GROUP
+            // (ORDER BY ..)` and `FILTER (WHERE ..)`, whose columns are
+            // aggregated like the argument's (measured on 2182: `SUM(A)
+            // FILTER (WHERE B > 1)`, `PERCENTILE_CONT(0.5) WITHIN GROUP
+            // (ORDER BY A)` and a HAVING's `COUNT(*) FILTER (WHERE B > 0)`
+            // answer over an ungrouped B / A)
+            let word_at = |k: usize, w: &str| {
+                text.len() >= k + w.len()
+                    && text[k..k + w.len()].eq_ignore_ascii_case(w)
+                    && !b.get(k + w.len()).is_some_and(|c| ident(*c))
+            };
+            while call {
+                let k = ws(close + 1);
+                let o = if word_at(k, "FILTER") {
+                    ws(k + "FILTER".len())
+                } else if word_at(k, "WITHIN") && word_at(ws(k + "WITHIN".len()), "GROUP") {
+                    ws(ws(k + "WITHIN".len()) + "GROUP".len())
+                } else {
+                    break;
+                };
+                if b.get(o) != Some(&b'(') {
+                    break;
+                }
+                close = matching_paren(b, o)?;
+            }
+            let mut windowed = false;
+            let mut over = None;
+            if call {
+                let k = ws(close + 1);
+                if text.len() >= k + 4 && text[k..k + 4].eq_ignore_ascii_case("OVER") && !b.get(k + 4).is_some_and(|c| ident(*c)) {
+                    windowed = true;
+                    let o = ws(k + 4);
+                    if b.get(o) == Some(&b'(') {
+                        over = Some((o, matching_paren(b, o)?));
+                    }
+                }
+            }
+            let not_ref = star || b.get(j) == Some(&b'\'') || (start > 0 && b[start - 1] == b':');
+            let word = match parts.as_slice() {
+                [(w, false)] if !call || w == "OVER" => w.clone(),
+                _ => String::new(),
+            };
+            toks.push(AggTok {
+                start,
+                end,
+                parts,
+                call,
+                close,
+                windowed,
+                over,
+                prev: prev.clone(),
+                prev2: prev2.clone(),
+                not_ref,
+            });
+            prev2 = std::mem::replace(&mut prev, word);
+            continue;
+        }
+        if c.is_ascii_digit() {
+            while i < b.len() && (ident(b[i]) || b[i] == b'.') {
+                i += 1;
+            }
+            prev.clear();
+            prev2.clear();
+            continue;
+        }
+        i += 1;
+    }
+    Some((toks, subq))
+}
+
+/// A text as the aggregate laws compare it: upper case outside quotes,
+/// no whitespace outside literals.
+fn normalize_sql(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quote: Option<char> = None;
+    for c in text.trim().chars() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    out.push(c);
+                } else if !c.is_whitespace() {
+                    out.push(c.to_ascii_uppercase());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// An ORDER BY / GROUP BY item that is a POSITION: an UNSIGNED integer
+/// literal, then only sort words. A signed one is an expression (measured:
+/// `ORDER BY -1` answers, sorted by the constant).
+fn sort_position(item: &str) -> Option<i64> {
+    let mut words = item.split_whitespace();
+    let first = words.next()?;
+    if !first.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let pos: i64 = first.parse().ok()?;
+    words
+        .all(|w| matches!(w.to_ascii_uppercase().as_str(), "ASC" | "ASCENDING" | "DESC" | "DESCENDING" | "NULLS" | "FIRST" | "LAST"))
+        .then_some(pos)
+}
+
+/// A select list without its head words - DISTINCT, ALL, FIRST n, SKIP n
+/// (n a number or a `?`) - as a slice of the list. None for a head this
+/// reader does not take apart.
+fn strip_select_head(proj: &str) -> Option<&str> {
+    let mut p = proj.trim_start();
+    loop {
+        let up: String = p.chars().take(9).collect::<String>().to_ascii_uppercase();
+        let word_at = |w: &str| up.starts_with(w) && p[w.len()..].starts_with(|c: char| c.is_whitespace());
+        if word_at("DISTINCT") {
+            p = p["DISTINCT".len()..].trim_start();
+        } else if word_at("ALL") {
+            p = p["ALL".len()..].trim_start();
+        } else if word_at("FIRST") || word_at("SKIP") {
+            let w = if word_at("FIRST") { "FIRST" } else { "SKIP" };
+            let rest = p[w.len()..].trim_start();
+            let arg = rest.split_whitespace().next()?;
+            if !(arg == "?" || arg.bytes().all(|c| c.is_ascii_digit())) {
+                return None;
+            }
+            p = rest[arg.len()..].trim_start();
+        } else {
+            return Some(p);
+        }
+    }
+}
+
+/// The order the engine's pass pushes a FROM's contexts on its stack, as
+/// indices into the FROM's items in text order: a comma list's items one
+/// after another; a JOIN's two sides reversed as the join node hands them
+/// back (RseNode::dsqlPass pops its temporary stack onto the base) - the
+/// left side then the right, except that a RIGHT or FULL join puts the
+/// right side first. Measured on 2182 through the ambiguity message:
+/// `T1, T2` is T1, T2; `T1 JOIN T2` T2, T1; `T1 JOIN T2 JOIN E` E, T1,
+/// T2; `T1 RIGHT JOIN T2` T1, T2; `T1 FULL JOIN T2 JOIN E` E, T2, T1.
+fn from_push_order(up_from: &str) -> Option<Vec<usize>> {
+    Some(from_stack_orders(up_from).0)
+}
+
+/// [from_push_order], and beside it each JOIN's ON SCOPE (indexed by the
+/// item the join adds; None for a FROM's first item and a comma item):
+/// the contexts of that join's own tree only, the left side's as they
+/// stand then the right side - the right side first for a RIGHT or FULL
+/// join - which is the stack the engine passes the ON over, before the
+/// join hands it back reversed. Measured on 2182 through the ambiguity
+/// message of a name in the ON: `T1 JOIN T2 ON ID = 1` lists T1, T2 (a
+/// LEFT join the same), `T1 RIGHT JOIN T2` and `FULL` T2, T1, `T1 JOIN
+/// T2 ON 1=1 JOIN VT2 ON ID = 1` T2, T1, VT2, `.. RIGHT JOIN VT2` VT2, T2,
+/// T1, `T1 RIGHT JOIN T2 ON 1=1 JOIN VT2` T1, T2, VT2; and `T1, T2 JOIN
+/// VT2 ON ID = 1` T2, VT2 - an earlier comma item is not in scope at all
+/// (`.. ON A = 1` is -206 "A", `ON T1.A = 1` -206 "T1"."A").
+fn from_stack_orders(up_from: &str) -> (Vec<usize>, Vec<Option<Vec<usize>>>) {
+    let mut out: Vec<usize> = Vec::new();
+    let mut on: Vec<Option<Vec<usize>>> = Vec::new();
+    let mut base = 0usize;
+    for part in split_top_level_commas(up_from) {
+        let mut outer_side: Vec<bool> = Vec::new();
+        let mut at = 0;
+        while let Some(j) = find_word_depth0(part, "JOIN", at) {
+            let before: Vec<&str> = part[..j].split_whitespace().rev().take(2).collect();
+            outer_side.push(before.iter().any(|w| *w == "RIGHT" || *w == "FULL"));
+            at = j + "JOIN".len();
+        }
+        let mut cur = vec![base];
+        on.push(None);
+        for (k, right_first) in outer_side.iter().enumerate() {
+            let next = base + k + 1;
+            let mut temp = if *right_first {
+                let mut t = vec![next];
+                t.extend(&cur);
+                t
+            } else {
+                let mut t = cur.clone();
+                t.push(next);
+                t
+            };
+            on.push(Some(temp.clone()));
+            temp.reverse();
+            cur = temp;
+        }
+        base += outer_side.len() + 1;
+        out.extend(cur);
+    }
+    (out, on)
+}
+
+/// The type family of a value as its describe would read it - what the
+/// aggregate argument check and makeFromList compare. None where this
+/// reader cannot tell from the text.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Fam {
+    Text,
+    Blob,
+    Num,
+    Date,
+    Time,
+    Timestamp,
+    TimeTz,
+    TimestampTz,
+    Bool,
+    Null,
+}
+
+impl QualCtx<'_> {
+    /// [Fam] of `e` at the level under judgement: a literal, a typed
+    /// literal, a context value, a CAST, a column of the level's
+    /// relations; None for anything else.
+    fn fam_of(&self, e: &str, scopes: &[Vec<ScopeQual>]) -> Option<Fam> {
+        let mut t = e.trim();
+        while t.starts_with('(') && matching_paren(t.as_bytes(), 0) == Some(t.len() - 1) {
+            t = t[1..t.len() - 1].trim();
+        }
+        let up = t.to_ascii_uppercase();
+        let lit = |s: &str| {
+            let s = s.trim();
+            s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') && !s[1..s.len() - 1].replace("''", "").contains('\'')
+        };
+        if lit(t) {
+            return Some(Fam::Text);
+        }
+        for (w, f) in [("TIMESTAMP", Fam::Timestamp), ("DATE", Fam::Date), ("TIME", Fam::Time)] {
+            if up.starts_with(w) && lit(&t[w.len()..]) && t[w.len()..].starts_with(char::is_whitespace) {
+                return Some(f);
+            }
+        }
+        match up.as_str() {
+            "NULL" => return Some(Fam::Null),
+            "TRUE" | "FALSE" => return Some(Fam::Bool),
+            "CURRENT_DATE" => return Some(Fam::Date),
+            "CURRENT_TIME" => return Some(Fam::TimeTz),
+            "CURRENT_TIMESTAMP" => return Some(Fam::TimestampTz),
+            "LOCALTIME" => return Some(Fam::Time),
+            "LOCALTIMESTAMP" => return Some(Fam::Timestamp),
+            _ => {}
+        }
+        if !up.is_empty() && up.trim_start_matches(['-', '+']).bytes().all(|c| c.is_ascii_digit() || c == b'.' || c == b'E' || c == b'-' || c == b'+') && up.trim_start_matches(['-', '+']).starts_with(|c: char| c.is_ascii_digit()) {
+            return Some(Fam::Num);
+        }
+        if up.starts_with("CAST") && t.ends_with(')') {
+            let open = t.find('(')?;
+            if matching_paren(t.as_bytes(), open)? != t.len() - 1 || !t[4..open].trim().is_empty() {
+                return None;
+            }
+            let inner = &up[open + 1..t.len() - 1];
+            let a = find_word_depth0(inner, "AS", 0)?;
+            let ty = inner[a + 2..].trim();
+            let first = ty.split(|c: char| c.is_whitespace() || c == '(').next()?;
+            return match first {
+                "CHAR" | "CHARACTER" | "VARCHAR" | "NCHAR" | "NATIONAL" | "BINARY" | "VARBINARY" => Some(Fam::Text),
+                "SMALLINT" | "INTEGER" | "INT" | "BIGINT" | "INT128" | "NUMERIC" | "DECIMAL" | "FLOAT" | "REAL"
+                | "DOUBLE" | "DECFLOAT" => Some(Fam::Num),
+                "DATE" => Some(Fam::Date),
+                "BOOLEAN" => Some(Fam::Bool),
+                "TIME" | "TIMESTAMP" => {
+                    let zoned = find_word_depth0(ty, "ZONE", 0).is_some() && find_word_depth0(ty, "WITHOUT", 0).is_none();
+                    Some(match (first, zoned) {
+                        ("TIME", false) => Fam::Time,
+                        ("TIME", true) => Fam::TimeTz,
+                        (_, false) => Fam::Timestamp,
+                        _ => Fam::TimestampTz,
+                    })
+                }
+                _ => None,
+            };
+        }
+        let (toks, subq) = agg_tokens(t)?;
+        if subq || toks.len() != 1 || !toks[0].is_column() || toks[0].end - toks[0].start != t.len() {
+            return None;
+        }
+        let Placed::At(qi, col) = self.place_column(&toks[0].parts, scopes)? else { return None };
+        let rel = scopes.last()?.get(qi)?.relation.clone()?;
+        let meta = self.db.relation_meta(&rel)?;
+        let fid = find_col(&meta.columns, &col)?.field_id as usize;
+        let d = meta.formats.last()?.1.get(fid)?;
+        Some(match d.dtype {
+            1..=3 => Fam::Text,
+            17 => Fam::Blob,
+            7..=13 | 19 | 22..=24 => Fam::Num,
+            14 => Fam::Date,
+            15 => Fam::Time,
+            16 => Fam::Timestamp,
+            21 => Fam::Bool,
+            25 | 27 => Fam::TimeTz,
+            26 | 28 => Fam::TimestampTz,
+            _ => return None,
+        })
+    }
+
+    /// The refusals the engine's DESCRIBE of a select list raises, after
+    /// every pass: SUM / AVG over a non-number ("Argument for SUM in
+    /// dialect 3 must be numeric", under the DSQL wrapper and "expression
+    /// evaluation not supported" - measured, and after every -206 of the
+    /// statement, an ORDER BY's included), and a COALESCE / IIF / CASE /
+    /// DECODE / MAXVALUE / MINVALUE whose values have no common type
+    /// (DataTypeUtil::makeFromList: no text among them and a DATE beside
+    /// a TIMESTAMP, a date-time kind beside a number or a BOOLEAN, a
+    /// BOOLEAN beside a number - "Datatypes are not comparable in
+    /// expression COALESCE", HY004, the bare `-104` with no DSQL wrapper;
+    /// IIF is named CASE, measured). The first such call of each item, in
+    /// text order, items in order.
+    fn describe_verdict(&self, bodies: &[&str], scopes: &[Vec<ScopeQual>]) -> Option<EvalErr> {
+        for body in bodies {
+            let (toks, _) = agg_tokens(body)?;
+            let mut calls: Vec<(usize, EvalErr)> = Vec::new();
+            for t in &toks {
+                let Some(name) = t.name() else { continue };
+                // CASE .. END: its THEN and ELSE values
+                let args: Vec<&str> = if name == "CASE" && !t.call {
+                    let Some(values) = case_values(&body[t.start..]) else { continue };
+                    values
+                } else if t.call {
+                    let open = body[t.end..].find('(')? + t.end;
+                    split_top_level_commas(&body[open + 1..t.close])
+                } else {
+                    continue;
+                };
+                let verdict = match name {
+                    "SUM" | "AVG" if t.call && args.len() == 1 => {
+                        let a = args[0].trim();
+                        let ua = a.to_ascii_uppercase();
+                        let a = ["DISTINCT ", "ALL "]
+                            .iter()
+                            .find(|w| ua.starts_with(*w))
+                            .map_or(a, |w| a[w.len()..].trim());
+                        match self.fam_of(a, scopes) {
+                            Some(Fam::Num | Fam::Null) | None => None,
+                            Some(_) => Some(EvalErr::Status(vec![
+                                StatusItem::Gds(GDS_DSQL_ERROR),
+                                StatusItem::Gds(335544606), // isc_expression_eval_err
+                                StatusItem::Gds(GDS_DSQL_AGG2_WRONGARG),
+                                StatusItem::Str(name.to_string()),
+                            ])),
+                        }
+                    }
+                    "COALESCE" | "IIF" | "DECODE" | "MAXVALUE" | "MINVALUE" | "CASE" => {
+                        let values: Vec<&str> = match name {
+                            "IIF" if args.len() == 3 => args[1..].to_vec(),
+                            "DECODE" if args.len() >= 3 => {
+                                let rest = &args[1..];
+                                let mut v: Vec<&str> = (0..rest.len() / 2).map(|k| rest[2 * k + 1]).collect();
+                                if rest.len() % 2 == 1 {
+                                    v.push(rest[rest.len() - 1]);
+                                }
+                                v
+                            }
+                            "IIF" | "DECODE" => continue,
+                            _ => args,
+                        };
+                        let fams: Option<Vec<Fam>> = values.iter().map(|v| self.fam_of(v, scopes)).collect();
+                        match fams {
+                            Some(f) if incomparable(&f) => Some(EvalErr::Status(vec![
+                                StatusItem::Gds(GDS_SQLERR),
+                                StatusItem::Num(-104),
+                                StatusItem::Gds(GDS_DSQL_DATATYPES_NOT_COMPARABLE),
+                                StatusItem::Str(String::new()),
+                                StatusItem::Str(if name == "IIF" { "CASE" } else { name }.to_string()),
+                            ])),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(e) = verdict {
+                    calls.push((t.start, e));
+                }
+            }
+            if let Some((_, e)) = calls.into_iter().min_by_key(|(at, _)| *at) {
+                return Some(e);
+            }
+        }
+        None
+    }
+}
+
+/// makeFromList's "not comparable": no text or blob among the values and
+/// a result that would have to be one - a date-time kind beside another
+/// kind (TIME beside TIME WITH TIME ZONE and TIMESTAMP beside TIMESTAMP
+/// WITH TIME ZONE excepted), beside a number or a BOOLEAN, or a BOOLEAN
+/// beside a number. NULLs take no part.
+fn incomparable(fams: &[Fam]) -> bool {
+    let f: Vec<Fam> = fams.iter().copied().filter(|f| *f != Fam::Null).collect();
+    if f.iter().any(|f| matches!(f, Fam::Text | Fam::Blob)) {
+        return false;
+    }
+    let dates: Vec<Fam> = f.iter().copied().filter(|f| matches!(f, Fam::Date | Fam::Time | Fam::Timestamp | Fam::TimeTz | Fam::TimestampTz)).collect();
+    let nums = f.iter().any(|f| *f == Fam::Num);
+    let bools = f.iter().any(|f| *f == Fam::Bool);
+    if !dates.is_empty() {
+        if nums || bools {
+            return true;
+        }
+        let pair_ok = |a: Fam, b: Fam| {
+            a == b
+                || matches!((a, b), (Fam::Time, Fam::TimeTz) | (Fam::TimeTz, Fam::Time) | (Fam::Timestamp, Fam::TimestampTz) | (Fam::TimestampTz, Fam::Timestamp))
+        };
+        return !dates.iter().all(|a| dates.iter().all(|b| pair_ok(*a, *b)));
+    }
+    nums && bools
+}
+
+/// The THEN and ELSE values of the `CASE .. END` that `text` opens with;
+/// None when its words do not pair up.
+fn case_values(text: &str) -> Option<Vec<&str>> {
+    let up = mask_literals(&text.to_ascii_uppercase());
+    let b = up.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let (mut depth, mut cd) = (0i32, 0i32);
+    let mut kws: Vec<(usize, &str)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            c if c.is_ascii_alphabetic() => {
+                let st = i;
+                while i < b.len() && ident(b[i]) {
+                    i += 1;
+                }
+                if st > 0 && (ident(b[st - 1]) || b[st - 1] == b'.' || b[st - 1] == b'"') {
+                    continue;
+                }
+                if depth == 0 {
+                    match &up[st..i] {
+                        "CASE" => {
+                            cd += 1;
+                            if cd == 1 {
+                                kws.push((st, "CASE"));
+                            }
+                        }
+                        "END" => {
+                            if cd == 1 {
+                                kws.push((st, "END"));
+                                break;
+                            }
+                            cd -= 1;
+                        }
+                        w @ ("WHEN" | "THEN" | "ELSE") if cd == 1 => kws.push((st, w)),
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if kws.len() < 4 || kws[0].1 != "CASE" || kws[kws.len() - 1].1 != "END" {
+        return None;
+    }
+    let mut out = Vec::new();
+    for k in 1..kws.len() - 1 {
+        if matches!(kws[k].1, "THEN" | "ELSE") {
+            out.push(&text[kws[k].0 + 4..kws[k + 1].0]);
+        }
+    }
+    Some(out)
+}
+
+/// The parser's own refusals the diagnosis names, ahead of every pass:
+/// `COUNT(DISTINCT *)` / `COUNT(ALL *)` is Token unknown at the `*`, and
+/// a SIGNED NTILE count Token unknown at the sign (measured: `ntile(-1)`
+/// names "-" at its column).
+fn token_unknown_verdict(sql: &str) -> Option<EvalErr> {
+    let up = mask_literals(&sql.to_ascii_uppercase());
+    let b = up.as_bytes();
+    let ws = |mut j: usize| {
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        j
+    };
+    let mut found: Option<usize> = None;
+    for (fname, check) in [("COUNT", 0u8), ("NTILE", 1u8)] {
+        let mut from = 0;
+        while let Some(k) = find_word(&up, fname, from) {
+            from = k + fname.len();
+            let o = ws(from);
+            if b.get(o) != Some(&b'(') {
+                continue;
+            }
+            let a = ws(o + 1);
+            let at = if check == 0 {
+                let w = ["DISTINCT", "ALL"].iter().find(|w| up[a..].starts_with(*w) && !b.get(a + w.len()).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_'));
+                match w {
+                    Some(w) if b.get(ws(a + w.len())) == Some(&b'*') => ws(a + w.len()),
+                    _ => continue,
+                }
+            } else if matches!(b.get(a), Some(b'-') | Some(b'+')) {
+                a
+            } else {
+                continue;
+            };
+            found = Some(found.map_or(at, |f| f.min(at)));
+        }
+    }
+    let at = match found {
+        Some(at) => at,
+        None => bare_star_token(sql)?,
+    };
+    let (line, col) = text_line_col(sql, &sql[at..at + 1])?;
+    Some(EvalErr::TokenUnknown { line, col, token: sql[at..at + 1].to_string() })
+}
+
+/// A BARE `*` beside another item of the outermost select list is the
+/// parser's: Token unknown at that `*`, or - the `*` first - at the comma
+/// after it (measured on 2182: `SELECT UNICODE_CHAR(65), * FROM T1` is
+/// Token unknown `*` at column 26, `SELECT *, UNICODE_CHAR(65) ..` `,`
+/// at column 9; `T1.*` is an item like any other). The byte offset in
+/// `sql`.
+fn bare_star_token(sql: &str) -> Option<usize> {
+    let body = sql.trim_start();
+    if !body.get(..6).is_some_and(|h| h.eq_ignore_ascii_case("SELECT")) {
+        return None;
+    }
+    let (proj, ..) = split_query(body)?;
+    let items = split_top_level_commas(strip_select_head(proj)?);
+    if items.len() < 2 {
+        return None;
+    }
+    let base = sql.as_ptr() as usize;
+    let first = items[0];
+    if first.trim() == "*" {
+        let end = first.as_ptr() as usize - base + first.len();
+        return sql[end..].starts_with(',').then_some(end);
+    }
+    let star = items.iter().find(|i| i.trim() == "*")?;
+    Some(star.as_ptr() as usize - base + (star.len() - star.trim_start().len()))
+}
+
+/// THE ENGINE'S VECTOR FOR A STATEMENT THIS SERVER REFUSED BARE - see the
+/// section comment. `sql` is the text as the client sent it. SELECT /
+/// WITH / UPDATE / DELETE are read by the qualifier scan in its bare
+/// mode; an INSERT by [insert_verdict].
+fn diagnose_refusal(sql: &str, dbo: &Option<Database>) -> Option<EvalErr> {
+    let db = dbo.as_ref()?;
+    if let Some(e) = token_unknown_verdict(sql) {
+        return Some(e);
+    }
+    let body = sql.trim_start();
+    let body = &body[..body.trim_end().trim_end_matches(';').trim_end().len()];
+    let head = body.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+    if head == "INSERT" {
+        return insert_verdict(sql, body, dbo);
+    }
+    let up = mask_literals(&sql.to_ascii_uppercase());
+    // the row-locking and optimizer tails, and a named WINDOW clause over
+    // another, are not read here
+    if ["LOCK", "UPDATE", "OPTIMIZE", "RETURNING", "MATCHING"]
+        .iter()
+        .any(|w| find_word_depth0(&up, w, 0).is_some_and(|p| p > 6))
+    {
+        return None;
+    }
+    let mut ctx = QualCtx {
+        sql,
+        up,
+        db,
+        dbo,
+        ctes: Vec::new(),
+        check_top: false,
+        bare: true,
+        aliases: std::cell::RefCell::new(Vec::new()),
+    };
+    let scan = match head.as_str() {
+        "SELECT" => ctx.select(body, &[]),
+        "UPDATE" => ctx.update(body),
+        "DELETE" => ctx.delete(body),
+        _ => QualScan::Aside,
+    };
+    match scan {
+        QualScan::Hit { at, len, name } => {
+            let (line, col) = text_line_col(sql, &sql[at..at + len])?;
+            Some(EvalErr::ColumnUnknown { name, line, col })
+        }
+        QualScan::Err(e) => Some(e),
+        QualScan::Clean if head == "SELECT" => {
+            // THE DESCRIBE, after every pass: the outermost query's list
+            let (proj, table_s, ..) = split_query(body)?;
+            let proj = strip_select_head(proj)?;
+            if find_word_depth0(ctx.up_of(body), "UNION", 0).is_some() {
+                return None;
+            }
+            let (from, joins) = parse_from(table_s)?;
+            let mut level: Vec<ScopeQual> = Vec::new();
+            for tr in std::iter::once(&from).chain(joins.iter().map(|(_, r, _, _)| r)) {
+                if tr.table.starts_with('(') || tr.schema.is_some() {
+                    return None;
+                }
+                level.push(ScopeQual {
+                    name: tr.alias.clone().unwrap_or_else(|| tr.table.clone()),
+                    schema: None,
+                    relation: Some(tr.table.clone()),
+                    push: 0,
+                });
+            }
+            let bodies: Vec<&str> = split_top_level_commas(proj).into_iter().map(|i| split_alias(i).0.trim()).collect();
+            ctx.describe_verdict(&bodies, &[level])
+        }
+        QualScan::Clean | QualScan::Aside => None,
+    }
+}
+
+/// An INSERT's refusals in StoreNode::dsqlPass order (measured on 2182):
+/// the VALUES first - a bare name there has no context to resolve in and
+/// is -206 wherever it stands - then the column list, each name the
+/// target does not have -206 at its place, then a count that differs from
+/// the values' "Count of read-write columns does not equal count of
+/// values" (21S01, -804). `INSERT .. SELECT` and DEFAULT VALUES are not
+/// read.
+fn insert_verdict(sql: &str, body: &str, dbo: &Option<Database>) -> Option<EvalErr> {
+    let db = dbo.as_ref()?;
+    let up = mask_literals(&sql.to_ascii_uppercase());
+    let ctx = QualCtx {
+        sql,
+        up,
+        db,
+        dbo,
+        ctes: Vec::new(),
+        check_top: false,
+        bare: true,
+        aliases: std::cell::RefCell::new(Vec::new()),
+    };
+    let ub = ctx.up_of(body);
+    let into = find_word_depth0(ub, "INTO", 0)?;
+    let vpos = find_word_depth0(ub, "VALUES", 0)?;
+    let target = body[into + "INTO".len()..vpos].trim();
+    let (name_part, cols) = match target.find('(') {
+        Some(o) => {
+            let close = matching_paren(target.as_bytes(), o)?;
+            if !target[close + 1..].trim().is_empty() {
+                return None;
+            }
+            (target[..o].trim(), Some(&target[o + 1..close]))
+        }
+        None => (target, None),
+    };
+    let table = canon_ident(name_part)?;
+    let meta = db.relation_meta(&table)?;
+    let vals_s = body[vpos + "VALUES".len()..].trim();
+    if !vals_s.starts_with('(') || matching_paren(vals_s.as_bytes(), 0)? != vals_s.len() - 1 {
+        return None;
+    }
+    let vals = split_top_level_commas(&vals_s[1..vals_s.len() - 1]);
+    for v in &vals {
+        match ctx.value(v, &[]) {
+            QualScan::Clean => {}
+            QualScan::Hit { at, len, name } => {
+                let (line, col) = text_line_col(sql, &sql[at..at + len])?;
+                return Some(EvalErr::ColumnUnknown { name, line, col });
+            }
+            QualScan::Err(e) => return Some(e),
+            QualScan::Aside => return None,
+        }
+    }
+    let ncols = match cols {
+        Some(c) => {
+            let names = split_top_level_commas(c);
+            for n in &names {
+                let t = n.trim();
+                let want = canon_ident(t)?;
+                if find_col(&meta.columns, &want).is_none() {
+                    let (line, col) = text_line_col(sql, t)?;
+                    let spelled = if t.starts_with('"') { t.to_string() } else { format!("\"{}\"", want) };
+                    return Some(EvalErr::ColumnUnknown { name: spelled, line, col });
+                }
+            }
+            names.len()
+        }
+        // the implicit list leaves the COMPUTED columns out (measured:
+        // `INSERT INTO TC VALUES (..)` over `A, B COMPUTED BY (A || 'x')`
+        // stores one value, two are 21S01)
+        None => {
+            let computed = computed_sources(db, &table);
+            meta.columns.iter().filter(|c| !computed.contains_key(&(c.field_id as usize))).count()
+        }
+    };
+    if ncols != vals.len() {
+        return Some(dsql_status(-804, GDS_DSQL_VAR_COUNT_ERR, Vec::new()));
+    }
+    None
 }
 
 /// The first FROM/JOIN item in `sql` naming a relation the catalog does
@@ -50850,6 +52591,13 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     // the client's own statement, whole: its select items reach the
     // client's fields ([deliver_plan_items])
     let mut out = out;
+    // ...and refused BARE, it is diagnosed for the vector the engine
+    // would have raised ([diagnose_refusal])
+    if armed && matches!(out.0, Plan::Refused) {
+        if let Some(e) = diagnose_refusal(sql, db) {
+            out = (Plan::RefusedEval(e), Vec::new());
+        }
+    }
     if armed {
         deliver_plan_items(&mut out.0);
     }
@@ -69185,6 +70933,13 @@ fn compute_windows(
                             RankFn::Rank => rank,
                             RankFn::PercentRank | RankFn::CumeDist => unreachable!("handled above"),
                             RankFn::DenseRank => dense,
+                            RankFn::Ntile(n) if *n < 1 => {
+                                return Err(EvalErr::Status(vec![
+                                    StatusItem::Gds(GDS_SYSF_ARGN_POSITIVE),
+                                    StatusItem::Num(1),
+                                    StatusItem::Str("NTILE".to_string()),
+                                ]));
+                            }
                             RankFn::Ntile(n) => {
                                 let size = perm.len() as i64;
                                 let base = size / n;
@@ -69213,6 +70968,24 @@ fn compute_windows(
                     // keys here: one at the collation's own strength would put
                     // 'abc' and 'ABC' back in id order; peers are read off adjacency)
                     let len = perm.len();
+                    // a negative offset is the engine's execute-time
+                    // refusal, raised on the first row it evaluates
+                    let offset = match usize::try_from(*offset) {
+                        Ok(o) => o,
+                        Err(_) if len == 0 => 0,
+                        Err(_) => {
+                            return Err(EvalErr::Status(vec![
+                                StatusItem::Gds(GDS_SYSF_ARGN_NONNEG),
+                                StatusItem::Num(2),
+                                StatusItem::Str(match func {
+                                    NavFn::Lag => "LAG",
+                                    NavFn::Lead => "LEAD",
+                                }
+                                .to_string()),
+                            ]))
+                        }
+                    };
+                    let offset = &offset;
                     for (pos, &p) in perm.iter().enumerate() {
                         let cur = idxs[p];
                         let src = match func {
@@ -71807,7 +73580,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::CreateViewRefused { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::CreateViewRefused { .. } | Plan::CreateTableRefused { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. } | Plan::AlterFunction { .. } | Plan::CreateOrAlterFunction { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -71832,7 +73605,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. } | Plan::AlterColumnRename { .. } | Plan::AlterColumnIdentity { .. } => {
             describe_dml(5, params, att) // isc_info_sql_stmt_ddl
         }
-        Plan::Insert { .. } => describe_dml(2, params, att), // isc_info_sql_stmt_insert
+        Plan::Insert { .. } | Plan::InsertRefused(_) => describe_dml(2, params, att), // isc_info_sql_stmt_insert
         // the engine types UPDATE OR INSERT as an INSERT
         // (UpdateOrInsertNode sets TYPE_INSERT)
         Plan::UpdateOrInsert { .. } => describe_dml(2, params, att),
@@ -71925,7 +73698,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
                 1
             }
         }
-        Plan::Insert { .. } | Plan::UpdateOrInsert { .. } | Plan::Merge { .. } => 2,
+        Plan::Insert { .. } | Plan::InsertRefused(_) | Plan::UpdateOrInsert { .. } | Plan::Merge { .. } => 2,
         Plan::Update { .. } => 3,
         Plan::Delete { .. } => 4,
         Plan::ViewTrig { action, .. } => view_trig_stmt_type(*action),
@@ -71933,7 +73706,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::CreateViewRefused { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::CreateViewRefused { .. } | Plan::CreateTableRefused { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. } | Plan::AlterFunction { .. } | Plan::CreateOrAlterFunction { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -73257,9 +75030,6 @@ const GDS_DSQL_CTE_WRONG_CLAUSE: i32 = 336397231;
 const GDS_DSQL_CTE_UNION_ALL: i32 = 336397232;
 /// isc_dsql_cte_nested_with (SQLERR 946): "WITH clause can't be nested"
 const GDS_DSQL_CTE_NESTED_WITH: i32 = 336397234;
-/// isc_dsql_agg_column_err (JRD 504): "Invalid expression in the @1 (not
-/// contained in either an aggregate function or the GROUP BY clause)"
-const GDS_DSQL_AGG_COLUMN_ERR: i32 = 335544824;
 /// isc_dsql_col_more_than_once_using (SQLERR 947): "column @1 appears
 /// more than once in USING clause"
 const GDS_DSQL_COL_MORE_THAN_ONCE_USING: i32 = 336397235;
@@ -73366,8 +75136,6 @@ fn write_err_args(w: &mut W, args: &[ErrArg]) {
 
 /// `isc_funmismat` - JRD message 119
 const GDS_FUNMISMAT: i32 = 335544439;
-/// `isc_dsql_datatypes_not_comparable` - DSQL (facility 7) message 16
-const GDS_DSQL_DATATYPES_NOT_COMPARABLE: i32 = 336003088;
 /// the codec / UUID / math vectors of the functions this round added -
 /// JRD message numbers 627..630, 632, 648, 649, 658, 659, 896, 897, 937,
 /// 938 (src/include/firebird/impl/msg/jrd.h) over 335544320
@@ -73419,6 +75187,15 @@ fn eval_status_vector(w: &mut W, e: &EvalErr) {
 /// nowhere near the cause.
 fn eval_status_items(w: &mut W, e: &EvalErr) {
     match e {
+        EvalErr::Status(items) => {
+            for it in items {
+                match it {
+                    StatusItem::Gds(c) => w.int(1).int(*c),
+                    StatusItem::Num(n) => w.int(ISC_ARG_NUMBER).int(*n),
+                    StatusItem::Str(t) => w.int(2).bytes(t.as_bytes()),
+                };
+            }
+        }
         EvalErr::DivideByZero => {
             w.int(1) // isc_arg_gds
                 .int(GDS_ARITH_EXCEPT)
@@ -76056,13 +77833,13 @@ fn emit_rows_inner(
         | Plan::SetTimeZone { .. }
         | Plan::SetTimeZoneRefused(_)
         | Plan::InsertSelect { .. }
-        | Plan::Insert { .. } | Plan::UpdateOrInsert { .. } | Plan::Merge { .. }
+        | Plan::Insert { .. } | Plan::InsertRefused(_) | Plan::UpdateOrInsert { .. } | Plan::Merge { .. }
         | Plan::Update { .. } | Plan::Delete { .. } | Plan::ViewTrig { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::CreateViewRefused { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::CreateViewRefused { .. } | Plan::CreateTableRefused { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. } | Plan::AlterFunction { .. } | Plan::CreateOrAlterFunction { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -77179,15 +78956,14 @@ fn encode_row_inline(
     inline: Option<(&Database, u32)>,
 ) -> Result<(), EvalErr> {
     // each column's value: an expression's result, or the record field.
-    // Computed up front so a divide-by-zero aborts before any byte lands.
-    let mut vals: Vec<Value> = if cols.iter().any(|c| c.expr.as_ref().is_some_and(expr_sets_context)) {
-        // right-to-left, the engine's order, when a SET_CONTEXT is in the list
-        let mut v: Vec<Value> = cols.iter().rev().map(|c| c.value_of(values)).collect::<Result<_, _>>()?;
-        v.reverse();
-        v
-    } else {
-        cols.iter().map(|c| c.value_of(values)).collect::<Result<_, _>>()?
-    };
+    // Computed up front so a divide-by-zero aborts before any byte lands,
+    // and RIGHT TO LEFT, the engine's order for every list - so when two
+    // items fail, the error is the LAST item's (measured on 2182: `SELECT
+    // LN(-7), SQRT(-2.5)` raises SQRT's domain error, `SELECT 1/0, LN(-7)`
+    // LN's, `SELECT LN(-7), 1/0` the division's) and a SET_CONTEXT to the
+    // right is seen by a GET_CONTEXT to its left.
+    let mut vals: Vec<Value> = cols.iter().rev().map(|c| c.value_of(values)).collect::<Result<_, _>>()?;
+    vals.reverse();
     // the client-declared output capacity, enforced per row exactly like
     // the expression errors above: before any byte of the row lands
     if let Some(out) = out {
@@ -77710,21 +79486,6 @@ impl Drop for ComputedExprGuard {
                 c.1.clear();
             });
         }
-    }
-}
-
-/// Whether an expression calls RDB$SET_CONTEXT anywhere - a side effect
-/// the engine evaluates select-list items RIGHT-TO-LEFT around (probed:
-/// `SET_CONTEXT(K, v), GET_CONTEXT(K)` reads the OLD value), so a row
-/// holding one is evaluated in that order too.
-fn expr_sets_context(e: &Expr) -> bool {
-    match e {
-        Expr::Func(SysFn::SetContext, _) => true,
-        Expr::Func(_, args) | Expr::Coalesce(args) => args.iter().any(expr_sets_context),
-        Expr::Neg(a) | Expr::Cast(a, ..) | Expr::TextNum(a, _) | Expr::TextNumKey(a, _) | Expr::TextBool(a, _) => expr_sets_context(a),
-        Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) | Expr::Iif(_, a, b) => expr_sets_context(a) || expr_sets_context(b),
-        Expr::Case(arms, els) => arms.iter().any(|(_, x)| expr_sets_context(x)) || els.as_ref().is_some_and(|x| expr_sets_context(x)),
-        _ => false,
     }
 }
 
@@ -79463,7 +81224,7 @@ enum WinKind {
     /// `LAG`/`LEAD`: `arg` read from the row `offset` positions away in the
     /// ordered partition, or `default` (else NULL) when that row is outside
     /// the partition
-    Nav { func: NavFn, arg: Expr, offset: usize, default: Option<Expr> },
+    Nav { func: NavFn, arg: Expr, offset: i64, default: Option<Expr> },
     /// `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`: `arg` read from a row
     /// selected by position within the default frame (partition start
     /// through the current row's last peer)
@@ -90368,6 +92129,37 @@ enum EvalErr {
     /// an aggregate or window function in a recursive member's select
     /// list
     CteRecursiveAggregate,
+    /// A vector spelled ITEM BY ITEM, for a refusal whose shape no other
+    /// variant carries - the diagnosis of a statement the planners
+    /// refused without one ([diagnose_refusal]) builds these, so each
+    /// new engine law is its items and not a variant plus an encoder arm
+    Status(Vec<StatusItem>),
+}
+
+/// One item of an [EvalErr::Status] vector.
+#[derive(Debug, Clone, PartialEq)]
+enum StatusItem {
+    /// `isc_arg_gds` - a status code
+    Gds(i32),
+    /// `isc_arg_number`
+    Num(i32),
+    /// `isc_arg_string`
+    Str(String),
+}
+
+/// `Dynamic SQL Error / -SQL error code = <sqlcode> / -<code's message>`,
+/// the DSQL wrapper every pass1 refusal carries (ERRD_post prepends the
+/// first item), then `rest` - the code's own arguments and any items
+/// after it.
+fn dsql_status(sqlcode: i32, code: i32, rest: Vec<StatusItem>) -> EvalErr {
+    let mut v = vec![
+        StatusItem::Gds(GDS_DSQL_ERROR),
+        StatusItem::Gds(GDS_SQLERR),
+        StatusItem::Num(sqlcode),
+        StatusItem::Gds(code),
+    ];
+    v.extend(rest);
+    EvalErr::Status(v)
 }
 
 /// What an expression's result is typed as - which drives its wire form
@@ -94327,6 +96119,59 @@ fn temporal_shift(
     }
 }
 
+/// evlDateAdd's refusals of a (part, operand) pair, raised per row after
+/// its NULL tests (SysFunction.cpp:2771-2806, 2949; measured on 2182 -
+/// the header is out before the error): a TIME, zoned or not, takes only
+/// HOUR / MINUTE / SECOND / MILLISECOND, and WEEKDAY / YEARDAY are no
+/// part to add to anything. `expression evaluation not supported` over
+/// the function's own message, no DSQL wrapper.
+fn dateadd_part_verdict(unit: ExtractPart, kind: TKind) -> Option<EvalErr> {
+    use ExtractPart::*;
+    const EXPRESSION_EVAL_ERR: i32 = 335544606;
+    if matches!(kind, TKind::Time | TKind::TimeTz) && !matches!(unit, Hour | Minute | Second | Millisecond) {
+        return Some(EvalErr::Status(vec![
+            StatusItem::Gds(EXPRESSION_EVAL_ERR),
+            StatusItem::Gds(335544951), // isc_sysf_invalid_addpart_time
+            StatusItem::Str("DATEADD".to_string()),
+        ]));
+    }
+    let part = match unit {
+        Weekday => "WEEKDAY",
+        Yearday => "YEARDAY",
+        _ => return None,
+    };
+    Some(EvalErr::Status(vec![
+        StatusItem::Gds(EXPRESSION_EVAL_ERR),
+        StatusItem::Gds(335544953), // isc_sysf_invalid_addpart_dtime
+        StatusItem::Str(part.to_string()),
+        StatusItem::Str("DATEADD".to_string()),
+    ]))
+}
+
+/// evlDateDiff's refusals of an operand pair (SysFunction.cpp:4180-4215,
+/// measured on 2182, per row after the NULL tests): under YEAR / MONTH /
+/// DAY / WEEK either side a TIME is "The result of TIME-<value>
+/// .. cannot be expressed in YEAR, MONTH, DAY or WEEK"; under a clock
+/// unit a TIMESTAMP against a TIME is the TIMESTAMP-TIME message and a
+/// DATE against a TIME the DATE-TIME one.
+fn datediff_pair_verdict(unit: ExtractPart, a: &Value, b: &Value) -> Option<EvalErr> {
+    use ExtractPart::*;
+    let time = |v: &Value| matches!(v, Value::Time(_) | Value::TimeTz(..));
+    let stamp = |v: &Value| matches!(v, Value::Timestamp(..) | Value::TimestampTz(..));
+    let date = |v: &Value| matches!(v, Value::Date(_));
+    let code = match unit {
+        Year | Month | Day | Week if time(a) || time(b) => 335544956, // isc_sysf_invalid_timediff
+        Hour | Minute | Second | Millisecond if (stamp(a) && time(b)) || (time(a) && stamp(b)) => 335544957, // isc_sysf_invalid_tstamptimediff
+        Hour | Minute | Second | Millisecond if (date(a) && time(b)) || (time(a) && date(b)) => 335544958, // isc_sysf_invalid_datetimediff
+        _ => return None,
+    };
+    Some(EvalErr::Status(vec![
+        StatusItem::Gds(335544606), // isc_expression_eval_err
+        StatusItem::Gds(code),
+        StatusItem::Str("DATEDIFF".to_string()),
+    ]))
+}
+
 /// `amount` is evlDateAdd's quantity: whole units, except MILLISECOND,
 /// whose amount is read at scale -1 - in 100us units, so a fractional
 /// millisecond is kept (measured: `DATEADD(MILLISECOND, 0.5, ts)` adds
@@ -96714,12 +98559,11 @@ impl Expr {
                     // through MOV_get_int64 (measured: a DOUBLE 0.25
                     // MILLISECOND adds 0.0003, '1.5' adds 0.0015; both
                     // were refused here)
-                    SysFn::DateAdd(unit) => match (ts[0], ts[1]) {
+                    SysFn::DateAdd(_) => match (ts[0], ts[1]) {
                         (
                             ExprType::Int | ExprType::Numeric | ExprType::Approx | ExprType::Text,
                             ExprType::Temporal(k),
                         ) => {
-                            use ExtractPart::*;
                             // a TIME-family operand takes ONLY the clock
                             // parts, zoned or not (measured: the engine
                             // raises 42000 "Only HOUR, MINUTE, SECOND and
@@ -96729,20 +98573,23 @@ impl Expr {
                             // have answered a WRONG VALUE for DATEADD(DAY,
                             // .., <ttz>) rather than the NULL they used to
                             // - the fix has to land with them.
-                            let ok = match k {
-                                TKind::Time | TKind::TimeTz => {
-                                    matches!(unit, Hour | Minute | Second | Millisecond)
-                                }
-                                _ => !matches!(unit, Weekday | Yearday),
-                            };
-                            if ok { Some(ExprType::Temporal(k)) } else { None }
+                            //
+                            // ...and it is raised at EXECUTE, per row, after
+                            // the NULL test (evlDateAdd, measured: the column
+                            // header is out before the error, a NULL operand
+                            // answers NULL, an empty table answers nothing) -
+                            // as is WEEKDAY / YEARDAY's "Invalid part". So the
+                            // pair types as the operand and the evaluator
+                            // raises ([dateadd_part_verdict]); refusing it here
+                            // answered a bare prepare-time Dynamic SQL Error.
+                            Some(ExprType::Temporal(k))
                         }
                         _ => None,
                     },
                     // two temporals -> BIGINT (MILLISECOND: a scale -1
                     // numeric, probed); a TIME pairs only with a TIME
                     SysFn::DateDiff(unit) => match (ts[0], ts[1]) {
-                        (ExprType::Temporal(a), ExprType::Temporal(b)) => {
+                        (ExprType::Temporal(_), ExprType::Temporal(_)) => {
                             use ExtractPart::*;
                             // ... and the same for DATEDIFF: a TIME pair,
                             // zoned or not, expresses only the clock parts
@@ -96752,16 +98599,15 @@ impl Expr {
                             // parts MUST stay legal on a zoned pair - the
                             // engine answers them - so this widens the
                             // pair test rather than narrowing it.
-                            let timey = |k| matches!(k, TKind::Time | TKind::TimeTz);
-                            let time_pair = timey(a) && timey(b);
-                            let datey = |k| !timey(k);
-                            let valid = if time_pair {
-                                matches!(unit, Hour | Minute | Second | Millisecond)
-                            } else if datey(a) && datey(b) {
-                                !matches!(unit, Weekday | Yearday)
-                            } else {
-                                false
-                            };
+                            //
+                            // Both are EXECUTE-time errors on the engine, per
+                            // row after the NULL test (evlDateDiff, measured
+                            // like DATEADD's), and so is a DATE or TIMESTAMP
+                            // against a TIME under a clock unit ("DATE-TIME or
+                            // TIME-DATE" / "TIMESTAMP-TIME"): every temporal
+                            // pair types BIGINT and [datediff_pair_verdict]
+                            // raises. WEEKDAY / YEARDAY stay refused.
+                            let valid = !matches!(unit, Weekday | Yearday | TimezoneHour | TimezoneMinute);
                             if !valid {
                                 None
                             } else if matches!(unit, Millisecond) {
@@ -99693,6 +101539,9 @@ impl Expr {
                             }
                             _ => return Ok(Value::Null),
                         };
+                        if let Some(e) = dateadd_part_verdict(*unit, kind) {
+                            return Err(e);
+                        }
                         dateadd_impl(*unit, amount, d, u, kind, zone)?
                     }
                     SysFn::DateDiff(unit) => {
@@ -99715,6 +101564,9 @@ impl Expr {
                         };
                         match (dt(&vs[0]), dt(&vs[1])) {
                             (Some(a), Some(b)) => {
+                                if let Some(e) = datediff_pair_verdict(*unit, &vs[0], &vs[1]) {
+                                    return Err(e);
+                                }
                                 datediff_impl(*unit, a, b).unwrap_or(Value::Null)
                             }
                             _ => Value::Null, // type-checked away
@@ -100156,7 +102008,13 @@ impl Expr {
                         // range* - in a projection and, per row, in a WHERE
                         // (measured; the i128 fold here answered
                         // 9223372036854775808 and a WHERE counted the row)
-                        let a = raw.checked_abs().ok_or(EvalErr::NumericOutOfRange)?;
+                        // ...and the INT128 minimum, whose absolute value no
+                        // 128-bit integer holds, is the engine's INTEGER
+                        // overflow (measured: `ABS(CAST(-170141183460469231731687303715884105728
+                        // AS INT128))` raises 22003 *Integer overflow. The result
+                        // of an integer operation caused the most significant
+                        // bit of the result to carry.*, as its negation does)
+                        let a = raw.checked_abs().ok_or(EvalErr::IntegerOverflowArith)?;
                         if matches!(vs[0], Value::Int(_) | Value::Scaled(..)) && a > i64::MAX as i128 {
                             return Err(EvalErr::NumericOutOfRange);
                         }
@@ -106655,21 +108513,31 @@ fn parse_rank_call(call: &str) -> Option<RankFn> {
                 _ => RankFn::DenseRank,
             })
         }
-        // NTILE(n) - a positive integer LITERAL bucket count (an
-        // expression count is a later slice)
+        // NTILE(n) - an unsigned integer LITERAL bucket count (an
+        // expression count is a later slice). A count below one is the
+        // engine's EXECUTE-time "Argument #1 for NTILE must be positive"
+        // (measured: the header is out first, an empty source answers no
+        // rows and no error), raised by the evaluator; a SIGN is the
+        // parser's Token unknown, which the refusal diagnosis names
         "NTILE" => {
+            if !inner.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
             let n: i64 = inner.parse().ok()?;
-            (n >= 1).then_some(RankFn::Ntile(n))
+            Some(RankFn::Ntile(n))
         }
         _ => None,
     }
 }
 
-/// `LAG`/`LEAD` - `<fn>( arg [, offset [, default]] )`. The offset is a
-/// non-negative integer LITERAL (default 1); anything else (an expression
-/// offset) refuses - a later slice. `default` is any expression (default
+/// `LAG`/`LEAD` - `<fn>( arg [, offset [, default]] )`. The offset is an
+/// integer LITERAL (default 1); anything else (an expression offset)
+/// refuses - a later slice. A NEGATIVE one plans: the engine raises
+/// "Argument #2 for LAG must be zero or positive" at EXECUTE (measured,
+/// after the header, and not over an empty source), and so does the
+/// evaluator here. `default` is any expression (default
 /// NULL). Returns the function, the argument, the offset and the default.
-fn parse_nav_call(call: &str) -> Option<(NavFn, RawExpr, usize, Option<RawExpr>)> {
+fn parse_nav_call(call: &str) -> Option<(NavFn, RawExpr, i64, Option<RawExpr>)> {
     let t = call.trim();
     let open = t.find('(')?;
     if !t.ends_with(')') {
@@ -106689,10 +108557,9 @@ fn parse_nav_call(call: &str) -> Option<(NavFn, RawExpr, usize, Option<RawExpr>)
     }
     let arg = parse_raw_expr_any(args[0])?;
     let offset = match args.get(1) {
-        None => 1usize,
-        // a plain non-negative integer literal - an expression offset is a
-        // later slice
-        Some(s) => s.parse::<usize>().ok()?,
+        None => 1i64,
+        // a plain integer literal - an expression offset is a later slice
+        Some(s) => s.parse::<i64>().ok()?,
     };
     let default = match args.get(2) {
         None => None,
@@ -126346,6 +128213,9 @@ fn after_auth(
                     // below would hide a qualified built-in call from K1's
                     // twin - [sql_qualified_builtin_call])
                     let qualified_builtin = sql_qualified_builtin_call(&stmt_sql);
+                    // the statement AS SENT, for the refusal's diagnosis
+                    // ([diagnose_refusal]) - positions are the client's
+                    let client_sql = stmt_sql.clone();
                     let stmt_sql = strip_dml_alias(&stmt_sql, alias_view)
                         .unwrap_or_else(|| stmt_sql.clone());
                     let stmt_sql = unqualify_dml(&stmt_sql, &database, dml_aliased)
@@ -126445,7 +128315,7 @@ fn after_auth(
                         // RETURNING clause (probed). Pass the refusal
                         // through unwrapped so the RefusedEval arm
                         // below answers it at prepare.
-                        (Some((p, ps)), Some(_)) if matches!(&*p, Plan::RefusedEval(_)) => {
+                        (Some((p, ps)), Some(_)) if matches!(&*p, Plan::RefusedEval(_) | Plan::InsertRefused(_)) => {
                             Some((p, ps))
                         }
                         // RETURNING WRAPS THE PLAN, so this one path
@@ -126507,7 +128377,10 @@ fn after_auth(
                         None => {
                             plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None, ScalarTy::int64()));
                             stmt_params = std::rc::Rc::new(Vec::new());
-                            match PREPARE_REFUSAL.with(|r| r.borrow_mut().take()) {
+                            match PREPARE_REFUSAL
+                                .with(|r| r.borrow_mut().take())
+                                .or_else(|| diagnose_refusal(&client_sql, &database))
+                            {
                                 Some(e) => respond_eval_error(&mut s, &mut enc, &e)?,
                                 None => {
                                     // a DDL statement this server cannot
@@ -126711,6 +128584,7 @@ fn after_auth(
                 } else if matches!(
                     &*plan,
                     Plan::Insert { .. }
+                        | Plan::InsertRefused(_)
                         | Plan::UpdateOrInsert { .. }
                         // a RETURNING statement is a DML that also has a
                         // cursor: it must EXECUTE here like every other
@@ -126732,7 +128606,7 @@ fn after_auth(
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
-                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::CreateViewRefused { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
+                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::CreateViewRefused { .. } | Plan::CreateTableRefused { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. } | Plan::AlterFunction { .. } | Plan::CreateOrAlterFunction { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
                         | Plan::CreateProcedure { .. }
@@ -134022,6 +135896,58 @@ mod tests {
         assert_eq!(GDS_RANDOM, 335544382); // isc_random - "@1"
     }
 
+    /// A JOIN's ON scope is its own join tree, stacked as the engine
+    /// passes the ON (measured on 2182, see [from_stack_orders]): `T1 JOIN
+    /// T2` T1, T2; RIGHT T2, T1; the second join of a chain sees the
+    /// first handed back reversed; a comma item starts a tree of its own.
+    #[test]
+    fn a_join_s_on_scope_is_its_own_tree() {
+        let (push, on) = from_stack_orders("T1 JOIN T2 ON ID = 1");
+        assert_eq!(push, vec![1, 0]);
+        assert_eq!(on, vec![None, Some(vec![0, 1])]);
+        assert_eq!(from_stack_orders("T1 RIGHT JOIN T2 ON ID = 1").1[1], Some(vec![1, 0]));
+        assert_eq!(from_stack_orders("T1 JOIN T2 ON 1=1 JOIN VT2 ON ID = 1").1[2], Some(vec![1, 0, 2]));
+        assert_eq!(from_stack_orders("T1 JOIN T2 ON 1=1 RIGHT JOIN VT2 ON ID = 1").1[2], Some(vec![2, 1, 0]));
+        assert_eq!(from_stack_orders("T1 RIGHT JOIN T2 ON 1=1 JOIN VT2 ON ID = 1").1[2], Some(vec![0, 1, 2]));
+        let (_, on) = from_stack_orders("T1, T2 JOIN VT2 ON ID = 1");
+        assert_eq!(on, vec![None, None, Some(vec![1, 2])]);
+    }
+
+    /// An aggregate's FILTER and WITHIN GROUP clauses are inside it, so
+    /// their columns are aggregated (measured: `SUM(A) FILTER (WHERE B >
+    /// 1)` answers over an ungrouped B); a call's name is no keyword for
+    /// the word after it.
+    #[test]
+    fn an_aggregate_spans_its_filter_and_within_group() {
+        let text = "SUM(A) FILTER (WHERE B > 1)";
+        let (toks, _) = agg_tokens(text).unwrap();
+        let sum = toks.iter().find(|t| t.is_agg()).unwrap();
+        assert_eq!(sum.close, text.len() - 1);
+        let text = "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY A) + B";
+        let (toks, _) = agg_tokens(text).unwrap();
+        let p = toks.iter().find(|t| t.is_agg()).unwrap();
+        assert_eq!(&text[p.close..p.close + 1], ")");
+        assert!(text[..p.close].ends_with("ORDER BY A"));
+        let b = toks.iter().find(|t| t.name() == Some("B")).unwrap();
+        assert!(b.is_column() && b.start > p.close);
+        // `HASH(V USING CRC32)`: V is a column, CRC32 the grammar's word
+        let (toks, _) = agg_tokens("HASH(V USING CRC32)").unwrap();
+        let cols: Vec<&str> = toks.iter().filter(|t| t.is_column()).filter_map(|t| t.name()).collect();
+        assert_eq!(cols, vec!["V"]);
+    }
+
+    /// A bare `*` beside another select item is the parser's Token
+    /// unknown - at the `*`, or at the comma after a leading one.
+    #[test]
+    fn a_bare_star_beside_an_item_is_a_token() {
+        let sql = "SELECT UNICODE_CHAR(65), * FROM T1";
+        assert_eq!(bare_star_token(sql), Some(25));
+        let sql = "SELECT *, UNICODE_CHAR(65) FROM T1";
+        assert_eq!(bare_star_token(sql), Some(8));
+        assert_eq!(bare_star_token("SELECT * FROM T1"), None);
+        assert_eq!(bare_star_token("SELECT ID, T1.* FROM T1"), None);
+    }
+
     /// The DPB items gfix's switches turn into, read out of a dpb.
     ///
     /// The MULTI-ITEM case is here rather than in a gate because no
@@ -140098,14 +142024,20 @@ mod tests {
         let a = parse_raw_expr("DATEDIFF(DAY, D, TS)").unwrap();
         let b = parse_raw_expr("DATEDIFF(DAY FROM D TO TS)").unwrap();
         assert!(normalize_raw(&a) == normalize_raw(&b));
-        // typing refusals: TIME takes only clock units; TIME cannot
-        // pair with a date in DATEDIFF; WEEKDAY is not a unit
+        // a TIME with a date unit, and a TIME beside a date in DATEDIFF,
+        // TYPE: the engine raises them at execute, per row
+        // ([dateadd_part_verdict], [datediff_pair_verdict]); WEEKDAY is
+        // not a unit
         let ty = |s: &str| {
             let raw = parse_raw_expr(s).unwrap();
             resolve_expr(&raw, &columns, &descs).unwrap().type_of(&descs)
         };
-        assert_eq!(ty("DATEADD(1 MONTH TO TM)"), None);
-        assert_eq!(ty("DATEDIFF(DAY, TM, D)"), None);
+        assert_eq!(ty("DATEADD(1 MONTH TO TM)"), Some(ExprType::Temporal(TKind::Time)));
+        assert_eq!(ty("DATEDIFF(DAY, TM, D)"), Some(ExprType::Int));
+        assert!(dateadd_part_verdict(ExtractPart::Month, TKind::Time).is_some());
+        assert!(dateadd_part_verdict(ExtractPart::Hour, TKind::Time).is_none());
+        assert!(datediff_pair_verdict(ExtractPart::Day, &Value::Time(0), &Value::Date(0)).is_some());
+        assert!(datediff_pair_verdict(ExtractPart::Day, &Value::Date(0), &Value::Date(1)).is_none());
         assert!(parse_raw_expr("DATEADD(1 WEEKDAY TO D)").is_none());
         // the announces: DATEADD keeps the operand's kind, DATEDIFF is
         // BIGINT (MILLISECOND: scale -1)
@@ -145447,9 +147379,11 @@ mod tests {
             }
             _ => panic!("not a CREATE TABLE plan"),
         }
-        // two PRIMARY KEYs are refused
-        assert!(plan_create_table("CREATE TABLE T (A INTEGER PRIMARY KEY, B INTEGER, PRIMARY KEY (B))", None)
-        .is_none());
+        // two PRIMARY KEYs plan to the engine's EXECUTE-time refusal
+        assert!(matches!(
+            plan_create_table("CREATE TABLE T (A INTEGER PRIMARY KEY, B INTEGER, PRIMARY KEY (B))", None),
+            Some((Plan::CreateTableRefused { .. }, _))
+        ));
     }
 
     /// Engine-probed golden bytes (inc 114): a user trigger's body BLR
