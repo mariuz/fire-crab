@@ -58201,6 +58201,23 @@ fn plan_query_inner_at_body(
         return Some(p);
     }
     if let Some((source, body_at)) = parse_execute_block(sql) {
+        // judged before it runs, as a selectable block's body is: the BLR
+        // compiler first, and [block_prepare_verdict] where it declines
+        let synth = format!("CREATE PROCEDURE FC$BLOCK AS {}", source);
+        fire_crab_dsql::set_catalog(dsql_catalog_for(db, &synth));
+        let compiled = fire_crab_dsql::compile_procedure_full_with_funcs(&synth, &plain_function_arities(db)).is_some();
+        fire_crab_dsql::set_catalog(Vec::new());
+        let meta = ProcMeta {
+            ins: Vec::new(),
+            outs: Vec::new(),
+            source: source.clone(),
+            body_at: Some(body_at),
+            prc_type: None,
+            is_function: false,
+        };
+        if let Some(refused) = block_prepare_gate(&meta, db, compiled) {
+            return refused;
+        }
         return Some(Plan::ExecBlock { source, body_at });
     }
     // EXECUTE PROCEDURE is not a SELECT, but isql prepares and FETCHES
@@ -108960,8 +108977,17 @@ fn psql_scaled_arith(kind: char, a: &Value, b: &Value) -> Result<Value, PsqlStop
             '+' => x + y,
             '-' => x - y,
             '*' => x * y,
+            // a DOUBLE operand's division by zero is the FLOAT one
+            // (measured: `A / 0` over a DOUBLE A, and `7 / D` over a
+            // DOUBLE D, both answer *Floating-point divide by zero*)
             '/' => {
                 if y == 0.0 {
+                    if matches!(a, Value::Double(_)) || matches!(b, Value::Double(_)) {
+                        return Err(PsqlStop::Raise(Thrown::Runtime {
+                            err: EvalErr::FloatDivideByZero,
+                            trace: Vec::new(),
+                        }));
+                    }
                     return Err(div0());
                 }
                 x / y
@@ -111441,6 +111467,14 @@ fn restore_ref_action(rule: &str) -> Result<fire_crab_ods::ddl::RefAction, Strin
 /// reads as an operator rather than part of the value and the statement
 /// refuses. `(-3)` is the same value in every position.
 fn subst_literal(v: &Value) -> Option<String> {
+    // A SINGLE-PRECISION VALUE IS WRITTEN AS THE FLOAT IT IS
+    // ([dml_subq_literal]'s cast): its shortest text `1e-1` reads back as
+    // the DOUBLE 0.1, and a FLOAT local's `F * 3` answered 0.3 where the
+    // engine computes over the single and answers 0.3000000044703484
+    // (measured, FLOAT and REAL alike)
+    if let Value::Float(_) = v {
+        return dml_subq_literal(v);
+    }
     let lit = psql_literal(v)?;
     Some(if lit.starts_with('-') { format!("({})", lit) } else { lit })
 }
@@ -112644,6 +112678,11 @@ fn exec_psql_stmt_inner(
             let row = (0..len).contains(&want).then(|| rows[want as usize].clone());
             state.pos = want.clamp(-1, len);
             let cs = state.cs.clone();
+            // RELATIVE 0 RE-READS THE CURRENT ROW AND COUNTS NONE: the
+            // INTO target is written, ROW_COUNT is 0 (measured on 2182:
+            // ABSOLUTE 2 then RELATIVE 0 answers the row 2 with
+            // ROW_COUNT 0, the RELATIVE 1 after it 3 with 1)
+            let counts = !matches!(orient, FetchOrient::Relative(_)) || step != Some(0);
             let got = match row {
                 Some(r) => {
                     if !into.is_empty() && r.len() != into.len() {
@@ -112652,7 +112691,7 @@ fn exec_psql_stmt_inner(
                     for (i, (slot, v)) in into.iter().zip(r.into_iter()).enumerate() {
                         store_slot_cs(f, *slot as usize, v, cs.get(i).copied().flatten())?;
                     }
-                    1
+                    i64::from(counts)
                 }
                 None => 0,
             };
@@ -113074,7 +113113,13 @@ fn run_autonomous(
     if let Some(d) = db.as_ref() {
         d.refresh_reader_view(); // the block's own ids, not the outer's
     }
+    // ITS USER_TRANSACTION CONTEXT IS ITS OWN: empty when it starts, and
+    // gone with it - measured on 2182, a key the block sets is NULL to
+    // the outer transaction after it, a key the outer one set is NULL
+    // inside it, and the block reads back what it set itself
+    let outer_ctx = CTX_VARS.with(|c| std::mem::take(&mut c.borrow_mut().1));
     let outcome = run(f, steps, db, ctx);
+    CTX_VARS.with(|c| c.borrow_mut().1 = outer_ctx);
     if let Some(d) = db.as_ref() {
         d.refresh_reader_view();
     }
@@ -116065,14 +116110,23 @@ fn trig_position(d: &TrigDef, off: usize) -> Option<(u32, u32)> {
 /// declares them in the same place - between `AS` and `BEGIN` - and its
 /// frame was built with an empty map, so `OPEN CU` in a trigger body had
 /// no cursor to find.
+///
+/// A `SCROLL` cursor is scrollable in a trigger exactly as in a
+/// procedure (measured on 2182: a BEFORE INSERT trigger's `FETCH LAST
+/// FROM C INTO K` over a SCROLL cursor stores 2, where every cursor
+/// built here non-scrollable raised HY106 at the FETCH).
 fn trig_cursor_states(source: &str) -> std::collections::HashMap<String, CursorState> {
     let up = source.to_ascii_uppercase();
     let Some(begin_at) = find_word(&up, "BEGIN", 0) else {
         return std::collections::HashMap::new();
     };
+    let scrolls = declared_scroll_cursors(&source[..begin_at]);
     declared_cursors(&source[..begin_at])
         .into_iter()
-        .map(|(name, query)| (name, CursorState { query, rows: None, pos: -1, scroll: false, cols: Vec::new(), cs: Vec::new() }))
+        .map(|(name, query)| {
+            let scroll = scrolls.contains(&name);
+            (name, CursorState { query, rows: None, pos: -1, scroll, cols: Vec::new(), cs: Vec::new() })
+        })
         .collect()
 }
 
@@ -116410,36 +116464,29 @@ fn run_execute_block(
 /// where a procedure's carries the quoted schema-qualified one.
 const ANONYMOUS_BLOCK: &str = "";
 
-/// Run a body the caller already holds the metadata for - the whole of
-/// [run_procedure] once the catalog lookup is done, and what an
-/// anonymous block borrows.
-fn run_body_source(
-    database: &mut Option<Database>,
-    name: &str,
-    meta: &ProcMeta,
-    args: &[Value],
-    ctx: &SessionCtx,
-    // the consumer's row limit, when it is known - see [PsqlFrame::stop_after]
-    stop_after: Option<BodyCap>,
-) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
-    if body_declares_collated_slot(database.as_ref(), meta) {
-        return Err(ProcErr::from(format!(
-            "{}: a parameter or variable of an explicit collation is outside this server's PSQL surface",
-            name
-        )));
-    }
-    // omitted trailing arguments take their parameters' DEFAULTs
-    let given = args.len();
-    let args = with_proc_defaults(meta, args, Some(ctx));
-    let args = &args[..];
-    if args.len() != meta.ins.len() {
-        return Err(ProcErr::from(format!(
-            "procedure {} expects {} input parameter(s), got {}",
-            name,
-            meta.ins.len(),
-            args.len()
-        )));
-    }
+/// What [run_body_source] reads off a body before a statement runs: the
+/// slot names and declared types, the header's cursors, the parsed
+/// statement tree (header initialisers first) - everything the frame is
+/// built from, and everything a PREPARE-TIME check of the body reads
+/// ([block_prepare_verdict]). The prepare-time call-count check
+/// ([body_call_out_mismatch]) has already run.
+struct BodyPrep {
+    names: Vec<String>,
+    types: Vec<Option<CastTarget>>,
+    rules: Vec<Option<VarRule>>,
+    lit_cs: SrcCs,
+    cursor_states: std::collections::HashMap<String, CursorState>,
+    row_count_slot: Option<u16>,
+    err_slots: [Option<u16>; 3],
+    cursor_fields: Vec<(u16, String, String)>,
+    body: TrigStmt,
+    /// how many of `names` are parameters and DECLAREd locals - the
+    /// slots after them are ROW_COUNT, the error context variables and
+    /// the `<cursor>.<column>` fields this server adds
+    declared: usize,
+}
+
+fn body_prepare(database: Option<&Database>, name: &str, meta: &ProcMeta) -> Result<BodyPrep, ProcErr> {
     // the parser numbers variables in the order it is given them:
     // inputs, then outputs - the same order the body's identifiers
     // resolve against
@@ -116451,7 +116498,7 @@ fn run_body_source(
     let lit_cs: SrcCs = if name == ANONYMOUS_BLOCK {
         Some(CURRENT_ATT_CS.with(|c| c.get()))
     } else {
-        database.as_ref().and_then(|dbr| {
+        database.and_then(|dbr| {
             let kind = if meta.is_function { "srclit-fn" } else { "srclit-proc" };
             *dbr.meta_memo(kind, name, || {
                 let img = dbr.bytes();
@@ -116510,7 +116557,7 @@ fn run_body_source(
     // what a local of a DOMAIN with a default and no initialiser starts as
     let mut domain_defaults: Vec<(String, String)> = Vec::new();
     for (n, text) in &locals {
-        let (t, rule, default) = match catalog_decl_type(database.as_ref(), n, text) {
+        let (t, rule, default) = match catalog_decl_type(database, n, text) {
             Ok(Some(c)) => c,
             Ok(None) => (declared_type_target(text), None, None),
             Err(why) => {
@@ -116526,10 +116573,11 @@ fn run_body_source(
     if rules.iter().all(|r| r.is_none()) {
         rules.clear();
     }
-    if let Some(dbr) = database.as_ref() {
+    if let Some(dbr) = database {
         fill_default_cs(&mut types[params_at..], db_default_charset(&dbr.bytes(), dbr.page_size));
     }
     names.extend(locals.into_iter().map(|(n, _)| n));
+    let declared = names.len();
     // THE CURSORS the header declares, and ROW_COUNT.
     //
     // ROW_COUNT is not a variable the body declares, but it reads
@@ -116590,7 +116638,7 @@ fn run_body_source(
     // it let a WHEN ANY around it catch an error the engine never lets
     // the body reach, and `RETURNING_VALUES :R` over a two-output
     // procedure bound the first and answered 8 where the engine raises
-    if let Some(dbr) = database.as_ref() {
+    if let Some(dbr) = database {
         if let Some(err) = body_call_out_mismatch(&body, dbr) {
             return Err(ProcErr {
                 rows: Vec::new(),
@@ -116599,6 +116647,523 @@ fn run_body_source(
             });
         }
     }
+    Ok(BodyPrep { names, types, rules, lit_cs, cursor_states, row_count_slot, err_slots, cursor_fields, body, declared })
+}
+
+/// An anonymous block's prepare-time verdict as the planner answers it:
+/// `None` to plan it, `Some(None)` to refuse it (the generic refusal, and
+/// the -204 of an unknown relation the refusal path names), `Some(Some(
+/// RefusedEval))` for the engine's own prepare-time vector. A body the
+/// BLR compiler took (`compiled`) was judged there already, and only an
+/// engine vector is added to it.
+fn block_prepare_gate(meta: &ProcMeta, db: &Option<Database>, compiled: bool) -> Option<Option<Plan>> {
+    let prep = match body_prepare(db.as_ref(), ANONYMOUS_BLOCK, meta) {
+        Ok(p) => p,
+        // a vector the run gives at its start ([body_call_out_mismatch])
+        Err(ProcErr { status: Some(_), .. }) => return None,
+        Err(_) => return (!compiled).then_some(None),
+    };
+    match block_prepare_verdict(&prep, meta, db) {
+        BlockVerdict::Clean => None,
+        BlockVerdict::Raise(e) => Some(Some(Plan::RefusedEval(e))),
+        BlockVerdict::Refuse { certain } => (certain || !compiled).then_some(None),
+    }
+}
+
+/// What a PREPARE-TIME look at an anonymous block's body says
+/// ([block_prepare_verdict]).
+enum BlockVerdict {
+    /// nothing the checks read is wrong
+    Clean,
+    /// the engine refuses the block at prepare, in words this server
+    /// does not reproduce - the block is refused. `certain` for a check
+    /// read off the body's shape alone (a name declared twice, a LEAVE
+    /// outside a loop), which holds whatever else judged the body; not
+    /// for one the planner answered, which is added only where the BLR
+    /// compiler did not judge the body
+    Refuse { certain: bool },
+    /// the engine refuses it at prepare with this vector
+    Raise(EvalErr),
+}
+
+/// AN EXECUTE BLOCK IS JUDGED WHOLE BEFORE A STATEMENT RUNS, and the
+/// source interpreter reads only the statements it reaches. So the
+/// checks the engine's compile makes are made here, over every
+/// statement, taken branch or not - measured on engine 2182, each in an
+/// IF branch that never runs: a table or a column nothing has (-204 /
+/// -206), a syntax error in a value (`N = 1 +;` -104), a duplicate
+/// output or local (-637), `DECLARE SQLCODE`, a nested duplicate loop
+/// label, RETURN in a block, LEAVE / CONTINUE outside a loop, FETCH from
+/// a cursor nothing declares, `UPDATE .. SET <no such column>`, an
+/// INSERT whose values do not count the columns, a two-column singleton
+/// SELECT into one variable (-313) - every one fails the block at
+/// prepare, where the interpreter answered rows.
+///
+/// A named cursor - `DECLARE C CURSOR FOR (...)` or `FOR SELECT .. AS
+/// CURSOR C` - is a derived table by the engine's reading: an unnamed
+/// column in it is *no column name specified for column number 2 in
+/// derived table C* at prepare, whether or not `C.<column>` is read
+/// (measured: over `FETCH C INTO R, R`, a bare `FETCH C` and a COUNT(*)
+/// alike).
+///
+/// Every query and value goes to the ORDINARY planner with each
+/// variable written as a NULL of its declared type, which is the check
+/// the engine's compile makes of it: its names, its grammar, its
+/// arity. What the planner cannot read refuses the block - the same
+/// bare refusal the interpreter gave when it reached the statement.
+fn block_prepare_verdict(prep: &BodyPrep, meta: &ProcMeta, db: &Option<Database>) -> BlockVerdict {
+    // THE HEADER: a name declared twice, or a name the grammar keeps
+    let declared = &prep.names[..prep.declared.min(prep.names.len())];
+    for (i, n) in declared.iter().enumerate() {
+        if declared[..i].contains(n) || matches!(n.as_str(), "SQLCODE" | "GDSCODE" | "SQLSTATE" | "ROW_COUNT") {
+            return BlockVerdict::Refuse { certain: true };
+        }
+    }
+    let up = meta.source.to_ascii_uppercase();
+    let header_end = find_word(&mask_literals(&up), "BEGIN", 0).unwrap_or(0);
+    let cursors = declared_cursors(&meta.source[..header_end]);
+    for (i, (c, _)) in cursors.iter().enumerate() {
+        if declared.contains(c) || cursors[..i].iter().any(|(d, _)| d == c) {
+            return BlockVerdict::Refuse { certain: true };
+        }
+    }
+    let cx = VerdictCx { prep, db, is_function: meta.is_function };
+    // each declared cursor's query, as the derived table it is
+    for (c, _) in &cursors {
+        let Some(state) = prep.cursor_states.get(c) else { return BlockVerdict::Refuse { certain: false } };
+        if let Err(v) = cx.cursor_query(&state.query, c) {
+            return v;
+        }
+    }
+    let mut loops: Vec<Option<String>> = Vec::new();
+    match cx.walk(&prep.body, &mut loops) {
+        Ok(()) => BlockVerdict::Clean,
+        Err(v) => v,
+    }
+}
+
+struct VerdictCx<'a> {
+    prep: &'a BodyPrep,
+    db: &'a Option<Database>,
+    is_function: bool,
+}
+
+impl VerdictCx<'_> {
+    /// Slot `i` as a NULL of its declared type - what the engine's compile
+    /// knows of a variable when it checks a statement over it.
+    fn standin(&self, i: usize) -> String {
+        if let Some(Some(t)) = self.prep.types.get(i) {
+            if let Some(ty) = cast_target_sql(t) {
+                return format!("CAST(NULL AS {})", ty);
+            }
+        }
+        match self.prep.names.get(i).map(String::as_str) {
+            Some("ROW_COUNT" | "SQLCODE" | "GDSCODE") => "CAST(NULL AS INTEGER)".to_string(),
+            Some("SQLSTATE") => "CAST(NULL AS CHAR(5))".to_string(),
+            _ => "NULL".to_string(),
+        }
+    }
+
+    /// `text` with its variables - `:name` binds and the parser's
+    /// [PSQL_VAR_MARK] slots - written as their stand-ins
+    fn subst(&self, text: &str, binds: &[(String, u16)]) -> String {
+        let mut t = text.to_string();
+        for i in (0..self.prep.names.len()).rev() {
+            let mark = format!("{}{}", PSQL_VAR_MARK, i);
+            if t.contains(&mark) {
+                t = t.replace(&mark, &self.standin(i));
+            }
+        }
+        let b = t.as_bytes();
+        let mut out = String::with_capacity(t.len() + 16);
+        let mut in_str = false;
+        let mut i = 0usize;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'\'' {
+                in_str = !in_str;
+                out.push('\'');
+                i += 1;
+                continue;
+            }
+            if !in_str && c == b':' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_') {
+                let mut j = i + 1;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'$') {
+                    j += 1;
+                }
+                let name = t[i + 1..j].to_ascii_uppercase();
+                let slot = binds
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, s)| *s as usize)
+                    .or_else(|| self.prep.names.iter().position(|n| *n == name));
+                match slot {
+                    Some(s) => out.push_str(&self.standin(s)),
+                    None => out.push_str(&t[i..j]),
+                }
+                i = j;
+                continue;
+            }
+            i = push_char_at(&mut out, &t, i);
+        }
+        out
+    }
+
+    /// A query the planner must take: its plan, or the refusal
+    fn query(&self, sql: &str) -> Result<Plan, BlockVerdict> {
+        match psql_plan(sql, self.db) {
+            Ok((Plan::Refused | Plan::RefusedEval(_), _)) | Err(_) => Err(BlockVerdict::Refuse { certain: false }),
+            Ok((p, _)) => Ok(p),
+        }
+    }
+
+    fn value(&self, (text, binds): &RawVal) -> Result<(), BlockVerdict> {
+        self.query(&format!("SELECT {} FROM RDB$DATABASE", self.subst(text, binds))).map(|_| ())
+    }
+
+    fn cond(&self, (text, binds): &RawVal) -> Result<(), BlockVerdict> {
+        self.query(&format!("SELECT COUNT(*) FROM RDB$DATABASE WHERE {}", self.subst(text, binds))).map(|_| ())
+    }
+
+    /// A NAMED cursor's query: planned, and its columns held to the
+    /// derived-table rules under the cursor's name
+    fn cursor_query(&self, query: &str, name: &str) -> Result<usize, BlockVerdict> {
+        let q = self.subst(query, &[]);
+        let p = self.query(&q)?;
+        let mut cols = output_cols_of(&p);
+        match derived_columns_verdict(&mut cols, &[], name) {
+            Some(e @ EvalErr::DerivedFieldUnnamed { .. }) => Err(BlockVerdict::Raise(e)),
+            Some(_) => Err(BlockVerdict::Refuse { certain: false }),
+            None => Ok(cols.len()),
+        }
+    }
+
+    /// A DML statement the body renders: planned, not run
+    fn dml(&self, sql: &str, kind: DmlKind) -> Result<(), BlockVerdict> {
+        let planned = match kind {
+            DmlKind::Insert => plan_insert(sql, self.db),
+            DmlKind::Update => plan_update(sql, self.db),
+            DmlKind::Delete => plan_delete(sql, self.db),
+        };
+        match planned {
+            Some((Plan::Refused | Plan::RefusedEval(_), _)) | None => Err(BlockVerdict::Refuse { certain: false }),
+            Some((_, params)) if !params.is_empty() => Err(BlockVerdict::Refuse { certain: false }),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// A frame of NULLs of the declared types, for the statements this
+    /// server renders from their parsed form ([render_psql_expr])
+    fn null_frame(&self) -> PsqlFrame {
+        PsqlFrame {
+            stop_after: None,
+            types: self.prep.types.clone(),
+            cast_cs: None,
+            lit_cs: self.prep.lit_cs,
+            vars: vec![Value::Null; self.prep.names.len()],
+            out_at: 0,
+            out_len: 0,
+            suspended: Vec::new(),
+            caught: None,
+            cursors: std::collections::HashMap::new(),
+            row_count_slot: None,
+            err_slots: [None; 3],
+            rules: Vec::new(),
+            cursor_fields: Vec::new(),
+            trig: None,
+            gen: Default::default(),
+            trig_excs: Vec::new(),
+        }
+    }
+
+    fn walk(&self, s: &TrigStmt, loops: &mut Vec<Option<String>>) -> Result<(), BlockVerdict> {
+        let refuse = || Err(BlockVerdict::Refuse { certain: false });
+        let shape = || Err(BlockVerdict::Refuse { certain: true });
+        // a loop label may not repeat one it is nested in
+        let enter = |loops: &mut Vec<Option<String>>, label: &Option<String>| -> Result<(), BlockVerdict> {
+            if label.is_some() && loops.contains(label) {
+                return Err(BlockVerdict::Refuse { certain: true });
+            }
+            loops.push(label.clone());
+            Ok(())
+        };
+        match s {
+            // a value the arithmetic grammar read is checked where it
+            // names a COLUMN - no block has a row to read one from, so
+            // the name is a variable nothing declared or a context word
+            // the planner knows (its text, `fallback`, is what decides)
+            TrigStmt::Assign { raw, expr, fallback, .. } => {
+                match (raw, fallback) {
+                    (Some(r), _) => self.value(r),
+                    (None, Some(r)) if !expr.field_refs().is_empty() => self.value(r),
+                    _ => Ok(()),
+                }
+            }
+            TrigStmt::If { then, otherwise, raw, .. } => {
+                if let Some(r) = raw {
+                    self.cond(r)?;
+                }
+                self.walk(then, loops)?;
+                match otherwise {
+                    Some(e) => self.walk(e, loops),
+                    None => Ok(()),
+                }
+            }
+            TrigStmt::While { body, label, raw, .. } => {
+                if let Some(r) = raw {
+                    self.cond(r)?;
+                }
+                enter(loops, label)?;
+                let r = self.walk(body, loops);
+                loops.pop();
+                r
+            }
+            TrigStmt::Raise { name, msg_raw, using, .. } => {
+                if self.db.as_ref().and_then(|d| exception_identity(d, name)).is_none() {
+                    return refuse();
+                }
+                if let Some(r) = msg_raw {
+                    self.value(r)?;
+                }
+                for r in using.iter().flatten() {
+                    self.value(r)?;
+                }
+                Ok(())
+            }
+            TrigStmt::Open { cursor, .. } | TrigStmt::Close { cursor, .. } => {
+                if !self.prep.cursor_states.contains_key(cursor) {
+                    return shape();
+                }
+                Ok(())
+            }
+            TrigStmt::Fetch { cursor, orient, .. } => {
+                if !self.prep.cursor_states.contains_key(cursor) {
+                    return shape();
+                }
+                match orient {
+                    FetchOrient::Absolute(r) | FetchOrient::Relative(r) => self.value(r),
+                    _ => Ok(()),
+                }
+            }
+            TrigStmt::Leave { target, .. } | TrigStmt::Continue { target, .. } => {
+                let ok = match target {
+                    None => !loops.is_empty(),
+                    Some(_) => loops.contains(target),
+                };
+                if ok { Ok(()) } else { shape() }
+            }
+            TrigStmt::Return { .. } | TrigStmt::ReturnText { .. } if !self.is_function => shape(),
+            TrigStmt::Store { table, cols, exprs, raw, .. } => {
+                let values = match raw {
+                    Some((text, binds)) => self.subst(text, binds),
+                    None => {
+                        if cols.len() != exprs.len() {
+                            return refuse();
+                        }
+                        let f = self.null_frame();
+                        match exprs.iter().map(|e| render_psql_expr(e, &f)).collect::<Option<Vec<_>>>() {
+                            Some(v) => v.join(", "),
+                            None => return refuse(),
+                        }
+                    }
+                };
+                let sql = if cols.is_empty() {
+                    format!("INSERT INTO {} VALUES ({})", render_canon_ref(table), values)
+                } else {
+                    format!(
+                        "INSERT INTO {} ({}) VALUES ({})",
+                        render_canon_ref(table),
+                        cols.iter().map(|c| render_canon_ref(c)).collect::<Vec<_>>().join(", "),
+                        values
+                    )
+                };
+                self.dml(&sql, DmlKind::Insert)
+            }
+            TrigStmt::Update { table, sets, wher, .. } => {
+                let f = self.null_frame();
+                let Some(assigns) = sets
+                    .iter()
+                    .map(|(c, e)| render_psql_expr(e, &f).map(|v| format!("{} = {}", render_canon_ref(c), v)))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return refuse();
+                };
+                let mut sql = format!("UPDATE {} SET {}", render_canon_ref(table), assigns.join(", "));
+                if let Some(c) = wher {
+                    let Some(w) = render_psql_cond(c, &f) else { return refuse() };
+                    sql.push_str(" WHERE ");
+                    sql.push_str(&w);
+                }
+                self.dml(&sql, DmlKind::Update)
+            }
+            TrigStmt::Delete { table, wher, .. } => {
+                let f = self.null_frame();
+                let mut sql = format!("DELETE FROM {}", render_canon_ref(table));
+                if let Some(c) = wher {
+                    let Some(w) = render_psql_cond(c, &f) else { return refuse() };
+                    sql.push_str(" WHERE ");
+                    sql.push_str(&w);
+                }
+                self.dml(&sql, DmlKind::Delete)
+            }
+            TrigStmt::DmlInto { sql: (text, binds), .. } => {
+                let sql = self.subst(text, binds);
+                let (dml_sql, _) = split_returning(&sql);
+                let up = dml_sql.trim_start().to_ascii_uppercase();
+                let kind = if find_word(&up, "INSERT", 0) == Some(0) {
+                    DmlKind::Insert
+                } else if find_word(&up, "UPDATE", 0) == Some(0) {
+                    DmlKind::Update
+                } else {
+                    DmlKind::Delete
+                };
+                // planned, and its RETURNING list wrapped over the target,
+                // as the run does it ([run_body_returning])
+                let planned = match kind {
+                    DmlKind::Insert => plan_insert(&dml_sql, self.db),
+                    DmlKind::Update => plan_update(&dml_sql, self.db),
+                    DmlKind::Delete => plan_delete(&dml_sql, self.db),
+                };
+                let planned = planned.filter(|(p, params)| {
+                    params.is_empty() && !matches!(p, Plan::Refused | Plan::RefusedEval(_))
+                });
+                let (Some((plan, _)), (_, Some(list)), Some(table)) =
+                    (planned, split_returning(&sql), dml_table_name(&dml_sql))
+                else {
+                    return refuse();
+                };
+                match wrap_returning(
+                    plan,
+                    Vec::new(),
+                    &list,
+                    &table,
+                    dml_target_alias(&dml_sql).map(|(a, _)| a).as_deref(),
+                    dml_binds_alias(&sql),
+                    self.db,
+                ) {
+                    Some((Plan::Returning { .. }, _)) => Ok(()),
+                    _ => refuse(),
+                }
+            }
+            TrigStmt::SelectInto { sql, into, binds, .. } => {
+                let p = self.query(&self.subst(sql, binds))?;
+                let projected = output_cols_of(&p).len();
+                if projected == 0 {
+                    return refuse();
+                }
+                if projected != into.len() {
+                    return Err(BlockVerdict::Raise(EvalErr::DsqlCountMismatch));
+                }
+                Ok(())
+            }
+            TrigStmt::ForSelect { query, into, body, label, cursor, .. } => {
+                let n = match cursor {
+                    Some(c) => self.cursor_query(query, c)?,
+                    None => output_cols_of(&self.query(&self.subst(query, &[]))?).len(),
+                };
+                if n == 0 || (!into.is_empty() && n != into.len()) {
+                    return refuse();
+                }
+                enter(loops, label)?;
+                let r = self.walk(body, loops);
+                loops.pop();
+                r
+            }
+            TrigStmt::ForExecStmt { body, label, .. } => {
+                enter(loops, label)?;
+                let r = self.walk(body, loops);
+                loops.pop();
+                r
+            }
+            TrigStmt::Block { stmts, handlers, .. } => {
+                for st in stmts {
+                    self.walk(st, loops)?;
+                }
+                for (_, h) in handlers {
+                    self.walk(h, loops)?;
+                }
+                Ok(())
+            }
+            TrigStmt::Autonomous { body, .. } => self.walk(body, loops),
+            TrigStmt::Call { raw, .. } => self.value(raw),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A [CastTarget] spelled as the SQL type it is, for a stand-in NULL.
+fn cast_target_sql(t: &CastTarget) -> Option<String> {
+    Some(match t {
+        CastTarget::Int { bytes } => match bytes {
+            2 => "SMALLINT".to_string(),
+            4 => "INTEGER".to_string(),
+            8 => "BIGINT".to_string(),
+            _ => "INT128".to_string(),
+        },
+        CastTarget::Text { len, pad, cs, .. } => {
+            let kind = if *pad { "CHAR" } else { "VARCHAR" };
+            match cs {
+                Some(cs) => format!("{}({}) CHARACTER SET {}", kind, (*len).max(1), charset_id_name(*cs)?),
+                None => format!("{}({})", kind, (*len).max(1)),
+            }
+        }
+        CastTarget::Numeric { scale, bytes, sub_type } => {
+            let p = match bytes {
+                2 => 4,
+                4 => 9,
+                8 => 18,
+                _ => 38,
+            };
+            format!("{}({}, {})", if *sub_type == 2 { "DECIMAL" } else { "NUMERIC" }, p, -(*scale as i32))
+        }
+        CastTarget::Approx => "DOUBLE PRECISION".to_string(),
+        CastTarget::Float => "FLOAT".to_string(),
+        CastTarget::Temporal(k) => match k {
+            TKind::Date => "DATE",
+            TKind::Time => "TIME",
+            TKind::Timestamp => "TIMESTAMP",
+            TKind::TimeTz => "TIME WITH TIME ZONE",
+            TKind::TimestampTz => "TIMESTAMP WITH TIME ZONE",
+        }
+        .to_string(),
+        CastTarget::Blob { sub_type, .. } => format!("BLOB SUB_TYPE {}", sub_type),
+        CastTarget::DecFloat { wide } => (if *wide { "DECFLOAT(34)" } else { "DECFLOAT(16)" }).to_string(),
+        CastTarget::Bool => "BOOLEAN".to_string(),
+    })
+}
+
+/// Run a body the caller already holds the metadata for - the whole of
+/// [run_procedure] once the catalog lookup is done, and what an
+/// anonymous block borrows.
+fn run_body_source(
+    database: &mut Option<Database>,
+    name: &str,
+    meta: &ProcMeta,
+    args: &[Value],
+    ctx: &SessionCtx,
+    // the consumer's row limit, when it is known - see [PsqlFrame::stop_after]
+    stop_after: Option<BodyCap>,
+) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
+    if body_declares_collated_slot(database.as_ref(), meta) {
+        return Err(ProcErr::from(format!(
+            "{}: a parameter or variable of an explicit collation is outside this server's PSQL surface",
+            name
+        )));
+    }
+    // omitted trailing arguments take their parameters' DEFAULTs
+    let given = args.len();
+    let args = with_proc_defaults(meta, args, Some(ctx));
+    let args = &args[..];
+    if args.len() != meta.ins.len() {
+        return Err(ProcErr::from(format!(
+            "procedure {} expects {} input parameter(s), got {}",
+            name,
+            meta.ins.len(),
+            args.len()
+        )));
+    }
+    let BodyPrep { names, types, rules, lit_cs, cursor_states, row_count_slot, err_slots, cursor_fields, body, .. } =
+        body_prepare(database.as_ref(), name, meta)?;
 
     // A STORED BODY WHOSE SOURCE LOST ITS LITERALS IS NOT ITS BODY. See
     // [source_literals_lost]: the engine answers from the BLR, where the
@@ -117161,9 +117726,12 @@ fn parse_execute_block_select(sql: &str, db: &Option<Database>) -> Option<Plan> 
     // compiler has no node for (the error context variables, EXCEPTION
     // ... USING, a BREAK, a function call as a statement). So when the
     // whole compile fails the header alone is compiled over a stand-in
-    // body (the compiler takes no empty one), and the interpreter is the
-    // judge: a body it cannot read still refuses, at execute, with the
-    // same bare 42000.
+    // body (the compiler takes no empty one). The body is then judged by
+    // [block_prepare_verdict] - the compile was the only prepare-time
+    // check of it, and the interpreter reads only the statements it
+    // reaches - and a body it cannot read still refuses, at execute,
+    // with the same bare 42000.
+    let compiled = c.is_some();
     let c = match c {
         Some(c) => Some(c),
         None => {
@@ -117188,6 +117756,23 @@ fn parse_execute_block_select(sql: &str, db: &Option<Database>) -> Option<Plan> 
         // PRECISION, FLOAT - is read by the column-type reader
         None => block_returns_scalar(returns_text)?,
     };
+    // ...and the body the compiler did not judge is judged here, before
+    // a statement of it runs ([block_prepare_verdict])
+    let meta = ProcMeta {
+        ins: Vec::new(),
+        outs: out_names
+            .iter()
+            .zip(out_descs.iter())
+            .map(|(n, d)| ProcParam { name: n.clone(), desc: *d, collated: false, default: None, default_ctx: None, default_cs: None })
+            .collect(),
+        source: body.to_string(),
+        body_at: Some(at),
+        prc_type: None,
+        is_function: false,
+    };
+    if let Some(refused) = block_prepare_gate(&meta, db, compiled) {
+        return refused;
+    }
     let mut cols = Vec::new();
     for (i, (n, d)) in out_names.iter().zip(out_descs.iter()).enumerate() {
         // the engine describes a block column with an EMPTY table/owner

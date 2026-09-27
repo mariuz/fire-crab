@@ -35,6 +35,19 @@
 #   9. CREATE TRIGGER with a literal holding ':' before NEW.<col>, and a
 #      DECLARE without VARIABLE: stored with the engine's BLR and debug
 #      bytes (read back by the engine).
+#  11. The engine judges a block's body WHOLE at prepare, and the source
+#      interpreter reads only what it reaches: every statement, in a
+#      branch that never runs too, is held to the compile's checks - an
+#      unknown table (the engine's -204, exact), column or variable, a
+#      value's syntax, a duplicate output / local / nested loop label,
+#      DECLARE SQLCODE, RETURN in a block, CONTINUE outside a loop, FETCH
+#      from no cursor, a DML the planner refuses, a RETURNING list, and
+#      the -313 of a singleton's count. A named cursor is a derived
+#      table: an unnamed column is the engine's -104 at prepare.
+#  12. A FLOAT local reaches the planner as the single it is; a DOUBLE
+#      division by zero is the floating-point one; an AUTONOMOUS block's
+#      USER_TRANSACTION context is its own; FETCH RELATIVE 0 re-reads
+#      the row with ROW_COUNT 0; a trigger's SCROLL cursor scrolls.
 #
 # RECORDED (the engine answers, this server refuses - a clean refusal,
 # never a wrong value): NEXT VALUE FOR in a block; a selectable procedure
@@ -42,8 +55,9 @@
 # sub-procedures; WHERE CURRENT OF; FETCH ABSOLUTE NULL; a DOMAIN-typed
 # block output; RETURNING OLD.<col> INTO; a trigger with COALESCE. And the
 # engine's prepare-time vectors this server answers with its generic
-# refusal: SQLCODE assigned, ten USING values, a message beside USING,
-# an unknown exception, a bare expression statement, COUNT(*) over a
+# refusal: section 11's vectors but the -204, the -313 and the derived
+# table's -104; SQLCODE assigned, ten USING values, a message beside
+# USING, an unknown exception, a bare expression statement, COUNT(*) over a
 # non-selectable procedure, a loop cursor's column out of its loop, and a
 # body query's unbound qualifier.
 #
@@ -84,6 +98,8 @@ CREATE DOMAIN DD7 AS INTEGER DEFAULT 7;
 CREATE DOMAIN DV3 AS VARCHAR(3) CHECK (VALUE <> 'bad');
 CREATE DOMAIN DNUMC AS NUMERIC(5,2) CHECK (VALUE < 100);
 CREATE DOMAIN DSMALL AS INTEGER CHECK (VALUE < 3);
+CREATE TABLE TSC (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER);
+CREATE TABLE TSD (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER);
 SET TERM ^;
 CREATE PROCEDURE PSQ (N INTEGER) RETURNS (I INTEGER, SQ BIGINT) AS BEGIN I = 1; WHILE (I <= N) DO BEGIN SQ = I * I; SUSPEND; I = I + 1; END END^
 CREATE PROCEDURE PDEF (A INTEGER = 1, B VARCHAR(10) = 'dflt') RETURNS (R VARCHAR(30)) AS BEGIN R = A || B; SUSPEND; END^
@@ -100,6 +116,8 @@ CREATE PROCEDURE PEXU (N INTEGER) RETURNS (R INTEGER) AS BEGIN R = N; EXCEPTION 
 CREATE PROCEDURE PCTX RETURNS (R VARCHAR(20)) AS BEGIN RDB$SET_CONTEXT('USER_TRANSACTION', 'PK', 'pv'); R = RDB$GET_CONTEXT('USER_TRANSACTION', 'PK'); SUSPEND; END^
 CREATE PROCEDURE PSCR RETURNS (X INTEGER) AS DECLARE C SCROLL CURSOR FOR (SELECT ID FROM T1 ORDER BY ID); BEGIN OPEN C; FETCH LAST FROM C INTO :X; SUSPEND; FETCH PRIOR FROM C INTO :X; SUSPEND; X = C.ID * 10; SUSPEND; CLOSE C; END^
 CREATE PROCEDURE PDOM (A INTEGER) RETURNS (R INTEGER) AS DECLARE X DPOS; BEGIN X = A; R = X; SUSPEND; END^
+CREATE TRIGGER TSC_BI FOR TSC BEFORE INSERT AS DECLARE C SCROLL CURSOR FOR (SELECT ID FROM T1 ORDER BY ID); DECLARE K INTEGER; BEGIN OPEN C; FETCH LAST FROM C INTO K; NEW.N = K; FETCH PRIOR FROM C INTO K; NEW.N = NEW.N * 10 + K; FETCH ABSOLUTE 1 FROM C INTO K; NEW.N = NEW.N * 10 + K; CLOSE C; END^
+CREATE TRIGGER TSD_BI FOR TSD BEFORE INSERT AS DECLARE C CURSOR FOR (SELECT ID FROM T1 ORDER BY ID); DECLARE K INTEGER; BEGIN OPEN C; FETCH LAST FROM C INTO K; NEW.N = K; CLOSE C; END^
 SET TERM ;^
 COMMIT;
 SQL
@@ -332,11 +350,48 @@ echo $'--- 10. A BODY\'S QUERY IS HELD TO THE PREPARE-TIME RULES'
 known   $'10 a qualifier nothing binds: the engine\'s -206 at prepare, this server refuses (it answered 1)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN SELECT FIRST 1 T.ID FROM T1 T ORDER BY T1.ID INTO N; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"T1"."ID"|-At line 1, column 83' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
 known   $'10 ...beside a construct the block compiler does not take' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = SQLCODE; SELECT FIRST 1 T.ID FROM T1 T ORDER BY T1.ID INTO N; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"T1"."ID"|-At line 1, column 96' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
 
+echo $'--- 11. THE BODY IS JUDGED WHOLE AT PREPARE, TAKEN BRANCH OR NOT'
+pin     $'11 an unknown table in a branch that never runs: the engine\'s -204 at prepare' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = SQLCODE; SUSPEND; IF (1 = 0) THEN SELECT ID FROM NOSUCHT INTO N; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42S02|Dynamic SQL Error|-SQL error code = -204|-Table unknown|-"NOSUCHT"|-At line 1, column 97'
+known   $'11 an unknown column there: the engine\'s -206, this server\'s refusal (it answered 1)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = 1; SUSPEND; IF (N = 0) THEN SELECT NOSUCH FROM T1 INTO N; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOSUCH"|-At line 1, column 83' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 a syntax error in a value there (N = 1 +;): -104, refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = SQLCODE; SUSPEND; IF (N = 9) THEN N = 1 +; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 89|-;' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 ...SUBSTRING(... FOR 2 FOR 3): refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER, S VARCHAR(10)) AS BEGIN N = SQLCODE; SUSPEND; IF (N = 5) THEN S = SUBSTRING(\'abc\' FROM 1 FOR 2 FOR 3); END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 130|-FOR' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 ...a variable nothing declares: refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = SQLCODE; SUSPEND; IF (N = 5) THEN N = NOSUCHV + 1; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOSUCHV"|-At line 1, column 86' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 a duplicate output: -637, refused (it answered two N columns)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER, N INTEGER) AS BEGIN N = SQLCODE; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -637|-duplicate specification of "N" - not supported' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 a duplicate local: -637, refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS DECLARE X INTEGER; DECLARE X INTEGER; BEGIN N = SQLCODE; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -637|-duplicate specification of "X" - not supported' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 ...and in a block the BLR compiler takes' $'SET TERM ^;\nEXECUTE BLOCK AS DECLARE X INTEGER; DECLARE X INTEGER; BEGIN X = 1; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -637|-duplicate specification of "X" - not supported' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 DECLARE SQLCODE: -104, refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS DECLARE SQLCODE INTEGER; BEGIN N = 1; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 46|-SQLCODE' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 a nested duplicate loop label: refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = SQLCODE; SUSPEND; L1: WHILE (N < 0) DO BEGIN L1: WHILE (N < 0) DO LEAVE L1; END END^\nSET TERM ;^' $'Statement failed, SQLSTATE = HY000|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-Label L1 already exists in the current scope' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 RETURN in a block: refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = SQLCODE; SUSPEND; IF (N = 5) THEN RETURN 5; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown|-RETURN' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 CONTINUE outside a loop: refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = SQLCODE; SUSPEND; IF (N = 5) THEN CONTINUE; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown|-CONTINUE' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 FETCH from a cursor nothing declares: HY015, refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = SQLCODE; SUSPEND; IF (N = 5) THEN FETCH C INTO N; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = HY015|Dynamic SQL Error|-SQL error code = -504|-Invalid cursor reference|-Cursor "C" is not found in the current context' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 UPDATE ... SET <no such column>: refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = SQLCODE; SUSPEND; IF (N = 5) THEN UPDATE TT SET NOSUCH = 1; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOSUCH"|-At line 1, column 96' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 an INSERT whose values do not count the columns: -804, refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = SQLCODE; SUSPEND; IF (N = 5) THEN INSERT INTO TT VALUES (1); END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 21S01|Dynamic SQL Error|-SQL error code = -804|-Count of read-write columns does not equal count of values' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+known   $'11 RETURNING <no such column> INTO: refused' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = SQLCODE; SUSPEND; IF (N = 5) THEN INSERT INTO TT (ID) VALUES (1) RETURNING NOSUCH INTO N; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42S22|Dynamic SQL Error|-SQL error code = -206|-Column unknown|-"NOSUCH"|-At line 1, column 123' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+pin     $'11 two columns into one variable there: the -313 at prepare, no row first' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = SQLCODE; SUSPEND; IF (N = 5) THEN SELECT ID, BI FROM T1 INTO N; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 07002|Dynamic SQL Error|-SQL error code = -313|-count of column list and variable list do not match'
+known   $'11 a block with no RETURNS: an unknown table where it never runs, refused (it ran)' $'SET TERM ^;\nEXECUTE BLOCK AS DECLARE X INTEGER; BEGIN X = SQLCODE; IF (1 = 0) THEN INSERT INTO NOSUCHT VALUES (1); END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42S02|Dynamic SQL Error|-SQL error code = -204|-Table unknown|-"NOSUCHT"|-At line 1, column 72' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+pin     $'11 CONTROL the same shapes where every name is known still run' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (N INTEGER, S VARCHAR(10)) AS DECLARE C CURSOR FOR (SELECT ID, ID + 1 AS X FROM T1 ORDER BY ID); BEGIN N = SQLCODE; IF (N = 5) THEN SELECT ID FROM T1 INTO N; IF (N = 5) THEN UPDATE TT SET N = 1; IF (N = 5) THEN S = SUBSTRING(\'abc\' FROM 1 FOR 2); OPEN C; FETCH C; N = C.X; SUSPEND; L1: WHILE (N < 3) DO BEGIN N = N + 1; IF (N = 3) THEN LEAVE L1; END SUSPEND; END^\nSET TERM ;^' $'N S|2 <null>|3 <null>'
+pin     $'11 a named cursor is a derived table: an unnamed column is its -104 at prepare' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INTEGER) AS DECLARE C CURSOR FOR (SELECT ID, ID + 1 FROM T1 ORDER BY ID); BEGIN OPEN C; FETCH C; R = C.ID; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-no column name specified for column number 2 in derived table C'
+pin     $'11 ...read by FETCH INTO alone too' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INTEGER) AS DECLARE C CURSOR FOR (SELECT COUNT(*) FROM T1); BEGIN OPEN C; FETCH C INTO R; SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-no column name specified for column number 1 in derived table C'
+pin     $'11 ...and FOR SELECT ... AS CURSOR' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INTEGER) AS BEGIN FOR SELECT ID, ID + 1 FROM T1 AS CURSOR C DO BEGIN R = C.ID; SUSPEND; END END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-no column name specified for column number 2 in derived table C'
+echo $'--- 12. VALUES THE PLANNER ANSWERS, CONTEXTS, SCROLL CURSORS'
+pin     $'12 a FLOAT local in arithmetic is the single, not its short text' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (M DOUBLE PRECISION) AS DECLARE F FLOAT = 0.1; BEGIN M = F * 3; SUSPEND; END^\nSET TERM ;^' $'M|0.3000000044703484'
+pin     $'12 ...two REAL locals' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (M DOUBLE PRECISION) AS DECLARE F REAL = 0.1; DECLARE G REAL = 0.2; BEGIN M = F + G; SUSPEND; END^\nSET TERM ;^' $'M|0.3000000044703484'
+pin     $'12 ...into text, and through a SELECT' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (M VARCHAR(40), D VARCHAR(40)) AS DECLARE F FLOAT = 0.1; BEGIN M = F * 3; SELECT :F * 3 FROM RDB$DATABASE INTO D; SUSPEND; END^\nSET TERM ;^' $'M D|0.3000000044703484 0.3000000044703484'
+pin     $'12 a DOUBLE division by zero is the floating-point one' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (M DOUBLE PRECISION) AS DECLARE A DOUBLE PRECISION = 2; BEGIN M = A / 0; SUSPEND; END^\nSET TERM ;^' $'M|Statement failed, SQLSTATE = 22012|arithmetic exception, numeric overflow, or string truncation|-Floating-point divide by zero. The code attempted to divide a floating-point value by zero.|-At block line: 1, col: 85'
+pin     $'12 ...by a DOUBLE zero' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (M VARCHAR(40)) AS DECLARE A INTEGER = 7; DECLARE D DOUBLE PRECISION = 0; BEGIN M = A / D; SUSPEND; END^\nSET TERM ;^' $'M|Statement failed, SQLSTATE = 22012|arithmetic exception, numeric overflow, or string truncation|-Floating-point divide by zero. The code attempted to divide a floating-point value by zero.|-At block line: 1, col: 103'
+pin     $'12 an AUTONOMOUS block\'s USER_TRANSACTION context is its own - gone after it' $'SET TERM ^;\nEXECUTE BLOCK AS BEGIN IN AUTONOMOUS TRANSACTION DO RDB$SET_CONTEXT(\'USER_TRANSACTION\', \'T5\', \'x\'); END^\nSET TERM ;^\nSELECT RDB$GET_CONTEXT(\'USER_TRANSACTION\', \'T5\') FROM RDB$DATABASE;\nSET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(10)) AS BEGIN IN AUTONOMOUS TRANSACTION DO BEGIN RDB$SET_CONTEXT(\'USER_TRANSACTION\', \'T6\', \'y\'); END R = RDB$GET_CONTEXT(\'USER_TRANSACTION\', \'T6\'); SUSPEND; END^\nSET TERM ;^' $'RDB$GET_CONTEXT|<null>|R|<null>'
+pin     $'12 ...the assignment form, and an outer key is not seen inside' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(10), S VARCHAR(10)) AS BEGIN IN AUTONOMOUS TRANSACTION DO R = RDB$SET_CONTEXT(\'USER_TRANSACTION\', \'T8\', \'y\'); R = COALESCE(RDB$GET_CONTEXT(\'USER_TRANSACTION\', \'T8\'), \'null\'); RDB$SET_CONTEXT(\'USER_TRANSACTION\', \'T9\', \'o\'); IN AUTONOMOUS TRANSACTION DO S = COALESCE(RDB$GET_CONTEXT(\'USER_TRANSACTION\', \'T9\'), \'null\'); SUSPEND; END^\nSET TERM ;^' $'R S|null null'
+pin     $'12 ...and the block reads back what it set' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(10)) AS BEGIN IN AUTONOMOUS TRANSACTION DO BEGIN RDB$SET_CONTEXT(\'USER_TRANSACTION\', \'TA\', \'y\'); R = RDB$GET_CONTEXT(\'USER_TRANSACTION\', \'TA\'); END SUSPEND; END^\nSET TERM ;^' $'R|y'
+pin     $'12 FETCH RELATIVE 0 re-reads the row, ROW_COUNT 0' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INTEGER, F INTEGER) AS DECLARE C SCROLL CURSOR FOR (SELECT ID FROM T1 ORDER BY ID); BEGIN OPEN C; FETCH RELATIVE 2 FROM C INTO :R; F = ROW_COUNT; SUSPEND; R = 99; FETCH RELATIVE 0 FROM C INTO :R; F = ROW_COUNT; SUSPEND; R = 98; FETCH RELATIVE 1 FROM C INTO :R; F = ROW_COUNT; SUSPEND; END^\nSET TERM ;^' $'R F|2 1|2 0|3 1'
+pin     $'12 ...without INTO, read by <cursor>.<column>; from a local 0' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R INTEGER, F INTEGER) AS DECLARE C SCROLL CURSOR FOR (SELECT ID FROM T1 ORDER BY ID); DECLARE K INTEGER = 0; BEGIN OPEN C; FETCH ABSOLUTE 2 FROM C INTO :R; F = ROW_COUNT; SUSPEND; FETCH RELATIVE 0 FROM C; R = C.ID; F = ROW_COUNT; SUSPEND; FETCH RELATIVE K FROM C INTO :R; F = ROW_COUNT; SUSPEND; END^\nSET TERM ;^' $'R F|2 1|2 0|2 0'
+pin     $'12 a SCROLL cursor in a TRIGGER scrolls' $'INSERT INTO TSC (ID) VALUES (1);\nSELECT * FROM TSC;\nROLLBACK;' $'ID N|1 321'
+pin     $'12 ...a plain one there is HY106 at the FETCH' $'INSERT INTO TSD (ID) VALUES (1);\nROLLBACK;' $'Statement failed, SQLSTATE = HY106|Fetch option LAST is invalid for a non-scrollable cursor|-At trigger "PUBLIC"."TSD_BI" line: 1, col: 135'
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-psqlgram-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 150 ]; then echo "FAIL only $ran checks ran (floor 150)"; fail=1; fi
+if [ "$ran" -lt 184 ]; then echo "FAIL only $ran checks ran (floor 184)"; fail=1; fi
 exit $fail
