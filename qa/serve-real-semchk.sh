@@ -95,6 +95,13 @@
 # an error text (re-encoded here, the engine echoes its bytes); a window
 # defined over another one (the engine's -204 comes first).
 #
+# THE QSHAPE ROUND (qa/serve-real-qshape.sh) closed eleven RECORDED cells,
+# pinned now with the engine's answer: a qualified star over a join or
+# beside a subquery, a CTE read inside a subquery / derived table / locked
+# IN, `T1, T1`, a nested WITH's -104, a UNION's ORDER BY -104, and USING
+# in a recursive member's outer join. A WITH inside a derived table that
+# declares an UNUSED CTE stays refused (the engine's end-of-query pass).
+#
 # Usage: qa/serve-real-semchk.sh [port]   (default 5950)
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
@@ -267,7 +274,7 @@ pin  "1 ...C (A, A)" "with c (a, a) as (select 1, 2 from rdb\$database) select *
 pin  "1 ...C (A) over a STAR body" "with c (a) as (select * from t1) select * from c;" "$C54|-column list from derived table C $LESS"
 pin  "1 CONTROL ...C (eight names) over the star" "with c (a, b, n1, n2, v, d, f, bo) as (select * from t1) select a from c;" "A|1|2|3|4|5|6"
 pin  "1 ...(1 X, 1 X) used" "with c as (select 1 x, 1 x from rdb\$database) select * from c;" "$I104|-column X $DUP C"
-err_differs "1 RECORDED T1.*, T2.* over a join (a refusal here)" "select * from (select t1.*, t2.* from t1 join t2 on t2.t1id = t1.id) dt;" "column ID $DUP DT"
+pin  "1 RECORDED T1.*, T2.* over a join (a refusal here) (answers since the qshape chunk)" "select * from (select t1.*, t2.* from t1 join t2 on t2.t1id = t1.id) dt;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-column ID was specified multiple times for derived table DT"
 pin  "1 ...a scalar subquery over a derived table" "select (select first 1 x.id from (select id, id from t1) x) from rdb\$database;" "$I104|-column ID $DUP X"
 err_differs "1 RECORDED LATERAL" "select * from t1 x, lateral (select x.id, x.id from rdb\$database) l;" "column ID $DUP L"
 err_differs "1 RECORDED a quoted \"id\" is the engine's -206" "select * from (select id, \"id\" from t1) dt;" "Column unknown|-\"id\""
@@ -300,7 +307,7 @@ pin  "2 ...C, D(C), E(D) .. T1 C" "with c as (select 1 x from rdb\$database), d 
 pin  "2 ...C, D SELECT * FROM C D" "with c as (select 1 x from rdb\$database), d as (select 2 y from rdb\$database) select * from c d;" "$A204 \"D\" $CONF|$W104|-CTE \"D\" $NOTUSED"
 pin  "2 ...C, D SELECT * FROM C, T1 D" "with c as (select 1 x from rdb\$database), d as (select 2 y from rdb\$database) select * from c, t1 d;" "$A204 \"D\" $CONF|$W104|-CTE \"D\" $NOTUSED"
 pin  "2 ...C, D(C) SELECT * FROM C, T1 D" "with c as (select 1 x from rdb\$database), d as (select * from c) select * from c, t1 d;" "$A204 \"D\" $CONF|$W104|-CTE \"D\" $NOTUSED"
-err_differs "2 RECORDED C, D SELECT * FROM (SELECT * FROM C) D (a CTE inside a derived table refuses here)" "with c as (select 1 x from rdb\$database), d as (select 2 y from rdb\$database) select * from (select * from c) d;" "alias \"D\" $CONF"
+pin  "2 RECORDED C, D SELECT * FROM (SELECT * FROM C) D (a CTE inside a derived table refuses here) (answers since the qshape chunk)" "with c as (select 1 x from rdb\$database), d as (select 2 y from rdb\$database) select * from (select * from c) d;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -204|-alias \"D\" conflicts with an alias in the same statement|SQL warning code = -104|-CTE \"D\" is not used in query"
 pin  "2 ...C, C .. T1 C" "with c as (select 1 x from rdb\$database), c as (select 2 x from rdb\$database) select * from t1 c;" "$A204 \"C\" $CONF|$W104|-CTE \"C\" $NOTUSED|-CTE \"C\" $NOTUSED"
 pin  "2 ...C, C, T1 .. FROM T1 (the CTE)" "with c as (select 1 x from rdb\$database), c as (select 2 x from rdb\$database), t1 as (select 9 y from rdb\$database) select * from t1;" "$A204 \"C\" $CONF|$W104|-CTE \"C\" $NOTUSED|-CTE \"C\" $NOTUSED"
 pin  "2 ...C, C .. (SELECT 1 Y ..) C" "with c as (select 1 x from rdb\$database), c as (select 2 x from rdb\$database) select * from (select 1 y from rdb\$database) c;" "$A204 \"C\" $CONF|$W104|-CTE \"C\" $NOTUSED|-CTE \"C\" $NOTUSED"
@@ -328,15 +335,15 @@ pin  "2 ...T1 C1, T1 C2 beside CTE C" "with c as (select 1 x from rdb\$database)
 pin  "2 ...C, D SELECT X FROM C WHERE EXISTS (.. T1 D)" "with c as (select 1 x from rdb\$database), d as (select 2 y from rdb\$database) select x from c where exists (select 1 from t1 d);" "$W104|-CTE \"D\" $NOTUSED|X|1"
 pin  "2 CONTROL WITH C .. SELECT * FROM C: no warning" "with c as (select 1 x from rdb\$database) select * from c;" "X|1"
 pin  "2 CONTROL C A, C B" "with c as (select 1 x from rdb\$database) select * from c a, c b;" "X X|1 1"
-refused "2 RECORDED the same table twice, unaliased, answers 36 there (a refusal here, as before)" "select count(*) from t1, t1;"
+pin  "2 RECORDED the same table twice, unaliased, answers 36 there (a refusal here, as before) (answers since the qshape chunk)" "select count(*) from t1, t1;" "COUNT|36"
 refused "2 RECORDED ...T1, T1 T1" "select count(*) from t1, t1 t1;"
 refused "2 RECORDED a quoted CTE name: WITH \"c\" .. T1 C answers with the warning" "with \"c\" as (select 1 x from rdb\$database) select count(*) from t1 c;"
 err_differs "2 RECORDED ...T1 \"c\" conflicts" "with \"c\" as (select 1 x from rdb\$database) select * from t1 \"c\";" "alias \"c\" $CONF"
 err_differs "2 RECORDED ...C, \"C\"" "with c as (select 1 x from rdb\$database), \"C\" as (select 2 x from rdb\$database) select * from c;" "alias \"C\" $CONF"
-refused "2 RECORDED a CTE read only inside a subquery" "with c as (select 1 x from rdb\$database), c as (select 2 x from rdb\$database) select count(*) from t1 x where x.id in (select 1 from c);"
-err_differs "2 RECORDED ...C, (SELECT * FROM C) C" "with c as (select 1 x from rdb\$database) select * from c, (select * from c) c;" "alias \"C\" $CONF"
+pin  "2 RECORDED a CTE read only inside a subquery (answers since the qshape chunk)" "with c as (select 1 x from rdb\$database), c as (select 2 x from rdb\$database) select count(*) from t1 x where x.id in (select 1 from c);" "SQL warning code = -104|-CTE \"C\" is not used in query|COUNT|1"
+pin  "2 RECORDED ...C, (SELECT * FROM C) C (answers since the qshape chunk)" "with c as (select 1 x from rdb\$database) select * from c, (select * from c) c;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -204|-alias \"C\" conflicts with an alias in the same statement"
 err_differs "2 RECORDED a WITH inside a derived table" "select * from (with c as (select 1 x from rdb\$database), c as (select 2 x from rdb\$database) select * from c) d;" "alias \"C\" $CONF"
-err_differs "2 RECORDED a nested WITH" "with c as (select 1 x from rdb\$database) select * from (with c as (select 2 x from rdb\$database) select * from c) d;" "WITH clause can't be nested"
+pin  "2 RECORDED a nested WITH (answers since the qshape chunk)" "with c as (select 1 x from rdb\$database) select * from (with c as (select 2 x from rdb\$database) select * from c) d;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-WITH clause can't be nested"
 err_differs "2 RECORDED an unused body's unknown column" "with c as (select nosuch from t1) select 1 from rdb\$database;" "Column unknown|-\"NOSUCH\""
 err_differs "2 RECORDED an unused body's unknown table" "with c as (select 1 x from nosuch) select 1 from rdb\$database;" "Table unknown|-\"NOSUCH\""
 err_differs "2 RECORDED inside an EXECUTE BLOCK" "$(eb 'execute block returns (n integer) as begin with c as (select 1 x from rdb$database), c as (select 2 x from rdb$database) select x from c into n; suspend; end')" "alias \"C\" $CONF"
@@ -450,7 +457,7 @@ pin  "3b ...GROUP BY in text order" "select t.id from t1 t group by t.id, t1.a, 
 pin  "3b ...a select-list subquery AFTER the plain items" "select (select t1.a from rdb\$database), t1.b from t1 t;" "$E206|-\"T1\".\"B\"|-At line 1, column 41"
 pin  "3b ...the first UNION member first" "select t.id from t1 t where t1.a = 1 union all select t.id from t1 t where t1.b = 2;" "$E206|-\"T1\".\"A\"|-At line 1, column 29"
 pin  "3 the THEN branch of a CASE is read before its condition (promoted: recorded in the first round)" "select t.id from t1 t where case when t1.a = 1 then t1.b else 0 end > 0;" "$E206|-\"T1\".\"B\"|-At line 1, column 53"
-err_differs "3 RECORDED a UNION's ORDER BY is the union's -104" "select t.id from t1 t union all select t.id from t1 t order by t1.id;" "invalid ORDER BY clause"
+pin  "3 RECORDED a UNION's ORDER BY is the union's -104 (answers since the qshape chunk)" "select t.id from t1 t union all select t.id from t1 t order by t1.id;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-invalid ORDER BY clause"
 err_differs "3 RECORDED a plain column beside a HAVING is the select list's -104" "select t.id from t1 t having t1.id = 1;" "Invalid expression in the select list"
 err_differs "3 RECORDED a bare unknown column" "select t.id from t1 t where nosuch = 1;" "Column unknown|-\"NOSUCH\""
 err_differs "3 RECORDED inside an EXECUTE BLOCK" "$(eb 'execute block returns (n integer) as begin select first 1 t.id from t1 t order by t1.id into n; suspend; end')" "\"T1\".\"ID\"|-At line 1, column 83"
@@ -521,7 +528,7 @@ refused "4b RECORDED a bare UNION among the ANCHORS is legal (two anchors refuse
 refused "4 RECORDED R JOIN (T3 LEFT JOIN T2): a parenthesised join" "$RB select r.n + 1 from r join (t3 left join t2 on t2.id = t3.k) on t3.k = r.n where r.n < 3) select * from r;"
 refused "4 RECORDED R JOIN (a derived table with an outer join)" "$RB select r.n + 1 from r join (select t3.k from t3 left join t2 on t2.id = t3.k) d on d.k = r.n where r.n < 3) select * from r;"
 err_differs "4 RECORDED (R JOIN T3) LEFT JOIN T2" "$RB select r.n + 1 from (r join t3 on t3.k = r.n) left join t2 on t2.id = t3.k where r.n < 3) select * from r;" "outer join"
-err_differs "4 RECORDED R LEFT JOIN T3 USING (K)" "$RB select r.n + 1 from r left join t3 using (k) where r.n < 3) select * from r;" "outer join"
+pin  "4 RECORDED R LEFT JOIN T3 USING (K) (answers since the qshape chunk)" "$RB select r.n + 1 from r left join t3 using (k) where r.n < 3) select * from r;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Recursive member of CTE can't be member of an outer join"
 refused "4 RECORDED two recursive members" "$RB select r.n + 1 from r where r.n < 2 union all select r.n + 10 from r where r.n < 2) select * from r;"
 refused "4 RECORDED FIRST 1 in a member" "$RB select first 1 r.n + 1 from r where r.n < 3) select * from r;"
 refused "4 RECORDED a subquery beside the reference" "$RB select r.n + 1 from r where r.n < 3 and r.n in (select k from t3)) select * from r;"
@@ -750,13 +757,13 @@ pin  "5c ...nor a recursive one" "with recursive r (n) as (select 1 from rdb\$da
 pin  "5c ...an unknown table under a WITH is the -204" "with c as (select 1 x from rdb\$database) select * from nosuch with lock;" "Statement failed, SQLSTATE = 42S02|Dynamic SQL Error|-SQL error code = -204|-Table unknown|-\"NOSUCH\"|-At line 1, column 56"
 refused "5c RECORDED a PLAN over a user table (the planner does not take a PLAN)" "select id from t1 plan (t1 natural) with lock;"
 refused "5c RECORDED ...with a WHERE" "select id from t1 where id = 1 plan (t1 natural) with lock;"
-refused "5c RECORDED a CTE read only by a subquery, locked" "with c as (select 1 x from rdb\$database) select id from t1 where id in (select x from c) with lock;"
+pin  "5c RECORDED a CTE read only by a subquery, locked (answers since the qshape chunk)" "with c as (select 1 x from rdb\$database) select id from t1 where id in (select x from c) with lock;" "ID|1"
 err_differs "5c RECORDED a PLAN ahead of the WHERE (the engine's parser refuses it)" "select * from t1 t plan (t natural) where t.id = 1 with lock;" "Token unknown"
 
 echo "--- 1c. RECORDED: a star over a join inside a derived table"
 refused "1c RECORDED a NATURAL JOIN's star (one merged ID: the engine answers)" "select * from (select * from t1 natural join t2) x where x.id = 1;"
 refused "1c RECORDED ...JOIN USING" "select * from (select * from t1 join t2 using (id)) x where x.id = 1;"
-refused "1c RECORDED ...T1.*, T2.X" "select * from (select t1.*, t2.x from t1 join t2 on t1.id = t2.id) x where x.id = 1;"
+pin  "1c RECORDED ...T1.*, T2.X (answers since the qshape chunk)" "select * from (select t1.*, t2.x from t1 join t2 on t1.id = t2.id) x where x.id = 1;" "ID A B N V D F BO X|1 10 100 1.50 apple 2020-01-01 1.500000000000000 <true> 5"
 err_differs "1c RECORDED a JOIN ON's star: the engine's duplicate ID, this server's unnamed column" "select * from (select * from t1 join t2 on t1.id = t2.id) x where x.id = 1;" "column ID $DUP X"
 pin  "1c CONTROL the top-level NATURAL JOIN star answers" "select count(*) from t1 natural join t2 where id = 1;" "COUNT|1"
 
@@ -898,7 +905,7 @@ pin  "1e ...a lower-case column folds" "select (select x.s from t2 x where x.id 
 pin  "1e ...a spaced name" "select (select x.s as \"My Q\" from t2 x where x.id = 7 - t.id) from t1 t where t.id = 1;" "My Q|six"
 pin  "1e ...over a derived table" "select (select x.s as \"q\" from t2 x where x.id = 7 - d.id) from (select id from t1) d where d.id = 1;" "q|six"
 pin  "1e CONTROL the describe" "set sqlda_display on; select (select x.s from t2 x where x.id = 7 - t.id) from t1 t where t.id = 1;" "INPUT message field count: 0|OUTPUT message field count: 1|01: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 20 charset: 0 SYSTEM.NONE|: name: S alias: S|: table: T2 schema: PUBLIC owner: SYSDBA|S|six"
-refused "1e RECORDED a star beside it" "select t.*, (select x.s from t2 x where x.id = 7 - t.id) from t1 t order by id;"
+pin  "1e RECORDED a star beside it (answers since the qshape chunk)" "select t.*, (select x.s from t2 x where x.id = 7 - t.id) from t1 t order by id;" "ID A B N V D F BO S|1 10 100 1.50 apple 2020-01-01 1.500000000000000 <true> six|2 20 <null> 2.25 banana 2021-06-15 <null> <false> five|3 <null> 300 <null> cherry <null> 3.250000000000000 <null> <null>|4 10 400 -4.00 <null> 2019-12-31 -1.000000000000000 <true> three|5 30 500 5.55 a_b%c 2022-02-28 2.000000000000000 <false> two|6 20 600 0.00 Apple 2020-01-01 0.000000000000000 <true> one"
 refused "1e RECORDED a GROUP BY over a join" "select (select x.x from t2 x where x.id = t.id) from t1 t join t2 u on u.id = t.id group by t.id order by t.id;"
 
 echo "--- 2f. A COMMITTED DDL PURGES THE STATEMENT CACHE: the warning comes back"

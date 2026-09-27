@@ -181,7 +181,7 @@ agree "WHERE u CONTAINING sub"     "select count(*) as n from t where u containi
 agree "WHERE u STARTING WITH pre"  "select count(*) as n from t where u starting with pre;"
 agree "WHERE u LIKE 'caf%'"        "select count(*) as n from t where u like 'caf%';"
 
-echo "-- 8. the last three recorded gaps, now closed; IS UNKNOWN still refused --"
+echo "-- 8. the last four recorded gaps, now closed (IS UNKNOWN by the qshape chunk) --"
 # PROMOTED 2026-09-20. All three answered and agreed with the engine on the
 # working tree AND on the previous committed binary
 # /tmp/fcwire-prev-0e5a8f4, so the gap was closed by an earlier chunk and
@@ -194,8 +194,8 @@ agree "carrier mix: SELECT n LIKE v (NONE u, UTF8 pattern; engine N<true>N<true>
       "select (n like v) as n from t order by id;"
 agree "carrier mix: SELECT u CONTAINING subn (UTF8 u, NONE sub; engine N<true>N<true>N<false>N<null>)" \
       "select (u containing subn) as n from t order by id;"
-gap "IS UNKNOWN over a predicate (pre-existing)" \
-    "select count(*) as n from t where (u like v) is unknown;"
+agree "IS UNKNOWN over a predicate (answers since the qshape chunk: a parenthesised predicate is a BOOLEAN operand; engine N1)" \
+      "select count(*) as n from t where (u like v) is unknown;"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$ENG" "$FC"

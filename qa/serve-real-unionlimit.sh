@@ -227,7 +227,7 @@ pin  "4 CONTROL GROUP BY in a member" "select a from t1 group by a union select 
 pin  "4 CONTROL a window's ORDER BY is not the member's" "select id, row_number() over (order by id desc) from t1 where id < 3 union all select 9, 9 from t3 where k = 1 order by 1;" "ID ROW_NUMBER|1 2|2 1|9 9"
 
 echo "--- 5. recorded, not fixed: shapes this server refuses where the engine answers"
-refused "5 a CTE whose main query is a UNION" "with c as (select id from t1) select first 1 id from c union all select id from t2;"
+pin  "5 a CTE whose main query is a UNION (answers since the qshape chunk: a CTE is spliced into every union member)" "with c as (select id from t1) select first 1 id from c union all select id from t2;" "ID|1|1|2|3|4|5|6"
 refused "5 ...with the union's own ROWS" "with c as (select id from t1) select id from c union all select id from t2 rows 3;"
 refused "5 a PLAN clause in a member" "select id from t1 plan (t1 natural) union select id from t2;"
 
@@ -356,7 +356,7 @@ pin  "13 an IN-subquery's ROWS under FIRST" "select first 2 id from t1 where id 
 echo "--- 14. recorded, not fixed (second round)"
 same    "14 a window under a member's FIRST (answers since 2026-09-26: the fold keeps the window's order - the aggplan chunk)" "select first 3 row_number() over (order by id desc) from t1 union all select first 1 x from t2;"
 same    "14 ...under FIRST alone" "select first 3 row_number() over (order by id desc) from t1;"
-refused "14 a union ORDER BY of two keys (with or without FIRST)" "select first 1 id, a from t1 union all select first 1 id, x from t2 order by 1, 2 desc;"
+pin  "14 a union ORDER BY of two keys (answers since the qshape chunk)" "select first 1 id, a from t1 union all select first 1 id, x from t2 order by 1, 2 desc;" "ID A|1 10|1 5"
 refused "14 a quantified comparison over a union" "select 1 from rdb\$database where 20 = any (select first 2 a from t1 union all select x from t2);"
 pin "14 a q-string (answered since the introducer/q-string rewrite of 2026-09-26; its quote is no clause boundary)" "select q'{'}', ' order ', ' union ' from t1 rows 1;" "CONSTANT CONSTANT CONSTANT|' order union"
 refused "14 an UPDATE's own ORDER BY / ROWS" "update t3 set name = 'z' order by k rows 1; select name from t3 order by k; rollback;"

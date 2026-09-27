@@ -39,7 +39,9 @@
 #
 # RECORDED, not fixed (section 4 and the 5 RECORDED cells): `(I > 0) IS
 # TRUE` and `(BO IS TRUE) IS NOT DISTINCT FROM FALSE` (a predicate as a
-# tested side) refuse as before; each nullable-side IS [NOT] DISTINCT FROM
+# tested side) refused - ANSWERED since the qshape chunk, where a
+# parenthesised predicate became a BOOLEAN operand (the three cells are
+# pinned now, qa/serve-real-qshape.sh section 7); each nullable-side IS [NOT] DISTINCT FROM
 # is a 2- or 3-group OR and a NOT over a column pair is 12 groups (the
 # contradictory null-test groups are not pruned), so TWO `NOT (a IS
 # DISTINCT FROM b)` or SEVEN `NOT (x IS NOT DISTINCT FROM 1)` cross
@@ -303,9 +305,9 @@ pin  "7 CONTROL CAST(... AS BOOLEAN) IS TRUE" "SELECT COUNT(*) FROM M WHERE CAST
 pin  "7 CONTROL the select list BO IS NOT FALSE" "SELECT ID, BO IS NOT FALSE FROM M ORDER BY ID;" "ID BOOL|1 <true>|2 <true>|3 <false>|4 <true>"
 
 echo "--- 4. RECORDED: refused, never answered wrong"
-refused "4 (I > 0) IS TRUE" "SELECT ID FROM M WHERE (I > 0) IS TRUE ORDER BY ID;"
-refused "4 NOT ((I > 0) IS FALSE)" "SELECT ID FROM M WHERE NOT ((I > 0) IS FALSE) ORDER BY ID;"
-refused "4 (BO IS TRUE) IS NOT DISTINCT FROM FALSE" "SELECT ID FROM M WHERE (BO IS TRUE) IS NOT DISTINCT FROM FALSE ORDER BY ID;"
+pin  "4 (I > 0) IS TRUE (answers since the qshape chunk)" "SELECT ID FROM M WHERE (I > 0) IS TRUE ORDER BY ID;" "ID|1|3"
+pin  "4 NOT ((I > 0) IS FALSE) (answers since the qshape chunk)" "SELECT ID FROM M WHERE NOT ((I > 0) IS FALSE) ORDER BY ID;" "ID|1|2|3|4"
+pin  "4 (BO IS TRUE) IS NOT DISTINCT FROM FALSE (answers since the qshape chunk)" "SELECT ID FROM M WHERE (BO IS TRUE) IS NOT DISTINCT FROM FALSE ORDER BY ID;" "ID|2|3"
 
 refused "4 six NOT-ed IS DISTINCT FROMs past the DNF cap" "SELECT ID FROM M WHERE NOT (I IS DISTINCT FROM NULLIF(J, 4) OR J IS DISTINCT FROM NULLIF(I, 3) OR S IS DISTINCT FROM UPPER(S) OR BO IS DISTINCT FROM NULLIF(BO, FALSE) OR N IS DISTINCT FROM NULLIF(N, 1.5) OR D IS DISTINCT FROM NULLIF(D, D)) ORDER BY ID;"
 refused "4 two NOT (a IS DISTINCT FROM b) over columns (12 DNF groups each)" "SELECT ID FROM M WHERE NOT (I IS DISTINCT FROM J) AND NOT (S IS DISTINCT FROM UPPER(S)) ORDER BY ID;"
