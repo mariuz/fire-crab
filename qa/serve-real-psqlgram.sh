@@ -65,6 +65,13 @@
 #      BIGINT minimum / -1 PANICKED the server).
 #  17. `:SQLCODE` (any context variable) is -104 *Token unknown* at the
 #      name; SUSPEND in a block with no RETURNS is -104 at prepare.
+#  18. An EXECUTE BLOCK's text that names no set is in the ATTACHMENT's
+#      (RETURNS and locals): under UTF8 a blob or a literal moved into it
+#      counts characters (it counted octets - 9 for 'séc€nd', a 22001, a
+#      vanished WIN1252 row). A text factor of * / beside an INT128 or a
+#      NUMERIC(38) is a DECFLOAT(34); an exact operand beside a DOUBLE is
+#      divided by its scale (1.25 read as 12500); a BIGINT product (an
+#      INT128) is an EXECUTE STATEMENT argument.
 #
 # RECORDED (the engine answers, this server refuses - a clean refusal,
 # never a wrong value): NEXT VALUE FOR in a block; a selectable procedure
@@ -120,6 +127,8 @@ CREATE TABLE TBLB (ID INTEGER, B BLOB SUB_TYPE TEXT, BB BLOB, BU BLOB SUB_TYPE T
 INSERT INTO TBLB VALUES (1, 'blobtext', 'bin', 'utf');
 CREATE TABLE TSC (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER);
 CREATE TABLE TSD (ID INTEGER NOT NULL PRIMARY KEY, N INTEGER);
+CREATE TABLE TBLW (ID INTEGER, BW BLOB SUB_TYPE TEXT CHARACTER SET WIN1252);
+CREATE TABLE TES (ID INTEGER);
 SET TERM ^;
 CREATE PROCEDURE PSQ (N INTEGER) RETURNS (I INTEGER, SQ BIGINT) AS BEGIN I = 1; WHILE (I <= N) DO BEGIN SQ = I * I; SUSPEND; I = I + 1; END END^
 CREATE PROCEDURE PDEF (A INTEGER = 1, B VARCHAR(10) = 'dflt') RETURNS (R VARCHAR(30)) AS BEGIN R = A || B; SUSPEND; END^
@@ -160,7 +169,7 @@ fail=0
 ran=0
 # a SCRIPT (a session), its lines squeezed and joined; errors included,
 # so an error cell compares the engine's whole message
-sess() { printf '%s\n' "$2" | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
+sess() { printf '%s\n' "$2" | timeout 25 "$ISQL" -q ${CH:+-ch "$CH"} -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
     | grep -av '^ *$' | grep -av '^=' | grep -av '^After line' | grep -av '^At line .* in file' \
     | sed 's/^ *//;s/ *$//;s/  */ /g' | paste -sd'|'; }
 # the ENGINE is pinned (the law, not just agreement) and this server matches
@@ -187,6 +196,8 @@ engboth() { # <label> <script> <engine-output>
         echo "FAIL $1"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
     else echo "OK   $1 [$ev]"; fi
 }
+# a pin under a UTF8 ATTACHMENT (the scripts are UTF-8)
+pinu() { CH=UTF8 pin "$@"; }
 # RECORDED: the engine answers, this server REFUSES (a clean error, never
 # a wrong value). Fails the day the two agree, so the cell gets promoted.
 refused() { # <label> <script> <engine-output>
@@ -505,11 +516,35 @@ pin     $'17 SUSPEND in a block with no RETURNS' $'SET TERM ^;\nEXECUTE BLOCK AS
 pin     $'17 ...after a BREAK' $'SET TERM ^;\nEXECUTE BLOCK AS DECLARE I INT = 0; BEGIN WHILE (I < 2) DO BEGIN I = I + 1; IF (I = 1) THEN BREAK; END SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-SUSPEND could not be used without RETURNS clause in PROCEDURE or EXECUTE BLOCK'
 pin     $'17 ...a bare one' $'SET TERM ^;\nEXECUTE BLOCK AS BEGIN SUSPEND; END^\nSET TERM ;^' $'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-SUSPEND could not be used without RETURNS clause in PROCEDURE or EXECUTE BLOCK'
 
+echo $'--- 18. A BLOCK\'S TEXT IS IN THE ATTACHMENT\'S SET; A TEXT FACTOR BESIDE 128 BITS IS A DECFLOAT; EXACT BESIDE A DOUBLE'
+pinu    $'18 a UTF8 blob into a block slot under a UTF8 attachment: its characters' $'INSERT INTO TBLB (ID, BU) VALUES (21, \'séc€nd\');\nSET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40), L INT) AS BEGIN SELECT BU FROM TBLB WHERE ID = 21 INTO R; L = CHAR_LENGTH(R); SUSPEND; END^\nSET TERM ;^' $'R L|séc€nd 6'
+pinu    $'18 ...into a VARCHAR(6)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(6)) AS BEGIN SELECT BU FROM TBLB WHERE ID = 21 INTO R; SUSPEND; END^\nSET TERM ;^' $'R|séc€nd'
+pinu    $'18 ...compared with the literal' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS BEGIN SELECT BU FROM TBLB WHERE ID = 21 INTO R; IF (R = \'séc€nd\') THEN R = \'eq\'; ELSE R = \'ne\'; SUSPEND; END^\nSET TERM ;^' $'R|eq'
+pinu    $'18 ...FOR SELECT, FETCH and <cursor>.<column>' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40), L INT) AS DECLARE C CURSOR FOR (SELECT BU FROM TBLB WHERE ID = 21); BEGIN FOR SELECT BU FROM TBLB WHERE ID = 21 INTO R DO BEGIN L = CHAR_LENGTH(R); SUSPEND; END OPEN C; FETCH C INTO R; L = CHAR_LENGTH(R); SUSPEND; CLOSE C; FOR SELECT BU FROM TBLB WHERE ID = 21 AS CURSOR K DO BEGIN R = K.BU; L = CHAR_LENGTH(R); SUSPEND; END END^\nSET TERM ;^' $'R L|séc€nd 6|séc€nd 6|séc€nd 6'
+pinu    $'18 a WIN1252 blob under a UTF8 attachment (the row vanished)' $'INSERT INTO TBLW VALUES (1, \'wé\');\nSET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40), L INT) AS BEGIN SELECT BW FROM TBLW WHERE ID = 1 INTO R; L = CHAR_LENGTH(R); SUSPEND; END^\nSET TERM ;^' $'R L|wé 2'
+pinu    $'18 INSERT ... RETURNING a blob this server wrote' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40), L INT) AS BEGIN INSERT INTO TBLB (ID, BU) VALUES (22, \'ñandú\') RETURNING BU INTO R; L = CHAR_LENGTH(R); SUSPEND; END^\nSET TERM ;^' $'R L|ñandú 5'
+pinu    $'18 a literal in a RETURNS slot and a local: characters, not octets' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40), L INT, O INT) AS DECLARE V VARCHAR(2); BEGIN R = \'é€\'; V = R; L = CHAR_LENGTH(R) * 10 + CHAR_LENGTH(V); O = OCTET_LENGTH(V); SUSPEND; END^\nSET TERM ;^' $'R L O|é€ 22 5'
+pinu    $'18 ...a VARCHAR(3) takes three' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(3)) AS BEGIN R = \'ñññ\'; SUSPEND; R = UPPER(\'ñé\'); SUSPEND; END^\nSET TERM ;^' $'R|ñññ|ÑÉ'
+pin     $'18 CONTROL under a NONE attachment the slot is NONE' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (L INT, O INT) AS DECLARE V VARCHAR(10); BEGIN V = \'é€\'; L = CHAR_LENGTH(V); O = OCTET_LENGTH(V); SUSPEND; END^\nSET TERM ;^' $'L O|5 5'
+pin     $'18 NUMERIC(18,2) * \'2\' is a DOUBLE' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE A NUMERIC(18,2) = 1.25; BEGIN R = A * \'2\'; SUSPEND; END^\nSET TERM ;^' $'R|2.500000000000000'
+pin     $'18 ...NUMERIC(9,2) / \'2\' and a VARCHAR times it' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE A NUMERIC(9,2) = 7.5; DECLARE S VARCHAR(5) = \'2\'; BEGIN R = A / \'2\'; SUSPEND; R = S * A; SUSPEND; END^\nSET TERM ;^' $'R|3.750000000000000|15.00000000000000'
+pin     $'18 NUMERIC(38,2) * \'2\' is a DECFLOAT(34)' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE A NUMERIC(38,2) = 1.25; BEGIN R = A * \'2\'; SUSPEND; R = A * \'2.5\'; SUSPEND; R = \'10\' / A; SUSPEND; R = A * 2 || \'\'; SUSPEND; END^\nSET TERM ;^' $'R|2.50|3.125|8|2.50'
+pin     $'18 ...INT128 * \'2\', \'7\' / A, A * \'1e2\', A * A || \'\'' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE A INT128 = 5; BEGIN R = A * \'2\'; SUSPEND; R = \'7\' / A; SUSPEND; R = A * \'1e2\'; SUSPEND; R = A * \'2\' + 1; SUSPEND; A = 12; R = A * A || \'\'; SUSPEND; END^\nSET TERM ;^' $'R|10|1.4|5E+2|11|144'
+pin     $'18 ...compared with an integer' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE A INT128 = 5; BEGIN IF (A * \'2\' = 10) THEN R = \'eq\'; ELSE R = \'ne\'; SUSPEND; END^\nSET TERM ;^' $'R|eq'
+pin     $'18 ...A * \'x\': the decimal float conversion error' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE A INT128 = 5; BEGIN R = A * \'x\'; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22018|Decimal float invalid operation. An indeterminant error occurred during an operation.|-conversion error from string "x"|-At block line: 1, col: 70'
+pin     $'18 ...A / \'0\': the decimal float divide by zero' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE A INT128 = 5; BEGIN R = A / \'0\'; SUSPEND; END^\nSET TERM ;^' $'R|Statement failed, SQLSTATE = 22012|Decimal float divide by zero. The code attempted to divide a DECFLOAT value by zero.|-At block line: 1, col: 70'
+pin     $'18 NUMERIC(18,2) and a DOUBLE: the scale divides' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE A NUMERIC(18,2) = 1.25; DECLARE D DOUBLE PRECISION = 2; BEGIN R = A * D; SUSPEND; R = D - A; SUSPEND; R = A / D; SUSPEND; R = A + D; SUSPEND; END^\nSET TERM ;^' $'R|2.500000000000000|0.7500000000000000|0.6250000000000000|3.250000000000000'
+pin     $'18 ...NUMERIC(18,3) * a DOUBLE' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE A NUMERIC(18,3) = 1.255; DECLARE D DOUBLE PRECISION = 2; BEGIN R = A * D; SUSPEND; END^\nSET TERM ;^' $'R|2.510000000000000'
+pin     $'18 ...compared' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE A NUMERIC(18,2) = 1.25; DECLARE D DOUBLE PRECISION = 2; BEGIN IF (A < D) THEN R = \'lt\'; ELSE R = \'ge\'; SUSPEND; END^\nSET TERM ;^' $'R|lt'
+pin     $'18 a BIGINT product as an EXECUTE STATEMENT argument' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE A BIGINT = 5; BEGIN EXECUTE STATEMENT (\'SELECT CAST(? AS VARCHAR(30)) FROM RDB$DATABASE\') (A * 2) INTO R; SUSPEND; EXECUTE STATEMENT (\'SELECT CAST(? AS VARCHAR(30)) FROM RDB$DATABASE\') (A / 2) INTO R; SUSPEND; END^\nSET TERM ;^' $'R|10|2'
+pin     $'18 ...into an INSERT, and named' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE A BIGINT = 5; BEGIN EXECUTE STATEMENT (\'INSERT INTO TES (ID) VALUES (?)\') (A * 20); SELECT MAX(ID) FROM TES INTO R; SUSPEND; EXECUTE STATEMENT (\'SELECT CAST(:P AS VARCHAR(30)) FROM RDB$DATABASE\') (P := A * 3) INTO R; SUSPEND; END^\nSET TERM ;^' $'R|100|15'
+pin     $'18 ...a NUMERIC(18,2) squared and a DECFLOAT product' $'SET TERM ^;\nEXECUTE BLOCK RETURNS (R VARCHAR(40)) AS DECLARE A NUMERIC(18,2) = 1.5; DECLARE B INT128 = 5; BEGIN EXECUTE STATEMENT (\'SELECT CAST(? AS VARCHAR(30)) FROM RDB$DATABASE\') (A * A) INTO R; SUSPEND; EXECUTE STATEMENT (\'SELECT CAST(? AS VARCHAR(30)) FROM RDB$DATABASE\') (B * \'2\') INTO R; SUSPEND; END^\nSET TERM ;^' $'R|2.2500|10'
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-psqlgram-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 274 ]; then echo "FAIL only $ran checks ran (floor 274)"; fail=1; fi
+if [ "$ran" -lt 296 ]; then echo "FAIL only $ran checks ran (floor 296)"; fail=1; fi
 exit $fail

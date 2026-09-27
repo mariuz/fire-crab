@@ -24821,6 +24821,14 @@ type DynArg = (Value, Option<u8>);
 fn dyn_arg_literal((v, cs): &DynArg) -> Option<String> {
     Some(match (v, cs) {
         (Value::Int(n), _) => n.to_string(),
+        // an INT128-typed value - a BIGINT's product or quotient
+        // ([psql_arith_width]) - is spelled typed ([psql_literal]):
+        // measured, `(A * 2)` over a BIGINT 5 into `SELECT CAST(? AS
+        // VARCHAR(30))` is 10, `(A * 20)` into an INSERT stores 100, and
+        // a NUMERIC(18,2) 1.5 squared is '2.2500'
+        (Value::Int128(..), _) => psql_literal(v)?,
+        // ...and a DECFLOAT one (a text factor beside an INT128)
+        (Value::DecFloat34(_), _) => format!("CAST('{}' AS DECFLOAT(34))", v.render()),
         (Value::Text(t), Some(cs)) => typed_text_literal(t, *cs, t.chars().count(), false)?,
         (Value::Text(t), None) => format!("'{}'", t.replace('\'', "''")),
         (Value::Null, _) => "NULL".to_string(),
@@ -115132,18 +115140,30 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
             // A TEXT FACTOR OF `*` OR `/` IS READ AS A DOUBLE: measured on
             // engine 2182 in a block, `R = 2 * 3 || 4` is 68.00000000000000
             // (2 * '34') and `S * 2` over a VARCHAR '1' 2.000000000000000;
-            // a `+` / `-` over text never reaches here ([expr_adds_text])
+            // a `+` / `-` over text never reaches here ([expr_adds_text]).
+            // BESIDE A 128-BIT OPERAND IT IS A DECFLOAT(34), and so is the
+            // result: `A * '2'` over an INT128 5 is 10, over a NUMERIC(38,2)
+            // 1.25 it is 2.50, `A * '2.7'` 13.5, `'7' / A` 1.4, `A * '1e2'`
+            // 5E+2, `A * 'x'` the decimal float conversion error - where a
+            // NUMERIC(18,2) 1.25 times '2' is the DOUBLE 2.500000000000000
+            // (all measured)
             (x, y) if matches!(kind, '*' | '/') && (matches!(x, Value::Text(_)) || matches!(y, Value::Text(_))) => {
-                let dbl = |v: Value| -> Result<Value, PsqlStop> {
+                let wide = |e: &E, v: &Value| match v {
+                    Value::Text(_) => false,
+                    Value::DecFloat34(_) | Value::DecFloat16(_) => true,
+                    v => numeric_parts(v).is_some() && psql_exact_width(e, f, v) == 16,
+                };
+                let target = if wide(a, &x) || wide(b, &y) { CastTarget::DecFloat { wide: true } } else { CastTarget::Approx };
+                let conv = |v: Value| -> Result<Value, PsqlStop> {
                     match v {
                         Value::Text(_) => {
-                            let e = Expr::Cast(Box::new(Expr::Col(0)), CastTarget::Approx, fire_crab_ods::intl::CS_UTF8);
+                            let e = Expr::Cast(Box::new(Expr::Col(0)), target, fire_crab_ods::intl::CS_UTF8);
                             e.eval(&[v]).map_err(psql_raise)
                         }
                         v => Ok(v),
                     }
                 };
-                psql_scaled_arith(kind, &dbl(x)?, &dbl(y)?, 8)
+                psql_scaled_arith(kind, &conv(x)?, &conv(y)?, 8)
             }
             (x, y) => {
                 let width = psql_arith_width(kind, psql_exact_width(a, f, &x), psql_exact_width(b, f, &y));
@@ -115293,12 +115313,30 @@ fn psql_num_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     if let Some(o) = num_cmp(a, b) {
         return Some(o);
     }
+    // a DECFLOAT against an exact value compares as decimals (`IF (A *
+    // '2' = 10)` over an INT128 5 takes THEN, measured)
+    if matches!(a, Value::DecFloat34(_) | Value::DecFloat16(_)) || matches!(b, Value::DecFloat34(_) | Value::DecFloat16(_)) {
+        use fire_crab_ods::decfloat::{self as dfl, Dec};
+        let dec = |v: &Value| -> Option<Dec> {
+            match v {
+                Value::DecFloat34(bits) => Some(dfl::decode_dec128(*bits)),
+                Value::DecFloat16(bits) => Some(dfl::decode_dec64(*bits)),
+                v => numeric_parts(v).map(|(r, sc)| Dec::Finite { neg: r < 0, coeff: r.unsigned_abs(), exp: sc as i32 }),
+            }
+        };
+        let (x, y) = (dec(a)?, dec(b)?);
+        if matches!(x, Dec::Nan) || matches!(y, Dec::Nan) {
+            return None;
+        }
+        return Some(dfl::cmp(&x, &y));
+    }
     let as_f64 = |v: &Value| -> Option<f64> {
         match v {
             Value::Double(d) => Some(*d),
             _ => {
+                // the scale is a NEGATIVE power of ten: 125 at -2 is 1.25
                 let (r, sc) = numeric_parts(v)?;
-                Some(r as f64 / 10f64.powi(sc as i32))
+                Some(r as f64 * 10f64.powi(sc as i32))
             }
         }
     };
@@ -115328,12 +115366,19 @@ fn psql_scaled_arith(kind: char, a: &Value, b: &Value, width: u8) -> Result<Valu
     };
     let rescale = || psql_raise(EvalErr::NumericOutOfRange);
     let div0 = || PsqlStop::Raise(Thrown::Runtime { err: EvalErr::DivideByZero, trace: Vec::new() });
+    if matches!(a, Value::DecFloat34(_) | Value::DecFloat16(_)) || matches!(b, Value::DecFloat34(_) | Value::DecFloat16(_)) {
+        return psql_dec_arith(kind, a, b);
+    }
     if matches!(a, Value::Double(_) | Value::Rounded(..)) || matches!(b, Value::Double(_) | Value::Rounded(..)) {
+        // an exact operand's scale is a NEGATIVE power of ten: it was
+        // multiplied in, so NUMERIC(18,2) 1.25 read as 12500 and `A * D`
+        // over a DOUBLE 2 answered 25000 where the engine answers
+        // 2.500000000000000 (and `D - A` 0.7500000000000000, measured)
         let f = |v: &Value| -> Option<f64> {
             match v {
                 Value::Double(d) => Some(*d),
                 Value::Rounded(..) => approx_of(v),
-                _ => numeric_parts(v).map(|(r, sc)| r as f64 / 10f64.powi(sc as i32)),
+                _ => numeric_parts(v).map(|(r, sc)| r as f64 * 10f64.powi(sc as i32)),
             }
         };
         let (x, y) = (f(a).ok_or(PsqlStop::Unsupported)?, f(b).ok_or(PsqlStop::Unsupported)?);
@@ -115404,6 +115449,44 @@ fn psql_scaled_arith(kind: char, a: &Value, b: &Value, width: u8) -> Result<Valu
         return Err(overflow());
     }
     Ok(scaled_value(raw, scale))
+}
+
+/// `+ - * /` with a DECFLOAT operand - a text factor beside a 128-bit
+/// one ([eval_psql_expr]) and whatever that result meets next: the other
+/// exact operand is the decimal of its (raw, scale), the arithmetic the
+/// decimal context's, which traps as the engine's does (a zero divisor
+/// 22012, an Invalid 22000, an Overflow 22003). An approximate operand
+/// is left to the refusal it always was.
+fn psql_dec_arith(kind: char, a: &Value, b: &Value) -> Result<Value, PsqlStop> {
+    use fire_crab_ods::decfloat::{self as dfl, Dec};
+    let dec = |v: &Value| -> Option<Dec> {
+        match v {
+            Value::DecFloat34(bits) => Some(dfl::decode_dec128(*bits)),
+            Value::DecFloat16(bits) => Some(dfl::decode_dec64(*bits)),
+            v => numeric_parts(v).map(|(r, sc)| Dec::Finite { neg: r < 0, coeff: r.unsigned_abs(), exp: sc as i32 }),
+        }
+    };
+    let (x, y) = (dec(a).ok_or(PsqlStop::Unsupported)?, dec(b).ok_or(PsqlStop::Unsupported)?);
+    let fin = |d: &Dec| matches!(d, Dec::Finite { .. });
+    let r = match kind {
+        '+' => dfl::add(&x, &y),
+        '-' => dfl::sub(&x, &y),
+        '*' => dfl::mul(&x, &y),
+        '/' => {
+            if dfl::is_zero(&y) && fin(&x) && !dfl::is_zero(&x) {
+                return Err(psql_raise(EvalErr::DecfloatDivideByZero));
+            }
+            dfl::div(&x, &y)
+        }
+        _ => return Err(PsqlStop::Unsupported),
+    };
+    if matches!(r, Dec::Nan) && !matches!(x, Dec::Nan) && !matches!(y, Dec::Nan) {
+        return Err(psql_raise(EvalErr::DecfloatInvalidOperation));
+    }
+    if matches!(r, Dec::Infinity { .. }) && fin(&x) && fin(&y) {
+        return Err(psql_raise(EvalErr::DecfloatOverflow));
+    }
+    Ok(Value::DecFloat34(dfl::dec_to_bits(&r)))
 }
 
 /// Evaluate a PSQL condition - three-valued, None being UNKNOWN, which
@@ -123036,7 +123119,11 @@ fn body_prepare(database: Option<&Database>, name: &str, meta: &ProcMeta) -> Res
     if rules.iter().all(|r| r.is_none()) {
         rules.clear();
     }
-    if let Some(dbr) = database {
+    // an EXECUTE BLOCK's locals are in the ATTACHMENT's set
+    // ([block_text_in_att_cs]); a stored body's in the database default
+    if name == ANONYMOUS_BLOCK {
+        fill_default_cs(&mut types[params_at..], CURRENT_ATT_CS.with(|c| c.get()));
+    } else if let Some(dbr) = database {
         fill_default_cs(&mut types[params_at..], db_default_charset(&dbr.bytes(), dbr.page_size));
     }
     names.extend(locals.into_iter().map(|(n, _)| n));
@@ -124382,6 +124469,8 @@ fn parse_execute_block_select(sql: &str, db: &Option<Database>) -> Option<Plan> 
         // PRECISION, FLOAT - is read by the column-type reader
         None => block_returns_scalar(returns_text)?,
     };
+    let mut out_descs = out_descs;
+    block_text_in_att_cs(returns_text, &mut out_descs);
     // ...and the body the compiler did not judge is judged here, before
     // a statement of it runs ([block_prepare_verdict])
     let meta = ProcMeta {
@@ -124413,6 +124502,49 @@ fn parse_execute_block_select(sql: &str, db: &Option<Database>) -> Option<Plan> 
 /// scale to resolve are taken - BOOLEAN, DOUBLE PRECISION, FLOAT and the
 /// plain integers and temporals - so the descriptor is the type itself;
 /// anything else stays refused.
+/// AN EXECUTE BLOCK'S TEXT THAT NAMES NO CHARACTER SET IS IN THE
+/// ATTACHMENT'S - its RETURNS parameters and its DECLAREd locals alike,
+/// not the database default a stored procedure's take. Measured on 2182,
+/// `R = 'é€'; L = CHAR_LENGTH(R); O = OCTET_LENGTH(R)`: a UTF8 attachment
+/// answers 2 / 5 in a NONE, a WIN1252 and a UTF8 database; a NONE
+/// attachment 5 / 5 in a UTF8 database; a DECLAREd VARCHAR local the
+/// same. The slot was NONE, so under a UTF8 attachment every non-ASCII
+/// value in it counted its octets as characters (`CHAR_LENGTH` 9 for
+/// 'séc€nd', a VARCHAR(6) target 22001, `R = 'séc€nd'` false) and a
+/// WIN1252 blob moved into it reached the client as invalid UTF-8 - the
+/// row vanished. A parameter that spells its CHARACTER SET (or is an
+/// NCHAR, a domain, a TYPE OF) keeps what it names.
+fn block_text_in_att_cs(returns_text: &str, descs: &mut [Descriptor]) {
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    let t = returns_text.trim();
+    let Some(rest) = t.get(.."RETURNS".len()).filter(|h| h.eq_ignore_ascii_case("RETURNS")).map(|_| &t["RETURNS".len()..]) else {
+        return;
+    };
+    let Some(inner) = rest.trim().strip_prefix('(').and_then(|r| r.strip_suffix(')')) else { return };
+    let items = split_top_level_commas(inner);
+    if items.len() != descs.len() {
+        return;
+    }
+    let bpc = fire_crab_ods::intl::bytes_per_char(att) as usize;
+    for (item, d) in items.iter().zip(descs.iter_mut()) {
+        if !matches!(d.dtype, dtype::TEXT | dtype::VARYING) || d.sub_type != 0 {
+            continue;
+        }
+        let up = mask_literals(&item.trim().to_ascii_uppercase());
+        // the type after the name: a plain CHAR / VARCHAR / CHARACTER
+        let ty = up.split_once(char::is_whitespace).map(|(_, r)| r.trim_start()).unwrap_or("");
+        let plain = ["CHAR", "VARCHAR", "CHARACTER"].iter().any(|k| find_word(ty, k, 0) == Some(0));
+        if !plain || find_word(ty, "SET", 0).is_some() {
+            continue;
+        }
+        let head = if d.dtype == dtype::VARYING { 2 } else { 0 };
+        let chars = (d.length as usize).saturating_sub(head);
+        let Ok(length) = u16::try_from(chars * bpc + head) else { continue };
+        d.length = length;
+        d.sub_type = att as i16;
+    }
+}
+
 fn block_returns_scalar(returns_text: &str) -> Option<(Vec<String>, Vec<Descriptor>)> {
     let t = returns_text.trim();
     let rest = t.get(.."RETURNS".len()).filter(|h| h.eq_ignore_ascii_case("RETURNS")).map(|_| &t["RETURNS".len()..])?;
