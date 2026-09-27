@@ -48,9 +48,21 @@
 #      literals together are TEXT, so `V IN (1, 'apple')` finds the row
 #      where comparing item by item raised 22018 on 'banana'.
 #
+#  13. A star over a join is NAMED one level up: every starred field
+#      its own name, a merged USING / NATURAL column the COALESCE the
+#      engine describes (`name: COALESCE`, no relation) aliased by the
+#      name - so a derived table or CTE over `SELECT * .. USING (K)`
+#      answers, and a real repeat is the engine's "column X was specified
+#      multiple times", not "no column name specified".
+#  14. A parenthesised union member takes no ROWS (the parser's Token
+#      unknown at it; OFFSET / FETCH answer); a derived table's body may
+#      be a parenthesised query or union; `IN ((SELECT ..))`, `EXISTS
+#      ((..))` and `= ANY ((..))` are the subquery, not a one-item list.
+#
 # Section 12 RECORDS what stays refused (or answers with another error),
 # each cell checked to still refuse. `CONTROL` cells agreed before this
-# gate; every other cell was red on master db71a0e.
+# gate; every other cell was red on master db71a0e (sections 13 and 14:
+# on the round-4 integration binary cff0432).
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
 ISQL="${ISQL:-isql}"
@@ -97,6 +109,17 @@ insert into cai values (2, 'b');
 insert into u8 values (1, 'apple');
 insert into u8 values (2, 'STRASSE');
 insert into u8 values (3, 'straße');
+create table pp (id integer, k integer, v varchar(10));
+create table qq (k integer, w varchar(10), id integer);
+create table rs (k integer, z varchar(5));
+insert into pp values (1, 1, 'p1');
+insert into pp values (2, 2, 'p2');
+insert into pp values (3, null, 'p3');
+insert into qq values (1, 'q1', 10);
+insert into qq values (3, 'q3', 30);
+insert into qq values (null, 'qn', 40);
+insert into rs values (3, 'r3');
+insert into rs values (5, 'r5');
 COMMIT;
 SQL
 } | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/qshape-build.log 2>&1
@@ -119,6 +142,19 @@ sess() { printf '%s\n' "$2" | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>
 # the describe: the sqltype lines and the name / alias lines
 dsc() { printf 'SET SQLDA_DISPLAY ON;\n%s\n' "$2" | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
     | grep -a 'sqltype\|: name:' | sed 's/^ *//;s/  */ /g' | paste -sd'|'; }
+# ...and with the field / alias / relation lines (`dsc` greps `: name:`,
+# which the describe spells with two spaces, so it keeps the types only)
+dscn() { printf 'SET SQLDA_DISPLAY ON;\n%s\n' "$2" | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
+    | grep -a 'sqltype\|name:\|table:' | sed 's/^ *//;s/  */ /g' | paste -sd'|'; }
+npin() { # <label> <script> <engine-describe with names>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(dscn "127.0.0.1/$REAL:$ENG" "$2"); fv=$(dscn "127.0.0.1/$PORT:$FC" "$2")
+    if [ "$ev" != "$3" ]; then echo "FAIL $1 - THE ENGINE DESCRIBES [$ev], not the pinned [$3]"; fail=1
+    elif [ "$ev" != "$fv" ]; then
+        echo "FAIL $1 (describe)"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
+    else echo "OK   $1 [$ev]"; fi
+}
 pin() { # <label> <script> <engine-output>
     ran=$((ran + 1))
     local ev fv
@@ -404,7 +440,7 @@ refused "12 a derived table's WITH declaring an UNUSED CTE (the engine warns; it
 refused "12 a parenthesised column" "select id, (a) r from t1 order by 1;"
 differs "12 T1.ID over T1 NATURAL JOIN T1 is the engine's -204 ambiguity; this server's bare refusal" "select t1.id from t1 natural join t1 order by 1;" "Statement failed, SQLSTATE = 42702|Dynamic SQL Error|-SQL error code = -204|-Ambiguous field name between table \"PUBLIC\".\"T1\" and table \"PUBLIC\".\"T1\"|-ID" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
 differs "12 a BOOLEAN UNION a number is the engine's HY004; this server's bare refusal" "select bo from t1 union select 1 from rdb\$database;" "Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression UNION" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
-differs "12 a star beside a column is the engine's -104 at the comma; this server's bare refusal" "select * , t3.k from t3;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 10|-," "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
+pin  "12 a star beside a column is the engine's -104 at the comma (promoted: the refusal diagnosis names it)" "select * , t3.k from t3;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 10|-,"
 differs "12 a text-only IN list against an INTEGER: the engine's message pads the item to the list's CHAR(2)" "select id from t1 where a in ('10', 'x') order by 1;" "ID|Statement failed, SQLSTATE = 22018|conversion error from string \"x \"" "ID|Statement failed, SQLSTATE = 22018|conversion error from string \"x\""
 refused "12 two ICU collations meet: a UNICODE_CI_AI column IN a UNICODE_CI set" "select id, s in (select s from ci) r from cai order by 1;"
 refused "12 ...a UNICODE_CI column IN a UNICODE_CI_AI set" "select id, s in (select s from cai) r from ci order by 1;"
@@ -413,11 +449,64 @@ refused "12 ...a COLLATE on the left side" "select id, s collate unicode_ci_ai i
 differs "12 GROUP BY the TEXT of a subquery-predicate item is the engine's -104; this server's bare refusal" "select a in (select x from t2) from t1 group by a in (select x from t2);" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid expression in the select list (not contained in either an aggregate function or the GROUP BY clause)" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
 differs "12 a two-column IN subquery as a value is the engine's 07002; this server's bare refusal" "select id, a in (select x, id from t2) r from t1 order by 1;" "Statement failed, SQLSTATE = 07002|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-count of column list and variable list do not match" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
 
+refused "12 a union of parenthesised members as an IN operand" "select * from pp where id in ((select k from qq) union (select 2 from rdb\$database)) order by 1;"
+refused "12 IN ((SELECT .. ROWS 1)), the engine's one-item list" "select * from pp where id in ((select k from qq rows 1));"
+refused "12 a recursive CTE read by a subquery of the final query" "with recursive r (n) as (select 1 from rdb\$database union all select n + 1 from r where n < 5) select sum(n), (select count(*) from r) from r;"
+refused "12 ...shadowing a base table of its name (read the table's rows)" "with recursive rs (n) as (select 1 from rdb\$database union all select n + 1 from rs where n < 5) select sum(n), (select count(*) from rs) from rs;"
+refused "12 ...in an IN subquery" "with recursive r (n) as (select 1 from rdb\$database union all select n + 1 from r where n < 5) select n from r where n in (select n * 2 from r) order by 1;"
+refused "12 a USING step after a USING step" "select * from pp left join (select k, w from qq) b using (k) left join rs using (k) order by 1;"
+refused "12 a NATURAL step after a FULL USING step" "select * from pp full join qq using (k) natural join rs order by 1, 2;"
+
+echo "--- 13. a star over a join is NAMED one level up: a derived table or CTE over USING / NATURAL / ON / CROSS"
+pin  "13 a derived table over SELECT * .. JOIN .. USING" "select * from (select * from pp join (select k, w from qq) b using (k)) d;" "ID K V W|1 1 p1 q1"
+pin  "13 ...over a FULL JOIN, the merged column the COALESCE" "select * from (select * from pp full join (select k, w from qq) b using (k)) d order by 1, 2;" "ID K V W|<null> <null> <null> qn|<null> 3 <null> q3|1 1 p1 q1|2 2 p2 <null>|3 <null> p3 <null>"
+pin  "13 ...over a RIGHT JOIN" "select * from (select * from pp a right join (select k, w from qq) b using (k)) d order by 1, 2;" "ID K V W|<null> <null> <null> qn|<null> 3 <null> q3|1 1 p1 q1"
+pin  "13 ...its merged column read by name over a LEFT JOIN" "select d.k from (select * from pp left join (select k, w from qq) b using (k)) d order by 1;" "K|<null>|1|2"
+pin  "13 ...and filtered over a FULL JOIN" "select d.k, d.w from (select * from pp full join (select k, w from qq) b using (k)) d where d.k is not null order by 1;" "K W|1 q1|2 <null>|3 q3"
+pin  "13 a CTE over the same body" "with c as (select * from pp join (select k, w from qq) b using (k)) select * from c;" "ID K V W|1 1 p1 q1"
+pin  "13 ...a FULL one read by name" "with c as (select * from pp full join (select k, w from qq) b using (k)) select k, w from c order by 1, 2;" "K W|<null> <null>|<null> qn|1 q1|2 <null>|3 q3"
+pin  "13 NATURAL JOIN in a derived table" "select * from (select * from pp a natural join (select k, w from qq) b) d;" "ID K V W|1 1 p1 q1"
+pin  "13 a merged ID beside a table sharing V: the -104 names V" "select * from (select * from pp a join t1 b using (id)) d where d.id < 3 order by 1;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-column V was specified multiple times for derived table D"
+pin  "13 COUNT(*), DISTINCT and FIRST over one" "select (select count(*) from (select * from pp join (select k, w from qq) b using (k)) d), (select count(*) from (select distinct * from pp join (select k, w from qq) b using (k)) d), (select count(*) from (select first 1 * from pp join (select k, w from qq) b using (k)) d) from rdb\$database;" "COUNT COUNT COUNT|1 1 1"
+pin  "13 a CROSS JOIN star in a derived table" "select * from (select * from t3 cross join (select w from qq) b) d where d.k = 2 order by 3;" "K NAME W|2 y q1|2 y q3|2 y qn"
+pin  "13 CONTROL a declared column list" "select * from (select * from pp join (select k, w from qq) b using (k)) d (c1, c2, c3, c4);" "C1 C2 C3 C4|1 1 p1 q1"
+pin  "13 duplicate names stay the engine's -104: a self join USING (K)" "select * from (select * from t3 a join t3 b using (k)) d;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-column NAME was specified multiple times for derived table D"
+pin  "13 ...an ON join names the first repeated column" "select * from (select * from pp a join qq b on a.k = b.k) d;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-column ID was specified multiple times for derived table D"
+pin  "13 ...two stars repeat the merged side's K" "select * from (select a.*, b.* from pp a join (select k, w from qq) b using (k)) d;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-column K was specified multiple times for derived table D"
+npin "13 the merged bare name describes COALESCE with no relation (inner)" "select k from pp join qq using (k) where 1=0;" "01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: COALESCE alias: K|: table: schema: owner: "
+npin "13 ...over FULL, aliased" "select k as kk from pp full join qq using (k) where 1=0;" "01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: COALESCE alias: KK|: table: schema: owner: "
+npin "13 ...under a star, the rest keep their relations" "select * from pp a join t3 b using (k) where 1=0;" "01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: ID alias: ID|: table: PP schema: PUBLIC owner: SYSDBA|02: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: COALESCE alias: K|: table: schema: owner: |03: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 10 charset: 0 SYSTEM.NONE|: name: V alias: V|: table: PP schema: PUBLIC owner: SYSDBA|04: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 10 charset: 0 SYSTEM.NONE|: name: NAME alias: NAME|: table: T3 schema: PUBLIC owner: SYSDBA"
+npin "13 ...and through a derived table" "select * from (select * from pp join (select k, w from qq) b using (k)) d where 1=0;" "01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: ID alias: ID|: table: PP schema: PUBLIC owner: SYSDBA|02: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: COALESCE alias: K|: table: schema: owner: |03: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 10 charset: 0 SYSTEM.NONE|: name: V alias: V|: table: PP schema: PUBLIC owner: SYSDBA|04: sqltype: 448 VARYING Nullable scale: 0 subtype: 0 len: 10 charset: 0 SYSTEM.NONE|: name: W alias: W|: table: QQ schema: PUBLIC owner: SYSDBA"
+npin "13 a UNION naming a merged first member: blank field, alias K" "select k from pp full join qq using (k) union select 1 from rdb\$database;" "01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|: name: alias: K|: table: schema: owner: "
+
+echo "--- 14. a parenthesised union member takes no ROWS; a derived table's or an IN's parentheses of their own"
+pin  "14 ROWS in a parenthesised member is the parser's Token unknown" "(select id from pp order by id desc rows 1) union all (select k from qq order by k rows 1);" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 37|-rows"
+pin  "14 ...the first member's" "(select id from pp rows 1) union all (select k from qq rows 1);" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 20|-rows"
+pin  "14 ...ROWS m TO n" "(select id from pp order by id rows 2 to 3) union all (select 0 from rdb\$database);" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 32|-rows"
+pin  "14 ...only the second member's" "select id from pp union all (select k from qq rows 1);" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 47|-rows"
+pin  "14 ...in two pairs of parentheses" "select id from pp where id = 1 union all ((select k from qq rows 1));" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Token unknown - line 1, column 61|-rows"
+pin  "14 CONTROL OFFSET / FETCH in a parenthesised member" "(select id from pp order by id offset 1 rows fetch next 1 row only) union all (select 0 from rdb\$database);" "ID|2|0"
+pin  "14 CONTROL a window's ROWS frame" "(select id, count(*) over (order by id rows between unbounded preceding and current row) from pp) union all (select 0, 0 from rdb\$database);" "ID COUNT|1 1|2 2|3 3|0 0"
+pin  "14 a parenthesised UNION as a derived table" "select * from ((select id from pp) union (select k from qq)) d order by 1;" "ID|<null>|1|2|3"
+pin  "14 ...UNION ALL, a bare second member" "select * from ((select id from pp) union all select k from qq) d order by 1;" "ID|<null>|1|1|2|3|3"
+pin  "14 ...with a member's FETCH" "select * from ((select id from pp order by id desc fetch first 1 row only) union all (select k from qq where k = 3)) d order by 1;" "ID|3|3"
+pin  "14 ...read by a qualified name" "select d.id from ((select id from pp) union (select k from qq)) d where d.id > 1 order by 1;" "ID|2|3"
+pin  "14 ...a declared column list" "select * from ((select id from pp) union (select k from qq)) d (x) order by 1;" "X|<null>|1|2|3"
+pin  "14 ...unaliased" "select * from ((select id from pp) union (select k from qq)) order by 1;" "ID|<null>|1|2|3"
+pin  "14 a query in two pairs of parentheses as a derived table" "select * from ((select id from pp)) d order by 1;" "ID|1|2|3"
+pin  "14 IN ((SELECT ..)) is the IN subquery" "select * from pp where id in ((select k from qq)) order by 1;" "ID K V|1 1 p1|3 <null> p3"
+pin  "14 ...NOT IN" "select * from pp where id not in ((select k from qq where k is not null)) order by 1;" "ID K V|2 2 p2"
+pin  "14 ...three pairs" "select * from pp where id in (((select k from qq))) order by 1;" "ID K V|1 1 p1|3 <null> p3"
+pin  "14 ...as a value" "select id, id in ((select k from qq)) from pp order by 1;" "ID BOOL|1 <true>|2 <false>|3 <true>"
+pin  "14 EXISTS ((SELECT ..))" "select * from pp where exists ((select 1 from qq where qq.k = pp.id)) order by 1;" "ID K V|1 1 p1|3 <null> p3"
+pin  "14 = ANY ((SELECT ..))" "select * from pp where id = any ((select k from qq)) order by 1;" "ID K V|1 1 p1|3 <null> p3"
+pin  "14 > ALL ((SELECT ..))" "select * from pp where id > all ((select k from qq where k < 3)) order by 1;" "ID K V|2 2 p2|3 <null> p3"
+pin  "14 CONTROL IN of a parenthesised subquery beside a value is a list" "select * from pp where id in ((select max(k) from qq), 2) order by 1;" "ID K V|2 2 p2|3 <null> p3"
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-qshape-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 233 ]; then echo "FAIL only $ran checks ran (floor 233)"; fail=1; fi
+if [ "$ran" -lt 282 ]; then echo "FAIL only $ran checks ran (floor 282)"; fail=1; fi
 exit $fail

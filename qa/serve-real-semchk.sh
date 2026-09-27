@@ -763,11 +763,11 @@ refused "5c RECORDED ...with a WHERE" "select id from t1 where id = 1 plan (t1 n
 pin  "5c RECORDED a CTE read only by a subquery, locked (answers since the qshape chunk)" "with c as (select 1 x from rdb\$database) select id from t1 where id in (select x from c) with lock;" "ID|1"
 err_differs "5c RECORDED a PLAN ahead of the WHERE (the engine's parser refuses it)" "select * from t1 t plan (t natural) where t.id = 1 with lock;" "Token unknown"
 
-echo "--- 1c. RECORDED: a star over a join inside a derived table"
-refused "1c RECORDED a NATURAL JOIN's star (one merged ID: the engine answers)" "select * from (select * from t1 natural join t2) x where x.id = 1;"
-refused "1c RECORDED ...JOIN USING" "select * from (select * from t1 join t2 using (id)) x where x.id = 1;"
+echo "--- 1c. a star over a join inside a derived table"
+pin  "1c a NATURAL JOIN's star (one merged ID; promoted: a starred column is named one level up)" "select * from (select * from t1 natural join t2) x where x.id = 1;" "ID A B N V D F BO T1ID X S|1 10 100 1.50 apple 2020-01-01 1.500000000000000 <true> 1 5 one"
+pin  "1c ...JOIN USING (promoted)" "select * from (select * from t1 join t2 using (id)) x where x.id = 1;" "ID A B N V D F BO T1ID X S|1 10 100 1.50 apple 2020-01-01 1.500000000000000 <true> 1 5 one"
 pin  "1c RECORDED ...T1.*, T2.X (answers since the qshape chunk)" "select * from (select t1.*, t2.x from t1 join t2 on t1.id = t2.id) x where x.id = 1;" "ID A B N V D F BO X|1 10 100 1.50 apple 2020-01-01 1.500000000000000 <true> 5"
-err_differs "1c RECORDED a JOIN ON's star: the engine's duplicate ID, this server's unnamed column" "select * from (select * from t1 join t2 on t1.id = t2.id) x where x.id = 1;" "column ID $DUP X"
+pin  "1c a JOIN ON's star is the engine's duplicate ID (promoted: no longer the unnamed column)" "select * from (select * from t1 join t2 on t1.id = t2.id) x where x.id = 1;" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|-SQL error code = -104|-Invalid command|-column ID was specified multiple times for derived table X"
 pin  "1c CONTROL the top-level NATURAL JOIN star answers" "select count(*) from t1 natural join t2 where id = 1;" "COUNT|1"
 
 echo "--- 2d. A CTE READ AS A COMMA ITEM IS READ (the third review's regression: an alias conflict here)"

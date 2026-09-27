@@ -44890,6 +44890,27 @@ struct JoinSide {
     flatten: Option<FlatSrc>,
 }
 
+/// The column a NATURAL / USING join made of the combined-row column
+/// `li` and its partners (`merged` holds (left, right) pairs in step
+/// order): `COALESCE(left, right, ..)`, or None when `li` merged with
+/// nothing. The engine builds exactly that node for the unqualified
+/// name and aliases it with the name, whatever the join kind - measured
+/// on 2182, `SELECT K FROM P JOIN Q USING (K)` (inner, LEFT, FULL and
+/// NATURAL alike) and the merged column of a `*` describe `name:
+/// COALESCE alias: K` with no relation, and that alias is what names it
+/// one level up (`SELECT * FROM (SELECT * FROM P JOIN (..) B USING (K))
+/// D` answers ID, K, V, W). Over an inner or LEFT step the value is
+/// the left column's; over a RIGHT or FULL one it is the padded side's
+/// partner ([JoinSide::merged_outer]).
+fn merged_coalesce(merged: &[(usize, usize)], li: usize) -> Option<Expr> {
+    let partners: Vec<Expr> =
+        merged.iter().filter(|(l, _)| *l == li).map(|(_, r)| Expr::Col(*r)).collect();
+    if partners.is_empty() {
+        return None;
+    }
+    Some(Expr::Coalesce(std::iter::once(Expr::Col(li)).chain(partners).collect()))
+}
+
 /// Resolve a (possibly qualified) column name against the two join sides
 /// to (combined row index, descriptor, canonical column name). A bare
 /// name must be unambiguous - present on exactly one side.
@@ -47046,20 +47067,37 @@ fn plan_join_bound(
                     // TWO sources: in an outer one the preserved side
                     // may be the padded one, and the engine shows the
                     // other's value (probed on `NATURAL RIGHT JOIN`).
-                    let expr = merged
-                        .iter()
-                        .find(|(l, _)| *l == idx)
-                        .map(|(l, r)| {
-                            Expr::Coalesce(vec![Expr::Col(*l), Expr::Col(*r)])
-                        });
+                    let expr = merged_coalesce(&merged, idx);
+                    let is_merged = expr.is_some();
                     cols.push(ProjCol {
                         name: rc.name.clone(),
-                        fname: side.fnames.get(rc.field_id as usize).cloned().flatten(),
+                        // EVERY STARRED COLUMN HAS A NAME: a field is
+                        // its own (None in `fnames` means exactly that,
+                        // and leaving it None read as UNNAMED one level
+                        // up - `(SELECT * FROM P CROSS JOIN (..) B) D`
+                        // was the -104 "no column name specified for
+                        // column number 1", measured answering rows on
+                        // 2182), a merged pair the COALESCE the engine
+                        // describes ([merged_coalesce])
+                        fname: if is_merged {
+                            Some("COALESCE".to_string())
+                        } else {
+                            side.fnames
+                                .get(rc.field_id as usize)
+                                .cloned()
+                                .flatten()
+                                .or_else(|| Some(rc.name.clone()))
+                        },
                         // each starred column reads from ITS side's
                         // relation (probed: `T JOIN U` answers T,T,U,U
-                        // per column, side aliases riding along)
-                        relation: side.rels.get(rc.field_id as usize).cloned().flatten(),
-                        rel_alias: side.rel_alias.clone(),
+                        // per column, side aliases riding along); a
+                        // merged one from none
+                        relation: if is_merged {
+                            None
+                        } else {
+                            side.rels.get(rc.field_id as usize).cloned().flatten()
+                        },
+                        rel_alias: if is_merged { None } else { side.rel_alias.clone() },
                         field_id: idx,
                         wire,
                         sql_type: nullable(sql_type),
@@ -47102,35 +47140,46 @@ fn plan_join_bound(
                     }
                     _ => return None, // aggregates over a join: fall back
                 };
-                // a BARE name of a column an outer NATURAL/USING join
-                // merged is the pair's COALESCE ([JoinSide::merged_outer])
-                let outer_merged = (!name.contains('.'))
-                    .then(|| {
-                        sides.iter().find_map(|s| {
-                            let rc = s.columns.iter().find(|c| c.name == *name)?;
-                            s.merged_outer
-                                .contains(&rc.field_id)
-                                .then(|| (s, rc, s.offset + rc.field_id as usize))
+                // a BARE name of a column a NATURAL/USING join merged is
+                // the pair's COALESCE ([merged_coalesce]) - its value
+                // over an outer step ([JoinSide::merged_outer]), and its
+                // describe over every step, an inner one included
+                // (one visible column of the name, or it is ambiguous and
+                // left to [resolve_join_col] to refuse)
+                let visible: Vec<(&JoinSide, &RelationColumn)> = if name.contains('.') {
+                    Vec::new()
+                } else {
+                    sides
+                        .iter()
+                        .flat_map(|s| {
+                            s.columns
+                                .iter()
+                                .filter(|c| c.name == *name && !s.merged_away.contains(&c.field_id))
+                                .map(move |c| (s, c))
                         })
-                    })
-                    .flatten();
-                if let Some((side, rc, li)) = outer_merged {
-                    let &(_, ri) = merged.iter().find(|(l, _)| *l == li)?;
+                        .collect()
+                };
+                let bare_merged = match visible.as_slice() {
+                    [(s, rc)] => merged_coalesce(&merged, s.offset + rc.field_id as usize)
+                        .map(|e| (*s, *rc, e)),
+                    _ => None,
+                };
+                if let Some((side, rc, coalesce)) = bare_merged {
                     let d = side.descs.get(rc.field_id as usize)?;
                     let (wire, sql_type, length, scale, sub_type) = wire_for(d);
                     cols.push(ProjCol {
                         name: alias.clone().unwrap_or_else(|| rc.name.clone()),
-                        fname: side.fnames.get(rc.field_id as usize).cloned().flatten().or_else(|| Some(rc.name.clone())),
-                        relation: side.rels.get(rc.field_id as usize).cloned().flatten(),
-                        rel_alias: side.rel_alias.clone(),
-                        field_id: li,
+                        fname: Some("COALESCE".to_string()),
+                        relation: None,
+                        rel_alias: None,
+                        field_id: side.offset + rc.field_id as usize,
                         wire,
                         sql_type: nullable(sql_type),
                         length,
                         oct_length: length,
                         scale,
                         sub_type,
-                        expr: Some(Expr::Coalesce(vec![Expr::Col(li), Expr::Col(ri)])),
+                        expr: Some(coalesce),
                     });
                     continue;
                 }
@@ -48848,6 +48897,16 @@ fn is_cte_name(masked_up: &str, name: &str) -> bool {
         let mut i = from;
         while i < b.len() && b[i].is_ascii_whitespace() {
             i += 1;
+        }
+        // a declared column list comes between (`R (N) AS (..)`, the
+        // shape every recursive CTE has - missing it posted the 42S02
+        // "Table unknown R" over a refused recursive query)
+        if b.get(i) == Some(&b'(') {
+            let Some(close) = matching_paren(b, i) else { continue };
+            i = close + 1;
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
         }
         // AS as a whole word
         if masked_up[i..].starts_with("AS")
@@ -60697,6 +60756,42 @@ fn paren_query_body(p: &str) -> Option<String> {
     (find_word(head, "SELECT", 0) == Some(0) || find_word(head, "WITH", 0) == Some(0)).then(|| inner.to_string())
 }
 
+/// The `ROWS` clause word of a WHOLLY parenthesised union member, as a
+/// slice of `member`, or None. The engine's parenthesised query takes
+/// ORDER BY, OFFSET and FETCH but no ROWS: measured on 2182, `(SELECT ID
+/// FROM P ROWS 1) UNION ALL ..` is the -104 Token unknown at that ROWS
+/// (line 1, column 19), in parentheses twice too, the second member's
+/// when only it has one, while `OFFSET 1 ROWS` / `FETCH FIRST 1 ROWS
+/// ONLY` and a window's `ROWS BETWEEN` (inside its OVER) answer. A
+/// derived table's own ROWS is another production and answers.
+fn paren_member_rows(member: &str) -> Option<&str> {
+    let mut t = member.trim();
+    while t.starts_with('(') && matching_paren(t.as_bytes(), 0) == Some(t.len() - 1) {
+        t = t[1..t.len() - 1].trim();
+        if t.starts_with('(') && matching_paren(t.as_bytes(), 0) == Some(t.len() - 1) {
+            continue;
+        }
+        // (byte-length preserving, so an offset into `up` is one into `t`)
+        let up = mask_literals(&t.to_ascii_uppercase());
+        if find_word(&up, "SELECT", 0) != Some(0) && find_word(&up, "WITH", 0) != Some(0) {
+            return None;
+        }
+        let mut from = 0;
+        while let Some(r) = find_word_depth0(&up, "ROWS", from) {
+            from = r + "ROWS".len();
+            // OFFSET n ROWS ends the text or meets FETCH; FETCH .. ROWS
+            // meets ONLY - neither is the ROWS clause
+            let next = up[from..].trim_start();
+            if next.is_empty() || find_word(next, "ONLY", 0) == Some(0) || find_word(next, "FETCH", 0) == Some(0) {
+                continue;
+            }
+            return Some(&t[r..from]);
+        }
+        return None;
+    }
+    None
+}
+
 /// A depth-0 UNION chain that MIXES `UNION` and `UNION ALL`, rewritten
 /// left-grouped (see the caller): `SELECT * FROM (<head>) <op> <rest>`.
 /// None when the chain is not mixed.
@@ -60795,6 +60890,31 @@ fn plan_union(
         None => last.clone(),
     };
     parts.push(last_body);
+    // ...but one carrying a ROWS clause is the parser's Token unknown at
+    // it, the first in text order ([paren_member_rows]); placed only in
+    // the text the client sent, and refused bare in a rewritten one
+    let mut cursor = 0usize;
+    for p in &parts {
+        let at = sql.get(cursor..).and_then(|rest| rest.find(p.as_str())).map(|i| i + cursor);
+        if let Some(at) = at {
+            cursor = at + p.len();
+        }
+        let Some(tok) = at.map_or_else(|| paren_member_rows(p), |at| paren_member_rows(&sql[at..at + p.len()]))
+        else {
+            continue;
+        };
+        let placed = at.is_some()
+            && STMT_TEXT.with(|t| {
+                let (q, t) = (tok.as_ptr() as usize, t.borrow());
+                t.as_ref().is_some_and(|(o, full)| q >= *o && q + tok.len() <= *o + full.len())
+            });
+        return Some(match (placed, text_line_col(sql, tok)) {
+            (true, Some((line, col))) => {
+                Plan::RefusedEval(EvalErr::TokenUnknown { line, col, token: tok.to_string() })
+            }
+            _ => Plan::Refused,
+        });
+    }
     // A PARENTHESISED MEMBER is its query: `(SELECT .. ) UNION ALL
     // (SELECT ..) ORDER BY 1` (measured on 2182: the bare members' rows)
     for p in parts.iter_mut() {
@@ -61846,6 +61966,18 @@ fn plan_query_inner_at_body(
                 }
                 if trace {
                     eprintln!("[srv] plan: recursive CTE {} produced {} rows", name, acc.len());
+                }
+                // The accumulated rows bind the final query's FROM only:
+                // a reference in a scalar / IN subquery elsewhere in it
+                // resolved as a TABLE - the 42S02 "Table unknown R", or,
+                // with a base table R beside the CTE, that table's rows
+                // (measured on 2182: `SELECT SUM(N), (SELECT COUNT(*)
+                // FROM R) FROM R` is 15, 5 - the CTE shadows the table -
+                // where this answered 15, 2). Refused, never misread.
+                let named = |t: &str| from_names(t).iter().filter(|n| n.eq_ignore_ascii_case(name)).count();
+                let in_from = split_query(&main).map_or(usize::MAX, |(_, t, ..)| named(&format!("SELECT 1 FROM {}", t)));
+                if named(&main) > in_from {
+                    return Some({ if trace { eprintln!("[srv] recursive CTE refused: a subquery of the final query reads it"); } Plan::Refused });
                 }
                 // FIRST/SKIP/DISTINCT on the final query are peeled off,
                 // the query planned over the accumulated rows, and the
@@ -65308,9 +65440,23 @@ fn parse_derived_table(from_s: &str) -> Option<(&str, String, Vec<String>)> {
     // BORROWED, not copied: a position measured inside the inner query
     // (its unknown table's `At line, column`) is then a slice of the
     // statement the client sent, and [text_line_col] places it there
-    let inner = t[1..close].trim();
+    let mut inner = t[1..close].trim();
+    // A PARENTHESISED QUERY IS A DERIVED TABLE'S BODY TOO, a union of
+    // parenthesised members included (measured on 2182: `SELECT * FROM
+    // ((SELECT ID FROM P) UNION (SELECT K FROM Q)) D` and `((SELECT ID
+    // FROM P)) D` answer; this read them as a TABLE named by the whole
+    // text, the 42S02). Wholly parenthesised, it is unwrapped - unless
+    // it carries ROWS, which the engine refuses ([paren_member_rows]) and
+    // which then plans as a parenthesised statement, refused bare.
+    while inner.starts_with('(')
+        && matching_paren(inner.as_bytes(), 0) == Some(inner.len() - 1)
+        && paren_member_rows(inner).is_none()
+    {
+        inner = inner[1..inner.len() - 1].trim();
+    }
     let up = mask_literals(&inner.to_ascii_uppercase());
-    if find_word(&up, "SELECT", 0) != Some(0) {
+    let head = up.trim_start_matches(|c: char| c == '(' || c.is_whitespace());
+    if find_word(head, "SELECT", 0) != Some(0) {
         return None;
     }
     let mut rest = t[close + 1..].trim();
@@ -103442,6 +103588,51 @@ fn extract_subqueries(where_text: &str) -> Option<(String, Vec<String>)> {
             continue;
         }
         if b[i] == b'(' {
+            // `[NOT] IN ((SELECT ..))`: an IN's operand in parentheses of
+            // its own is still the SET, not a one-item list of a scalar
+            // subquery (measured on 2182: `ID IN ((SELECT K FROM Q))`
+            // answers the IN rows where the list reading raised 21000
+            // "multiple rows in singleton select" after the header). The
+            // outer group is lifted whole, as the bare query - and so is
+            // `EXISTS ((SELECT ..))`'s and `= ANY ((SELECT ..))`'s
+            // (measured: each answers its rows).
+            let after_in = {
+                let o = out.trim_end().as_bytes();
+                ["IN", "EXISTS", "ANY", "SOME", "ALL"].iter().any(|w| {
+                    let n = w.len();
+                    o.len() >= n
+                        && o[o.len() - n..].eq_ignore_ascii_case(w.as_bytes())
+                        && (o.len() == n
+                            || !(o[o.len() - n - 1].is_ascii_alphanumeric() || matches!(o[o.len() - n - 1], b'_' | b'$')))
+                })
+            };
+            if after_in {
+                if let Some(close) = matching_paren(b, i) {
+                    let mut body = where_text[i + 1..close].trim().to_string();
+                    let mut wrapped = false;
+                    while let Some(inner) = paren_query_body(&body) {
+                        // a parenthesised query takes no ROWS
+                        // ([paren_member_rows]), so with one the group
+                        // is the engine's one-item LIST of a scalar
+                        // subquery after all (measured: `ID IN ((SELECT
+                        // K FROM Q ROWS 1))` answers ID 1)
+                        if paren_member_rows(&body).is_some() || split_union(&inner).is_some() {
+                            break;
+                        }
+                        body = inner;
+                        wrapped = true;
+                    }
+                    if wrapped && paren_query_body(&body).is_none() {
+                        subs.push(body);
+                        out.push(' ');
+                        out.push_str(SUBQ_MARK);
+                        out.push_str(&(subs.len() - 1).to_string());
+                        out.push(' ');
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
             // does the word after the paren start a SELECT?
             let mut j = i + 1;
             while j < b.len() && b[j].is_ascii_whitespace() {
