@@ -84507,11 +84507,23 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
 /// exactly as the engine's do. `next` continues across select-list items
 /// (and the WHERE clause picks up after it), so the whole statement's
 /// input SQLDA is in textual order.
+thread_local! {
+    /// Set by [renumber_proj_params_from] for its own walk only: a folded
+    /// SELECT-LIST subquery (`RawExpr::Subq`) consumes its registered
+    /// slots in text order there ([proj_subquery_param_base]). Every
+    /// other renumbering - a WHERE's tokens, whose subqueries the WHERE
+    /// path counts itself (`prm_used`) - leaves it unset.
+    static COUNT_SUBQ_SLOTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn renumber_raw_params(e: &mut RawExpr, next: &mut usize) {
     match e {
         RawExpr::Param(i) => {
             *i = *next;
             *next += 1;
+        }
+        RawExpr::Subq(id) if COUNT_SUBQ_SLOTS.with(|c| c.get()) => {
+            *next += corr_param_count(*id);
         }
         RawExpr::Neg(a) => renumber_raw_params(a, next),
         RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
@@ -84591,6 +84603,7 @@ fn renumber_proj_params(proj: &mut Proj) -> usize {
 /// which is what the WHERE numbers from.
 fn renumber_proj_params_from(proj: &mut Proj, base: usize) -> usize {
     let mut n = base;
+    let was = COUNT_SUBQ_SLOTS.with(|c| c.replace(true));
     if let Proj::Items(items) = proj {
         for it in items.iter_mut() {
             match it {
@@ -84602,6 +84615,7 @@ fn renumber_proj_params_from(proj: &mut Proj, base: usize) -> usize {
             }
         }
     }
+    COUNT_SUBQ_SLOTS.with(|c| c.set(was));
     n
 }
 
@@ -107497,19 +107511,40 @@ fn text_param_under_operator(text: &str) -> bool {
     })
 }
 
-/// The statement slot a SELECT-LIST subquery's first `?` claims - only
-/// when that subquery's text holds EVERY `?` of the body (`base` is the
-/// body's own first slot), so no other numbering moves: the projection
-/// around it and the WHERE after it carry none. Any other shape keeps the
-/// old refusal (None): interleaving a subquery's slots with the
-/// projection's own renumbering is a slice of its own. Measured
+/// The statement slot a SELECT-LIST subquery's first `?` claims: the
+/// body's first (`base`) plus every `?` written before it - the
+/// projection's renumbering then lets the folded subquery consume its own
+/// count in the same text order ([COUNT_SUBQ_SLOTS]), so a projection
+/// `?` after it and the WHERE's `?`s number past it. A `FIRST ?` / `SKIP
+/// ?` ahead of the select list keeps the old refusal (None). Measured
 /// 2026-10-02: `SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?)
 /// FROM T` answers 2 on every row on the engine and refused here, as did
 /// every select-list subquery carrying a `?`.
 fn proj_subquery_param_base(body: &str, sub: &str, base: usize) -> Option<usize> {
-    let all = mask_literals(body).matches('?').count();
-    let mine = mask_literals(sub).matches('?').count();
-    (mine > 0 && mine == all).then_some(base)
+    let masked = mask_literals(body);
+    if !mask_literals(sub).contains('?') {
+        return Some(base); // no `?` of its own: nothing to number
+    }
+    // the subquery's text in the body; its `?`s take the slots after
+    // every `?` written before it, in text order - the order
+    // [renumber_proj_params_from] walks, a folded subquery consuming its
+    // own count there ([COUNT_SUBQ_SLOTS])
+    let at = body.find(sub)?;
+    // the SAME subquery text twice would place both at the first one's
+    // slots - a wrong binding, not a refusal - so a repeat refuses
+    if body.matches(sub).count() != 1 {
+        return None;
+    }
+    // nothing ahead of the select list may hold a `?` (`FIRST ?` / `SKIP ?`
+    // number before it on their own path): refused, as before
+    let up = masked.to_ascii_uppercase();
+    let head_end = up.find("SELECT").map(|i| i + 6).unwrap_or(0);
+    let head = &up[head_end..at.min(up.len())];
+    let lead = head.trim_start();
+    if (lead.starts_with("FIRST") || lead.starts_with("SKIP")) && head.split_whitespace().take(4).any(|w| w.contains('?')) {
+        return None;
+    }
+    Some(base + masked[..at].matches('?').count())
 }
 
 /// Publish the slots registered subqueries claimed into the statement's

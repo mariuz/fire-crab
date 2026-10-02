@@ -387,10 +387,31 @@ both "6 EXISTS(SELECT 1 .. T2.ID > ?) as an item"     "SELECT ID, EXISTS(SELECT 
 both "6 (SELECT ..) + 1 - inside arithmetic"          "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) + 1 FROM T ORDER BY ID" '[1]'
 both "6 .. $R"                                         "SELECT (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) $R" '[0]'
 both "6 .. beside a ?-free WHERE"                      "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) FROM T WHERE ID > 1 ORDER BY ID" '[1]'
-# RECORDED: a `?` outside the subquery too - the projection's own numbering
-dml_refused "6 .. and a WHERE ?"            "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) FROM T WHERE ID > ? ORDER BY ID" '[1,1]'
-dml_refused "6 .. and a projection ?"       "SELECT ID, IIF(ID > ?, 1, 0), (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) FROM T ORDER BY ID" '[1,1]'
-dml_refused "6 .. two subqueries with a ? each" "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?), (SELECT COUNT(*) FROM T T3 WHERE T3.ID < ?) FROM T ORDER BY ID" '[1,3]'
+# INTERLEAVED: the subquery's slots sit among the statement's in TEXT
+# ORDER - the projection's renumbering lets a folded subquery consume its
+# own count (COUNT_SUBQ_SLOTS).  The binds are chosen so a swapped slot
+# changes the answer: [0,2] is the subquery's 0 and the WHERE's 2.
+C="(SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?)"
+both "6 .. and a WHERE ? [1,1]"             "SELECT ID, $C FROM T WHERE ID > ? ORDER BY ID" '[1,1]'
+both "6 .. and a WHERE ? [0,2] - the order discriminates" "SELECT ID, $C FROM T WHERE ID > ? ORDER BY ID" '[0,2]'
+both "6 a pattern ? BEFORE the subquery"    "SELECT ID, IIF(V LIKE ?, 1, 0), $C FROM T ORDER BY ID" '["1%",1]'
+both "6 a pattern ? AFTER the subquery"     "SELECT ID, $C, IIF(V LIKE ?, 1, 0) FROM T ORDER BY ID" '[1,"1%"]'
+both "6 two subqueries with a ? each"       "SELECT ID, $C, (SELECT COUNT(*) FROM T T3 WHERE T3.ID < ?) FROM T ORDER BY ID" '[1,3]'
+both "6 two subqueries and a WHERE ?"       "SELECT ID, $C, (SELECT COUNT(*) FROM T T3 WHERE T3.ID < ?) FROM T WHERE ID <> ? ORDER BY ID" '[1,3,2]'
+both "6 .. and a WHERE pattern ?"           "SELECT ID, $C FROM T WHERE V LIKE ? ORDER BY ID" '[1,"1%"]'
+both "6 .. and a WHERE IN-subquery's ?"     "SELECT ID, $C FROM T WHERE ID IN (SELECT T4.ID FROM T T4 WHERE T4.ID > ?) ORDER BY ID" '[1,1]'
+both "6 .. and two WHERE ?s"                "SELECT ID, $C FROM T WHERE ID > ? AND V LIKE ? ORDER BY ID" '[1,1,"1%"]'
+both "6 a UNION ALL, a subquery ? in each branch" "SELECT ID, $C FROM T WHERE ID = 1 UNION ALL SELECT ID, (SELECT COUNT(*) FROM T T3 WHERE T3.ID < ?) FROM T WHERE ID = 3" '[0,3]'
+both "6 a UNION ALL, the second branch's WHERE ?" "SELECT ID, $C FROM T WHERE ID = 1 UNION ALL SELECT ID, 0 FROM T WHERE ID > ?" '[0,2]'
+both "6 a derived table's item, and the outer WHERE ?" "SELECT d.ID, d.K FROM (SELECT ID, $C AS K FROM T) d WHERE d.ID > ? ORDER BY 1" '[0,1]'
+both "6 a CTE's item, and the outer WHERE ?" "WITH c AS (SELECT ID, $C AS K FROM T) SELECT ID, K FROM c WHERE ID > ? ORDER BY ID" '[0,1]'
+# RECORDED: K1's numeric mix, a repeated or overlapping subquery text (its
+# position is ambiguous - refused rather than risk a swapped slot), a
+# `FIRST ?`, and a second UNION branch after a first one's WHERE `?`
+dml_refused "6 .. and a NUMERIC condition ? - K1"       "SELECT ID, IIF(ID > ?, 1, 0), $C FROM T ORDER BY ID" '[1,1]'
+dml_refused "6 the SAME subquery text twice"            "SELECT ID, $C, $C FROM T ORDER BY ID" '[1,2]'
+dml_refused "6 FIRST ? ahead of the select list"        "SELECT FIRST ? ID, $C FROM T ORDER BY ID" '[2,1]'
+dml_refused "6 a UNION's second branch after a WHERE ?" "SELECT ID, 0 FROM T WHERE ID > ? UNION ALL SELECT ID, (SELECT COUNT(*) FROM T T3 WHERE T3.ID < ?) FROM T WHERE ID = 3" '[2,3]'
 
 # ---------------------------------------------------------------
 echo "--- panic check"
@@ -402,6 +423,6 @@ elif ! kill -0 $srv 2>/dev/null; then
 else echo "OK   no panic and the server is still up"; fi
 
 echo "ran $ran checks"
-# the floor is the MEASURED count: 120 on the 2026-10-02 binary, 120 OK
-if [ "$ran" -lt 120 ]; then echo "FAIL only $ran checks ran (floor 120) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 134 on the 2026-10-02 binary, 134 OK
+if [ "$ran" -lt 134 ]; then echo "FAIL only $ran checks ran (floor 134) - cells went missing"; fail=1; fi
 exit $fail
