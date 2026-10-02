@@ -86962,11 +86962,48 @@ fn bare_true_refusal(side: &Expr, descs: &[Descriptor]) {
     }
 }
 
+thread_local! {
+    /// A `?` sink LENT to the literal resolver ([with_ambient_sink]) for
+    /// the length of one call: while it is here, the condition entry
+    /// ([resolve_raw_cond]) borrows it and types its `?`s exactly as the
+    /// sink router does. Taken out for the borrow, so a condition nested
+    /// inside a condition sees none and keeps its refusal.
+    static AMBIENT_SINK: std::cell::RefCell<Option<Vec<Option<Descriptor>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Resolve with the LITERAL resolver while lending it `sink` for its
+/// conditions' `?`s ([AMBIENT_SINK]). The projection router uses it for a
+/// node it has no arm of its own for - a built-in function - whose every
+/// `?` sits in a condition ([raw_value_param_free]): the literal path
+/// carries each function's own law (its width, charset, result type,
+/// lowering) and the condition's `?` is the only thing it lacked.
+/// Measured 2026-10-02: `CHAR_LENGTH(IIF(ID > ?, 'big', 's'))` is 3 on
+/// every row (the CHAR(3) pad counts), `UPPER(..)` `S  `, `TRIM(..)` `s`,
+/// `SUBSTRING(.. FROM 1 FOR 2)` `s `, `ROUND(IIF(ID > ?, 1.25, 2.5), 1)`
+/// 1.3, `HASH(..)` the padded text's hash - every one refused here.
+fn with_ambient_sink<T>(sink: &mut Vec<Option<Descriptor>>, f: impl FnOnce() -> Option<T>) -> Option<T> {
+    let prev = AMBIENT_SINK.with(|a| a.replace(Some(std::mem::take(sink))));
+    let r = f();
+    let back = AMBIENT_SINK.with(|a| a.replace(prev));
+    *sink = back.unwrap_or_default();
+    r
+}
+
 fn resolve_raw_cond(
     c: &RawCond,
     columns: &[RelationColumn],
     descs: &[Descriptor],
 ) -> Option<Cond2> {
+    // a lent sink: this condition's `?`s are typed as the sink router
+    // types them ([with_ambient_sink]); a `?`-free one resolves as ever
+    if raw_cond_has_param(c) {
+        if let Some(mut lent) = AMBIENT_SINK.with(|a| a.borrow_mut().take()) {
+            let r = resolve_raw_cond_sink(c, columns, descs, &mut lent);
+            AMBIENT_SINK.with(|a| *a.borrow_mut() = Some(lent));
+            return r;
+        }
+    }
     if let RawCond::Cmp(a, op, b) = c {
         if let Some(d) = distribute_cmp(a, *op, b, columns, descs) {
             return resolve_distributed(&d, columns, descs);
@@ -92170,6 +92207,11 @@ fn resolve_proj_expr_body(
                 ),
                 descs,
             )
+        }
+        // a BUILT-IN FUNCTION whose every `?` is in a condition: the
+        // literal resolver, with this sink lent to its conditions
+        RawExpr::Func(..) if raw_value_param_free(raw) => {
+            with_ambient_sink(sink, || resolve_expr(raw, columns, descs))?
         }
         // a bare `?` (untyped), or a parameter in a shape this first
         // slice does not carry, refuses

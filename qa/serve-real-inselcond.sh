@@ -285,7 +285,7 @@ echo "--- 3 RECORDED BOUNDARIES (each fails loudly the day it moves)"
 dml_refused "3 INSERT .. SELECT ? - a bare item, typed from the target" "$I SELECT ?, 'z' FROM T RETURNING ID, TAG" '[10]'
 dml_refused "3 INSERT .. SELECT ID + ? - an operand"                 "$I SELECT ID + ?, 'z' FROM T RETURNING ID, TAG" '[10]'
 dml_refused "3 INSERT .. SELECT IIF(V = ?, ?, 'n') - a BRANCH ?, typed from TAG" "$I SELECT ID + 10, IIF(V = ?, ?, 'n') FROM T RETURNING ID, TAG" '["10.00","q"]'
-dml_refused "3 INSERT .. SELECT SUBSTRING(IIF(V = ?, ..)) - a node the walk does not open" "$I SELECT ID + 10, SUBSTRING(IIF(V = ?, 'yes', 'no') FROM 1 FOR 1) FROM T RETURNING ID, TAG" '["10.00"]'
+dml         "3 INSERT .. SELECT SUBSTRING(IIF(V = ?, ..)) - promoted with section 4's function arm" "$I SELECT ID + 10, SUBSTRING(IIF(V = ?, 'yes', 'no') FROM 1 FOR 1) FROM T RETURNING ID, TAG" '["10.00"]'
 # a PATTERN slot beside a WHERE `?` - promoted the day K1 learned the
 # pattern slot is neutral (`serve-real-condpattern.sh` section 8)
 dml         "3 INSERT .. SELECT IIF(V LIKE ?) .. WHERE ID > ? - a pattern slot mixes nothing" "$I SELECT ID + 10, IIF(V LIKE ?, 'y', 'n') FROM T WHERE ID > ? RETURNING ID, TAG" '["1%",1]'
@@ -293,7 +293,42 @@ dml         "3 INSERT .. SELECT IIF(V LIKE ?) .. WHERE ID > ? - a pattern slot m
 # INSERT and the plain SELECT alike
 dml_refused "3 INSERT .. SELECT IIF(ID > ?) .. WHERE ID > ? - K1"     "$I SELECT ID + 10, IIF(ID > ?, 'y', 'n') FROM T WHERE ID > ? RETURNING ID, TAG" '[1,1]'
 dml_refused "3 ...and the plain SELECT refuses that mix too"          "SELECT ID, IIF(ID > ?, 'y', 'n') FROM T WHERE ID > ?" '[1,1]'
-dml_refused "3 CHAR_LENGTH(IIF(ID > ?, ..)) - the function router"    "SELECT ID, CHAR_LENGTH(IIF(ID > ?, 'big', 's')) FROM T ORDER BY ID" '[1]'
+dml         "3 CHAR_LENGTH(IIF(ID > ?, ..)) - promoted with section 4's function arm"    "SELECT ID, CHAR_LENGTH(IIF(ID > ?, 'big', 's')) FROM T ORDER BY ID" '[1]'
+
+# ---------------------------------------------------------------
+echo "--- 4 a BUILT-IN FUNCTION over a conditional whose condition carries a ?"
+# The projection router had no function arm at all: CHAR_LENGTH / UPPER /
+# TRIM / SUBSTRING / ROUND / HASH .. over `IIF(ID > ?, ..)` refused, though
+# the conditional alone answered.  The literal resolver carries every
+# function's own law; it now runs with the router's `?` sink LENT to its
+# conditions (with_ambient_sink), so only the condition's `?` is new.
+X="IIF(ID > ?, 'big', 's')"
+for f in "CHAR_LENGTH($X)" "OCTET_LENGTH($X)" "UPPER($X)" "LOWER($X)" "TRIM($X)" "SUBSTRING($X FROM 1 FOR 2)" \
+         "POSITION('g' IN $X)" "REVERSE($X)" "LPAD($X, 5, '*')" "REPLACE($X, 's', 'S')" "LEFT($X, 2)" "HASH($X)" \
+         "ABS(IIF(ID > ?, -1, 2))" "ROUND(IIF(ID > ?, 1.25, 2.5), 1)" "UPPER(TRIM($X)) || '|'" \
+         "CHAR_LENGTH(CASE WHEN V LIKE ? THEN 'abcd' ELSE 'x' END)" "CHAR_LENGTH(COALESCE(IIF(ID > ?, NULL, 'ab'), 'zzzz'))" \
+         "EXTRACT(YEAR FROM IIF(ID > ?, DT, DATE '2000-01-01'))" "ROUND(IIF(ID > ?, N92, 0), 0)" \
+         "CAST(ABS(IIF(ID > ?, D34, -1)) AS VARCHAR(40))" "UPPER(IIF(IIF(ID > ?, 1, 0) = 1, 'big', 's'))"; do
+    case "$f" in *LIKE*) b='["1%"]';; *) b='[1]';; esac
+    both "4 $f" "SELECT ID, $f FROM T ORDER BY ID" "$b"
+done
+both "4 UPPER(IIF(DT CONTAINING ?, V, 'no'))" "SELECT ID, UPPER(IIF(DT CONTAINING ?, V, 'no')) FROM T ORDER BY ID" '["2020"]'
+both "4 CHAR_LENGTH(..) with a NULL bind - the ELSE" "SELECT ID, CHAR_LENGTH($X) FROM T ORDER BY ID" '[null]'
+both "4 WHERE CHAR_LENGTH(..) = 3"   "SELECT ID FROM T WHERE CHAR_LENGTH($X) = 3 ORDER BY ID" '[1]'
+both "4 WHERE UPPER(..) = 'BIG'"     "SELECT ID FROM T WHERE UPPER($X) = 'BIG' ORDER BY ID" '[1]'
+both "4 GROUP BY UPPER(..)"          "SELECT UPPER($X), COUNT(*) FROM T GROUP BY 1 ORDER BY 1" '[1]'
+both "4 ORDER BY REVERSE(..)"        "SELECT ID FROM T ORDER BY REVERSE($X), ID" '[1]'
+both "4 HAVING MAX(CHAR_LENGTH(..))" "SELECT V FROM T GROUP BY V HAVING MAX(CHAR_LENGTH(IIF(V > ?, V, 'x'))) > 4 ORDER BY V" '["10"]'
+both "4 SUM(CHAR_LENGTH(..))"        "SELECT SUM(CHAR_LENGTH($X)) FROM T" '[1]'
+both "4 UPPER(IIF(V LIKE ?)) .. WHERE ID > ? - a pattern slot beside a classic one" "SELECT ID, UPPER(IIF(V LIKE ?, 'y', 'n')) FROM T WHERE ID > ? ORDER BY ID" '["1%",1]'
+dml  "4 UPDATE SET TAG = UPPER(..)"  "UPDATE U SET TAG = UPPER($X) WHERE ID = 1 RETURNING TAG" '[2]'
+dml  "4 INSERT .. SELECT UPPER(..)"  "$I SELECT ID + 10, UPPER($X) FROM T RETURNING ID, TAG" '[1]'
+# RECORDED: other routers, a value-position `?`, and K1's numeric mix
+dml_refused "4 WHERE UPPER(..) LIKE 'B%' - the expression-pattern router"  "SELECT ID FROM T WHERE UPPER($X) LIKE 'B%' ORDER BY ID" '[1]'
+dml_refused "4 a scalar subquery's CHAR_LENGTH(IIF(T.ID > ?))"             "SELECT ID, (SELECT CHAR_LENGTH(IIF(T.ID > ?, 'big', 's')) FROM RDB\$DATABASE) FROM T ORDER BY ID" '[1]'
+dml_refused "4 UPPER(IIF(ID > ?, ?, 's')) - a BRANCH ?"                    "SELECT ID, UPPER(IIF(ID > ?, ?, 's')) FROM T ORDER BY ID" '[1,"q"]'
+dml_refused "4 LPAD(.., ?, '*') - a function ARGUMENT ?"                   "SELECT ID, LPAD($X, ?, '*') FROM T ORDER BY ID" '[1,5]'
+dml_refused "4 UPPER(IIF(ID > ?)) .. WHERE ID > ? - K1's numeric mix"      "SELECT ID, UPPER($X) FROM T WHERE ID > ? ORDER BY ID" '[1,1]'
 
 # ---------------------------------------------------------------
 echo "--- panic check"
@@ -305,6 +340,6 @@ elif ! kill -0 $srv 2>/dev/null; then
 else echo "OK   no panic and the server is still up"; fi
 
 echo "ran $ran checks"
-# the floor is the MEASURED count: 36 on the 2026-10-02 binary, 36 OK
-if [ "$ran" -lt 36 ]; then echo "FAIL only $ran checks ran (floor 36) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 73 on the 2026-10-02 binary, 73 OK
+if [ "$ran" -lt 73 ]; then echo "FAIL only $ran checks ran (floor 73) - cells went missing"; fail=1; fi
 exit $fail
