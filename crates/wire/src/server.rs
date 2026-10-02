@@ -87477,35 +87477,12 @@ fn resolve_raw_cond_sink_body(
         RawCond::StartingExpr(a, pat, negated) if bare_pattern_param(a, pat).is_some() => {
             let e = resolve_expr(a, columns, descs)?;
             let p = claim_pattern_rung(&e, pat, descs, sink)?;
-            if !matches!(e.type_of(descs), Some(ExprType::Text)) {
-                Cond2::StartingExpr(Box::new(e), Box::new(p), None, *negated)
-            } else {
-                // the per-row prefix's collation decision, as there
-                let (value, tt) = collate_operand_ttype(e, descs)?;
-                match fire_crab_ods::coll::icu_strength_of_ttype(tt) {
-                    Some(_) => Cond2::StartingExpr(
-                        Box::new(Expr::CollCanon(Box::new(value), tt, false)),
-                        Box::new(p),
-                        Some(tt),
-                        *negated,
-                    ),
-                    None if fire_crab_ods::intl::collation_id(tt as i16) != 0 => return None,
-                    None => Cond2::StartingExpr(Box::new(value), Box::new(p), None, *negated),
-                }
-            }
+            bound_starting_cond(e, p, *negated, descs)?
         }
-        // the operand is held UNWRAPPED here: the bind desugars it through
-        // [containing_term] exactly as the predicate world's
-        // `Term::ExprContainingParam` does, once the needle is known
         RawCond::ContainingExpr(a, pat, negated) if bare_pattern_param(a, pat).is_some() => {
             let e = resolve_expr(a, columns, descs)?;
             let p = claim_pattern_rung(&e, pat, descs, sink)?;
-            let (value, tt) = if matches!(e.type_of(descs), Some(ExprType::Text)) {
-                collate_operand_ttype(e, descs)?
-            } else {
-                (e, 0)
-            };
-            Cond2::ContainingExpr(Box::new(value), Box::new(p), tt, *negated)
+            bound_containing_cond(e, p, *negated, descs)?
         }
         RawCond::SimilarExpr(a, pat, esc, negated) if bare_pattern_param(a, pat).is_some() => {
             let e = resolve_expr(a, columns, descs)?;
@@ -87517,6 +87494,43 @@ fn resolve_raw_cond_sink_body(
         }
         other => resolve_raw_cond(other, columns, descs)?,
     })
+}
+
+/// `<operand> [NOT] STARTING WITH <bound prefix>` as a condition, the
+/// prefix being the text rung [subst_params_cond] collapses at bind. A
+/// TEXT operand's own collation decides the test, per row, exactly as the
+/// per-row-prefix form does ([RawCond::StartingExpr]'s arm): a
+/// canonicalising one wraps the value and canonicalises the prefix, a
+/// declared one with no canonical form refuses. Shared by a condition's
+/// sink arm and the predicate world's text-expression arm.
+fn bound_starting_cond(e: Expr, p: Expr, negated: bool, descs: &[Descriptor]) -> Option<Cond2> {
+    if !matches!(e.type_of(descs), Some(ExprType::Text)) {
+        return Some(Cond2::StartingExpr(Box::new(e), Box::new(p), None, negated));
+    }
+    let (value, tt) = collate_operand_ttype(e, descs)?;
+    match fire_crab_ods::coll::icu_strength_of_ttype(tt) {
+        Some(_) => Some(Cond2::StartingExpr(
+            Box::new(Expr::CollCanon(Box::new(value), tt, false)),
+            Box::new(p),
+            Some(tt),
+            negated,
+        )),
+        None if fire_crab_ods::intl::collation_id(tt as i16) != 0 => None,
+        None => Some(Cond2::StartingExpr(Box::new(value), Box::new(p), None, negated)),
+    }
+}
+
+/// `<operand> [NOT] CONTAINING <bound needle>` as a condition. The operand
+/// is held UNWRAPPED with its ttype: the bind desugars it through
+/// [containing_term] once the needle is known, exactly as the predicate
+/// world's `Term::ExprContainingParam` does.
+fn bound_containing_cond(e: Expr, p: Expr, negated: bool, descs: &[Descriptor]) -> Option<Cond2> {
+    let (value, tt) = if matches!(e.type_of(descs), Some(ExprType::Text)) {
+        collate_operand_ttype(e, descs)?
+    } else {
+        (e, 0)
+    };
+    Some(Cond2::ContainingExpr(Box::new(value), Box::new(p), tt, negated))
 }
 
 /// The slot of a pattern that is a BARE `?` over a `?`-free operand -
@@ -128094,8 +128108,20 @@ fn resolve_expr_term_body(
     // path - LIKE, STARTING WITH, CONTAINING, SIMILAR TO - matches
     // through the collation's own MATCHER, which no key expresses.
     let is_cmp = matches!(rt.kind, RawKind::Cmp(..) | RawKind::CmpExpr(..));
+    // ...except a TEXT operand's BOUND STARTING / CONTAINING, which goes
+    // to the condition world's builders ([bound_starting_cond],
+    // [bound_containing_cond]) - and THOSE carry the collation per row (a
+    // canonicalising one wraps the value and canonicalises the bound text,
+    // a declared one with no canonical form refuses there). Measured
+    // under UNICODE_CI / UNICODE_CI_AI / a collated CHAR, every cell the
+    // engine's (`serve-real-textprefix.sh`).
+    let bound_text_prefix = matches!(
+        rt.kind,
+        RawKind::Starting(Rhs::Param(..), _) | RawKind::Containing(Rhs::Param(..), _)
+    ) && matches!(lhs.type_of(descs), Some(ExprType::Text));
     if !explicit_ok
         && !is_cmp
+        && !bound_text_prefix
         && expr_reads(&lhs, &|fid| descs.get(fid).is_some_and(|d| !coll_keyable(d)))
     {
         return None;
@@ -128749,6 +128775,22 @@ fn resolve_expr_term_body(
         // descriptor, which is what the engine announces), and a text
         // EXPRESSION's slot width is unprobed.
         RawKind::Containing(Rhs::Param(slot, _, ..), negated) => {
+            // A TEXT EXPRESSION's bound CONTAINING: the condition world's
+            // builder ([bound_containing_cond]), whose collation handling is per row -
+            // measured 2026-10-02, `U || '' STARTING WITH ?` ['ap'] takes
+            // Apple and apricot under UNICODE_CI, `A || '' STARTING WITH ?`
+            // ['ec'] takes Eclair and eclat under UNICODE_CI_AI, the slot
+            // VARYING at the expression's width in its charset. A text
+            // COLUMN never arrives here ([col_kind] answers for it).
+            if matches!(lhs.type_of(descs), Some(ExprType::Text)) {
+                let desc = bound_pattern_desc(&lhs, descs)?;
+                if params.len() <= *slot {
+                    params.resize(*slot + 1, None);
+                }
+                params[*slot] = Some(desc);
+                let rung = cmp_param_rung(*slot, &desc)?;
+                return Some(Term::ExprCond(Box::new(bound_containing_cond(lhs, rung, *negated, descs)?)));
+            }
             // EVERY non-text family, and the needle is NOT CONVERTED -
             // which is where this arm's law is sharpest.  The same text,
             // written as a literal and bound as a parameter, gives
@@ -128878,6 +128920,22 @@ fn resolve_expr_term_body(
         // only at bind cannot be wrapped the same way.  Refusing there
         // keeps a law this arm has not measured from being invented.
         RawKind::Starting(Rhs::Param(slot, _, ..), negated) => {
+            // A TEXT EXPRESSION's bound STARTING: the condition world's
+            // builder ([bound_starting_cond]), whose collation handling is per row -
+            // measured 2026-10-02, `U || '' STARTING WITH ?` ['ap'] takes
+            // Apple and apricot under UNICODE_CI, `A || '' STARTING WITH ?`
+            // ['ec'] takes Eclair and eclat under UNICODE_CI_AI, the slot
+            // VARYING at the expression's width in its charset. A text
+            // COLUMN never arrives here ([col_kind] answers for it).
+            if matches!(lhs.type_of(descs), Some(ExprType::Text)) {
+                let desc = bound_pattern_desc(&lhs, descs)?;
+                if params.len() <= *slot {
+                    params.resize(*slot + 1, None);
+                }
+                params[*slot] = Some(desc);
+                let rung = cmp_param_rung(*slot, &desc)?;
+                return Some(Term::ExprCond(Box::new(bound_starting_cond(lhs, rung, *negated, descs)?)));
+            }
             if !matches!(
                 lhs.type_of(descs)?,
                 ExprType::Int
