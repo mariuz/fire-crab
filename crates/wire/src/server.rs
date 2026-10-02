@@ -35187,9 +35187,34 @@ fn plan_insert_select(
     // NON-nullable, unlike every other parameter in the statement).
     // Giving a projection target-column typing is a projection-planner
     // slice, not this one.
+    //
+    // A `?` INSIDE A CONDITION is a different law, and the engine keeps
+    // it: it is typed from the comparison's other side exactly as in a
+    // plain SELECT, never from the target (measured 2026-10-02, `INSERT
+    // INTO U (ID, TAG) SELECT ID + 10, IIF(V = ?, 'y', 'n') FROM T`
+    // describes V's `VARYING len 20`, `CASE WHEN DP > ?` a DOUBLE,
+    // `IIF(V LIKE ?, ..)` the pattern slot, and the select list's slots
+    // come BEFORE the WHERE's). So an item whose every `?` sits in a
+    // condition plans through the source's own sink; any value-position
+    // `?` - a bare item, an operand, a conditional's BRANCH (`IIF(V = ?,
+    // ?, 'n')` types its branch from TAG, `VARYING len 5`) - still
+    // refuses, and so does a `?` the walk cannot account for.
     let from_kw = find_word(masked, "FROM", sel).unwrap_or(masked.len());
-    if masked[sel..from_kw].contains('?') {
-        return None;
+    let marks = masked[sel..from_kw].matches('?').count();
+    if marks > 0 {
+        let Some(Proj::Items(items)) = split_query(s[sel..].trim()).and_then(|(p, ..)| parse_projection(p))
+        else {
+            return None;
+        };
+        let mut in_conditions = 0usize;
+        for it in &items {
+            if let SelItem::Expr(raw, ..) = it {
+                in_conditions += raw_params_only_in_conditions(raw)?;
+            }
+        }
+        if in_conditions != marks {
+            return None;
+        }
     }
     // The source is planned HERE. Its WHERE-clause `?`s are typed from
     // the compared COLUMN and land in the input SQLDA in textual order
@@ -89045,6 +89070,50 @@ fn raw_param_in_condition(e: &RawExpr) -> bool {
     }
 }
 
+/// No `?` of `e` sits at a VALUE position - every one (if any) is in a
+/// condition, so the tree resolves to the literal twin's shape.
+fn raw_value_param_free(e: &RawExpr) -> bool {
+    raw_params_only_in_conditions(e).is_some()
+}
+
+/// How many `?`s `e` carries, when EVERY one sits in a condition (an
+/// IIF or CASE condition, a boolean expression) - None when any `?` is at
+/// a value position: the item itself, an operand, a conditional's branch.
+/// A node this walk does not open counts nothing, so a caller comparing
+/// the total against the text's markers refuses a `?` hidden there.
+fn raw_params_only_in_conditions(e: &RawExpr) -> Option<usize> {
+    let cond = |c: &RawCond| {
+        let (mut c, mut n) = (c.clone(), 0usize);
+        renumber_cond_params(&mut c, &mut n);
+        n
+    };
+    Some(match e {
+        RawExpr::Param(_) => return None,
+        RawExpr::Neg(a) | RawExpr::Cast(a, _) => raw_params_only_in_conditions(a)?,
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
+            raw_params_only_in_conditions(a)? + raw_params_only_in_conditions(b)?
+        }
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) => {
+            v.iter().map(raw_params_only_in_conditions).sum::<Option<usize>>()?
+        }
+        RawExpr::Iif(c, a, b) => {
+            cond(c) + raw_params_only_in_conditions(a)? + raw_params_only_in_conditions(b)?
+        }
+        RawExpr::Case(branches, else_, _) => {
+            let mut n = 0;
+            for (c, t) in branches {
+                n += cond(c) + raw_params_only_in_conditions(t)?;
+            }
+            n + match else_.as_deref() {
+                Some(x) => raw_params_only_in_conditions(x)?,
+                None => 0,
+            }
+        }
+        RawExpr::Cond(c) => cond(c),
+        _ => 0,
+    })
+}
+
 /// Is any `?` in this expression an OPERAND OF ARITHMETIC rather than a
 /// whole side?  MERGE needs the difference: it desugars its ON predicate
 /// and its WHEN .. AND condition into TEXT, and an operand `?` is one the
@@ -89530,6 +89599,20 @@ fn resolve_dest_param_expr(
             if v.iter().any(coalesce_arg_raises) {
                 return None;
             }
+            // every `?` in a CONDITION: the literal twin's tree, and its
+            // passes ([conditional_finish]) - `SET TAG = COALESCE(IIF(ID >
+            // ?, NULL, 'ab'), 'zzzz') || '!'` stored `ab!` where the engine
+            // stores `ab  !`
+            if v.iter().all(raw_value_param_free) {
+                return Some(conditional_finish(true)(
+                    Expr::Coalesce(
+                        v.iter()
+                            .map(|a| resolve_dest_param_expr(a, &sd, columns, descs, sink))
+                            .collect::<Option<Vec<_>>>()?,
+                    ),
+                    descs,
+                ));
+            }
             // a bare `?` in a TEXT-reconciled COALESCE carries the length
             // check the engine makes when the node is evaluated
             // ([CS_TEXT_FIT], round 8, Q4) - a check only, never a
@@ -89678,6 +89761,43 @@ fn resolve_dest_param_expr(
         // no role there (measured: `UPDATE T SET N = IIF(ID = ?, 99, N)`
         // describes ID's own LONG, not N's); only the VALUE arms below
         // carry the destination down
+        //
+        // A conditional whose `?`s are all in its CONDITIONS takes the
+        // literal twin's passes ([conditional_finish]) - `SET TAG = CASE
+        // WHEN ID > ? THEN 'big' ELSE 's' END` stored `s` where the engine
+        // stores the CHAR(3)-padded `s  `; a value-arm `?` keeps the plain
+        // tree, as before
+        RawExpr::Iif(c, a, b) if raw_value_param_free(a) && raw_value_param_free(b) => conditional_finish(true)(
+            Expr::Iif(
+                Box::new(resolve_raw_cond_sink(c, columns, descs, sink)?),
+                Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?),
+                Box::new(resolve_dest_param_expr(b, dest, columns, descs, sink)?),
+            ),
+            descs,
+        ),
+        RawExpr::Case(branches, else_, simple)
+            if branches.iter().all(|(_, t)| raw_value_param_free(t))
+                && else_.as_deref().is_none_or(raw_value_param_free) =>
+        {
+            conditional_finish(true)(
+                simple_case_nullable(*simple, Expr::Case(
+                    branches
+                        .iter()
+                        .map(|(c, t)| {
+                            Some((
+                                resolve_raw_cond_sink(c, columns, descs, sink)?,
+                                resolve_dest_param_expr(t, dest, columns, descs, sink)?,
+                            ))
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                    match else_ {
+                        Some(e) => Some(Box::new(resolve_dest_param_expr(e, dest, columns, descs, sink)?)),
+                        None => None,
+                    },
+                )),
+                descs,
+            )
+        }
         RawExpr::Iif(c, a, b) => Expr::Iif(
             Box::new(resolve_raw_cond_sink(c, columns, descs, sink)?),
             Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?),
@@ -91803,6 +91923,32 @@ fn resolve_proj_expr(
     resolve_proj_expr_body(raw, columns, descs, sink)
 }
 
+/// The post-resolution passes a CASE / IIF / COALESCE whose `?`s are ALL IN ITS
+/// CONDITIONS takes: with param-free branches the tree is the literal
+/// twin's, so it gets the literal twin's whole chain ([resolve_expr_body]
+/// - align, recode, PAD, recode the string functions, float, decfloat).
+/// This router had applied only [float_conditional], and a CHAR-formed
+/// conditional lost its pad the moment its condition carried a `?`:
+/// `CASE WHEN DP > ? THEN 'big' ELSE 's' END || '|'` answered `s|` where
+/// the engine answers `s  |`, and `UPDATE .. SET TAG = <that CASE>` and an
+/// `INSERT .. SELECT` of it STORED `s` where the engine stores `s  `
+/// (measured 2026-10-02; the literal twins agree, the previous binary
+/// diverged the same). A branch carrying a `?` is typed into the
+/// reconciled sibling slot and keeps the float pass alone, as before.
+fn conditional_finish(branches_param_free: bool) -> impl Fn(Expr, &[Descriptor]) -> Expr {
+    move |e, descs| {
+        if !branches_param_free {
+            return float_conditional(e, descs);
+        }
+        let e = align_conditional(e, descs);
+        let e = recode_conditional(recode_concat(e, descs), descs);
+        let e = pad_conditional(e, descs);
+        let e = recode_strfn(e, descs);
+        let e = float_conditional(e, descs);
+        decfloat_conditional(e, descs)
+    }
+}
+
 fn resolve_proj_expr_body(
     raw: &RawExpr,
     columns: &[RelationColumn],
@@ -91937,7 +92083,8 @@ fn resolve_proj_expr_body(
                 return None;
             }
             let sd = coalesce_sibling_desc(&v.iter().collect::<Vec<_>>(), columns, descs)?;
-            float_conditional(
+            let finish = conditional_finish(v.iter().all(raw_value_param_free));
+            finish(
                 Expr::Coalesce(
                     v.iter()
                         .map(|a| resolve_dest_param_expr(a, &sd, columns, descs, sink))
@@ -91977,7 +92124,8 @@ fn resolve_proj_expr_body(
                 .chain(else_.iter().map(|b| &**b))
                 .collect();
             let sd = coalesce_sibling_desc(&sibs, columns, descs)?;
-            float_conditional(
+            let finish = conditional_finish(sibs.iter().all(|t| raw_value_param_free(t)));
+            finish(
                 simple_case_nullable(*simple, Expr::Case(
                     branches
                         .iter()
@@ -92000,7 +92148,8 @@ fn resolve_proj_expr_body(
         }
         RawExpr::Iif(c, a, b) => {
             let sd = coalesce_sibling_desc(&[&**a, &**b], columns, descs)?;
-            float_conditional(
+            let finish = conditional_finish(raw_value_param_free(a) && raw_value_param_free(b));
+            finish(
                 Expr::Iif(
                     Box::new(resolve_raw_cond_sink(c, columns, descs, sink)?),
                     Box::new(resolve_dest_param_expr(a, &sd, columns, descs, sink)?),
@@ -118059,7 +118208,16 @@ fn insert_select(
     let rows = {
         let db = database.as_ref().ok_or("no database attached")?;
         // `args` reaches the source now: a WHERE-clause `?` binds here
-        // exactly as it does in a bare SELECT
+        // exactly as it does in a bare SELECT - and a SELECT-LIST one (a
+        // condition's, [plan_insert_select]) is bound into the projection
+        // first, as the execute path does for a top-level SELECT only
+        let bound;
+        let src = if plan_has_proj_param(src) {
+            bound = bind_plan_params(src, args).ok_or("parameter type does not match its column")?;
+            &bound
+        } else {
+            src
+        };
         branch_rows(src, db, args)
             .ok_or("the SELECT feeding this INSERT is not one this server can run")?
     };

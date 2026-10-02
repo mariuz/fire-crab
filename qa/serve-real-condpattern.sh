@@ -351,18 +351,21 @@ eng_only "7 a scalar subquery's IIF over an outer column"            "SELECT ID,
 eng_only "7 a GROUP BY projection's IIF(V LIKE ?)"                   "SELECT ID, IIF(V LIKE ?,1,0) FROM T GROUP BY ID, V ORDER BY ID" '["1%"]'
 eng_only "7 EXISTS(.. WHERE T2.N382 LIKE ?) - a subquery's predicate over a non-text operand" "$W EXISTS(SELECT 1 FROM T T2 WHERE T2.N382 LIKE ?) ORDER BY ID" '["1%"]'
 eng_only "7 V LIKE ? ESCAPE ? - a bound escape"                      "$W V LIKE ? ESCAPE ? ORDER BY ID" '["1%","!"]'
-# INSERT .. SELECT types NO `?` in a select-list condition at all - not
-# even `IIF(V = ?, ..)` - a whole router without a sink, broader than
-# patterns (the WHERE of the same INSERT .. SELECT answers, §6)
+# INSERT .. SELECT typed NO `?` in a select-list condition at all - not
+# even `IIF(V = ?, ..)`; recorded here, these two cells SELF-EXPIRED the
+# same day when `serve-real-inselcond.sh` landed, and were promoted: the
+# rows AND the describe must now match
 for cell in \
   "7 INSERT .. SELECT IIF(V = ?) - the comparison too|INSERT INTO U (ID, TAG) SELECT ID + 10, IIF(V = ?, 'y', 'n') FROM T RETURNING ID, TAG|[\"10.00\"]" \
   "7 INSERT .. SELECT IIF(V STARTING WITH ?)|INSERT INTO U (ID, TAG) SELECT ID + 10, IIF(V STARTING WITH ?, 'y', 'n') FROM T RETURNING ID, TAG|[\"10\"]"; do
     IFS='|' read -r lab sql js <<<"$cell"
     ran=$((ran + 1))
     ev=$(qmsg "$REAL" "$ENG" "$sql" "$js"); fv=$(qmsg "$PORT" "$FC" "$sql" "$js")
+    ed=$(dsc "127.0.0.1/$REAL:$ENG" "$sql"); fd=$(dsc "127.0.0.1/$PORT:$FC" "$sql")
     if [ "${ev#rows }" = "$ev" ]; then echo "FAIL $lab - the ENGINE no longer writes [$ev]"; fail=1
-    elif [ "$fv" != "ERR Dynamic SQL Error" ]; then echo "FAIL $lab - this server moved [$fv] (engine [$ev]); promote the cell if they agree"; fail=1
-    else echo "OK   $lab (engine [$ev], this server refuses - recorded)"; fi
+    elif [ "$ev" != "$fv" ]; then echo "FAIL $lab (value)"; echo "     eng=[$ev] fc=[$fv]"; fail=1
+    elif [ -z "$ed" ] || [ "$ed" != "$fd" ]; then echo "FAIL $lab (DESCRIBE)"; echo "     eng=[$ed]"; echo "     fc =[$fd]"; fail=1
+    else echo "OK   $lab [$ev]"; fi
 done
 
 # ---------------------------------------------------------------
