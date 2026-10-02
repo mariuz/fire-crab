@@ -394,6 +394,51 @@ eng_only "8 CONTROL IIF(ID > ?) .. WHERE ID > ? - numeric new + classic" "SELECT
 eng_only "8 CONTROL + a pattern slot - still mixed"  "SELECT ID, IIF(ID > ? AND V LIKE ?, 'y', 'n') FROM T WHERE ID > ? ORDER BY ID" '[1,"1%",1]'
 
 # ---------------------------------------------------------------
+echo "--- 9 a PATTERN PREDICATE whose OPERAND carries a condition ?"
+# `IIF(ID > ?, 'big', 's') LIKE 'b%'` PREPARED (the describe agreed) and
+# then failed at EXECUTE: Predicate::bind rebuilt the pattern terms around
+# a CLONE of the operand, which kept its raw `?`.  subst_pattern_operand
+# substitutes it, for every pattern term shape.
+X="IIF(ID > ?, 'big', 's')"
+for p in "$X LIKE 'b%'" "UPPER($X) LIKE 'B%'" "$X STARTING WITH 'b'" "$X CONTAINING 'I'" "$X SIMILAR TO 'b%'" \
+         "$X NOT LIKE 's%'" "$X LIKE 'b%' ESCAPE '!'" "IIF(ID > ?, V, 'x') LIKE '1%'" "NOT ($X LIKE 'b%')" \
+         "$X LIKE 'b%' OR ID = 1" "$X LIKE 's  '" "$X LIKE 's'" "$X LIKE '%s '" "$X LIKE 'b!%' ESCAPE '!'"; do
+    both "9 WHERE $p" "$W $p ORDER BY ID" '[1]'
+done
+both "9 WHERE .. LIKE ? - a bound pattern too"   "$W $X LIKE ? ORDER BY ID" '[1,"b%"]'
+both "9 WHERE .. LIKE 'b%' [NULL] - the ELSE"     "$W $X LIKE 'b%' ORDER BY ID" '[null]'
+both "9 IIF(DT CONTAINING ?, V, 'x') LIKE '1%'"   "$W IIF(DT CONTAINING ?, V, 'x') LIKE '1%' ORDER BY ID" '["2020"]'
+both "9 UPPER(IIF(V LIKE ?, V, 'none')) STARTING WITH 'N'" "$W UPPER(IIF(V LIKE ?, V, 'none')) STARTING WITH 'N' ORDER BY ID" '["1.%"]'
+both_is "9 a FALSE conjunct first silences a malformed SIMILAR" "$W ID < 0 AND IIF(ID > 1, 'big', 's') SIMILAR TO '(' ORDER BY ID" "(none)"
+err_msg "9 .. SIMILAR TO '(' over rows raises"    "$W $X SIMILAR TO '(' ORDER BY ID" '[1]'
+both "9 HAVING IIF(MAX(ID) > ?, ..) LIKE 'b%'"    "SELECT V FROM T GROUP BY V HAVING IIF(MAX(ID) > ?, 'big', 's') LIKE 'b%' ORDER BY V" '[1]'
+for cell in \
+  "9 UPDATE .. WHERE <it> LIKE 'b%'|UPDATE U SET TAG = 'u' WHERE IIF(ID > ?, 'big', 's') LIKE 'b%' RETURNING ID|[1]" \
+  "9 DELETE .. WHERE <it> STARTING WITH 's'|DELETE FROM U WHERE IIF(ID > ?, 'big', 's') STARTING WITH 's' RETURNING ID|[1]"; do
+    IFS='|' read -r lab sql js <<<"$cell"
+    ran=$((ran + 1))
+    ev=$(qmsg "$REAL" "$ENG" "$sql" "$js"); fv=$(qmsg "$PORT" "$FC" "$sql" "$js")
+    if [ "${ev#rows }" = "$ev" ]; then echo "FAIL $lab - the ENGINE did not write [$ev]"; fail=1
+    elif [ "$ev" != "$fv" ]; then echo "FAIL $lab"; echo "     eng=[$ev] fc=[$fv]"; fail=1
+    else echo "OK   $lab [$ev]"; fi
+done
+# RECORDED: a TEXT-expression operand's bound STARTING / CONTAINING (the
+# predicate world's arms refuse a text expression - its collation), a
+# TEMPORAL conditional under a literal pattern (the engine's prepare-time
+# 22018, this server's refusal) and K1's numeric mix
+eng_only "9 <text expr> STARTING WITH ? - the text-expression arm" "$W $X STARTING WITH ? ORDER BY ID" '[1,"s"]'
+eng_only "9 <text expr> CONTAINING ?"                               "$W $X CONTAINING ? ORDER BY ID" '[1,"IG"]'
+eng_only "9 .. LIKE 'b%' AND ID > ? - K1's numeric mix"              "$W $X LIKE 'b%' AND ID > ? ORDER BY ID" '[1,2]'
+# (a LITERAL condition: isql cannot bind, and this server already raises
+# the engine's prepare-time 22018 there - the BOUND twin is the refusal)
+err_same "9 IIF(ID > 1, DT, ..) LIKE '2%' - a temporal conditional's literal pattern converts" "$W IIF(ID > 1, DT, DATE '2000-01-01') LIKE '2%'"
+eng_err_refused() { ran=$((ran + 1)); local ev fv; ev=$(qmsg "$REAL" "$ENG" "$2" "$3"); fv=$(qmsg "$PORT" "$FC" "$2" "$3")
+  if [ "${ev#*$4}" = "$ev" ]; then echo "FAIL $1 - the ENGINE moved [$ev]"; fail=1
+  elif [ "$fv" != "ERR Dynamic SQL Error" ]; then echo "FAIL $1 - this server moved [$fv]; promote if it matches [$ev]"; fail=1
+  else echo "OK   $1 (engine [$ev], this server refuses - recorded)"; fi; }
+eng_err_refused "9 IIF(ID > ?, DT, ..) LIKE '2%' - the BOUND condition refuses" "$W IIF(ID > ?, DT, DATE '2000-01-01') LIKE '2%'" '[1]' 'Conversion error from string "2%"'
+
+# ---------------------------------------------------------------
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-condpattern-$PORT.log"; then
@@ -403,7 +448,7 @@ elif ! kill -0 $srv 2>/dev/null; then
 else echo "OK   no panic and the server is still up"; fi
 
 echo "ran $ran checks"
-# the floor is the MEASURED count: 194 on the 2026-10-02 binary (181 +
-# section 8's 13), 194 OK
-if [ "$ran" -lt 194 ]; then echo "FAIL only $ran checks ran (floor 194) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 222 on the 2026-10-02 binary (181 +
+# section 8's 13 + section 9's 28), 222 OK
+if [ "$ran" -lt 222 ]; then echo "FAIL only $ran checks ran (floor 222) - cells went missing"; fail=1; fi
 exit $fail

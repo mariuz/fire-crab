@@ -324,7 +324,7 @@ both "4 UPPER(IIF(V LIKE ?)) .. WHERE ID > ? - a pattern slot beside a classic o
 dml  "4 UPDATE SET TAG = UPPER(..)"  "UPDATE U SET TAG = UPPER($X) WHERE ID = 1 RETURNING TAG" '[2]'
 dml  "4 INSERT .. SELECT UPPER(..)"  "$I SELECT ID + 10, UPPER($X) FROM T RETURNING ID, TAG" '[1]'
 # RECORDED: other routers, a value-position `?`, and K1's numeric mix
-dml_refused "4 WHERE UPPER(..) LIKE 'B%' - the expression-pattern router"  "SELECT ID FROM T WHERE UPPER($X) LIKE 'B%' ORDER BY ID" '[1]'
+both        "4 WHERE UPPER(..) LIKE 'B%' - promoted with condpattern section 9's bind fix"  "SELECT ID FROM T WHERE UPPER($X) LIKE 'B%' ORDER BY ID" '[1]'
 dml_refused "4 a scalar subquery's CHAR_LENGTH(IIF(T.ID > ?))"             "SELECT ID, (SELECT CHAR_LENGTH(IIF(T.ID > ?, 'big', 's')) FROM RDB\$DATABASE) FROM T ORDER BY ID" '[1]'
 dml_refused "4 UPPER(IIF(ID > ?, ?, 's')) - a BRANCH ?"                    "SELECT ID, UPPER(IIF(ID > ?, ?, 's')) FROM T ORDER BY ID" '[1,"q"]'
 dml_refused "4 LPAD(.., ?, '*') - a function ARGUMENT ?"                   "SELECT ID, LPAD($X, ?, '*') FROM T ORDER BY ID" '[1,5]'

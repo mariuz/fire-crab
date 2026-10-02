@@ -12830,7 +12830,7 @@ impl Predicate {
         for g in &self.groups {
             let mut terms = Vec::new();
             for t in g {
-                terms.push(match t {
+                terms.push(subst_pattern_operand(match t {
                     // A NUMERIC wire value against a TEXT column: the
                     // engine coerces the COLUMN per row
                     // ([Term::TextNumCmp]; probed: `S = ?` bound 5
@@ -13334,7 +13334,7 @@ impl Predicate {
                         ))
                     }
                     other => other.clone(),
-                });
+                }, args)?);
             }
             groups.push(terms);
         }
@@ -13737,6 +13737,35 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
 
 fn cond_has_col(c: &Cond2) -> bool {
     cond_reads(c, &|_| true)
+}
+
+/// A PATTERN TERM'S OPERAND carrying a `?` - `IIF(ID > ?, 'big', 's')
+/// LIKE 'b%'`, `UPPER(IIF(..)) STARTING WITH 'B'`, or the same under a
+/// bound pattern - substituted at bind like every other term's `?`.
+/// [Predicate::bind]'s pattern arms rebuild these terms around a CLONE of
+/// the operand and its fallthrough clones the rest, so the operand kept
+/// its raw `Expr::Param` and the first row reaching it failed with a
+/// Dynamic SQL Error after a clean prepare (the describe agreed - only the
+/// execute did not). Measured 2026-10-02: LIKE / NOT LIKE / STARTING /
+/// CONTAINING / SIMILAR TO / LIKE .. ESCAPE over such an operand, under
+/// NOT and beside an OR, every one 2;3 or the engine's own answer.
+fn subst_pattern_operand(t: Term, args: &[WireParam]) -> Result<Term, ExecErr> {
+    let sub = |e: Box<Expr>| -> Result<Box<Expr>, ExecErr> {
+        if expr_has_param(&e) {
+            Ok(Box::new(subst_params_expr(&e, args).ok_or("parameter type does not match its column")?))
+        } else {
+            Ok(e)
+        }
+    };
+    Ok(match t {
+        Term::ExprLike(e, p, esc, n) => Term::ExprLike(sub(e)?, p, esc, n),
+        Term::ExprStarting(e, p, n) => Term::ExprStarting(sub(e)?, p, n),
+        Term::ExprSimilar(e, re, n) => Term::ExprSimilar(sub(e)?, re, n),
+        Term::BadSimilar(e, err) => Term::BadSimilar(sub(e)?, err),
+        Term::MalformedLike(e) => Term::MalformedLike(sub(e)?),
+        Term::BadExprLike(e, p) => Term::BadExprLike(sub(e)?, p),
+        other => other,
+    })
 }
 
 /// Does this condition carry a `?` placeholder - the shape
@@ -130157,9 +130186,12 @@ const NUM_LIKE_PATTERN_LEN: u16 = 32;
 /// Its CHARSET is the side's, through the same sentinel the comparison
 /// arm uses (`? LIKE 'a%'` is announced in the attachment's set,
 /// measured); the non-text 30 is 30 CHARACTERS in the attachment's set
-/// ([num_pat_desc]'s law). Nullable exactly when the operand reads a
-/// column: `IIF('abc' LIKE ?, ..)` and `IIF(1 LIKE ?, ..)` announce NOT
-/// NULL slots of 3 and 30.
+/// ([num_pat_desc]'s law). Nullable exactly when the operand's VALUE can
+/// be NULL ([expr_nullable], every column taken as nullable): `IIF('abc'
+/// LIKE ?, ..)` and `IIF(1 LIKE ?, ..)` announce NOT NULL slots of 3 and
+/// 30, and so does `IIF(ID > ?, 'big', 's') LIKE ?` - a column read only
+/// by a CONDITION does not make the value nullable (measured 2026-10-02;
+/// "reads a column" announced it Nullable).
 fn bound_pattern_desc(lhs: &Expr, descs: &[Descriptor]) -> Option<Descriptor> {
     let ty = lhs.type_of(descs);
     let length = match ty {
@@ -130182,7 +130214,7 @@ fn bound_pattern_desc(lhs: &Expr, descs: &[Descriptor]) -> Option<Descriptor> {
         } else {
             ATT_SUBTYPE as i16
         },
-        flags: PARAM_PATTERN | if expr_has_col(lhs) { 0 } else { PARAM_NOT_NULL },
+        flags: PARAM_PATTERN | if expr_nullable(lhs, &|_| false) { 0 } else { PARAM_NOT_NULL },
         offset: 4,
     })
 }
