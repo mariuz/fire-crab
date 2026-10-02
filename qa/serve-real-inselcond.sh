@@ -325,7 +325,7 @@ dml  "4 UPDATE SET TAG = UPPER(..)"  "UPDATE U SET TAG = UPPER($X) WHERE ID = 1 
 dml  "4 INSERT .. SELECT UPPER(..)"  "$I SELECT ID + 10, UPPER($X) FROM T RETURNING ID, TAG" '[1]'
 # RECORDED: other routers, a value-position `?`, and K1's numeric mix
 both        "4 WHERE UPPER(..) LIKE 'B%' - promoted with condpattern section 9's bind fix"  "SELECT ID FROM T WHERE UPPER($X) LIKE 'B%' ORDER BY ID" '[1]'
-dml_refused "4 a scalar subquery's CHAR_LENGTH(IIF(T.ID > ?))"             "SELECT ID, (SELECT CHAR_LENGTH(IIF(T.ID > ?, 'big', 's')) FROM RDB\$DATABASE) FROM T ORDER BY ID" '[1]'
+both        "4 a scalar subquery's CHAR_LENGTH(IIF(T.ID > ?)) - promoted with section 6"             "SELECT ID, (SELECT CHAR_LENGTH(IIF(T.ID > ?, 'big', 's')) FROM RDB\$DATABASE) FROM T ORDER BY ID" '[1]'
 dml_refused "4 UPPER(IIF(ID > ?, ?, 's')) - a BRANCH ?"                    "SELECT ID, UPPER(IIF(ID > ?, ?, 's')) FROM T ORDER BY ID" '[1,"q"]'
 dml_refused "4 LPAD(.., ?, '*') - a function ARGUMENT ?"                   "SELECT ID, LPAD($X, ?, '*') FROM T ORDER BY ID" '[1,5]'
 dml_refused "4 UPPER(IIF(ID > ?)) .. WHERE ID > ? - K1's numeric mix"      "SELECT ID, UPPER($X) FROM T WHERE ID > ? ORDER BY ID" '[1,1]'
@@ -363,6 +363,36 @@ dml_refused "5 IIF(ID > ?) .. WHERE V LIKE ? - K1: a classic text pattern beside
 dml_refused "5 IIF(ID > ?, ?, 'n') .. GROUP BY ID - a BRANCH ?" "SELECT ID, IIF(ID > ?, ?, 'n') $G ID ORDER BY ID" '[1,"q"]'
 
 # ---------------------------------------------------------------
+echo "--- 6 a SELECT-LIST subquery carrying the statement's ?s"
+# Every select-list subquery with a `?` refused: the projection router
+# registered its subqueries with no statement slot to number from.  When
+# the subquery's text holds EVERY `?` of the body, its first slot is the
+# body's own first and nothing else moves - so it now numbers from there,
+# and its slots are published past the projection's re-plan.  A `?`
+# outside it as well is a numbering slice of its own (recorded).
+R="FROM RDB\$DATABASE"
+both "6 (SELECT COUNT(*) .. WHERE T2.ID > ?)"          "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) FROM T ORDER BY ID" '[1]'
+both "6 .. two slots in the body"                     "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ? AND T2.V LIKE ?) FROM T ORDER BY ID" '[1,"1%"]'
+both "6 .. correlated, T2.ID > T.ID AND T2.ID < ?"    "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > T.ID AND T2.ID < ?) FROM T ORDER BY ID" '[3]'
+both "6 (SELECT MAX(T2.V) .. LIKE ?)"                 "SELECT ID, (SELECT MAX(T2.V) FROM T T2 WHERE T2.V LIKE ?) FROM T ORDER BY ID" '["1%"]'
+both "6 (SELECT IIF(T.V LIKE ?, 1, 0) $R)"            "SELECT ID, (SELECT IIF(T.V LIKE ?, 1, 0) $R) FROM T ORDER BY ID" '["1%"]'
+both "6 (SELECT IIF(T.ID > ?, 1, 0) $R)"              "SELECT ID, (SELECT IIF(T.ID > ?, 1, 0) $R) FROM T ORDER BY ID" '[1]'
+both "6 (SELECT CHAR_LENGTH(IIF(T.ID > ?, ..)) $R) - the pad counts" "SELECT ID, (SELECT CHAR_LENGTH(IIF(T.ID > ?, 'big', 's')) $R) FROM T ORDER BY ID" '[1]'
+both "6 .. T2.N382 LIKE ? - the non-text spelling"    "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.N382 LIKE ?) FROM T ORDER BY ID" '["1%"]'
+both "6 (SELECT FIRST 1 T2.V .. T2.ID = ?)"           "SELECT ID, (SELECT FIRST 1 T2.V FROM T T2 WHERE T2.ID = ?) FROM T ORDER BY ID" '[2]'
+both "6 .. [NULL]"                                    "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) FROM T ORDER BY ID" '[null]'
+both "6 .. T2.V = ? - a text slot"                    "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.V = ?) FROM T ORDER BY ID" '["10.00"]'
+both "6 .. T2.DP > ? - a DOUBLE slot"                 "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.DP > ?) FROM T ORDER BY ID" '[1.5]'
+both "6 EXISTS(SELECT 1 .. T2.ID > ?) as an item"     "SELECT ID, EXISTS(SELECT 1 FROM T T2 WHERE T2.ID > ?) FROM T ORDER BY ID" '[2]'
+both "6 (SELECT ..) + 1 - inside arithmetic"          "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) + 1 FROM T ORDER BY ID" '[1]'
+both "6 .. $R"                                         "SELECT (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) $R" '[0]'
+both "6 .. beside a ?-free WHERE"                      "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) FROM T WHERE ID > 1 ORDER BY ID" '[1]'
+# RECORDED: a `?` outside the subquery too - the projection's own numbering
+dml_refused "6 .. and a WHERE ?"            "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) FROM T WHERE ID > ? ORDER BY ID" '[1,1]'
+dml_refused "6 .. and a projection ?"       "SELECT ID, IIF(ID > ?, 1, 0), (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) FROM T ORDER BY ID" '[1,1]'
+dml_refused "6 .. two subqueries with a ? each" "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?), (SELECT COUNT(*) FROM T T3 WHERE T3.ID < ?) FROM T ORDER BY ID" '[1,3]'
+
+# ---------------------------------------------------------------
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-inselcond-$PORT.log"; then
@@ -372,6 +402,6 @@ elif ! kill -0 $srv 2>/dev/null; then
 else echo "OK   no panic and the server is still up"; fi
 
 echo "ran $ran checks"
-# the floor is the MEASURED count: 101 on the 2026-10-02 binary, 101 OK
-if [ "$ran" -lt 101 ]; then echo "FAIL only $ran checks ran (floor 101) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 120 on the 2026-10-02 binary, 120 OK
+if [ "$ran" -lt 120 ]; then echo "FAIL only $ran checks ran (floor 120) - cells went missing"; fail=1; fi
 exit $fail

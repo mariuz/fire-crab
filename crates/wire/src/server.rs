@@ -64240,14 +64240,14 @@ fn plan_query_inner_at_body(
                                 };
                                 let Some(id) = corr_register(
                                     sub, scan, CorrKindRaw::Exists { negated }, scope.as_ref()?, db,
-                                    // this path numbers no statement slot
-                                    None,
+                                    proj_subquery_param_base(sql, sub, base),
                                 ) else {
                                     if trace {
                                         eprintln!("[srv] plan: EXISTS subquery {:?} not answerable", sub);
                                     }
                                     return Some(Plan::Refused);
                                 };
+                                publish_corr_params(params);
                                 format!("FC$CORR({})", id)
                             }
                         };
@@ -64316,12 +64316,16 @@ fn plan_query_inner_at_body(
                             }
                             return Some(Plan::Refused);
                         };
-                        let Some(id) = corr_register(sub, scan, CorrKindRaw::Scalar, scope.as_ref()?, db, None) else {
+                        let Some(id) = corr_register(
+                            sub, scan, CorrKindRaw::Scalar, scope.as_ref()?, db,
+                            proj_subquery_param_base(sql, sub, base),
+                        ) else {
                             if trace {
                                 eprintln!("[srv] plan: select-list subquery {:?} not answerable", sub);
                             }
                             return Some(Plan::Refused);
                         };
+                        publish_corr_params(params);
                         // the name is NO ALIAS here either (the law at
                         // the fold below): spliced as `FC$CORR(<id>) AS
                         // <name>` it made `.. GROUP BY T.ID` over an
@@ -64492,6 +64496,11 @@ fn plan_query_inner_at_body(
                 // folded text: the FROM item has moved, so a positional
                 // refusal from it is downgraded ([downgrade_rewritten])
                 let mut plan = downgrade_rewritten(plan_query_inner(&out, db, params)?);
+                // the folded text carries `FC$CORR(<id>)` where a select-list
+                // subquery stood, and that subquery's own `?`s are slots the
+                // re-plan cannot see: published again past the clear
+                // ([proj_subquery_param_base])
+                publish_corr_params(params);
                 // ANY SELECT ITEM CARRYING A SUBQUERY IS NULLABLE, even
                 // when the fold leaves behind something that plainly is
                 // not: `(SELECT <col> FROM T WHERE ...) + 1` folds to
@@ -107486,6 +107495,32 @@ fn text_param_under_operator(text: &str) -> bool {
         }
         b.get(r).is_some_and(|&c| is_op(c))
     })
+}
+
+/// The statement slot a SELECT-LIST subquery's first `?` claims - only
+/// when that subquery's text holds EVERY `?` of the body (`base` is the
+/// body's own first slot), so no other numbering moves: the projection
+/// around it and the WHERE after it carry none. Any other shape keeps the
+/// old refusal (None): interleaving a subquery's slots with the
+/// projection's own renumbering is a slice of its own. Measured
+/// 2026-10-02: `SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?)
+/// FROM T` answers 2 on every row on the engine and refused here, as did
+/// every select-list subquery carrying a `?`.
+fn proj_subquery_param_base(body: &str, sub: &str, base: usize) -> Option<usize> {
+    let all = mask_literals(body).matches('?').count();
+    let mine = mask_literals(sub).matches('?').count();
+    (mine > 0 && mine == all).then_some(base)
+}
+
+/// Publish the slots registered subqueries claimed into the statement's
+/// parameter list, as the WHERE path does after [resolve_subqueries].
+fn publish_corr_params(params: &mut Vec<Option<Descriptor>>) {
+    for (slot, d) in corr_claimed_params() {
+        if params.len() <= slot {
+            params.resize(slot + 1, None);
+        }
+        params[slot] = Some(d);
+    }
 }
 
 /// Register a scanned subquery under a fresh id.

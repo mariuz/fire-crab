@@ -347,7 +347,7 @@ done
 echo "--- 7 RECORDED BOUNDARIES - other routers, other shapes (each fails loudly the day it moves)"
 eng_only "7 IIF(? LIKE ?) - a bound TESTED side"                     "$W IIF(? LIKE ?,1,0)=1 ORDER BY ID" '["ab","a%"]'
 eng_only "7 IIF(V LIKE ? || '%') - a ? inside a pattern EXPRESSION"  "$W IIF(V LIKE ? || '%',1,0)=1 ORDER BY ID" '["1"]'
-eng_only "7 a scalar subquery's IIF over an outer column"            "SELECT ID, (SELECT IIF(T.V LIKE ?,1,0) FROM RDB\$DATABASE) FROM T ORDER BY ID" '["1%"]'
+both     "7 a scalar subquery's IIF over an outer column - promoted with inselcond section 6"            "SELECT ID, (SELECT IIF(T.V LIKE ?,1,0) FROM RDB\$DATABASE) FROM T ORDER BY ID" '["1%"]'
 both     "7 a GROUP BY projection's IIF(V LIKE ?) - promoted with inselcond section 5"                   "SELECT ID, IIF(V LIKE ?,1,0) FROM T GROUP BY ID, V ORDER BY ID" '["1%"]'
 both     "7 EXISTS(.. WHERE T2.N382 LIKE ?) - promoted with section 10" "$W EXISTS(SELECT 1 FROM T T2 WHERE T2.N382 LIKE ?) ORDER BY ID" '["1%"]'
 eng_only "7 V LIKE ? ESCAPE ? - a bound escape"                      "$W V LIKE ? ESCAPE ? ORDER BY ID" '["1%","!"]'
@@ -467,7 +467,7 @@ eng_only "10 EXISTS(.. T2.DP CONTAINING ?)"     "$E T2.DP CONTAINING ?) ORDER BY
 eng_only "10 EXISTS(.. T2.I128 STARTING WITH ?)" "$E T2.I128 STARTING WITH ?) ORDER BY ID" '["10"]'
 eng_only "10 EXISTS(.. T2.D34 LIKE ?)"          "$E T2.D34 LIKE ?) ORDER BY ID" '["1%"]'
 eng_only "10 EXISTS(.. T2.N382 SIMILAR TO ?)"   "$E T2.N382 SIMILAR TO ?) ORDER BY ID" '["1%"]'
-eng_only "10 a scalar subquery carrying ANY ? in the projection" "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) FROM T ORDER BY ID" '[1]'
+both     "10 a scalar subquery carrying ? in the projection - promoted with inselcond section 6" "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) FROM T ORDER BY ID" '[1]'
 
 # ---------------------------------------------------------------
 echo "--- panic check"

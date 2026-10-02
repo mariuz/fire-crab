@@ -662,7 +662,10 @@ both             "an IN subquery body: B.ID > ? [1.5] (engine 2;3)" "SELECT ID F
 # CorrSub sink is a different router from the WHERE one this chunk fixes
 # (the `EXISTS` and `IN` bodies two cells above ARE bound and answer), so
 # the boundary is recorded here rather than moved.
-eng_only         "a correlated scalar subquery in the SELECT LIST - refused at prepare for every bind type, integer included (engine -3,0;0,0;1,0;2,1;3,1;9,0)" "SELECT ID, (SELECT COUNT(*) FROM U B WHERE B.ID = A.ID AND B.D > ?) K FROM T A ORDER BY ID" '[2.4]'
+# PROMOTED 2026-10-02 (`serve-real-inselcond.sh` section 6): a select-list
+# subquery holding every `?` of the statement now numbers its slots - this
+# cell self-expired in that chunk's sweep, the DOUBLE bind agreeing too
+both             "a correlated scalar subquery in the SELECT LIST - a DOUBLE bind into its body (engine -3,0;0,0;1,0;2,1;3,1;9,0)" "SELECT ID, (SELECT COUNT(*) FROM U B WHERE B.ID = A.ID AND B.D > ?) K FROM T A ORDER BY ID" '[2.4]'
 
 echo "-- 6. DML WHERE (rolled back, with a read-back) --"
 dml_rb           "UPDATE U SET N = 99 WHERE ID > ? [2.5] (engine dml=(none) rb=1,1,1;2,2,2.5;3,99,2.49)" "UPDATE U SET N = 99 WHERE ID > ?" '[2.5]' "SELECT ID, N, NM FROM U ORDER BY ID"
