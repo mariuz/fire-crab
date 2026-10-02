@@ -369,6 +369,31 @@ for cell in \
 done
 
 # ---------------------------------------------------------------
+echo "--- 8 a PATTERN slot mixes with nothing under K1: beside a classic WHERE ? it plans"
+# K1 refuses a chunk-new slot beside a classic one because their NUMERIC
+# text readings disagree on exotic spellings; a pattern slot has no numeric
+# reading, so it is neutral (PARAM_PATTERN).  Refuted 2026-10-02: 342
+# mixed cells (18 classic shapes x 19 texts, exotic ones included) against
+# their classic-only twins - 0 divergences of the mix's own; the 17 the
+# battery found are the classic slot's, identical without the pattern.
+MX="SELECT ID, IIF(V LIKE ?, 1, 0) FROM T WHERE"
+both "8 .. WHERE ID > ?"            "$MX ID > ? ORDER BY ID" '["1%",1]'
+both "8 .. WHERE V = ?"             "$MX V = ? ORDER BY ID" '["1%","10.00"]'
+both "8 .. WHERE N92 = ? ['1.50']"  "$MX N92 = ? ORDER BY ID" '["1.5%","1.50"]'
+both "8 .. WHERE DT = ? ['2020-01-15']" "$MX DT = ? ORDER BY ID" '["1%","2020-01-15"]'
+both "8 .. WHERE DP > ? [2.5]"      "$MX DP > ? ORDER BY ID" '["1%",2.5]'
+both "8 .. WHERE ID IN (?, 3)"      "$MX ID IN (?, 3) ORDER BY ID" '["1%",1]'
+both "8 .. WHERE V LIKE ? - two pattern slots" "$MX V LIKE ? ORDER BY ID" '["%0","1%"]'
+both "8 IIF(DT CONTAINING ?) .. WHERE ID > ?" "SELECT ID, IIF(DT CONTAINING ?, 1, 0) FROM T WHERE ID > ? ORDER BY ID" '["2020",0]'
+both "8 CASE WHEN DP STARTING WITH ? .. WHERE ID < ?" "SELECT ID, CASE WHEN DP STARTING WITH ? THEN 'y' ELSE 'n' END FROM T WHERE ID < ? ORDER BY ID" '["1",3]'
+both "8 a pattern slot beside a NUMERIC chunk-new one (no classic)" "SELECT ID, IIF(V LIKE ?, 1, 0) FROM T WHERE IIF(ID * ? = 2, 1, 0) = 1 ORDER BY ID" '["1%",2]'
+both "8 .. WHERE ID > ? with a NULL classic bind" "$MX ID > ? ORDER BY ID" '["1%",null]'
+# CONTROLS: K1 still refuses a NUMERIC chunk-new slot beside a classic one,
+# with or without a pattern riding along
+eng_only "8 CONTROL IIF(ID > ?) .. WHERE ID > ? - numeric new + classic" "SELECT ID, IIF(ID > ?, 'y', 'n') FROM T WHERE ID > ? ORDER BY ID" '[1,1]'
+eng_only "8 CONTROL + a pattern slot - still mixed"  "SELECT ID, IIF(ID > ? AND V LIKE ?, 'y', 'n') FROM T WHERE ID > ? ORDER BY ID" '[1,"1%",1]'
+
+# ---------------------------------------------------------------
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-condpattern-$PORT.log"; then
@@ -378,6 +403,7 @@ elif ! kill -0 $srv 2>/dev/null; then
 else echo "OK   no panic and the server is still up"; fi
 
 echo "ran $ran checks"
-# the floor is the MEASURED count: 181 on the 2026-10-02 binary, 181 OK
-if [ "$ran" -lt 181 ]; then echo "FAIL only $ran checks ran (floor 181) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 194 on the 2026-10-02 binary (181 +
+# section 8's 13), 194 OK
+if [ "$ran" -lt 194 ]; then echo "FAIL only $ran checks ran (floor 194) - cells went missing"; fail=1; fi
 exit $fail

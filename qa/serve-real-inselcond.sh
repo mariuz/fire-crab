@@ -286,7 +286,12 @@ dml_refused "3 INSERT .. SELECT ? - a bare item, typed from the target" "$I SELE
 dml_refused "3 INSERT .. SELECT ID + ? - an operand"                 "$I SELECT ID + ?, 'z' FROM T RETURNING ID, TAG" '[10]'
 dml_refused "3 INSERT .. SELECT IIF(V = ?, ?, 'n') - a BRANCH ?, typed from TAG" "$I SELECT ID + 10, IIF(V = ?, ?, 'n') FROM T RETURNING ID, TAG" '["10.00","q"]'
 dml_refused "3 INSERT .. SELECT SUBSTRING(IIF(V = ?, ..)) - a node the walk does not open" "$I SELECT ID + 10, SUBSTRING(IIF(V = ?, 'yes', 'no') FROM 1 FOR 1) FROM T RETURNING ID, TAG" '["10.00"]'
-dml_refused "3 INSERT .. SELECT with a select-list AND a WHERE ?"      "$I SELECT ID + 10, IIF(V LIKE ?, 'y', 'n') FROM T WHERE ID > ? RETURNING ID, TAG" '["1%",1]'
+# a PATTERN slot beside a WHERE `?` - promoted the day K1 learned the
+# pattern slot is neutral (`serve-real-condpattern.sh` section 8)
+dml         "3 INSERT .. SELECT IIF(V LIKE ?) .. WHERE ID > ? - a pattern slot mixes nothing" "$I SELECT ID + 10, IIF(V LIKE ?, 'y', 'n') FROM T WHERE ID > ? RETURNING ID, TAG" '["1%",1]'
+# ...while a NUMERIC condition slot beside a WHERE `?` is K1's mix, in the
+# INSERT and the plain SELECT alike
+dml_refused "3 INSERT .. SELECT IIF(ID > ?) .. WHERE ID > ? - K1"     "$I SELECT ID + 10, IIF(ID > ?, 'y', 'n') FROM T WHERE ID > ? RETURNING ID, TAG" '[1,1]'
 dml_refused "3 ...and the plain SELECT refuses that mix too"          "SELECT ID, IIF(ID > ?, 'y', 'n') FROM T WHERE ID > ?" '[1,1]'
 dml_refused "3 CHAR_LENGTH(IIF(ID > ?, ..)) - the function router"    "SELECT ID, CHAR_LENGTH(IIF(ID > ?, 'big', 's')) FROM T ORDER BY ID" '[1]'
 
@@ -300,6 +305,6 @@ elif ! kill -0 $srv 2>/dev/null; then
 else echo "OK   no panic and the server is still up"; fi
 
 echo "ran $ran checks"
-# the floor is the MEASURED count: 35 on the 2026-10-02 binary, 35 OK
-if [ "$ran" -lt 35 ]; then echo "FAIL only $ran checks ran (floor 35) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 36 on the 2026-10-02 binary, 36 OK
+if [ "$ran" -lt 36 ]; then echo "FAIL only $ran checks ran (floor 36) - cells went missing"; fail=1; fi
 exit $fail

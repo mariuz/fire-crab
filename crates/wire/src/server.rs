@@ -3114,6 +3114,16 @@ const PARAM_CHUNK_NEW: u16 = 0x2000;
 /// where the engine raises *Decimal float invalid operation* (round 11's
 /// refuter). Set in [corr_register]; no describe carries it.
 const PARAM_BODY_CMP: u16 = 0x1000;
+/// A BOUND PATTERN's slot ([bound_pattern_desc]) - text matched against
+/// a rendered operand, with NO NUMERIC READING of its own. K1
+/// ([chunk_new_mixed]) counts it as NEITHER chunk-new nor classic: K1
+/// exists because a chunk-new slot's numeric text reading and a classic
+/// slot's disagree on exotic spellings inside one statement, and a
+/// pattern has no such reading to disagree with - so `SELECT IIF(V LIKE
+/// ?, ..) FROM T WHERE ID > ?` plans, while a NUMERIC chunk-new slot
+/// beside a classic one still refuses whatever patterns ride along. No
+/// describe carries it.
+const PARAM_PATTERN: u16 = 0x0800;
 
 fn append_bind_section(d: &mut Vec<u8>, params: &[Descriptor], att: AttCs) {
     fn int_item(d: &mut Vec<u8>, code: u8, val: i32) {
@@ -90395,6 +90405,9 @@ fn marking_chunk_new<T>(
 fn chunk_new_mixed<'a>(ds: impl IntoIterator<Item = &'a Descriptor>) -> bool {
     let (mut new, mut old) = (false, false);
     for d in ds {
+        if d.flags & PARAM_PATTERN != 0 {
+            continue;
+        }
         if d.flags & PARAM_CHUNK_NEW != 0 {
             new = true;
         } else {
@@ -130127,7 +130140,7 @@ fn bound_pattern_desc(lhs: &Expr, descs: &[Descriptor]) -> Option<Descriptor> {
         } else {
             ATT_SUBTYPE as i16
         },
-        flags: if expr_has_col(lhs) { 0 } else { PARAM_NOT_NULL },
+        flags: PARAM_PATTERN | if expr_has_col(lhs) { 0 } else { PARAM_NOT_NULL },
         offset: 4,
     })
 }
@@ -149602,6 +149615,12 @@ mod tests {
         assert!(!chunk_new_mixed([old, old].iter()));
         assert!(chunk_new_mixed([new, old].iter()));
         assert!(chunk_new_mixed([old, new, new].iter()));
+        // a PATTERN slot is neutral: beside either kind it mixes nothing
+        let mut pat = old;
+        pat.flags |= PARAM_PATTERN | PARAM_CHUNK_NEW;
+        assert!(!chunk_new_mixed([pat, old].iter()));
+        assert!(!chunk_new_mixed([pat, new].iter()));
+        assert!(chunk_new_mixed([pat, new, old].iter()));
 
         // K2: a text off the grammar into a chunk-new NUMERIC slot raises;
         // a canonical text, an integer or double message, a text into a
