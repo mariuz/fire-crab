@@ -349,17 +349,17 @@ both      "9 N382 + 0 LIKE ? ['1%'] - and a numeric expression's"  "SELECT ID FR
 both      "9 CAST(DT AS TIMESTAMP) LIKE ? ['2020%']"  "SELECT ID FROM T WHERE CAST(DT AS TIMESTAMP) LIKE ? ORDER BY ID" '["2020%"]'
 
 echo "--- 10. RECORDED, NOT FIXED"
-# A BOUND PATTERN INSIDE AN EXPRESSION CONDITION: `resolve_raw_cond` has
-# no parameter sink at all (its comment calls itself the sink-less
-# resolver) and [Predicate::bind] refuses every pattern form carrying a
-# `?`, so IIF / CASE / a subquery's WHERE over a non-text operand all
-# refuse.  Three routers, one missing capability - recorded whole rather
-# than half-built.
-eng_only  "10 IIF(V LIKE ?,..) - a bound pattern inside an expression condition" "SELECT ID FROM T WHERE IIF(V LIKE ?,1,0) = 1 ORDER BY ID" '["1%"]'
-eng_only  "10 CASE WHEN V LIKE ? .." "SELECT ID FROM T WHERE CASE WHEN V LIKE ? THEN 1 ELSE 0 END = 1 ORDER BY ID" '["1%"]'
-eng_only  "10 IIF(DP LIKE ?,..)"     "SELECT ID FROM T WHERE IIF(DP LIKE ?,1,0) = 1 ORDER BY ID" '["1%"]'
-eng_only  "10 IIF(V STARTING WITH ?,..)" "SELECT ID FROM T WHERE IIF(V STARTING WITH ?,1,0) = 1 ORDER BY ID" '["1"]'
-eng_only  "10 IIF(V CONTAINING ?,..)"    "SELECT ID FROM T WHERE IIF(V CONTAINING ?,1,0) = 1 ORDER BY ID" '["1"]'
+# A BOUND PATTERN INSIDE AN EXPRESSION CONDITION was recorded here as a
+# missing parameter sink; the five IIF / CASE cells SELF-EXPIRED on
+# 2026-10-02 when the condition resolver's sink learned the bare-`?`
+# pattern (`serve-real-condpattern.sh`, 181 cells) and were promoted.
+# A subquery's WHERE over a non-text operand is a different router and
+# still refuses.
+both      "10 IIF(V LIKE ?,..) - a bound pattern inside an expression condition" "SELECT ID FROM T WHERE IIF(V LIKE ?,1,0) = 1 ORDER BY ID" '["1%"]'
+both      "10 CASE WHEN V LIKE ? .." "SELECT ID FROM T WHERE CASE WHEN V LIKE ? THEN 1 ELSE 0 END = 1 ORDER BY ID" '["1%"]'
+both      "10 IIF(DP LIKE ?,..)"     "SELECT ID FROM T WHERE IIF(DP LIKE ?,1,0) = 1 ORDER BY ID" '["1%"]'
+both      "10 IIF(V STARTING WITH ?,..)" "SELECT ID FROM T WHERE IIF(V STARTING WITH ?,1,0) = 1 ORDER BY ID" '["1"]'
+both      "10 IIF(V CONTAINING ?,..)"    "SELECT ID FROM T WHERE IIF(V CONTAINING ?,1,0) = 1 ORDER BY ID" '["1"]'
 eng_only  "10 EXISTS(.. WHERE T2.N382 LIKE ?) - a subquery's WHERE over a non-text operand" "SELECT ID FROM T WHERE EXISTS(SELECT 1 FROM T T2 WHERE T2.N382 LIKE ?) ORDER BY ID" '["1%"]'
 eng_only  "10 V LIKE ? ESCAPE ? - a BOUND escape character has no slot here" "SELECT ID FROM T WHERE V LIKE ? ESCAPE ? ORDER BY ID" '["1%","!"]'
 eng_only  "10 B SIMILAR TO ? - SIMILAR TO has no bound-pattern arm at all" "SELECT ID FROM T WHERE B SIMILAR TO ? ORDER BY ID" '["T%"]'

@@ -3136,12 +3136,13 @@ eng_only "ID * ? > ALL (SELECT 1 FROM RDB\$DATABASE) - a quantified side" "SELEC
 # IN / BETWEEN with a DECIMAL list or bound (the reconciled INT64 scale)
 eng_only "ID * ? IN (2, 3.5) - the reconciled list type"       "SELECT ID FROM T WHERE ID * ? IN (2, 3.5)" '[1]'
 eng_only "ID * ? BETWEEN 1.5 AND 2 - a decimal lower bound"    "SELECT ID FROM T WHERE ID * ? BETWEEN 1.5 AND 2" '[1]'
-# a bare ? as the TESTED side, or under a pattern, inside a condition
+# a bare ? as the TESTED side inside a condition - recorded; a bare ? AS
+# THE PATTERN answers since 2026-10-02 (`serve-real-condpattern.sh`)
 eng_only "IIF(? BETWEEN 1 AND 2, 1, 0)"                        "SELECT IIF(? BETWEEN 1 AND 2, 1, 0) AS X FROM T" '[2]'
 eng_only "IIF(? IN (1, 2), 1, 0)"                              "SELECT IIF(? IN (1, 2), 1, 0) AS X FROM T" '[2]'
-eng_only "IIF(S LIKE ?, 1, 0)"                                 "SELECT IIF(S LIKE ?, 1, 0) AS X FROM T" '["c%"]'
+both     "IIF(S LIKE ?, 1, 0)"                                 "SELECT IIF(S LIKE ?, 1, 0) AS X FROM T" '["c%"]'
 eng_only "IIF(? LIKE 'a%', 1, 0)"                              "SELECT IIF(? LIKE 'a%', 1, 0) AS X FROM T" '["ab"]'
-eng_only "IIF(S STARTING WITH ?, 1, 0)"                        "SELECT IIF(S STARTING WITH ?, 1, 0) AS X FROM T" '["e"]'
+both     "IIF(S STARTING WITH ?, 1, 0)"                        "SELECT IIF(S STARTING WITH ?, 1, 0) AS X FROM T" '["e"]'
 
 panic_free "R6 the whole gate ran without a server panic; the process is alive at the end"
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT

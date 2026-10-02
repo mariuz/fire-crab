@@ -12145,7 +12145,7 @@ enum Term {
     /// suppress it - the engine answers no rows for `1 = 0 AND <col>
     /// SIMILAR TO '['` and raises for `... AND 1 = 0` (measured, both
     /// orders). As a TERM it obeys the written order for free.
-    BadSimilar(Box<Expr>),
+    BadSimilar(Box<Expr>, EvalErr),
     /// A positive LIKE whose BYTE-CARRIER pattern, reinterpreted into the
     /// tested side's real charset, leaves a leading literal segment
     /// ending in a MULTI-BYTE character: the engine raises 22000
@@ -12932,9 +12932,9 @@ impl Predicate {
                     Term::ParamSimilar(fid, idx, escape, negated) => {
                         match bind_rhs(idx, &ColKind::Text)? {
                             None => Term::Unknown,
-                            Some(Rhs::Str(p)) => match sim_compile(&p, *escape) {
-                                Some(re) => Term::Similar(*fid, re, *negated),
-                                None => Term::BadSimilar(Box::new(Expr::Col(*fid))),
+                            Some(Rhs::Str(p)) => match sim_compile_err(&p, *escape) {
+                                Ok(re) => Term::Similar(*fid, re, *negated),
+                                Err(err) => Term::BadSimilar(Box::new(Expr::Col(*fid)), err),
                             },
                             Some(_) => Term::Unknown,
                         }
@@ -12980,9 +12980,9 @@ impl Predicate {
                         };
                         match pat {
                             None => Term::Never,
-                            Some(p) => match sim_compile(&p, *escape) {
-                                Some(re) => Term::Const(sim_match(&re, &val) != *negated),
-                                None => Term::BadSimilar(Box::new(Expr::Str(val))),
+                            Some(p) => match sim_compile_err(&p, *escape) {
+                                Ok(re) => Term::Const(sim_match(&re, &val) != *negated),
+                                Err(err) => Term::BadSimilar(Box::new(Expr::Str(val)), err),
                             },
                         }
                     }
@@ -13623,7 +13623,7 @@ fn term_row_independent(t: &Term) -> bool {
         // there. Without this arm the term fell to `_ => false`, the
         // conjunct was skipped by the pass entirely, and a FALSE written
         // AFTER the bad pattern silently won.
-        Term::BadSimilar(e) => !expr_has_col(e),
+        Term::BadSimilar(e, _) => !expr_has_col(e),
         // and the malformed carrier LIKE, for the same reason: invariant
         // exactly when its tested value is, so a COLUMN keeps it in the
         // per-row walk (where `1 = 0 AND ...` and an empty table answer
@@ -13749,6 +13749,13 @@ fn cond_has_param(c: &Cond2) -> bool {
     }
 }
 
+/// A per-row pattern form whose pattern is the bare-`?` text rung over a
+/// `?`-free operand - what [resolve_raw_cond_sink] builds for `IIF(<x>
+/// LIKE ?, ..)` and its three siblings.
+fn bound_pattern_rung(operand: &Expr, pattern: &Expr) -> bool {
+    !expr_has_param(operand) && is_text_param_rung(pattern)
+}
+
 /// Substitute the bound arguments into a condition's `?` placeholders,
 /// the [subst_params_expr] twin for the predicate side. The CAST that
 /// types an OPERAND `?` then converts it PER ROW, which is where the
@@ -13805,17 +13812,42 @@ fn subst_params_cond(c: &Cond2, args: &[WireParam]) -> Option<Cond2> {
         Cond2::Or(parts) => Cond2::Or(
             parts.iter().map(|p| subst_params_cond(p, args)).collect::<Option<Vec<_>>>()?,
         ),
-        // a pattern side carrying a `?` never resolves (the projection
-        // resolver types no pattern, and [resolve_raw_cond_sink] hands
-        // these arms to the sink-less resolver), so one reaching here
-        // WITH a `?` is a shape no resolver built - refuse the bind; the
-        // `?`-free form returned above
+        // A BARE `?` PATTERN - the one shape [resolve_raw_cond_sink] types
+        // (the text rung over a `?`-free operand). LIKE, STARTING and
+        // SIMILAR keep their per-row form with the bound string in the
+        // pattern's place; CONTAINING desugars through [containing_term]
+        // now that the needle is known, exactly as the predicate world's
+        // `Term::ExprContainingParam` does at bind. A NULL pattern is
+        // UNKNOWN whatever the operand.
+        Cond2::LikeExpr(a, p, esc, n) if bound_pattern_rung(a, p) => {
+            Cond2::LikeExpr(a.clone(), Box::new(subst_params_expr(p, args)?), *esc, *n)
+        }
+        Cond2::StartingExpr(a, p, tt, n) if bound_pattern_rung(a, p) => {
+            Cond2::StartingExpr(a.clone(), Box::new(subst_params_expr(p, args)?), *tt, *n)
+        }
+        Cond2::SimilarExpr(a, p, esc, n) if bound_pattern_rung(a, p) => {
+            Cond2::SimilarExpr(a.clone(), Box::new(subst_params_expr(p, args)?), *esc, *n)
+        }
+        Cond2::ContainingExpr(a, p, tt, n) if bound_pattern_rung(a, p) => {
+            match subst_params_expr(p, args)? {
+                Expr::Null => Cond2::LikeExpr(a.clone(), Box::new(Expr::Null), None, *n),
+                needle => {
+                    let needle = needle.eval(&[]).ok()?.render();
+                    match containing_term((**a).clone(), *tt, &needle, *n, true) {
+                        Term::ExprLike(x, pat, esc, neg) => Cond2::Like(x, pat, esc, neg),
+                        _ => return None, // containing_term builds only that shape
+                    }
+                }
+            }
+        }
+        // any other pattern side carrying a `?` never resolves (the
+        // projection resolver types no pattern, and the per-row pattern
+        // arms refuse a `?` inside one outright - [raw_has_param]), so one
+        // reaching here WITH a `?` is a shape no resolver built - refuse
+        // the bind; the `?`-free form returned above
         Cond2::Like(..)
         | Cond2::Starting(..)
         | Cond2::Similar(..)
-        // the expression forms likewise: the resolver refuses a `?` inside
-        // a per-row pattern outright ([raw_has_param]), so one never
-        // reaches bind and there is nothing here to substitute
         | Cond2::LikeExpr(..)
         | Cond2::StartingExpr(..)
         | Cond2::ContainingExpr(..)
@@ -14339,9 +14371,9 @@ impl Term {
                 Value::Null => None,
                 _ => return Err(EvalErr::MalformedString),
             },
-            Term::BadSimilar(e) => match e.eval(values)? {
+            Term::BadSimilar(e, err) => match e.eval(values)? {
                 Value::Null => None,
-                _ => return Err(EvalErr::InvalidSimilar),
+                _ => return Err(err.clone()),
             },
             Term::BadExprLike(e, prefix) => match e.eval(values)? {
                 Value::Null => None,
@@ -14413,9 +14445,9 @@ impl Term {
             Term::ExprSimilarExpr(e, pat, esc, negated) => {
                 match (e.eval(values)?, pat.eval(values)?) {
                     (Value::Null, _) | (_, Value::Null) => None,
-                    (v, p) => match sim_compile(&p.render(), *esc) {
-                        Some(re) => Some(sim_match(&re, &v.render()) != *negated),
-                        None => return Err(EvalErr::InvalidSimilar),
+                    (v, p) => match sim_compile_err(&p.render(), *esc) {
+                        Ok(re) => Some(sim_match(&re, &v.render()) != *negated),
+                        Err(err) => return Err(err),
                     },
                 }
             }
@@ -14997,13 +15029,66 @@ enum SimClass {
 /// Compile a `SIMILAR TO` pattern; `esc` is the ESCAPE character. None on a
 /// malformed pattern (the engine raises on one at prepare).
 fn sim_compile(pattern: &str, esc: Option<char>) -> Option<SimRe> {
+    sim_compile_err(pattern, esc).ok()
+}
+
+thread_local! {
+    /// Set by the SIMILAR parser when it stops at an ESCAPE before a
+    /// character that is neither special nor the escape itself - the one
+    /// malformation the engine names differently ([sim_escaped]).
+    static SIM_BAD_ESCAPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The character after an ESCAPE must be the escape itself or one of the
+/// grammar's specials, or the pattern raises 22025 *Invalid ESCAPE
+/// sequence* - NOT 42000 *Invalid SIMILAR TO pattern* - and this parser
+/// had taken any escaped character as a literal, so `V SIMILAR TO '1!.%'
+/// ESCAPE '!'` answered row 1 where the engine raises (measured
+/// 2026-10-02, a WHERE literal, an IIF literal, a bound pattern and a
+/// class member `[a!.]` or range end `[!.-z]` alike). The engine's
+/// compiler is ONE left-to-right pass (SimilarToRegex.cpp: the checks at
+/// its three escape sites, `isSpecialChar` the list below), so the first
+/// malformation met names the error - and this recursive descent stops
+/// at the same character, which is what keeps the two errors apart.
+fn sim_escaped(c: char, esc: Option<char>) -> Option<char> {
+    const SPECIAL: &str = "^-_%[](){}|?+*";
+    if Some(c) == esc || SPECIAL.contains(c) {
+        Some(c)
+    } else {
+        SIM_BAD_ESCAPE.with(|f| f.set(true));
+        None
+    }
+}
+
+/// [sim_escaped] inside a bracket class, where the engine ALSO names a
+/// pattern that ENDS under the escape 22025 (`[a!` - its class parser
+/// checks for the end first, SimilarToRegex.cpp:373/442), while outside
+/// one (`a!`) the same end is 42000 *Invalid SIMILAR TO pattern*.
+fn sim_class_escaped(c: Option<&char>, esc: Option<char>) -> Option<char> {
+    match c {
+        Some(c) => sim_escaped(*c, esc),
+        None => {
+            SIM_BAD_ESCAPE.with(|f| f.set(true));
+            None
+        }
+    }
+}
+
+/// [sim_compile] with the engine's error for a malformed pattern:
+/// [EvalErr::InvalidEscape] for a bad escape ([sim_escaped]), otherwise
+/// [EvalErr::InvalidSimilar].
+fn sim_compile_err(pattern: &str, esc: Option<char>) -> Result<SimRe, EvalErr> {
+    SIM_BAD_ESCAPE.with(|f| f.set(false));
+    let fail = || {
+        if SIM_BAD_ESCAPE.with(|f| f.get()) { EvalErr::InvalidEscape } else { EvalErr::InvalidSimilar }
+    };
     let p: Vec<char> = pattern.chars().collect();
     let mut i = 0usize;
-    let re = sim_alt(&p, &mut i, esc)?;
+    let re = sim_alt(&p, &mut i, esc).ok_or_else(fail)?;
     if i != p.len() {
-        return None; // trailing junk (an unbalanced `)`, etc.)
+        return Err(fail()); // trailing junk (an unbalanced `)`, etc.)
     }
-    Some(re)
+    Ok(re)
 }
 
 fn sim_alt(p: &[char], i: &mut usize, esc: Option<char>) -> Option<SimRe> {
@@ -15079,7 +15164,7 @@ fn sim_bounds(body: &str) -> Option<(usize, Option<usize>)> {
 fn sim_primary(p: &[char], i: &mut usize, esc: Option<char>) -> Option<SimRe> {
     let c = *p.get(*i)?;
     if Some(c) == esc {
-        let lit = *p.get(*i + 1)?;
+        let lit = sim_escaped(*p.get(*i + 1)?, esc)?;
         *i += 2;
         return Some(SimRe::Lit(lit));
     }
@@ -15156,7 +15241,7 @@ fn sim_class(p: &[char], i: &mut usize, esc: Option<char>) -> Option<SimRe> {
         }
         // a member, possibly escaped, possibly the low end of a range
         let lo = if Some(p[*i]) == esc {
-            let lit = *p.get(*i + 1)?;
+            let lit = sim_class_escaped(p.get(*i + 1), esc)?;
             *i += 2;
             lit
         } else {
@@ -15166,7 +15251,7 @@ fn sim_class(p: &[char], i: &mut usize, esc: Option<char>) -> Option<SimRe> {
         };
         if p.get(*i) == Some(&'-') && p.get(*i + 1).is_some_and(|&c| c != ']') {
             let hi = if Some(p[*i + 1]) == esc {
-                let lit = *p.get(*i + 2)?;
+                let lit = sim_class_escaped(p.get(*i + 2), esc)?;
                 *i += 3;
                 lit
             } else {
@@ -87121,7 +87206,21 @@ fn resolve_raw_cond_body(
                 return None;
             }
             let pat = &converting_expr_pattern(&e, pat, descs)?;
-            Cond2::Similar(Box::new(e), sim_compile(pat, *esc)?, *negated)
+            match sim_compile(pat, *esc) {
+                Some(re) => Cond2::Similar(Box::new(e), re, *negated),
+                // A MALFORMED PATTERN RAISES WHEN A ROW REACHES IT, as the
+                // predicate world's [Term::BadSimilar] does - and this arm
+                // refused the statement at prepare. Measured 2026-10-02:
+                // `IIF(V SIMILAR TO '(', 1, 0)` raises *Invalid SIMILAR TO
+                // pattern* over rows, answers NO ROWS over none, 0 for a
+                // NULL operand (`IIF(B SIMILAR TO '(', ..)` on the NULL row,
+                // `CAST(NULL AS VARCHAR(5))` everywhere), and `ID < 0 AND
+                // IIF(..) = 1` answers where `IIF(..) = 1 AND ID < 0`
+                // raises; a bad ESCAPE names 22025 the same way. The
+                // per-row form compiles the constant on each non-NULL row
+                // and raises exactly that, value-gated.
+                None => Cond2::SimilarExpr(Box::new(e), Box::new(Expr::Str(pat.clone())), *esc, *negated),
+            }
         }
         // the per-row pattern. The collated-operand refusal above applies
         // here for the same reason (a canonicalised character CLASS is a
@@ -87187,8 +87286,10 @@ fn resolve_raw_cond_body(
 /// inside arithmetic: `IIF(ID * ? = 2, ..)` LONG NOT NULL, `CASE WHEN ID
 /// > ? + 1` LONG Nullable). NOT/AND/OR recurse with the sink; every
 /// other arm delegates to the sink-less resolver and therefore keeps
-/// refusing a `?` (LIKE/STARTING/CONTAINING/SIMILAR patterns, `? IS
-/// NULL` - the SQL_NULL slot - all recorded boundaries).
+/// refusing a `?` (`? IS NULL` - the SQL_NULL slot - a `?` inside a
+/// pattern EXPRESSION, a `?` on a pattern's tested side: recorded
+/// boundaries) - except a BARE `?` PATTERN, which LIKE / STARTING WITH /
+/// CONTAINING / SIMILAR TO type here ([bound_pattern_desc]).
 ///
 /// ROUND 12: EVERY SLOT A CONDITION REGISTERS IS CHUNK-NEW - the previous
 /// binary refused any `?` in a CASE / IIF condition - and is marked so
@@ -87248,8 +87349,96 @@ fn resolve_raw_cond_sink_body(
             }
             Cond2::Or(v)
         }
+        // A BARE `?` PATTERN: the value-world twin of the predicate
+        // world's bound-pattern arms, which carried it all along while a
+        // condition refused it - `WHERE V LIKE ?` answered and `WHERE
+        // IIF(V LIKE ?, 1, 0) = 1` raised a Dynamic SQL Error. The slot is
+        // [bound_pattern_desc]'s; the pattern is the TEXT RUNG
+        // ([cmp_param_rung]), which [subst_params_cond] collapses to the
+        // bound string, and it is NEVER CONVERTED - every operand matches
+        // its rendered text with the bound wildcards live. Measured
+        // 2026-10-02 over LIKE / STARTING WITH / CONTAINING / SIMILAR TO
+        // and nineteen operand shapes: `IIF(DT LIKE ?, ..)` ['1%'] takes
+        // only 1999-12-31, `IIF(TM CONTAINING ?, ..)` ['1'] takes
+        // 10:20:30 and 01:02:03, `IIF(B LIKE ?, ..)` ['1%'] takes nothing.
+        // Each family keeps the boundaries its per-row-pattern twin draws
+        // in [resolve_raw_cond]: an OCTETS or collate-canonical LIKE
+        // operand, a collated SIMILAR one, a STARTING collation with no
+        // canonical form.
+        RawCond::LikeExpr(a, pat, esc, negated) if bare_pattern_param(a, pat).is_some() => {
+            let e = resolve_expr(a, columns, descs)?;
+            if expr_is_octets(&e, descs) || collate_canon_of(&e, descs).is_some() {
+                return None;
+            }
+            let p = claim_pattern_rung(&e, pat, descs, sink)?;
+            Cond2::LikeExpr(Box::new(e), Box::new(p), *esc, *negated)
+        }
+        RawCond::StartingExpr(a, pat, negated) if bare_pattern_param(a, pat).is_some() => {
+            let e = resolve_expr(a, columns, descs)?;
+            let p = claim_pattern_rung(&e, pat, descs, sink)?;
+            if !matches!(e.type_of(descs), Some(ExprType::Text)) {
+                Cond2::StartingExpr(Box::new(e), Box::new(p), None, *negated)
+            } else {
+                // the per-row prefix's collation decision, as there
+                let (value, tt) = collate_operand_ttype(e, descs)?;
+                match fire_crab_ods::coll::icu_strength_of_ttype(tt) {
+                    Some(_) => Cond2::StartingExpr(
+                        Box::new(Expr::CollCanon(Box::new(value), tt, false)),
+                        Box::new(p),
+                        Some(tt),
+                        *negated,
+                    ),
+                    None if fire_crab_ods::intl::collation_id(tt as i16) != 0 => return None,
+                    None => Cond2::StartingExpr(Box::new(value), Box::new(p), None, *negated),
+                }
+            }
+        }
+        // the operand is held UNWRAPPED here: the bind desugars it through
+        // [containing_term] exactly as the predicate world's
+        // `Term::ExprContainingParam` does, once the needle is known
+        RawCond::ContainingExpr(a, pat, negated) if bare_pattern_param(a, pat).is_some() => {
+            let e = resolve_expr(a, columns, descs)?;
+            let p = claim_pattern_rung(&e, pat, descs, sink)?;
+            let (value, tt) = if matches!(e.type_of(descs), Some(ExprType::Text)) {
+                collate_operand_ttype(e, descs)?
+            } else {
+                (e, 0)
+            };
+            Cond2::ContainingExpr(Box::new(value), Box::new(p), tt, *negated)
+        }
+        RawCond::SimilarExpr(a, pat, esc, negated) if bare_pattern_param(a, pat).is_some() => {
+            let e = resolve_expr(a, columns, descs)?;
+            if expr_reads_coll(&e, descs) {
+                return None;
+            }
+            let p = claim_pattern_rung(&e, pat, descs, sink)?;
+            Cond2::SimilarExpr(Box::new(e), Box::new(p), *esc, *negated)
+        }
         other => resolve_raw_cond(other, columns, descs)?,
     })
+}
+
+/// The slot of a pattern that is a BARE `?` over a `?`-free operand -
+/// the one bound-pattern shape a condition answers ([bound_pattern_desc]).
+fn bare_pattern_param(operand: &RawExpr, pat: &RawExpr) -> Option<usize> {
+    match pat {
+        RawExpr::Param(i) if !raw_has_param(operand) => Some(*i),
+        _ => None,
+    }
+}
+
+/// Claim a bare `?` pattern's slot for `operand` and build the text rung
+/// the bind collapses to the bound string.
+fn claim_pattern_rung(
+    operand: &Expr,
+    pat: &RawExpr,
+    descs: &[Descriptor],
+    sink: &mut Vec<Option<Descriptor>>,
+) -> Option<Expr> {
+    let RawExpr::Param(i) = *pat else { return None };
+    let slot = bound_pattern_desc(operand, descs)?;
+    claim_param_slot(sink, i, &slot)?;
+    cmp_param_rung(i, &slot)
 }
 
 fn resolve_expr(
@@ -93195,9 +93384,9 @@ impl Cond2 {
             Cond2::SimilarExpr(a, pat, esc, negated) => {
                 match (a.eval(values)?, pat.eval(values)?) {
                     (Value::Null, _) | (_, Value::Null) => None,
-                    (v, p) => match sim_compile(&p.render(), *esc) {
-                        Some(re) => Some(sim_match(&re, &v.render()) != *negated),
-                        None => return Err(EvalErr::InvalidSimilar),
+                    (v, p) => match sim_compile_err(&p.render(), *esc) {
+                        Ok(re) => Some(sim_match(&re, &v.render()) != *negated),
+                        Err(err) => return Err(err),
                     },
                 }
             }
@@ -126823,9 +127012,9 @@ fn containing_term(value: Expr, ttype: u16, pattern: &str, negated: bool, wrap_c
 /// converting operand keeps: `DT SIMILAR TO '15.01.2020'` converts to
 /// "2020-01-15", whose `-` the engine's grammar rejects.
 fn similar_term(value: Expr, pattern: &str, escape: Option<char>, negated: bool) -> Term {
-    match sim_compile(pattern, escape) {
-        Some(re) => Term::ExprSimilar(Box::new(value), re, negated),
-        None => Term::BadSimilar(Box::new(value)),
+    match sim_compile_err(pattern, escape) {
+        Ok(re) => Term::ExprSimilar(Box::new(value), re, negated),
+        Err(err) => Term::BadSimilar(Box::new(value), err),
     }
 }
 
@@ -127119,9 +127308,9 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
             // AND 1 = 0` both answer no rows), so it becomes the
             // row-gated [Term::BadSimilar] like a bound one. A parameter
             // pattern or a non-text operand is a later slice.
-            (ColKind::Text, Rhs::Str(p)) => match sim_compile(&p, escape) {
-                Some(re) => Term::Similar(idx, re, negated),
-                None => Term::BadSimilar(Box::new(Expr::Col(idx))),
+            (ColKind::Text, Rhs::Str(p)) => match sim_compile_err(&p, escape) {
+                Ok(re) => Term::Similar(idx, re, negated),
+                Err(err) => Term::BadSimilar(Box::new(Expr::Col(idx)), err),
             },
             // an INTEGER column matches its decimal text, the pattern as
             // written - an integer does not convert it (measured: `SI
@@ -128071,60 +128260,14 @@ fn resolve_expr_term_body(
             // 30, a text one to its computed width - UPPER(VC10) is 10,
             // VC||'x' is 11, SUBSTRING(.. FOR 3) is 3, CAST(I AS VARCHAR(7))
             // is 7. A width the describe machinery cannot pin keeps the max.
-            let length = match lhs.type_of(descs)? {
-                // a numeric expression (INT or scaled NUMERIC) renders to
-                // the fixed 30, matching the literal-pattern arm above,
-                // which already accepts a numeric side
-                //
-                // A TEMPORAL SIDE TAKES THE SAME FIXED 30 - measured, all
-                // five families announce `VARYING len 30 charset NONE`
-                // for `<temporal> LIKE ?` - and a BOUND pattern is NOT
-                // converted the way a literal one is: it matches the
-                // RENDERED value, wildcards live, which is what makes
-                // `DT LIKE ?` bound '2%' answer rows where the literal
-                // `DT LIKE '2%'` raises.  The conversion is a PREPARE-time
-                // fold and a parameter has no value to fold.
-                //
-                // AN APPROXIMATE AND A BOOLEAN SIDE TAKE IT TOO, and
-                // leaving them out cost real answers at both: `DP LIKE ?`
-                // bound '1%' is 1;2 on the engine and `B LIKE ?` bound
-                // 'F%' is the FALSE row, while this server refused each
-                // with a Dynamic SQL Error.  Every non-text operand
-                // announces the same `VARYING len 30 charset NONE`
-                // (measured, all eight families), so the arm is the type
-                // list and nothing else.
-                ExprType::Int
-                | ExprType::Numeric
-                | ExprType::Temporal(_)
-                | ExprType::Approx
-                | ExprType::Bool => NUM_LIKE_PATTERN_LEN,
-                ExprType::Text => text_param_width(&lhs, descs)
-                    .map(|(_, w)| (w as u16).saturating_add(2))
-                    .unwrap_or(32765),
-            };
+            // (a DECFLOAT side has no ExprType and refuses HERE, in the
+            // predicate world, as it always has - the value world's twin
+            // admits it, measured: [bound_pattern_desc])
+            lhs.type_of(descs)?;
             if params.len() <= *slot {
                 params.resize(*slot + 1, None);
             }
-            // A PATTERN IS ALWAYS VARYING, whatever form the side has -
-            // but its CHARSET is the side's, through the same sentinel
-            // the comparison arm uses (`? LIKE 'a%'` is announced in the
-            // attachment's set, measured). The numeric side's fixed 30
-            // keeps its flat ttype: its charset is not measured here.
-            params[*slot] = Some(Descriptor {
-                dtype: dtype::VARYING,
-                scale: 0,
-                length,
-                sub_type: if matches!(lhs.type_of(descs), Some(ExprType::Text)) {
-                    text_param_cs(&lhs, descs)
-                } else {
-                    // a NUMERIC side's fixed 30 is 30 CHARACTERS in the
-                    // attachment's charset, the same law [num_pat_desc]
-                    // carries - it was flat NONE here too
-                    ATT_SUBTYPE as i16
-                },
-                flags: if expr_has_col(&lhs) { 0 } else { PARAM_NOT_NULL },
-                offset: 4,
-            });
+            params[*slot] = Some(bound_pattern_desc(&lhs, descs)?);
             Term::ExprLikeParam(Box::new(lhs), *slot, *escape, *negated)
         }
         RawKind::Like(..) => return None, // NULL pattern
@@ -128211,12 +128354,12 @@ fn resolve_expr_term_body(
                 }
                 _ => p.clone(),
             };
-            match sim_compile(p, *escape) {
-                Some(re) => Term::ExprSimilar(Box::new(lhs), re, *negated),
+            match sim_compile_err(p, *escape) {
+                Ok(re) => Term::ExprSimilar(Box::new(lhs), re, *negated),
                 // ...and a malformed one raises WHEN A ROW REACHES IT,
                 // rather than refusing the statement - the expression
                 // twin of the column arm in [typed_term]
-                None => Term::BadSimilar(Box::new(lhs)),
+                Err(err) => Term::BadSimilar(Box::new(lhs), err),
             }
         }
         // THE PER-ROW SIMILAR PATTERN. Same declines as its three siblings -
@@ -129779,6 +129922,57 @@ fn cond_no_raise(c: &Cond2, descs: &[Descriptor]) -> bool {
 /// WIN1252 - the ordinary attachment law, which [num_pat_desc] now
 /// carries through the `ATT_SUBTYPE` sentinel.
 const NUM_LIKE_PATTERN_LEN: u16 = 32;
+
+/// The slot a BOUND pattern claims - `<x> LIKE ?`, `STARTING WITH ?`,
+/// `CONTAINING ?`, `SIMILAR TO ?` - in the predicate world's expression
+/// arm and in a condition's (`IIF(<x> LIKE ?, ..)`, `CASE WHEN`), which
+/// the engine describes identically: measured across all four operators
+/// and every family, 2026-10-02.
+///
+/// The pattern slot describes as the operand's own result text width: a
+/// text one its computed width - UPPER(VC20) is 20, VC20||'x' is 21, a
+/// CHAR(6) is 6 (as VARYING: A PATTERN IS ALWAYS VARYING, whatever form
+/// the side has), and a width the describe machinery cannot pin keeps
+/// the max. Every NON-TEXT operand takes the fixed 30 - integer, scaled,
+/// INT128, FLOAT, DOUBLE, DECFLOAT, the temporals and BOOLEAN alike -
+/// and a bound pattern is NOT converted the way a literal one is: it
+/// matches the RENDERED value, wildcards live, which is what makes `DT
+/// LIKE ?` bound '2%' answer rows where the literal `DT LIKE '2%'`
+/// raises. The conversion is a PREPARE-time fold and a parameter has no
+/// value to fold.
+///
+/// Its CHARSET is the side's, through the same sentinel the comparison
+/// arm uses (`? LIKE 'a%'` is announced in the attachment's set,
+/// measured); the non-text 30 is 30 CHARACTERS in the attachment's set
+/// ([num_pat_desc]'s law). Nullable exactly when the operand reads a
+/// column: `IIF('abc' LIKE ?, ..)` and `IIF(1 LIKE ?, ..)` announce NOT
+/// NULL slots of 3 and 30.
+fn bound_pattern_desc(lhs: &Expr, descs: &[Descriptor]) -> Option<Descriptor> {
+    let ty = lhs.type_of(descs);
+    let length = match ty {
+        Some(ExprType::Text) => {
+            text_param_width(lhs, descs).map(|(_, w)| (w as u16).saturating_add(2)).unwrap_or(32765)
+        }
+        Some(
+            ExprType::Int | ExprType::Numeric | ExprType::Temporal(_) | ExprType::Approx | ExprType::Bool,
+        ) => NUM_LIKE_PATTERN_LEN,
+        // a DECFLOAT descriptor has no ExprType at all
+        _ if expr_decfloat_desc(lhs, descs).is_some() => NUM_LIKE_PATTERN_LEN,
+        _ => return None,
+    };
+    Some(Descriptor {
+        dtype: dtype::VARYING,
+        scale: 0,
+        length,
+        sub_type: if matches!(ty, Some(ExprType::Text)) {
+            text_param_cs(lhs, descs)
+        } else {
+            ATT_SUBTYPE as i16
+        },
+        flags: if expr_has_col(lhs) { 0 } else { PARAM_NOT_NULL },
+        offset: 4,
+    })
+}
 
 /// The SYNTHESIZED text slot a numeric side's pattern predicate claims -
 /// [NUM_LIKE_PATTERN_LEN] characters in the ATTACHMENT's charset,
@@ -142762,6 +142956,21 @@ mod tests {
         assert!(!hit("^", "[^\\^]"));
         assert!(hit("]", "[]a]"));
         assert!(bad("[]"));
+        // an ESCAPE may precede only a special or itself - and the
+        // engine names that error apart (22025, not 42000), the first
+        // malformation met in one left-to-right pass deciding which
+        let err = |p: &str| sim_compile_err(p, Some('!')).err();
+        for p in ["1!.%", "%!a", "[a!.]", "[!.-z]", "[a-!.]"] {
+            assert_eq!(err(p), Some(EvalErr::InvalidEscape), "{p}");
+        }
+        assert!(sim_compile_err("1!!%", Some('!')).is_ok());
+        assert!(sim_compile_err("1!%!_![", Some('!')).is_ok());
+        assert_eq!(err("%!"), Some(EvalErr::InvalidSimilar));
+        assert_eq!(err("(a!b"), Some(EvalErr::InvalidEscape));
+        assert_eq!(err("a{2!,}"), Some(EvalErr::InvalidSimilar));
+        assert_eq!(err("(!a"), Some(EvalErr::InvalidEscape));
+        assert_eq!(err("[a!"), Some(EvalErr::InvalidEscape));
+        assert_eq!(err("a!"), Some(EvalErr::InvalidSimilar));
     }
 
     #[test]
@@ -148111,9 +148320,24 @@ mod tests {
         assert!(hits("IIF(A = ?, 1, 0) = ?", &[WireParam::Int(-7, 0), WireParam::Int(1, 0)]));
         // a `?`-free LIKE arm beside a `?` comparison binds (no bind error)
         assert!(hits("IIF(A = ? AND NAME LIKE 'a%', 1, 0) = 1", &[WireParam::Int(-7, 0)]));
+        // a BARE `?` PATTERN types from the operand ([bound_pattern_desc]):
+        // the text width, VARYING; any non-text operand the fixed 30 - and
+        // the bound text matches the render unconverted
+        let (_, p) = build("IIF(NAME LIKE ?, 1, 0) = 1").unwrap();
+        assert_eq!(slot(&p, 0).0, dtype::VARYING);
+        let (_, p) = build("IIF(D CONTAINING ?, 1, 0) = 1").unwrap();
+        assert_eq!((slot(&p, 0).0, slot(&p, 0).1), (dtype::VARYING, NUM_LIKE_PATTERN_LEN));
+        let text = |t: &str| [WireParam::Text(t.into())];
+        assert!(hits("IIF(NAME LIKE ?, 1, 0) = 1", &text("a%")));
+        assert!(!hits("IIF(NAME LIKE ?, 1, 0) = 1", &text("b%")));
+        assert!(hits("IIF(NAME CONTAINING ?, 1, 0) = 1", &text("B")));
+        assert!(hits("IIF(NAME STARTING WITH ?, 1, 0) = 1", &text("a")));
+        assert!(hits("IIF(NAME SIMILAR TO ?, 1, 0) = 1", &text("[a-b]+")));
+        assert!(hits("IIF(D LIKE ?, 1, 0) = 1", &text("1.5%")));
+        assert!(!hits("IIF(NAME LIKE ?, 1, 0) = 1", &[WireParam::Null]));
         for s in [
             "IIF(A = ?, ?, ?) = 1", "IIF(NULL = ?, 1, 0) = 1", "IIF(? IS NULL, 1, 0) = 1",
-            "IIF(NAME LIKE ?, 1, 0) = 1", "IIF(? BETWEEN 1 AND 2, 1, 0) = 1",
+            "IIF(? LIKE 'a%', 1, 0) = 1", "IIF(? BETWEEN 1 AND 2, 1, 0) = 1",
             "IIF(? IN (1, 2), 1, 0) = 1",
         ] {
             assert!(refused(s), "{s} should refuse");
