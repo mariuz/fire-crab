@@ -365,10 +365,13 @@ eng_only  "10 V LIKE ? ESCAPE ? - a BOUND escape character has no slot here" "SE
 eng_only  "10 B SIMILAR TO ? - SIMILAR TO has no bound-pattern arm at all" "SELECT ID FROM T WHERE B SIMILAR TO ? ORDER BY ID" '["T%"]'
 # SIMILAR TO over a TEMPORAL raises whatever the pattern is - 22018 when
 # it cannot convert, *Invalid SIMILAR TO pattern* when it can (the
-# converted text will not compile as one) - and this server refuses the
-# shape.  Two vectors, both pinned.
-err_differs "10 DT SIMILAR TO '2020%' - the engine converts and raises; this server refuses the shape" \
-            "SELECT ID FROM T WHERE DT SIMILAR TO '2020%'" "22018" "42000"
+# converted text will not compile as one).  The FIRST of the two is the
+# engine's own vector now: the temporal operand is in SIMILAR TO's
+# converting set, so the pattern converts here too and raises where the
+# engine raises.  The second is still a refusal - this cell SELF-EXPIRED
+# and was promoted when the two lines of work met.
+err_same    "10 DT SIMILAR TO '2020%' - the pattern converts, and a wildcard cannot" \
+            "SELECT ID FROM T WHERE DT SIMILAR TO '2020%'"
 err_differs "10 DT SIMILAR TO '2020-01-15' - ...and a CONVERTIBLE pattern raises differently again" \
             "SELECT ID FROM T WHERE DT SIMILAR TO '2020-01-15'" "SIMILAR TO" "42000"
 

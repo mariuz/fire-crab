@@ -687,6 +687,11 @@ enum Bool {
     /// STARTING [WITH]: blr_starting - NOT keeps a real blr_not,
     /// like LIKE (probed)
     Starting(Val, Val),
+    /// `<a> IS NOT DISTINCT FROM <b>` - blr_equiv, the null-safe
+    /// equality; `IS DISTINCT FROM` is blr_not over it, the parser's
+    /// own shape (parse.y distinct_predicate), which NotBoolNode keeps
+    /// because blr_equiv has no inverse verb
+    Equiv(Val, Val),
     AnsiAny(CmpOp, Val, SubQ),
     /// `<left> <cmp> ALL (SELECT ...)` and NOT IN - blr_ansi_all
     AnsiAll(CmpOp, Val, SubQ),
@@ -734,7 +739,7 @@ fn stamp_bool(b: &mut Bool, cn: &str) {
             stamp_bool(r, cn);
         }
         Bool::Not(x) => stamp_bool(x, cn),
-        Bool::Cmp(_, a, c) | Bool::Like(a, c) | Bool::Starting(a, c) => {
+        Bool::Cmp(_, a, c) | Bool::Like(a, c) | Bool::Starting(a, c) | Bool::Equiv(a, c) => {
             stamp_val(a, cn);
             stamp_val(c, cn);
         }
@@ -804,7 +809,7 @@ fn negate(b: Bool) -> Bool {
             Box::new(Bool::Cmp(CmpOp::Gtr, v, hi)),
         ),
         keep @ (Bool::Missing(_) | Bool::Like(..) | Bool::Starting(..)
-        | Bool::InList(..)) => {
+        | Bool::InList(..) | Bool::Equiv(..)) => {
             Bool::Not(Box::new(keep))
         }
         // the quantifier FLIPS and the comparison INVERTS (probed:
@@ -2731,6 +2736,13 @@ impl<'a> P<'a> {
         let left = self.val()?;
         if self.kw("IS") {
             let negated = self.kw("NOT");
+            if self.kw("DISTINCT") {
+                if !self.kw("FROM") {
+                    return None;
+                }
+                let e = Bool::Equiv(left, self.val()?);
+                return Some(if negated { e } else { Bool::Not(Box::new(e)) });
+            }
             if !self.kw("NULL") {
                 return None;
             }
@@ -3249,6 +3261,11 @@ fn emit_bool(out: &mut Vec<u8>, b: &Bool) {
             out.push(blr::LIKE);
             emit_val(out, v);
             emit_val(out, p);
+        }
+        Bool::Equiv(a, bb) => {
+            out.push(blr::EQUIV);
+            emit_val(out, a);
+            emit_val(out, bb);
         }
         Bool::Starting(v, p) => {
             out.push(0x37); // blr_starting
@@ -10745,6 +10762,21 @@ mod tests {
         pin(
             "SELECT ID FROM T WHERE A = ID",
             "0543014A015401472F170101411701024944FF4C",
+        );
+        // IS NOT DISTINCT FROM is blr_equiv; IS DISTINCT FROM keeps a
+        // blr_not over it, and NOT of that cancels (read back from the
+        // engine's RDB$VIEW_BLR on 2182)
+        pin(
+            "SELECT ID FROM T WHERE A IS NOT DISTINCT FROM 5",
+            "0543014A015401472E1701014115080005000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE A IS DISTINCT FROM 5",
+            "0543014A015401473B2E1701014115080005000000FF4C",
+        );
+        pin(
+            "SELECT ID FROM T WHERE NOT (A IS DISTINCT FROM 5)",
+            "0543014A015401472E1701014115080005000000FF4C",
         );
     }
 

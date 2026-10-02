@@ -206,14 +206,11 @@ for bad in "CAST(S AS INTEGER)" "CAST(S AS DATE)" "CAST(S AS DOUBLE PRECISION)" 
 done
 
 # --- refusals that must STAY refusals ----------------------------------
-# a TIME does not become a DATE or a TIMESTAMP: the engine would use the
-# CURRENT DATE, which this server does not do - the same reason the two
-# do not compare.
-r=$(query "SELECT CAST(CAST('08:30' AS TIME) AS TIMESTAMP) FROM T WHERE ID = 1" "$PORT" "$A")
-case "$r" in
-    ERR*) echo "OK   TIME to TIMESTAMP is refused (the engine uses the current date)" ;;
-    *) echo "DIFF TIME to TIMESTAMP answered: [$r]"; fail=1 ;;
-esac
+# a TIME becomes a TIMESTAMP dated TODAY in the session zone - this was
+# a refusal while this server had no session wall clock in a named zone
+# (serve-real-sessionclock.sh pins the date against the host clock);
+# promoted to an engine comparison
+both "TIME to TIMESTAMP is dated today" "SELECT CAST(CAST('08:30' AS TIME) AS TIMESTAMP) FROM T WHERE ID = 1"
 # a BLOB target is a conversion like any other now - the value's own
 # rendering, read back through a cast to text so the comparison is the
 # CONTENT and not each server's own blob id

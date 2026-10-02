@@ -560,7 +560,7 @@ bound "MERGE ... WHEN NOT MATCHED THEN INSERT ... OVERRIDING (no MERGE surface a
 # star's own laws live in qa/serve-real-returnold.sh)
 both "RETURNING * over DEFAULT VALUES" \
      "INSERT INTO BND DEFAULT VALUES RETURNING *"
-bound "RETURNING a COMPUTED column (engine evaluates it; fc would answer null-flag bytes)" \
+both "RETURNING a COMPUTED column (the engine evaluates it; fc answers it since 2026-09-27)" \
       "INSERT INTO BCMP DEFAULT VALUES RETURNING A, C"
 # both error, different vector: fire-crab has no -804 surface
 both "? = ? in the source refuses on BOTH (engine -804/HY004, fc generic)" \

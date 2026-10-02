@@ -423,21 +423,25 @@ both      "10 CONTROL N92 LIKE '1.50'  - the narrow numeric's rendered match" "S
 both      "10 CONTROL EXTRACT(YEAR FROM DT) = 2020 - a temporal FUNCTION is not a pattern" "SELECT ID FROM T WHERE EXTRACT(YEAR FROM DT) = 2020 ORDER BY ID"
 
 echo "--- 11. RECORDED, NOT FIXED"
-# CONTAINING over a temporal CONVERTS, exactly as LIKE does - it was a
-# recorded vector gap here until `serve-real-patternfam.sh` routed the
-# whole pattern family through one conversion, and the cell self-expired.
+# CONTAINING and SIMILAR TO over a temporal CONVERT, exactly as LIKE
+# does - both were recorded vector gaps here until the pattern family
+# was routed through one conversion, and all three cells self-expired.
+# SIMILAR TO now answers the engine's own 22018 rather than refusing:
+# the temporal operand is in the converting set (measured upstream in
+# `serve-real-numpattern.sh` SS 3 and 7).
 err_same  "11 DT CONTAINING '2020' - the needle converts, and a bare year is no date" "SELECT ID FROM T WHERE DT CONTAINING '2020'"
 both      "11 DT CONTAINING '15.01.2020' - ...while a convertible one answers through the render" "SELECT ID FROM T WHERE DT CONTAINING '15.01.2020' ORDER BY ID"
-err_differs "11 DT SIMILAR TO '2%'   - likewise" \
-            "SELECT ID FROM T WHERE DT SIMILAR TO '2%'" "22018" "42000"
+err_same  "11 DT SIMILAR TO '2%'   - likewise, and a wildcard cannot convert" "SELECT ID FROM T WHERE DT SIMILAR TO '2%'"
 # fire-crab knows the zone NAMES but not the tzdata RULES, so it cannot
 # render a value stored in a named zone other than GMT at all - which is
 # a boundary of its own, older than this law, and it costs these cells.
 # The PATTERN's half of the rule is proved by the GMT cells in §4.
-differs   "11 TSZ LIKE '2020-01-15 10:20:30 Europe/Bucharest' - row 4 is stored in a named zone this server cannot convert" \
-          "SELECT ID FROM T WHERE TSZ LIKE '2020-01-15 10:20:30 Europe/Bucharest' ORDER BY ID" "4" "(none)"
-differs   "11 TSZ LIKE '2020-01-15 10:20:30.0000 europe/bucharest' - and the canonicalised spelling of it" \
-          "SELECT ID FROM T WHERE TSZ LIKE '2020-01-15 10:20:30.0000 europe/bucharest' ORDER BY ID" "4" "(none)"
+# ...and row 4's REGION converts now, through the host's zone rules
+# (`serve-real-sessionclock.sh`), so these two are promoted
+both_is   "11 TSZ LIKE '2020-01-15 10:20:30 Europe/Bucharest' - row 4 stored in a named zone" \
+          "SELECT ID FROM T WHERE TSZ LIKE '2020-01-15 10:20:30 Europe/Bucharest' ORDER BY ID" "4"
+both_is   "11 TSZ LIKE '2020-01-15 10:20:30.0000 europe/bucharest' - and the canonicalised spelling of it" \
+          "SELECT ID FROM T WHERE TSZ LIKE '2020-01-15 10:20:30.0000 europe/bucharest' ORDER BY ID" "4"
 
 echo "--- 12. THE LAW IS A LITERAL'S, AND A BOUND ? IS NOT ONE"
 # Measured against the engine with node-firebird: a `?` pattern is NOT

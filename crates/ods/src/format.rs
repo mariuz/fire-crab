@@ -294,6 +294,8 @@ impl Value {
             Value::Float(f) => render_float(*f),
             Value::Rounded(raw, scale) if *scale > 0 => format!("{}{}", raw, "0".repeat(*scale as usize)),
             Value::Rounded(raw, scale) => render_scaled(*raw, *scale),
+            // the engine's own text for a boolean (CVT, and what a CAST to
+            // VARCHAR, LIKE, POSITION and SUBSTRING all see): upper case
             // THE ENGINE SPELLS A BOOLEAN IN CAPITALS EVERYWHERE it
             // renders one - `CAST(B AS VARCHAR(10))`, `B||'x'` and the
             // text a LIKE pattern is matched against are all TRUE/FALSE
@@ -308,14 +310,28 @@ impl Value {
             Value::Timestamp(d, t) => format!("{} {}", render_date(*d), render_time(*t)),
             Value::Blob(rel, num) => format!("<blob {}:{}>", rel, num),
             Value::Int128(v, scale) => render_scaled_i128(*v, *scale),
-            Value::DecFloat16(b) => crate::decfloat::to_string(&crate::decfloat::decode_dec64(*b)),
-            Value::DecFloat34(b) => crate::decfloat::to_string(&crate::decfloat::decode_dec128(*b)),
+            // a NaN keeps its FORM in its text - `sNaN`, `-NaN` - which
+            // the decoded value no longer carries (measured on 2182:
+            // `MAXVALUE(<stored sNaN>, 1) || 'x'` is sNaNx)
+            Value::DecFloat16(b) => match crate::decfloat::decode_dec64(*b) {
+                crate::decfloat::Dec::Nan => nan_text(b >> 63 == 1, (b >> 57) & 1 == 1),
+                d => crate::decfloat::to_string(&d),
+            },
+            Value::DecFloat34(b) => match crate::decfloat::decode_dec128(*b) {
+                crate::decfloat::Dec::Nan => nan_text(b >> 127 == 1, (b >> 121) & 1 == 1),
+                d => crate::decfloat::to_string(&d),
+            },
             Value::TimeTz(t, zone) => render_time_tz(*t, *zone),
             Value::TimestampTz(d, t, zone) => render_timestamp_tz(*d, *t, *zone),
             Value::Unsupported(t) => format!("<{}>", t),
             Value::OutOfRange => "<out-of-range>".into(),
         }
     }
+}
+
+/// A DECFLOAT NaN's text by its form: `NaN`, `sNaN`, `-NaN`, `-sNaN`.
+fn nan_text(neg: bool, signalling: bool) -> String {
+    format!("{}{}NaN", if neg { "-" } else { "" }, if signalling { "s" } else { "" })
 }
 
 /// An approximate value as the engine prints it: 8 SIGNIFICANT digits for
@@ -435,7 +451,8 @@ const DAY_UNITS: i64 = 24 * 60 * 60 * 10_000;
 /// are exact; a named zone without tzdata rules is rendered VISIBLY
 /// unconverted - never a silently wrong local time.
 fn render_time_tz(utc: u32, zone: u16) -> String {
-    match crate::tz::displacement(zone) {
+    // a region's TIME sits on the engine's base date (2020-01-01)
+    match crate::tz::time_displacement(zone, utc) {
         Some(disp) => {
             let local = (utc as i64 + disp as i64 * 600_000).rem_euclid(DAY_UNITS);
             format!("{} {}", render_time(local as u32), crate::tz::zone_text(zone))
@@ -447,7 +464,8 @@ fn render_time_tz(utc: u32, zone: u16) -> String {
 /// TIMESTAMP WITH TIME ZONE: local date and time (day carry applied),
 /// then the zone text - same conversion policy as [render_time_tz].
 fn render_timestamp_tz(date: i32, utc: u32, zone: u16) -> String {
-    match crate::tz::displacement(zone) {
+    // the instant is known, so a named zone converts through its rules
+    match crate::tz::displacement_at(zone, date, utc) {
         Some(disp) => {
             let t = utc as i64 + disp as i64 * 600_000;
             let local_date = date as i64 + t.div_euclid(DAY_UNITS);
@@ -874,6 +892,69 @@ pub fn relation_format_defaults(
         .collect()
 }
 
+/// The NEWEST format's default section, RAW: (field index, the
+/// default's own descriptor, its value bytes) - what an ALTER that
+/// mints the next format must carry forward, since a record stored
+/// before a defaulted NOT NULL field existed reads that field from the
+/// newest format's section, whatever else changed since (measured: the
+/// engine's format 4 of `P` still lists the defaults format 2 and 3
+/// added, after a nullable `ADD W` that contributed none).
+pub fn newest_format_default_section(
+    file: &crate::Image,
+    page_size: usize,
+    relation: u16,
+) -> Vec<(u16, Descriptor, Vec<u8>)> {
+    let sys = formats_table_format();
+    let tips = crate::tra::TipChain::read(file, page_size);
+    let mut best: Option<(i64, Vec<u8>)> = None;
+    for dp_no in relation_data_pages(file, page_size, REL_FORMATS) {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
+            continue;
+        };
+        for r in dp.records() {
+            let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else {
+                continue;
+            };
+            let row = decode_record(&image, &sys);
+            let (Value::Int(rel_id), Value::Int(fmt_no), Value::Blob(_, blob_recno)) =
+                (&row[0], &row[1], &row[2])
+            else {
+                continue;
+            };
+            if *rel_id as u16 != relation || best.as_ref().is_some_and(|(n, _)| *n >= *fmt_no) {
+                continue;
+            }
+            if let Some(blob) = read_blob(file, page_size, REL_FORMATS, *blob_recno, true) {
+                best = Some((*fmt_no, blob));
+            }
+        }
+    }
+    let Some((_, b)) = best else { return Vec::new() };
+    let mut out = Vec::new();
+    if b.len() < 2 {
+        return out;
+    }
+    let mut at = 2 + u16_at(&b, 0) as usize * 12;
+    if b.len() < at + 2 {
+        return out;
+    }
+    let n = u16_at(&b, at) as usize;
+    at += 2;
+    for _ in 0..n {
+        let Some(desc) = b.get(at + 2..at + 14).and_then(Descriptor::decode) else {
+            return out;
+        };
+        let field = u16_at(&b, at);
+        at += 14;
+        let Some(v) = b.get(at..at + desc.length as usize) else {
+            return out;
+        };
+        at += desc.length as usize;
+        out.push((field, desc, v.to_vec()));
+    }
+    out
+}
+
 pub fn relation_formats(
     file: &crate::Image,
     page_size: usize,
@@ -1196,6 +1277,23 @@ mod tests {
         assert_eq!(Value::Bool(false).render(), "FALSE");
     }
 
+    /// A rescale that keeps the storage word is judged against THAT word:
+    /// SMALLINT 32000 read as NUMERIC(4,2) is 3200000, past i16, and the
+    /// engine raises 22003 at the read (measured on 2182) - it wrapped to
+    /// -112.64 here. A value that fits is re-expressed.
+    #[test]
+    fn a_rescale_is_judged_by_the_new_storage_word() {
+        let d = |dtype: u8, scale: i8, length: u16| Descriptor { dtype, scale, length, sub_type: 0, flags: 0, offset: 4 };
+        let (s, n42) = (d(dtype::SHORT, 0, 2), d(dtype::SHORT, -2, 2));
+        assert_eq!(present_field(&Value::Int(32000), &s, &n42), Some(Value::OutOfRange));
+        assert_eq!(present_field(&Value::Int(327), &s, &n42), Some(Value::Scaled(32700, -2)));
+        let (i, n92) = (d(dtype::LONG, 0, 4), d(dtype::LONG, -2, 4));
+        assert_eq!(present_field(&Value::Int(30000000), &i, &n92), Some(Value::OutOfRange));
+        assert_eq!(present_field(&Value::Int(-21474836), &i, &n92), Some(Value::Scaled(-2147483600, -2)));
+        let n182 = d(dtype::INT64, -2, 8);
+        assert_eq!(present_field(&Value::Int(30000000), &i, &n182), Some(Value::Scaled(3000000000, -2)));
+    }
+
     #[test]
     fn per_page_formulas_match_ods_cpp() {
         // 8K pages: ((8192-32)*8/40) & ~7 = 1632; (8192-28)/17 = 480
@@ -1246,6 +1344,29 @@ fn rescale_present(raw: i128, from: i8, to: i8) -> Option<i128> {
 /// Everything else - a non-exact numeric with an unchanged type, a type
 /// change with no rule - is `None`, left as the record carries it.
 pub fn present_field(v: &Value, stored: &Descriptor, newest: &Descriptor) -> Option<Value> {
+    // an exact or FLOAT value under a DOUBLE PRECISION descriptor - an
+    // ALTER ... TYPE DOUBLE PRECISION over rows stored before it (the
+    // engine's MOV: INTEGER 7 reads 7.000000000000000, NUMERIC(9,2) 12.34
+    // reads 12.34)
+    if newest.dtype == dtype::DOUBLE && stored.dtype != dtype::DOUBLE {
+        return match v {
+            Value::Int(n) => Some(Value::Double(*n as f64)),
+            Value::Scaled(r, s) => Some(Value::Double(*r as f64 / 10f64.powi(-(*s as i32)))),
+            Value::Float(f) => Some(Value::Double(*f as f64)),
+            _ => None,
+        };
+    }
+    // a VARCHAR value under a CHAR descriptor pads to the new width, as
+    // the engine's MOV into CHAR does ('ab' -> 'ab    ' for CHAR(6)); a
+    // CHAR value under a VARCHAR keeps its pad (measured: CHAR(3) 'x'
+    // retyped to VARCHAR(4) reads 'x  ', CHAR_LENGTH 3)
+    if stored.dtype == dtype::VARYING && newest.dtype == dtype::TEXT {
+        let nw = crate::intl::char_length(newest.dtype, newest.length, newest.sub_type);
+        return match v {
+            Value::Text(t) => Some(Value::Text(crate::intl::fit_char(t, nw))),
+            _ => None,
+        };
+    }
     if stored.dtype == dtype::SQL_DATE && newest.dtype == dtype::TIMESTAMP {
         return match v {
             Value::Date(d) => Some(Value::Timestamp(*d, 0)),
@@ -1284,9 +1405,20 @@ pub fn present_field(v: &Value, stored: &Descriptor, newest: &Descriptor) -> Opt
         }
         Some(Value::Int128(n, to))
     } else {
+        // the rescaled mantissa must fit the NEW type's storage word, not
+        // just an i64 - the declared precision does not bound what the
+        // record holds, the word does (measured on 2182: SMALLINT 32000
+        // retyped to NUMERIC(4,2), INTEGER 30000000 to NUMERIC(9,2) and
+        // NUMERIC(3,1) 3276.7 to NUMERIC(4,2) each raise 22003 "numeric
+        // value is out of range" when the row is read, SUM too)
+        let fits = match newest.dtype {
+            dtype::SHORT => i16::try_from(n).is_ok(),
+            dtype::LONG => i32::try_from(n).is_ok(),
+            _ => i64::try_from(n).is_ok(),
+        };
         match i64::try_from(n) {
-            Ok(m) => Some(if to == 0 { Value::Int(m) } else { Value::Scaled(m, to) }),
-            Err(_) => Some(Value::OutOfRange),
+            Ok(m) if fits => Some(if to == 0 { Value::Int(m) } else { Value::Scaled(m, to) }),
+            _ => Some(Value::OutOfRange),
         }
     }
 }

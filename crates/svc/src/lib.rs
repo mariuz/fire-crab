@@ -1318,7 +1318,7 @@ mod tests {
 
     fn server() -> ServerInfo {
         ServerInfo {
-            server_version: "LI-V6.0.0.2076 Firebird 6.0 fire-crab".into(),
+            server_version: "LI-V6.0.0.2182 Firebird 6.0 fire-crab".into(),
             implementation: "Firebird/Linux/ARM64".into(),
             security_db: "/opt/firebird/security6.fdb".into(),
             root: "/opt/firebird/".into(),

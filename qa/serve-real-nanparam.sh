@@ -417,10 +417,10 @@ both             "4 CONTROL D > ? [-Inf] (engine -3;0;1;2;3;9)" "SELECT ID FROM 
 both             "4 CONTROL TI.D > ? [-Inf] - indexed, and it does NOT split (engine -3;0;1;2;3;9)" "SELECT ID FROM TI WHERE D > ? ORDER BY ID" '["#-Inf"]'
 both             "4 CONTROL ID < ? [+Inf] - an exact column against Infinity (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE ID < ? ORDER BY ID" '["#Inf"]'
 both             "4 CONTROL TI.ID > ? [-Inf] - indexed (engine -3;0;1;2;3;9)" "SELECT ID FROM TI WHERE ID > ? ORDER BY ID" '["#-Inf"]'
-both             "4 CONTROL a written CAST absorbs the NaN as 0: ID = CAST(? AS INTEGER) [NaN] (engine 0)" "SELECT ID FROM T WHERE ID = CAST(? AS INTEGER) ORDER BY ID" '["#NaN"]'
+both             "4 CONTROL a written CAST absorbs the NaN by the platform cast: ID = CAST(? AS INTEGER) [NaN] (ARM engine 0, x86 INT32_MIN: none)" "SELECT ID FROM T WHERE ID = CAST(? AS INTEGER) ORDER BY ID" '["#NaN"]'
 both             "4 CONTROL TI.ID = CAST(? AS INTEGER) [NaN] - indexed (engine 0)" "SELECT ID FROM TI WHERE ID = CAST(? AS INTEGER) ORDER BY ID" '["#NaN"]'
 
-echo "-- 4b. THE `IN`-LIST BOUNDARY, pinned so it fails loudly --"
+echo "-- 4b. THE 'IN'-LIST BOUNDARY, pinned so it fails loudly --"
 # THE ENGINE\'S `IN` IS NOT THE `OR` IT DESUGARS TO, for a NaN, and it is
 # not one alternative law but at least two.  Measured 2026-09-20 over
 # five literals in both written positions, three-item lists, and with

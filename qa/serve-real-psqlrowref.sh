@@ -240,20 +240,16 @@ both "G3 the untouched row"         "UPDATE AP SET ID = ID; SELECT ID, D, F FROM
 both "G4 committed"                 "UPDATE AP SET ID = ID; COMMIT; SELECT ID, D, F FROM LAP ORDER BY ID;"
 
 # ---------------------------------------------------------------- H
-# A RECORDED BOUNDARY, not a differential: a row reference whose type
-# has NO literal form yet - INT128 (NUMERIC over 18 digits), DECFLOAT,
-# a blob - refuses the whole statement. The ENGINE ANSWERS these, so
-# this is a GAP; what is asserted is that the refusal is CLEAN. It must
-# not half-write, and it must not fall back to the bare column name,
-# which is what it used to do (`SET N = N`, storing nothing and
-# reporting success).
-#
-# WHEN THE LITERAL LANDS THIS CHECK GOES RED. That is deliberate - it
-# is how the boundary gets unrecorded instead of quietly outliving the
-# limit that justified it.
+# A ROW REFERENCE OF A TYPE WITH NO LITERAL FORM refuses the whole
+# statement cleanly - it must not half-write, and it must not fall back
+# to the bare column name (`SET N = N`, storing nothing and reporting
+# success, which is what it used to do). INT128 has its literal now - a
+# typed CAST of its text - and answers what the engine answers
+# (measured on 2182: LNB's row 1 reads 12.3456, and a 28-digit
+# NUMERIC(38,4) arrives whole); DECFLOAT and a blob remain the gap.
 c=$(printf 'SET LIST ON;\nUPDATE NB SET ID = ID;\nCOMMIT;\nSELECT ID, N FROM LNB ORDER BY ID;\n' \
     | "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
-check "H1 int128 refuses, no write" "$c" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|ID 1|N 0.0000|ID 2|N 5.0000|"
+check "H1 an int128 row reference, written" "$c" "ID 1|N 12.3456|ID 2|N 5.0000|"
 
 # ---------------------------------------------------------------- I
 # THE TEXT PATH. Not every nested statement is rebuilt from a parsed

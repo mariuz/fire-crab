@@ -256,8 +256,8 @@ both "CTE literal: concat bytes"       "WITH Q AS (SELECT 'abc' AS C FROM RDB\$D
 # CHAR_LENGTH, CAST to OCTETS, CAST to VARCHAR, UPPER, qualified and
 # unqualified), and the DERIVED-TABLE twin of this very statement answers
 # correctly. The engine answers 4 and 61C3A96278.
-refuses "CTE + non-ASCII literal: octet_length" "WITH Q AS (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) SELECT OCTET_LENGTH(Q.C) FROM Q"
-refuses "CTE + non-ASCII literal: concat bytes" "WITH Q AS (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) SELECT CAST(Q.C || 'x' AS VARCHAR(32) CHARACTER SET OCTETS) FROM Q"
+both "CTE + non-ASCII literal: octet_length (answers since 2026-09-26)" "WITH Q AS (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) SELECT OCTET_LENGTH(Q.C) FROM Q"
+both "CTE + non-ASCII literal: concat bytes (answers since 2026-09-26)" "WITH Q AS (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) SELECT CAST(Q.C || 'x' AS VARCHAR(32) CHARACTER SET OCTETS) FROM Q"
 both "nested derived literal"          "SELECT OCTET_LENGTH(Z.C) FROM (SELECT * FROM (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) Y) Z"
 
 # The controls that keep section 7 honest - and two cells that are NOT

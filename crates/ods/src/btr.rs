@@ -94,6 +94,39 @@ pub const IRT_UNUSED: u8 = 0;
 pub const IRT_NORMAL: u8 = 3;
 /// `irt_drop` - a dropped index awaiting physical removal (ods.h:456).
 pub const IRT_DROP: u8 = 6;
+/// `irt_commit` - an index its transaction drops at commit (ods.h:455).
+pub const IRT_COMMIT: u8 = 5;
+
+impl IndexRootEntry {
+    /// Is this slot an index on its way out - INACTIVE or dropped? It is
+    /// `irt_drop`, or `irt_commit` under a transaction that has already
+    /// committed: the engine's own `alter index i37 inactive` leaves the
+    /// slot in irt_commit with its flags whole (measured on 2182: a
+    /// UNIQUE DESC index reads state 5, flags 0x0003, until a later
+    /// attachment settles it), and from then on the engine neither
+    /// retrieves through it nor enforces it (a duplicate id inserts).
+    /// Such a slot is still KEYED by every writer ([IndexRootPage::live_entries]).
+    pub fn is_dropping(&self, tips: Option<&crate::tra::TipChain>) -> bool {
+        self.state == IRT_DROP
+            || (self.state == IRT_COMMIT
+                && tips.and_then(|t| t.state(self.transaction)) == Some(crate::tip::TxState::Committed))
+    }
+}
+
+/// Put the index-root slot at byte `at` into `irt_drop` the way the
+/// engine's `setDrop` (ods.h:613) does: it clears `irt_unique |
+/// irt_foreign | irt_primary` and KEEPS every other flag. The tree lives
+/// on and every writer keeps keying it ([IndexRootPage::live_entries]),
+/// so `irt_descending` must survive: measured on 2182, `create desc
+/// index i34` then `alter index i34 inactive` leaves the slot's flags at
+/// 0x0002. Zeroing them (as both drop sites here did) turned a dropped
+/// DESC tree into an ascending one to every writer and reader after it,
+/// and fire-crab's retrievals through the column then missed rows.
+pub fn set_irt_drop(page: &mut [u8], at: usize) {
+    let flags = crate::u16_at(page, at + 18) & !(crate::btw::IRT_UNIQUE | crate::btw::IRT_FOREIGN | crate::btw::IRT_PRIMARY);
+    page[at + 18..at + 20].copy_from_slice(&flags.to_le_bytes());
+    page[at + 20] = IRT_DROP;
+}
 
 /// A b-tree bucket (`btree_page`, ods.h:296; offsets pinned by
 /// ods.h:312-324). Nodes begin after the jump table.
@@ -567,6 +600,20 @@ pub fn lookup_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// setDrop clears the enforcing flags and keeps irt_descending (2182:
+    /// a UNIQUE DESC index made inactive reads 0x0003, then 0x0002 once
+    /// dropped - a writer still keying the tree must key it descending)
+    #[test]
+    fn a_dropped_slot_keeps_its_descending_flag() {
+        let mut page = vec![0u8; 24 + 24];
+        let flags = crate::btw::IRT_UNIQUE | crate::btw::IRT_DESCENDING | crate::btw::IRT_PRIMARY;
+        page[24 + 18..24 + 20].copy_from_slice(&flags.to_le_bytes());
+        page[24 + 20] = IRT_NORMAL;
+        set_irt_drop(&mut page, 24);
+        assert_eq!(crate::u16_at(&page, 24 + 18), crate::btw::IRT_DESCENDING);
+        assert_eq!(page[24 + 20], IRT_DROP);
+    }
 
     fn recnos_of(r: Option<Vec<(Vec<u8>, u64)>>) -> Vec<u64> {
         r.unwrap().into_iter().map(|(_, n)| n).collect()

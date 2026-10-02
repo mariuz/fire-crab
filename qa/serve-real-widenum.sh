@@ -1,0 +1,412 @@
+#!/bin/bash
+# RESULT TYPING FOR WIDE NUMERICS: INT128 / NUMERIC(38) / DECFLOAT INTO
+# THE DblDec FUNCTIONS, THE STATISTICAL FOLDS, ABS, DECODE, AND THE
+# DOUBLE -> INT128 CONVERSION.
+#
+# Measured on engine 2182 and matched:
+#
+#   * SQRT / POWER / EXP / LN / LOG / LOG10 over an INT128-backed or
+#     DECFLOAT argument, with no approximate one, compute in DECIMAL128
+#     through decNumber's own routines and describe DECFLOAT(34)
+#     (SysFunction.cpp makeDblDecResult / evlPower etc.); this server
+#     answered a DOUBLE.  The engine's EXP is `e ** x` over a 34-digit e,
+#     so EXP(100) ends ...579964E+43, not the true ...580014;
+#   * PERCENTILE_CONT and the two-argument CORR / COVAR / REGR folds over
+#     such a FIRST argument fold in decimal128 and describe DECFLOAT(34)
+#     (this described DOUBLE or refused); VAR / STDDEV / PERCENTILE_DISC
+#     over a DECFLOAT EXPRESSION refused;
+#   * ABS widens SMALLINT -> INTEGER and INTEGER -> BIGINT for a cast and
+#     a literal too (only a column did), reads a TEXT as DOUBLE, keeps a
+#     DECFLOAT, and SUM over it widens from THAT (SUM(ABS(<INTEGER>)) is
+#     INT128 - this said INT64); a simple CASE / DECODE describes NULLABLE
+#     whatever its branches;
+#   * a DOUBLE converted to an INT128-backed exact at RUN TIME takes the
+#     engine's Int128::set(double) - defect included - so a double column
+#     holding 1e30 casts to 999999999994923055729694736384; a literal under
+#     an assignment to the target (a projection, an INSERT) is re-read from
+#     its text and exact, but in a UNION branch or an aggregate argument it
+#     is the double.  And a literal `1e37` IS the engine's double: one ULP
+#     above the nearest (cvt.cpp's own text-to-double).
+#
+#   * (the review round) a HAVING over a decimal128 fold compares the
+#     exact literal in DECIMAL (every group was silently dropped); a
+#     REGR_* whose covarPop / varPopX is 0 / 0 - a single row, a constant
+#     X - is the trapped invalid operation, 22000 (AggNodes.cpp
+#     `safeDivide` clears only the divide-by-zero); a DECFLOAT into an
+#     INT128 target is range-checked (22003) BEFORE the 34-digit quantize
+#     (22000), so 1E+34 never converts (cvt.cpp CVT_get_int128 /
+#     Int128::set); SIGN / ROUND / TRUNC / FLOOR / CEILING take a decfloat
+#     operand (evlRound is the INT128 route, evlTrunc's power of ten
+#     wraps in an INT64, ceil / floor are decQuadToIntegralValue); and a
+#     double literal under a CAST to DECFLOAT is re-read from its
+#     SPELLING (LiteralNode::pass2), a 16 / 17-digit spelling under an
+#     INT128 target too.
+#
+#   * (the merged-binary review) a DOUBLE conditional over an INT128 and a
+#     DOUBLE branch converts every branch value (VAR_POP / SUM / MAX over
+#     it read the INT128 rows as a decimal fold and answered 0 or 22003);
+#     a NEGATED double literal folds with its minus; the assignment fold
+#     reaches every double literal of an INT128 / DECFLOAT item - through
+#     a CAST TO DOUBLE, a sum, a nested cast - and no predicate's; a
+#     DECFLOAT(34) answer compares in an IN / ANY / ALL / scalar subquery
+#     and a DECFLOAT NaN there traps; a SUBNORMAL EXP / POWER rounds once
+#     at E-6176 (it clamped at E-6143); POWER / EXP / LOG / TRUNC of an
+#     Infinity and SQRT / LN / LOG10 / LOG of a NaN are decNumber's.
+#
+#   * (its review) the literal fold is the ASSIGNMENT TARGET's: a DML
+#     value's column, a derived table's / CTE's / subquery's outer item -
+#     no fold into a DOUBLE / VARCHAR / SMALLINT column or under an
+#     operator, a CAST TO DOUBLE, an aggregate, a WHERE / ON / GROUP BY,
+#     and a DECFLOAT column folds its literals as DECFLOAT (the cast's
+#     own target folded them everywhere at depth 1: a silent 0 for 1); a
+#     FLOAT conditional's exact branch converts too, and MAX over it
+#     describes FLOAT; two spellings of one value (1e37, 1.0e37, 10e36)
+#     fold as that value under an INT128 target (cvt.cpp's double).
+#
+# RECORDED, not fixed: a windowed decimal fold (`VAR_POP(I) OVER ()`), a
+# DECFLOAT / INT128 percentile fraction, DECODE with a mistyped search
+# value (the engine describes and raises at fetch; this refuses), a
+# VIEW's literal cast (the engine runs the double conversion there), a
+# decfloat beside a DOUBLE LITERAL (the same assignment fold), GROUP BY a
+# decfloat expression,
+# COVAR_POP(NULL, ..)'s TEXT NULL, and the sign of a decimal zero through
+# minus / multiply / TRUNC; a DECFLOAT scalar subquery in the select
+# list, a non-finite DECFLOAT folded into an IN list, a signalling or
+# negative NaN (neither has a form here: the CAST refuses), and a bare
+# literal cast under a VARCHAR item (it still folds by the CAST's
+# target); one derived column read by two consumers that disagree
+# (refused), and an INT128 item that is not a CAST (no fold here).
+#
+# Usage: qa/serve-real-widenum.sh [port]   (default 5890)
+set -u
+FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
+ISQL="${ISQL:-isql}"
+PORT="${1:-5890}"
+REAL="${FC_REAL_PORT:-3050}"
+U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
+D="/tmp/fbhandson"
+ENG="$D/widenum-eng.fdb"; FC="$D/widenum-fc.fdb"
+mkdir -p "$D"; rm -f "$ENG" "$FC"
+
+{ echo "CREATE DATABASE '127.0.0.1/$REAL:$ENG' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;"
+  cat <<'SQL'
+CREATE TABLE FX (ID INTEGER, I INT128, N NUMERIC(38,2), D DECFLOAT(16), D34 DECFLOAT(34), DBL DOUBLE PRECISION, NN INT128 NOT NULL, B BIGINT);
+INSERT INTO FX VALUES (1, 5, 2.00, 16, 2, 2.0, 7, 3);
+INSERT INTO FX VALUES (2, NULL, NULL, NULL, NULL, NULL, 9, NULL);
+CREATE TABLE BIG2 (ID INTEGER, M NUMERIC(38,0), I INT128, DF DECFLOAT(16), D34 DECFLOAT(34), N9 NUMERIC(9,2), N18 NUMERIC(18,2), B BIGINT, DBL DOUBLE PRECISION, S SMALLINT, N382 NUMERIC(38,2));
+INSERT INTO BIG2 VALUES (1, 1, 1, 1, 1, 1.5, 1.5, 1, 1.0, 1, 1.50);
+INSERT INTO BIG2 VALUES (2, 2, 2, 2, 2, 2.5, 2.5, 2, 2.0, 2, 2.50);
+INSERT INTO BIG2 VALUES (3, 4, 4, 4, 4, 4.5, 4.5, 4, 4.0, 4, 4.50);
+INSERT INTO BIG2 VALUES (4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+CREATE TABLE BIG0 (ID INTEGER, M NUMERIC(38,0), I INT128, DF DECFLOAT(16), D34 DECFLOAT(34));
+CREATE TABLE T (I INTEGER, B BIGINT, S SMALLINT, N NUMERIC(9,2), N18 NUMERIC(18,2), I128 INT128, DBL DOUBLE PRECISION, FLT FLOAT, DF DECFLOAT(16), NN INTEGER NOT NULL, V VARCHAR(5), N41 NUMERIC(4,1));
+INSERT INTO T VALUES (10, 20, 3, 1.5, 2.5, 7, -1.5, -2.5, -3.5, 4, '5', -1.5);
+INSERT INTO T VALUES (-10, -20, -3, -1.5, -2.5, -7, 1.5, 2.5, 3.5, 4, '-5', 1.5);
+CREATE TABLE DD (ID INTEGER, D DOUBLE PRECISION, F FLOAT);
+INSERT INTO DD VALUES (1, 1e30, 1e30);
+INSERT INTO DD VALUES (2, 1e20, 1e20);
+INSERT INTO DD VALUES (3, 1e25, 1e25);
+INSERT INTO DD VALUES (5, 18446744073709551616, 18446744073709551616);
+INSERT INTO DD VALUES (7, 1e18, 1e18);
+INSERT INTO DD VALUES (9, 123456789012345678901234567.0, 123456789012345678901234567.0);
+INSERT INTO DD VALUES (10, -1e30, -1e30);
+INSERT INTO DD VALUES (11, 1e37, 1e37);
+INSERT INTO DD VALUES (14, 2.5, 2.5);
+INSERT INTO DD VALUES (17, 18446744073709555712, 18446744073709555712);
+INSERT INTO DD VALUES (21, -1e25, -1e25);
+INSERT INTO DD VALUES (26, NULL, NULL);
+CREATE TABLE BIG3 (ID INTEGER, M NUMERIC(38,0), I INT128, B BIGINT, DBL DOUBLE PRECISION, F FLOAT);
+INSERT INTO BIG3 VALUES (1, 1, 1, 1, 1.0, 1.0);
+INSERT INTO BIG3 VALUES (2, 2, 2, 2, 2.0, 2.0);
+INSERT INTO BIG3 VALUES (3, 4, 4, 4, 4.0, 4.0);
+INSERT INTO BIG3 VALUES (4, NULL, NULL, NULL, NULL, NULL);
+CREATE TABLE T3 (ID INTEGER, DBL DOUBLE PRECISION, V VARCHAR(40), S SMALLINT, N18 NUMERIC(18,2), D34 DECFLOAT(34), I INT128, M NUMERIC(38,0), N382 NUMERIC(38,2));
+CREATE VIEW V1 AS SELECT CAST(1e30 AS NUMERIC(38,6)) X FROM RDB$DATABASE;
+COMMIT;
+SQL
+} | "$ISQL" -q -b -user "$U" -pas "$P" > /tmp/widenum-build.log 2>&1
+grep -qiE 'Statement failed|error' /tmp/widenum-build.log && { echo "FAIL fixture build"; sed 's/^/   /' /tmp/widenum-build.log; exit 1; }
+cp "$ENG" "$FC"; chmod 666 "$FC"
+
+"$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" > "/tmp/fc-serve-widenum-$PORT.log" 2>&1 & srv=$!
+trap 'kill $srv 2>/dev/null; rm -f "$ENG" "$FC"' EXIT
+i=0; while [ $i -lt 20 ]; do
+    kill -0 $srv 2>/dev/null || break
+    ( exec 3<>"/dev/tcp/127.0.0.1/$PORT" ) 2>/dev/null && break
+    i=$((i + 1)); sleep 0.1
+done
+kill -0 $srv 2>/dev/null || { echo "FAIL fcwire is not running - port $PORT already in use?"; exit 1; }
+
+fail=0
+ran=0
+# a SCRIPT (a session), its lines squeezed and joined; errors included,
+# so an error cell compares the engine's whole message
+sess() { printf '%s\n' "$2" | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
+    | grep -av '^ *$' | grep -av '^=' | grep -av '^After line' | sed 's/^ *//;s/ *$//;s/  */ /g' | paste -sd'|'; }
+# the describe: type, length, charset, nullability
+dsc() { printf 'SET SQLDA_DISPLAY ON;\n%s\n' "$2" | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 \
+    | grep -a 'sqltype' | sed 's/  */ /g' | paste -sd'|'; }
+# engine and this server print the same thing - value or error
+same() { # <label> <script>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(sess "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2")
+    if [ -z "$ev" ]; then echo "FAIL $1 - the engine printed nothing"; fail=1
+    elif [ "$ev" != "$fv" ]; then
+        echo "FAIL $1"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
+    else echo "OK   $1 [$ev]"; fi
+}
+# ...and the ENGINE is pinned too (the law, not just agreement)
+pin() { # <label> <script> <engine-output>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(sess "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2")
+    if [ "$ev" != "$3" ]; then echo "FAIL $1 - THE ENGINE ANSWERS [$ev], not the pinned [$3]"; fail=1
+    elif [ "$ev" != "$fv" ]; then
+        echo "FAIL $1"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
+    else echo "OK   $1 [$ev]"; fi
+}
+# the same describe, pinned
+dpin() { # <label> <select> <engine-describe>
+    ran=$((ran + 1))
+    local ed fd
+    ed=$(dsc "127.0.0.1/$REAL:$ENG" "$2"); fd=$(dsc "127.0.0.1/$PORT:$FC" "$2")
+    if [ "$ed" != "$3" ]; then echo "FAIL $1 - THE ENGINE DESCRIBES [$ed], not the pinned [$3]"; fail=1
+    elif [ "$ed" != "$fd" ]; then echo "FAIL $1"; echo "     eng=[$ed]"; echo "     fc =[$fd]"; fail=1
+    else echo "OK   $1 [$ed]"; fi
+}
+# the engine answers (pinned) and this server REFUSES - recorded
+refused() { # <label> <script> <engine-output>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(sess "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2")
+    if [ "$ev" != "$3" ]; then echo "FAIL $1 - THE ENGINE ANSWERS [$ev], not the pinned [$3]"; fail=1
+    elif [ "${fv#*SQLSTATE = 42000}" = "$fv" ]; then echo "FAIL $1 - this server no longer refuses: [$fv]; promote the cell"; fail=1
+    else echo "OK   $1 (recorded: the engine answers [${ev:0:80}], this server refuses)"; fi
+}
+# both answer, DIFFERENTLY - recorded (the engine pinned)
+differs() { # <label> <script> <engine-output> <fc-output>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(sess "127.0.0.1/$REAL:$ENG" "$2"); fv=$(sess "127.0.0.1/$PORT:$FC" "$2")
+    if [ "$ev" != "$3" ]; then echo "FAIL $1 - THE ENGINE ANSWERS [$ev], not the pinned [$3]"; fail=1
+    elif [ "$fv" != "$4" ]; then echo "FAIL $1 - this server answers [$fv], not the recorded [$4]"; fail=1
+    else echo "OK   $1 (recorded: engine [${ev:0:60}], this server [${fv:0:60}])"; fi
+}
+DUAL='FROM RDB$DATABASE'
+D34='01: sqltype: 32762 DECFLOAT(34) scale: 0 subtype: 0 len: 16'
+D34N='01: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16'
+DBL='01: sqltype: 480 DOUBLE scale: 0 subtype: 0 len: 8'
+DBLN='01: sqltype: 480 DOUBLE Nullable scale: 0 subtype: 0 len: 8'
+EVAL='Statement failed, SQLSTATE = 42000|expression evaluation not supported'
+E22003='Statement failed, SQLSTATE = 22003|arithmetic exception, numeric overflow, or string truncation|-numeric value is out of range'
+E22000='Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.'
+EFLOAT='Statement failed, SQLSTATE = 22000|Floating-point invalid operand. An indeterminant error occurred during a floating-point operation.'
+E22012='Statement failed, SQLSTATE = 22012|Decimal float divide by zero. The code attempted to divide a DECFLOAT value by zero.'
+
+echo "--- 1. THE DblDec FUNCTIONS OVER INT128 / NUMERIC(38) / DECFLOAT: DECFLOAT(34), decNumber's digits"
+dpin "1 POWER(<INT128>, 30) describes DECFLOAT(34)" "SELECT POWER(CAST(10 AS INT128), 30) $DUAL;" "$D34"
+pin  "1 ...and answers the exact power" "SELECT POWER(CAST(10 AS INT128), 30) $DUAL;" "POWER|1000000000000000000000000000000"
+pin  "1 EXP(<INT128> 1) is the engine's 34-digit e" "SELECT EXP(CAST(1 AS INT128)) $DUAL;" "EXP|2.718281828459045235360287471352662"
+pin  "1 EXP(100) is e ** 100 over that e (not exp(100))" "SELECT EXP(CAST(100 AS INT128)) $DUAL;" "EXP|2.688117141816135448412625551579964E+43"
+pin  "1 SQRT / LN over NUMERIC(38,0) and INT128" "SELECT SQRT(CAST(2 AS NUMERIC(38,0))), LN(CAST(10 AS INT128)) $DUAL;" "SQRT LN|1.414213562373095048801688724209698 2.302585092994045684017991454684364"
+pin  "1 POWER keeps the operand cohort: 10.00 ** 3 is 1000.000000" "SELECT POWER(CAST(10 AS NUMERIC(38,2)), 3) $DUAL;" "POWER|1000.000000"
+pin  "1 an INT128 EXPONENT decides too" "SELECT POWER(10, CAST(3 AS INT128)), POWER(CAST(2 AS BIGINT), CAST(3 AS INT128)) $DUAL;" "POWER POWER|1000 8"
+pin  "1 CONTROL a BIGINT base and an INTEGER exponent stay DOUBLE" "SELECT POWER(CAST(2 AS BIGINT), 10) $DUAL;" "POWER|1024.000000000000"
+dpin "1 ...described DOUBLE" "SELECT POWER(CAST(2 AS BIGINT), 10) $DUAL;" "$DBL"
+pin  "1 DECFLOAT(16) and (34) arguments" "SELECT SQRT(CAST(2 AS DECFLOAT(16))), EXP(CAST(1 AS DECFLOAT(16))), SQRT(CAST(2 AS DECFLOAT(34))) $DUAL;" "SQRT EXP SQRT|1.414213562373095048801688724209698 2.718281828459045235360287471352662 1.414213562373095048801688724209698"
+pin  "1 LOG / LOG10: an exact division is short, an inexact one 34 digits" "SELECT LOG(CAST(10 AS INT128), 100), LOG10(CAST(1000 AS INT128)), LOG(CAST(10 AS INT128), CAST(1000 AS INT128)), LOG(CAST(2 AS INT128), 10) $DUAL;" "LOG LOG10 LOG LOG|2 3 3.000000000000000000000000000000000 3.321928094887362347870319429489390"
+pin  "1 CONTROL SIN / FLOOR / ABS / SIGN / MOD over INT128 keep their own types" "SELECT SIN(CAST(1 AS INT128)), FLOOR(CAST(1 AS INT128)), ABS(CAST(-1 AS INT128)), SIGN(CAST(-1 AS INT128)), MOD(CAST(10 AS INT128), 3) $DUAL;" "SIN FLOOR ABS SIGN MOD|0.8414709848078965 1 1 -1 1"
+pin  "1 over columns: nullability follows the operand" "SELECT SQRT(I), SQRT(NN), POWER(NN, 2), POWER(I, NN), EXP(D), LN(N), LOG(NN, D34), LOG10(NN) FROM FX ORDER BY ID;" "SQRT SQRT POWER POWER EXP LN LOG LOG10|2.236067977499789696409173668731276 2.645751311064590590501615753639260 49 78125 8886110.520507872636763023740781424 0.6931471805599453094172321214581766 0.3562071871080221765141770780012905 0.8450980400142568307122162585926362|<null> 3 81 <null> <null> <null> <null> 0.9542425094393248745900558065102306"
+dpin "1 ...SQRT(<NOT NULL INT128>) describes NOT nullable" "SELECT SQRT(NN), SQRT(I) FROM FX;" "$D34|02: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16"
+pin  "1 an APPROXIMATE argument wins: DOUBLE" "SELECT POWER(I, 2.5e0), POWER(DBL, I) FROM FX WHERE ID = 1;" "POWER POWER|55.90169943749474 32.00000000000000"
+dpin "1 ...described DOUBLE beside a decimal sibling" "SELECT POWER(I, 2.5e0), POWER(I, D), LOG(I, 8), LOG(2, I) FROM FX WHERE ID = 1;" "$DBLN|02: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16|03: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16|04: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16"
+pin  "1 ...their values" "SELECT POWER(I, D), POWER(B, I), LOG(I, 8), LOG(2, I) FROM FX WHERE ID = 1;" "POWER POWER LOG LOG|152587890625 243 1.292029674220179152010319706291897 2.321928094887362347870319429489391"
+pin  "1 NULL propagates" "SELECT SQRT(CAST(NULL AS INT128)), POWER(I, NULL), POWER(NULL, I) FROM FX WHERE ID = 1;" "SQRT POWER POWER|<null> <null> <null>"
+pin  "1 SQRT of a negative INT128 is the domain refusal" "SELECT SQRT(CAST(-1 AS INT128)) $DUAL;" "SQRT|$EVAL|-Argument for SQRT must be zero or positive"
+pin  "1 LN of zero / negative" "SELECT LN(CAST(0 AS INT128)) $DUAL;" "LN|$EVAL|-Argument for LN must be positive"
+pin  "1 LOG: base first, then the argument" "SELECT LOG(CAST(-2 AS INT128), 10) $DUAL;" "LOG|$EVAL|-Base for LOG must be positive"
+pin  "1 LOG(1, x) divides by ln(1): the decimal divide by zero" "SELECT LOG(CAST(1 AS INT128), 10) $DUAL;" "LOG|Statement failed, SQLSTATE = 22012|Decimal float divide by zero. The code attempted to divide a DECFLOAT value by zero."
+pin  "1 0 ** -1 is an untrapped Infinity" "SELECT POWER(CAST(0 AS INT128), -1) $DUAL;" "POWER|Infinity"
+pin  "1 a negative base to a fractional power is invalid" "SELECT POWER(CAST(-2 AS INT128), 0.5) $DUAL;" "POWER|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation."
+pin  "1 0 ** 0 too" "SELECT POWER(CAST(0 AS INT128), 0) $DUAL;" "POWER|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation."
+pin  "1 ...but an odd integer power keeps the sign" "SELECT POWER(CAST(-2 AS INT128), 3) $DUAL;" "POWER|-8"
+pin  "1 the decimal128 overflow: 10 ** 6145" "SELECT POWER(CAST(10 AS INT128), 6145) $DUAL;" "POWER|Statement failed, SQLSTATE = 22003|Decimal float overflow. The exponent of a result is greater than the magnitude allowed."
+pin  "1 ...and 10 ** 6144 fits, clamped" "SELECT POWER(CAST(10 AS INT128), 6144) $DUAL;" "POWER|1.000000000000000000000000000000000E+6144"
+pin  "1 EXP far out: no overflow at 10000, tiny at -10000" "SELECT EXP(CAST(10000 AS INT128)), EXP(CAST(-10000 AS INT128)) $DUAL;" "EXP EXP|8.806818225662921587261496007628434E+4342 1.135483865314736098540938875068328E-4343"
+pin  "1 34 digits exactly, then rounding into E form" "SELECT POWER(CAST(2 AS INT128), 100), POWER(CAST(2 AS INT128), 120), POWER(CAST(10 AS INT128), 33), POWER(CAST(10 AS INT128), 34) $DUAL;" "POWER POWER POWER POWER|1267650600228229401496703205376 1.329227995784915872903807060280345E+36 1000000000000000000000000000000000 1.000000000000000000000000000000000E+34"
+pin  "1 fractional exponents: exp(ln(x) * y) at 44 digits" "SELECT POWER(CAST(2.5 AS NUMERIC(38,1)), 3), POWER(CAST(7 AS INT128), CAST(2.5 AS NUMERIC(38,1))), POWER(CAST(1.1 AS DECFLOAT(16)), 100), POWER(CAST(16 AS DECFLOAT(16)), 0.5) $DUAL;" "POWER POWER POWER POWER|15.625 129.6418142421649389345791719283238 13780.61233982227018411833717208964 4.000000000000000000000000000000000"
+pin  "1 SQRT: an exact root trims to the ideal exponent" "SELECT SQRT(CAST(16 AS INT128)), SQRT(CAST(100 AS NUMERIC(38,2))), SQRT(CAST(0 AS INT128)), SQRT(CAST(123456789012345678901234567890123 AS INT128)) $DUAL;" "SQRT SQRT SQRT SQRT|4 10.0 0 11111111061111110.99361111058186109"
+pin  "1 LN of 2.00 takes the Newton loop, LN(2) the constant - same digits" "SELECT LN(CAST(2 AS NUMERIC(38,2))), LN(CAST(2 AS INT128)), LN(CAST(1 AS INT128)), LN(CAST(123456789012345678901234567890 AS INT128)) $DUAL;" "LN LN LN LN|0.6931471805599453094172321214581766 0.6931471805599453094172321214581766 0 66.98568871914297739757675389633419"
+pin  "1 EXP over NUMERIC(38,1) and negative" "SELECT EXP(CAST(0 AS INT128)), EXP(CAST(2 AS NUMERIC(38,1))), EXP(CAST(-1 AS INT128)) $DUAL;" "EXP EXP EXP|1 7.389056098930650227230427460575005 0.3678794411714423215955237701614609"
+pin  "1 the result in arithmetic, a CAST, a compare, a fold" "SELECT SQRT(I) + 1, CAST(SQRT(I) AS NUMERIC(18,6)), SQRT(I) * I, SQRT(I) > 2 FROM FX WHERE ID = 1;" "ADD CAST MULTIPLY BOOL|3.236067977499789696409173668731276 2.236068 11.18033988749894848204586834365638 <true>"
+pin  "1 SUM / AVG / MAX over it are DECFLOAT(34)" "SELECT SUM(SQRT(I)), AVG(POWER(I, 2)), MAX(EXP(D34)) FROM FX;" "SUM AVG MAX|2.236067977499789696409173668731276 25 7.389056098930650227230427460575005"
+dpin "1 ...described so" "SELECT SUM(SQRT(I)), AVG(POWER(I, 2)), MAX(EXP(D34)) FROM FX;" "$D34N|02: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16|03: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16"
+
+echo "--- 2. THE STATISTICAL FOLDS AND PERCENTILE_CONT OVER INT128 / DECFLOAT: DECFLOAT(34)"
+dpin "2 PERCENTILE_CONT over NUMERIC(38,0) describes DECFLOAT(34) nullable" "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY M) FROM BIG2;" "$D34N"
+pin  "2 ...its value, and over INT128 / DECFLOAT(16) / DECFLOAT(34)" "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY M), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY DF), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY D34) FROM BIG2;" "PERCENTILE_CONT PERCENTILE_CONT PERCENTILE_CONT PERCENTILE_CONT|2 2 2 2"
+pin  "2 CONTROL over NUMERIC(9,2) / BIGINT / DOUBLE / SMALLINT it is a DOUBLE" "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY N9), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY B), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY DBL), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY S) FROM BIG2;" "PERCENTILE_CONT PERCENTILE_CONT PERCENTILE_CONT PERCENTILE_CONT|2.500000000000000 2.000000000000000 2.000000000000000 2.000000000000000"
+pin  "2 a fractional rank interpolates through the 17-digit double weights" "SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY I), PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY I), PERCENTILE_CONT(0.1) WITHIN GROUP (ORDER BY I), PERCENTILE_CONT(0) WITHIN GROUP (ORDER BY I), PERCENTILE_CONT(1) WITHIN GROUP (ORDER BY I), PERCENTILE_CONT(0.1) WITHIN GROUP (ORDER BY DF) FROM BIG2;" "PERCENTILE_CONT PERCENTILE_CONT PERCENTILE_CONT PERCENTILE_CONT PERCENTILE_CONT PERCENTILE_CONT|1.50000000000000000 3.00000000000000000 1.19999999999999996 1 4 1.19999999999999996"
+pin  "2 ...the DOUBLE fold prints 1.200000000000000 beside a decimal one" "SELECT PERCENTILE_CONT(0.1) WITHIN GROUP (ORDER BY DBL), PERCENTILE_CONT(0.1) WITHIN GROUP (ORDER BY B), PERCENTILE_CONT(1.0/3) WITHIN GROUP (ORDER BY I) FROM BIG2;" "PERCENTILE_CONT PERCENTILE_CONT PERCENTILE_CONT|1.200000000000000 1.200000000000000 1.60000000000000009"
+pin  "2 PERCENTILE_DISC keeps the order value's type" "SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY M), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY DF), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY D34), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY N9) FROM BIG2;" "PERCENTILE_DISC PERCENTILE_DISC PERCENTILE_DISC PERCENTILE_DISC|2 2 2 2.50"
+dpin "2 ...described: INT128 sub_type 1, DECFLOAT(16), DECFLOAT(34), LONG" "SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY M), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY DF), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY D34), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY N9) FROM BIG2;" "01: sqltype: 32752 INT128 Nullable scale: 0 subtype: 1 len: 16|02: sqltype: 32760 DECFLOAT(16) Nullable scale: 0 subtype: 0 len: 8|03: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16|04: sqltype: 496 LONG Nullable scale: -2 subtype: 1 len: 4"
+pin  "2 an EXPRESSION order: a CAST to INT128 / DECFLOAT, arithmetic" "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY CAST(ID AS INT128)), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I + 1), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY CAST(ID AS DECFLOAT(16))), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY I * 2), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY CAST(ID AS DECFLOAT(34))) FROM BIG2;" "PERCENTILE_CONT PERCENTILE_CONT PERCENTILE_DISC PERCENTILE_DISC PERCENTILE_CONT|2.50000000000000000 3 2 4 2.50000000000000000"
+dpin "2 ...described" "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY CAST(ID AS INT128)), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY CAST(ID AS DECFLOAT(16))), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY I * 2) FROM BIG2;" "$D34N|02: sqltype: 32760 DECFLOAT(16) Nullable scale: 0 subtype: 0 len: 8|03: sqltype: 32752 INT128 Nullable scale: 0 subtype: 0 len: 16"
+pin  "2 DESC orders" "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I DESC), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY M DESC), PERCENTILE_CONT(0.3) WITHIN GROUP (ORDER BY I DESC) FROM BIG2;" "PERCENTILE_CONT PERCENTILE_DISC PERCENTILE_CONT|2 2 2.79999999999999982"
+pin  "2 VAR / STDDEV over a DECFLOAT EXPRESSION (refused): the engine's STDDEV_POP is the variance" "SELECT STDDEV_POP(CAST(ID AS DECFLOAT(16))), VAR_POP(CAST(ID AS DECFLOAT(34))), STDDEV_SAMP(DF + 1), VAR_POP(I * 2), VAR_POP(CAST(ID AS INT128)), VAR_SAMP(M + M) FROM BIG2;" "STDDEV_POP VAR_POP STDDEV_SAMP VAR_POP VAR_POP VAR_SAMP|1.25 1.25 1.527525231651946668862682397909337 6.222222222222222222222222222222223 1.25 9.333333333333333333333333333333335"
+dpin "2 ...DECFLOAT(34) NOT nullable" "SELECT STDDEV_POP(CAST(ID AS DECFLOAT(16))), VAR_SAMP(M + M) FROM BIG2;" "$D34|02: sqltype: 32762 DECFLOAT(34) scale: 0 subtype: 0 len: 16"
+pin  "2 the two-argument folds: the FIRST argument types them" "SELECT CORR(ID, M), CORR(M, ID), COVAR_POP(ID, M), COVAR_POP(M, ID), COVAR_SAMP(M, ID), COVAR_SAMP(ID, M), REGR_SLOPE(ID, M), REGR_INTERCEPT(M, ID), REGR_R2(ID, I) FROM BIG2;" "CORR CORR COVAR_POP COVAR_POP COVAR_SAMP COVAR_SAMP REGR_SLOPE REGR_INTERCEPT REGR_R2|0.9819805060619656 0.9819805060619657156974386843702867 1.000000000000000 1 1.5 1.500000000000000 0.6428571428571427 -0.666666666666666666666666666666667 0.9642857142857141"
+dpin "2 ...DOUBLE / DECFLOAT(34) by that argument, none nullable" "SELECT CORR(ID, M), CORR(M, ID), COVAR_SAMP(M, ID), REGR_R2(ID, I) FROM BIG2;" "$DBL|02: sqltype: 32762 DECFLOAT(34) scale: 0 subtype: 0 len: 16|03: sqltype: 32762 DECFLOAT(34) scale: 0 subtype: 0 len: 16|04: sqltype: 480 DOUBLE scale: 0 subtype: 0 len: 8"
+pin  "2 REGR_AVGX / AVGY / SXX / SXY / SYY / COUNT both ways round" "SELECT REGR_AVGX(M, ID), REGR_AVGY(ID, M), REGR_SXX(M, ID), REGR_SXY(ID, M), REGR_SYY(M, ID), REGR_COUNT(M, ID), REGR_AVGX(ID, M), REGR_AVGY(M, ID), REGR_SXX(ID, M) FROM BIG2;" "REGR_AVGX REGR_AVGY REGR_SXX REGR_SXY REGR_SYY REGR_COUNT REGR_AVGX REGR_AVGY REGR_SXX|2 2.000000000000000 2 3.000000000000000 4.66666666666666666666666666666667 3 2.333333333333333 2.333333333333333333333333333333333 4.666666666666668"
+pin  "2 a DOUBLE second argument converts at 17 digits; a DECFLOAT first one decides" "SELECT CORR(DBL, M), CORR(M, DBL), CORR(DF, ID), CORR(ID, DF), CORR(D34, DF), COVAR_POP(DF, I), REGR_SLOPE(DBL, I), REGR_SXY(I, DBL), REGR_AVGX(I, DBL) FROM BIG2;" "CORR CORR CORR CORR CORR COVAR_POP REGR_SLOPE REGR_SXY REGR_AVGX|1.000000000000000 1 0.9819805060619657156974386843702867 0.9819805060619656 1 1.555555555555555555555555555555557 1.000000000000000 4.66666666666666666666666666666667 2.333333333333333333333333333333333"
+pin  "2 REGR_SLOPE / INTERCEPT / AVGY / R2 over INT128 and the NUMERIC(9,2) controls" "SELECT REGR_SLOPE(M, ID), REGR_INTERCEPT(ID, M), REGR_AVGY(M, ID), REGR_R2(M, M), REGR_SXX(N9, ID), COVAR_POP(N18, B), CORR(B, N18), CORR(S, S) FROM BIG2;" "REGR_SLOPE REGR_INTERCEPT REGR_AVGY REGR_R2 REGR_SXX COVAR_POP CORR CORR|1.500000000000000000000000000000000 0.5000000000000002 2.333333333333333333333333333333333 1 2.000000000000000 1.555555555555556 1.000000000000000 1.000000000000000"
+pin  "2 an EMPTY set: NULL percentiles, the not-null folds' zero" "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY I), VAR_POP(I), STDDEV_SAMP(D34), CORR(M, ID), COVAR_POP(I, I), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY DF) FROM BIG0;" "PERCENTILE_CONT PERCENTILE_DISC VAR_POP STDDEV_SAMP CORR COVAR_POP PERCENTILE_CONT|<null> <null> 0E-6176 0E-6176 0E-6176 0E-6176 <null>"
+pin  "2 CONTROL AVG / SUM keep their own widening" "SELECT AVG(I), SUM(I), AVG(M), SUM(M), AVG(DF), SUM(D34) FROM BIG2;" "AVG SUM AVG SUM AVG SUM|2 7 2 7 2.333333333333333 7"
+pin  "2 grouped" "SELECT ID, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I), CORR(M, ID) FROM BIG2 GROUP BY ID ORDER BY ID;" "ID PERCENTILE_CONT CORR|1 1 0E-6176|2 2 0E-6176|3 4 0E-6176|4 <null> 0E-6176"
+
+echo "--- 3. ABS AND DECODE: the widening, the nullability, the SUM over them"
+dpin "3 ABS widens SMALLINT -> LONG, INTEGER -> INT64, keeps BIGINT / NUMERIC(18) / INT128 / DOUBLE / FLOAT / DECFLOAT(16)" "SELECT ABS(S), ABS(I), ABS(B), ABS(N), ABS(N18), ABS(I128), ABS(DBL), ABS(FLT), ABS(DF), ABS(N41), ABS(NN) FROM T;" "01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|02: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|03: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|04: sqltype: 580 INT64 Nullable scale: -2 subtype: 0 len: 8|05: sqltype: 580 INT64 Nullable scale: -2 subtype: 1 len: 8|06: sqltype: 32752 INT128 Nullable scale: 0 subtype: 0 len: 16|07: sqltype: 480 DOUBLE Nullable scale: 0 subtype: 0 len: 8|08: sqltype: 482 FLOAT Nullable scale: 0 subtype: 0 len: 4|09: sqltype: 32760 DECFLOAT(16) Nullable scale: 0 subtype: 0 len: 8|10: sqltype: 496 LONG Nullable scale: -1 subtype: 0 len: 4|11: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8"
+pin  "3 ...their values (ABS of a DECFLOAT refused)" "SELECT ABS(S), ABS(I), ABS(B), ABS(N), ABS(N18), ABS(I128), ABS(DBL), ABS(FLT), ABS(DF), ABS(N41), ABS(NN) FROM T;" "ABS ABS ABS ABS ABS ABS ABS ABS ABS ABS ABS|3 10 20 1.50 2.50 7 1.500000000000000 2.5000000 3.5 1.5 4|3 10 20 1.50 2.50 7 1.500000000000000 2.5000000 3.5 1.5 4"
+dpin "3 a literal, NULL, a TEXT (DOUBLE), a CAST: the same one-step widening" "SELECT ABS(1), ABS(1.5), ABS(NULL), ABS('5'), ABS(V), ABS(CAST(1.5 AS NUMERIC(4,1))), ABS(CAST(-100000 AS NUMERIC(9,3))), ABS(CAST(1 AS NUMERIC(18,4))) FROM T;" "01: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8|02: sqltype: 580 INT64 scale: -1 subtype: 0 len: 8|03: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|04: sqltype: 480 DOUBLE scale: 0 subtype: 0 len: 8|05: sqltype: 480 DOUBLE Nullable scale: 0 subtype: 0 len: 8|06: sqltype: 496 LONG scale: -1 subtype: 0 len: 4|07: sqltype: 580 INT64 scale: -3 subtype: 0 len: 8|08: sqltype: 580 INT64 scale: -4 subtype: 1 len: 8"
+pin  "3 ...their values" "SELECT ABS(1), ABS(1.5), ABS(NULL), ABS('5'), ABS(V), ABS(CAST(1.5 AS NUMERIC(4,1))), ABS(CAST(-100000 AS NUMERIC(9,3))), ABS(CAST(1 AS NUMERIC(18,4))) FROM T;" "ABS ABS ABS ABS ABS ABS ABS ABS|1 1.5 <null> 5.000000000000000 5.000000000000000 1.5 100000.000 1.0000|1 1.5 <null> 5.000000000000000 5.000000000000000 1.5 100000.000 1.0000"
+dpin "3 SUM widens from what ABS answers: SUM(ABS(<INTEGER>)) is INT128" "SELECT SUM(ABS(S)), SUM(ABS(I)), SUM(ABS(B)), SUM(ABS(N)), SUM(ABS(N18)), SUM(ABS(I128)), SUM(ABS(DBL)), SUM(ABS(DF)), SUM(ABS(N41)), SUM(ABS(NN)), SUM(ABS(V)) FROM T;" "01: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|02: sqltype: 32752 INT128 Nullable scale: 0 subtype: 0 len: 16|03: sqltype: 32752 INT128 Nullable scale: 0 subtype: 0 len: 16|04: sqltype: 32752 INT128 Nullable scale: -2 subtype: 0 len: 16|05: sqltype: 32752 INT128 Nullable scale: -2 subtype: 1 len: 16|06: sqltype: 32752 INT128 Nullable scale: 0 subtype: 0 len: 16|07: sqltype: 480 DOUBLE Nullable scale: 0 subtype: 0 len: 8|08: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16|09: sqltype: 580 INT64 Nullable scale: -1 subtype: 0 len: 8|10: sqltype: 32752 INT128 Nullable scale: 0 subtype: 0 len: 16|11: sqltype: 480 DOUBLE Nullable scale: 0 subtype: 0 len: 8"
+pin  "3 ...their values" "SELECT SUM(ABS(S)), SUM(ABS(I)), SUM(ABS(B)), SUM(ABS(N)), SUM(ABS(N18)), SUM(ABS(I128)), SUM(ABS(DBL)), SUM(ABS(DF)), SUM(ABS(N41)), SUM(ABS(NN)), SUM(ABS(V)) FROM T;" "SUM SUM SUM SUM SUM SUM SUM SUM SUM SUM SUM|6 20 40 3.00 5.00 14 3.000000000000000 7.0 3.0 8 10.00000000000000"
+dpin "3 AVG keeps INT64; MIN / MAX / COUNT; ABS(I) / 3 is INT128" "SELECT AVG(ABS(I)), AVG(ABS(S)), AVG(ABS(N)), AVG(ABS(B)), SUM(ABS(I) + 1), MIN(ABS(I)), MAX(ABS(N)), SUM(ABS(I) * 2), COUNT(ABS(I)) FROM T;" "01: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|02: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|03: sqltype: 580 INT64 Nullable scale: -2 subtype: 0 len: 8|04: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|05: sqltype: 32752 INT128 Nullable scale: 0 subtype: 0 len: 16|06: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|07: sqltype: 580 INT64 Nullable scale: -2 subtype: 0 len: 8|08: sqltype: 32752 INT128 Nullable scale: 0 subtype: 0 len: 16|09: sqltype: 580 INT64 scale: 0 subtype: 0 len: 8"
+dpin "3 ...arithmetic over ABS" "SELECT ABS(I) + 1, ABS(S) * 2, ABS(N) - 1, ABS(I) / 3, -ABS(I), ABS(ABS(S)), ABS(I) + ABS(S) FROM T;" "01: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|02: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|03: sqltype: 580 INT64 Nullable scale: -2 subtype: 0 len: 8|04: sqltype: 32752 INT128 Nullable scale: 0 subtype: 0 len: 16|05: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|06: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8|07: sqltype: 580 INT64 Nullable scale: 0 subtype: 0 len: 8"
+pin  "3 ...and the values, grouped and windowed" "SELECT SUM(ABS(I)) FROM T GROUP BY ABS(S); SELECT SUM(ABS(I)) OVER (), AVG(ABS(B)) OVER () FROM T; SELECT ABS(I) FROM T WHERE ABS(I) > 5 ORDER BY ABS(I) DESC;" "SUM|20|SUM AVG|20 20|20 20|ABS|10|10"
+pin  "3 the BIGINT minimum has no ABS" "SELECT ABS(CAST(-9223372036854775808 AS BIGINT)) $DUAL;" "ABS|$E22003"
+dpin "3 a simple CASE / DECODE describes NULLABLE whatever its branches; the searched CASE / IIF follow them" "SELECT DECODE(I, 1, 'a', 'bb'), DECODE(NN, 4, 'x', 'y'), DECODE(I, 1, 'a'), CASE I WHEN 1 THEN 'a' ELSE 'bb' END, CASE NN WHEN 4 THEN 'x' ELSE 'y' END, IIF(NN = 4, 'x', 'y'), COALESCE(I, 0), DECODE(NN, 4, NN, 5) FROM T;" "01: sqltype: 452 TEXT Nullable scale: 0 subtype: 0 len: 2 charset: 0 SYSTEM.NONE|02: sqltype: 452 TEXT Nullable scale: 0 subtype: 0 len: 1 charset: 0 SYSTEM.NONE|03: sqltype: 452 TEXT Nullable scale: 0 subtype: 0 len: 1 charset: 0 SYSTEM.NONE|04: sqltype: 452 TEXT Nullable scale: 0 subtype: 0 len: 2 charset: 0 SYSTEM.NONE|05: sqltype: 452 TEXT Nullable scale: 0 subtype: 0 len: 1 charset: 0 SYSTEM.NONE|06: sqltype: 452 TEXT scale: 0 subtype: 0 len: 1 charset: 0 SYSTEM.NONE|07: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|08: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4"
+pin  "3 ...their values" "SELECT DECODE(I, 1, 'a', 'bb'), DECODE(NN, 4, 'x', 'y'), DECODE(I, 1, 'a'), CASE I WHEN 1 THEN 'a' ELSE 'bb' END, CASE NN WHEN 4 THEN 'x' ELSE 'y' END, IIF(NN = 4, 'x', 'y'), COALESCE(I, 0), DECODE(NN, 4, NN, 5) FROM T;" "DECODE DECODE DECODE CASE CASE CASE COALESCE DECODE|bb x <null> bb x x 10 4|bb x <null> bb x x -10 4"
+dpin "3 ...over literals and numerics" "SELECT DECODE(1, 1, 'a', 'bb') $DUAL; SELECT DECODE(I, 10, 1, 2), DECODE(I, 10, 1.5, 2), DECODE(I, 10, 1, 2.5), DECODE(I, 10, CAST(1 AS INT128), 2) FROM T;" "01: sqltype: 452 TEXT Nullable scale: 0 subtype: 0 len: 2 charset: 0 SYSTEM.NONE|01: sqltype: 496 LONG Nullable scale: 0 subtype: 0 len: 4|02: sqltype: 580 INT64 Nullable scale: -1 subtype: 0 len: 8|03: sqltype: 580 INT64 Nullable scale: -1 subtype: 0 len: 8|04: sqltype: 32752 INT128 Nullable scale: 0 subtype: 0 len: 16"
+pin  "3 ...and the values" "SELECT DECODE(I, 10, 1, 2), DECODE(I, 10, 1.5, 2), DECODE(I, 10, 1, 2.5), DECODE(I, 10, CAST(1 AS INT128), 2) FROM T;" "DECODE DECODE DECODE DECODE|1 1.5 1.0 1|2 2.0 2.5 2"
+
+echo "--- 4. A DOUBLE INTO AN INT128-BACKED EXACT: the engine's Int128::set(double), defect included"
+pin  "4 a DOUBLE column to NUMERIC(38,0): exact below 2^64, mangled above" "SELECT ID, CAST(D AS NUMERIC(38,0)) FROM DD ORDER BY ID;" "ID CAST|1 999999999994923055729694736384|2 99999999998338007040|3 9999999999999998758486016|5 18446744073709551616|7 1000000000000000000|9 123456789012345678152597504|10 -999999999994923055729694736384|11 10000000000000000719354278919532445696|14 3|17 18446744073709551616|21 -9999999999999998758486016|26 <null>"
+pin  "4 ...to NUMERIC(38,6): scaled by 1e6 IN DOUBLE first" "SELECT ID, CAST(D AS NUMERIC(38,6)) FROM DD WHERE ID < 11 ORDER BY ID;" "ID CAST|1 1000000000000000042420637374017.961984|2 100000000000000004764.729344|3 9999999999986124045444366.467072|5 18446744073709551616.000000|7 999999999999997298.868224|9 123456789012336696855637690.155008|10 -1000000000000000042420637374017.961984"
+pin  "4 ...and past the range at that scale, 22003" "SELECT CAST(D AS NUMERIC(38,6)) FROM DD WHERE ID = 11;" "CAST|$E22003"
+pin  "4 a FLOAT column converts as its exact double" "SELECT ID, CAST(F AS NUMERIC(38,0)) FROM DD WHERE ID IN (1, 2, 7, 9, 11) ORDER BY ID;" "ID CAST|1 1000000015047466219876688855040|2 100000002004087734272|7 999999984306749440|9 123456790068172987402551296|11 9999999933815812510711506376257961984"
+pin  "4 CAST(D AS INT128) is the same conversion; a NUMERIC(38,2) target" "SELECT ID, CAST(D AS INT128), CAST(D AS NUMERIC(38,2)) FROM DD WHERE ID IN (5, 7, 17) ORDER BY ID;" "ID CAST CAST|5 18446744073709551616 18446744073709551616.00|7 1000000000000000000 999999999983380070.40|17 18446744073709551616 18446744073709551616.00"
+pin  "4 CONTROL an INT64-backed target is the plain conversion" "SELECT ID, CAST(D AS NUMERIC(18,2)), CAST(D AS BIGINT) FROM DD WHERE ID = 14; SELECT CAST(D AS NUMERIC(18,2)) FROM DD WHERE ID = 7;" "ID CAST CAST|14 2.50 3|CAST|$E22003"
+pin  "4 a LITERAL under the projection is re-read from its text: exact" "SELECT CAST(1e30 AS NUMERIC(38,6)), CAST(1e30 AS NUMERIC(38,6)) + 0, COALESCE(CAST(1e30 AS NUMERIC(38,6)), 0) $DUAL;" "CAST ADD COALESCE|1000000000000000000000000000000.000000 1000000000000000000000000000000.000000 1000000000000000000000000000000.000000"
+pin  "4 ...in a UNION branch it is the double (the map is no assignment)" "SELECT CAST(1e30 AS NUMERIC(38,6)) X $DUAL UNION ALL SELECT CAST(1e30 AS NUMERIC(38,6)) $DUAL;" "X|1000000000000000042420637374017.961984|1000000000000000042420637374017.961984"
+pin  "4 ...whichever branch, UNION or UNION ALL, and SUM over it is exact" "SELECT 1 X $DUAL UNION ALL SELECT CAST(1e30 AS NUMERIC(38,6)) $DUAL; SELECT CAST(1e30 AS NUMERIC(38,6)) X $DUAL UNION SELECT 1 $DUAL; SELECT SUM(X) FROM (SELECT CAST(1e30 AS NUMERIC(38,6)) X $DUAL UNION ALL SELECT CAST(1e30 AS NUMERIC(38,6)) $DUAL);" "X|1.000000|1000000000000000042420637374017.961984|X|1.000000|1000000000000000042420637374017.961984|SUM|2000000000000000084841274748035.923968"
+pin  "4 ...an AGGREGATE argument is the double too" "SELECT MAX(CAST(1e30 AS NUMERIC(38,6))) $DUAL;" "MAX|1000000000000000042420637374017.961984"
+pin  "4 ...and a literal cast to DOUBLE first" "SELECT CAST(CAST(1e30 AS DOUBLE PRECISION) AS NUMERIC(38,6)) $DUAL;" "CAST|1000000000000000042420637374017.961984"
+pin  "4 the union branch over other magnitudes (a 20-digit spelling is a DECFLOAT literal: exact)" "SELECT CAST(18446744073709555712e0 AS NUMERIC(38,0)) X $DUAL UNION ALL SELECT CAST(2e19 AS NUMERIC(38,0)) $DUAL UNION ALL SELECT CAST(1e20 AS NUMERIC(38,0)) $DUAL UNION ALL SELECT CAST(1e25 AS NUMERIC(38,0)) $DUAL UNION ALL SELECT CAST(1e30 AS NUMERIC(38,0)) $DUAL UNION ALL SELECT CAST(1e35 AS NUMERIC(38,0)) $DUAL;" "X|18446744073709555712|19999999999667601408|99999999998338007040|9999999999999998758486016|999999999994923055729694736384|99999999999999996863366107917975552"
+pin  "4 ...the same double through a column and a CAST to DOUBLE: mangled" "SELECT CAST(CAST(18446744073709555712e0 AS DOUBLE PRECISION) AS NUMERIC(38,0)), CAST(CAST(2e19 AS DOUBLE PRECISION) AS NUMERIC(38,0)) $DUAL;" "CAST CAST|18446744073709551616 19999999999667601408"
+pin  "4 a literal 1e37 IS the engine's double: one ULP above the nearest (its own text-to-double)" "SELECT CAST(1e37 AS NUMERIC(38,0)) X $DUAL UNION ALL SELECT CAST(1.7e38 AS NUMERIC(38,0)) $DUAL;" "X|10000000000000000719354278919532445696|170000000000000016951389224501696790528"
+pin  "4 ...CONTROL the same literal projected is exact, and 1e38 overflows NUMERIC(38,6)" "SELECT CAST(1e37 AS NUMERIC(38,0)) $DUAL; SELECT CAST(1e38 AS NUMERIC(38,6)) X $DUAL UNION ALL SELECT 1 $DUAL;" "CAST|10000000000000000000000000000000000000|X|$E22003"
+pin  "4 an INSERT of the literal is an assignment: exact" "INSERT INTO BIG0 (ID, M) VALUES (1, CAST(1e30 AS NUMERIC(38,0))); SELECT M FROM BIG0; ROLLBACK;" "M|1000000000000000000000000000000"
+pin  "4 CAST(1e30 AS DECFLOAT(34)) in a union branch is the double's 17 digits" "SELECT CAST(1e30 AS DECFLOAT(34)) X $DUAL UNION ALL SELECT 1 $DUAL;" "X|1.0000000000000000E+30|1"
+
+echo "--- 5. RECORDED (the engine answers; this server refuses or differs)"
+pin  "5 a WINDOWED decimal fold (planned since the window planner round of 2026-09-26)" "SELECT ID, VAR_POP(I) OVER () FROM BIG2 ORDER BY ID;" "ID VAR_POP|1 1.555555555555555555555555555555557|2 1.555555555555555555555555555555557|3 1.555555555555555555555555555555557|4 1.555555555555555555555555555555557"
+refused "5 a DECFLOAT / INT128 percentile FRACTION" "SELECT PERCENTILE_CONT(CAST(0.5 AS DECFLOAT(16))) WITHIN GROUP (ORDER BY I) FROM BIG2;" "PERCENTILE_CONT|2"
+refused "5 DECODE with a mistyped search value: the engine describes, then raises at fetch" "SELECT DECODE(I, 10, 'a', 'b', 'c') FROM T;" "DECODE|a|Statement failed, SQLSTATE = 22018|conversion error from string \"b\""
+pin  "5 a VIEW's literal cast runs the double conversion on the engine (promoted: a view's items are never an assignment's source)" "SELECT X FROM V1;" "X|1000000000000000042420637374017.961984"
+
+echo "--- 6. A HAVING OVER A DECIMAL128 FOLD compares the exact literal in decimal (every group was dropped)"
+pin  "6 PERCENTILE_CONT over INT128 > 1: groups 2 and 3" "SELECT ID FROM BIG2 GROUP BY ID HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I) > 1 ORDER BY ID;" "ID|2|3"
+pin  "6 ...over NUMERIC(38,2) and DECFLOAT(16); =, BETWEEN, <>, IN" "SELECT ID FROM BIG2 GROUP BY ID HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY N382) > 1 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY DF) > 1 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I) = 2 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I) BETWEEN 1 AND 3 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I) <> 2 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I) IN (1, 2) ORDER BY ID;" "ID|1|2|3|ID|2|3|ID|2|ID|1|2|ID|1|3|ID|1|2"
+pin  "6 the two-argument and VAR / STDDEV folds, and beside another term" "SELECT ID FROM BIG2 GROUP BY ID HAVING COVAR_POP(I, ID) = 0 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING VAR_POP(I) >= 0 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING STDDEV_POP(M) >= 0 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING SUM(I) > 1 AND VAR_POP(I) >= 0 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I) > 1 AND ID > 1 ORDER BY ID;" "ID|1|2|3|ID|1|2|3|ID|1|2|3|ID|2|3|ID|2|3"
+pin  "6 a text literal converts, a wide literal aligns, a projected twin agrees" "SELECT ID FROM BIG2 GROUP BY ID HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I) > '1' ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I) >= 170141183460469231731687303715884105727 ORDER BY ID; SELECT ID, SUM(I) FROM BIG2 GROUP BY ID HAVING PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY I) > 1 ORDER BY ID;" "ID|2|3|ID SUM|2 2|3 4"
+pin  "6 a DECFLOAT column's fold and a decfloat EXPRESSION's (SUM(SQRT(I))) - refused before" "SELECT ID FROM BIG2 GROUP BY ID HAVING SUM(DF) > 1 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING MAX(D34) > 1 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING AVG(D34) > 1 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING SUM(D34) IS NOT NULL ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING SUM(SQRT(I)) > 1 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING MAX(SQRT(I)) > 1 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING SUM(SQRT(I)) IS NOT NULL ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING SUM(D34 + 1) > 1 ORDER BY ID; SELECT ID FROM BIG2 GROUP BY ID HAVING FLOOR(SUM(SQRT(I))) > 1 ORDER BY ID;" "ID|2|3|ID|2|3|ID|2|3|ID|1|2|3|ID|2|3|ID|2|3|ID|1|2|3|ID|1|2|3|ID|3"
+
+echo "--- 7. REGR_* OVER A ZERO VARIANCE: covarPop / varPopX is 0 / 0 before the switch - the trapped invalid operation"
+pin  "7 a single row" "SELECT REGR_SLOPE(I, I) FROM BIG2 WHERE ID = 1;" "REGR_SLOPE|$E22000"
+pin  "7 ...every REGR type over a constant X, and a constant Y for the corr step" "SELECT REGR_AVGX(M, CAST(1 AS INT128)) FROM BIG2; SELECT REGR_SXX(I, CAST(1 AS INT128)) FROM BIG2; SELECT REGR_SYY(M, CAST(1 AS INT128)) FROM BIG2; SELECT REGR_SXY(M, CAST(1 AS INT128)) FROM BIG2; SELECT REGR_R2(CAST(1 AS INT128), I) FROM BIG2; SELECT REGR_INTERCEPT(I, B) FROM BIG2 WHERE ID = 1; SELECT REGR_SLOPE(M, 1.5) FROM BIG2;" "REGR_AVGX|$E22000|REGR_SXX|$E22000|REGR_SYY|$E22000|REGR_SXY|$E22000|REGR_R2|$E22000|REGR_INTERCEPT|$E22000|REGR_SLOPE|$E22000"
+pin  "7 ...GROUP BY the row key" "SELECT ID, REGR_SLOPE(M, ID) FROM BIG2 WHERE ID < 4 GROUP BY ID ORDER BY ID;" "ID REGR_SLOPE|$E22000"
+pin  "7 CONTROL: CORR / COVAR test the divisor first, an empty group is NULL, the DOUBLE path is silent" "SELECT CORR(M, CAST(1 AS INT128)), COVAR_POP(M, CAST(1 AS INT128)), REGR_COUNT(M, CAST(1 AS INT128)) FROM BIG2; SELECT REGR_SLOPE(M, ID) FROM BIG2 WHERE ID = 9; SELECT REGR_SLOPE(DBL, ID), REGR_R2(DBL, ID) FROM BIG2 WHERE ID = 1;" "CORR COVAR_POP REGR_COUNT|0E-6176 0 3|REGR_SLOPE|0E-6176|REGR_SLOPE REGR_R2|0.000000000000000 0.000000000000000"
+
+echo "--- 8. A DECFLOAT INTO AN INT128-BACKED EXACT: the range first (22003), then the 34-digit quantize (22000)"
+pin  "8 2 ** 128 is out of range, 2 ** 127 and 2 ** 126 need 39 digits" "SELECT CAST(POWER(CAST(2 AS INT128), 128) AS INT128) $DUAL; SELECT CAST(POWER(CAST(2 AS INT128), 127) AS INT128) $DUAL; SELECT CAST(POWER(CAST(2 AS INT128), 126) AS NUMERIC(38,2)) $DUAL; SELECT CAST(POWER(CAST(2 AS INT128), 126) AS INT128) $DUAL;" "CAST|$E22003|CAST|$E22000|CAST|$E22003|CAST|$E22000"
+pin  "8 a 34-digit fraction has no NUMERIC(38,34); one digit less does" "SELECT CAST(SQRT(CAST(2 AS INT128)) AS NUMERIC(38,34)) $DUAL; SELECT CAST(SQRT(CAST(2 AS INT128)) AS NUMERIC(38,33)) $DUAL; SELECT CAST(POWER(CAST(10 AS INT128), 20) AS NUMERIC(38,14)) $DUAL; SELECT CAST(POWER(CAST(10 AS INT128), 20) AS NUMERIC(38,13)) $DUAL;" "CAST|$E22000|CAST|1.414213562373095048801688724209698|CAST|$E22000|CAST|100000000000000000000.0000000000000"
+pin  "8 1E+34 never converts, 10 ** 33 does, 1e37 is the range, and the INT128 edge in decimal" "SELECT CAST(CAST('1e34' AS DECFLOAT(34)) AS INT128) $DUAL; SELECT CAST(POWER(CAST(10 AS INT128), 33) AS INT128) $DUAL; SELECT CAST(CAST('1e37' AS DECFLOAT(34)) AS NUMERIC(38,2)) $DUAL; SELECT CAST(CAST('1.701411834604692317316873037158841E+38' AS DECFLOAT(34)) AS INT128) $DUAL; SELECT CAST(CAST('1.701411834604692317316873037158842E+38' AS DECFLOAT(34)) AS INT128) $DUAL;" "CAST|$E22000|CAST|1000000000000000000000000000000000|CAST|$E22003|CAST|$E22000|CAST|$E22003"
+pin  "8 half-up, a tiny value is 0, the specials" "SELECT CAST(CAST('2.5' AS DECFLOAT(34)) AS INT128), CAST(CAST('-2.5' AS DECFLOAT(34)) AS INT128), CAST(CAST('1e-40' AS DECFLOAT(34)) AS INT128), CAST(CAST('1e-40' AS DECFLOAT(34)) AS NUMERIC(38,4)), CAST(CAST('9999999999999999999999999999999999' AS DECFLOAT(34)) AS INT128) $DUAL; SELECT CAST(CAST('inf' AS DECFLOAT(34)) AS INT128) $DUAL; SELECT CAST(CAST('NaN' AS DECFLOAT(34)) AS INT128) $DUAL;" "CAST CAST CAST CAST CAST|3 -3 0 0.0000 9999999999999999999999999999999999|CAST|$E22003|CAST|$E22000"
+pin  "8 an INT64 target is toInt64: the quantize, then the range through the DOUBLE context; SHORT / LONG through the LONG one" "SELECT CAST(CAST('1e30' AS DECFLOAT(34)) AS BIGINT) $DUAL; SELECT CAST(CAST('9223372036854775807.5' AS DECFLOAT(34)) AS BIGINT) $DUAL; SELECT CAST(CAST('9223372036854775807.4' AS DECFLOAT(34)) AS BIGINT) $DUAL; SELECT CAST(CAST('1e35' AS DECFLOAT(34)) AS NUMERIC(18,2)) $DUAL; SELECT CAST(CAST('1e20' AS DECFLOAT(34)) AS NUMERIC(18,2)) $DUAL; SELECT CAST(CAST('1e18' AS DECFLOAT(34)) AS SMALLINT) $DUAL; SELECT CAST(CAST('32767.5' AS DECFLOAT(34)) AS SMALLINT) $DUAL;" "CAST|$EFLOAT|CAST|$EFLOAT|CAST|9223372036854775807|CAST|$E22000|CAST|$EFLOAT|CAST|$E22000|CAST|$E22003"
+
+echo "--- 9. THE CONSUMERS OF A DECFLOAT(34) FUNCTION RESULT, and the double literal's spelling"
+dpin "9 SIGN of a decfloat is SHORT; ROUND / TRUNC keep the width, FLOOR / CEILING are DECFLOAT(34)" "SELECT SIGN(SQRT(I)), ROUND(SQRT(I), 2), TRUNC(SQRT(I)), FLOOR(SQRT(I)), CEILING(SQRT(I)), ROUND(D, 1), FLOOR(D) FROM FX;" "01: sqltype: 500 SHORT Nullable scale: 0 subtype: 0 len: 2|02: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16|03: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16|04: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16|05: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16|06: sqltype: 32760 DECFLOAT(16) Nullable scale: 0 subtype: 0 len: 8|07: sqltype: 32762 DECFLOAT(34) Nullable scale: 0 subtype: 0 len: 16"
+pin  "9 ...their values" "SELECT SIGN(SQRT(I)), ROUND(SQRT(I), 2), TRUNC(SQRT(I)), FLOOR(SQRT(I)), CEILING(SQRT(I)), ROUND(D, 1), FLOOR(D), ROUND(SQRT(I)), TRUNC(SQRT(I), 3), ROUND(SQRT(I), -1), ROUND(EXP(I), 2) FROM FX ORDER BY ID;" "SIGN ROUND TRUNC FLOOR CEILING ROUND FLOOR ROUND TRUNC ROUND ROUND|1 2.24 2 2 3 16.0 16 2 2.236 0E+1 148.41|<null> <null> <null> <null> <null> <null> <null> <null> <null> <null> <null>"
+pin  "9 ROUND is the INT128 route: the quantize (2.00, 1.2E+2, 0E-128), the range (22003), the 34 digits (22000), the SCHAR scale" "SELECT ROUND(D34, 2), ROUND(CAST('123.456' AS DECFLOAT(34)), -1), ROUND(CAST('2.5' AS DECFLOAT(34))), ROUND(CAST('-2.5' AS DECFLOAT(34))), ROUND(CAST('1.5' AS DECFLOAT(34)), -128) FROM FX WHERE ID = 1; SELECT ROUND(CAST('1.5' AS DECFLOAT(34)), 127) $DUAL; SELECT ROUND(SQRT(CAST(2 AS INT128)), 34) $DUAL; SELECT ROUND(CAST('1.5' AS DECFLOAT(34)), 128) $DUAL;" "ROUND ROUND ROUND ROUND ROUND|2.00 1.2E+2 3 -3 0E-128|ROUND|$E22003|ROUND|$E22000|ROUND|Statement failed, SQLSTATE = 42000|expression evaluation not supported|-The numeric scale must be between -128 and 127 in ROUND"
+pin  "9 ...a DECFLOAT(16) operand is the INT64 route" "SELECT ROUND(CAST('1234567890123456.5' AS DECFLOAT(16))), ROUND(CAST('12345678.5' AS DECFLOAT(16)), -3) $DUAL; SELECT ROUND(CAST('1e19' AS DECFLOAT(16))) $DUAL; SELECT ROUND(CAST('1.5' AS DECFLOAT(16)), 100) $DUAL;" "ROUND ROUND|1234567890123457 1.2346E+7|ROUND|$EFLOAT|ROUND|$E22000"
+pin  "9 TRUNC works in decimal with an INT64 power of ten that WRAPS past 10^18" "SELECT TRUNC(CAST('1.23456' AS DECFLOAT(34)), 3), TRUNC(D34, 2), TRUNC(CAST('123.456' AS DECFLOAT(34)), -1), TRUNC(CAST('-2.5' AS DECFLOAT(34))), TRUNC(SQRT(CAST(2 AS INT128)), 18), TRUNC(SQRT(CAST(2 AS INT128)), 19), TRUNC(SQRT(CAST(2 AS INT128)), 40) FROM FX WHERE ID = 1; SELECT TRUNC(SQRT(CAST(2 AS INT128)), 64) $DUAL; SELECT TRUNC(CAST('123' AS DECFLOAT(34)), -64) $DUAL;" "TRUNC TRUNC TRUNC TRUNC TRUNC TRUNC TRUNC|1.234 2 120 -2 1.414213562373095048 1.414213562373095048720917202727053 1.414213562373095048705607286608139|TRUNC|$E22000|TRUNC|$E22012"
+pin  "9 FLOOR / CEILING: an integral value keeps its exponent, the specials pass, a DECFLOAT(16) widens" "SELECT FLOOR(CAST('1.5' AS DECFLOAT(34))), CEILING(CAST('-1.5' AS DECFLOAT(34))), FLOOR(CAST('1E+36' AS DECFLOAT(34))), FLOOR(CAST('1.5E+2' AS DECFLOAT(34))), FLOOR(CAST('NaN' AS DECFLOAT(34))), CEILING(CAST('-0.5' AS DECFLOAT(34))), CEILING(CAST('1234567890123456.5' AS DECFLOAT(16))) $DUAL;" "FLOOR CEILING FLOOR FLOOR FLOOR CEILING CEILING|1 -1 1E+36 1.5E+2 NaN -0 1234567890123457"
+pin  "9 SIGN: a zero of either sign is 0, then the sign bit" "SELECT SIGN(D34), SIGN(-D34), SIGN(D34 - 2), SIGN(POWER(I, 2)) FROM FX WHERE ID = 1; SELECT SIGN(CAST('-0' AS DECFLOAT(34))), SIGN(CAST('NaN' AS DECFLOAT(34))), SIGN(CAST('-inf' AS DECFLOAT(34))), SIGN(CAST('1E-6176' AS DECFLOAT(34))) $DUAL;" "SIGN SIGN SIGN SIGN|1 -1 0 1|SIGN SIGN SIGN SIGN|0 1 -1 1"
+pin  "9 the results in arithmetic, folds, a WHERE, an ORDER BY, a CAST" "SELECT FLOOR(SQRT(I)) + 1, CEILING(SQRT(I)) * D34, ROUND(SQRT(I), 2) + 1, TRUNC(SQRT(I), 2) - 1, SIGN(SQRT(I)) + 1 FROM FX WHERE ID = 1; SELECT SUM(FLOOR(SQRT(I))), MAX(ROUND(SQRT(I), 3)), MIN(TRUNC(SQRT(I), 1)), AVG(CEILING(SQRT(I))), COUNT(FLOOR(SQRT(I))) FROM FX; SELECT ROUND(SQRT(I), 2) FROM FX WHERE ROUND(SQRT(I), 2) > 2; SELECT ROUND(SQRT(I), 2) FROM FX ORDER BY ROUND(SQRT(I), 2); SELECT ID FROM FX WHERE SQRT(I) > 2; SELECT ID FROM FX WHERE SIGN(SQRT(I)) = 1; SELECT CAST(ROUND(SQRT(I), 2) AS NUMERIC(18,4)), CAST(FLOOR(SQRT(I)) AS VARCHAR(10)) FROM FX WHERE ID = 1;" "ADD MULTIPLY ADD SUBTRACT ADD|3 6 3.24 1.23 2|SUM MAX MIN AVG COUNT|2 2.236 2.2 3 1|ROUND|2.24|ROUND|<null>|2.24|ID|1|ID|1|CAST CAST|2.2400 2"
+pin  "9 POWER over a DECFLOAT beside an approximate argument takes the DOUBLE path" "SELECT POWER(D34, 0.5e0), POWER(D, 2e0) FROM FX WHERE ID = 1;" "POWER POWER|1.414213562373095 256.0000000000000"
+pin  "9 a double literal under a CAST to DECFLOAT is re-read from its TEXT, a function argument included (this refused, then failed at fetch)" "SELECT CAST(1e30 AS DECFLOAT(34)), CAST(1.50e0 AS DECFLOAT(34)), CAST(0.1e0 AS DECFLOAT(16)), CAST(-0e0 AS DECFLOAT(34)), CAST(2.5e-1 AS DECFLOAT(16)) $DUAL; SELECT SQRT(CAST(1e-30 AS DECFLOAT(34))), LN(CAST(1e-10 AS DECFLOAT(34))), SQRT(CAST(1e-30 AS DECFLOAT(16))) $DUAL; SELECT CAST(1e-30 AS DECFLOAT(34)) + 0 $DUAL;" "CAST CAST CAST CAST CAST|1E+30 1.50 0.1 -0 0.25|SQRT LN SQRT|1E-15 -23.02585092994045684017991454684364 1E-15|ADD|1E-30"
+pin  "9 ...and a 16 / 17-digit spelling folds to ITS digits under an INT128 target" "SELECT CAST(9007199254740993e0 AS NUMERIC(38,0)), CAST(1.0000000000000001e0 AS NUMERIC(38,17)), CAST(1234567890123456789e0 AS NUMERIC(38,0)) $DUAL;" "CAST CAST CAST|9007199254740993 1.00000000000000010 1234567890123456789"
+pin  "9 CONTROL: in a UNION branch the literal stays the double" "SELECT SQRT(CAST(1e-30 AS DECFLOAT(34))) X $DUAL UNION ALL SELECT 1 $DUAL; SELECT CAST(1.5e0 AS DECFLOAT(34)) X $DUAL UNION ALL SELECT 1 $DUAL;" "X|9.999999999999999549999999999999990E-16|1|X|1.5000000000000000|1"
+
+echo "--- 10. RECORDED (the review round): the engine answers, this server refuses or differs"
+pin  "10 a decfloat beside a DOUBLE LITERAL - the assignment fold under a DECFLOAT output (promoted: the literal is its text in any DECFLOAT item)" "SELECT SQRT(I) * 1.5e0, D34 + 0.1e0 FROM FX WHERE ID = 1;" "MULTIPLY ADD|3.354101966249684544613760503096914 2.1"
+refused "10 GROUP BY a decfloat expression" "SELECT SQRT(I), COUNT(*) FROM FX GROUP BY 1 ORDER BY 1;" "SQRT COUNT|<null> 1|2.236067977499789696409173668731276 1"
+refused "10 a TEXT places count (the exact family refuses it too)" "SELECT ROUND(CAST('1.5' AS DECFLOAT(34)), '2') $DUAL;" "ROUND|1.50"
+pin  "10 a derived table's literal cast under an AGGREGATE runs the double conversion (recorded; the assignment's fold agrees now)" "SELECT SUM(X) FROM (SELECT CAST(1e30 AS NUMERIC(38,6)) X $DUAL);" "SUM|1000000000000000042420637374017.961984"
+differs "10 COVAR_POP(NULL, I) is a TEXT NULL on the engine" "SELECT COVAR_POP(NULL, I) FROM BIG2;" "COVAR_POP|<null>" "COVAR_POP|0.000000000000000"
+differs "10 the sign of a decimal ZERO through multiply and TRUNC (decNumber keeps it)" "SELECT CAST('-1' AS DECFLOAT(34)) * 0, TRUNC(CAST('-0.0012345' AS DECFLOAT(34)), 2) $DUAL;" "MULTIPLY TRUNC|-0 -0" "MULTIPLY TRUNC|0 0"
+
+echo "--- 11. THE MERGED-BINARY REVIEW: a DOUBLE fold over a mixed conditional, the negated literal, the fold through CAST TO DOUBLE, subquery compares, subnormals, the specials"
+dpin "11 VAR_POP over IIF(<INT128>, <DOUBLE>) describes DOUBLE" "SELECT VAR_POP(IIF(ID = 1, I, DBL)) FROM BIG2;" "$DBL"
+pin  "11 ...and folds every branch value as the double it is (this read 0)" "SELECT VAR_POP(IIF(ID = 1, I, DBL)) FROM BIG2; SELECT VAR_POP(IIF(ID = 1, I, DBL)) FROM BIG2 WHERE ID IN (1, 2);" "VAR_POP|1.555555555555556|VAR_POP|0.2500000000000000"
+pin  "11 ...STDDEV / VAR_SAMP / COVAR / CORR / REGR / PERCENTILE_CONT the same" "SELECT STDDEV_POP(IIF(ID = 1, I, DBL)), VAR_SAMP(IIF(ID = 1, I, DBL)), COVAR_POP(IIF(ID = 1, I, DBL), ID), CORR(IIF(ID = 1, I, DBL), ID), REGR_SLOPE(IIF(ID = 1, I, DBL), ID), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY IIF(ID = 1, I, DBL)) FROM BIG2;" "STDDEV_POP VAR_SAMP COVAR_POP CORR REGR_SLOPE PERCENTILE_CONT|1.247219128924647 2.333333333333334 1.000000000000000 0.9819805060619656 1.500000000000000 2.000000000000000"
+pin  "11 ...COALESCE, a searched and a simple CASE, either branch order, NUMERIC(38,2)" "SELECT VAR_POP(COALESCE(I, DBL)), VAR_POP(CASE WHEN ID = 1 THEN I ELSE DBL END), VAR_POP(CASE ID WHEN 1 THEN M ELSE DBL END), VAR_POP(IIF(ID = 1, DBL, I)), VAR_POP(IIF(ID = 1, N382, DBL)) FROM BIG2;" "VAR_POP VAR_POP VAR_POP VAR_POP VAR_POP|1.555555555555556 1.555555555555556 1.555555555555556 1.555555555555556 1.166666666666667"
+pin  "11 ...windowed" "SELECT ID, VAR_POP(IIF(ID = 1, I, DBL)) OVER () FROM BIG2 ORDER BY ID;" "ID VAR_POP|1 1.555555555555556|2 1.555555555555556|3 1.555555555555556|4 1.555555555555556"
+pin  "11 ...SUM / AVG / MAX / MIN over it (0, 0 and 22003 before)" "SELECT SUM(COALESCE(I, DBL)), AVG(COALESCE(I, DBL)), MAX(IIF(ID = 1, I, DBL)), MIN(IIF(ID = 1, I, DBL)), SUM(IIF(ID = 1, M, DBL)) FROM BIG2;" "SUM AVG MAX MIN SUM|7.000000000000000 2.333333333333333 4.000000000000000 1.000000000000000 7.000000000000000"
+pin  "11 CONTROL: a DECFLOAT branch makes the node DECFLOAT(34), a BIGINT one stays DOUBLE, the projected IIF was right" "SELECT VAR_POP(IIF(ID = 1, I, D34)), VAR_POP(IIF(ID = 1, B, DBL)) FROM BIG2; SELECT IIF(ID = 1, I, DBL) FROM BIG2 ORDER BY ID;" "VAR_POP VAR_POP|1.555555555555555555555555555555557 1.555555555555556|CASE|1.000000000000000|2.000000000000000|4.000000000000000|<null>"
+pin  "11 a NEGATED double literal folds with its minus (NegateNode::genBlr's text)" "SELECT CAST(-1.7e38 AS INT128), CAST(-1e37 AS INT128), CAST(-1e37 AS NUMERIC(38,0)), CAST(1e37 AS INT128), -CAST(1.7e38 AS INT128) $DUAL;" "CAST CAST CAST CAST|-170000000000000000000000000000000000000 -10000000000000000000000000000000000000 -10000000000000000000000000000000000000 10000000000000000000000000000000000000 -170000000000000000000000000000000000000"
+pin  "11 ...an INSERT, the 16 / 17-digit spellings, a parenthesised operand, DECFLOAT" "INSERT INTO BIG0 (ID, M) VALUES (1, CAST(-1e37 AS NUMERIC(38,0))); SELECT M FROM BIG0; ROLLBACK; SELECT CAST(-9007199254740993e0 AS NUMERIC(38,0)), CAST(-1.0000000000000001e0 AS NUMERIC(38,17)), CAST(-(1e37) AS INT128), CAST(-(-1e37) AS INT128) $DUAL; SELECT CAST(-1.50e0 AS DECFLOAT(34)), CAST(-1e37 AS DECFLOAT(16)) $DUAL;" "M|-10000000000000000000000000000000000000|CAST CAST CAST CAST|-9007199254740993 -1.00000000000000010 -10000000000000000000000000000000000000 10000000000000000000000000000000000000|CAST CAST|-1.50 -1E+37"
+pin  "11 CONTROL: in a UNION branch and under an aggregate the negated literal is the double" "SELECT CAST(-1e37 AS INT128) X $DUAL UNION ALL SELECT CAST(1 AS INT128) $DUAL; SELECT MAX(CAST(-1e37 AS INT128)) $DUAL;" "X|-10000000000000000719354278919532445696|1|MAX|-10000000000000000719354278919532445696"
+dpin "11 the literal folds THROUGH a CAST TO DOUBLE under an INT128 / DECFLOAT item" "SELECT CAST(CAST(1e37 AS DOUBLE PRECISION) AS DECFLOAT(34)), CAST(CAST(1e37 AS DOUBLE PRECISION) AS INT128) $DUAL;" "01: sqltype: 32762 DECFLOAT(34) scale: 0 subtype: 0 len: 16|02: sqltype: 32752 INT128 scale: 0 subtype: 0 len: 16"
+pin  "11 ...exact first, then the nearest double (Int128 / Decimal128 toDouble)" "SELECT CAST(CAST(1e37 AS DOUBLE PRECISION) AS DECFLOAT(34)), CAST(CAST(1e37 AS DOUBLE PRECISION) AS INT128) $DUAL; SELECT CAST(CAST(1.7014118346046921e38 AS DOUBLE PRECISION) AS DECFLOAT(34)), CAST(CAST(1.7014118346046921e38 AS DOUBLE PRECISION) AS INT128), CAST(CAST(123456789012345678e0 AS DOUBLE PRECISION) AS INT128) $DUAL; SELECT CAST(CAST(9.223372036854775e18 AS DOUBLE PRECISION) AS INT128), CAST(CAST(9.223372036854775e18 AS DOUBLE PRECISION) AS DECFLOAT(34)) $DUAL;" "CAST CAST|9.9999999999999995E+36 9999999999999999538762658202121142272|CAST CAST CAST|1.7014118346046921E+38 170141183460469212842221372237303250944 123456789012345680|CAST CAST|9223372036854774784 9.2233720368547748E+18"
+pin  "11 ...the EXACT decimal rounds half away from zero at the item's scale, not the double" "SELECT CAST(CAST(0.4999999999999999e0 AS DOUBLE PRECISION) AS INT128), CAST(CAST(0.49999999999999e0 AS DOUBLE PRECISION) AS INT128), CAST(CAST(2.49999999999999e0 AS DOUBLE PRECISION) AS INT128), CAST(CAST(2.5e0 AS DOUBLE PRECISION) AS INT128), CAST(CAST(-2.5e0 AS DOUBLE PRECISION) AS INT128), CAST(CAST(1.25e0 AS DOUBLE PRECISION) AS NUMERIC(38,1)) $DUAL;" "CAST CAST CAST CAST CAST CAST|0 0 2 3 -3 1.3"
+pin  "11 ...every literal of the item, before the operators: a sum, a nested cast, a function, a DECFLOAT item" "SELECT CAST(0.4e0 + 0.4e0 AS INT128), CAST(0.4e0 * 2e0 AS INT128), CAST(1e37 + 1e37 AS INT128), CAST(CAST(1e37 AS DOUBLE PRECISION) * 2 AS INT128), CAST(CAST(1.24951e0 AS NUMERIC(38,1)) AS NUMERIC(38,3)), CAST(ABS(-2.5e0) AS INT128) $DUAL; SELECT CAST(1.5e0 * 2 AS DECFLOAT(34)), CAST(0.1e0 + 0.2e0 AS DECFLOAT(34)) $DUAL; SELECT CAST(CAST(-1e37 AS NUMERIC(38,0)) AS DECFLOAT(34)) $DUAL;" "CAST CAST CAST CAST CAST CAST|0 0 20000000000000000000000000000000000000 19999999999999999077525316404242284544 1.300 3|CAST CAST|3.0 0.3|CAST|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation."
+pin  "11 CONTROL: a UNION branch, an aggregate, a BIGINT item and a VARCHAR item are no INT128 assignment" "SELECT CAST(CAST(1.7014118346046921e38 AS DOUBLE PRECISION) AS INT128) X $DUAL UNION ALL SELECT 1 $DUAL; SELECT CAST(CAST(0.4999999999999999e0 AS DOUBLE PRECISION) AS INT128) X $DUAL UNION ALL SELECT 1 $DUAL; SELECT MAX(CAST(CAST(1e37 AS DOUBLE PRECISION) AS INT128)) $DUAL; SELECT CAST(CAST(4.5e0 AS DOUBLE PRECISION) AS NUMERIC(18,0)) $DUAL; SELECT CAST(CAST(1e37 AS DOUBLE PRECISION) AS NUMERIC(38,0)) || '' $DUAL;" "X|170141183460469193952755440758722396160|1|X|1|1|MAX|10000000000000000719354278919532445696|CAST|5|CONCATENATION|10000000000000000719354278919532445696"
+pin  "11 ...nor a WHERE: the literal there is cvt.cpp's double (every row answered before)" "SELECT COUNT(*) FROM BIG2 WHERE CAST(1e37 AS INT128) = 10000000000000000000000000000000000000; SELECT COUNT(*) FROM BIG2 WHERE CAST(CAST(0.4999999999999999e0 AS DOUBLE PRECISION) AS INT128) = 0; SELECT COUNT(*) FROM BIG2 WHERE CAST(1e37 AS INT128) = 10000000000000000719354278919532445696;" "COUNT|0|COUNT|0|COUNT|4"
+pin  "11 a DECFLOAT(34) result in an IN / = ANY / ALL subquery compares in decimal (refused)" "SELECT ID FROM BIG2 WHERE I IN (SELECT SQRT(I) FROM BIG2) ORDER BY ID; SELECT ID FROM BIG2 WHERE I IN (SELECT POWER(I, 1) FROM BIG2) ORDER BY ID; SELECT ID FROM BIG2 WHERE DBL IN (SELECT SQRT(I) FROM BIG2) ORDER BY ID; SELECT ID FROM BIG2 WHERE D34 IN (SELECT SQRT(I) FROM BIG2) ORDER BY ID; SELECT ID FROM BIG2 WHERE B IN (SELECT SQRT(I) FROM BIG2) ORDER BY ID; SELECT ID FROM BIG2 WHERE I = ANY (SELECT SQRT(I) FROM BIG2) ORDER BY ID; SELECT ID FROM BIG2 WHERE I > ALL (SELECT SQRT(X.I) FROM BIG2 X WHERE X.ID < 3) ORDER BY ID; SELECT ID FROM BIG2 WHERE I NOT IN (SELECT SQRT(I) FROM BIG2 WHERE ID < 4) ORDER BY ID;" "ID|1|2|ID|1|2|3|ID|1|2|ID|1|2|ID|1|2|ID|1|2|ID|2|3|ID|3"
+pin  "11 ...a scalar subquery on either side, correlated or not, and a DECFLOAT column's fold" "SELECT ID FROM BIG2 WHERE (SELECT VAR_POP(X.I) FROM BIG2 X) > 1 ORDER BY ID; SELECT ID FROM BIG2 WHERE (SELECT MAX(SQRT(X.I)) FROM BIG2 X) > 1 ORDER BY ID; SELECT ID FROM BIG2 WHERE (SELECT CORR(X.I, X.ID) FROM BIG2 X) > 0.9 ORDER BY ID; SELECT ID FROM BIG2 WHERE (SELECT SQRT(X.I) FROM BIG2 X WHERE X.ID = 3) > 1 ORDER BY ID; SELECT ID FROM BIG2 WHERE (SELECT SQRT(X.I) FROM BIG2 X WHERE X.ID = BIG2.ID) >= 1.4 ORDER BY ID; SELECT ID FROM BIG2 WHERE (SELECT MAX(X.D34) FROM BIG2 X) > 1 ORDER BY ID; SELECT ID FROM BIG2 WHERE I = (SELECT SQRT(X.I) FROM BIG2 X WHERE X.ID = 3) ORDER BY ID;" "ID|1|2|3|4|ID|1|2|3|4|ID|1|2|3|4|ID|1|2|3|4|ID|2|3|ID|1|2|3|4|ID|2"
+pin  "11 a DECFLOAT NaN in a compare is the 22000 (the total order answered the rows)" "SELECT ID FROM BIG2 WHERE CAST('NaN' AS DECFLOAT(34)) > 1; SELECT ID FROM BIG2 WHERE IIF(ID = 2, CAST('NaN' AS DECFLOAT(34)), D34) > 1; SELECT ID FROM BIG2 WHERE (SELECT CAST('NaN' AS DECFLOAT(34)) $DUAL) > 1;" "ID|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.|ID|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.|ID|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation."
+dpin "11 a SUBNORMAL EXP / POWER result describes DECFLOAT(34)" "SELECT EXP(CAST(-14200 AS INT128)) $DUAL;" "$D34"
+pin  "11 ...and rounds once at E-6176 (this clamped 17 digits at E-6143)" "SELECT EXP(CAST(-14200 AS INT128)), POWER(CAST(2 AS INT128), -20500), EXP(CAST(-14170 AS INT128)), EXP(CAST('-14209' AS DECFLOAT(34))) $DUAL; SELECT EXP(CAST(-14215 AS INT128)), EXP(CAST(-14220 AS INT128)), POWER(CAST(3 AS INT128), -12900), POWER(CAST(10 AS INT128), -6176) $DUAL;" "EXP POWER EXP EXP|1.043174528E-6167 7.6752E-6172 1.1147858072722035504387E-6154 1.28738E-6171|EXP EXP POWER POWER|3.19E-6174 2E-6176 1.367143545262418933351E-6155 1E-6176"
+pin  "11 ...an underflow to nothing is 0E-6176, x / Infinity too" "SELECT POWER(CAST(2 AS INT128), -25000), EXP(CAST(-14300 AS INT128)), LOG(CAST('Inf' AS DECFLOAT(34)), 2), POWER(CAST(10 AS INT128), -6177) $DUAL; SELECT CAST(POWER(CAST(2 AS INT128), -25000) AS VARCHAR(50)) $DUAL;" "POWER EXP LOG POWER|0E-6176 0E-6176 0E-6176 0E-6176|CAST|0E-6176"
+pin  "11 POWER / EXP of an Infinity is decNumber's IEEE answer (22000 before)" "SELECT POWER(CAST('Inf' AS DECFLOAT(34)), 2), POWER(CAST('Inf' AS DECFLOAT(34)), -2), POWER(CAST(2 AS INT128), CAST('Inf' AS DECFLOAT(34))), POWER(CAST('-Inf' AS DECFLOAT(34)), 3), POWER(CAST('-Inf' AS DECFLOAT(34)), -3), POWER(CAST('Inf' AS DECFLOAT(34)), 0) $DUAL; SELECT POWER(CAST('0.5' AS DECFLOAT(34)), CAST('Inf' AS DECFLOAT(34))), POWER(CAST('0.5' AS DECFLOAT(34)), CAST('-Inf' AS DECFLOAT(34))), POWER(CAST('1' AS DECFLOAT(34)), CAST('Inf' AS DECFLOAT(34))), POWER(CAST('-Inf' AS DECFLOAT(34)), CAST('0.5' AS DECFLOAT(34))), EXP(CAST('Inf' AS DECFLOAT(34))), EXP(CAST('-Inf' AS DECFLOAT(34))) $DUAL; SELECT POWER(CAST('-2' AS DECFLOAT(34)), CAST('Inf' AS DECFLOAT(34))) $DUAL;" "POWER POWER POWER POWER POWER POWER|Infinity 0 Infinity -Infinity -0 1|POWER POWER POWER POWER EXP EXP|0 Infinity 1.000000000000000000000000000000000 Infinity Infinity 0|POWER|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation."
+pin  "11 a NaN into SQRT / LN / LOG10 / LOG is the compare's 22000; EXP / POWER pass it" "SELECT SQRT(CAST('NaN' AS DECFLOAT(34))) $DUAL; SELECT LN(CAST('NaN' AS DECFLOAT(34))) $DUAL; SELECT LOG10(CAST('NaN' AS DECFLOAT(34))) $DUAL; SELECT LOG(2, CAST('NaN' AS DECFLOAT(34))) $DUAL; SELECT EXP(CAST('NaN' AS DECFLOAT(34))), POWER(CAST('NaN' AS DECFLOAT(34)), 2) $DUAL;" "SQRT|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.|LN|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.|LOG10|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.|LOG|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.|EXP POWER|NaN NaN"
+pin  "11 LOG over an Infinity divides as decQuadDivide does" "SELECT LOG(2, CAST('Inf' AS DECFLOAT(34))), LOG(CAST('Inf' AS DECFLOAT(34)), 1), LOG(CAST('Inf' AS DECFLOAT(34)), CAST('0.5' AS DECFLOAT(34))), LOG(CAST('0.5' AS DECFLOAT(34)), CAST('Inf' AS DECFLOAT(34))), LOG(1, CAST('Inf' AS DECFLOAT(34))) $DUAL; SELECT LOG(CAST('Inf' AS DECFLOAT(34)), CAST('Inf' AS DECFLOAT(34))) $DUAL;" "LOG LOG LOG LOG LOG|Infinity 0E-6176 -0E-6176 -Infinity Infinity|LOG|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation."
+pin  "11 TRUNC of an Infinity is Inf - Inf, the 22000; of a NaN, NaN" "SELECT TRUNC(CAST('Inf' AS DECFLOAT(34))) $DUAL; SELECT TRUNC(CAST('-Inf' AS DECFLOAT(34)), 2) $DUAL; SELECT TRUNC(CAST('Inf' AS DECFLOAT(34)), -2) $DUAL; SELECT TRUNC(CAST('NaN' AS DECFLOAT(34))), TRUNC(CAST('NaN' AS DECFLOAT(34)), 2), FLOOR(CAST('NaN' AS DECFLOAT(34))), CEILING(CAST('Inf' AS DECFLOAT(34))) $DUAL; SELECT TRUNC(CAST('1.5' AS DECFLOAT(34)), 128) $DUAL;" "TRUNC|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.|TRUNC|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.|TRUNC|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.|TRUNC TRUNC FLOOR CEILING|NaN NaN NaN Infinity|TRUNC|Statement failed, SQLSTATE = 42000|expression evaluation not supported|-The numeric scale must be between -128 and 127 in TRUNC"
+
+echo "--- 12. RECORDED (the merged-binary review): the engine answers, this server refuses or differs"
+refused "12 a DECFLOAT scalar subquery in the SELECT LIST" "SELECT (SELECT VAR_POP(I) FROM BIG2) $DUAL;" "VAR_POP|1.555555555555555555555555555555557"
+refused "12 a non-finite DECFLOAT folded into an IN list" "SELECT COUNT(*) FROM BIG2 WHERE I IN (SELECT CAST('Inf' AS DECFLOAT(34)) $DUAL);" "COUNT|0"
+refused "12 a SIGNALLING NaN has no form here (its CAST refuses; FLOOR / CEILING / EXP of it trap on the engine)" "SELECT CEILING(CAST('sNaN' AS DECFLOAT(34))) $DUAL;" "CEILING|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation."
+refused "12 nor a NEGATIVE NaN (the engine's SIGN of it is -1)" "SELECT SIGN(CAST('-NaN' AS DECFLOAT(34))), CAST('-NaN' AS DECFLOAT(34)) $DUAL;" "SIGN CAST|-1 -NaN"
+differs "12 a bare literal cast under a VARCHAR item still folds here (the engine converts cvt.cpp's double)" "SELECT CAST(1e37 AS NUMERIC(38,0)) || '' $DUAL;" "CONCATENATION|10000000000000000719354278919532445696" "CONCATENATION|10000000000000000000000000000000000000"
+
+echo "--- 13. THE FOLD IS THE ASSIGNMENT'S TARGET's: a DML column, the outer item over a derived table / CTE / subquery; a FLOAT conditional's exact branch; a literal's two spellings"
+pin  "13 a DML value folds by its COLUMN: no fold into DOUBLE / VARCHAR / SMALLINT / NUMERIC(18,2), DECFLOAT's own into DECFLOAT (this answered 0)" "INSERT INTO T3 (ID, DBL) VALUES (1, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING DBL; INSERT INTO T3 (ID, V) VALUES (2, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING V; INSERT INTO T3 (ID, S) VALUES (3, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING S; INSERT INTO T3 (ID, N18) VALUES (4, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING N18; INSERT INTO T3 (ID, D34) VALUES (5, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING D34; ROLLBACK;" "DBL|1.000000000000000|V|1|S|1|N18|1.00|D34|1"
+pin  "13 ...an INT128-backed column folds at ITS type and scale, whatever the cast's" "INSERT INTO T3 (ID, I) VALUES (1, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING I; INSERT INTO T3 (ID, M) VALUES (2, CAST(0.4e0 + 0.4e0 AS INT128)) RETURNING M; INSERT INTO T3 (ID, I) VALUES (3, CAST(0.4e0 + 0.4e0 AS BIGINT)) RETURNING I; INSERT INTO T3 (ID, N382) VALUES (4, CAST(CAST(1.24951e0 AS DOUBLE PRECISION) AS NUMERIC(38,1))) RETURNING N382; INSERT INTO T3 (ID, M) VALUES (5, CAST(CAST(0.45e0 AS DOUBLE PRECISION) AS NUMERIC(38,1))) RETURNING M; ROLLBACK;" "I|0|M|0|I|0|N382|1.30|M|0"
+pin  "13 ...INSERT .. SELECT, UPDATE and UPDATE OR INSERT the same" "INSERT INTO T3 (ID, DBL) SELECT 1, CAST(0.4e0 + 0.4e0 AS INT128) $DUAL RETURNING DBL; INSERT INTO T3 (ID, I) SELECT 2, CAST(0.4e0 + 0.4e0 AS INT128) $DUAL RETURNING I; INSERT INTO T3 (ID, DBL) VALUES (3, 5); UPDATE T3 SET DBL = CAST(0.4e0 + 0.4e0 AS INT128) WHERE ID = 3 RETURNING DBL; UPDATE T3 SET I = CAST(0.4e0 + 0.4e0 AS INT128) WHERE ID = 3 RETURNING I; UPDATE OR INSERT INTO T3 (ID, V) VALUES (3, CAST(0.4e0 + 0.4e0 AS INT128)) MATCHING (ID) RETURNING V; ROLLBACK;" "DBL|1.000000000000000|I|0|DBL|1.000000000000000|I|0|V|1"
+pin  "13 ...a DECFLOAT / INT128 cast into a VARCHAR column is cvt.cpp's double (0.3 and 10^37 here)" "INSERT INTO T3 (ID, V) VALUES (1, CAST(0.1e0 + 0.2e0 AS DECFLOAT(34))) RETURNING V; INSERT INTO T3 (ID, V) VALUES (2, CAST(1e37 AS INT128)) RETURNING V; INSERT INTO T3 (ID, V) VALUES (3, CAST(CAST(1e37 AS DOUBLE PRECISION) AS INT128)) RETURNING V; INSERT INTO T3 (ID, D34) VALUES (4, CAST(0.1e0 + 0.2e0 AS DECFLOAT(34))) RETURNING D34; ROLLBACK;" "V|0.30000000000000004|V|10000000000000000719354278919532445696|V|10000000000000000719354278919532445696|D34|0.3"
+pin  "13 a derived table's / CTE's item under an operator, a CAST TO DOUBLE, an aggregate is no assignment (this answered 0)" "SELECT X || '' FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); SELECT CAST(X AS DOUBLE PRECISION) FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); SELECT MAX(X) FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); SELECT A.X * 1.0 FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL) A; WITH C AS (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL) SELECT X || 'a' FROM C;" "CONCATENATION|1|CAST|1.000000000000000|MAX|1|MULTIPLY|1.0|CONCATENATION|1a"
+pin  "13 ...the literal there is cvt.cpp's double, through a nested cast, a bare literal, a DECFLOAT, two derived levels" "SELECT X || '' FROM (SELECT CAST(CAST(1e37 AS DOUBLE PRECISION) AS INT128) X $DUAL); SELECT CAST(X AS VARCHAR(40)) FROM (SELECT CAST(CAST(0.4999999999999999e0 AS DOUBLE PRECISION) AS INT128) X $DUAL); SELECT X || '' FROM (SELECT CAST(1e30 AS NUMERIC(38,6)) X $DUAL); SELECT X || '' FROM (SELECT CAST(0.1e0 + 0.2e0 AS DECFLOAT(34)) X $DUAL); SELECT Y || '' FROM (SELECT X Y FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL));" "CONCATENATION|10000000000000000719354278919532445696|CAST|1|CONCATENATION|1000000000000000042420637374017.961984|CONCATENATION|0.30000000000000004|CONCATENATION|1"
+pin  "13 ...a scalar subquery inside an expression too; the whole item folds" "SELECT (SELECT CAST(0.4e0 + 0.4e0 AS INT128) $DUAL) || '' $DUAL; SELECT (SELECT CAST(1e37 AS INT128) $DUAL) || '' $DUAL; SELECT (SELECT CAST(0.4e0 + 0.4e0 AS INT128) $DUAL) $DUAL;" "CONCATENATION|1|CONCATENATION|10000000000000000719354278919532445696|CAST|0"
+pin  "13 ...a WHERE, an ON and a GROUP BY read the unfolded value (no row, and X 0, before)" "SELECT 'W' FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL) WHERE X = 1; SELECT 'J' FROM RDB\$DATABASE A JOIN (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL) B ON B.X = 1; SELECT X, COUNT(*) FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL) GROUP BY X;" "CONSTANT|W|CONSTANT|J|X COUNT|1 1"
+pin  "13 CONTROL: read bare, through *, a rename, CAST AS INT128, a CTE - the outer item's type - it folds; CAST AS DECFLOAT folds as DECFLOAT" "SELECT X FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); SELECT * FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); SELECT Y FROM (SELECT X Y FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL)); SELECT CAST(X AS INT128) FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); SELECT CAST(X AS DECFLOAT(34)) FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL); WITH C AS (SELECT CAST(1e37 AS INT128) X $DUAL) SELECT X FROM C; SELECT X FROM (SELECT CAST(CAST(1e37 AS DOUBLE PRECISION) AS INT128) X $DUAL);" "X|0|X|0|Y|0|CAST|0|CAST|1|X|10000000000000000000000000000000000000|X|9999999999999999538762658202121142272"
+pin  "13 an EXACT branch beside a FLOAT one converts too (VAR_POP / STDDEV / CORR / PERCENTILE_CONT read 0)" "SELECT VAR_POP(IIF(ID = 1, I, F)), VAR_POP(IIF(ID = 1, M, F)), VAR_POP(IIF(ID = 1, I, CAST(DBL AS FLOAT))), VAR_POP(IIF(ID = 1, I, CAST(1.5 AS FLOAT))) FROM BIG3; SELECT STDDEV_POP(COALESCE(I, F)), CORR(COALESCE(I, F), ID), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(I, F)) FROM BIG3;" "VAR_POP VAR_POP VAR_POP VAR_POP|1.555555555555556 1.555555555555556 1.555555555555556 0.04687500000000000|STDDEV_POP CORR PERCENTILE_CONT|1.247219128924647 0.9819805060619656 2.000000000000000"
+pin  "13 ...SUM / AVG / MAX / MIN over it, a BIGINT branch included (0 and 22003 before)" "SELECT AVG(COALESCE(I, F)), SUM(COALESCE(B, F)), SUM(IIF(ID = 1, I, CAST(DBL AS FLOAT))), MAX(COALESCE(I, F)), MIN(COALESCE(I, F)), MAX(COALESCE(M, F)) FROM BIG3;" "AVG SUM SUM MAX MIN MAX|2.333333333333333 7.000000000000000 7.000000000000000 4.0000000 1.0000000 4.0000000"
+dpin "13 ...and MAX over a FLOAT expression describes FLOAT (DOUBLE here)" "SELECT MAX(COALESCE(I, F)), MAX(COALESCE(F, 0)) FROM BIG3;" "01: sqltype: 482 FLOAT Nullable scale: 0 subtype: 0 len: 4|02: sqltype: 482 FLOAT Nullable scale: 0 subtype: 0 len: 4"
+pin  "13 two spellings of one VALUE fold as that value under an INT128 target (cvt.cpp's double before)" "SELECT CAST(-1e37 AS INT128), CAST(-1.0e37 AS INT128) $DUAL; SELECT CAST(1e37 AS INT128), CAST(1.0e37 AS INT128), CAST(10e36 AS NUMERIC(38,0)) $DUAL; SELECT CAST(-1e37 AS INT128) $DUAL WHERE 1e0 < 10e36; SELECT CAST(-1e37 AS INT128) FROM BIG3 WHERE DBL < 10e36 AND ID = 1;" "CAST CAST|-10000000000000000000000000000000000000 -10000000000000000000000000000000000000|CAST CAST CAST|10000000000000000000000000000000000000 10000000000000000000000000000000000000 10000000000000000000000000000000000000|CAST|-10000000000000000000000000000000000000|CAST|-10000000000000000000000000000000000000"
+
+echo "--- 14. RECORDED (the fold's target): the engine answers, this server refuses or differs"
+refused "14 one derived column read by two consumers that disagree (the engine inlines it per consumer)" "SELECT X, X || '' FROM (SELECT CAST(0.4e0 + 0.4e0 AS INT128) X $DUAL);" "X CONCATENATION|0 1"
+differs "14 an INT128 item that is not a CAST folds its literals on the engine" "SELECT CAST(0.4e0 + 0.4e0 AS INT128) + 1, IIF(1 = 1, CAST(0.4e0 + 0.4e0 AS INT128), 5), COALESCE(CAST(0.4e0 + 0.4e0 AS INT128), 5) $DUAL;" "ADD CASE COALESCE|1 0 0" "ADD CASE COALESCE|2 1 1"
+
+echo "--- panic check"
+ran=$((ran + 1))
+if grep -aq 'panicked at' "/tmp/fc-serve-widenum-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
+elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
+else echo "OK   no panic and the server is still up"; fi
+echo "ran $ran checks"
+if [ "$ran" -lt 140 ]; then echo "FAIL only $ran checks ran (floor 140)"; fail=1; fi
+exit $fail

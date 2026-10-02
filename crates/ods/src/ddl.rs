@@ -742,6 +742,69 @@ fn write_format_blob(
     dml::insert_blob(file, page_size, 8, &[fmt_payload], 6)
 }
 
+/// [write_format_blob] for the NEXT format of an existing relation: its
+/// default section carries the newest format's entries forward (a
+/// field since dropped - a placeholder, or past the new end - loses
+/// its entry), plus `extra` - the default of a NOT NULL field this
+/// statement adds. Writing an empty section here, which every ALTER
+/// did, would make each record stored before such a field read it
+/// NULL again after any later ALTER of the table.
+fn write_format_blob_carried(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel: u16,
+    descs: &[Descriptor],
+    extra: Option<(u16, Descriptor, Vec<u8>)>,
+) -> Result<u64, String> {
+    let mut defaults: Vec<(u16, Descriptor, Vec<u8>)> =
+        crate::format::newest_format_default_section(file, page_size, rel)
+            .into_iter()
+            .filter(|(f, _, _)| descs.get(*f as usize).is_some_and(|d| !(d.dtype == 0 && d.length == 0)))
+            .collect();
+    if let Some(x) = extra {
+        defaults.retain(|(f, _, _)| *f != x.0);
+        defaults.push(x);
+    }
+    defaults.sort_by_key(|(f, _, _)| *f);
+    let mut fmt_payload = Vec::with_capacity(2 + descs.len() * 12 + 2);
+    fmt_payload.extend_from_slice(&(descs.len() as u16).to_le_bytes());
+    for d in descs {
+        fmt_payload.push(d.dtype);
+        fmt_payload.push(d.scale as u8);
+        fmt_payload.extend_from_slice(&d.length.to_le_bytes());
+        fmt_payload.extend_from_slice(&(d.sub_type as u16).to_le_bytes());
+        fmt_payload.extend_from_slice(&d.flags.to_le_bytes());
+        fmt_payload.extend_from_slice(&d.offset.to_le_bytes());
+    }
+    fmt_payload.extend_from_slice(&(defaults.len() as u16).to_le_bytes());
+    for (f, d, v) in &defaults {
+        fmt_payload.extend_from_slice(&f.to_le_bytes());
+        fmt_payload.push(d.dtype);
+        fmt_payload.push(d.scale as u8);
+        fmt_payload.extend_from_slice(&d.length.to_le_bytes());
+        fmt_payload.extend_from_slice(&(d.sub_type as u16).to_le_bytes());
+        fmt_payload.extend_from_slice(&d.flags.to_le_bytes());
+        fmt_payload.extend_from_slice(&0u32.to_le_bytes());
+        fmt_payload.extend_from_slice(v);
+    }
+    dml::insert_blob(file, page_size, 8, &[fmt_payload], 6)
+}
+
+/// A dropped field's placeholder is ALL ZERO, offset included, in every
+/// format the engine writes after the drop - not wherever the offset
+/// walk had got to when it passed it. Measured: `TG (K, M)`, add C, drop
+/// C, add C, add D, drop M - the engine's format 6 has BOTH holes
+/// (the first C's and M's) at offset 0; this re-walked the older hole
+/// to offset 8 in every re-format after it (ADD, DROP, a retype).
+fn zero_placeholders(mut descs: Vec<Descriptor>) -> Vec<Descriptor> {
+    for d in descs.iter_mut() {
+        if d.dtype == 0 && d.length == 0 {
+            *d = Descriptor { dtype: 0, scale: 0, length: 0, sub_type: 0, flags: 0, offset: 0 };
+        }
+    }
+    descs
+}
+
 /// Turn a relation's current descriptors back into the `(dtype, length,
 /// scale, sub_type)` tuples `compute_format` consumes. `compute_format`
 /// re-adds the VARYING count word, so it is stripped here first - without
@@ -776,6 +839,22 @@ fn col_field(dtype: u8, length: u16, scale: i8, sub_type: i16) -> (u8, u16, i8, 
 
 /// [col_field] for a column definition: an ARRAY column's storage is the
 /// 8-byte array blob id (dtype_array), whatever its element type
+/// The storage descriptor a declared column gets in its format (at
+/// offset 0) - what a value bound for it is encoded against.
+pub fn column_descriptor(c: &ColumnDef) -> Descriptor {
+    let f = col_field_of(c);
+    let mut d = compute_format(&[f]).into_iter().next().unwrap_or(Descriptor {
+        dtype: 0,
+        scale: 0,
+        length: 0,
+        sub_type: 0,
+        flags: 0,
+        offset: 0,
+    });
+    d.offset = 0;
+    d
+}
+
 fn col_field_of(c: &ColumnDef) -> (u8, u16, i8, i16) {
     if c.dtype == crate::format::dtype::BLOB && c.dims.is_empty() {
         // a blob's descriptor carries its sub_type, and its CHARACTER SET
@@ -1427,11 +1506,20 @@ fn relation_trigger_names(file: &crate::Image, page_size: usize, table: &str) ->
 /// records use the new one. The sequence mirrors the tail of
 /// [create_table] for the single new field, plus a version rewrite of the
 /// `RDB$RELATIONS` row to bump its `RDB$FORMAT` and field count.
+///
+/// A NOT NULL column (or an IDENTITY one, implicitly NOT NULL) over a
+/// table that already has rows needs a value for them: `format_default`
+/// is its DEFAULT evaluated now, as (the value's own descriptor, its
+/// bytes), and it goes into the new format's default section, where
+/// every older record reads it ([crate::format::parse_format_defaults]).
+/// With none, rows present are the engine's 22006 "Cannot make field
+/// ... NOT NULL because there are NULLs present".
 pub fn alter_table_add_column(
     file: &mut crate::Image,
     page_size: usize,
     table: &str,
     col: &ColumnDef,
+    format_default: Option<(Descriptor, Vec<u8>)>,
 ) -> Result<(), String> {
     let table = table.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &table)
@@ -1445,7 +1533,32 @@ pub fn alter_table_add_column(
     {
         return Err(format!("column {} already exists", col.name));
     }
-    let new_fid = existing.iter().map(|c| c.field_id + 1).max().unwrap_or(0);
+    // THE NEW FIELD'S ID IS THE RELATION'S NEXT-ID COUNTER, never one a
+    // dropped field had: records stored under the older formats still
+    // hold that field's bytes at that id, and they would read back
+    // under the new column. Measured, `add c integer default 4`, a row,
+    // `drop c`, `add c integer default 77`: the engine reads the old row
+    // as C NULL, with C at RDB$FIELD_ID 3 of (K 0, M 1) and the counter
+    // RDB$RELATIONS.RDB$FIELD_ID 3 -> 4 (the drop leaves it); this took
+    // max(id)+1 = 2, the dropped C's own id, and the old row read C 4.
+    // The POSITION is the next one after the highest left (a drop does
+    // not renumber: `drop m` between K 0 and C 2 puts the next ADD at 4).
+    let mut new_fid = existing.iter().map(|c| c.field_id + 1).max().unwrap_or(0);
+    if let Some((_, _, image, _)) = find_relations_row(file, page_size, &table) {
+        let sys = system_relation_formats(file, page_size, "RDB$RELATIONS");
+        let fid_f = relation_columns(file, page_size, "RDB$RELATIONS")
+            .iter()
+            .find(|c| c.name == "RDB$FIELD_ID")
+            .map(|c| c.field_id as usize);
+        if let (Some(sys), Some(fid_f)) = (sys, fid_f) {
+            if let Some((_, d)) = sys.iter().max_by_key(|(n, _)| *n) {
+                if let Some(Value::Int(n)) = decode_record(&image, d).get(fid_f) {
+                    new_fid = new_fid.max(u16::try_from(*n).unwrap_or(0));
+                }
+            }
+        }
+    }
+    let new_pos = existing.iter().map(|c| c.position + 1).max().unwrap_or(0);
 
     // a DOMAIN-typed column resolves its storage off the domain's row,
     // exactly as create_table does, and its RDB$FIELD_SOURCE is the
@@ -1476,6 +1589,7 @@ pub fn alter_table_add_column(
             rc.sub_type = dt.sub_type;
             rc.char_len = dt.char_len;
             rc.dims = dt.dims.clone();
+            rc.charset_id = dt.charset_id;
             resolved_col = rc;
             (&resolved_col, Some(dname))
         }
@@ -1525,9 +1639,16 @@ pub fn alter_table_add_column(
         .zip(cur_descs.iter())
         .map(|((dt, l, s, st), d)| (dt, l, s, st, d.offset == 0 && d.length != 0))
         .collect();
+    // the ids between the newest format's end and the new field are
+    // dropped fields' (a trailing drop truncates the format): each keeps
+    // a placeholder, as a mid-table hole does
+    new_fid = new_fid.max(fields.len() as u16);
+    while fields.len() < new_fid as usize {
+        fields.push((0, 0, 0, 0, false));
+    }
     let (dt, l, s, st) = col_field_of(col);
     fields.push((dt, l, s, st, col.computed.is_some()));
-    let new_descs = compute_format_mixed(&fields);
+    let new_descs = zero_placeholders(compute_format_mixed(&fields));
     if new_descs.len() != fields.len() {
         return Err("format computation failed".into());
     }
@@ -1554,7 +1675,29 @@ pub fn alter_table_add_column(
     let new_format_no = cur_format_no + 1;
 
     // --- write the new format version blob + RDB$FORMATS row ----------
-    let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+    // A NOT NULL (or IDENTITY) field over rows that are already there:
+    // with a default, the format carries it for them (measured: `alter
+    // table p add y integer default 5 not null` over one row writes
+    // format 2's section `0100 0100 090004000000000000000000 05000000`
+    // and the row reads Y 5 - an EMPTY table's format carries it too);
+    // without one, the engine's deferred check finds the NULLs and the
+    // whole ALTER fails (22006, measured the same for an identity
+    // column, whose generator never fills a stored row)
+    let not_null = col.not_null || col.identity.is_some();
+    let extra = match (not_null, format_default) {
+        (true, Some((d, v))) if col.identity.is_none() => Some((new_fid, d, v)),
+        (true, _) => {
+            if relation_has_rows(file, page_size, rel) {
+                return Err(format!(
+                    "Cannot make field {} of table {} NOT NULL because there are NULLs present",
+                    col.name, table
+                ));
+            }
+            None
+        }
+        (false, _) => None,
+    };
+    let fmt_blob = write_format_blob_carried(file, page_size, rel, &new_descs, extra)?;
     sys_insert(
         file,
         page_size,
@@ -1566,6 +1709,22 @@ pub fn alter_table_add_column(
             ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(8, fmt_blob))),
         ],
     )?;
+
+    // an IDENTITY column's implicit generator (system flag 6), named
+    // from the generator counter, as create_table draws it. ADD used to
+    // write neither the generator nor the column's RDB$GENERATOR_NAME /
+    // RDB$IDENTITY_TYPE, so the column was a plain nullable one that
+    // read NULL for every inserted row (measured: the engine answers
+    // ID 1, 2 for two inserts after `add id integer generated by
+    // default as identity`, RDB$NULL_FLAG 1, RDB$IDENTITY_TYPE 1)
+    let identity_gen: Option<(String, IdentityDef)> = match &col.identity {
+        Some(id) => {
+            let g = format!("RDB${}", next_generator_number(file, page_size, 1)?);
+            write_generator(file, page_size, &g, 6, id.start, id.increment)?;
+            Some((g, id.clone()))
+        }
+        None => None,
+    };
 
     // --- the new column's domain, RDB$FIELDS and RDB$RELATION_FIELDS --
     // a USER-domain column points at the domain itself; only a plain
@@ -1648,22 +1807,68 @@ pub fn alter_table_add_column(
     }
     } // domain_source.is_none() - a user domain's row already exists
 
-    let rf_vals: Vec<(&str, SysVal<'_>)> = vec![
+    let mut rf_vals: Vec<(&str, SysVal<'_>)> = vec![
         ("RDB$FIELD_NAME", SysVal::S(&col.name)),
         ("RDB$RELATION_NAME", SysVal::S(&table)),
         ("RDB$FIELD_SOURCE", SysVal::S(&dom)),
-        ("RDB$FIELD_POSITION", SysVal::I(new_fid as i64)),
+        ("RDB$FIELD_POSITION", SysVal::I(new_pos as i64)),
         // a computed column is read-only: RDB$UPDATE_FLAG 0 (probed)
         ("RDB$UPDATE_FLAG", SysVal::I(if col.computed.is_some() { 0 } else { 1 })),
         ("RDB$FIELD_ID", SysVal::I(new_fid as i64)),
         ("RDB$SYSTEM_FLAG", SysVal::I(0)),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ("RDB$FIELD_SOURCE_SCHEMA_NAME", SysVal::S("PUBLIC")),
-        // a text column's collation rides here too (the ttype high byte);
-        // a built-in non-text column is 0
-        ("RDB$COLLATION_ID", SysVal::I(crate::intl::collation_id(col.sub_type) as i64)),
     ];
+    // a text column's collation rides here too (the ttype high byte); a
+    // built-in non-text column is 0. A DOMAIN column's is NULL - its
+    // collation is the domain's, as create_table writes it (measured:
+    // `alter table tc add z dci` leaves RDB$COLLATION_ID NULL on the
+    // engine; this wrote the domain's 3 once the ttype carried it)
+    if domain_source.is_none() {
+        rf_vals.push(("RDB$COLLATION_ID", SysVal::I(crate::intl::collation_id(col.sub_type) as i64)));
+    }
+    // the column's DEFAULT lands on its RDB$RELATION_FIELDS row, exactly
+    // as create_table puts it, BEFORE the runtime rebuild below re-reads
+    // it. It was parsed and dropped here: measured, `alter table tt add c
+    // integer default 4` then `insert into tt (a) values (2)` reads C 4
+    // on the engine (RDB$DEFAULT_SOURCE 'default 4') and read NULL here,
+    // with no default in the catalog at all. Rows already stored keep
+    // reading NULL for the new column on both (a nullable ADD).
+    if let Some(def) = &col.default {
+        let src = dml::insert_blob_cs(file, page_size, 5, &[def.source.as_bytes().to_vec()], 1, 4)?;
+        let val = dml::insert_blob(file, page_size, 5, &[def.value_blr.clone()], 2)?;
+        rf_vals.push(("RDB$DEFAULT_SOURCE", SysVal::B(blob_id_bytes(5, src))));
+        rf_vals.push(("RDB$DEFAULT_VALUE", SysVal::B(blob_id_bytes(5, val))));
+    }
+    // NOT NULL on the row (an identity column's too, with no constraint
+    // row - as create_table writes both)
+    if not_null {
+        rf_vals.push(("RDB$NULL_FLAG", SysVal::I(1)));
+    }
+    if let Some((g, id)) = &identity_gen {
+        rf_vals.push(("RDB$GENERATOR_NAME", SysVal::S(g)));
+        rf_vals.push(("RDB$IDENTITY_TYPE", SysVal::I(id.identity_type as i64)));
+    }
     sys_insert(file, page_size, "RDB$RELATION_FIELDS", 5, &rf_vals)?;
+    // an explicit NOT NULL is a constraint: an INTEG_<n> NOT NULL row
+    // naming the field (measured: `add x integer not null` then `add y
+    // integer default 5 not null` are INTEG_1 X and INTEG_2 Y)
+    if col.not_null {
+        let cname = next_integ_name(file, page_size)?;
+        sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
+            ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+            ("RDB$CONSTRAINT_TYPE", SysVal::S("NOT NULL")),
+            ("RDB$RELATION_NAME", SysVal::S(&table)),
+            ("RDB$DEFERRABLE", SysVal::S("NO")),
+            ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ])?;
+        sys_row_by_name(file, page_size, "RDB$CHECK_CONSTRAINTS", &[
+            ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+            ("RDB$TRIGGER_NAME", SysVal::S(&col.name)),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ])?;
+    }
 
     // --- rebuild RDB$RUNTIME for all fields (incl. the new one, now in
     // RDB$RELATION_FIELDS) so DSQL resolves the added column ------------
@@ -1926,7 +2131,7 @@ fn reformat_for_retype(
         }
         *f = (dt, l, s, st, false);
     }
-    let new_descs = compute_format_mixed(&fields);
+    let new_descs = zero_placeholders(compute_format_mixed(&fields));
 
     let (rel_page, rel_slot, mut rel_image, rec_format) =
         find_relations_row(file, page_size, table).ok_or("RDB$RELATIONS row not found")?;
@@ -1944,7 +2149,7 @@ fn reformat_for_retype(
     };
     let new_format_no = cur_format_no + 1;
 
-    let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+    let fmt_blob = write_format_blob_carried(file, page_size, rel, &new_descs, None)?;
     sys_insert(
         file,
         page_size,
@@ -2010,18 +2215,21 @@ fn domain_dependents(
 /// The first table.column that uses a domain as its `RDB$FIELD_SOURCE`
 /// (None if the domain is unused) - a `DROP DOMAIN` is refused while it
 /// is in use.
-fn domain_user(file: &crate::Image, page_size: usize, name: &str) -> Option<String> {
+/// The first `RDB$RELATION_FIELDS` row whose source is the domain, in
+/// storage order - the one the engine's DROP DOMAIN names: its relation
+/// and its local (column) name.
+fn domain_user(file: &crate::Image, page_size: usize, name: &str) -> Option<(String, String)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS")?;
     let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     let cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
-    let (rn_f, src_f) = (fid("RDB$RELATION_NAME")?, fid("RDB$FIELD_SOURCE")?);
+    let (rn_f, src_f, fn_f) = (fid("RDB$RELATION_NAME")?, fid("RDB$FIELD_SOURCE")?, fid("RDB$FIELD_NAME")?);
     let mut used = None;
     walk_rows(file, page_size, rel, descs, |v| {
         if used.is_none() && text_eq(v.get(src_f), name) {
-            if let Some(Value::Text(t)) = v.get(rn_f) {
-                used = Some(t.trim_end().to_string());
+            if let (Some(Value::Text(t)), Some(Value::Text(f))) = (v.get(rn_f), v.get(fn_f)) {
+                used = Some((t.trim_end().to_string(), f.trim_end().to_string()));
             }
         }
     });
@@ -2334,8 +2542,8 @@ pub fn drop_domain(file: &mut crate::Image, page_size: usize, name: &str) -> Res
     if !domain_exists(file, page_size, &want) {
         return Err(format!("Domain {} not found", want));
     }
-    if let Some(user) = domain_user(file, page_size, &want) {
-        return Err(format!("Domain {} is used in table {}", want, user));
+    if let Some((user, local)) = domain_user(file, page_size, &want) {
+        return Err(format!("Domain {} is used in table {} (local name {})", want, user, local));
     }
     // the domain's security class and its owner privilege go with it (the
     // engine drops both), then the RDB$FIELDS row
@@ -2355,6 +2563,20 @@ pub fn drop_domain(file: &mut crate::Image, page_size: usize, name: &str) -> Res
     delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| {
         text_eq(v.get(rn_f), &dn) && matches!(v.get(ot_f), Some(Value::Int(9)))
     })?;
+    // the rows the domain's CHECK recorded (type 4, a CHECK reading a
+    // table: `CHECK (VALUE IN (SELECT ID FROM T1))` is two rows on T1) and
+    // a computed domain's (type 3) go with it - MET_delete_dependencies
+    // for obj_validation. Measured on 2182: after DROP DOMAIN D1 none is
+    // left and DROP TABLE T1 passes; left behind here they refused it
+    // "TABLE T1 / there are 1 dependencies"
+    if crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES").is_some() {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let dn = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            text_eq(v.get(dn_f), &dn) && (int_eq(v.get(dt_f), 3) || int_eq(v.get(dt_f), 4))
+        })?;
+    }
     advance_oldest_transactions(file, page_size)
 }
 
@@ -2536,6 +2758,8 @@ pub struct DomainType {
     /// an ARRAY domain's bounds (RDB$DIMENSIONS + RDB$FIELD_DIMENSIONS);
     /// empty for a scalar domain
     pub dims: Vec<(i32, i32)>,
+    /// the domain's RDB$CHARACTER_SET_ID (text and text BLOB domains)
+    pub charset_id: Option<u8>,
 }
 
 /// The bounds of an ARRAY field's dimensions, in dimension order -
@@ -2618,6 +2842,29 @@ pub fn domain_charset_id(file: &crate::Image, page_size: usize, name: &str) -> O
     out
 }
 
+/// A domain's `RDB$COLLATION_ID` (None when SQL NULL) - where a
+/// procedure or function PARAMETER declared `COLLATE <name>` keeps its
+/// collation (the parameter row's own RDB$COLLATION_ID stays NULL,
+/// measured on 2182).
+pub fn domain_collation_id(file: &crate::Image, page_size: usize, name: &str) -> Option<i64> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$FIELDS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$FIELDS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let name_f = fid("RDB$FIELD_NAME")?;
+    let co_f = fid("RDB$COLLATION_ID")?;
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(name_f), name) {
+            if let Some(Value::Int(i)) = v.get(co_f) {
+                out = Some(*i);
+            }
+        }
+    });
+    out
+}
+
 fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Option<DomainType> {
     let rel = crate::resolve_relation(file, page_size, "RDB$FIELDS")?;
     let formats = system_relation_formats(file, page_size, "RDB$FIELDS")?;
@@ -2634,6 +2881,9 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
     let dv_f = fid("RDB$DEFAULT_VALUE");
     let vb_f = fid("RDB$VALIDATION_BLR");
     let dim_f = fid("RDB$DIMENSIONS");
+    let cs_f = fid("RDB$CHARACTER_SET_ID");
+    let coll_f = fid("RDB$COLLATION_ID");
+    let mut cs_coll: (Option<i64>, i64) = (None, 0);
     #[allow(clippy::type_complexity)]
     let mut found: Option<(
         i16,
@@ -2665,6 +2915,13 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
                 Some(Value::Blob(r, n)) => Some((*r, *n)),
                 _ => None,
             });
+            cs_coll = (
+                cs_f.and_then(|f| match v.get(f) {
+                    Some(Value::Int(i)) => Some(*i),
+                    _ => None,
+                }),
+                coll_f.map_or(0, geti),
+            );
             found = Some((
                 geti(ft_f) as i16,
                 geti(len_f) as u16,
@@ -2679,6 +2936,20 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
         }
     });
     let (field_type, byte_len, scale, sub_type, char_len, not_null, def, vblr, ndims) = found?;
+    // A TEXT domain's column carries the domain's CHARACTER SET and
+    // COLLATE in its format descriptor, as the ttype (charset low byte,
+    // collation high byte) - RDB$FIELD_SUB_TYPE is 0 for CHAR/VARCHAR, so
+    // copying that dropped both. Measured: a column of `varchar(5)
+    // character set utf8 collate unicode_ci` describes charset 4
+    // SYSTEM.UTF8 and `where a = 'abc'` finds 'AbC' on the engine; this
+    // described charset 0 NONE and compared byte-wise (count 0).
+    let (charset_id, sub_type) = match (field_type, cs_coll.0) {
+        (14 | 37 | 40, Some(cs)) => {
+            (Some(cs as u8), ((cs as u16 & 0xFF) | ((cs_coll.1 as u16 & 0xFF) << 8)) as i16)
+        }
+        (261, Some(cs)) => (Some(cs as u8), sub_type),
+        _ => (None, sub_type),
+    };
     let dims = if ndims > 0 { field_dimensions(file, page_size, dname) } else { Vec::new() };
     let dtype = field_type_to_dtype(field_type)?;
     // dsc_length: a VARYING carries its 2-byte count word, other types do not
@@ -2701,6 +2972,7 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
         default_blr,
         validation_blr,
         dims,
+        charset_id,
     })
 }
 
@@ -2791,11 +3063,9 @@ pub fn alter_domain_type(
         (*n, d.clone())
     };
     let mut f_image = {
-        let dp = DataPage::decode(crate::page_at(file, page_size, fpage).ok_or("bad page")?)
-            .ok_or("bad data page")?;
-        dp.record(fslot)
-            .and_then(|r| r.image())
-            .ok_or("no field image")?
+        catalog_patch_base(file, page_size, fpage, fslot)
+            .map_err(|_| "no field image")?
+            .0
     };
     let patch_field = |image: &mut [u8], nm: &str, v: SysVal<'_>| -> Result<(), String> {
         let fid = f_fid(nm).ok_or_else(|| format!("no {} column", nm))?;
@@ -2896,6 +3166,34 @@ pub fn alter_table_drop_column(
             }
         }
     }
+    // ANY OTHER OBJECT THAT READS THE COLUMN - a trigger, a view, a
+    // procedure: its RDB$DEPENDENCIES rows name the column, and the
+    // engine counts the distinct dependents and refuses (dfw.epp
+    // check_dependencies, `REDUCED TO` the dependent). Measured: a
+    // BEFORE INSERT trigger `new.b = 99` makes `alter table t drop b`
+    // "cannot delete / COLUMN "PUBLIC"."T"."B" / there are 1
+    // dependencies"; this dropped the column, and the trigger's row
+    // still named it.
+    // ...a VIEW column that IS this column is refused first, by the
+    // statement itself, with its own message (DdlNodes.epp
+    // deleteLocalField, DYN 52; measured: "ALTER TABLE "PUBLIC"."T"
+    // failed / Column "C" from table "PUBLIC"."T" is referenced in view
+    // "PUBLIC"."V"")
+    if let Some(view) = view_selecting_column(file, page_size, &table, &col_up) {
+        return Err(format!(
+            "Column {} from table {} is referenced in view {}",
+            col_up, table, view
+        ));
+    }
+    let dependents = column_dependents(file, page_size, &table, &col_up);
+    if !dependents.is_empty() {
+        return Err(format!(
+            "cannot delete COLUMN {}.{}: there are {} dependencies",
+            table,
+            col_up,
+            dependents.len()
+        ));
+    }
     // an indexed/key column would leave a dangling index - reject it
     if let Some(irt) = find_index_root(file, page_size, rel) {
         for e in irt.live_entries() {
@@ -2952,7 +3250,7 @@ pub fn alter_table_drop_column(
         .map(|((dt, l, s, st), d)| (dt, l, s, st, d.offset == 0 && d.length != 0))
         .collect();
     fields[drop_fid] = (0, 0, 0, 0, false); // dropped-field placeholder
-    let mut new_descs = compute_format_mixed(&fields);
+    let mut new_descs = zero_placeholders(compute_format_mixed(&fields));
     // the placeholder itself is all-zero at offset 0 (dfw.epp), matching
     // the engine's format blob for a dropped field
     new_descs[drop_fid] = Descriptor {
@@ -2988,7 +3286,7 @@ pub fn alter_table_drop_column(
     let new_format_no = cur_format_no + 1;
 
     // --- new format blob + RDB$FORMATS row ----------------------------
-    let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+    let fmt_blob = write_format_blob_carried(file, page_size, rel, &new_descs, None)?;
     sys_insert(
         file,
         page_size,
@@ -3005,6 +3303,23 @@ pub fn alter_table_drop_column(
     let rf_slot = find_sys_row_slot(file, page_size, "RDB$RELATION_FIELDS", 5, matches_col)
         .ok_or("RDB$RELATION_FIELDS row not found")?;
     dml::delete_records(file, page_size, 5, &[rf_slot])?;
+    // ONLY an auto-domain (RDB$<n>) dies with its column: a column
+    // declared over a named domain leaves the domain (measured on 2182:
+    // `ALTER TABLE CE DROP X` over `X DD` keeps DD's RDB$FIELDS row -
+    // this deleted it). A computed column's auto-domain takes the
+    // type-3 RDB$DEPENDENCIES rows its expression recorded (measured:
+    // after `ALTER TABLE CB DROP CNT` over `CNT COMPUTED BY ((SELECT
+    // COUNT(*) FROM CA))` the engine holds no RDB$3 row and DROP TABLE
+    // CA passes; left behind here they refused it "1 dependencies")
+    let domain = domain.filter(|d| d.strip_prefix("RDB$").is_some_and(|x| x.parse::<u64>().is_ok()));
+    if let Some(dom) = &domain {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let d = dom.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            int_eq(v.get(dt_f), 3) && text_is(v.get(dn_f), &d)
+        })?;
+    }
     if let Some(dom) = &domain {
         let dom_pred = |vals: &[Value]| {
             let f_fid = relation_columns(file, page_size, "RDB$FIELDS")
@@ -3046,6 +3361,89 @@ pub fn alter_table_drop_column(
 
     advance_oldest_transactions(file, page_size)?;
     Ok(())
+}
+
+/// The view one of whose columns is `table`.`column` itself: a
+/// RDB$RELATION_FIELDS row whose RDB$BASE_FIELD is the column, sharing
+/// its field source, in a view whose RDB$VIEW_RELATIONS row for that
+/// context is `table` - the engine's own join in deleteLocalField.
+fn view_selecting_column(file: &crate::Image, page_size: usize, table: &str, column: &str) -> Option<String> {
+    let src = relation_field_source(file, page_size, table, column)?;
+    let rf_rel = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS")?;
+    let rf_formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")?;
+    let (_, rf_descs) = rf_formats.iter().max_by_key(|(n, _)| *n)?;
+    let rf = |n: &str| sys_fid(file, page_size, "RDB$RELATION_FIELDS", n).ok();
+    let (rn_f, base_f, src_f, ctx_f) =
+        (rf("RDB$RELATION_NAME")?, rf("RDB$BASE_FIELD")?, rf("RDB$FIELD_SOURCE")?, rf("RDB$VIEW_CONTEXT")?);
+    let mut cands: Vec<(String, i64)> = Vec::new();
+    walk_rows(file, page_size, rf_rel, rf_descs, |v| {
+        if text_is(v.get(base_f), column) && text_is(v.get(src_f), &src) {
+            if let (Some(Value::Text(r)), Some(Value::Int(c))) = (v.get(rn_f), v.get(ctx_f)) {
+                cands.push((r.trim_end().to_string(), *c));
+            }
+        }
+    });
+    if cands.is_empty() {
+        return None;
+    }
+    let vr_rel = crate::resolve_relation(file, page_size, "RDB$VIEW_RELATIONS")?;
+    let vr_formats = system_relation_formats(file, page_size, "RDB$VIEW_RELATIONS")?;
+    let (_, vr_descs) = vr_formats.iter().max_by_key(|(n, _)| *n)?;
+    let vf = |n: &str| sys_fid(file, page_size, "RDB$VIEW_RELATIONS", n).ok();
+    let (vn_f, vrel_f, vctx_f) = (vf("RDB$VIEW_NAME")?, vf("RDB$RELATION_NAME")?, vf("RDB$VIEW_CONTEXT")?);
+    let mut hit: Option<String> = None;
+    walk_rows(file, page_size, vr_rel, vr_descs, |v| {
+        if hit.is_some() || !text_is(v.get(vrel_f), table) {
+            return;
+        }
+        if let (Some(Value::Text(vn)), Some(Value::Int(c))) = (v.get(vn_f), v.get(vctx_f)) {
+            let vn = vn.trim_end();
+            if cands.iter().any(|(r, cc)| r == vn && cc == c) {
+                hit = Some(vn.to_string());
+            }
+        }
+    });
+    hit
+}
+
+/// The distinct (dependent name, dependent type) pairs whose
+/// RDB$DEPENDENCIES rows name `table`.`column` (a relation, type 0).
+fn column_dependents(file: &crate::Image, page_size: usize, table: &str, column: &str) -> Vec<(String, i64)> {
+    let mut out: Vec<(String, i64)> = Vec::new();
+    let (Some(rel), Some(formats)) = (
+        crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES"),
+        system_relation_formats(file, page_size, "RDB$DEPENDENCIES"),
+    ) else {
+        return out;
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else { return out };
+    let cols = relation_columns(file, page_size, "RDB$DEPENDENCIES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(dep_f), Some(on_f), Some(fld_f), Some(on_ty_f), Some(dep_ty_f)) = (
+        fid("RDB$DEPENDENT_NAME"),
+        fid("RDB$DEPENDED_ON_NAME"),
+        fid("RDB$FIELD_NAME"),
+        fid("RDB$DEPENDED_ON_TYPE"),
+        fid("RDB$DEPENDENT_TYPE"),
+    ) else {
+        return out;
+    };
+    walk_rows(file, page_size, rel, descs, |v| {
+        if !text_is(v.get(on_f), table) || !text_is(v.get(fld_f), column) {
+            return;
+        }
+        if !matches!(v.get(on_ty_f), Some(Value::Int(0))) {
+            return;
+        }
+        let (Some(Value::Text(d)), Some(Value::Int(t))) = (v.get(dep_f), v.get(dep_ty_f)) else {
+            return;
+        };
+        let key = (d.trim_end().to_string(), *t);
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    });
+    out
 }
 
 /// The storage width of an integer dtype, for the widening check.
@@ -3145,6 +3543,120 @@ fn column_in_constraint_index(
     Ok(hit)
 }
 
+/// The column's (RDB$FIELD_SUB_TYPE, RDB$FIELD_PRECISION) off its
+/// domain's RDB$FIELDS row - what the engine's numeric check reads.
+fn column_field_precision(file: &crate::Image, page_size: usize, table: &str, col: &str) -> (i64, i64) {
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+        _ => None,
+    };
+    let int = |v: Option<&Value>| match v {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let (Some(rf_formats), Some(f_formats)) = (
+        system_relation_formats(file, page_size, "RDB$RELATION_FIELDS"),
+        system_relation_formats(file, page_size, "RDB$FIELDS"),
+    ) else {
+        return (0, 0);
+    };
+    let (Some((_, rf_descs)), Some((_, f_descs))) =
+        (rf_formats.iter().max_by_key(|(n, _)| *n), f_formats.iter().max_by_key(|(n, _)| *n))
+    else {
+        return (0, 0);
+    };
+    let (Ok(rel_f), Ok(name_f), Ok(src_f), Ok(fn_f), Ok(sub_f), Ok(prec_f)) = (
+        sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME"),
+        sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_NAME"),
+        sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_SOURCE"),
+        sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME"),
+        sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_SUB_TYPE"),
+        sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_PRECISION"),
+    ) else {
+        return (0, 0);
+    };
+    let mut source = None;
+    walk_rows(file, page_size, 5, rf_descs, |v| {
+        if text_is(v.get(rel_f), table) && text_is(v.get(name_f), col) {
+            source = text(v.get(src_f));
+        }
+    });
+    let Some(source) = source else { return (0, 0) };
+    let mut out = (0, 0);
+    walk_rows(file, page_size, 2, f_descs, |v| {
+        if text_is(v.get(fn_f), &source) {
+            out = (int(v.get(sub_f)), int(v.get(prec_f)));
+        }
+    });
+    out
+}
+
+/// The part of the engine's type-change matrix (DdlNodes.epp
+/// AlterDomainNode::checkUpdate) whose stored values this server
+/// PRESENTS in the new type ([crate::format::present_field]), measured
+/// on 2182 over rows written before the ALTER:
+///
+/// - an exact numeric to a same-or-wider exact one (SMALLINT only from
+///   SMALLINT, INTEGER from SMALLINT/INTEGER, BIGINT from those, INT128
+///   from any), with checkUpdateNumericType's rule when both are
+///   NUMERIC/DECIMAL - the integral digits (precision + scale) may not
+///   shrink: `numeric(10,2)` -> `numeric(18,4)` reads 12.3400,
+///   `numeric(5,2)` -> `numeric(9,4)` 1.2500, `integer` ->
+///   `numeric(9,3)` 1.000;
+/// - SMALLINT, INTEGER (at any scale) and FLOAT to DOUBLE PRECISION
+///   (7.000000000000000) - but NOT BIGINT, the engine's "Conversion from
+///   base type BIGINT to DOUBLE PRECISION is not supported";
+/// - DATE to TIMESTAMP (midnight);
+/// - CHAR / VARCHAR to CHAR / VARCHAR of the same character set holding
+///   at least as many characters: `varchar(5)` 'ab' -> `char(6)` reads
+///   'ab    ', `char(3)` 'x' -> `varchar(4)` keeps its pad, 'x  '.
+///
+/// A scale that shallows would round the stored values the engine keeps
+/// exact, so only a scale that deepens or stays is taken; everything
+/// else keeps the refusal it had. The ALTER is taken whatever the rows
+/// hold: a stored value whose rescale no longer fits the new type's
+/// storage word (SMALLINT 32000 to NUMERIC(4,2)) raises 22003 when it is
+/// read, as on 2182 ([crate::format::present_field]).
+fn column_type_change_extended(old: &Descriptor, new: &ColumnDef, (old_sub, old_prec): (i64, i64)) -> bool {
+    use crate::format::dtype;
+    let (o, n) = (old.dtype, new.dtype);
+    match n {
+        dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 => {
+            let from: &[u8] = match n {
+                dtype::SHORT => &[dtype::SHORT],
+                dtype::LONG => &[dtype::SHORT, dtype::LONG],
+                dtype::INT64 => &[dtype::SHORT, dtype::LONG, dtype::INT64],
+                _ => &[dtype::SHORT, dtype::LONG, dtype::INT64, dtype::INT128],
+            };
+            if !from.contains(&o) {
+                return false;
+            }
+            // checkUpdateNumericType: both NUMERIC/DECIMAL - the integral
+            // width may not shrink
+            let new_prec = new.precision.map_or(0, |p| p as i64);
+            if old_sub != 0 && new.sub_type != 0 && old_prec + old.scale as i64 > new_prec + new.scale as i64 {
+                return false;
+            }
+            new.scale <= old.scale
+        }
+        dtype::DOUBLE => matches!(o, dtype::SHORT | dtype::LONG | dtype::REAL | dtype::DOUBLE),
+        dtype::TIMESTAMP => o == dtype::SQL_DATE || o == dtype::TIMESTAMP,
+        dtype::TEXT | dtype::VARYING => {
+            if !matches!(o, dtype::TEXT | dtype::VARYING) {
+                return false;
+            }
+            let old_cs = (old.sub_type as u16 & 0xFF) as u8;
+            if new.charset_id.is_some_and(|c| c != old_cs) {
+                return false;
+            }
+            let old_chars = crate::intl::char_length(o, old.length, old.sub_type);
+            let new_chars = crate::intl::char_length(n, new.length, old.sub_type);
+            new_chars >= old_chars
+        }
+        _ => false,
+    }
+}
+
 fn type_change_supported(old: &Descriptor, new: &ColumnDef) -> bool {
     use crate::format::dtype;
     // integer family: same or wider, both scale 0
@@ -3200,7 +3712,17 @@ pub fn alter_table_alter_column_type(
         .max_by_key(|(n, _)| *n)
         .ok_or("relation has no format")?;
     let old_desc = cur_descs.get(fid).ok_or("field beyond format")?;
-    if !type_change_supported(old_desc, new_col) {
+    // the widenings this path always took, or - over a column no index
+    // reads, whose stored values the readers PRESENT in the new type
+    // (crate::format::present_field) - the engine's wider matrix
+    // ([column_type_change_extended])
+    // (...and no view, CHECK or computed column reads - whose own
+    // formats and compiled expressions were built over the old type)
+    if !type_change_supported(old_desc, new_col)
+        && !(column_type_change_extended(old_desc, new_col, column_field_precision(file, page_size, &table, &col_up))
+            && indices_containing(file, page_size, &table, &col_up)?.is_empty()
+            && column_dependent(file, page_size, &table, &col_up)?.is_none())
+    {
         return Err(format!(
             "cannot change datatype for {}; conversion not supported",
             col_name
@@ -3232,7 +3754,7 @@ pub fn alter_table_alter_column_type(
         .collect();
     let (dt, l, s, st) = col_field_of(new_col);
     fields[fid] = (dt, l, s, st, false);
-    let new_descs = compute_format_mixed(&fields);
+    let new_descs = zero_placeholders(compute_format_mixed(&fields));
 
     // the column's domain (RDB$FIELD_SOURCE) - retyped in place
     let rf_formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
@@ -3274,7 +3796,7 @@ pub fn alter_table_alter_column_type(
     let new_format_no = cur_format_no + 1;
 
     // --- new format blob + RDB$FORMATS row ----------------------------
-    let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+    let fmt_blob = write_format_blob_carried(file, page_size, rel, &new_descs, None)?;
     sys_insert(
         file,
         page_size,
@@ -3304,17 +3826,12 @@ pub fn alter_table_alter_column_type(
         (*n, d.clone())
     };
     let mut f_image = {
-        let dp = DataPage::decode(crate::page_at(file, page_size, fpage).ok_or("bad page")?)
-            .ok_or("bad data page")?;
-        // `image()`, NOT `assembled_image` - ON PURPOSE. This reads a
-        // record it is about to REWRITE IN PLACE, and a fragmented one
-        // cannot be rewritten in place: its bytes live on several pages
-        // and the pieces would have to be re-split. `image()` answers
-        // None for a fragmented record, so this errors out instead of
-        // patching the head and leaving the tail describing the old
-        // shape. Refusing is the boundary; the other patch sites in this
-        // file are the same, and the roadmap names them.
-        dp.record(fslot).and_then(|r| r.image()).ok_or("no field image")?
+        // the version the catalog sees, whole - a fragmented one too:
+        // the rewrite below is a versioned [dml::update_records], which
+        // clones the old head, pieces and all, and lays a fresh one
+        catalog_patch_base(file, page_size, fpage, fslot)
+            .map_err(|_| "no field image")?
+            .0
     };
     let patch_field = |image: &mut [u8], name: &str, v: SysVal<'_>| -> Result<(), String> {
         let fid = f_fid(name).ok_or_else(|| format!("no {} column", name))?;
@@ -3329,9 +3846,28 @@ pub fn alter_table_alter_column_type(
         Ok(())
     };
     patch_field(&mut f_image, "RDB$FIELD_TYPE", SysVal::I(new_col.field_type as i64))?;
-    patch_field(&mut f_image, "RDB$FIELD_LENGTH", SysVal::I(new_col.length as i64))?;
+    // RDB$FIELD_LENGTH is the BYTE length - a VARCHAR's without the
+    // 2-byte count word its descriptor carries (measured on 2182:
+    // `alter v type varchar(8)` reads 8; this wrote 10, a width the
+    // engine would lay the field out by)
+    // ([catalog_field_length], the rule ALTER DOMAIN ... TYPE already
+    // keeps)
+    patch_field(&mut f_image, "RDB$FIELD_LENGTH", SysVal::I(catalog_field_length(new_col)))?;
     patch_field(&mut f_image, "RDB$FIELD_SCALE", SysVal::I(new_col.scale as i64))?;
     patch_field(&mut f_image, "RDB$FIELD_SUB_TYPE", SysVal::I(new_col.sub_type as i64))?;
+    // AN APPROXIMATE OR TEMPORAL TYPE HAS NEITHER: the engine leaves
+    // RDB$FIELD_SUB_TYPE and RDB$FIELD_PRECISION NULL on a column retyped
+    // to DOUBLE PRECISION (measured on 2182, from INTEGER, SMALLINT and
+    // FLOAT alike) or to TIMESTAMP (from DATE)
+    if matches!(
+        new_col.dtype,
+        crate::format::dtype::DOUBLE | crate::format::dtype::REAL | crate::format::dtype::TIMESTAMP
+    ) {
+        for name in ["RDB$FIELD_SUB_TYPE", "RDB$FIELD_PRECISION"] {
+            let fid = f_fid(name).ok_or_else(|| format!("no {} column", name))?;
+            f_image[fid / 8] |= 1 << (fid % 8);
+        }
+    }
     if let Some(p) = new_col.precision {
         // the engine retypes precision too (probed: INTEGER ->
         // NUMERIC(12) sets 12; int -> int keeps 0)
@@ -3419,6 +3955,9 @@ pub fn alter_column_default(
             }
         }
     }
+    if default.is_none() {
+        drop_default_guard(file, page_size, &table, &column)?;
+    }
     let (src_val, val_val) = match default {
         Some(def) => {
             let src =
@@ -3448,6 +3987,51 @@ pub fn alter_column_default(
     // rebuild the runtime so the engine applies (or stops applying) the default
     update_relation_runtime(file, page_size, &table)?;
     advance_oldest_transactions(file, page_size)
+}
+
+/// DROP DEFAULT drops the column's OWN default and nothing else. Measured
+/// on 2182, AUTODDL on or off: a column with no local default is DYN 229
+/// "Local column A doesn't have a default", and one whose default comes
+/// from its domain is DYN 230 "Local column "C" default belongs to domain
+/// "PUBLIC"."D74"" - so a second DROP DEFAULT of a column that had a
+/// local default over a defaulted domain answers the latter. Both were
+/// accepted silently here (the catalog was left as it was).
+fn drop_default_guard(file: &crate::Image, page_size: usize, table: &str, column: &str) -> Result<(), String> {
+    let rf_row = |name: &str, pred: &dyn Fn(&[Value], &dyn Fn(&str) -> Option<usize>) -> bool| {
+        let rel = crate::resolve_relation(file, page_size, name)?;
+        let formats = system_relation_formats(file, page_size, name)?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+        let cols = relation_columns(file, page_size, name);
+        let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+        let mut out = None;
+        walk_rows(file, page_size, rel, descs, |v| {
+            if out.is_none() && pred(v, &fid) {
+                out = Some((v.to_vec(), fid("RDB$DEFAULT_VALUE"), fid("RDB$FIELD_SOURCE")));
+            }
+        });
+        out
+    };
+    let has_default = |row: &(Vec<Value>, Option<usize>, Option<usize>)| {
+        row.1.and_then(|f| row.0.get(f)).is_some_and(|v| !matches!(v, Value::Null))
+    };
+    let Some(rf) = rf_row("RDB$RELATION_FIELDS", &|v, fid| {
+        fid("RDB$RELATION_NAME").is_some_and(|f| text_is(v.get(f), table))
+            && fid("RDB$FIELD_NAME").is_some_and(|f| text_is(v.get(f), column))
+    }) else {
+        return Ok(());
+    };
+    if has_default(&rf) {
+        return Ok(());
+    }
+    let source = match rf.2.and_then(|f| rf.0.get(f)) {
+        Some(Value::Text(t)) => t.trim_end().to_string(),
+        _ => String::new(),
+    };
+    let domain = rf_row("RDB$FIELDS", &|v, fid| fid("RDB$FIELD_NAME").is_some_and(|f| text_is(v.get(f), &source)));
+    if !source.starts_with("RDB$") && domain.as_ref().is_some_and(has_default) {
+        return Err(format!("Local column {} default belongs to domain {}", column, source));
+    }
+    Err(format!("Local column {} doesn't have a default", column))
 }
 
 /// The identity generator backing a column - its `RDB$GENERATOR_NAME` when
@@ -3480,6 +4064,196 @@ fn column_identity_generator(
         }
     });
     out
+}
+
+/// `ALTER TABLE <t> ALTER [COLUMN] <c> SET INCREMENT [BY] <n>` - the
+/// identity column's backing generator takes the new step on its
+/// RDB$GENERATORS row (MET_update_generator_increment), its value is
+/// left where it is (measured on 2182: over an identity that has drawn
+/// 1, `set increment by 10` makes the next insert 11). A column with no
+/// identity is the engine's "Column V is not an identity column", and
+/// a zero step its isc_dyn_cant_use_zero_inc_ident - both errors here.
+pub fn alter_column_identity_increment(
+    file: &mut crate::Image,
+    page_size: usize,
+    table: &str,
+    column: &str,
+    step: i64,
+) -> Result<(), String> {
+    let gen = column_identity_generator(file, page_size, table.trim(), column.trim())
+        .ok_or_else(|| format!("Column {} is not an identity column", column))?;
+    if step == 0 {
+        return Err(format!("INCREMENT BY 0 is an illegal option for identity column {}", column));
+    }
+    alter_sequence_increment(file, page_size, &gen, step)
+}
+
+/// The first object RDB$DEPENDENCIES says reads this column - a view, a
+/// CHECK constraint's trigger, a computed column's field - or None.
+fn column_dependent(file: &crate::Image, page_size: usize, table: &str, col: &str) -> Result<Option<String>, String> {
+    let Some(dep_rel) = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES") else {
+        return Ok(None);
+    };
+    let formats = system_relation_formats(file, page_size, "RDB$DEPENDENCIES").ok_or("no RDB$DEPENDENCIES format")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let on_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDED_ON_NAME")?;
+    let fld_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$FIELD_NAME")?;
+    let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+    let mut by: Option<String> = None;
+    walk_rows(file, page_size, dep_rel, descs, |v| {
+        if by.is_none() && text_is(v.get(on_f), table) && text_is(v.get(fld_f), col) {
+            if let Some(Value::Text(t)) = v.get(dn_f) {
+                by = Some(t.trim_end().to_string());
+            }
+        }
+    });
+    Ok(by)
+}
+
+/// `ALTER TABLE <t> ALTER [COLUMN] <old> TO <new>` - rename a column, the
+/// engine's law measured on 2182: the RDB$RELATION_FIELDS row takes the
+/// new name, and so does every RDB$INDEX_SEGMENTS row of a plain index
+/// over it and the RDB$CHECK_CONSTRAINTS link of its NOT NULL (whose
+/// RDB$TRIGGER_NAME is the column); the relation's runtime summary is
+/// rebuilt. A column some other object DEPENDS on - a view, a CHECK
+/// constraint's trigger, a computed column - is the engine's "Column "V"
+/// from table ... is referenced in ..." (RDB$DEPENDENCIES names it), a
+/// column in a PRIMARY KEY / UNIQUE / FOREIGN KEY index its "Cannot
+/// update index segment used by an Integrity Constraint", a new name the
+/// table already has its "A column with that name already exists": each
+/// an error here, before anything is written.
+pub fn alter_column_rename(
+    file: &mut crate::Image,
+    page_size: usize,
+    table: &str,
+    old: &str,
+    new: &str,
+) -> Result<(), String> {
+    let table = table.trim().to_string();
+    crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    let cols = relation_columns(file, page_size, &table);
+    if !cols.iter().any(|c| c.name == old) {
+        return Err(format!("column {} does not exist in table/view {}", old, table));
+    }
+    if cols.iter().any(|c| c.name == new) {
+        return Err(format!(
+            "Cannot rename column {} to {}.  A column with that name already exists in table {}.",
+            old, new, table
+        ));
+    }
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+        _ => None,
+    };
+    // anything that depends on the column refuses the rename
+    if let Some(d) = column_dependent(file, page_size, &table, old)? {
+        return Err(format!("Column \"{}\" from table {} is referenced in {}", old, table, d));
+    }
+    // the table's indices over the column, and whether a constraint owns one
+    let ix_rel = crate::resolve_relation(file, page_size, "RDB$INDICES").ok_or("no RDB$INDICES")?;
+    let ix_formats = system_relation_formats(file, page_size, "RDB$INDICES").ok_or("no RDB$INDICES format")?;
+    let (_, ix_descs) = ix_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let ix_name_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+    let ix_rel_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$RELATION_NAME")?;
+    let mut indices: Vec<String> = Vec::new();
+    walk_rows(file, page_size, ix_rel, ix_descs, |v| {
+        if text_is(v.get(ix_rel_f), &table) {
+            if let Some(n) = text(v.get(ix_name_f)) {
+                indices.push(n);
+            }
+        }
+    });
+    let seg_rel = crate::resolve_relation(file, page_size, "RDB$INDEX_SEGMENTS").ok_or("no RDB$INDEX_SEGMENTS")?;
+    let seg_formats =
+        system_relation_formats(file, page_size, "RDB$INDEX_SEGMENTS").ok_or("no RDB$INDEX_SEGMENTS format")?;
+    let (_, seg_descs) = seg_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let seg_ix_f = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$INDEX_NAME")?;
+    let seg_fld_f = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$FIELD_NAME")?;
+    let mut over: Vec<String> = Vec::new();
+    walk_rows(file, page_size, seg_rel, seg_descs, |v| {
+        if text_is(v.get(seg_fld_f), old) {
+            if let Some(ix) = text(v.get(seg_ix_f)).filter(|ix| indices.contains(ix)) {
+                over.push(ix);
+            }
+        }
+    });
+    if !over.is_empty() {
+        let rc_rel = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS")
+            .ok_or("no RDB$RELATION_CONSTRAINTS")?;
+        let rc_formats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")
+            .ok_or("no RDB$RELATION_CONSTRAINTS format")?;
+        let (_, rc_descs) = rc_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let rc_ix_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$INDEX_NAME")?;
+        let mut owned = false;
+        walk_rows(file, page_size, rc_rel, rc_descs, |v| {
+            if text(v.get(rc_ix_f)).is_some_and(|ix| over.contains(&ix)) {
+                owned = true;
+            }
+        });
+        if owned {
+            return Err("Cannot update index segment used by an Integrity Constraint".into());
+        }
+    }
+    // the writes: the column row, its plain index segments, its NOT NULL link
+    let rf_rel = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS").ok_or("no RDB$RELATION_FIELDS")?;
+    let rf_rel_f = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
+    let rf_name_f = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_NAME")?;
+    {
+        let (t, o) = (table.clone(), old.to_string());
+        patch_sys_row(
+            file,
+            page_size,
+            "RDB$RELATION_FIELDS",
+            rf_rel,
+            move |v| text_is(v.get(rf_rel_f), &t) && text_is(v.get(rf_name_f), &o),
+            &[("RDB$FIELD_NAME", SysVal::S(new))],
+        )?;
+    }
+    for ix in &over {
+        let (i, o) = (ix.clone(), old.to_string());
+        patch_sys_row(
+            file,
+            page_size,
+            "RDB$INDEX_SEGMENTS",
+            seg_rel,
+            move |v| text_is(v.get(seg_ix_f), &i) && text_is(v.get(seg_fld_f), &o),
+            &[("RDB$FIELD_NAME", SysVal::S(new))],
+        )?;
+    }
+    // the NOT NULL link: the RDB$CHECK_CONSTRAINTS row of one of THIS
+    // table's NOT NULL constraints whose trigger name is the column
+    if let (Some(cc_rel), Some(rc_rel)) = (
+        crate::resolve_relation(file, page_size, "RDB$CHECK_CONSTRAINTS"),
+        crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS"),
+    ) {
+        let rc_formats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")
+            .ok_or("no RDB$RELATION_CONSTRAINTS format")?;
+        let (_, rc_descs) = rc_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let rc_name_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+        let rc_type_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_TYPE")?;
+        let rc_tab_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$RELATION_NAME")?;
+        let mut nn: Vec<String> = Vec::new();
+        walk_rows(file, page_size, rc_rel, rc_descs, |v| {
+            if text_is(v.get(rc_tab_f), &table) && text_is(v.get(rc_type_f), "NOT NULL") {
+                if let Some(n) = text(v.get(rc_name_f)) {
+                    nn.push(n);
+                }
+            }
+        });
+        let cc_name_f = sys_fid(file, page_size, "RDB$CHECK_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+        let cc_trig_f = sys_fid(file, page_size, "RDB$CHECK_CONSTRAINTS", "RDB$TRIGGER_NAME")?;
+        let o = old.to_string();
+        let hit = move |v: &[Value]| {
+            text_is(v.get(cc_trig_f), &o)
+                && matches!(v.get(cc_name_f), Some(Value::Text(t)) if nn.iter().any(|n| n == t.trim_end()))
+        };
+        if find_sys_row_slot(file, page_size, "RDB$CHECK_CONSTRAINTS", cc_rel, &hit).is_some() {
+            patch_sys_row(file, page_size, "RDB$CHECK_CONSTRAINTS", cc_rel, hit, &[("RDB$TRIGGER_NAME", SysVal::S(new))])?;
+        }
+    }
+    refresh_runtime(file, page_size, &table)?;
+    advance_oldest_transactions(file, page_size)
 }
 
 /// A generator's `(RDB$GENERATOR_ID, RDB$GENERATOR_INCREMENT,
@@ -3705,6 +4479,23 @@ pub fn alter_column_position(
 
 /// Whether any committed primary record of `rel` has a NULL in field
 /// `fid` - the check `SET NOT NULL` makes before it can succeed.
+/// Whether a relation holds any record at all - the rows an added NOT
+/// NULL field without a default would leave NULL.
+fn relation_has_rows(file: &crate::Image, page_size: usize, rel: u16) -> bool {
+    let tips = crate::tra::TipChain::read(file, page_size);
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
+            continue;
+        };
+        for r in dp.records() {
+            if crate::data::catalog_image(file, page_size, &r, tips.as_ref()).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn column_has_nulls(file: &crate::Image, page_size: usize, rel: u16, fid: usize) -> bool {
     let formats = crate::relation_formats(file, page_size, rel);
     let tips = crate::tra::TipChain::read(file, page_size);
@@ -3759,9 +4550,9 @@ fn patch_rf_null_flag(
     let (page, slot) = find_sys_row_slot(file, page_size, "RDB$RELATION_FIELDS", 5, pred)
         .ok_or("RDB$RELATION_FIELDS row not found")?;
     let mut image = {
-        let dp = DataPage::decode(crate::page_at(file, page_size, page).ok_or("bad page")?)
-            .ok_or("bad data page")?;
-        dp.record(slot).and_then(|r| r.image()).ok_or("no field image")?
+        catalog_patch_base(file, page_size, page, slot)
+            .map_err(|_| "no field image")?
+            .0
     };
     let d = rf_descs.get(null_fid).ok_or("field beyond format")?;
     let at = d.offset as usize;
@@ -3875,7 +4666,7 @@ pub fn field_changed(file: &mut crate::Image, page_size: usize, field: &str) -> 
         if fields.is_empty() {
             continue;
         }
-        let new_descs = compute_format_mixed(&fields);
+        let new_descs = zero_placeholders(compute_format_mixed(&fields));
         let same = new_descs.len() == cur_descs.len()
             && new_descs.iter().zip(cur_descs.iter()).all(|(a, b)| {
                 a.dtype == b.dtype && a.length == b.length && a.scale == b.scale && a.sub_type == b.sub_type && a.offset == b.offset
@@ -3885,7 +4676,7 @@ pub fn field_changed(file: &mut crate::Image, page_size: usize, field: &str) -> 
             continue;
         }
         let new_format_no = *cur_no as i64 + 1;
-        let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+        let fmt_blob = write_format_blob_carried(file, page_size, rel, &new_descs, None)?;
         sys_insert(
             file,
             page_size,
@@ -4012,19 +4803,51 @@ pub fn alter_table_drop_not_null(
         Some(Value::Text(t)) => Some(t.trim_end().to_string()),
         _ => None,
     };
+    // THIS TABLE'S NOT NULL constraints: a link names only the COLUMN, so
+    // a column of the same name in another table carries a row just like
+    // it - and taking the first one by column name alone dropped THAT
+    // table's NOT NULL (measured: `alter table at1 alter k drop not null`
+    // took RN.K's RDB$CHECK_CONSTRAINTS row, which the engine keeps)
+    let nn_rel = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS")
+        .ok_or("no RDB$RELATION_CONSTRAINTS")?;
+    let nn_formats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")
+        .ok_or("no RDB$RELATION_CONSTRAINTS format")?;
+    let (_, nn_descs) = nn_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let nn_name_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+    let nn_type_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_TYPE")?;
+    let nn_tab_f = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$RELATION_NAME")?;
+    let mut mine: Vec<String> = Vec::new();
+    walk_rows(file, page_size, nn_rel, nn_descs, |v| {
+        if text_is(v.get(nn_tab_f), &table) && text_is(v.get(nn_type_f), "NOT NULL") {
+            if let Some(n) = text(v.get(nn_name_f)) {
+                mine.push(n);
+            }
+        }
+    });
+    let ours = |vals: &[Value]| {
+        text(vals.get(cc_trig)).as_deref() == Some(col_up.as_str())
+            && text(vals.get(cc_name)).is_some_and(|n| mine.contains(&n))
+    };
     let mut constraint: Option<String> = None;
     walk_rows(file, page_size, cc_rel, cc_descs, |vals| {
-        if text(vals.get(cc_trig)).as_deref() == Some(col_up.as_str()) {
+        if ours(vals) {
             constraint = text(vals.get(cc_name));
         }
     });
-    let constraint = constraint
-        .ok_or_else(|| format!("column {} has no NOT NULL constraint", col_name))?;
+    // A COLUMN THAT IS ALREADY NULLABLE: the engine's DROP NOT NULL finds
+    // no constraint to drop and succeeds, changing nothing (measured on
+    // 2182: `alter table t1 alter column f drop not null` over a plain
+    // DOUBLE PRECISION column is silent; RDB$NULL_FLAG stays NULL and
+    // RDB$RELATION_CONSTRAINTS keeps its rows). It was an error here.
+    let Some(constraint) = constraint else {
+        return Ok(());
+    };
 
     patch_rf_null_flag(file, page_size, &table, &col_up, None)?;
 
-    // delete the RDB$CHECK_CONSTRAINTS row (by trigger = column)
-    let cc_pred = |vals: &[Value]| text(vals.get(cc_trig)).as_deref() == Some(col_up.as_str());
+    // delete the RDB$CHECK_CONSTRAINTS row (by trigger = column, among
+    // this table's own)
+    let cc_pred = |vals: &[Value]| ours(vals);
     if let Some(slot) = find_sys_row_slot(file, page_size, "RDB$CHECK_CONSTRAINTS", cc_rel, cc_pred) {
         dml::delete_records(file, page_size, cc_rel, &[slot])?;
     }
@@ -4196,6 +5019,9 @@ pub fn create_table(
     {
         return Err(format!("table {} already exists", name));
     }
+    if plain_procedure_exists(file, page_size, &name) {
+        return Err(format!("Procedure {} already exists", name));
+    }
     let rel_id_u16 = next_relation_id(file, page_size, &rels)?;
     let rel_id = rel_id_u16 as i64;
 
@@ -4239,6 +5065,7 @@ pub fn create_table(
             rc.scale = dt.scale;
             rc.sub_type = dt.sub_type;
             rc.char_len = dt.char_len;
+            rc.charset_id = dt.charset_id;
             // an ARRAY domain makes the column an array of its shape (the
             // bounds live on the domain's RDB$FIELDS row; the column's
             // storage is the 8-byte array id like any other)
@@ -5043,6 +5870,9 @@ pub fn create_view(
     if crate::resolve_relation(file, page_size, &want).is_some() {
         return Err(format!("relation {} already exists", want));
     }
+    if plain_procedure_exists(file, page_size, &want) {
+        return Err(format!("Procedure {} already exists", want));
+    }
     create_view_impl(file, page_size, name, view_blr, view_source, fields, contexts, None)
 }
 
@@ -5065,7 +5895,18 @@ pub fn alter_view(
         return Err(format!("View {} not found", want));
     }
     let old_id = rel as i64;
-    drop_view(file, page_size, &want)?;
+    // an ALTER keeps the relation, so a dependent view or procedure
+    // does not block it (measured: ALTER VIEW VD under VDEP passes where
+    // DROP VIEW VD is refused)
+    drop_view_rows(file, page_size, &want, false)?;
+    // ...but NOT its CHECK OPTION: the CHECK_n system triggers
+    // (RDB$SYSTEM_FLAG 5) belong to the old definition and go with it,
+    // with their type-2 rows. Measured on 2182: after `ALTER VIEW VC AS
+    // SELECT ID, N FROM T2` over `... FROM T1 WHERE ID > 0 WITH CHECK
+    // OPTION` VC has no trigger and no CHECK_n row is left, so DROP TABLE
+    // T1 passes; kept here, CHECK_1 -> T1 refused it. A user trigger
+    // stays ([drop_view_rows])
+    delete_relation_triggers_where(file, page_size, &want, Some(5))?;
     create_view_impl(file, page_size, name, view_blr, view_source, fields, contexts, Some(old_id))
 }
 
@@ -5175,11 +6016,29 @@ fn insert_auto_field_row(file: &mut crate::Image, page_size: usize, source: &str
 /// view relations, formats, security class and privileges go; a TABLE is
 /// not a view (the engine's "does not exist" for DROP VIEW, probed).
 pub fn drop_view(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
+    drop_view_rows(file, page_size, name, true)
+}
+
+/// [drop_view]'s body; `check_deps` is false for the ALTER VIEW path,
+/// which keeps the relation and so answers to no dependent.
+fn drop_view_rows(file: &mut crate::Image, page_size: usize, name: &str, check_deps: bool) -> Result<(), String> {
     let name = name.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &name)
         .ok_or_else(|| format!("View {} not found", name))?;
     if rel < 128 || !is_view(file, page_size, &name) {
         return Err(format!("View {} not found", name));
+    }
+    // A view something still reads is not dropped - the same two checks
+    // DROP TABLE makes ([relation_dependents]), measured on 2182: a view
+    // over it is "cannot delete / TABLE "PUBLIC"."V1" / there are N
+    // dependencies" (N the RDB$VIEW_RELATIONS rows), a procedure or a
+    // trigger on another relation is "VIEW "PUBLIC"."V1"" with the
+    // distinct dependents. RECREATE VIEW meets the same wall; ALTER VIEW
+    // and CREATE OR ALTER VIEW pass (they keep the relation).
+    if check_deps {
+        if let Some((kind, n)) = relation_dependents(file, page_size, &name, true) {
+            return Err(format!("cannot delete {} {} - there are {} dependencies", kind, name, n));
+        }
     }
     let mut domain_names: Vec<String> = Vec::new();
     {
@@ -5230,6 +6089,27 @@ pub fn drop_view(file: &mut crate::Image, page_size: usize, name: &str) -> Resul
         let fid = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$VIEW_NAME")?;
         let n = name.clone();
         delete_catalog_rows(file, page_size, "RDB$VIEW_RELATIONS", move |v| text_is(v.get(fid), &n))?;
+    }
+    // a real DROP (and RECREATE) takes the view's own triggers; an ALTER
+    // keeps the relation and them (measured: V1_BI still fires after
+    // ALTER VIEW V1 on 2182)
+    if check_deps {
+        delete_relation_triggers(file, page_size, &name)?;
+    }
+    // the view's OWN dependency rows go with it (the engine's
+    // MET_delete_dependencies for obj_view, and obj_computed for its
+    // expression domains): left behind, a dropped dependent view still
+    // counted against its base (measured: DROP VIEW VDEP, then DROP VIEW
+    // VD answered "VIEW / 2 dependencies" where the engine drops it)
+    {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let n = name.clone();
+        let domains = domain_names.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            (text_is(v.get(dn_f), &n) && int_eq(v.get(dt_f), 1))
+                || (int_eq(v.get(dt_f), 3) && domains.iter().any(|d| text_is(v.get(dn_f), d)))
+        })?;
     }
     {
         let fid = sys_fid(file, page_size, "RDB$FORMATS", "RDB$RELATION_ID")?;
@@ -5379,7 +6259,7 @@ pub fn append_identical_format(file: &mut crate::Image, page_size: usize, table:
     let formats = crate::relation_formats(file, page_size, rel);
     let (cur, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("relation has no format")?;
     let next = *cur as i64 + 1;
-    let fmt_blob = write_format_blob(file, page_size, descs)?;
+    let fmt_blob = write_format_blob_carried(file, page_size, rel, descs, None)?;
     sys_insert(
         file,
         page_size,
@@ -5878,6 +6758,28 @@ pub fn alter_trigger_attrs(
     advance_oldest_transactions(file, page_size)
 }
 
+/// `ALTER SEQUENCE <g> INCREMENT BY <k>`: the RDB$GENERATORS row's
+/// RDB$GENERATOR_INCREMENT, in place, as the engine MODIFYs it.
+pub fn alter_sequence_increment(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    step: i64,
+) -> Result<(), String> {
+    let want = name.trim().to_string();
+    let rel = crate::resolve_relation(file, page_size, "RDB$GENERATORS").ok_or("no RDB$GENERATORS")?;
+    let name_f = sys_fid(file, page_size, "RDB$GENERATORS", "RDB$GENERATOR_NAME")?;
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$GENERATORS",
+        rel,
+        move |v| text_eq(v.get(name_f), &want),
+        &[("RDB$GENERATOR_INCREMENT", SysVal::I(step))],
+    )?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// `DROP TRIGGER <name>`: the row and the trigger's dependency rows go.
 pub fn drop_trigger(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
@@ -6145,6 +7047,17 @@ pub fn drop_index(file: &mut crate::Image, page_size: usize, index_name: &str) -
         return Err("system relations are read-only".into());
     }
     deferred_drop_index(file, page_size, rel, &want)?;
+    // an expression index's own RDB$DEPENDENCIES rows (dependent type 6,
+    // engine-built) go with it, or they keep counting against the table
+    // (measured: DROP INDEX, then DROP TABLE passes on 2182 - the engine
+    // leaves a renamed RDB$TEMP_DEPEND_* row behind, which this server
+    // does not imitate)
+    {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let w = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| text_is(v.get(dn_f), &w) && int_eq(v.get(dt_f), 6))?;
+    }
     advance_oldest_transactions(file, page_size)?;
     Ok(())
 }
@@ -6153,8 +7066,12 @@ pub fn drop_index(file: &mut crate::Image, page_size: usize, index_name: &str) -
 /// column is written.
 #[derive(Clone)]
 pub enum CommentTarget {
-    /// `COMMENT ON TABLE <name>` - the `RDB$RELATIONS` row
+    /// `COMMENT ON TABLE <name>` - the `RDB$RELATIONS` row of a TABLE
     Table(String),
+    /// `COMMENT ON VIEW <name>` - the `RDB$RELATIONS` row of a VIEW. The
+    /// two verbs are not interchangeable (measured on 2182): TABLE over a
+    /// view is "Table @1 not found", VIEW over a table "View @1 not found"
+    View(String),
     /// `COMMENT ON COLUMN <table>.<column>` - the `RDB$RELATION_FIELDS` row
     Column(String, String),
     /// `COMMENT ON INDEX <name>` - the `RDB$INDICES` row
@@ -6217,12 +7134,30 @@ pub fn comment_on(
     // an empty comment is a NULL comment (engine probe: IS '' clears it)
     let text = text.filter(|t| !t.is_empty());
     match target {
-        CommentTarget::Table(name) => {
+        CommentTarget::Table(name) | CommentTarget::View(name) => {
             let name = name.trim().to_string();
-            let rel = crate::resolve_relation(file, page_size, &name)
-                .ok_or_else(|| format!("Table \"{}\" not found", name))?;
+            let want_view = matches!(target, CommentTarget::View(_));
+            // the kind's own "not found", and - the engine's quirk, kept
+            // - a TABLE verb names the missing relation BARE ("NOSUCH")
+            // but a view it found QUALIFIED ("PUBLIC"."V1"); the VIEW
+            // verb qualifies both. The wire layer spells it from the
+            // message's tail
+            let rel = crate::resolve_relation(file, page_size, &name).ok_or_else(|| {
+                if want_view {
+                    format!("View {} not found (qualified)", name)
+                } else {
+                    format!("Table {} not found (bare)", name)
+                }
+            })?;
             if rel < 128 {
                 return Err("system relations are read-only".into());
+            }
+            if is_view(file, page_size, &name) != want_view {
+                return Err(if want_view {
+                    format!("View {} not found (qualified)", name)
+                } else {
+                    format!("Table {} not found (qualified)", name)
+                });
             }
             let value = description_blob(file, page_size, 6, text)?;
             let name_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
@@ -6660,8 +7595,7 @@ fn mark_index_slot_dropped(
     if at + 24 > page.len() {
         return Err("index slot beyond the root page".into());
     }
-    dml::put_u16(page, at + 18, 0); // irt_flags
-    page[at + 20] = 6; // irt_drop (ods.h:456)
+    crate::btr::set_irt_drop(page, at);
     Ok(())
 }
 
@@ -6860,27 +7794,280 @@ fn table_pk_referenced_by_fk(file: &crate::Image, page_size: usize, table: &str)
     })
 }
 
-/// The DISTINCT procedures that reference this table (RDB$DEPENDENCIES,
-/// dependent type 5). When no view blocks, these are the drop's N.
-fn procedure_dependents(file: &crate::Image, page_size: usize, table: &str) -> Vec<String> {
-    let mut procs: Vec<String> = Vec::new();
-    let Some(drel) = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES") else { return procs };
-    let Some(dfmts) = system_relation_formats(file, page_size, "RDB$DEPENDENCIES") else { return procs };
-    let Some((_, ddescs)) = dfmts.iter().max_by_key(|(n, _)| *n) else { return procs };
+/// A relation's RDB$RELATION_TYPE (0 persistent, 1 view, 2 external, 4
+/// GTT ON COMMIT PRESERVE ROWS, 5 GTT ON COMMIT DELETE ROWS), or None
+/// for a name the catalog does not hold.
+pub fn relation_type_of(file: &crate::Image, page_size: usize, name: &str) -> Option<i64> {
+    let formats = system_relation_formats(file, page_size, "RDB$RELATIONS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$RELATIONS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, type_f) = (fid("RDB$RELATION_NAME")?, fid("RDB$RELATION_TYPE")?);
+    let want = name.trim();
+    let mut out = None;
+    walk_rows(file, page_size, 6, descs, |v| {
+        if out.is_none() && text_is(v.get(name_f), want) {
+            out = Some(match v.get(type_f) {
+                Some(Value::Int(t)) => *t,
+                _ => 0,
+            });
+        }
+    });
+    out
+}
+
+/// What blocks the DROP of a relation - the engine's two checks in
+/// dfw.epp `delete_relation` phase 1, in their order, each measured on
+/// 2182 (`qa/serve-real-dmlcheck.sh`):
+///
+///   1. RDB$VIEW_RELATIONS rows naming the relation as a base: the
+///      count is the ROWS, one per view context - a view that self-joins
+///      V counts 2 - and the object is always spelled `TABLE @1`
+///      (isc_table_name), even when the relation being dropped is a
+///      view (`DROP VIEW V1` under a dependent view: "cannot delete /
+///      TABLE "PUBLIC"."V1" / there are 2 dependencies");
+///   2. otherwise `check_dependencies`: the DISTINCT (dependent name,
+///      dependent type) pairs in RDB$DEPENDENCIES whose depended-on is
+///      the relation with its own kind (type 0 a table, 1 a view), and
+///      the object is spelled by that kind - `VIEW @1` for a view read
+///      by a procedure and a trigger ("there are 2 dependencies"),
+///      `TABLE @1` for a table. Dependents that go with the relation
+///      are not counted (the engine's `find_depend_in_dfw`): its own
+///      triggers, its own computed / validation domains (types 3 and
+///      4 whose domain is a RDB$FIELD_SOURCE of the relation - ANOTHER
+///      table's computed column reading it counts: `B.CNT COMPUTED BY
+///      ((SELECT COUNT(*) FROM A))` beside C's two CHECK triggers is
+///      "there are 3 dependencies", and 1 once C is gone), and its own
+///      expression indices (type 6, engine-built: an index COMPUTED BY
+///      over the table drops with it).
+///
+/// `Some((kind, count))` when something blocks, kind being "TABLE" or
+/// "VIEW" as the message spells it.
+fn relation_dependents(file: &crate::Image, page_size: usize, name: &str, is_view: bool) -> Option<(&'static str, usize)> {
+    let name = name.trim();
+    // 1. the views built over it, one row per context
+    let mut view_rows = 0usize;
+    if let (Some(vrel), Some(vfmts)) = (
+        crate::resolve_relation(file, page_size, "RDB$VIEW_RELATIONS"),
+        system_relation_formats(file, page_size, "RDB$VIEW_RELATIONS"),
+    ) {
+        if let Some((_, vdescs)) = vfmts.iter().max_by_key(|(n, _)| *n) {
+            if let Ok(vreln_f) = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$RELATION_NAME") {
+                walk_rows(file, page_size, vrel, vdescs, |v| {
+                    if text_is(v.get(vreln_f), name) {
+                        view_rows += 1;
+                    }
+                });
+            }
+        }
+    }
+    if view_rows > 0 {
+        return Some(("TABLE", view_rows));
+    }
+    // 2. the recorded dependents of the relation's own kind
+    let own_triggers = triggers_of_relation(file, page_size, name, None);
+    let own_domains = relation_field_sources(file, page_size, name);
+    let drel = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES")?;
+    let dfmts = system_relation_formats(file, page_size, "RDB$DEPENDENCIES")?;
+    let (_, ddescs) = dfmts.iter().max_by_key(|(n, _)| *n)?;
     let cols = relation_columns(file, page_size, "RDB$DEPENDENCIES");
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
-    let (Some(dn_f), Some(dt_f), Some(don_f)) = (fid("RDB$DEPENDENT_NAME"), fid("RDB$DEPENDENT_TYPE"), fid("RDB$DEPENDED_ON_NAME")) else { return procs };
+    let (dn_f, dt_f, don_f, dot_f) = (
+        fid("RDB$DEPENDENT_NAME")?,
+        fid("RDB$DEPENDENT_TYPE")?,
+        fid("RDB$DEPENDED_ON_NAME")?,
+        fid("RDB$DEPENDED_ON_TYPE")?,
+    );
+    let own_type = if is_view { 1 } else { 0 };
+    let mut seen: Vec<(String, i64)> = Vec::new();
     walk_rows(file, page_size, drel, ddescs, |v| {
-        if text_is(v.get(don_f), table) && matches!(v.get(dt_f), Some(Value::Int(5))) {
-            if let Some(Value::Text(t)) = v.get(dn_f) {
-                let n = t.trim_end().to_string();
-                if !procs.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
-                    procs.push(n);
-                }
+        if !text_is(v.get(don_f), name) || !int_eq(v.get(dot_f), own_type) {
+            return;
+        }
+        let (Some(Value::Text(t)), Some(Value::Int(dt))) = (v.get(dn_f), v.get(dt_f)) else { return };
+        let dn = t.trim_end().to_string();
+        let goes_with_it = match *dt {
+            2 => own_triggers.iter().any(|x| *x == dn),
+            3 | 4 => own_domains.iter().any(|x| *x == dn),
+            6 => find_index_relation(file, page_size, &dn).is_some_and(|(t, _)| t == name),
+            _ => false,
+        };
+        if !goes_with_it && !seen.iter().any(|(n, k)| *n == dn && *k == *dt) {
+            seen.push((dn, *dt));
+        }
+    });
+    if seen.is_empty() {
+        None
+    } else {
+        Some((if is_view { "VIEW" } else { "TABLE" }, seen.len()))
+    }
+}
+
+/// The RDB$FIELD_SOURCE domains of a relation's columns - the auto
+/// domains its computed columns live in, and any named domain a column
+/// was declared with.
+fn relation_field_sources(file: &crate::Image, page_size: usize, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(fmts) = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS") else { return out };
+    let Some((_, descs)) = fmts.iter().max_by_key(|(n, _)| *n) else { return out };
+    let cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(rn_f), Some(src_f)) = (fid("RDB$RELATION_NAME"), fid("RDB$FIELD_SOURCE")) else { return out };
+    walk_rows(file, page_size, 5, descs, |v| {
+        if text_is(v.get(rn_f), name) {
+            if let Some(Value::Text(t)) = v.get(src_f) {
+                out.push(t.trim_end().to_string());
             }
         }
     });
-    procs
+    out
+}
+
+/// The names of a relation's own triggers (its RDB$TRIGGERS rows).
+fn triggers_of_relation(file: &crate::Image, page_size: usize, name: &str, system_flag: Option<i64>) -> Vec<String> {
+    let mut out = Vec::new();
+    let (Some(rel), Some(fmts)) = (
+        crate::resolve_relation(file, page_size, "RDB$TRIGGERS"),
+        system_relation_formats(file, page_size, "RDB$TRIGGERS"),
+    ) else { return out };
+    let Some((_, descs)) = fmts.iter().max_by_key(|(n, _)| *n) else { return out };
+    let cols = relation_columns(file, page_size, "RDB$TRIGGERS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(tn_f), Some(rn_f)) = (fid("RDB$TRIGGER_NAME"), fid("RDB$RELATION_NAME")) else { return out };
+    let sf_f = fid("RDB$SYSTEM_FLAG");
+    walk_rows(file, page_size, rel, descs, |v| {
+        let flag_ok = system_flag.map_or(true, |f| sf_f.is_some_and(|i| int_eq(v.get(i), f)));
+        if text_is(v.get(rn_f), name) && flag_ok {
+            if let Some(Value::Text(t)) = v.get(tn_f) {
+                out.push(t.trim_end().to_string());
+            }
+        }
+    });
+    out
+}
+
+/// Whether a PLAIN (unpackaged) procedure holds the name. Relations and
+/// procedures share one namespace on the engine: `CREATE TABLE PR`,
+/// `CREATE VIEW PR`, `RECREATE VIEW PR` and `CREATE OR ALTER VIEW PR`
+/// over a procedure PR are each "<VERB> @1 failed / Procedure @1 already
+/// exists" (42000, measured on 2182), and nothing is written.
+fn plain_procedure_exists(file: &crate::Image, page_size: usize, name: &str) -> bool {
+    let (Some(rel), Some(fmts)) = (
+        crate::resolve_relation(file, page_size, "RDB$PROCEDURES"),
+        system_relation_formats(file, page_size, "RDB$PROCEDURES"),
+    ) else { return false };
+    let Some((_, descs)) = fmts.iter().max_by_key(|(n, _)| *n) else { return false };
+    let cols = relation_columns(file, page_size, "RDB$PROCEDURES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let Some(name_f) = fid("RDB$PROCEDURE_NAME") else { return false };
+    let pkg_f = fid("RDB$PACKAGE_NAME");
+    let mut found = false;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_is(v.get(name_f), name) && pkg_f.map_or(true, |i| matches!(v.get(i), None | Some(Value::Null))) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// The distinct (dependent name, dependent type) pairs RDB$DEPENDENCIES
+/// records against an object of the given depended-on type - the
+/// engine's `check_dependencies` count for a DROP of an exception (7) or
+/// a sequence (14), taken at COMMIT ([refused_drop]). Measured on 2182: a
+/// procedure raising EX1 makes `DROP EXCEPTION EX1` and `RECREATE
+/// EXCEPTION EX1` "cannot delete / EXCEPTION "PUBLIC"."EX1" / there are
+/// 1 dependencies", a trigger drawing NEXT VALUE FOR SQ1 the same with
+/// GENERATOR, and nothing is written (the trigger keeps drawing from the
+/// old SQ1).
+fn object_dependents(file: &crate::Image, page_size: usize, name: &str, on_type: i64) -> usize {
+    let (Some(rel), Some(fmts)) = (
+        crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES"),
+        system_relation_formats(file, page_size, "RDB$DEPENDENCIES"),
+    ) else { return 0 };
+    let Some((_, descs)) = fmts.iter().max_by_key(|(n, _)| *n) else { return 0 };
+    let cols = relation_columns(file, page_size, "RDB$DEPENDENCIES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(dn_f), Some(dt_f), Some(don_f), Some(dot_f)) = (
+        fid("RDB$DEPENDENT_NAME"),
+        fid("RDB$DEPENDENT_TYPE"),
+        fid("RDB$DEPENDED_ON_NAME"),
+        fid("RDB$DEPENDED_ON_TYPE"),
+    ) else { return 0 };
+    let mut seen: Vec<(String, i64)> = Vec::new();
+    walk_rows(file, page_size, rel, descs, |v| {
+        if !text_is(v.get(don_f), name) || !int_eq(v.get(dot_f), on_type) {
+            return;
+        }
+        let (Some(Value::Text(t)), Some(Value::Int(dt))) = (v.get(dn_f), v.get(dt_f)) else { return };
+        let key = (t.trim_end().to_string(), *dt);
+        if !seen.contains(&key) {
+            seen.push(key);
+        }
+    });
+    seen.len()
+}
+
+/// The first pending [crate::DdlDeferred::CheckDependents] something
+/// still uses, as (name, depended-on type, dependents) - the refusal a
+/// COMMIT answers before it writes anything. Counted on the image the
+/// transaction sees, so a user it dropped itself no longer counts.
+pub fn refused_drop<'a>(
+    file: &crate::Image,
+    page_size: usize,
+    deferred: impl IntoIterator<Item = &'a crate::DdlDeferred>,
+) -> Option<(String, i64, usize)> {
+    deferred.into_iter().find_map(|d| match d {
+        crate::DdlDeferred::CheckDependents { name, on_type } => {
+            let n = object_dependents(file, page_size, name, *on_type);
+            (n > 0).then(|| (name.clone(), *on_type, n))
+        }
+        _ => None,
+    })
+}
+
+/// A dropped relation's OWN triggers go with it - their RDB$TRIGGERS rows
+/// and the type-2 RDB$DEPENDENCIES rows they recorded (dfw.epp
+/// `delete_relation` phase 2 erases every trigger whose RDB$RELATION_NAME
+/// is the relation, and `MET_delete_dependencies` their rows). Measured
+/// on 2182: after `DROP TABLE T2` / `DROP VIEW V1` no TR2 / V1_BI row is
+/// left, so `DROP TABLE T1` that either read passes, and a `RECREATE
+/// TABLE T1` / `RECREATE VIEW V1` starts with NO trigger (an insert
+/// stores the value as given). Left behind here, the orphan counted
+/// against the table it read and re-attached BY NAME to a relation
+/// re-created under the same name.
+fn delete_relation_triggers(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
+    delete_relation_triggers_where(file, page_size, name, None)
+}
+
+/// [delete_relation_triggers], narrowed to the triggers of one
+/// RDB$SYSTEM_FLAG when `system_flag` is given.
+fn delete_relation_triggers_where(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    system_flag: Option<i64>,
+) -> Result<(), String> {
+    let triggers = triggers_of_relation(file, page_size, name, system_flag);
+    if triggers.is_empty() {
+        return Ok(());
+    }
+    {
+        let tn_f = sys_fid(file, page_size, "RDB$TRIGGERS", "RDB$TRIGGER_NAME")?;
+        let rn_f = sys_fid(file, page_size, "RDB$TRIGGERS", "RDB$RELATION_NAME")?;
+        let n = name.to_string();
+        let t = triggers.clone();
+        delete_catalog_rows(file, page_size, "RDB$TRIGGERS", move |v| {
+            text_is(v.get(rn_f), &n) && t.iter().any(|x| text_is(v.get(tn_f), x))
+        })?;
+    }
+    if crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES").is_some() {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            int_eq(v.get(dt_f), 2) && triggers.iter().any(|t| text_is(v.get(dn_f), t))
+        })?;
+    }
+    Ok(())
 }
 
 /// The foreign key (if any) whose RDB$REF_CONSTRAINTS row names this
@@ -6929,9 +8116,9 @@ fn deferred_drop_index(
     })
     .ok_or_else(|| format!("index {} not found", index_name))?;
     let mut image = {
-        let dp = DataPage::decode(crate::page_at(file, page_size, page).ok_or("bad page")?)
-            .ok_or("bad data page")?;
-        dp.record(slot).and_then(|r| r.image()).ok_or("no index image")?
+        catalog_patch_base(file, page_size, page, slot)
+            .map_err(|_| "no index image")?
+            .0
     };
     // RDB$INDEX_ID is the irt slot + 1 (both here and in the engine)
     let index_id = {
@@ -6988,16 +8175,18 @@ fn deferred_drop_index(
     if at + 24 > page.len() {
         return Err("index slot beyond the root page".into());
     }
-    // irt_drop (6) with the flags cleared: the SETTLED shape an
-    // engine-dropped index reaches (fcstat reads exactly this back off
-    // an engine file once the dropping transaction is old). The engine
+    // irt_drop (6) with the enforcing flags cleared ([btr::set_irt_drop]
+    // keeps irt_descending, which the writers still keying this tree
+    // need): the SETTLED shape an engine-dropped index reaches before
+    // the sweep frees its slot (measured on 2182: a dropped DESC index's
+    // slot reads state 6, flags 0x0002, until a later attachment turns
+    // it irt_unused with root 0). The engine
     // passes through irt_commit (5) first because its DDL runs inside a
     // transaction that has yet to commit; this writer's statement is
     // already committed when it returns, so the settled state is the
     // honest one - and it is the one gfix validates as clean, since a
     // state-5 index is still scanned while its segment rows are gone
-    dml::put_u16(page, at + 18, 0); // irt_flags
-    page[at + 20] = 6; // irt_drop (ods.h:456)
+    crate::btr::set_irt_drop(page, at);
     Ok(())
 }
 
@@ -7340,6 +8529,16 @@ fn write_foreign_key_full(
     fk: &ForeignKeyDef,
     synth_triggers: bool,
 ) -> Result<(), String> {
+    // THE REFERENCED RELATION, before its key is looked for (measured on
+    // 2182 for CREATE TABLE and ALTER TABLE ADD alike): a name the catalog
+    // does not hold is "<verb> @1 failed / Table @2 not found"; a VIEW is
+    // "attempt to reference a view (@1) in a foreign key" (DYN 242).
+    let Some(ref_type) = relation_type_of(file, page_size, &fk.ref_table) else {
+        return Err(format!("Table {} not found (qualified)", fk.ref_table.trim()));
+    };
+    if ref_type == 1 || is_view(file, page_size, &fk.ref_table) {
+        return Err(format!("attempt to reference a view ({}) in a foreign key", fk.ref_table.trim()));
+    }
     let (uq_constraint, partner_index) =
         find_partner_key(file, page_size, &fk.ref_table, &fk.ref_columns).ok_or_else(|| {
             if fk.ref_columns.is_empty() {
@@ -7361,6 +8560,33 @@ fn write_foreign_key_full(
     // not online due to failure to activate one or more indices`), which
     // makes the database unrestorable. Refusing is the only answer.
     check_partner_compatible(file, page_size, table, fk, &partner_index)?;
+    // A KEY MAY NOT OUTLIVE THE ROWS THAT HOLD IT (DYN 232, "@1 cannot
+    // reference @2", SQLSTATE HY000; measured on 2182 after the partner
+    // checks above - a GTT whose FK names a non-key column gets "could
+    // not find UNIQUE or PRIMARY KEY", not this): a global temporary
+    // table of either kind cannot reference a persistent table, a
+    // persistent table cannot reference a GTT of either kind, and an ON
+    // COMMIT PRESERVE ROWS GTT cannot reference an ON COMMIT DELETE ROWS
+    // one. DELETE ROWS -> PRESERVE ROWS, like -> like and a
+    // self-reference pass. Both operands are spelled as the engine
+    // spells them, names already qualified and quoted, so the wire
+    // layer ships the two halves as they stand.
+    {
+        let spell = |name: &str, t: i64| match t {
+            4 => format!("global temporary table \"PUBLIC\".\"{}\" of type ON COMMIT PRESERVE ROWS", name.trim()),
+            5 => format!("global temporary table \"PUBLIC\".\"{}\" of type ON COMMIT DELETE ROWS", name.trim()),
+            _ => format!("persistent table \"PUBLIC\".\"{}\"", name.trim()),
+        };
+        let child = relation_type_of(file, page_size, table).unwrap_or(0);
+        let parent = ref_type;
+        let is_gtt = |t: i64| t == 4 || t == 5;
+        let refused = (is_gtt(child) && !is_gtt(parent))
+            || (!is_gtt(child) && is_gtt(parent))
+            || (child == 4 && parent == 5);
+        if refused {
+            return Err(format!("{} cannot reference {}", spell(table, child), spell(&fk.ref_table, parent)));
+        }
+    }
     create_index(
         file, page_size, table, index_name, &fk.columns, false, false, false,
         Some(&partner_index),
@@ -7937,6 +9163,15 @@ fn index_itype(d: &Descriptor) -> Option<u16> {
         dtype::SHORT | dtype::LONG | dtype::REAL | dtype::DOUBLE => btw::IDX_NUMERIC,
         dtype::INT64 => btw::IDX_NUMERIC2,
         dtype::INT128 => btw::IDX_BCD, // ODS >= 13.1 (dfw.epp)
+        // A TEXT COLUMN WITH A REAL COLLATION has no key this writer can
+        // build: the engine stamps it `idx_offset_intl_range + ttype`
+        // and keys it by the collation's SORT key (for UNICODE_CI the
+        // ICU key), where this stamps a byte index and keys the bytes.
+        // Measured over a UNICODE_CI column (a domain's, or declared):
+        // the engine's PRIMARY KEY refuses 'abc' beside 'AbC' (23000)
+        // and an FK child 'KEY' finds its parent 'Key'; the byte index
+        // here stored both and refused the child. Refused, not guessed.
+        dtype::TEXT | dtype::VARYING if crate::intl::collation_id(d.sub_type) != 0 => return None,
         dtype::TEXT | dtype::VARYING => btw::IDX_STRING,
         dtype::SQL_DATE => 5,  // idx_sql_date
         dtype::SQL_TIME => 6,  // idx_sql_time
@@ -8171,11 +9406,13 @@ pub fn create_expression_index(
             continue;
         };
         let seq = dp.sequence as u64;
+        // the chain state read per page: the loop below writes the file
+        let tips = crate::tra::TipChain::read(file, page_size);
         let rows: Vec<(u16, Vec<Value>)> = dp
             .records()
-            .filter(|r| r.is_primary_record())
             .filter_map(|r| {
-                crate::data::assembled_image(file, page_size, &r)
+                // the version the catalog view sees, as [backfill_index_inner]
+                crate::data::catalog_image(file, page_size, &r, tips.as_ref())
                     .map(|img| (r.slot, decode_record(&img, &descs)))
             })
             .collect();
@@ -8323,6 +9560,7 @@ fn backfill_index_inner(
     primary: bool,
 ) -> Result<(), String> {
     let recs = max_recs_per_dp(page_size);
+    let tips = crate::tra::TipChain::read(file, page_size);
     // (key, recno) for every row, then sorted in the tree's order
     let mut keyed: Vec<(Vec<u8>, u64, bool)> = Vec::new();
     for dp_no in relation_data_pages(file, page_size, rel) {
@@ -8332,13 +9570,21 @@ fn backfill_index_inner(
         let seq = dp.sequence as u64;
         let rows: Vec<(u16, Vec<Value>)> = dp
             .records()
-            .filter(|r| r.is_primary_record())
             .filter_map(|r| {
                 // ASSEMBLED, not `image()`. A fragmented row skipped here is
                 // a row MISSING FROM THE INDEX THIS WRITES - and that index is
                 // then read by the REAL engine, which returns nothing for a key
                 // whose row plainly exists. Durable wrong state, not a bad plan.
-                crate::data::assembled_image(file, page_size, &r)
+                //
+                // And the VISIBLE version, not the head: a rolled-back
+                // INSERT or UPDATE leaves a DEAD head in the slot, and
+                // keying it made `alter index i37 active` over a UNIQUE
+                // index refuse "duplicate key" for a row the engine never
+                // counts (measured on 2182: `insert into t20 values (4, 1)`
+                // beside a committed id 4 under the inactive index,
+                // rollback, then ACTIVE succeeds). A dead DELETE stub gives
+                // its row back; a committed one has no row.
+                crate::data::catalog_image(file, page_size, &r, tips.as_ref())
                     .map(|img| (r.slot, decode_record(&img, descs)))
             })
             .collect();
@@ -8457,6 +9703,14 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
     if rel < 128 {
         return Err("system relations cannot be dropped".into());
     }
+    // A VIEW is not a table: `DROP TABLE V1` and `RECREATE TABLE V1` over a
+    // view are the same -607 "Table @1 does not exist" the missing name
+    // gets (measured on 2182, `DROP TABLE IF EXISTS V1` included), and the
+    // view stays. Its own message, so a RECREATE does not read it as "not
+    // there, go on and create".
+    if is_view(file, page_size, &name) {
+        return Err(format!("table {} does not exist: it is a view", name));
+    }
     // FK/PK takes precedence and fires immediately, with its own vector: a
     // FOREIGN KEY on another table that references this table's PRIMARY KEY
     // or UNIQUE constraint blocks the drop before any dependency count.
@@ -8466,39 +9720,12 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
             name
         ));
     }
-    // Then the dependency count. The engine's N is DISTINCT dependent VIEWS
-    // whenever any view exists (procedures/triggers that also reference the
-    // table are recompiled, not counted); with no view, DISTINCT dependent
-    // PROCEDURES. RDB$VIEW_RELATIONS holds one row per view context (fc
-    // writes it for its own views, so this is db-agnostic); the procedure
-    // count reads RDB$DEPENDENCIES, which the engine populates. A trigger on
-    // ANOTHER table that is the SOLE dependent is a recorded boundary - this
-    // server drops there, where the engine refuses.
-    let mut views: Vec<String> = Vec::new();
-    if let Some(vrel) = crate::resolve_relation(file, page_size, "RDB$VIEW_RELATIONS") {
-        let vfmts = system_relation_formats(file, page_size, "RDB$VIEW_RELATIONS")
-            .ok_or("no RDB$VIEW_RELATIONS format")?;
-        let (_, vdescs) = vfmts.iter().max_by_key(|(n, _)| *n).ok_or("no view-relations format")?;
-        let vname_f = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$VIEW_NAME")?;
-        let vreln_f = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$RELATION_NAME")?;
-        walk_rows(file, page_size, vrel, vdescs, |v| {
-            if text_is(v.get(vreln_f), &name) {
-                if let Some(Value::Text(t)) = v.get(vname_f) {
-                    let vn = t.trim_end().to_string();
-                    if !views.iter().any(|x| *x == vn) {
-                        views.push(vn);
-                    }
-                }
-            }
-        });
-    }
-    let n = if !views.is_empty() {
-        views.len()
-    } else {
-        procedure_dependents(file, page_size, &name).len()
-    };
-    if n > 0 {
-        return Err(format!("cannot delete TABLE {} - there are {} dependencies", name, n));
+    // Then the dependency count - the engine's two checks, shared with
+    // DROP VIEW ([relation_dependents]): the RDB$VIEW_RELATIONS rows over
+    // it, else the distinct dependents RDB$DEPENDENCIES records (a
+    // procedure, a trigger on ANOTHER table, ...).
+    if let Some((kind, n)) = relation_dependents(file, page_size, &name, false) {
+        return Err(format!("cannot delete {} {} - there are {} dependencies", kind, name, n));
     }
 
     // gather what the catalog says belongs to this table BEFORE
@@ -8595,6 +9822,9 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         }
     }
 
+    // ...and the table's own user triggers, with their rows
+    delete_relation_triggers(file, page_size, &name)?;
+
     let mut domain_names: Vec<String> = Vec::new();
     {
         let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
@@ -8675,6 +9905,21 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         let fid = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
         delete_catalog_rows(file, page_size, "RDB$FIELDS",
             idx_pred(domain_names.clone(), fid))?;
+    }
+    // ...and what those domains and the table's expression indices
+    // recorded in RDB$DEPENDENCIES (a computed column reading ANOTHER
+    // table, type 3; an engine-built COMPUTED BY index, type 6): left
+    // behind they keep that other table undroppable (measured: DROP
+    // TABLE B whose CNT reads A, then DROP TABLE A passes on 2182)
+    {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let domains = domain_names.clone();
+        let indices = index_names.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            (int_eq(v.get(dt_f), 3) && domains.iter().any(|d| text_is(v.get(dn_f), d)))
+                || (int_eq(v.get(dt_f), 6) && indices.iter().any(|i| text_is(v.get(dn_f), i)))
+        })?;
     }
     {
         let fid = sys_fid(file, page_size, "RDB$FORMATS", "RDB$RELATION_ID")?;
@@ -9590,6 +10835,55 @@ pub enum SysValue<'a> {
     Null,
 }
 
+/// The image a catalog PATCH starts from, for the row whose chain is
+/// headed at `(page, slot)` ([find_sys_row_slot] found it by what the
+/// catalog SEES): that version's image, its format, and whether it is a
+/// fragmented head (only then can the caller poke it in place).
+///
+/// NOT THE PHYSICAL HEAD. The head can be a version the catalog walks
+/// past: a rolled-back DROP's stub, or a rolled-back ALTER's rewrite,
+/// whose transaction is DEAD. Patching the head's bytes resurrected the
+/// rolled-back change and committed it with the new one (measured on the
+/// 2182 file this server writes: `set autoddl off; alter table t47 alter
+/// column b to bb; rollback; alter table t47 alter b set default 'z2';
+/// commit` left RDB$FIELD_NAME 'BB', and a rolled-back `alter column b
+/// position 1` followed by `alter a set default 1` left A at position 2;
+/// the engine keeps B, and A at 1). The patch reads what the finder read
+/// - the visible version under the same view as [crate::data::catalog_image]
+/// - and the new head goes on top of the chain as any update's does.
+///
+/// A FRAGMENTED visible head is read whole too. The sites that rewrite
+/// through [dml::update_records] used to refuse one ("no field image",
+/// read with `image()`), but that write clones the head as the back
+/// version, forward pointer and all, and lays a fresh head - measured:
+/// `alter table w47 alter aa set not null` and `drop index w34` over
+/// rows a long session had grown refused with a bare 42000 where 2182
+/// answers.
+fn catalog_patch_base(
+    file: &crate::Image,
+    page_size: usize,
+    page: u32,
+    slot: u16,
+) -> Result<(Vec<u8>, u8, bool), String> {
+    let dp = DataPage::decode(crate::page_at(file, page_size, page).ok_or("bad page")?)
+        .ok_or("bad data page")?;
+    let r = dp.record(slot).ok_or("no row image")?;
+    let tips = crate::tra::TipChain::read(file, page_size).ok_or("no TIP")?;
+    let own = crate::tra::reader_view().unwrap_or_else(crate::tra::OwnTx::catalog);
+    let v = crate::tra::visible_version(file, page_size, &r, &tips, &own).ok_or("no row image")?;
+    if v.walked > 0 {
+        // a back version: a whole image, never patched in place
+        return Ok((v.image, v.format, false));
+    }
+    let frag = r.flags & crate::data::flags::INCOMPLETE != 0;
+    // A FRAGMENTED ROW IS READ WHOLE and patched in its head. Reading
+    // with `image()` answered None here, which is what refused 88
+    // COMMENT ON and 92 DROP INDEX statements on an ordinary restored
+    // database - see [dml::patch_head_in_place] for why the head is
+    // enough and what happens when it is not.
+    Ok((v.image, r.format, frag))
+}
+
 fn patch_sys_row(
     file: &mut crate::Image,
     page_size: usize,
@@ -9617,19 +10911,7 @@ fn patch_sys_row(
     // It needs a system relation carrying more than one format to fire,
     // so it has been latent rather than absent - and it is reachable on
     // ORDINARY rows, nothing to do with fragmentation.
-    let (mut image, format_no, fragmented) = {
-        let dp = DataPage::decode(crate::page_at(file, page_size, page).ok_or("bad page")?)
-            .ok_or("bad data page")?;
-        let r = dp.record(slot).ok_or("no row image")?;
-        let frag = r.flags & crate::data::flags::INCOMPLETE != 0;
-        // A FRAGMENTED ROW IS READ WHOLE and patched in its head. Reading
-        // with `image()` answered None here, which is what refused 88
-        // COMMENT ON and 92 DROP INDEX statements on an ordinary restored
-        // database - see [dml::patch_head_in_place] for why the head is
-        // enough and what happens when it is not.
-        let img = crate::data::assembled_image(file, page_size, &r).ok_or("no row image")?;
-        (img, r.format, frag)
-    };
+    let (mut image, format_no, fragmented) = catalog_patch_base(file, page_size, page, slot)?;
     let descs = formats
         .iter()
         .find(|(n, _)| *n == format_no)
@@ -11843,6 +13125,8 @@ pub fn drop_sequence(file: &mut crate::Image, page_size: usize, name: &str) -> R
     if system != 0 {
         return Err(format!("Cannot delete system generator {}", want));
     }
+    // whether anything uses it is asked at COMMIT ([crate::DdlDeferred::CheckDependents])
+    file.ddl_deferred.push(crate::DdlDeferred::CheckDependents { name: want.clone(), on_type: 14 });
     let name_f = sys_fid(file, page_size, "RDB$GENERATORS", "RDB$GENERATOR_NAME")?;
     {
         let want = want.clone();
@@ -12113,6 +13397,22 @@ pub fn drop_procedure(file: &mut crate::Image, page_size: usize, name: &str) -> 
             text_eq(v.get(rel_f), &want) && int_eq(v.get(obj_f), 5)
         })?;
     }
+    // the procedure's OWN dependency rows go with it (the engine's
+    // MET_delete_dependencies for obj_procedure): a dropped procedure
+    // must stop counting against the view it read (measured: DROP
+    // PROCEDURE PR, then DROP VIEW VP under one trigger is "VIEW / 1")
+    {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        // a packaged member shares the bare name and keeps its rows
+        let pk_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$PACKAGE_NAME").ok();
+        let want = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            text_eq(v.get(dn_f), &want)
+                && int_eq(v.get(dt_f), 5)
+                && !matches!(pk_f.and_then(|f| v.get(f)), Some(Value::Text(_)))
+        })?;
+    }
     advance_oldest_transactions(file, page_size)
 }
 
@@ -12214,6 +13514,13 @@ pub fn create_procedure_with_id(
         if dup {
             return Err(format!("Procedure {} already exists", want));
         }
+    }
+    // ...and a plain procedure does not take a RELATION's name (one
+    // namespace, [plain_procedure_exists]): `CREATE PROCEDURE T1` over a
+    // table T1 is "CREATE PROCEDURE @1 failed / Table @1 already exists"
+    // (42S01, measured on 2182)
+    if package.is_none() && crate::resolve_relation(file, page_size, &want).is_some() {
+        return Err(format!("Table {} already exists", want));
     }
     let id = match keep_id {
         Some(id) => id,
@@ -12507,6 +13814,20 @@ pub fn alter_domain_check(
                     ("RDB$VALIDATION_SOURCE", SysVal::Null),
                 ],
             )?;
+            // ...and the rows the dropped CHECK recorded (type 4), as
+            // DROP DOMAIN takes them. Measured on 2182: after `ALTER
+            // DOMAIN D1 DROP CONSTRAINT` over `CHECK (VALUE IN (SELECT ID
+            // FROM T1))` no D1 row is left and DROP TABLE T1 passes; left
+            // behind here they refused it "TABLE T1 / there are 1
+            // dependencies"
+            if crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES").is_some() {
+                let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+                let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+                let dn = want.clone();
+                delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+                    text_eq(v.get(dn_f), &dn) && int_eq(v.get(dt_f), 4)
+                })?;
+            }
         }
     }
     // the tables whose columns use the domain, for the summary rebuild
@@ -13747,6 +15068,20 @@ pub fn drop_package(file: &mut crate::Image, page_size: usize, name: &str) -> Re
         let w = want.clone();
         delete_catalog_rows(file, page_size, "RDB$PACKAGES", move |v| text_eq(v.get(nf), &w))?;
     }
+    // the package's OWN dependency rows go with it - the engine records
+    // a body's reads under the PACKAGE's name (RDB$DEPENDENT_NAME = the
+    // package, type 18 the header, 19 the body, RDB$PACKAGE_NAME NULL;
+    // measured) and deletes them at DROP PACKAGE: left behind, the
+    // table the body read stays undroppable ("there are 1 dependencies"
+    // where the engine drops it)
+    {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let w = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            text_eq(v.get(dn_f), &w) && (int_eq(v.get(dt_f), 18) || int_eq(v.get(dt_f), 19))
+        })?;
+    }
     advance_oldest_transactions(file, page_size)
 }
 
@@ -13919,6 +15254,8 @@ pub fn drop_exception(file: &mut crate::Image, page_size: usize, name: &str) -> 
     if system != 0 {
         return Err(format!("Cannot delete system exception {}", want));
     }
+    // whether anything uses it is asked at COMMIT ([crate::DdlDeferred::CheckDependents])
+    file.ddl_deferred.push(crate::DdlDeferred::CheckDependents { name: want.clone(), on_type: 7 });
     let name_f = sys_fid(file, page_size, "RDB$EXCEPTIONS", "RDB$EXCEPTION_NAME")?;
     {
         let want = want.clone();

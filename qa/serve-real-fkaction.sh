@@ -984,18 +984,10 @@ for spec in "N9:NUMERIC(9,2):INTEGER" "N18:NUMERIC(18,2):BIGINT" "N20:NUMERIC(20
           SELECT ID PID FROM MP$n; SELECT B CB FROM MC$n;"
     dsql="DELETE FROM MP$n WHERE ID = 7.00; COMMIT;
           SELECT COUNT(*) NP FROM MP$n; SELECT B CB FROM MC$n;"
-    if [ "$n" = "N20" ]; then
-        # an INT128-backed key loses the `-Problematic key value` line
-        # in this server's refusal - PRE-EXISTING (byte-identical on the
-        # previous round's binary for a plain no-rule child, and for
-        # NUMERIC(19,2) and INT128 alike), recorded in docs/roadmap.md.
-        # Both answers are pinned rather than skipped.
-        gap "16a/$n DELETE the key the default writes back - both REFUSE" "$dsql" \
-            'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "MKN20" on table "PUBLIC"."MCN20"|-Foreign key references are present for the record|NP 1|CB 7.00|' \
-            'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "MKN20" on table "PUBLIC"."MCN20"|-Foreign key references are present for the record|-Problematic key value is ("ID" = 7.00)|NP 1|CB 7.00|'
-    else
-        both "16a/$n DELETE the key the default writes back - both REFUSE" "$dsql"
-    fi
+    # (an INT128-backed key lost its `-Problematic key value` line here,
+    # then spelled it as a CAST; it prints the plain digits since
+    # 2026-09-27 and the N20 gap cell was promoted)
+    both "16a/$n DELETE the key the default writes back - both REFUSE" "$dsql"
     eboth "16a/$n the ENGINE reads both files: the parent kept, NO orphan" \
           "SELECT COUNT(*) NPAR FROM MP$n;
            SELECT COUNT(*) ORPH FROM MC$n c WHERE c.B IS NOT NULL
@@ -1010,14 +1002,7 @@ for spec in "N9:NUMERIC(9,2):INTEGER" "N18:NUMERIC(18,2):BIGINT" "N20:NUMERIC(20
           COMMIT; INSERT INTO XP$n VALUES (7.00); COMMIT;
           INSERT INTO XC$n VALUES (1, 7); COMMIT; SELECT COUNT(*) NXC FROM XC$n;"
     xsql="DELETE FROM XP$n WHERE ID = 7.00; COMMIT; SELECT COUNT(*) NXP FROM XP$n;"
-    if [ "$n" = "N20" ]; then
-        # the same PRE-EXISTING INT128 message gap as 16a/N20
-        gap "16b/$n ...and the parent DELETE is then REFUSED by both" "$xsql" \
-            'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "XKN20" on table "PUBLIC"."XCN20"|-Foreign key references are present for the record|NXP 1|' \
-            'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "XKN20" on table "PUBLIC"."XCN20"|-Foreign key references are present for the record|-Problematic key value is ("ID" = 7.00)|NXP 1|'
-    else
-        both "16b/$n ...and the parent DELETE is then REFUSED by both" "$xsql"
-    fi
+    both "16b/$n ...and the parent DELETE is then REFUSED by both" "$xsql"
     eboth "16b/$n the ENGINE reads both files: the parent kept, NO orphan" \
           "SELECT COUNT(*) NXP FROM XP$n; SELECT COUNT(*) NXC FROM XC$n;
            SELECT COUNT(*) ORPH FROM XC$n c WHERE c.B IS NOT NULL
@@ -1075,18 +1060,19 @@ both "16f contrast NUMERIC(9,1) parent / NUMERIC(9,3) child - both sides scaled"
       COMMIT; INSERT INTO ZS1 VALUES (7.0); COMMIT; INSERT INTO ZC1 VALUES (1, 7.000); COMMIT;
       DELETE FROM ZS1 WHERE ID = 7.0; COMMIT; SELECT COUNT(*) N FROM ZS1;"
 # a DOUBLE PRECISION key is APPROXIMATE: both servers refuse and both
-# files keep the same rows, and they differ only in how the refusal
-# RENDERS the key - `7e0` against the engine's `7.000000000000000`.
-# PRE-EXISTING (identical on the previous round's binary); both answers
-# are pinned rather than skipped.
-gap "16f contrast DOUBLE PRECISION key, DEFAULT 7 - approximate, not exact" \
-    "CREATE TABLE DPP (ID DOUBLE PRECISION NOT NULL PRIMARY KEY);
+# files keep the same rows. They differed in how the refusal RENDERED the
+# key - `7e0` here against the engine's `7.000000000000000` - until the
+# key value took DescPrinter's own form (CVT's `%#.16g`,
+# qa/serve-real-errvec.sh section 9); both answers are pinned.
+DPQ="CREATE TABLE DPP (ID DOUBLE PRECISION NOT NULL PRIMARY KEY);
      CREATE TABLE DPC (X INTEGER, B DOUBLE PRECISION DEFAULT 7,
                        CONSTRAINT DPK FOREIGN KEY (B) REFERENCES DPP ON DELETE SET DEFAULT);
      COMMIT; INSERT INTO DPP VALUES (7); INSERT INTO DPC VALUES (100, 7); COMMIT;
      DELETE FROM DPP WHERE ID = 7; COMMIT;
-     SELECT COUNT(*) NP FROM DPP; SELECT B CB FROM DPC;" \
-    'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "DPK" on table "PUBLIC"."DPC"|-Foreign key references are present for the record|-Problematic key value is ("ID" = 7e0)|NP 1|CB 7.000000000000000|' \
+     SELECT COUNT(*) NP FROM DPP; SELECT B CB FROM DPC;"
+check "16f contrast DOUBLE PRECISION key, DEFAULT 7 - approximate, not exact - fire-crab's answer" "$(crabq "$DPQ")" \
+    'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "DPK" on table "PUBLIC"."DPC"|-Foreign key references are present for the record|-Problematic key value is ("ID" = 7.000000000000000)|NP 1|CB 7.000000000000000|'
+check "16f contrast DOUBLE PRECISION key, DEFAULT 7 - the ENGINE's own answer" "$(engineq "$DPQ")" \
     'Statement failed, SQLSTATE = 23000|violation of FOREIGN KEY constraint "DPK" on table "PUBLIC"."DPC"|-Foreign key references are present for the record|-Problematic key value is ("ID" = 7.000000000000000)|NP 1|CB 7.000000000000000|'
 both "16f contrast a default that is a DIFFERENT key still lets the DELETE through" \
      "CREATE TABLE OKP (ID NUMERIC(9,2) NOT NULL PRIMARY KEY);

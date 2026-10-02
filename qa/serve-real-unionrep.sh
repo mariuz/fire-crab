@@ -80,9 +80,15 @@ agree() { # <label> <sql>
 }
 
 echo "-- the bug: a blank-only-differing VARCHAR dedup survivor is REFUSED --"
-refuses "c3 UNION v5"        "select octet_length(x) ol from (select c3 x from t union select v5 from t) z;"
-refuses "v5 UNION c3 (rev)"  "select octet_length(x) ol from (select v5 x from t union select c3 from t) z;"
-refuses "3-leg c3 U v5 U c5" "select octet_length(x) ol from (select c3 x from t union select v5 from t union select c5 from t) z;"
+# PROMOTED 2026-09-26 (serve-real-collkey): the survivor of a blank-only
+# collision over PLAIN legs is the row fed LAST (the later leg's - the
+# engine's unique sort drops the earlier of two adjacent equals), which fc
+# keeps now; these answer the engine's OCTET_LENGTH. A leg that is itself
+# DISTINCT still refuses (the last cell: the engine keeps the FIRST leg's
+# there)
+agree "c3 UNION v5"        "select octet_length(x) ol from (select c3 x from t union select v5 from t) z;"
+agree "v5 UNION c3 (rev)"  "select octet_length(x) ol from (select v5 x from t union select c3 from t) z;"
+agree "3-leg c3 U v5 U c5" "select octet_length(x) ol from (select c3 x from t union select v5 from t union select c5 from t) z;"
 refuses "SELECT DISTINCT mix" "select octet_length(x) ol from (select distinct c3 x from t union select v5 from t) z;"
 echo "-- controls that must STILL ANSWER and match the engine --"
 agree "byte-equal v3 U v5"   "select octet_length(x) ol from (select v3 x from t union select v5 from t) z;"

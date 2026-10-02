@@ -347,48 +347,22 @@ if [ "$got" = "$want" ]; then echo "OK   F6 what the ENGINE's backup of that fil
     echo "     got:  [$got]"; echo "     want: [$want]"; fail=1; fi
 
 # ---------------------------------------------------------------- H
-# AN INDEX OLDER THAN THE FORMAT THE ROW WAS WRITTEN UNDER - a WRONG
-# ANSWER this round did NOT fix, pinned so it cannot move unnoticed.
-#
-# This section was headed "an index that PREDATES the ALTER" until
-# 2026-09-03, and that is NARROWER THAN THE DEFECT. An index entry is
-# keyed at the scale the row carried WHEN THE ENTRY WAS MADE, and a
-# probe builds ONE key, so an index does not name the rows written under
-# any format MINTED AFTER IT. With a single ALTER that reads as "older
-# than the ALTER"; with two it does not, and the corrected wording is
-# what a reader needs. Measured 2026-09-03 on three fixtures,
-# `INTEGER` -> `NUMERIC(9,2)` [-> `NUMERIC(18,4)`], rows written on both
-# sides of every ALTER:
-#
-#   IW   index made BEFORE the only ALTER (this gate's fixture)
-#          = 7    crab: ID 2       engine: ID 2, 3
-#          = 700  crab: ID 1       engine: ID 1, 4
-#          > 0    crab: ID 1, 2    engine: ID 1, 2, 3, 4   <- a RANGE
-#          BETWEEN 1 AND 1000: the same two, and the same four
-#   IX3  index made AFTER a first ALTER and BEFORE a second
-#          = 7    crab: ID 2, 3          engine: ID 2, 3, 5
-#          > 0    crab: ID 1, 2, 3, 4    engine: ID 1, 2, 3, 4, 5
-#   IX4  index made after BOTH ALTERs: `= 7`, `> 0`, the projection and
-#          `ORDER BY` are all the engine's answers, on both servers
-#
-# IX3 is the shape that corrects the wording: its index is YOUNGER than
-# the ALTER, and it still loses the rows written under the format minted
-# after it. This fixture carries one ALTER, so only the IW shapes are
-# pinned here; IX3 and IX4 are recorded in `docs/roadmap.md`. It is the
-# index KEY ENCODING, not the projection - identical on a binary with
-# the projection fix reverted - and section C shows the shape does NOT
-# appear when the index is younger than every format the table has.
-gap "H1 an index older than the format the row was written under, = 7" \
-    "SELECT ID FROM IW WHERE N = 7 ORDER BY ID;" \
-    "ID 2|" "ID 2|ID 3|"
-gap "H2 an index older than the format the row was written under, = 700" \
-    "SELECT ID FROM IW WHERE N = 700 ORDER BY ID;" \
-    "ID 1|" "ID 1|ID 4|"
-# a RANGE probe loses the same rows - added 2026-09-03, because pinning
-# only the two equality shapes read as "equality probes only"
-gap "H3 ... and a RANGE probe over the same index, > 0" \
-    "SELECT ID FROM IW WHERE N > 0 ORDER BY ID;" \
-    "ID 1|ID 2|" "ID 1|ID 2|ID 3|ID 4|"
+# AN INDEX OLDER THAN THE FORMAT THE ROW WAS WRITTEN UNDER - recorded
+# here as a wrong answer (crab `= 7` ID 2 where the engine answers 2, 3;
+# `= 700` ID 1 for 1, 4; `> 0` ID 1, 2 for 1, 2, 3, 4) until 2026-09-27,
+# and it was NOT the key encoding. The engine's ALTER TYPE over an
+# indexed column REBUILDS the index into a new slot and leaves the old
+# one in irt_drop with its tree (measured on 2182: IWN's slot 0 state 6,
+# the rebuilt slot 1 state 3). This server read through the FIRST slot
+# carrying the column - the dropped one, keyed at the old scale. A
+# retrieval now skips a slot on its way out ([IndexOp::retrievable] in
+# crates/wire/src/server.rs), which is the engine's answer on all three.
+both "H1 an index older than the format the row was written under, = 7" \
+    "SELECT ID FROM IW WHERE N = 7 ORDER BY ID;"
+both "H2 an index older than the format the row was written under, = 700" \
+    "SELECT ID FROM IW WHERE N = 700 ORDER BY ID;"
+both "H3 ... and a RANGE probe over the same index, > 0" \
+    "SELECT ID FROM IW WHERE N > 0 ORDER BY ID;"
 # ...while the same table's PROJECTION, DISTINCT and ORDER BY - which do
 # not probe the index - are the engine's, which is this round's fix
 both "H4 the same table projects right" "SELECT ID, N FROM IW ORDER BY ID;"

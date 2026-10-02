@@ -163,9 +163,12 @@ same "concat with a CAST"           "SELECT ID FROM T WHERE S||CAST(A AS VARCHAR
 same "NULL propagates through ||"   "SELECT ID FROM T WHERE S||'x' IS NULL"
 same "concat in AND beside classic" "SELECT ID FROM T WHERE S||'x' LIKE 'a%' AND A > 0 ORDER BY ID"
 
+# DECODE in a WHERE answers now (the built-ins round: the predicate
+# tokenizer hands the call to the expression parser, as it does IIF)
+same "DECODE in WHERE answers now"  "SELECT ID FROM T WHERE DECODE(A, 1, 2) = 2 ORDER BY ID"
+
 # --- refusals that REMAIN ----------------------------------------------
-for bad in "SELECT ID FROM T WHERE DECODE(A, 1, 2) = 2" \
-           "SELECT ID FROM T WHERE A = ? + 1"; do
+for bad in "SELECT ID FROM T WHERE A = ? + 1"; do
     out=$(printf '%s;\n' "$bad" |
           "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
     case "$out" in

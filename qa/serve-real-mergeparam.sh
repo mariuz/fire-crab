@@ -155,8 +155,12 @@ refuses "one compared with the SOURCE's column refuses" \
   "MERGE INTO T tg USING SRC s ON tg.ID = s.K WHEN MATCHED AND s.V > ? THEN DELETE;"
 refuses "one outside a comparison refuses" \
   "MERGE INTO T tg USING SRC s ON tg.ID = s.K WHEN MATCHED AND ? THEN DELETE;"
-refuses "a RETURNING expression naming the SOURCE refuses" \
-  "MERGE INTO T tg USING SRC s ON tg.ID = s.K WHEN MATCHED THEN UPDATE SET N = 1 RETURNING s.V * 2;"
+# a RETURNING expression naming the SOURCE was a boundary here; it
+# answers now, reading the source row (serve-real-returnold.sh)
+mboth "a RETURNING expression naming the SOURCE (was a boundary)" \
+  "MERGE INTO T tg USING SRC s ON tg.ID = s.K WHEN MATCHED THEN UPDATE SET N = 1 RETURNING s.V * 2; ROLLBACK;"
+desc "...described as the engine does" \
+  "MERGE INTO T tg USING SRC s ON tg.ID = s.K WHEN MATCHED THEN UPDATE SET N = 1 RETURNING s.V * 2; ROLLBACK;"
 refuses "ORDER BY on a MERGE still refuses" \
   "MERGE INTO T tg USING SRC s ON tg.ID = s.K WHEN MATCHED THEN DELETE ORDER BY 1;"
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)

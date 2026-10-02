@@ -64,7 +64,7 @@ fail=0
 # compared (see the recorded nit at the end)
 sig() { printf 'set sqlda_display on;\nset list on;\n%s\n' "$2" | "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | grep -aiE '^0[0-9]: sqltype|^[A-Z_][A-Z0-9_]* |SQLSTATE|^-' | sed 's/  */ /g' | tr '\n' '|'; }
 agree() { local e f; e=$(sig "127.0.0.1/3050:$ENG" "$2"); f=$(sig "127.0.0.1/$PORT:$FC" "$2"); if [ "$e" = "$f" ]; then echo "OK   $1"; else echo "FAIL $1"; echo "     eng=[$e]"; echo "     fc =[$f]"; fail=1; fi; }
-refuses_fc() { local f; f=$(sig "127.0.0.1/$PORT:$FC" "$2"); if printf '%s' "$f" | grep -qiE 'SQLSTATE'; then echo "OK   $1 (fc refuses, deferred)"; else echo "FAIL $1 (fc should refuse)"; echo "     fc =[$f]"; fail=1; fi; }
+refuses_fc() { local f e; f=$(sig "127.0.0.1/$PORT:$FC" "$2"); if printf '%s' "$f" | grep -qiE 'SQLSTATE'; then echo "OK   $1 (fc refuses, deferred)"; else e=$(sig "127.0.0.1/3050:$ENG" "$2"); echo "FAIL $1 (fc should refuse)"; echo "     fc =[$f]"; echo "     eng=[$e]"; fail=1; fi; }
 U16="(select d16 a from t union all select d16 from t) q"
 U34="(select d34 a from t union all select d34 from t) q"
 
@@ -136,8 +136,8 @@ agree "derived union distinct"   "select * from (select id a from t union distin
 agree "cte union distinct"       "with q as (select id a from t union distinct select id from u) select count(*), sum(a) from q;"
 agree "union distinct d16"       "select a from (select d16 a from t union distinct select d16 from t) q order by a;"
 echo "-- pre-existing boundaries, NOT derived-specific (the base-table form refuses too): recorded --"
-refuses_fc "decfloat IN subquery"  "select id from t where d16 in (select d16 from t where d16 > 2);"
-refuses_fc "HAVING over decfloat"  "select sum(d16) from t having sum(d16) > 1;"
+agree "decfloat IN subquery (answers since the merged-binary review: a DECFLOAT answer folds back as its decimal128 literal)"  "select id from t where d16 in (select d16 from t where d16 > 2);"
+agree "HAVING over decfloat (answers since the wide-numeric round of 2026-09-26)" "select sum(d16) from t having sum(d16) > 1;"
 echo "-- controls: other types through a derived table unchanged --"
 agree "numeric(9,2) sum"     "select sum(a) from (select cast(id as numeric(9,2)) a from t union all select n from u) q;"
 agree "double sum"           "select sum(a) from (select cast(id as double precision) a from t union all select n from u) q;"

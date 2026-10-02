@@ -34,7 +34,7 @@
 # takes every row; against an EXACT column NaN sorts BELOW everything on
 # a scan - and the INDEXED answer is the opposite (`TI.ID > ?` [NaN] is
 # none where `T.ID > ?` is every row).  A cast the engine converts at
-# absorbs the NaN as 0 and those cells ARE answered.  On the previous
+# absorbs the NaN by the platform's cast and those cells ARE answered.  On the previous
 # binary the DOUBLE-column NaN cells are WRONG ANSWERS, including a
 # wrong DELETE: value_cmp's approx arm does partial_cmp().unwrap_or(Equal),
 # which makes NaN equal to everything.
@@ -42,7 +42,12 @@
 # THE STORE LAW IS A DIFFERENT LAW from the compare: scale to the target,
 # add (0.5 + 1e-14) away from zero, truncate, then range-check - 2.5 -> 3,
 # -2.5 -> -3, 7.245 -> 7.25 into NUMERIC(9,2) and 7.2 into NUMERIC(18,1),
-# NaN -> 0, +-Infinity and an overflow -> 22003.  2147483647.4 fits an
+# NaN -> the C++ cast of the ENGINE's platform (undefined in C++, so the
+# hardware decides): 0 on ARM, where these cells were first measured, and
+# on x86-64 the "integer indefinite" - INT32_MIN for an INTEGER-backed
+# target, INT64_MIN for a BIGINT one, 22003 for a SMALLINT one.  The cells
+# compare against the LIVE engine, so they hold on either; the labels
+# carry the ARM numbers.  +-Infinity and an overflow -> 22003.  2147483647.4 fits an
 # INTEGER and does NOT fit a NUMERIC(9,2).  A runtime INT128 value below
 # 2^53 takes the same eps law (10.075 -> 10.07), where the double LITERAL
 # spelling does not.
@@ -643,7 +648,7 @@ both             "a derived table: X.ID > ? [2.5] (engine 3;9)" "SELECT X.ID FRO
 # `TI.ID > ?` (section 2) both agree, so it is the derived wrap that drops
 # the flag, not this chunk.  Recorded rather than typed shut; the helper
 # FAILS the day the gap closes.
-desc_differs     "a derived table over the INDEXED table - the value agrees, the `?` slot is announced Nullable where the engine says NOT NULL (engine 3;9)" "SELECT X.ID FROM (SELECT ID FROM TI) X WHERE X.ID > ? ORDER BY X.ID" '[2.5]'
+desc_differs     "a derived table over the INDEXED table - the value agrees, the '?' slot is announced Nullable where the engine says NOT NULL (engine 3;9)" "SELECT X.ID FROM (SELECT ID FROM TI) X WHERE X.ID > ? ORDER BY X.ID" '[2.5]'
 eng_only         "a derived table on a WIDE column: X.BI > ? [2.5] (engine 9)" "SELECT X.ID FROM (SELECT ID, BI FROM TI) X WHERE X.BI > ? ORDER BY X.ID" '[2.5]'
 both             "a CTE: WITH Q AS (...) WHERE Q.ID > ? [2.5] (engine 3;9)" "WITH Q AS (SELECT ID FROM T) SELECT Q.ID FROM Q WHERE Q.ID > ? ORDER BY Q.ID" '[2.5]'
 both             "a UNION branch: the second branch carries the ? (engine -3;3;9)" "SELECT ID FROM T WHERE ID < -2 UNION ALL SELECT ID FROM T WHERE ID > ?" '[2.5]'
@@ -690,7 +695,7 @@ dml_rb           "UPDATE W SET N41 = ? [7.245] - NUMERIC(4,1) (engine dml=(none)
 dml_rb           "UPDATE W SET H = ? [2.5] - INT128 (engine dml=(none) rb=1,1,1,1,1.00,1.0,1.0,3,1.00;2,2,2,2,2.00,2.0,2.0,2,2.00)" "UPDATE W SET H = ? WHERE ID = 1" '[2.5]' "SELECT ID, CAST(N AS VARCHAR(40)) VN, CAST(SM AS VARCHAR(40)) VS, CAST(BI AS VARCHAR(40)) VB, CAST(NM AS VARCHAR(40)) VM, CAST(N18 AS VARCHAR(40)) V18, CAST(N41 AS VARCHAR(40)) V41, CAST(H AS VARCHAR(50)) VH, CAST(H2 AS VARCHAR(50)) VH2 FROM W ORDER BY ID"
 dml_rb           "UPDATE W SET H2 = ? [10.075] - INT128 at scale 2: the RUNTIME eps law (engine dml=(none) rb=1,1,1,1,1.00,1.0,1.0,1,10.07;2,2,2,2,2.00,2.0,2.0,2,2.00)" "UPDATE W SET H2 = ? WHERE ID = 1" '[10.075]' "SELECT ID, CAST(N AS VARCHAR(40)) VN, CAST(SM AS VARCHAR(40)) VS, CAST(BI AS VARCHAR(40)) VB, CAST(NM AS VARCHAR(40)) VM, CAST(N18 AS VARCHAR(40)) V18, CAST(N41 AS VARCHAR(40)) V41, CAST(H AS VARCHAR(50)) VH, CAST(H2 AS VARCHAR(50)) VH2 FROM W ORDER BY ID"
 dml_rb           "UPDATE W SET H2 = ? [0.0049999999999999994] (engine dml=(none) rb=1,1,1,1,1.00,1.0,1.0,1,0.01;2,2,2,2,2.00,2.0,2.0,2,2.00)" "UPDATE W SET H2 = ? WHERE ID = 1" '[0.004999999999999999]' "SELECT ID, CAST(N AS VARCHAR(40)) VN, CAST(SM AS VARCHAR(40)) VS, CAST(BI AS VARCHAR(40)) VB, CAST(NM AS VARCHAR(40)) VM, CAST(N18 AS VARCHAR(40)) V18, CAST(N41 AS VARCHAR(40)) V41, CAST(H AS VARCHAR(50)) VH, CAST(H2 AS VARCHAR(50)) VH2 FROM W ORDER BY ID"
-dml_rb           "UPDATE W SET N = ? [NaN] - a NaN store writes 0 (engine dml=(none) rb=1,0,1,1,1.00,1.0,1.0,1,1.00;2,2,2,2,2.00,2.0,2.0,2,2.00)" "UPDATE W SET N = ? WHERE ID = 1" '["#NaN"]' "SELECT ID, CAST(N AS VARCHAR(40)) VN, CAST(SM AS VARCHAR(40)) VS, CAST(BI AS VARCHAR(40)) VB, CAST(NM AS VARCHAR(40)) VM, CAST(N18 AS VARCHAR(40)) V18, CAST(N41 AS VARCHAR(40)) V41, CAST(H AS VARCHAR(50)) VH, CAST(H2 AS VARCHAR(50)) VH2 FROM W ORDER BY ID"
+dml_rb           "UPDATE W SET N = ? [NaN] - a NaN store writes the platform cast (ARM 0, x86 INT32_MIN) (engine dml=(none) rb=1,0,1,1,1.00,1.0,1.0,1,1.00;2,2,2,2,2.00,2.0,2.0,2,2.00)" "UPDATE W SET N = ? WHERE ID = 1" '["#NaN"]' "SELECT ID, CAST(N AS VARCHAR(40)) VN, CAST(SM AS VARCHAR(40)) VS, CAST(BI AS VARCHAR(40)) VB, CAST(NM AS VARCHAR(40)) VM, CAST(N18 AS VARCHAR(40)) V18, CAST(N41 AS VARCHAR(40)) V41, CAST(H AS VARCHAR(50)) VH, CAST(H2 AS VARCHAR(50)) VH2 FROM W ORDER BY ID"
 dml_rb           "UPDATE W SET NM = ? [NaN] (engine dml=(none) rb=1,1,1,1,0.00,1.0,1.0,1,1.00;2,2,2,2,2.00,2.0,2.0,2,2.00)" "UPDATE W SET NM = ? WHERE ID = 1" '["#NaN"]' "SELECT ID, CAST(N AS VARCHAR(40)) VN, CAST(SM AS VARCHAR(40)) VS, CAST(BI AS VARCHAR(40)) VB, CAST(NM AS VARCHAR(40)) VM, CAST(N18 AS VARCHAR(40)) V18, CAST(N41 AS VARCHAR(40)) V41, CAST(H AS VARCHAR(50)) VH, CAST(H2 AS VARCHAR(50)) VH2 FROM W ORDER BY ID"
 dml_rb           "UPDATE W SET BI = ? [NaN] (engine dml=(none) rb=1,1,1,0,1.00,1.0,1.0,1,1.00;2,2,2,2,2.00,2.0,2.0,2,2.00)" "UPDATE W SET BI = ? WHERE ID = 1" '["#NaN"]' "SELECT ID, CAST(N AS VARCHAR(40)) VN, CAST(SM AS VARCHAR(40)) VS, CAST(BI AS VARCHAR(40)) VB, CAST(NM AS VARCHAR(40)) VM, CAST(N18 AS VARCHAR(40)) V18, CAST(N41 AS VARCHAR(40)) V41, CAST(H AS VARCHAR(50)) VH, CAST(H2 AS VARCHAR(50)) VH2 FROM W ORDER BY ID"
 dml_rb           "INSERT INTO W: six exact slots at once [2.5, 2.5, 2.5, 7.245, 7.245, 7.245] (engine dml=(none) rb=1,1,1,1,1.00,1.0,1.0,1,1.00;2,2,2,2,2.00,2.0,2.0,2,2.00;5,3,3,3,7.25,7.2,7.2,NULL,NULL)" "INSERT INTO W (ID, N, SM, BI, NM, N18, N41) VALUES (5, ?, ?, ?, ?, ?, ?)" '[2.5, 2.5, 2.5, 7.245, 7.245, 7.245]' "SELECT ID, CAST(N AS VARCHAR(40)) VN, CAST(SM AS VARCHAR(40)) VS, CAST(BI AS VARCHAR(40)) VB, CAST(NM AS VARCHAR(40)) VM, CAST(N18 AS VARCHAR(40)) V18, CAST(N41 AS VARCHAR(40)) V41, CAST(H AS VARCHAR(50)) VH, CAST(H2 AS VARCHAR(50)) VH2 FROM W ORDER BY ID"
@@ -704,13 +709,13 @@ dml_rb_both_err  "UPDATE W SET N = ? [-Inf] - 22003 (engine dml=ERR Arithmetic e
 dml_rb_both_err  "INSERT INTO W (N) VALUES (?) [+Inf] - 22003 (engine dml=ERR Arithmetic exception, numeric overflow, or string truncation, numeric value is out of range rb=1,1,1,1,1.00,1.0,1.0,1,1.00;2,2,2,2,2.00,2.0,2.)" "INSERT INTO W (ID, N) VALUES (7, ?)" '["#Inf"]' "SELECT ID, CAST(N AS VARCHAR(40)) VN, CAST(SM AS VARCHAR(40)) VS, CAST(BI AS VARCHAR(40)) VB, CAST(NM AS VARCHAR(40)) VM, CAST(N18 AS VARCHAR(40)) V18, CAST(N41 AS VARCHAR(40)) V41, CAST(H AS VARCHAR(50)) VH, CAST(H2 AS VARCHAR(50)) VH2 FROM W ORDER BY ID"
 dml_rb           "EXECUTE PROCEDURE P3(?, ?) [2.5, 7.245] - the argument conversion on the EXECUTE path (engine dml=(none) rb=1,1,1,1,1.00,1.0,1.0,1,1.00;2,2,2,2,2.00,2.0,2.0,2,2.00;8,3,NULL,NULL,7.25,NULL,NULL,NULL,NULL)" "EXECUTE PROCEDURE P3(?, ?)" '[2.5, 7.245]' "SELECT ID, CAST(N AS VARCHAR(40)) VN, CAST(SM AS VARCHAR(40)) VS, CAST(BI AS VARCHAR(40)) VB, CAST(NM AS VARCHAR(40)) VM, CAST(N18 AS VARCHAR(40)) V18, CAST(N41 AS VARCHAR(40)) V41, CAST(H AS VARCHAR(50)) VH, CAST(H2 AS VARCHAR(50)) VH2 FROM W ORDER BY ID"
 dml_rb           "EXECUTE PROCEDURE P3(?, ?) [-2.5, 7.255] (engine dml=(none) rb=1,1,1,1,1.00,1.0,1.0,1,1.00;2,2,2,2,2.00,2.0,2.0,2,2.00;8,-3,NULL,NULL,7.26,NULL,NULL,NULL,NULL)" "EXECUTE PROCEDURE P3(?, ?)" '[-2.5, 7.255]' "SELECT ID, CAST(N AS VARCHAR(40)) VN, CAST(SM AS VARCHAR(40)) VS, CAST(BI AS VARCHAR(40)) VB, CAST(NM AS VARCHAR(40)) VM, CAST(N18 AS VARCHAR(40)) V18, CAST(N41 AS VARCHAR(40)) V41, CAST(H AS VARCHAR(50)) VH, CAST(H2 AS VARCHAR(50)) VH2 FROM W ORDER BY ID"
-dml_rb           "EXECUTE PROCEDURE P3(?, ?) [NaN, NaN] - a NaN argument stores 0 (engine dml=(none) rb=1,1,1,1,1.00,1.0,1.0,1,1.00;2,2,2,2,2.00,2.0,2.0,2,2.00;8,0,NULL,NULL,0.00,NULL,NULL,NULL,NULL)" "EXECUTE PROCEDURE P3(?, ?)" '["#NaN", "#NaN"]' "SELECT ID, CAST(N AS VARCHAR(40)) VN, CAST(SM AS VARCHAR(40)) VS, CAST(BI AS VARCHAR(40)) VB, CAST(NM AS VARCHAR(40)) VM, CAST(N18 AS VARCHAR(40)) V18, CAST(N41 AS VARCHAR(40)) V41, CAST(H AS VARCHAR(50)) VH, CAST(H2 AS VARCHAR(50)) VH2 FROM W ORDER BY ID"
+dml_rb           "EXECUTE PROCEDURE P3(?, ?) [NaN, NaN] - a NaN argument stores the platform cast (engine dml=(none) rb=1,1,1,1,1.00,1.0,1.0,1,1.00;2,2,2,2,2.00,2.0,2.0,2,2.00;8,0,NULL,NULL,0.00,NULL,NULL,NULL,NULL)" "EXECUTE PROCEDURE P3(?, ?)" '["#NaN", "#NaN"]' "SELECT ID, CAST(N AS VARCHAR(40)) VN, CAST(SM AS VARCHAR(40)) VS, CAST(BI AS VARCHAR(40)) VB, CAST(NM AS VARCHAR(40)) VM, CAST(N18 AS VARCHAR(40)) V18, CAST(N41 AS VARCHAR(40)) V41, CAST(H AS VARCHAR(50)) VH, CAST(H2 AS VARCHAR(50)) VH2 FROM W ORDER BY ID"
 both             "a selectable procedure: SELECT FROM P1(?, ?) [2.5, 7.245] (engine 3,7.25)" "SELECT RA, RB FROM P1(?, ?)" '[2.5, 7.245]'
 both             "SELECT FROM P1(?, ?) [2.4, 7.255] (engine 2,7.26)" "SELECT RA, RB FROM P1(?, ?)" '[2.4, 7.255]'
 both             "SELECT FROM P1(?, ?) [-2.5, -7.245] (engine -3,-7.25)" "SELECT RA, RB FROM P1(?, ?)" '[-2.5, -7.245]'
 both             "SELECT FROM P1(?, 1) [2147483647.4] - INTEGER takes it (engine 2147483647,1)" "SELECT RA, RB FROM P1(?, 1)" '[2147483647.4]'
 both             "SELECT FROM P2(?, ?) [2.5, 2.5] - BIGINT and SMALLINT inputs (engine 3,3)" "SELECT RA, RB FROM P2(?, ?)" '[2.5, 2.5]'
-both             "a procedure argument [NaN, NaN] converts to 0 (engine 0,0)" "SELECT RA, RB FROM P1(?, ?)" '["#NaN", "#NaN"]'
+both             "a procedure argument [NaN, NaN] converts by the platform cast (ARM engine 0,0)" "SELECT RA, RB FROM P1(?, ?)" '["#NaN", "#NaN"]'
 both             "WHERE over a procedure's output: RA < ? [3.5] (engine 3)" "SELECT RA FROM P1(3, 1) WHERE RA < ?" '[3.5]'
 both_err         "P1(1, ?) [2147483647.4] - 22003 out of range for NUMERIC(9,2) (engine ERR Arithmetic exception, numeric overflow, or string trunca)" "SELECT RA, RB FROM P1(1, ?)" '[2147483647.4]'
 both_err         "P1(?, 1) [+Inf] - 22003 (engine ERR Arithmetic exception, numeric overflow, or string trunca)" "SELECT RA, RB FROM P1(?, 1)" '["#Inf"]'
@@ -747,7 +752,7 @@ eng_only         "BI > ? [NaN] (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE BI
 eng_only         "TI.ID > ? [NaN] - the LONG index answers the OTHER WAY from the scan (engine (none))" "SELECT ID FROM TI WHERE ID > ? ORDER BY ID" '["#NaN"]'
 eng_only         "ID + 0 > ? [NaN] (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE ID + 0 > ? ORDER BY ID" '["#NaN"]'
 eng_only         "HAVING SUM(ID) > ? [NaN] (engine 12)" "SELECT SUM(ID) X FROM T HAVING SUM(ID) > ?" '["#NaN"]'
-both             "ID > CAST(? AS INTEGER) [NaN] - a written cast ABSORBS the NaN as 0 (engine 1;2;3;9)" "SELECT ID FROM T WHERE ID > CAST(? AS INTEGER) ORDER BY ID" '["#NaN"]'
+both             "ID > CAST(? AS INTEGER) [NaN] - a written cast ABSORBS the NaN, by the platform cast (ARM engine 1;2;3;9, x86 every row)" "SELECT ID FROM T WHERE ID > CAST(? AS INTEGER) ORDER BY ID" '["#NaN"]'
 both             "ID = CAST(? AS INTEGER) [NaN] (engine 0)" "SELECT ID FROM T WHERE ID = CAST(? AS INTEGER) ORDER BY ID" '["#NaN"]'
 both             "ID > ? + 0 [NaN] - an operand rung absorbs it (engine 1;2;3;9)" "SELECT ID FROM T WHERE ID > ? + 0 ORDER BY ID" '["#NaN"]'
 dml_rb           "DELETE FROM U WHERE D < ? [NaN] - a WRONG DELETE on the previous binary (engine dml=(none) rb=(none))" "DELETE FROM U WHERE D < ?" '["#NaN"]' "SELECT ID, N, NM FROM U ORDER BY ID"
@@ -970,7 +975,7 @@ dml_rb           "12 CONTROL MERGE INTO MBI ON T.NM > ? [2.495] - NUMERIC(9,2), 
 dml_rb           "12 CONTROL MERGE INTO MBI SET NM = ? [7.245] - the STORE arm keeps its own law, eps and all (engine dml=(none) rb=1,1.00;2,7.25;3,2.49)" "MERGE INTO MBI T USING (SELECT 1 AS X FROM RDB\$DATABASE) S ON T.ID = ? WHEN MATCHED THEN UPDATE SET NM = ?" '[2, 7.245]' "SELECT ID AS A, CAST(NM AS VARCHAR(20)) AS B FROM MBI ORDER BY ID"
 dml_rb           "12 CONTROL MERGE INTO MBH WHEN NOT MATCHED THEN INSERT .. VALUES (?) [7.245] - the INSERT arm is a VALUE position, not a condition (engine dml=(none) rb=1,1.00;2,2.50;3,2.49;99,7.25)" "MERGE INTO MBH T USING (SELECT 99 AS X FROM RDB\$DATABASE) S ON T.ID = S.X WHEN NOT MATCHED THEN INSERT (ID, N, NM) VALUES (99, 5, ?)" '[7.245]' "SELECT ID AS A, CAST(NM AS VARCHAR(20)) AS B FROM MBH ORDER BY ID"
 
-echo "-- 13. A NUMERIC FUNCTION\'S `?` IS A DOUBLE SLOT, NOT THE DESTINATION\'S --"
+echo "-- 13. A NUMERIC FUNCTION'S '?' IS A DOUBLE SLOT, NOT THE DESTINATION'S --"
 # Measured on the engine's own input SQLDA 2026-09-20: the `?` argument
 # of ABS, SIGN, ROUND, ROUND(?,n), TRUNC, TRUNC(?,n), FLOOR, CEIL and
 # CEILING is announced `sqltype 480 DOUBLE len 8` - THE DESTINATION PLAYS

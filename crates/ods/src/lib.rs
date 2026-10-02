@@ -32,6 +32,7 @@ pub mod coll;
 pub mod data;
 pub mod ddl;
 pub mod decfloat;
+pub mod decmath;
 pub mod dml;
 pub mod expr;
 pub mod format;
@@ -199,6 +200,17 @@ pub enum DdlDeferred {
     /// (dfw create_procedure / get_trigger_dependencies / the view's
     /// RDB$VIEW_BLR in MET_scan_relation) and stores what it met
     StoreDependencies { kind: i64, name: String },
+    /// a DROP (or the drop half of a RECREATE) of an exception (7) or a
+    /// sequence (14): whether anything still uses it is the COMMIT's
+    /// question, not the statement's - dfw.epp `check_dependencies` runs
+    /// in the deferred work. Measured on 2182 under AUTODDL OFF: `DROP
+    /// EXCEPTION EX1` with a procedure raising it passes, `COMMIT` then
+    /// fails "cannot delete / EXCEPTION @1 / there are 1 dependencies"
+    /// and leaves the transaction ACTIVE (EX1 still invisible to it),
+    /// and a `DROP PROCEDURE` of the user before that commit lets it
+    /// pass. Not work: the server asks [crate::ddl::refused_drop] before
+    /// a commit and [crate::dml::apply_ddl_deferred] skips it.
+    CheckDependents { name: String, on_type: i64 },
 }
 
 impl Image {

@@ -114,8 +114,52 @@ agrees "2000 chained +"   "SELECT $(chain x '+' 2000 '1') AS X FROM RDB\$DATABAS
 agrees "400 nested parens" "SELECT $(python3 -c "print('('*400 + '1' + ')'*400)") AS X FROM RDB\$DATABASE"
 agrees "an ordinary expression (control)" "SELECT ID + 1, S || 'x' FROM T ORDER BY ID"
 
+agrees "390 nested UPPER"  "SELECT CHAR_LENGTH($(python3 -c "print('UPPER('*390 + \"'a'\" + ')'*390)")) AS X FROM RDB\$DATABASE"
+agrees "390 nested TRIM || 'b'" "SELECT CHAR_LENGTH($(python3 -c "print('TRIM('*390 + \"'a'\" + \" || 'b')\"*390)")) AS X FROM RDB\$DATABASE"
+agrees "60 nested UPPER(DECODE(...))" "SELECT CHAR_LENGTH($(python3 -c "print('UPPER(DECODE(1, 1, '*60 + \"'a'\" + \", 'b'))\"*60)")) AS X FROM RDB\$DATABASE"
+agrees "20 concatenated mixed-set DECODEs" "SELECT CHAR_LENGTH($(chain x ' || ' 20 "DECODE(ID, 1, CAST(S AS VARCHAR(10) CHARACTER SET WIN1252), 'x')")) AS X FROM T WHERE ID = 1"
+
+echo "--- 3. and in BOUNDED TIME ------------------------------------------"
+# A 2000-deep || took 90 s to PREPARE: every level of resolution asked
+# the text form of both operands, and the text form probed `type_of` - a
+# full subtree walk - at every node, so the chain was cubic.  It is about
+# half a second now.  The bound is loose on purpose (this gate runs in a
+# parallel sweep on a loaded box); a return of the cubic blows past it.
+fast() { # <label> <seconds> <sql>
+    ran=$((ran + 1))
+    printf 'SET HEADING OFF;\n%s;\n' "$3" > "$Q"
+    local t0 t1 r
+    t0=$(date +%s.%N)
+    r=$(timeout 120 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$Q" 2>&1 | tr -s ' \n' ' ')
+    t1=$(date +%s.%N)
+    local el; el=$(echo "$t1 - $t0" | bc)
+    if [ "$(echo "$el > $2" | bc)" = 1 ]; then echo "DIFF $1 took ${el}s (bound $2 s) [$r]"; fail=1
+    else echo "OK   $1 in $(printf '%.2f' "$el")s (bound $2 s) [$(printf '%.30s' "$r")]"; fi
+}
+fast "2000 chained ||"   15 "SELECT OCTET_LENGTH($(chain x '||' 2000 "'a'")) AS X FROM RDB\$DATABASE"
+fast "2500 chained ||"   30 "SELECT OCTET_LENGTH($(chain x '||' 2500 "'a'")) AS X FROM RDB\$DATABASE"
+fast "2000 chained || over a column" 15 "SELECT OCTET_LENGTH($(chain x '||' 2000 'S')) AS X FROM T WHERE ID = 1"
+fast "390 nested UPPER"  15 "SELECT CHAR_LENGTH($(python3 -c "print('UPPER('*390 + \"'a'\" + ')'*390)")) AS X FROM RDB\$DATABASE"
+# ...and so did 390 nested `TRIM(... || 'b')` once the run-time set
+# was modelled (2026-09-26): the set a string function's value is in
+# descended its operands, asking the whole text form at every step, and
+# a TRIM's temporal probe walked its operand at every level - over 90 s,
+# where the engine answers at once. And a function over a simple CASE
+# distributes into its branches: a draft that resolved each branch twice
+# to read its set, at every level, took 31 s over 22 nested
+# `UPPER(DECODE(...))`.
+fast "390 nested TRIM || 'b'" 15 "SELECT CHAR_LENGTH($(python3 -c "print('TRIM('*390 + \"'a'\" + \" || 'b')\"*390)")) AS X FROM RDB\$DATABASE"
+fast "60 nested UPPER(DECODE(...))" 15 "SELECT CHAR_LENGTH($(python3 -c "print('UPPER(DECODE(1, 1, '*60 + \"'a'\" + \", 'b'))\"*60)")) AS X FROM RDB\$DATABASE"
+# A function over a simple CASE whose branches are in different sets is
+# distributed into the branches, and `||` over either side: that copies
+# the other side into every branch, so n concatenated DECODEs resolved
+# about 2^n branches - 16 took 35 s to prepare, 18 ran past 100 s and
+# left the server at 3.9 GB (2026-09-26). Past four such CASEs under one
+# `||` the chain keeps the negotiated set.
+fast "20 concatenated mixed-set DECODEs" 15 "SELECT CHAR_LENGTH($(chain x ' || ' 20 "DECODE(ID, 1, CAST(S AS VARCHAR(10) CHARACTER SET WIN1252), 'x')")) AS X FROM T WHERE ID = 1"
+
 echo "----------------------------------------------------------------------"
 echo "ran $ran checks"
-[ "$ran" -ge 17 ] || { echo "FAIL only $ran checks ran"; fail=1; }
+[ "$ran" -ge 28 ] || { echo "FAIL only $ran checks ran"; fail=1; }
 [ $fail -eq 0 ] && echo "PASS $ran checks" || echo "FAIL"
 exit $fail
