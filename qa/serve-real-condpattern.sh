@@ -348,7 +348,7 @@ echo "--- 7 RECORDED BOUNDARIES - other routers, other shapes (each fails loudly
 eng_only "7 IIF(? LIKE ?) - a bound TESTED side"                     "$W IIF(? LIKE ?,1,0)=1 ORDER BY ID" '["ab","a%"]'
 eng_only "7 IIF(V LIKE ? || '%') - a ? inside a pattern EXPRESSION"  "$W IIF(V LIKE ? || '%',1,0)=1 ORDER BY ID" '["1"]'
 eng_only "7 a scalar subquery's IIF over an outer column"            "SELECT ID, (SELECT IIF(T.V LIKE ?,1,0) FROM RDB\$DATABASE) FROM T ORDER BY ID" '["1%"]'
-eng_only "7 a GROUP BY projection's IIF(V LIKE ?)"                   "SELECT ID, IIF(V LIKE ?,1,0) FROM T GROUP BY ID, V ORDER BY ID" '["1%"]'
+both     "7 a GROUP BY projection's IIF(V LIKE ?) - promoted with inselcond section 5"                   "SELECT ID, IIF(V LIKE ?,1,0) FROM T GROUP BY ID, V ORDER BY ID" '["1%"]'
 eng_only "7 EXISTS(.. WHERE T2.N382 LIKE ?) - a subquery's predicate over a non-text operand" "$W EXISTS(SELECT 1 FROM T T2 WHERE T2.N382 LIKE ?) ORDER BY ID" '["1%"]'
 eng_only "7 V LIKE ? ESCAPE ? - a bound escape"                      "$W V LIKE ? ESCAPE ? ORDER BY ID" '["1%","!"]'
 # INSERT .. SELECT typed NO `?` in a select-list condition at all - not

@@ -331,6 +331,38 @@ dml_refused "4 LPAD(.., ?, '*') - a function ARGUMENT ?"                   "SELE
 dml_refused "4 UPPER(IIF(ID > ?)) .. WHERE ID > ? - K1's numeric mix"      "SELECT ID, UPPER($X) FROM T WHERE ID > ? ORDER BY ID" '[1,1]'
 
 # ---------------------------------------------------------------
+echo "--- 5 a GROUPED projection: a condition ? over the keys, and an aggregate slot's nullability"
+# `SELECT ID, IIF(ID > ?, 'y', 'n') FROM T GROUP BY ID` refused - an
+# expression over the grouping keys carrying ANY `?` was a boundary - while
+# the same over an AGGREGATE answered.  A condition-only `?` now takes the
+# deferred path, resolved through the sink over the key slots.  And a `?`
+# compared with COUNT / VAR / STDDEV / a statistical fold is NOT NULL on
+# the engine: the group row's view now carries the describe rule
+# (agg_described_not_null), shared with the output describe.
+G="FROM T GROUP BY"
+both "5 IIF(V LIKE ?) .. GROUP BY ID, V"        "SELECT ID, IIF(V LIKE ?, 1, 0) $G ID, V ORDER BY ID" '["1%"]'
+both "5 IIF(ID > ?) .. GROUP BY ID"             "SELECT ID, IIF(ID > ?, 'y', 'n') $G ID ORDER BY ID" '[1]'
+both "5 IIF(V = ?) .. GROUP BY V"               "SELECT V, IIF(V = ?, 'y', 'n') $G V ORDER BY V" '["10.00"]'
+both "5 IIF(V LIKE ?), COUNT(*) .. ORDER BY 1"  "SELECT IIF(V LIKE ?, 1, 0), COUNT(*) $G V ORDER BY 1" '["1%"]'
+both "5 CASE WHEN V LIKE ? .. GROUP BY ID, V"   "SELECT ID, CASE WHEN V LIKE ? THEN 'a' ELSE 'b' END $G ID, V ORDER BY ID" '["1%"]'
+both "5 UPPER(IIF(ID > ?)) .. GROUP BY ID"      "SELECT ID, UPPER(IIF(ID > ?, 'big', 's')) $G ID ORDER BY ID" '[1]'
+both "5 .. HAVING COUNT(*) > 0"                 "SELECT ID, IIF(ID > ?, 'y', 'n') $G ID HAVING COUNT(*) > 0 ORDER BY ID" '[1]'
+both "5 .. beside COUNT(*), ORDER BY 2, 1"      "SELECT ID, IIF(ID > ?, 'y', 'n'), COUNT(*) $G ID ORDER BY 2, 1" '[1]'
+both "5 .. ROWS 2"                              "SELECT ID, IIF(ID > ?, 'y', 'n') $G ID ORDER BY ID ROWS 2" '[1]'
+both "5 FIRST 1 .. DESC"                        "SELECT FIRST 1 ID, IIF(ID > ?, 'y', 'n') $G ID ORDER BY ID DESC" '[1]'
+both "5 over a JOIN, GROUP BY T.ID, U.TAG"      "SELECT T.ID, IIF(U.TAG LIKE ?, 1, 0) FROM T JOIN U ON U.ID = T.ID GROUP BY T.ID, U.TAG ORDER BY 1" '["b"]'
+both "5 IIF(V LIKE ?) .. WHERE ID > ? - a pattern slot beside a classic one" "SELECT ID, IIF(V LIKE ?, 'y', 'n') FROM T WHERE ID > ? GROUP BY ID, V ORDER BY ID" '["1%",1]'
+for a in "COUNT(*)" "COUNT(ID)" "COUNT(DISTINCT ID)" "VAR_POP(ID)" "STDDEV_SAMP(ID)" "COVAR_SAMP(ID, SM)" "REGR_COUNT(ID, SM)" "SUM(ID)" "MIN(ID)" "AVG(ID)" "COUNT(*) + 1"; do
+    both "5 IIF($a > ?) - the slot's nullability" "SELECT V, IIF($a > ?, 'y', 'n') $G V ORDER BY V" '[0]'
+done
+both "5 IIF(COUNT(*) > ?) with no GROUP BY"       "SELECT IIF(COUNT(*) > ?, 'many', 'one') FROM T" '[2]'
+both "5 CASE WHEN COUNT(*) > ? .. END"            "SELECT V, CASE WHEN COUNT(*) > ? THEN 1 END $G V ORDER BY V" '[0]'
+both "5 HAVING IIF(COUNT(*) > ?, 1, 0) = 1"       "SELECT V $G V HAVING IIF(COUNT(*) > ?, 1, 0) = 1 ORDER BY V" '[0]'
+# RECORDED
+dml_refused "5 IIF(ID > ?) .. WHERE V LIKE ? - K1: a classic text pattern beside a numeric condition slot" "SELECT ID, IIF(ID > ?, 'y', 'n') FROM T WHERE V LIKE ? GROUP BY ID ORDER BY ID" '[1,"1%"]'
+dml_refused "5 IIF(ID > ?, ?, 'n') .. GROUP BY ID - a BRANCH ?" "SELECT ID, IIF(ID > ?, ?, 'n') $G ID ORDER BY ID" '[1,"q"]'
+
+# ---------------------------------------------------------------
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-inselcond-$PORT.log"; then
@@ -340,6 +372,6 @@ elif ! kill -0 $srv 2>/dev/null; then
 else echo "OK   no panic and the server is still up"; fi
 
 echo "ran $ran checks"
-# the floor is the MEASURED count: 73 on the 2026-10-02 binary, 73 OK
-if [ "$ran" -lt 73 ]; then echo "FAIL only $ran checks ran (floor 73) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 101 on the 2026-10-02 binary, 101 OK
+if [ "$ran" -lt 101 ]; then echo "FAIL only $ran checks ran (floor 101) - cells went missing"; fail=1; fi
 exit $fail

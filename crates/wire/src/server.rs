@@ -67233,6 +67233,16 @@ fn synth_group_view(
             flags: 0,
             offset: 0,
         });
+        // a COUNT / VAR / STDDEV / statistical slot is described NOT NULL
+        // ([agg_described_not_null]), and a `?` typed from it reads that:
+        // `IIF(COUNT(*) > ?, ..)` and `IIF(STDDEV_SAMP(ID) > ?, ..)`
+        // announce their slots NOT NULL on the engine, where this view's
+        // descriptor carried no flag and the slot went out Nullable
+        // (measured 2026-10-02)
+        let mut d = d;
+        if matches!(gi, GItem::Agg(f, ..) if agg_described_not_null(f)) {
+            d.flags |= PARAM_NOT_NULL;
+        }
         if synth_descs.len() <= slot {
             synth_descs.resize(slot + 1, d.clone());
         }
@@ -67301,16 +67311,19 @@ fn raw_has_agg(e: &RawExpr) -> bool {
 /// a column, a parameter or an ELSE-less CASE keeps it nullable, and
 /// NULLIF can always answer NULL. Conditions do not count (measured:
 /// CASE WHEN VAR_POP(N) > 1 THEN 'hi' ELSE 'lo' END is not-nullable).
+/// The aggregates the engine describes NOT NULL: COUNT, the variance /
+/// standard-deviation family and the two-argument statistical folds. Read
+/// by the output describe ([raw_described_not_null]) AND by the group
+/// row's synthetic view ([synth_group_view]), whose slots type a `?`
+/// compared with them - one list, so the two cannot drift.
+fn agg_described_not_null(f: &AggFn) -> bool {
+    matches!(f, AggFn::Count | AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp)
+        || f.is_statistical2()
+}
+
 fn raw_described_not_null(e: &RawExpr) -> bool {
     match e {
-        RawExpr::Agg(f, _) => matches!(
-            f,
-            AggFn::Count
-                | AggFn::VarPop
-                | AggFn::VarSamp
-                | AggFn::StddevPop
-                | AggFn::StddevSamp
-        ) || f.is_statistical2(),
+        RawExpr::Agg(f, _) => agg_described_not_null(f),
         RawExpr::Int(_)
         | RawExpr::Int128(_)
         | RawExpr::Dec(..)
@@ -67656,12 +67669,20 @@ fn build_group_items(
                         cols.push(pc);
                         gitems.push(GItem::Const(Value::Null));
                         slot_descs.push(None);
-                    } else if param {
-                        // a `?` mixed into a column expression
-                        // (V + CAST(? AS INT)) is functionally valid on the
-                        // engine but a boundary here
+                    } else if param && !raw_value_param_free(raw) {
+                        // a `?` mixed into a column expression at a VALUE
+                        // position (V + CAST(? AS INT)) is functionally
+                        // valid on the engine but a boundary here
                         return None;
                     } else {
+                        // ...while one whose every `?` sits in a CONDITION
+                        // (`IIF(ID > ?, 'y', 'n')`, `CASE WHEN V LIKE ? ..`
+                        // with GROUP BY ID, V) is deferred like any other
+                        // expression over the keys: the second pass resolves
+                        // it through the sink router over the key slots, and
+                        // the execute binds the group plan's columns
+                        // (measured 2026-10-02 - every shape refused here,
+                        // the engine answers them all)
                         // an expression over the grouping columns: defer it,
                         // typed and evaluated over the key slots below
                         deferred.push((out_idx, raw.clone(), name.clone()));
