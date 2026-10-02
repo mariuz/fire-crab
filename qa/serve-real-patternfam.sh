@@ -360,7 +360,7 @@ both      "10 CASE WHEN V LIKE ? .." "SELECT ID FROM T WHERE CASE WHEN V LIKE ? 
 both      "10 IIF(DP LIKE ?,..)"     "SELECT ID FROM T WHERE IIF(DP LIKE ?,1,0) = 1 ORDER BY ID" '["1%"]'
 both      "10 IIF(V STARTING WITH ?,..)" "SELECT ID FROM T WHERE IIF(V STARTING WITH ?,1,0) = 1 ORDER BY ID" '["1"]'
 both      "10 IIF(V CONTAINING ?,..)"    "SELECT ID FROM T WHERE IIF(V CONTAINING ?,1,0) = 1 ORDER BY ID" '["1"]'
-eng_only  "10 EXISTS(.. WHERE T2.N382 LIKE ?) - a subquery's WHERE over a non-text operand" "SELECT ID FROM T WHERE EXISTS(SELECT 1 FROM T T2 WHERE T2.N382 LIKE ?) ORDER BY ID" '["1%"]'
+both      "10 EXISTS(.. WHERE T2.N382 LIKE ?) - promoted with serve-real-condpattern.sh section 10" "SELECT ID FROM T WHERE EXISTS(SELECT 1 FROM T T2 WHERE T2.N382 LIKE ?) ORDER BY ID" '["1%"]'
 eng_only  "10 V LIKE ? ESCAPE ? - a BOUND escape character has no slot here" "SELECT ID FROM T WHERE V LIKE ? ESCAPE ? ORDER BY ID" '["1%","!"]'
 eng_only  "10 B SIMILAR TO ? - SIMILAR TO has no bound-pattern arm at all" "SELECT ID FROM T WHERE B SIMILAR TO ? ORDER BY ID" '["T%"]'
 # SIMILAR TO over a TEMPORAL raises whatever the pattern is - 22018 when

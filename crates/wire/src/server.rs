@@ -79299,9 +79299,15 @@ fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
             if !prm.is_empty() =>
         {
             let cmp_sides = corr_cmp_side_slots(text);
+            let patterns = corr_pattern_slots(text);
             let t = subst_prm_markers(text, &|slot| {
                 let d = prm.iter().find(|(s, _)| *s == slot).map(|(_, d)| d)?;
                 let arg = args.get(slot)?;
+                if patterns.contains(&slot) {
+                    if let Some(spelled) = corr_bound_pattern_spelling(arg, d) {
+                        return spelled;
+                    }
+                }
                 // a TEXT bound into a numeric WHOLE COMPARISON SIDE of the
                 // body reads by the compare grammar, as the outer
                 // whole-side rung does ([corr_text_cmp_literal])
@@ -106861,6 +106867,84 @@ fn corr_cmp_side_slots(text: &str) -> Vec<usize> {
         from = end;
     }
     out
+}
+
+/// The statement slots of every `FC$PRM<slot>` marker in a subquery text
+/// that is a PATTERN - the operand of LIKE, STARTING [WITH], CONTAINING or
+/// SIMILAR TO (never an ESCAPE) - read off the masked text.
+fn corr_pattern_slots(text: &str) -> Vec<usize> {
+    let masked = mask_literals(text).to_ascii_uppercase();
+    let b = masked.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(p) = masked[from..].find("FC$PRM") {
+        let at = from + p;
+        let mut end = at + 6;
+        while end < b.len() && b[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end > at + 6 {
+            // the word before the marker
+            let mut w_end = at;
+            while w_end > 0 && b[w_end - 1].is_ascii_whitespace() {
+                w_end -= 1;
+            }
+            let mut w = w_end;
+            while w > 0 && (b[w - 1].is_ascii_alphanumeric() || b[w - 1] == b'_') {
+                w -= 1;
+            }
+            let word = &masked[w..w_end];
+            let pattern = match word {
+                "LIKE" | "CONTAINING" | "STARTING" => true,
+                // STARTING WITH / SIMILAR TO: the word before that
+                "WITH" | "TO" => {
+                    let mut e = w;
+                    while e > 0 && b[e - 1].is_ascii_whitespace() {
+                        e -= 1;
+                    }
+                    let mut v = e;
+                    while v > 0 && b[v - 1].is_ascii_alphanumeric() {
+                        v -= 1;
+                    }
+                    matches!((word, &masked[v..e]), ("WITH", "STARTING") | ("TO", "SIMILAR"))
+                }
+                _ => false,
+            };
+            if pattern {
+                if let Ok(idx) = masked[at + 6..end].parse::<usize>() {
+                    out.push(idx);
+                }
+            }
+        }
+        from = end;
+    }
+    out
+}
+
+/// A BOUND PATTERN over a NON-TEXT operand, spelled into a subquery body:
+/// as a CAST - an EXPRESSION pattern - never as a literal. A literal
+/// pattern CONVERTS against a numeric, approximate or temporal operand
+/// (`N382 LIKE '1%'` raises 22018) where a bound one never does (`N382
+/// LIKE ?` ['1%'] takes every row), and the expression pattern is the
+/// bound law - measured 2026-10-02: `EXISTS(SELECT 1 FROM T T2 WHERE ..
+/// T2.N382 LIKE ?)` raised a conversion error at execute here, while
+/// `.. LIKE CAST('1%' AS VARCHAR(30))` answers the engine's bound rows. The
+/// slot says which operand it was: the synthesized non-text slot is the
+/// fixed 30 in the attachment's set ([num_pat_desc], [bound_pattern_desc]);
+/// a text operand's slot is its own and keeps the literal spelling (its
+/// literal is not converted, and a collated column canonicalises it).
+fn corr_bound_pattern_spelling(arg: &WireParam, d: &Descriptor) -> Option<Option<String>> {
+    if !(d.dtype == dtype::VARYING && d.length == NUM_LIKE_PATTERN_LEN && d.sub_type == ATT_SUBTYPE as i16) {
+        return None;
+    }
+    let text = match arg {
+        WireParam::Null => return Some(Some("CAST(NULL AS VARCHAR(1))".to_string())),
+        WireParam::Text(s) | WireParam::TextCs(s, _) => s.clone(),
+        WireParam::Int(v, 0) => v.to_string(),
+        _ => return Some(None),
+    };
+    let n = text.chars().count().max(1);
+    Some(Some(format!("CAST('{}' AS VARCHAR({}))", text.replace('\'', "''"), n)))
 }
 
 /// A subquery slot the compare grammar applies to: an exact or an

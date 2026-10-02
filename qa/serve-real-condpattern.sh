@@ -349,7 +349,7 @@ eng_only "7 IIF(? LIKE ?) - a bound TESTED side"                     "$W IIF(? L
 eng_only "7 IIF(V LIKE ? || '%') - a ? inside a pattern EXPRESSION"  "$W IIF(V LIKE ? || '%',1,0)=1 ORDER BY ID" '["1"]'
 eng_only "7 a scalar subquery's IIF over an outer column"            "SELECT ID, (SELECT IIF(T.V LIKE ?,1,0) FROM RDB\$DATABASE) FROM T ORDER BY ID" '["1%"]'
 both     "7 a GROUP BY projection's IIF(V LIKE ?) - promoted with inselcond section 5"                   "SELECT ID, IIF(V LIKE ?,1,0) FROM T GROUP BY ID, V ORDER BY ID" '["1%"]'
-eng_only "7 EXISTS(.. WHERE T2.N382 LIKE ?) - a subquery's predicate over a non-text operand" "$W EXISTS(SELECT 1 FROM T T2 WHERE T2.N382 LIKE ?) ORDER BY ID" '["1%"]'
+both     "7 EXISTS(.. WHERE T2.N382 LIKE ?) - promoted with section 10" "$W EXISTS(SELECT 1 FROM T T2 WHERE T2.N382 LIKE ?) ORDER BY ID" '["1%"]'
 eng_only "7 V LIKE ? ESCAPE ? - a bound escape"                      "$W V LIKE ? ESCAPE ? ORDER BY ID" '["1%","!"]'
 # INSERT .. SELECT typed NO `?` in a select-list condition at all - not
 # even `IIF(V = ?, ..)`; recorded here, these two cells SELF-EXPIRED the
@@ -439,6 +439,37 @@ eng_err_refused() { ran=$((ran + 1)); local ev fv; ev=$(qmsg "$REAL" "$ENG" "$2"
 eng_err_refused "9 IIF(ID > ?, DT, ..) LIKE '2%' - the BOUND condition refuses" "$W IIF(ID > ?, DT, DATE '2000-01-01') LIKE '2%'" '[1]' 'Conversion error from string "2%"'
 
 # ---------------------------------------------------------------
+echo "--- 10 a BOUND pattern over a non-text operand INSIDE A SUBQUERY BODY"
+# A subquery's `?` is spelled back into its body as a SQL literal at bind -
+# and a LITERAL pattern CONVERTS against a numeric / temporal operand
+# (`T2.N382 LIKE '1%'` raises 22018) where a BOUND one never does.  So
+# `EXISTS(.. T2.N382 LIKE ?)` prepared and raised at execute.  The
+# synthesized non-text pattern slot is now spelled as a CAST - an
+# expression pattern, the bound law - and a text operand keeps its literal.
+E="$W EXISTS(SELECT 1 FROM T T2 WHERE T2.ID = T.ID AND"
+both "10 EXISTS(.. T2.N382 LIKE ?) - uncorrelated" "$W EXISTS(SELECT 1 FROM T T2 WHERE T2.N382 LIKE ?) ORDER BY ID" '["1%"]'
+both "10 EXISTS(.. T2.N382 LIKE ?)"         "$E T2.N382 LIKE ?) ORDER BY ID" '["1%"]'
+both "10 EXISTS(.. T2.DT LIKE ?) ['2%']"    "$E T2.DT LIKE ?) ORDER BY ID" '["2%"]'
+both "10 EXISTS(.. T2.TS LIKE ?)"           "$E T2.TS LIKE ?) ORDER BY ID" '["2020%"]'
+both "10 EXISTS(.. T2.ID STARTING WITH ?)"  "$E T2.ID STARTING WITH ?) ORDER BY ID" '["1"]'
+both "10 EXISTS(.. T2.N382 NOT LIKE ?)"     "$E T2.N382 NOT LIKE ?) ORDER BY ID" '["1%"]'
+both "10 EXISTS(.. T2.N382 LIKE ? ESCAPE '!')" "$E T2.N382 LIKE ? ESCAPE '!') ORDER BY ID" '["1!%"]'
+both "10 EXISTS(.. T2.N382 LIKE ?) [NULL]"  "$E T2.N382 LIKE ?) ORDER BY ID" '[null]'
+both "10 EXISTS(.. T2.N382 LIKE ?) [1] - an integer bind" "$E T2.N382 LIKE ?) ORDER BY ID" '[1]'
+both "10 ID IN (SELECT .. T2.N92 LIKE ?)"   "$W ID IN (SELECT T2.ID FROM T T2 WHERE T2.N92 LIKE ?) ORDER BY ID" '["1%"]'
+both "10 ID IN (SELECT .. T2.B LIKE ?)"     "$W ID IN (SELECT T2.ID FROM T T2 WHERE T2.B LIKE ?) ORDER BY ID" '["T%"]'
+both "10 CONTROL a text column keeps its literal: T2.V LIKE ?" "$E T2.V LIKE ?) ORDER BY ID" '["1%"]'
+both "10 CONTROL a CHAR column: T2.C LIKE ?" "$E T2.C LIKE ?) ORDER BY ID" '["1.50%"]'
+both "10 a quote in the bind is data"       "$E T2.N382 LIKE ?) ORDER BY ID" "[\"1'%\"]"
+both "10 an injection-shaped bind is data"  "$E T2.N382 LIKE ?) ORDER BY ID" "[\"%' OR 1=1 --\"]"
+# RECORDED: the subquery planner's own prepare-time refusals
+eng_only "10 EXISTS(.. T2.DP CONTAINING ?)"     "$E T2.DP CONTAINING ?) ORDER BY ID" '[".5"]'
+eng_only "10 EXISTS(.. T2.I128 STARTING WITH ?)" "$E T2.I128 STARTING WITH ?) ORDER BY ID" '["10"]'
+eng_only "10 EXISTS(.. T2.D34 LIKE ?)"          "$E T2.D34 LIKE ?) ORDER BY ID" '["1%"]'
+eng_only "10 EXISTS(.. T2.N382 SIMILAR TO ?)"   "$E T2.N382 SIMILAR TO ?) ORDER BY ID" '["1%"]'
+eng_only "10 a scalar subquery carrying ANY ? in the projection" "SELECT ID, (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) FROM T ORDER BY ID" '[1]'
+
+# ---------------------------------------------------------------
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-condpattern-$PORT.log"; then
@@ -448,7 +479,7 @@ elif ! kill -0 $srv 2>/dev/null; then
 else echo "OK   no panic and the server is still up"; fi
 
 echo "ran $ran checks"
-# the floor is the MEASURED count: 222 on the 2026-10-02 binary (181 +
-# section 8's 13 + section 9's 28), 222 OK
-if [ "$ran" -lt 222 ]; then echo "FAIL only $ran checks ran (floor 222) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 242 on the 2026-10-02 binary (181 +
+# section 8's 13 + section 9's 28 + section 10's 20), 242 OK
+if [ "$ran" -lt 242 ]; then echo "FAIL only $ran checks ran (floor 242) - cells went missing"; fail=1; fi
 exit $fail
