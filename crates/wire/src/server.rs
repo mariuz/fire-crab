@@ -38717,7 +38717,28 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 let rhs = if rhs.contains('(')
                     && find_word(&mask_literals(&rhs.to_ascii_uppercase()), "SELECT", 0).is_some()
                 {
-                    rhs_lifted = lift_corr_text(rhs, &set_scope, db, db_outer, None)?;
+                    // A SUBQUERY HOLDING EVERY `?` OF THIS VALUE numbers them
+                    // from where the SET list has reached, and publishes
+                    // only its own claims: `SET TAG = (SELECT MAX(T2.V) ..
+                    // WHERE T2.ID < ?)` refused here, the engine answers
+                    // (measured 2026-10-03)
+                    let all = mask_literals(rhs).matches('?').count();
+                    let lone_base = (all > 0
+                        && extract_subqueries(rhs).is_some_and(|(_, subs)| {
+                            subs.len() == 1 && mask_literals(&subs[0]).matches('?').count() == all
+                        }))
+                    .then_some(params.len());
+                    let mark = corr_claimed_mark();
+                    let prev = LIFT_PARAM_BASE.with(|b| b.replace(lone_base));
+                    let lifted = lift_corr_text(rhs, &set_scope, db, db_outer, None);
+                    LIFT_PARAM_BASE.with(|b| b.set(prev));
+                    rhs_lifted = lifted?;
+                    for (slot, d) in corr_claimed_since(mark) {
+                        if params.len() <= slot {
+                            params.resize(slot + 1, None);
+                        }
+                        params[slot] = Some(d);
+                    }
                     if trace_on() {
                         eprintln!("[srv] update SET per-row sub {:?}", rhs_lifted);
                     }
@@ -107828,6 +107849,14 @@ fn corr_cmp_before(text: &str, at: usize) -> Option<(usize, Cmp)> {
 /// whose positions the expansion shifts, keeps the `AS <name>` splice.
 /// The text comes back unchanged when it holds no subquery; None when one
 /// cannot be lifted (the statement then keeps its refusal).
+thread_local! {
+    /// The statement slot an UPDATE SET value's lone subquery numbers its
+    /// `?`s from - set by `plan_update` around its own [lift_corr_text]
+    /// call only, when that subquery holds every `?` of the value; every
+    /// other lift registers with no base and keeps its refusal.
+    static LIFT_PARAM_BASE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 fn lift_corr_text(
     text: &str,
     scope: &CorrScope,
@@ -107895,7 +107924,10 @@ fn lift_corr_text(
         // (the explicit-collation compare reads it there); a membership
         // test compares its values per row under the ICU side's collation
         // ([corr_member_coll]).
-        let id = corr_register(sub, scan, kind.clone(), scope, db_opt, None)?;
+        // a slot base LENT by the one caller that can number this text
+        // ([LIFT_PARAM_BASE]) applies to a lone subquery only
+        let base = if subs.len() == 1 { LIFT_PARAM_BASE.with(|b| b.get()) } else { None };
+        let id = corr_register(sub, scan, kind.clone(), scope, db_opt, base)?;
         let icu = corr_icu_ttype(id, sub, db_opt);
         let scope_desc = |name: &str| -> Option<Descriptor> {
             let bare = name.rsplit('.').next().unwrap_or(name);

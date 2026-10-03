@@ -431,9 +431,25 @@ dml "7 DELETE .. WHERE ID IN (.. T2.N382 LIKE ?) - the non-text spelling" "DELET
 dml "7 DELETE .. WHERE EXISTS(.. T2.ID > ?) - correlated" "DELETE FROM U WHERE EXISTS(SELECT 1 FROM T T2 WHERE T2.ID = U.ID AND T2.ID > ?) RETURNING ID" '[1]'
 dml         "7 DELETE .. WHERE ID = <subquery ?> [NULL] - no row" "DELETE FROM U WHERE ID = $M RETURNING ID" '[null]'
 dml "7 INSERT .. SELECT <select-list subquery ?>"   "INSERT INTO U (ID, TAG) SELECT ID + 10, (SELECT MAX(T2.V) FROM T T2 WHERE T2.ID < ?) FROM T RETURNING ID, TAG" '[3]'
-# RECORDED: a subquery in the SET list, and in an INSERT's VALUES
-dml_refused "7 UPDATE SET TAG = (<subquery ?>)"    "UPDATE U SET TAG = (SELECT MAX(T2.V) FROM T T2 WHERE T2.ID < ?) WHERE ID = 1 RETURNING TAG" '[3]'
-dml_refused "7 UPDATE SET ID = (<subquery ?>) WHERE ID = ?" "UPDATE U SET ID = (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) WHERE ID = ? RETURNING ID" '[1,2]'
+# AN UPDATE SET VALUE's lone subquery holding every `?` of the value
+# numbers them from where the SET list has reached (LIFT_PARAM_BASE, lent
+# by plan_update alone) and publishes only its own claims.
+X="(SELECT MAX(T2.V) FROM T T2 WHERE T2.ID < ?)"
+K="(SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?)"
+dml "7 UPDATE SET TAG = (<subquery ?>) [3]"         "UPDATE U SET TAG = $X WHERE ID = 1 RETURNING TAG" '[3]'
+dml "7 ..[2]"                                       "UPDATE U SET TAG = $X WHERE ID = 1 RETURNING TAG" '[2]'
+dml "7 UPDATE SET ID = (<subquery ?>) WHERE ID = ? [1,2]" "UPDATE U SET ID = $K WHERE ID = ? RETURNING ID" '[1,2]'
+dml "7 ..[2,1] - the order discriminates"           "UPDATE U SET ID = $K WHERE ID = ? RETURNING ID" '[2,1]'
+dml "7 SET TAG = ?, ID = (<subquery ?>)"            "UPDATE U SET TAG = ?, ID = $K WHERE ID = 1 RETURNING ID, TAG" '["q",0]'
+dml "7 SET ID = (<subquery ?>), TAG = ?"            "UPDATE U SET ID = $K, TAG = ? WHERE ID = 1 RETURNING ID, TAG" '[0,"q"]'
+dml "7 SET TAG = (SELECT CHAR_LENGTH(IIF(U.ID > ?, ..)) ..)" "UPDATE U SET TAG = (SELECT CHAR_LENGTH(IIF(U.ID > ?, 'big', 's')) FROM RDB\$DATABASE) WHERE ID = 1 RETURNING TAG" '[0]'
+dml "7 SET TAG = <correlated subquery ?> - every row" "UPDATE U SET TAG = (SELECT MAX(T2.V) FROM T T2 WHERE T2.ID = U.ID AND T2.ID < ?) RETURNING ID, TAG" '[3]'
+dml "7 SET TAG = (<subquery ?>) [NULL]"             "UPDATE U SET TAG = $X WHERE ID = 1 RETURNING TAG" '[null]'
+dml "7 SET TAG = COALESCE((<subquery ?>), 'none')"  "UPDATE U SET TAG = COALESCE($X, 'none') WHERE ID = 1 RETURNING TAG" '[0]'
+dml "7 SET ID = 10 + (<subquery ?>)"                "UPDATE U SET ID = 10 + $K WHERE ID = 1 RETURNING ID" '[1]'
+# RECORDED: a `?` beside the subquery in the same value, and an INSERT's VALUES
+dml_refused "7 SET ID = ? + (<subquery ?>)"         "UPDATE U SET ID = ? + $K WHERE ID = 1 RETURNING ID" '[10,1]'
+dml_refused "7 INSERT .. VALUES ((<subquery ?>), ..)" "INSERT INTO U (ID, TAG) VALUES ((SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?), 'n') RETURNING ID, TAG" '[1]'
 
 # ---------------------------------------------------------------
 echo "--- panic check"
@@ -445,6 +461,6 @@ elif ! kill -0 $srv 2>/dev/null; then
 else echo "OK   no panic and the server is still up"; fi
 
 echo "ran $ran checks"
-# the floor is the MEASURED count: 146 on the 2026-10-02 binary, 146 OK
-if [ "$ran" -lt 146 ]; then echo "FAIL only $ran checks ran (floor 146) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 157 on the 2026-10-03 binary, 157 OK
+if [ "$ran" -lt 157 ]; then echo "FAIL only $ran checks ran (floor 157) - cells went missing"; fail=1; fi
 exit $fail
