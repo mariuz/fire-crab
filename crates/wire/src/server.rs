@@ -46289,7 +46289,7 @@ fn parse_on(
     // NULL semantics come out right for free: a comparison with NULL is
     // UNKNOWN, `Predicate::matches` answers false, and an unmatched
     // left row is padded exactly as it was.
-    let toks = tokenize(on_s)?;
+    let toks = tokenize_calls(on_s)?;
     // A `?` IN THE ON. Its slot number continues the statement's count -
     // the ON sits between the select list and the WHERE in the text, and
     // that is the order the engine numbers by (probed: `ON P.I = ?
@@ -56035,6 +56035,17 @@ impl BoundSrc {
     }
 }
 
+/// [tokenize] with a stored call lexed as an expression token
+/// ([LEX_WHERE]) - armed only while a client SELECT's prepare arms
+/// [LEX_USER_FNS]; a condition over a derived source runs its calls
+/// through the memo ([memo_fn_rows])
+fn tokenize_calls(s: &str) -> Option<Vec<Tok>> {
+    let prev = LEX_WHERE.with(|a| a.replace(true));
+    let t = tokenize(s);
+    LEX_WHERE.with(|a| a.set(prev));
+    t
+}
+
 fn plan_over_source(
     sql: &str,
     name: &str,
@@ -56220,7 +56231,7 @@ fn plan_over_source(
         let filter = match where_s {
             None => None,
             Some(ws) => Some(resolve_predicate(
-                tokenize(&unq(ws)).and_then(|t| parse_predicate(&t, &mut np))?,
+                tokenize_calls(&unq(ws)).and_then(|t| parse_predicate(&t, &mut np))?,
                 &columns,
                 &descs,
                 params,
@@ -56236,7 +56247,7 @@ fn plan_over_source(
         let having = match having_s {
             None => None,
             Some(hs) => Some(
-                tokenize(&unq(hs))
+                tokenize_calls(&unq(hs))
                     .and_then(|t| parse_predicate(&t, &mut np))
                     .and_then(|raw| {
                         let gl = gitems.len();
@@ -56432,7 +56443,7 @@ fn plan_over_source(
     let filter = match where_s {
         None => None,
         Some(ws) => Some(resolve_predicate(
-            tokenize(&unq(ws)).and_then(|t| parse_predicate(&t, &mut np))?,
+            tokenize_calls(&unq(ws)).and_then(|t| parse_predicate(&t, &mut np))?,
             &columns,
             &descs,
             params,

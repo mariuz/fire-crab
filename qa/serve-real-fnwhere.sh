@@ -59,8 +59,8 @@
 # and surfaces only if the final pass reaches it), the plan runs again -
 # each pass a fresh execution, so no subquery cache keeps a placeholder's
 # answer (one did: the first build answered a scalar subquery NULL). An
-# impure call there refuses, as does a call in a LEFT JOIN's ON or in the
-# WHERE over a derived table (9b, routers of their own).
+# impure call there refuses (9b). A condition over a derived source or a
+# CTE and a join's ON are routers of their own; each lexes calls too.
 #
 # A window over a NAVIGATED key, and ROWS ?, refuse - recorded (section 6).
 #
@@ -398,13 +398,21 @@ both "9 IN: the raise avoided inside"               "SELECT ID FROM T WHERE ID I
 both "9 a lazy IIF in a derived select list"        "SELECT D.R FROM (SELECT IIF(ID = 2, 0, FZ(ID)) AS R FROM T) D ORDER BY 1" '[]'
 both "9 a nested call in a join"                    "SELECT T.ID, FN(T.ID) FROM T JOIN TI ON TI.ID = T.ID WHERE FN(TI.ID) > 4 ORDER BY 1" '[]'
 both "9 a bound ? argument in a derived table"      "SELECT D.ID FROM (SELECT ID FROM T WHERE F1(ID) > ?) D ORDER BY 1" '[3]'
+# the routers of their own (recorded in 9b until 2026-10-03): a condition
+# over a derived source or a CTE, and a join's ON
+both "9 the WHERE over a derived table"             "SELECT D.ID FROM (SELECT ID FROM T) D WHERE F1(D.ID) > 2 ORDER BY 1" '[]'
+both "9 ...written order there, the raise"          "SELECT D.ID FROM (SELECT ID FROM T) D WHERE FZ(D.ID) > 0 AND D.ID <> 2" '[]'
+both "9 the WHERE over a CTE"                       "WITH C AS (SELECT ID FROM T) SELECT ID FROM C WHERE F1(ID) > 2 ORDER BY 1" '[]'
+both "9 HAVING over a derived table"                "SELECT V, COUNT(*) FROM (SELECT ID, V FROM T) D GROUP BY V HAVING F1(COUNT(*)) = 2 ORDER BY 1" '[]'
+both "9 a call in a LEFT JOIN's ON"                 "SELECT T.ID, TI.ID FROM T LEFT JOIN TI ON F1(TI.ID) = T.ID ORDER BY 1, 2" '[]'
+both "9 an inner join's ON beside a key"            "SELECT T.ID, TI.ID FROM T JOIN TI ON TI.ID = T.ID AND F1(TI.ID) > 2 ORDER BY 1" '[]'
+both "9 a LEFT JOIN's ON, written order"            "SELECT T.ID, TI.ID FROM T LEFT JOIN TI ON TI.ID = T.ID AND TI.ID <> 2 AND FZ(TI.ID) > 0 ORDER BY 1" '[]'
+both "9 a RIGHT JOIN's ON"                          "SELECT T.ID, TI.ID FROM T RIGHT JOIN TI ON F1(T.ID) = TI.ID ORDER BY 2" '[]'
 echo "--- 9b RECORDED"
 # an IMPURE call outside the per-row runners' shapes refuses at prepare -
 # the memo answers a call once per argument list, a reading function's
 # answer may move between rows
 eng_only "9b an impure call in a derived table"     "SELECT D.ID FROM (SELECT ID FROM T WHERE ID < FC()) D" '[]'
-eng_only "9b a call in the WHERE OVER a derived table" "SELECT D.ID FROM (SELECT ID FROM T) D WHERE F1(D.ID) > 2 ORDER BY 1" '[]'
-eng_only "9b a call in a LEFT JOIN's ON"            "SELECT T.ID FROM T LEFT JOIN TI ON F1(TI.ID) = T.ID ORDER BY 1" '[]'
 
 echo "--- panic check"
 ran=$((ran + 1))
@@ -412,6 +420,6 @@ if grep -aq 'panicked at' "/tmp/fc-serve-fnwhere-$PORT.log"; then echo "FAIL the
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 192 on the 2026-10-03 binary, 192 OK
-if [ "$ran" -lt 192 ]; then echo "FAIL only $ran checks ran (floor 192) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 198 on the 2026-10-03 binary, 198 OK
+if [ "$ran" -lt 198 ]; then echo "FAIL only $ran checks ran (floor 198) - cells went missing"; fail=1; fi
 exit $fail

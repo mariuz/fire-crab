@@ -56,4 +56,4 @@ Short, actionable items. The long-form engineering backlog lives in
 - [x] A PURE stored call in a derived table, a join, a UNION branch or a subquery (fnwhere section 9,
       the memo fallback).
 - [ ] Still refused: ROWS ?, a window over a navigated key (6); an impure call in DML (8b); an impure
-      call in those shapes, a call in a LEFT JOIN's ON or in the WHERE over a derived table (9b).
+      call in those shapes (9b).
