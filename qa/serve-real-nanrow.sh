@@ -415,7 +415,8 @@ echo "-- 6. AN ENGINE BUG, RECORDED (not reproduced): a WHERE IN-subquery loses 
 # This server answers the SQL meaning (row 7), which is the engine's own
 # projection answer; the divergence is pinned with BOTH answers so it
 # fails loudly the day the engine is fixed (promote it then) or this
-# server moves.
+# server moves.  Reported upstream on FirebirdSQL/firebird#9158 (2026-10-03).
+#
 divergence       "6 WHERE N IN (SELECT N .. ID IN (4, 7)) - the NULL streams first" "SELECT ID FROM M WHERE N IN (SELECT N FROM M M2 WHERE M2.ID IN (4, 7)) ORDER BY ID" '[]' "(none)" "7"
 divergence       "6 the same over NUMERIC"           "SELECT ID FROM M WHERE NM IN (SELECT NM FROM M M2 WHERE M2.ID IN (4, 7)) ORDER BY ID" '[]' "(none)" "7"
 divergence       "6 the same over DOUBLE"            "SELECT ID FROM M WHERE D IN (SELECT D2 FROM M M2 WHERE M2.ID IN (4, 7)) ORDER BY ID" '[]' "(none)" "7"

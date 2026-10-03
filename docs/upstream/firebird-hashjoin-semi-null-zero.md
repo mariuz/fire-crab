@@ -1,6 +1,6 @@
 # Upstream issue draft — Firebird: a semi-join `IN` / `EXISTS` misses a match on `0` when a `NULL` precedes it
 
-**Status:** DRAFT — not filed. Tracked in [`TODO.md`](../../TODO.md).
+**Status:** REPORTED 2026-10-03 as a comment on the existing upstream issue **[FirebirdSQL/firebird#9158](https://github.com/FirebirdSQL/firebird/issues/9158)** ("Incorrect result HASH SEMI JOIN with UUID key") — the same SEMI-join first-candidate defect, there triggered by random UUID hash collisions; this report adds a deterministic two-row INTEGER trigger (NULL and 0 share a key) and notes that 6.0 has no `SubQueryConversion` gate. Comment: <https://github.com/FirebirdSQL/firebird/issues/9158#issuecomment-5965771034> (text: [`firebird-9158-comment.md`](firebird-9158-comment.md)). Related: [#7769](https://github.com/FirebirdSQL/firebird/issues/7769). The draft below was kept as the full write-up.
 **Target:** <https://github.com/FirebirdSQL/firebird/issues>
 **Repro script:** [`firebird-hashjoin-semi-null-zero.sql`](firebird-hashjoin-semi-null-zero.sql) (self-contained; creates and drops its own database)
 
