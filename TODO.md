@@ -53,5 +53,7 @@ Short, actionable items. The long-form engineering backlog lives in
 - [x] A duplicate CREATE TRIGGER / INDEX / DOMAIN / ROLE answers the engine's already-exists vector (metaupdate).
 - [x] A schema-qualified DML target that does not exist answers the -204 `"PUBLIC"."S2"` (dmlunknown section 2).
 - [x] UPDATE / DELETE whose WHERE calls PURE stored functions (fnwhere section 8).
-- [ ] A stored function call in a join, a derived table, a subquery, UNION or ROWS ? still refuses at
-      prepare (fnwhere section 6); in DML, an impure call (8b).
+- [x] A PURE stored call in a derived table, a join, a UNION branch or a subquery (fnwhere section 9,
+      the memo fallback).
+- [ ] Still refused: ROWS ?, a window over a navigated key (6); an impure call in DML (8b); an impure
+      call in those shapes, a call in a LEFT JOIN's ON or in the WHERE over a derived table (9b).

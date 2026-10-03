@@ -51,9 +51,18 @@
 # earlier writes (`DELETE FROM T WHERE ID < FC()`, FC counting T, deletes
 # one row of three), which no pre-pass reproduces.
 #
-# A call inside a subquery, a derived table, a view, a join or UNION,
-# and a window over a NAVIGATED key, refuse at prepare - recorded
-# (section 6).
+# THE MEMO (section 9): a PURE call in any other shape - a derived table,
+# a join, a UNION branch, an IN / EXISTS / scalar subquery, correlated or
+# not - runs the plan through its ordinary row machinery with every call
+# answered from a memo keyed by (function, argument values); a pass that
+# reaches an unanswered call records it, the calls run (a raise is kept,
+# and surfaces only if the final pass reaches it), the plan runs again -
+# each pass a fresh execution, so no subquery cache keeps a placeholder's
+# answer (one did: the first build answered a scalar subquery NULL). An
+# impure call there refuses, as does a call in a LEFT JOIN's ON or in the
+# WHERE over a derived table (9b, routers of their own).
+#
+# A window over a NAVIGATED key, and ROWS ?, refuse - recorded (section 6).
 #
 # Usage: qa/serve-real-fnwhere.sh [port]
 set -u
@@ -253,11 +262,11 @@ both "5 CONTROL a built-in in a WHERE"        "SELECT ID FROM T WHERE UPPER(V) =
 both "5 CONTROL a keyed WHERE"                "SELECT ID FROM TI WHERE ID = 2" '[]'
 
 echo "--- 6 RECORDED - the engine answers, this server refuses at prepare"
-eng_only "6 a call inside an IN subquery"     "SELECT ID FROM T WHERE ID IN (SELECT ID FROM T WHERE F1(ID) > 3) ORDER BY ID" '[]'
-eng_only "6 a call inside a correlated EXISTS" "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM T T2 WHERE F1(T2.ID) = T.ID * 2 AND T2.ID > 1) ORDER BY ID" '[]'
-eng_only "6 a derived table"                  "SELECT ID FROM (SELECT ID FROM T WHERE F1(ID) > 3) ORDER BY ID" '[]'
-eng_only "6 a join"                           "SELECT T.ID FROM T JOIN TI ON TI.ID = T.ID WHERE F1(T.ID) > 3 ORDER BY 1" '[]'
-eng_only "6 a UNION branch"                   "SELECT ID FROM T WHERE F1(ID) > 3 UNION ALL SELECT 9 $R" '[]'
+both     "6 a call inside an IN subquery - PROMOTED (the memo)"     "SELECT ID FROM T WHERE ID IN (SELECT ID FROM T WHERE F1(ID) > 3) ORDER BY ID" '[]'
+both     "6 a call inside a correlated EXISTS - PROMOTED (the memo)" "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM T T2 WHERE F1(T2.ID) = T.ID * 2 AND T2.ID > 1) ORDER BY ID" '[]'
+both     "6 a derived table - PROMOTED (the memo)"                  "SELECT ID FROM (SELECT ID FROM T WHERE F1(ID) > 3) ORDER BY ID" '[]'
+both     "6 a join - PROMOTED (the memo)"                           "SELECT T.ID FROM T JOIN TI ON TI.ID = T.ID WHERE F1(T.ID) > 3 ORDER BY 1" '[]'
+both     "6 a UNION branch - PROMOTED (the memo)"                   "SELECT ID FROM T WHERE F1(ID) > 3 UNION ALL SELECT 9 $R" '[]'
 eng_only "6 ROWS ? - a bound window"          "SELECT ID FROM T WHERE F1(ID) > ? ROWS ?" '[1, 1]'
 eng_only "6 FIRST over a NAVIGATED key"       "SELECT FIRST 1 ID FROM TI WHERE ID > 2 AND FZ(ID) > 0 ORDER BY ID" '[]'
 
@@ -373,12 +382,36 @@ echo "--- 8b RECORDED - an IMPURE function: the engine's calls see the statement
 eng_only "8b DELETE .. WHERE ID < FC() - FC reads the target" "DELETE FROM T WHERE ID < FC()" '[]'
 eng_only "8b an IMPURE call in a RETURNING list"     "UPDATE T SET N = 1 WHERE ID = 1 RETURNING FC()" '[]'
 
+echo "--- 9 THE MEMO: a PURE call in any other shape - derived tables, joins,"
+echo "      UNION branches, subqueries - answered from (function, arguments)"
+both "9 derived: a call in the select list"         "SELECT D.ID FROM (SELECT ID, F1(ID) AS X FROM T) D WHERE D.X > 3 ORDER BY 1" '[]'
+both "9 derived: written order, the raise avoided"  "SELECT D.ID FROM (SELECT ID FROM T WHERE ID <> 2 AND FZ(ID) > 0) D" '[]'
+both "9 derived: written order, the raise"          "SELECT D.ID FROM (SELECT ID FROM T WHERE FZ(ID) > 0 AND ID <> 2) D" '[]'
+both "9 join: a call over the joined side"          "SELECT T.ID, F1(TI.ID) FROM T JOIN TI ON TI.ID = T.ID ORDER BY 1" '[]'
+both "9 join: a text call in the WHERE"             "SELECT T.ID FROM T JOIN TI ON TI.ID = T.ID WHERE F2(T.V, TI.ID) = 'b-2'" '[]'
+both "9 UNION: calls in both branches"              "SELECT F1(ID) FROM T UNION SELECT F1(ID) + 1 FROM TI ORDER BY 1" '[]'
+both "9 UNION ALL: a NULL argument"                 "SELECT F1(N) FROM T UNION ALL SELECT 0 $R" '[]'
+both "9 a scalar subquery over a fold"              "SELECT ID, (SELECT F1(MAX(ID)) FROM T) AS M FROM T ORDER BY 1" '[]'
+both "9 a correlated scalar subquery"               "SELECT ID, (SELECT MAX(B.ID) FROM T B WHERE F1(B.ID) < A.ID * 3) AS M FROM T A ORDER BY 1" '[]'
+both "9 IN: written-order raise inside"             "SELECT ID FROM T WHERE ID IN (SELECT ID FROM T WHERE FZ(ID) > 0 AND ID <> 2)" '[]'
+both "9 IN: the raise avoided inside"               "SELECT ID FROM T WHERE ID IN (SELECT ID FROM T WHERE ID <> 2 AND FZ(ID) > 0)" '[]'
+both "9 a lazy IIF in a derived select list"        "SELECT D.R FROM (SELECT IIF(ID = 2, 0, FZ(ID)) AS R FROM T) D ORDER BY 1" '[]'
+both "9 a nested call in a join"                    "SELECT T.ID, FN(T.ID) FROM T JOIN TI ON TI.ID = T.ID WHERE FN(TI.ID) > 4 ORDER BY 1" '[]'
+both "9 a bound ? argument in a derived table"      "SELECT D.ID FROM (SELECT ID FROM T WHERE F1(ID) > ?) D ORDER BY 1" '[3]'
+echo "--- 9b RECORDED"
+# an IMPURE call outside the per-row runners' shapes refuses at prepare -
+# the memo answers a call once per argument list, a reading function's
+# answer may move between rows
+eng_only "9b an impure call in a derived table"     "SELECT D.ID FROM (SELECT ID FROM T WHERE ID < FC()) D" '[]'
+eng_only "9b a call in the WHERE OVER a derived table" "SELECT D.ID FROM (SELECT ID FROM T) D WHERE F1(D.ID) > 2 ORDER BY 1" '[]'
+eng_only "9b a call in a LEFT JOIN's ON"            "SELECT T.ID FROM T LEFT JOIN TI ON F1(TI.ID) = T.ID ORDER BY 1" '[]'
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-fnwhere-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 175 on the 2026-10-03 binary, 175 OK
-if [ "$ran" -lt 175 ]; then echo "FAIL only $ran checks ran (floor 175) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 192 on the 2026-10-03 binary, 192 OK
+if [ "$ran" -lt 192 ]; then echo "FAIL only $ran checks ran (floor 192) - cells went missing"; fail=1; fi
 exit $fail

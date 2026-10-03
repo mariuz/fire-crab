@@ -48055,7 +48055,14 @@ fn plan_join_bound(
     let filter = match where_s {
         None => None,
         Some(ws) => Some(
-            tokenize(ws)
+            {
+                // a join's WHERE may lex a stored call ([LEX_WHERE]); its
+                // rows run through the memo ([memo_fn_rows])
+                LEX_WHERE.with(|a| a.set(true));
+                let t = tokenize(ws);
+                LEX_WHERE.with(|a| a.set(false));
+                t
+            }
                 .and_then(|t| parse_predicate(&t, &mut next_param))
                 .or_else(|| cond_where_fallback(ws))
                 .and_then(|raw| resolve_join_predicate(raw, &sides, params))?,
@@ -66441,8 +66448,11 @@ fn plan_query_inner_at_body(
         Some(ws) => match extract_subqueries(ws)
             .and_then(|(rewritten, subs)| {
                 // this WHERE may lex a stored function call ([LEX_WHERE])
-                let outermost = PLAN_BODY_DEPTH.with(|d| d.get()) == 1 && FN_SCOPE.with(|d| d.get()) == 0;
-                LEX_WHERE.with(|a| a.set(outermost));
+                // ...and a NESTED one too (a derived table, a correlated
+                // subquery): what runs at execute takes the memo
+                // ([memo_fn_rows]), and a subquery folded at prepare, whose
+                // call cannot run there, still refuses
+                LEX_WHERE.with(|a| a.set(true));
                 let toks = tokenize(&rewritten);
                 LEX_WHERE.with(|a| a.set(false));
                 let toks = toks?;
@@ -82352,6 +82362,13 @@ thread_local! {
     /// the record the target walk is judging, by (data page, slot), and
     /// per record the call values the pre-pass computed for it
     static DML_ROW_KEY: std::cell::Cell<Option<(u32, u16)>> = const { std::cell::Cell::new(None) };
+    /// while [memo_fn_rows] runs a plan: every call's answer by (call id,
+    /// its argument values), the calls a pass reached without one, and the
+    /// statement's bound parameters for an argument that holds a `?`
+    static FN_MEMO: std::cell::RefCell<Option<std::collections::HashMap<(String, String), Result<Value, EvalErr>>>> =
+        const { std::cell::RefCell::new(None) };
+    static FN_MEMO_MISSES: std::cell::RefCell<Vec<(u32, String, Vec<Value>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FN_MEMO_ARGS: std::cell::RefCell<Vec<WireParam>> = const { std::cell::RefCell::new(Vec::new()) };
     static FN_DML_VALS: std::cell::RefCell<std::collections::HashMap<(u32, u16), std::collections::HashMap<u32, Value>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     static FN_ROW_VALS: std::cell::RefCell<Vec<std::collections::HashMap<u32, Value>>> =
@@ -93318,10 +93335,11 @@ impl Drop for FnScope {
 /// nested plan ([FN_NESTED]), an aggregate, a join, a window or a
 /// generated column refuses at prepare - where an unsupported statement
 /// fails on the engine too.
-fn fn_filter_plannable(plan: &Plan) -> bool {
-    if !FN_LEXED.with(|f| f.get()) {
-        return true;
-    }
+/// Can the per-row runners take this plan's calls ([materialise_user_fn_rows],
+/// [group_fn_rows])? Some(false) is a definite refusal, None a shape they
+/// do not run - which the memo fallback may ([memo_fn_rows]).
+fn fn_native_plannable(plan: &Plan) -> Option<bool> {
+    let lexed = FN_LEXED.with(|f| f.get());
     let outer = plan;
     let plan = match plan {
         // FIRST / SKIP / ROWS / DISTINCT - the runner cuts the window and
@@ -93333,21 +93351,38 @@ fn fn_filter_plannable(plan: &Plan) -> bool {
     // may sort there instead (`ID > 0 AND <unindexable> ORDER BY ID` is
     // SORT INDEX on 2182, a navigation here): which rows reach the call
     // would then differ - refused, recorded
-    if let (Plan::Modified { .. }, Plan::Project { index: Some(a), .. }) = (outer, plan) {
+    if let (true, Plan::Modified { .. }, Plan::Project { index: Some(a), .. }) = (lexed, outer, plan) {
         if a.navigate() {
-            return false;
+            return Some(false);
         }
     }
     if FN_NESTED.with(|n| n.get()) {
-        return false;
+        return None;
     }
     match plan {
-        Plan::Project { gen_cols, windows, .. } => gen_cols.is_empty() && windows.is_empty(),
+        Plan::Project { gen_cols, windows, .. } if gen_cols.is_empty() && windows.is_empty() => Some(true),
+        // a generator column or a window beside a call: no runner takes
+        // it (the generic row path would answer the generator NULL)
+        Plan::Project { .. } => Some(false),
         // a fold: the WHERE, the aggregates' arguments, the keys, HAVING,
         // the ORDER BY and the select list all run their calls
         // ([group_fn_rows])
-        Plan::Group { .. } => true,
-        _ => false,
+        Plan::Group { .. } => Some(true),
+        _ => None,
+    }
+}
+
+/// May a SELECT whose prepare resolved `calls` run them? The per-row
+/// runners' shapes, or - any other shape, a call inside a derived table,
+/// a join, a UNION branch, a correlated subquery - when every call is
+/// PURE ([user_fn_pure]), through the memo fallback ([memo_fn_rows]).
+fn fn_plannable(plan: &Plan, calls: &[FnCall], db: &Option<Database>) -> bool {
+    if calls.is_empty() {
+        return true;
+    }
+    match fn_native_plannable(plan) {
+        Some(v) => v,
+        None => db.as_ref().is_some_and(|d| calls.iter().all(|c| user_fn_pure(d, &c.name, &mut Vec::new()))),
     }
 }
 
@@ -105296,12 +105331,13 @@ impl Expr {
                     }
                 }
             }
-            Expr::UserFn { id, .. } => match FN_VALS
+            Expr::UserFn { id, name, args, .. } => match FN_VALS
                 .with(|m| m.borrow().get(id).cloned())
                 .or_else(|| fn_row_val(*id, values))
                 .or_else(|| fn_dml_val(*id))
             {
                 Some(v) => v,
+                None if FN_MEMO.with(|m| m.borrow().is_some()) => fn_memo_val(*id, name, args, values)?,
                 None => {
                     // not run yet: name the call, so [lazy_fn_eval] can
                     // run it and evaluate again - a call runs only when
@@ -126400,6 +126436,105 @@ fn dml_fn_prepass(
     Ok(out)
 }
 
+/// A `UserFn` node's answer from the memo ([memo_fn_rows]): its arguments
+/// evaluated over the row, the answer (or the raise) its call produced for
+/// them. A call the memo has no answer for is recorded, and answers NULL
+/// for this pass only - the pass is then thrown away.
+fn fn_memo_val(id: u32, name: &str, args: &[Expr], values: &[Value]) -> Result<Value, EvalErr> {
+    let mut argv = Vec::with_capacity(args.len());
+    for a in args {
+        argv.push(if expr_has_param(a) {
+            FN_MEMO_ARGS
+                .with(|p| subst_params_expr(a, &p.borrow()))
+                .ok_or(EvalErr::Unsupported)?
+                .eval(values)?
+        } else {
+            a.eval(values)?
+        });
+    }
+    // keyed by the function's NAME, not the call's id: a pure function's
+    // answer is its arguments', and a correlated subquery re-planned at
+    // the fetch mints new ids for the same calls
+    let key = (name.to_ascii_uppercase(), format!("{:?}", argv));
+    match FN_MEMO.with(|m| m.borrow().as_ref().and_then(|m| m.get(&key).cloned())) {
+        Some(r) => r,
+        None => {
+            FN_MEMO_MISSES.with(|m| m.borrow_mut().push((id, name.to_string(), argv)));
+            Ok(Value::Null)
+        }
+    }
+}
+
+/// THE MEMO FALLBACK: the rows of a SELECT whose calls stand in a shape the
+/// per-row runners do not take - a derived table, a join, a UNION branch,
+/// a correlated subquery - for PURE functions only ([fn_plannable]). The
+/// plan runs through its ordinary row machinery with every call answered
+/// from a memo keyed by (call, argument values); a pass that reaches a
+/// call with no answer yet records it, the recorded calls then run (a raise
+/// is KEPT, not raised: an argument a placeholder led to may be one the
+/// real evaluation never reaches), and the plan runs again - until a pass
+/// reaches only answered calls, whose rows (or raise) are the statement's.
+/// A pure function's answer depends on its arguments alone, so running it
+/// once per distinct argument list is running it as often as matters.
+fn memo_fn_rows(
+    database: &mut Option<Database>,
+    plan: &Plan,
+    calls: &[FnCall],
+    args: &[WireParam],
+    ctx: &SessionCtx,
+) -> Result<Vec<Vec<Value>>, EvalErr> {
+    let mut memo: std::collections::HashMap<(String, String), Result<Value, EvalErr>> = std::collections::HashMap::new();
+    FN_MEMO_ARGS.with(|p| *p.borrow_mut() = args.to_vec());
+    // a subquery re-planned at the fetch lexes its calls as the prepare did
+    if let Some(db) = database.as_ref() {
+        USER_FNS.with(|m| *m.borrow_mut() = user_function_sigs(db));
+    }
+    let mut known: Vec<FnCall> = calls.to_vec();
+    let r = (|| {
+        for _pass in 0..64 {
+            FN_MEMO.with(|m| *m.borrow_mut() = Some(std::mem::take(&mut memo)));
+            FN_MEMO_MISSES.with(|m| m.borrow_mut().clear());
+            FN_CALLS.with(|l| l.borrow_mut().clear());
+            // a subquery's cached answer (or any memo of this execution)
+            // from an earlier pass was computed over placeholders - every
+            // pass is an execution of its own ([bump_exec_epoch])
+            bump_exec_epoch();
+            LEX_USER_FNS.with(|a| a.set(true));
+            let r = match database.as_ref() {
+                Some(db) => branch_rows_res(plan, db, args),
+                None => Err(EvalErr::Unsupported),
+            };
+            LEX_USER_FNS.with(|a| a.set(false));
+            memo = FN_MEMO.with(|m| m.borrow_mut().take()).unwrap_or_default();
+            // the calls a re-plan registered: their argument character sets
+            known.extend(FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut())));
+            let misses = FN_MEMO_MISSES.with(|m| std::mem::take(&mut *m.borrow_mut()));
+            if misses.is_empty() {
+                return r;
+            }
+            let mut progressed = false;
+            for (id, name, argv) in misses {
+                let key = (name.to_ascii_uppercase(), format!("{:?}", argv));
+                if memo.contains_key(&key) {
+                    continue;
+                }
+                let c = known.iter().find(|c| c.id == id).cloned().ok_or(EvalErr::Unsupported)?;
+                let v = run_user_fn_body(database, &c, &argv, ctx);
+                memo.insert(key, v);
+                progressed = true;
+            }
+            if !progressed {
+                return Err(EvalErr::Unsupported);
+            }
+        }
+        Err(EvalErr::Unsupported)
+    })();
+    LEX_USER_FNS.with(|a| a.set(false));
+    FN_MEMO.with(|m| *m.borrow_mut() = None);
+    bump_exec_epoch();
+    r
+}
+
 /// A `UserFn` node's value for the record the DML target walk is judging
 /// ([DML_ROW_KEY]), as [dml_fn_prepass] computed it.
 fn fn_dml_val(id: u32) -> Option<Value> {
@@ -135839,7 +135974,7 @@ fn after_auth(
                     SEMANTIC_SCAN_ARMED.with(|a| a.set(false));
                     LEX_USER_FNS.with(|a| a.set(false));
                     fn_calls = std::rc::Rc::new(FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut())));
-                    let p = if !calls_fn || fn_filter_plannable(&p) { p } else { std::rc::Rc::new(Plan::Refused) };
+                    let p = if !calls_fn || fn_plannable(&p, &fn_calls, &database) { p } else { std::rc::Rc::new(Plan::Refused) };
                     // A REFUSED STATEMENT FAILS AT PREPARE, which is where
                     // the engine fails an unsupported one too. Answering
                     // the prepare and then raising at fetch left the error
@@ -137307,13 +137442,20 @@ fn after_auth(
                     // the select list calls user functions: the rows are
                     // computed NOW, the cursor served from the buffer
                     let calls = fn_calls.clone();
-                    match materialise_user_fn_rows(
-                        &mut database,
-                        &*plan,
-                        &calls,
-                        &bound_args,
-                        &SessionCtx { user, attach_id },
-                    ) {
+                    let ctx = SessionCtx { user, attach_id };
+                    // the per-row runners first; a shape they do not take
+                    // runs through the memo, for pure calls ([memo_fn_rows])
+                    let rows = match materialise_user_fn_rows(&mut database, &*plan, &calls, &bound_args, &ctx) {
+                        Err(EvalErr::Unsupported)
+                            if database.as_ref().is_some_and(|db| {
+                                calls.iter().all(|c| user_fn_pure(db, &c.name, &mut Vec::new()))
+                            }) =>
+                        {
+                            memo_fn_rows(&mut database, &*plan, &calls, &bound_args, &ctx)
+                        }
+                        other => other,
+                    };
+                    match rows {
                         Ok(rows) => {
                             let cols: Vec<ProjCol> = output_cols_of(&*plan)
                                 .iter()
