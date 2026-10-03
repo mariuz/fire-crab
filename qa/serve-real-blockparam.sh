@@ -136,8 +136,9 @@ echo "--- 4 RECORDED"
 # a DATE input bound from TEXT: the procedure-argument law refuses a
 # cross-type text into a temporal parameter by design (bind_proc_args)
 eng_only "4 DATE input from text '2020-01-31'"     "$EB (DT DATE = ?) RETURNS (R DATE) AS BEGIN R = DT + 1; SUSPEND; END" '["2020-01-31"]'
-# a stored FUNCTION called with a `?` - a router of its own
-eng_only "4 SELECT F1(?) - a PSQL function's argument" "SELECT F1(?) FROM RDB\$DATABASE" '[21]'
+# a stored FUNCTION called with a `?` - promoted the day it landed
+# (`serve-real-fnparam.sh`); one in a WHERE is still a router of its own
+both     "4 SELECT F1(?) - a PSQL function's argument (promoted with fnparam)" "SELECT F1(?) FROM RDB\$DATABASE" '[21]'
 eng_only "4 WHERE F1(ID) > ?"                       "SELECT ID FROM T WHERE F1(ID) > ? ORDER BY ID" '[3]'
 
 echo "--- panic check"

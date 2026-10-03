@@ -81426,6 +81426,11 @@ thread_local! {
     static USER_FNS: std::cell::RefCell<std::collections::HashMap<String, (Descriptor, Vec<String>, usize)>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     /// the user-function values of the row being projected, by call id
+    /// each user function's INPUT parameter descriptors, by the same keys
+    /// as [USER_FNS] - what a bare `?` argument is described as
+    /// ([user_function_sigs] fills it)
+    static USER_FN_PARAMS: std::cell::RefCell<std::collections::HashMap<String, Vec<Descriptor>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
     static FN_VALS: std::cell::RefCell<std::collections::HashMap<u32, Value>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     /// the calls the prepare in progress resolved, in POST-ORDER (an
@@ -84707,7 +84712,7 @@ fn renumber_raw_params(e: &mut RawExpr, next: &mut usize) {
             renumber_raw_params(b, next);
         }
         RawExpr::Cast(a, _) => renumber_raw_params(a, next),
-        RawExpr::Coalesce(v) | RawExpr::Func(_, v) => {
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) | RawExpr::UserFn(_, v) => {
             for x in v {
                 renumber_raw_params(x, next);
             }
@@ -89325,7 +89330,9 @@ fn raw_has_param(e: &RawExpr) -> bool {
         RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
             raw_has_param(a) || raw_has_param(b)
         }
-        RawExpr::Coalesce(v) | RawExpr::Func(_, v) => v.iter().any(raw_has_param),
+        // a STORED function's arguments too: a `?` there was invisible, so
+        // the call took the sink-less resolver and refused ([USER_FN_PARAMS])
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) | RawExpr::UserFn(_, v) => v.iter().any(raw_has_param),
         // a CASE's BRANCHES carry values like any other node - without
         // this arm a `CASE WHEN ... THEN ? END` looked parameterless,
         // took the ordinary resolver and refused there (IIF, which is
@@ -92268,6 +92275,20 @@ fn conditional_finish(branches_param_free: bool) -> impl Fn(Expr, &[Descriptor])
     }
 }
 
+/// Record one user-function CALL for the statement ([FN_CALLS]) and
+/// build its node - its value is computed per row, by id, before the row
+/// is projected ([materialise_user_fn_rows]).
+fn register_user_fn_call(name: &str, args: Vec<Expr>, ret: Descriptor, descs: &[Descriptor]) -> Expr {
+    let id = NEXT_FN_CALL.with(|c| {
+        let v = c.get();
+        c.set(v.wrapping_add(1));
+        v
+    });
+    let arg_cs = args.iter().map(|a| cmp_text_charset(a, descs)).collect();
+    FN_CALLS.with(|l| l.borrow_mut().push(FnCall { id, name: name.to_string(), args: args.clone(), arg_cs }));
+    Expr::UserFn { name: name.to_string(), args, ret, id }
+}
+
 fn resolve_proj_expr_body(
     raw: &RawExpr,
     columns: &[RelationColumn],
@@ -92476,6 +92497,35 @@ fn resolve_proj_expr_body(
                 ),
                 descs,
             )
+        }
+        // A STORED FUNCTION with a BARE `?` ARGUMENT: the slot is the
+        // parameter's DECLARED type - measured 2026-10-03, `F1(?)` over
+        // `X INTEGER` describes LONG, `F2(?, ?)` over `(S VARCHAR(10), K
+        // INTEGER)` VARYING 10 then LONG, `F3(?)` over `N NUMERIC(9,2)`
+        // LONG scale -2 subtype 1 - and the bound value moves into it
+        // when the call runs, by the procedure-argument law. Any other
+        // `?` shape in an argument (`F1(? + 1)`) keeps its refusal.
+        RawExpr::UserFn(name, args)
+            if args.iter().all(|a| matches!(a, RawExpr::Param(_)) || !raw_has_param(a)) =>
+        {
+            let (ret, _, required) = USER_FNS.with(|m| m.borrow().get(name).cloned())?;
+            let pdescs = USER_FN_PARAMS.with(|m| m.borrow().get(name).cloned())?;
+            if args.len() < required || args.len() > pdescs.len() {
+                return None; // the arity refusal is the plain resolver's to name
+            }
+            let mut resolved = Vec::with_capacity(args.len());
+            for (a, pd) in args.iter().zip(pdescs.iter()) {
+                resolved.push(match a {
+                    RawExpr::Param(i) => {
+                        let mut d = *pd;
+                        d.flags &= PARAM_NOT_NULL;
+                        claim_param_slot(sink, *i, &d)?;
+                        Expr::Param(*i)
+                    }
+                    other => resolve_expr(other, columns, descs)?,
+                });
+            }
+            register_user_fn_call(name, resolved, ret, descs)
         }
         // a BUILT-IN FUNCTION whose every `?` is in a condition: the
         // literal resolver, with this sink lent to its conditions
@@ -93376,16 +93426,7 @@ fn resolve_expr_inner(
                 .iter()
                 .map(|a| resolve_expr(a, columns, descs))
                 .collect::<Option<Vec<_>>>()?;
-            let id = NEXT_FN_CALL.with(|c| {
-                let v = c.get();
-                c.set(v.wrapping_add(1));
-                v
-            });
-            let arg_cs = resolved.iter().map(|a| cmp_text_charset(a, descs)).collect();
-            FN_CALLS.with(|l| {
-                l.borrow_mut().push(FnCall { id, name: name.clone(), args: resolved.clone(), arg_cs })
-            });
-            Expr::UserFn { name: name.clone(), args: resolved, ret, id }
+            register_user_fn_call(name, resolved, ret, descs)
         }
         RawExpr::Case(branches, else_, simple) => simple_case_nullable(*simple, Expr::Case(
             branches
@@ -124754,9 +124795,11 @@ fn user_function_sigs(db: &Database) -> std::collections::HashMap<String, (Descr
             }
         }
     });
+    let mut param_descs: std::collections::HashMap<String, Vec<Descriptor>> = std::collections::HashMap::new();
     for (key, load_name) in keys {
         if let Some(meta) = load_function(db, &load_name) {
             if let Some(r) = meta.outs.first() {
+                param_descs.insert(key.clone(), meta.ins.iter().map(|p| p.desc).collect());
                 let names = meta.ins.iter().map(|p| p.name.clone()).collect();
                 // required arity = the inputs WITHOUT a default (defaults
                 // are trailing), so a call may omit the defaulted tail
@@ -124765,6 +124808,7 @@ fn user_function_sigs(db: &Database) -> std::collections::HashMap<String, (Descr
             }
         }
     }
+    USER_FN_PARAMS.with(|m| *m.borrow_mut() = param_descs);
     out
 }
 
@@ -124799,6 +124843,12 @@ fn materialise_user_fn_rows(
         for c in calls {
             let mut argv = Vec::with_capacity(c.args.len());
             for a in &c.args {
+                // a bound `?` argument becomes its value first
+                if expr_has_param(a) {
+                    let bound = subst_params_expr(a, args).ok_or(EvalErr::Unsupported)?;
+                    argv.push(bound.eval(values)?);
+                    continue;
+                }
                 argv.push(a.eval(values)?);
             }
             // the BLR executor first (the full expression surface), then
@@ -124960,9 +125010,12 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     let (an_f, pos_f, fs_f) = (afid("RDB$FUNCTION_NAME")?, afid("RDB$ARGUMENT_POSITION")?, afid("RDB$FIELD_SOURCE")?);
     let aname_f = afid("RDB$ARGUMENT_NAME");
     let adefval_f = afid("RDB$DEFAULT_VALUE");
+    let anull_f = afid("RDB$NULL_FLAG");
     let (aschema_f, apkg_f) = (afid("RDB$SCHEMA_NAME"), afid("RDB$PACKAGE_NAME"));
     let afmts = vec![(0u8, adescs)];
     let mut raw: Vec<(i64, String, String, Option<(DefaultVal, SrcCs)>)> = Vec::new();
+    // the positions declared NOT NULL (`N NUMERIC(9,2) NOT NULL`)
+    let mut not_null_pos: Vec<i64> = Vec::new();
     for_each_catalog_record(db, 15, &afmts, usize::MAX, |v| {
         let hit = matches!(v.get(an_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || !row_visible(v, aschema_f, apkg_f) {
@@ -124978,6 +125031,9 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
                     .and_then(|b| decode_param_default_blr(&b)),
                 _ => None,
             };
+            if matches!(anull_f.and_then(|i| v.get(i)), Some(Value::Int(1))) {
+                not_null_pos.push(*pos);
+            }
             raw.push((*pos, pname, fs.trim_end().to_string(), defval));
         }
     });
@@ -125033,6 +125089,15 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
         } else {
             let default_cs = defval.as_ref().and_then(|(_, c)| *c);
             let (default, default_ctx) = split_default(defval.map(|(d, _)| d));
+            // A PARAMETER DECLARED NOT NULL carries it on its descriptor:
+            // its `?` slot is announced NOT NULL (`F3(?)` over `N
+            // NUMERIC(9,2) NOT NULL` is LONG without Nullable, measured)
+            // and a NULL argument raises when the call binds it
+            // ([run_body_source])
+            let mut desc = desc;
+            if not_null_pos.contains(&pos) {
+                desc.flags |= PARAM_NOT_NULL;
+            }
             ins.push(ProcParam { name: pname, desc, collated, default, default_ctx, default_cs });
         }
     }
@@ -126513,6 +126578,38 @@ fn run_body_source(
         trig_excs: Vec::new(),
     };
     let bound = bind_proc_args(name, meta, args, given)?;
+    // AN INPUT DECLARED NOT NULL REFUSES A NULL ARGUMENT - the engine's
+    // `Validation error for variable "N", value "*** null ***"` with the
+    // routine's frame, raised as the argument is written into it. This
+    // server passed the NULL through: `SELECT F3(NULL)` answered NULL and
+    // `SELECT F3(N) FROM T` delivered the NULL row's call where the engine
+    // raises (measured 2026-10-03, identical on the previous binary).
+    for (param, v) in meta.ins.iter().zip(bound.iter()) {
+        if param.desc.flags & PARAM_NOT_NULL != 0 && matches!(v, Value::Null) {
+            // the routine's frame, with NO line - the raise is at entry,
+            // before a statement: `At function "PUBLIC"."F3"` (measured)
+            let at = if name == ANONYMOUS_BLOCK {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "At {} {}",
+                    if meta.is_function { "function" } else { "procedure" },
+                    quoted_qualified_pkg(name)
+                )]
+            };
+            return Err(ProcErr {
+                rows: Vec::new(),
+                text: format!("{}: NULL into NOT NULL parameter {}", name, param.name),
+                status: Some(wrap_at_procedure(
+                    EvalErr::NotValidVar {
+                        var: format!("\"{}\"", param.name),
+                        value: validation_value_text(&Value::Null),
+                    },
+                    at,
+                )),
+            });
+        }
+    }
     // the calls the BODY makes spell their own arguments: the default
     // again (statement text), whatever this call's caller had set
     let _args_reset = CallArgCsReset::new();
