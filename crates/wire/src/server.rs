@@ -84039,7 +84039,7 @@ fn raw_contains_gen(e: &RawExpr) -> bool {
         RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
             raw_contains_gen(a) || raw_contains_gen(b)
         }
-        RawExpr::Func(_, args) | RawExpr::Coalesce(args) => {
+        RawExpr::Func(_, args) | RawExpr::Coalesce(args) | RawExpr::UserFn(_, args) => {
             args.iter().any(raw_contains_gen)
         }
         RawExpr::Iif(_, a, b) => raw_contains_gen(a) || raw_contains_gen(b),
@@ -84086,7 +84086,10 @@ fn assign_gen_slots(
             assign_gen_slots(a, db, gen_base, gen_cols)?;
             assign_gen_slots(b, db, gen_base, gen_cols)?;
         }
-        RawExpr::Func(_, args) => {
+        // a STORED CALL's arguments are all evaluated when the call runs,
+        // and in a select list it runs once per delivered row (measured on
+        // 2196: `SELECT ID, F1(GEN_ID(G, 1)) FROM T` draws once per row)
+        RawExpr::Func(_, args) | RawExpr::UserFn(_, args) => {
             for a in args {
                 assign_gen_slots(a, db, gen_base, gen_cols)?;
             }

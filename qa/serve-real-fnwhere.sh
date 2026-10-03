@@ -424,7 +424,14 @@ both "10 GEN_ID(GS, 1) per row beside F1(ID)"      "SELECT ID, GEN_ID(GS, 1) AS 
 both "10 NEXT VALUE FOR beside a WHERE call"       "SELECT ID, NEXT VALUE FOR GS AS G FROM T WHERE F1(ID) > 3 ORDER BY ID" '[]' "$RG"
 both "10 the raise avoided: draws for kept rows"   "SELECT ID, GEN_ID(GS, 1) AS G FROM T WHERE ID <> 2 AND FZ(ID) > 0" '[]' "$RG"
 both "10 the WHERE raises: no draw delivered"      "SELECT ID, GEN_ID(GS, 1) AS G FROM T WHERE FZ(ID) > 0 AND ID <> 2" '[]' "$RG"
-eng_only "10 RECORDED - a generator inside a call's argument" "SELECT ID, F1(GEN_ID(GS, 1)) AS G FROM T ORDER BY ID" '[]'
+# a generator INSIDE a call's argument: drawn once per delivered row, as
+# the call runs (refused until 2026-10-03)
+both "10 a generator inside a call's argument"     "SELECT ID, F1(GEN_ID(GS, 1)) AS G FROM T ORDER BY ID" '[]' "$RG"
+both "10 ...beside another call, DESC delivery"   "SELECT ID, F1(NEXT VALUE FOR GS) + F1(ID) AS G FROM T ORDER BY ID DESC" '[]' "$RG"
+# the engine draws LAZILY under IIF - in its condition per row, in a branch
+# only when taken; no slot can be filled ahead of that, so both refuse
+eng_only "10 RECORDED - a generator in an IIF's condition" "SELECT IIF(GEN_ID(GS, 1) > 0, 1, 0) AS G FROM T" '[]'
+eng_only "10 RECORDED - a call over a generator in an IIF branch" "SELECT IIF(ID = 2, F1(GEN_ID(GS, 1)), 0) AS G FROM T ORDER BY ID" '[]'
 
 echo "--- panic check"
 ran=$((ran + 1))
@@ -432,6 +439,6 @@ if grep -aq 'panicked at' "/tmp/fc-serve-fnwhere-$PORT.log"; then echo "FAIL the
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 204 on the 2026-10-03 binary, 204 OK
-if [ "$ran" -lt 204 ]; then echo "FAIL only $ran checks ran (floor 204) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 207 on the 2026-10-03 binary, 207 OK
+if [ "$ran" -lt 207 ]; then echo "FAIL only $ran checks ran (floor 207) - cells went missing"; fail=1; fi
 exit $fail
