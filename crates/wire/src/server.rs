@@ -1974,6 +1974,13 @@ fn ddl_dup_codes(plan: &Plan) -> Option<(i32, i32, String)> {
         Plan::CreateFunction { name, .. } => Some((336397260, 336068876, q(name))), // CREATE FUNCTION @1 failed / Function @1 already exists
         Plan::CreateSequence { name, .. } => Some((336397285, 336068862, q(name))),
         Plan::CreateProcedure { name, .. } => Some((336397265, 336068743, q(name))),
+        // CREATE TRIGGER / INDEX / DOMAIN @1 failed + DYN 310 / 251 (42S11)
+        // / 311 "<Kind> @1 already exists"; a ROLE is named bare in both
+        // items, "SQL role @1 already exists" (DYN 194) - measured on 2196
+        Plan::CreateTrigger { def, .. } => Some((336397270, 336068918, q(&def.name))),
+        Plan::CreateIndex { name, .. } => Some((336397316, 336068859, q(name))),
+        Plan::CreateDomain { col, .. } => Some((336397277, 336068919, q(&col.name))),
+        Plan::CreateRole { name } => Some((336397310, 336068802, name.trim().trim_matches('"').to_ascii_uppercase())),
         _ => None,
     }
 }

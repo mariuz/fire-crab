@@ -45,7 +45,7 @@ Short, actionable items. The long-form engineering backlog lives in
 - [x] A trigger body with `EXIT;` stores `blr_leave 0` (emptybody section 4).
 - [x] A trigger's `DECLARE V INTEGER = 0;` initializer stores the engine's BLR (emptybody section 5).
 - [ ] CREATE PROCEDURE / FUNCTION stores no `RDB$DEBUG_INFO` (the engine writes one; triggers do).
-- [ ] A duplicate CREATE TRIGGER answers a bare Dynamic SQL Error, not `Trigger @1 already exists`.
+- [x] A duplicate CREATE TRIGGER / INDEX / DOMAIN / ROLE answers the engine's already-exists vector (metaupdate).
 - [ ] A schema-qualified DML target that does not exist answers a bare Dynamic SQL Error where the
       engine answers -204 `"PUBLIC"."S2"` (recorded in `qa/serve-real-dmlunknown.sh` section 2).
 - [ ] A stored function call in a join, a derived table, a subquery, UNION, ROWS ? or DML still

@@ -30,9 +30,13 @@ CREATE DATABASE '$c' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (ID INTEGER);
 CREATE EXCEPTION E_X 'a';
 CREATE SEQUENCE SQ;
+CREATE INDEX IX ON T (ID);
+CREATE DOMAIN DM INTEGER;
+CREATE ROLE R1;
 COMMIT;
 SET TERM ^ ;
 CREATE PROCEDURE P AS BEGIN EXIT; END^
+CREATE TRIGGER TR FOR T BEFORE INSERT AS BEGIN END^
 SET TERM ; ^
 COMMIT;
 EOF
@@ -51,6 +55,14 @@ both "a duplicate TABLE - full no-meta-update vector, SQLSTATE 42S01" "CREATE TA
 both "a duplicate EXCEPTION" "CREATE EXCEPTION E_X 'b';"
 both "a duplicate SEQUENCE" "CREATE SEQUENCE SQ;"
 both "a duplicate PROCEDURE" "SET TERM ^ ; CREATE PROCEDURE P AS BEGIN EXIT; END^ SET TERM ; ^"
+# ...and four kinds that answered a bare Dynamic SQL Error until
+# 2026-10-03: an INDEX (DYN 251, SQLSTATE 42S11), a DOMAIN (DYN 311), a
+# TRIGGER (DYN 310) and a ROLE - named BARE in both items, "SQL role @1
+# already exists" (DYN 194)
+both "a duplicate INDEX - SQLSTATE 42S11" "CREATE INDEX IX ON T (ID);"
+both "a duplicate DOMAIN" "CREATE DOMAIN DM INTEGER;"
+both "a duplicate ROLE - named bare, lower case written" "CREATE ROLE r1;"
+both "a duplicate TRIGGER" "SET TERM ^ ; CREATE TRIGGER TR FOR T BEFORE INSERT AS BEGIN END^ SET TERM ; ^"
 
 # DROP of a missing name - the reasons are irregular per type, and
 # three of them are carried now (exception carries no name, sequence is
