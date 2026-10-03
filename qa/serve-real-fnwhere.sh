@@ -428,9 +428,15 @@ both "10 the WHERE raises: no draw delivered"      "SELECT ID, GEN_ID(GS, 1) AS 
 # the call runs (refused until 2026-10-03)
 both "10 a generator inside a call's argument"     "SELECT ID, F1(GEN_ID(GS, 1)) AS G FROM T ORDER BY ID" '[]' "$RG"
 both "10 ...beside another call, DESC delivery"   "SELECT ID, F1(NEXT VALUE FOR GS) + F1(ID) AS G FROM T ORDER BY ID DESC" '[]' "$RG"
-# the engine draws LAZILY under IIF - in its condition per row, in a branch
-# only when taken; no slot can be filled ahead of that, so both refuse
-eng_only "10 RECORDED - a generator in an IIF's condition" "SELECT IIF(GEN_ID(GS, 1) > 0, 1, 0) AS G FROM T" '[]'
+# an IIF's CONDITION runs for every row - drawn eagerly, slotted (refused
+# until 2026-10-03); its BRANCHES draw only when taken, which no slot filled
+# ahead can follow - those refuse, and so does a CASE WHEN's condition (a
+# later WHEN runs only when the earlier ones fail) and an AND / OR
+both "10 a generator in an IIF's condition"         "SELECT ID, IIF(GEN_ID(GS, 1) > 1, 'y', 'n') AS G FROM T ORDER BY ID" '[]' "$RG"
+both "10 ...under IS NULL"                          "SELECT ID, IIF(GEN_ID(GS, 1) IS NULL, 0, 1) AS G FROM T ORDER BY ID" '[]' "$RG"
+both "10 ...a call over it in the condition"        "SELECT ID, IIF(F1(GEN_ID(GS, 1)) > 60, 'y', 'n') AS G FROM T ORDER BY ID" '[]' "$RG"
+eng_only "10 RECORDED - a generator in a CASE WHEN's condition" "SELECT ID, CASE WHEN GEN_ID(GS, 1) > 12 THEN 'y' ELSE 'n' END AS G FROM T ORDER BY ID" '[]'
+eng_only "10 RECORDED - a generator under an IIF's AND" "SELECT ID, IIF(GEN_ID(GS, 1) > 0 AND ID > 1, 'y', 'n') AS G FROM T ORDER BY ID" '[]'
 eng_only "10 RECORDED - a call over a generator in an IIF branch" "SELECT IIF(ID = 2, F1(GEN_ID(GS, 1)), 0) AS G FROM T ORDER BY ID" '[]'
 
 echo "--- panic check"
@@ -439,6 +445,6 @@ if grep -aq 'panicked at' "/tmp/fc-serve-fnwhere-$PORT.log"; then echo "FAIL the
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 207 on the 2026-10-03 binary, 207 OK
-if [ "$ran" -lt 207 ]; then echo "FAIL only $ran checks ran (floor 207) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 211 on the 2026-10-03 binary, 211 OK
+if [ "$ran" -lt 211 ]; then echo "FAIL only $ran checks ran (floor 211) - cells went missing"; fail=1; fi
 exit $fail

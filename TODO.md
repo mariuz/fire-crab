@@ -46,7 +46,7 @@ Short, actionable items. The long-form engineering backlog lives in
 - [x] Schema-qualified DDL (`CREATE TABLE PUBLIC.T7 ..`, every kind, a view body over `PUBLIC.T`) and an
       unknown schema's vector (`qa/serve-real-ddlqualified.sh`).
 - [x] A select list holding `GEN_ID(..)` / NEXT VALUE FOR beside a stored function call (fnwhere section 10).
-- [ ] A generator in an IIF condition or branch, and DISTINCT over a select list with a
+- [ ] A generator in an IIF branch, a CASE WHEN condition or under AND / OR, and DISTINCT over a select list with a
       generator column (with or without a call), refuse at prepare.
 - [x] An empty PSQL body (`AS BEGIN END`) compiles to the engine's BLR (`qa/serve-real-emptybody.sh`).
 - [x] A trigger body with `EXIT;` stores `blr_leave 0` (emptybody section 4).

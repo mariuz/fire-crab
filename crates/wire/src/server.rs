@@ -84032,6 +84032,40 @@ fn expr_contains_genval(e: &Expr) -> bool {
 /// Does this expression contain a generator advance anywhere - eager,
 /// lazy, or nested? Used to route a select list to the Project path
 /// and to refuse the lazy positions [assign_gen_slots] cannot fill.
+/// [assign_gen_slots] through a condition evaluated whole for every row:
+/// a comparison's and a null test's operands; a condition joining others
+/// (AND / OR short-circuit) or a pattern test keeps the refusal.
+fn assign_gen_slots_cond(c: &mut RawCond, db: &Database, gen_base: usize, gen_cols: &mut Vec<GenCol>) -> Option<()> {
+    match c {
+        RawCond::Cmp(a, _, b) => {
+            assign_gen_slots(a, db, gen_base, gen_cols)?;
+            assign_gen_slots(b, db, gen_base, gen_cols)
+        }
+        RawCond::IsNull(a) | RawCond::IsNotNull(a) => assign_gen_slots(a, db, gen_base, gen_cols),
+        other => (!cond_contains_gen(other)).then_some(()),
+    }
+}
+
+/// Does a condition draw a generator anywhere?
+fn cond_contains_gen(c: &RawCond) -> bool {
+    match c {
+        RawCond::Cmp(a, _, b) => raw_contains_gen(a) || raw_contains_gen(b),
+        RawCond::IsNull(a)
+        | RawCond::IsNotNull(a)
+        | RawCond::IsUnknown(a, _)
+        | RawCond::Like(a, ..)
+        | RawCond::Starting(a, ..)
+        | RawCond::Containing(a, ..)
+        | RawCond::Similar(a, ..) => raw_contains_gen(a),
+        RawCond::LikeExpr(a, p, ..)
+        | RawCond::StartingExpr(a, p, ..)
+        | RawCond::ContainingExpr(a, p, ..)
+        | RawCond::SimilarExpr(a, p, ..) => raw_contains_gen(a) || raw_contains_gen(p),
+        RawCond::Not(a) => cond_contains_gen(a),
+        RawCond::And(v) | RawCond::Or(v) => v.iter().any(cond_contains_gen),
+    }
+}
+
 fn raw_contains_gen(e: &RawExpr) -> bool {
     match e {
         RawExpr::Gen { .. } => true,
@@ -84042,11 +84076,12 @@ fn raw_contains_gen(e: &RawExpr) -> bool {
         RawExpr::Func(_, args) | RawExpr::Coalesce(args) | RawExpr::UserFn(_, args) => {
             args.iter().any(raw_contains_gen)
         }
-        RawExpr::Iif(_, a, b) => raw_contains_gen(a) || raw_contains_gen(b),
+        RawExpr::Iif(c, a, b) => cond_contains_gen(c) || raw_contains_gen(a) || raw_contains_gen(b),
         RawExpr::Case(branches, else_, _) => {
-            branches.iter().any(|(_, t)| raw_contains_gen(t))
+            branches.iter().any(|(c, t)| cond_contains_gen(c) || raw_contains_gen(t))
                 || else_.as_deref().is_some_and(raw_contains_gen)
         }
+        RawExpr::Cond(c) => cond_contains_gen(c),
         RawExpr::Agg(_, t) => match &**t {
             AggTarget::Expr(inner) => raw_contains_gen(inner),
             _ => false,
@@ -84102,9 +84137,17 @@ fn assign_gen_slots(
             }
             assign_gen_slots(&mut args[0], db, gen_base, gen_cols)?;
         }
-        RawExpr::NullIf(..) | RawExpr::Iif(..) | RawExpr::Case(..) | RawExpr::Cond(_)
-        | RawExpr::Agg(..) => {
-            if raw_contains_gen(e) {
+        // an IIF's CONDITION runs for every row - its draws are eager, its
+        // BRANCHES' lazy (measured on 2196: `IIF(GEN_ID(G, 1) > 0, 1, 0)`
+        // draws once per row); a branch draw keeps the refusal
+        RawExpr::Iif(c, a, b) => {
+            if raw_contains_gen(a) || raw_contains_gen(b) {
+                return None;
+            }
+            assign_gen_slots_cond(c, db, gen_base, gen_cols)?;
+        }
+        RawExpr::NullIf(..) | RawExpr::Case(..) | RawExpr::Cond(_) | RawExpr::Agg(..) => {
+            if raw_contains_gen(e) || matches!(e, RawExpr::Cond(c) if cond_contains_gen(c)) {
                 return None;
             }
         }
