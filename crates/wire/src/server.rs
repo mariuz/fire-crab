@@ -11925,6 +11925,9 @@ enum AggSrc {
         coll: u16,
         /// the WITHIN GROUP sort keys (DESC, NULLS FIRST flags beside them)
         order: Vec<(Expr, bool, bool)>,
+        /// the list's character set - the argument's ([list_arg_charset]):
+        /// its blob is minted in it ([list_fold])
+        cs: u8,
     },
 }
 
@@ -22247,6 +22250,12 @@ fn blob_result(e: &Expr, descs: &[Descriptor]) -> Option<(i16, u8)> {
     }
     let cs = match text_form(e, descs) {
         Some((_, _, TfCs::Ttype(t))) => (t & 0xFF) as u8,
+        // THE ATTACHMENT'S SET, which a literal carries: a NONE blob
+        // yields to it as NONE yields to any set (measured on 2196: `B ||
+        // '.'` over a NONE blob column, and `LIST(ID) || '.'`, describe
+        // UTF8 under a UTF8 attachment, WIN1252 under WIN1252 - this said
+        // NONE)
+        Some((_, _, TfCs::Att)) => CURRENT_ATT_CS.with(|c| c.get()),
         _ => 0,
     };
     Some((sub, if sub == 0 { 0 } else { cs }))
@@ -37252,6 +37261,12 @@ struct TempBlob {
     /// the permanent id once a store materialised it: a second store of
     /// the same temp id re-resolves to it (blb.cpp:1205)
     materialised: Option<[u8; 8]>,
+    /// the character set a COMPUTED text blob's bytes are in, when it is
+    /// known ([Expr::BlobOf] mints in its declared set): the delivery
+    /// moves them into the attachment's set as it moves a stored blob's.
+    /// None: raw bytes, delivered as they are (a client's own blob, and a
+    /// LIST fold's - which holds its text as UTF-8)
+    charset: Option<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -59890,6 +59905,18 @@ fn set_blob_source(db: Option<&Database>) {
 /// The stored length of blob `rel:num` through [BLOB_SOURCE]; None
 /// without a published image or for an id the pages do not hold.
 fn blob_length_of(rel: u16, num: u64) -> Option<i64> {
+    // A COMPUTED blob's bytes are held as UTF-8 whatever set it is
+    // declared in, so its octet count is the set's only for ASCII content
+    // (the same in every set); anything else refuses rather than counting
+    // the wrong octets (measured on 2196: OCTET_LENGTH(LIST(W)) over the
+    // WIN1252 'é', 'ü' is 3, the UTF-8 form 5)
+    if rel == 0 {
+        // a KNOWN set's bytes are its octets; a LIST's UTF-8 hold only
+        // ASCII's ([TempBlob::charset])
+        return computed_blob_bytes(num)
+            .filter(|(b, known)| known.is_some() || b.is_ascii())
+            .map(|(b, _)| b.len() as i64);
+    }
     let (shared, page_size) = BLOB_SOURCE.with(|c| c.borrow().clone())?;
     let image = shared.image();
     fire_crab_blb::read_blob(&image, page_size, rel, num)
@@ -68072,7 +68099,8 @@ fn resolve_agg_src(
                 }
                 keys.push((e, *desc, *nulls_first));
             }
-            (AggSrc::List { arg: a, sep: s, distinct: *distinct, pad, coll, order: keys }, false)
+            let cs = list_arg_charset(&a, descs) as u8;
+            (AggSrc::List { arg: a, sep: s, distinct: *distinct, pad, coll, order: keys, cs }, false)
         }
     };
     Some(out)
@@ -68305,7 +68333,9 @@ fn agg_result_desc(
                 AggTarget::List { arg, .. } => raw_first_text_charset(arg, columns, descs),
                 _ => 0,
             };
-            Descriptor { dtype: dtype::BLOB, scale: cs as i8, length: 8, sub_type: 1, flags: 0, offset: 0 }
+            // (offset 1: a zero offset with a length reads as a COMPUTED BY
+            // column - [is_computed_fid] - and every operand over it refused)
+            Descriptor { dtype: dtype::BLOB, scale: cs as i8, length: 8, sub_type: 1, flags: 0, offset: 1 }
         }
         AggFn::Count => int64(0),
         AggFn::Min | AggFn::Max => match target {
@@ -69659,8 +69689,11 @@ fn build_group_items(
             col.oct_length = pc.oct_length;
             col.scale = pc.scale;
             col.sub_type = pc.sub_type;
-            // the VALUE is computed from the group row by this expression
-            col.expr = Some(re);
+            // the VALUE is computed from the group row by the expression
+            // the describe was built for - a blob result's is wrapped to
+            // mint its blob ([Expr::BlobOf]); the bare one travelled as
+            // text into a blob slot, an EMPTY blob 0:0 at the client
+            col.expr = pc.expr.or(Some(re));
         }
     }
     Some((cols, gitems, slot_descs))
@@ -75891,6 +75924,46 @@ fn list_sorted(
     Ok(idx.into_iter().map(|x| keyed[x].1.clone()).collect())
 }
 
+/// A folded LIST re-minted in its character set ([AggSrc::List::cs]): the
+/// fold joins its pieces as UTF-8 text, which for a real set other than
+/// UTF8 is not the engine's bytes - `OCTET_LENGTH(LIST(W))` over WIN1252
+/// 'é', 'ü' is 3 on 2196, and a NONE / WIN1252 attachment receives the
+/// WIN1252 octets. Each segment is moved into the set, framing kept; a
+/// NONE / OCTETS list keeps its raw bytes, as before.
+fn list_in_set(v: Value, cs: u8) -> Result<Value, EvalErr> {
+    let Value::Blob(0, num) = v else { return Ok(v) };
+    if cs == 0 || fire_crab_ods::intl::byte_carrier(cs) {
+        return Ok(v);
+    }
+    let segs = BLOB_MINT.with(|c| {
+        c.borrow().as_ref().and_then(|ctx| {
+            ctx.minted.iter().find(|(id, _)| u64::from(*id) == num).map(|(_, tb)| tb.segments.clone())
+        })
+    });
+    // (a piece past 32768 bytes was split into segments mid-character,
+    // which a per-segment move could tear: such a list keeps its raw form)
+    let Some(segs) = segs.filter(|sg| sg.iter().all(|x| x.len() < 32768)) else { return Ok(v) };
+    let mut out = Vec::with_capacity(segs.len());
+    for sg in segs {
+        let t = String::from_utf8_lossy(&sg);
+        out.push(
+            fire_crab_ods::intl::encode_text(cs, &t)
+                .map_err(|_| EvalErr::TransliterationFailed)?
+                .unwrap_or_else(|| sg.clone()),
+        );
+    }
+    BLOB_MINT.with(|c| {
+        if let Some(ctx) = c.borrow_mut().as_mut() {
+            if let Some((_, tb)) = ctx.minted.iter_mut().find(|(id, _)| u64::from(*id) == num) {
+                tb.segments = out;
+                tb.max_put = tb.segments.iter().map(|x| x.len()).max().unwrap_or(0) as u16;
+                tb.charset = Some(cs);
+            }
+        }
+    });
+    Ok(v)
+}
+
 fn list_fold(
     rows: &[Vec<Value>],
     arg: &Expr,
@@ -76665,12 +76738,13 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                     }
                 }
                 GItem::Const(v) => v.clone(), // a per-group constant slot
-                GItem::Agg(AggFn::List, AggSrc::List { arg, sep, distinct, pad, coll, order }, _) => {
-                    if order.is_empty() {
+                GItem::Agg(AggFn::List, AggSrc::List { arg, sep, distinct, pad, coll, order, cs }, _) => {
+                    let v = if order.is_empty() {
                         list_fold(rows, arg, sep.as_ref(), *distinct, *pad, *coll)?
                     } else {
                         list_fold(&list_sorted(rows, order, arg, *pad)?, arg, sep.as_ref(), *distinct, *pad, *coll)?
-                    }
+                    };
+                    list_in_set(v, *cs)?
                 }
                 GItem::Agg(..) => Value::Null, // MIN/MAX/SUM(*): rejected at plan
             })
@@ -80887,7 +80961,8 @@ fn subst_params_aggsrc(s: &AggSrc, args: &[WireParam]) -> Option<AggSrc> {
             order: subst_params_expr(order, args)?,
             desc: *desc,
         },
-        AggSrc::List { arg, sep, distinct, pad, coll, order } => AggSrc::List {
+        AggSrc::List { arg, sep, distinct, pad, coll, order, cs } => AggSrc::List {
+            cs: *cs,
             arg: subst_params_expr(arg, args)?,
             sep: match sep {
                 Some(x) => Some(subst_params_expr(x, args)?),
@@ -82872,6 +82947,12 @@ fn drain_minted_blobs(db: &mut Option<Database>) {
 /// splits). Errors when no mint context is armed (a fold outside an op
 /// - nothing reaches a LIST fold that way).
 fn mint_computed_blob(pieces: &[Vec<u8>]) -> Result<Value, EvalErr> {
+    mint_computed_blob_cs(pieces, None)
+}
+
+/// [mint_computed_blob] whose bytes are in a KNOWN character set
+/// ([TempBlob::charset]).
+fn mint_computed_blob_cs(pieces: &[Vec<u8>], charset: Option<u8>) -> Result<Value, EvalErr> {
     BLOB_MINT.with(|c| {
         let mut b = c.borrow_mut();
         let ctx = b.as_mut().ok_or(EvalErr::Unsupported)?;
@@ -82892,7 +82973,7 @@ fn mint_computed_blob(pieces: &[Vec<u8>]) -> Result<Value, EvalErr> {
         let id = ctx.next;
         ctx.minted.push((
             id,
-            TempBlob { segments, stream: false, puts, max_put, closed: true, materialised: None },
+            TempBlob { segments, stream: false, puts, max_put, closed: true, materialised: None, charset },
         ));
         Ok(Value::Blob(0, id as u64))
     })
@@ -83045,6 +83126,30 @@ fn blob_value_text(rel: u16, num: u64) -> Result<(String, u8), EvalErr> {
     Ok((blob_text_of(rel, num, cs)?, cs))
 }
 
+/// A COMPUTED blob's bytes (relation 0): in the mint context while the op
+/// that made it runs, and - by a LATER op of the same statement - in the
+/// connection's temp blobs the op boundary drained it into (a grouped plan
+/// folds its LIST at execute and evaluates `UPPER(LIST(..))`,
+/// `OCTET_LENGTH(LIST(..))` at the fetch).
+fn computed_blob_bytes(num: u64) -> Option<(Vec<u8>, Option<u8>)> {
+    let minted = BLOB_MINT.with(|c| {
+        c.borrow().as_ref().and_then(|ctx| {
+            ctx.minted
+                .iter()
+                .find(|(id, _)| u64::from(*id) == num)
+                .map(|(_, tb)| (tb.segments.concat(), tb.charset))
+        })
+    });
+    minted.or_else(|| {
+        let ptr = SUBQ_DB.with(|c| c.get())?;
+        // SAFETY: armed by a [SubqDbGuard] over the database the op holds
+        // for as long as this evaluation runs
+        let db_opt: &Option<Database> = unsafe { &*ptr };
+        let id = u32::try_from(num).ok()?;
+        db_opt.as_ref()?.temp_blobs.get(&id).map(|tb| (tb.segments.concat(), tb.charset))
+    })
+}
+
 fn blob_text_of(rel: u16, num: u64, cs: u8) -> Result<String, EvalErr> {
     // A COMPUTED BLOB IS READABLE BY THE STATEMENT THAT MADE IT. One
     // carries relation 0 and lives in the mint context until the op
@@ -83054,17 +83159,15 @@ fn blob_text_of(rel: u16, num: u64, cs: u8) -> Result<String, EvalErr> {
     // where the engine answers the text. (Found on MON$SQL_TEXT; the
     // same held for `CAST(LIST(x) AS VARCHAR(n))`.)
     if rel == 0 {
-        let minted = BLOB_MINT.with(|c| {
-            c.borrow().as_ref().and_then(|ctx| {
-                ctx.minted
-                    .iter()
-                    .find(|(id, _)| u64::from(*id) == num)
-                    .map(|(_, tb)| tb.segments.concat())
-            })
-        });
-        let Some(bytes) = minted else {
+        let Some((bytes, known)) = computed_blob_bytes(num) else {
             return Err(EvalErr::Unsupported);
         };
+        // bytes in a KNOWN set read in it ([TempBlob::charset])
+        if let Some(kc) = known.filter(|k| !fire_crab_ods::intl::byte_carrier(*k)) {
+            if let Some(t) = fire_crab_ods::intl::decode_text(kc, &bytes) {
+                return Ok(t);
+            }
+        }
         return Ok(if fire_crab_ods::intl::byte_carrier(cs) {
             fire_crab_ods::intl::carrier_decode(&bytes)
         } else {
@@ -103699,7 +103802,11 @@ impl Expr {
                             .map_err(|_| EvalErr::TransliterationFailed)?
                             .unwrap_or_else(|| text.as_bytes().to_vec())
                     };
-                    mint_computed_blob(&[bytes])?
+                    // ...bytes in `cs`, which the delivery moves into the
+                    // attachment's set: shipped raw, `UPPER(<a WIN1252
+                    // blob>)` reached a UTF8 client as an invalid byte
+                    // (measured against 2196, which delivers 'É')
+                    mint_computed_blob_cs(&[bytes], Some(*cs))?
                 }
             },
             Expr::BlobText(fid, cs) => match values.get(*fid) {
@@ -138962,7 +139069,20 @@ fn after_auth(
                         if num == 0 {
                             ReadBlob::empty()
                         } else {
-                            db.temp_blobs.get(&(num as u32)).map(ReadBlob::of_temp).unwrap_or_else(ReadBlob::empty)
+                            match db.temp_blobs.get(&(num as u32)) {
+                                // a computed text blob in a known set is
+                                // delivered in the attachment's, as a
+                                // stored blob is ([TempBlob::charset])
+                                Some(tb) if tb.charset.is_some() => {
+                                    let mut rb = ReadBlob::of_temp(tb);
+                                    rb.segs = blob_segs_out(rb.segs, 1, tb.charset.unwrap_or(0), att_cs);
+                                    rb.length = rb.segs.iter().map(|x| x.len() as u64).sum();
+                                    rb.max_segment = rb.segs.iter().map(|x| x.len()).max().unwrap_or(0) as u16;
+                                    rb
+                                }
+                                Some(tb) => ReadBlob::of_temp(tb),
+                                None => ReadBlob::empty(),
+                            }
                         }
                     })
                 } else {
@@ -160902,3 +161022,4 @@ mod builtins_round {
         assert!(matches!(parse_raw_expr_any("12345.678"), Some(RawExpr::Dec(12345678, -3))));
     }
 }
+

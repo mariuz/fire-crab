@@ -40,9 +40,10 @@ Short, actionable items. The long-form engineering backlog lives in
 ## Recorded gaps found on the way (2026-10-03)
 
 - [x] `CAST(LIST(..) AS VARCHAR(n))` answers (`qa/serve-real-listexpr.sh`).
-- [ ] Other expressions over a LIST refuse: `LIST(K) || '!'`, UPPER / SUBSTRING / COALESCE, CHAR/OCTET_LENGTH
-      (listexpr section 2), and LIST in a condition (`HAVING LIST(ID) = '1,2'`, `LIKE`, `IS NULL`, `IIF`, `CASE
-      WHEN`) or an ORDER BY key.
+- [x] Every other expression over a LIST (`||`, UPPER, SUBSTRING, COALESCE, CHAR/OCTET_LENGTH, IIF, CASE WHEN,
+      ORDER BY) answers, and a computed blob is minted and delivered in its own character set (UTF8 / NONE /
+      WIN1252 attachments - listexpr sections 2 and 4).
+- [ ] A LIST in HAVING's comparison or LIKE (`HAVING LIST(ID) = '1,2'`) still refuses (listexpr 2b).
 - [x] Schema-qualified DDL (`CREATE TABLE PUBLIC.T7 ..`, every kind, a view body over `PUBLIC.T`) and an
       unknown schema's vector (`qa/serve-real-ddlqualified.sh`).
 - [x] A select list holding `GEN_ID(..)` / NEXT VALUE FOR beside a stored function call (fnwhere section 10).

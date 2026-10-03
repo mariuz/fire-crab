@@ -64,8 +64,7 @@
 #      before it - it desynchronised the wire (08006).
 #
 # RECORDED, not fixed (every one a refusal here, never a wrong answer):
-# LIST() inside an expression (a blob result, the recorded boundary of
-# the aggregate router); a VIEW whose select item is the predicate, or
+# a VIEW whose select item is the predicate, or
 # over OVERLAY (the view compiler has neither); OVERLAY over two
 # different character sets; DATEADD / DATEDIFF with QUARTER (the
 # engine's fetch-time "Invalid part"); an unordered NTH_VALUE window; a
@@ -326,9 +325,12 @@ refused "8 a VIEW whose select item is IS NOT DISTINCT (the compiler has no bool
 refused "8 a VIEW over OVERLAY (the compiler knows no OVERLAY)" "create view vd5 as select overlay(s placing 'x' from 1) o from d; commit; select count(*) from rdb\$relations where rdb\$relation_name = 'VD5';" "COUNT|1"
 # PROMOTED 2026-10-03: a CAST over a LIST answers (serve-real-listexpr.sh)
 pin  "8 LIST cast" "select cast(list(v) as varchar(50)) from t;" "CAST|b,a"
-refused "8 LIST concatenated" "select list(v) || '!' from t;" "CONCATENATION|0:2|CONCATENATION:|b,a!"
-refused "8 LIST measured" "select char_length(list(v)) from t;" "CHAR_LENGTH|3"
-refused "8 SUBSTRING over LIST (was -204 \"1\")" "select substring(list(v) from 1 for 3) from t;" "SUBSTRING|0:2|SUBSTRING:|b,a"
+# PROMOTED 2026-10-03: every expression over a LIST answers; the blob-out
+# forms are cast here only so the server's own blob id stays out of the
+# compared text (serve-real-listexpr.sh compares the blobs themselves)
+pin  "8 LIST concatenated" "select cast(list(v) || '!' as varchar(20)) from t;" "CAST|b,a!"
+pin  "8 LIST measured" "select char_length(list(v)) from t;" "CHAR_LENGTH|3"
+pin  "8 SUBSTRING over LIST (was -204 \"1\")" "select cast(substring(list(v) from 1 for 3) as varchar(20)) from t;" "CAST|b,a"
 pin "8 ...as EXTRACT(YEAR) is (the compiler's boundary)" "$(eb "execute block returns (r integer) as begin r = extract(year from date '2024-11-01'); suspend; end")" "R|2024"
 refused "8 OVERLAY over two sets" "select overlay(u placing w from 1) from u8;" "OVERLAY|def"
 refused "8 an unordered NTH_VALUE FROM LAST" "select id, nth_value(val, 1) from last over (partition by g) from w order by id;" "ID NTH_VALUE|1 30|2 30|3 30|4 <null>|5 <null>|6 <null>"
@@ -403,5 +405,5 @@ if grep -aq 'panicked at' "/tmp/fc-serve-fromloc-$PORT.log"; then echo "FAIL the
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 189 ]; then echo "FAIL only $ran checks ran (floor 189)"; fail=1; fi
+if [ "$ran" -lt 190 ]; then echo "FAIL only $ran checks ran (floor 190)"; fail=1; fi
 exit $fail

@@ -12,10 +12,14 @@
 # empty forms, the describe (VARYING n in the cast's set), and the 22001
 # `expected length 2, actual 3` when the list does not fit.
 #
-# STILL REFUSED (section 2, recorded - each fails the day it answers):
-# LIST(K) || '!', UPPER / SUBSTRING / COALESCE over it (blob-returning)
-# and CHAR_LENGTH / OCTET_LENGTH - the select-list route that types those
-# over a blob COLUMN is not the one the grouped path takes.
+# EVERY OTHER EXPRESSION over it (section 2) since 2026-10-03, after three
+# fixes: the slot descriptor carried offset 0, which reads as a COMPUTED BY
+# column and refused every operand; the grouped select list stored the
+# BARE expression, not the one wrapped to mint a blob result (a blob-out
+# expression shipped as id 0:0, EMPTY at the client - a wrong answer); and
+# a computed blob read by a LATER op of its statement (the fold runs at
+# execute, the select list at the fetch) was looked for only in the mint.
+# A LIST in HAVING's comparison or LIKE still refuses (2b, recorded).
 #
 #   qa/serve-real-listexpr.sh [port]
 set -u
@@ -32,6 +36,9 @@ CREATE TABLE G (ID INTEGER, K VARCHAR(5), C CHAR(3), W VARCHAR(5) CHARACTER SET 
 INSERT INTO G VALUES (1, 'a', 'x', 'é');
 INSERT INTO G VALUES (2, 'b', 'x', 'ü');
 INSERT INTO G VALUES (3, NULL, 'y', NULL);
+CREATE TABLE BT (ID INTEGER, B BLOB SUB_TYPE TEXT CHARACTER SET NONE, BW BLOB SUB_TYPE TEXT CHARACTER SET WIN1252);
+INSERT INTO BT VALUES (1, 'abc', 'é');
+INSERT INTO BT VALUES (2, 'de', 'ü');
 COMMIT;\n" "$REAL" "$ENG" "$U" "$P" | "$ISQL" -q -b > /tmp/listexpr-build.log 2>&1
 [ -s "$ENG" ] || { echo "FAIL fixture not created"; sed 's/^/   /' /tmp/listexpr-build.log; exit 1; }
 cp "$ENG" "$FC"; chmod 666 "$FC"
@@ -46,7 +53,10 @@ kill -0 $srv 2>/dev/null || { echo "FAIL fcwire is not running - port $PORT alre
 
 fail=0; ran=0
 norm() { grep -a -v '^$' | sed 's/  */ /g; s/ *$//' | tr '\n' '|'; }
-run() { printf 'SET SQLDA_DISPLAY ON;\n%s\n' "$2" | timeout 60 "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "$1" 2>&1 | norm; }
+# (a blob id line - `0:1c`, the value column beside it - is the server's own
+# numbering, not the content, which isql prints after it)
+run() { printf 'SET SQLDA_DISPLAY ON;\nSET BLOB ALL;\n%s\n' "$2" | timeout 60 "$ISQL" -q -ch "${CH:-UTF8}" -user "$U" -pas "$P" "$1" 2>&1 \
+    | sed -E 's/(^| +)[0-9a-f]+:[0-9a-f]+( |$)/\1\2/g; s/(^| +)[0-9a-f]+:[0-9a-f]+( |$)/\1\2/g; s/ +$//' | norm; }
 both() { # <label> <sql> - the describe and the answer
     ran=$((ran + 1))
     local e c
@@ -76,11 +86,36 @@ both "1 a WIN1252 argument, cast to UTF8"    "SELECT CAST(LIST(W) AS VARCHAR(20)
 both "1 a numeric argument"                  "SELECT CAST(LIST(ID * 10) AS VARCHAR(20)) FROM G;"
 both "1 beside another aggregate"            "SELECT COUNT(*), CAST(LIST(K, '|') AS VARCHAR(20)) FROM G;"
 
-echo "--- 2 RECORDED - the engine answers, this server refuses"
-recorded "2 LIST(K) || '!'"                  "SELECT LIST(K) || '!' FROM G;"
-recorded "2 UPPER(LIST(K))"                  "SELECT UPPER(LIST(K)) FROM G;"
-recorded "2 CHAR_LENGTH(LIST(K))"            "SELECT CHAR_LENGTH(LIST(K)) FROM G;"
-recorded "2 OCTET_LENGTH(LIST(K))"           "SELECT OCTET_LENGTH(LIST(K)) FROM G;"
+echo "--- 2 every other expression over a LIST (recorded refusals until 2026-10-03)"
+both "2 LIST(K) || '!' - a blob out"          "SELECT LIST(K) || '!' FROM G;"
+both "2 UPPER(LIST(K))"                        "SELECT UPPER(LIST(K)) FROM G;"
+both "2 CHAR_LENGTH(LIST(K))"                  "SELECT CHAR_LENGTH(LIST(K)) FROM G;"
+both "2 OCTET_LENGTH(LIST(K))"                 "SELECT OCTET_LENGTH(LIST(K)) FROM G;"
+both "2 SUBSTRING over a LIST"                 "SELECT SUBSTRING(LIST(K) FROM 1 FOR 2) FROM G;"
+both "2 COALESCE over an empty LIST - a blob"  "SELECT COALESCE(LIST(K), 'none') FROM G WHERE 1 = 0;"
+both "2 per group: lengths, a concatenation"   "SELECT C, CHAR_LENGTH(LIST(ID)) AS L, OCTET_LENGTH(LIST(ID)) AS O, LIST(ID) || '.' AS X FROM G GROUP BY C ORDER BY 1;"
+both "2 a WIN1252 argument's octets"           "SELECT OCTET_LENGTH(LIST(W)), CHAR_LENGTH(LIST(W)) FROM G;"
+both "2 IIF over a LIST"                       "SELECT IIF(LIST(K) = 'a,b', 1, 0) FROM G;"
+both "2 CASE WHEN a LIST IS NULL"              "SELECT CASE WHEN LIST(K) IS NULL THEN 'n' ELSE 'y' END FROM G;"
+both "2 ORDER BY a LIST"                       "SELECT C, COUNT(*) FROM G GROUP BY C ORDER BY LIST(ID);"
+echo "--- 2b RECORDED - the engine answers, this server refuses"
+recorded "2b HAVING LIST(..) = 'text'"         "SELECT C FROM G GROUP BY C HAVING LIST(ID) = '1,2';"
+recorded "2b HAVING LIST(..) LIKE"             "SELECT C FROM G GROUP BY C HAVING LIST(ID) LIKE '1%';"
+
+echo "--- 4 THE SETS: a computed blob's bytes, under UTF8, NONE and WIN1252 attachments"
+# a LIST is minted in its argument's set and a blob-valued expression in
+# its own, and each is delivered in the attachment's as a stored blob is:
+# shipped raw, `UPPER(<a WIN1252 blob>)` reached a UTF8 client as an
+# invalid byte, a bare LIST(<WIN1252>) a NONE one as UTF-8, and a NONE
+# blob `|| '.'` was described NONE where the literal's set rules
+for CH in UTF8 NONE WIN1252; do
+  both "4 [$CH] a NONE blob || a literal"        "SELECT B || '.' FROM BT WHERE ID = 1;"
+  both "4 [$CH] UPPER / || over a WIN1252 blob"  "SELECT UPPER(BW) AS U, BW || '.' AS C FROM BT WHERE ID = 1;"
+  both "4 [$CH] a LIST of WIN1252 values"         "SELECT LIST(BW) AS L, LIST(W, '|') AS L2 FROM BT, G WHERE G.ID = BT.ID;"
+  both "4 [$CH] lengths of WIN1252 lists"         "SELECT OCTET_LENGTH(LIST(W)) AS O, CHAR_LENGTH(LIST(W)) AS C FROM G;"
+  both "4 [$CH] LIST(W) || '.', UPPER(LIST(W))"   "SELECT LIST(W) || '.' AS X, UPPER(LIST(W)) AS U FROM G;"
+done
+CH=UTF8
 
 echo "--- 3 CONTROLS - a bare LIST and a non-LIST cast"
 both "3 a bare LIST is still its blob"       "SELECT CHAR_LENGTH(CAST(MAX(K) AS VARCHAR(5))) FROM G;"
@@ -92,6 +127,6 @@ if grep -aq 'panicked at' "/tmp/fc-serve-listexpr-$PORT.log"; then echo "FAIL th
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 16 on the 2026-10-03 binary, 16 OK
-if [ "$ran" -lt 16 ]; then echo "FAIL only $ran checks ran (floor 16) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 40 on the 2026-10-03 binary, 40 OK
+if [ "$ran" -lt 40 ]; then echo "FAIL only $ran checks ran (floor 40) - cells went missing"; fail=1; fi
 exit $fail
