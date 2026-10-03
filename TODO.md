@@ -18,6 +18,11 @@ Short, actionable items. The long-form engineering backlog lives in
       `serve-real-gbak.sh` (external table after an engine restore) and `serve-real-tz.sh` (named zone).
       All of them are red identically on the binary before 2026-10-02, so they aren't regressions. See the
       roadmap's "ENVIRONMENT FINDING".
-- [ ] The local engine stopped accepting connections once (2026-10-03 ~01:52) and needed
-      `sudo systemctl restart firebird`. It didn't reproduce; if it recurs, capture `ss -ltn | grep 3050`
-      and the engine's `firebird.log` before restarting.
+- [ ] **The local engine hits an internal mutex fault under heavy parallel load** - its `firebird.log`
+      records `Operating system call pthread_mutex_trylock failed. Error code 22` (EINVAL) three times
+      (2026-10-02 19:46 and 23:07, when fbguard restarted it; 2026-10-03 05:17, when it instead stopped
+      accepting connections - the 3050 accept queue full - and needed `sudo systemctl restart firebird`;
+      an earlier wedge at ~01:52 had the same symptom). Every time during a `-j 4` sweep; the first two
+      predate any of this work's code. Symptom in gates: `rc=124` timeouts and "the engine printed no
+      describe". Check `ss -ltn | grep 3050` (Recv-Q) and the log, restart, re-run the affected gates
+      alone; sweeps now run at `-j 3`. Possibly worth an upstream report once it has a narrower trigger.

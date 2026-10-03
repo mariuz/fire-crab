@@ -12361,6 +12361,13 @@ struct Predicate {
     tags: Vec<Vec<u32>>,
     keys: Vec<usize>,
     keys_known: bool,
+    /// Columns NO live index of the relation leads with - read from the
+    /// index root, so an index this server cannot otherwise read still
+    /// counts ([unindexed_fids]). Where a column is listed, the engine
+    /// can only SCAN for a predicate on it, which decides the access-path
+    /// split of a bound NaN against a text column ([Predicate::bind]).
+    /// Empty = unknown, never "all indexed".
+    unindexed: Vec<usize>,
 }
 
 impl Predicate {
@@ -12375,7 +12382,7 @@ impl Predicate {
         } else {
             groups.iter().map(|g| vec![0; g.len()]).collect()
         };
-        Predicate { groups, tags, keys: Vec::new(), keys_known: false }
+        Predicate { groups, tags, keys: Vec::new(), keys_known: false, unindexed: Vec::new() }
     }
 
     fn tagged(groups: Vec<Vec<Term>>, tags: Vec<Vec<u32>>) -> Predicate {
@@ -12383,12 +12390,12 @@ impl Predicate {
             groups.iter().map(Vec::len).collect::<Vec<_>>(),
             tags.iter().map(Vec::len).collect::<Vec<_>>(),
         );
-        Predicate { groups, tags, keys: Vec::new(), keys_known: false }
+        Predicate { groups, tags, keys: Vec::new(), keys_known: false, unindexed: Vec::new() }
     }
 
     /// `WHERE 1=0`: no group to satisfy, matches nothing.
     fn empty() -> Predicate {
-        Predicate { groups: vec![], tags: vec![], keys: Vec::new(), keys_known: false }
+        Predicate { groups: vec![], tags: vec![], keys: Vec::new(), keys_known: false, unindexed: Vec::new() }
     }
 
     /// The keyable columns of the relation this filter reads, for the
@@ -12406,6 +12413,13 @@ impl Predicate {
     fn keyed_like(mut self, src: &Predicate) -> Predicate {
         self.keys = src.keys.clone();
         self.keys_known = src.keys_known;
+        self.unindexed = src.unindexed.clone();
+        self
+    }
+
+    /// The columns no index leads with ([Predicate::unindexed]).
+    fn with_unindexed(mut self, fids: Vec<usize>) -> Predicate {
+        self.unindexed = fids;
         self
     }
 
@@ -12868,6 +12882,22 @@ impl Predicate {
                             // the indexed half, and refusing would take
                             // that right answer back.
                             WireParam::Double(d) if d.is_nan() && matches!(op, Cmp::Ne) => {
+                                Term::TextNumCmp(*fid, Cmp::Ge, Rhs::Dbl(f64::NEG_INFINITY))
+                            }
+                            // ...and where NO index leads with the column the
+                            // engine can only SCAN, so `>` / `>=` take the
+                            // heap half of the split: the NaN is the LESSER,
+                            // TRUE for every convertible row whichever side
+                            // it is written on (`S > ?`, `? < S` - measured
+                            // 2026-10-03 on an unindexed VARCHAR, where an
+                            // `UPDATE .. WHERE S > ?` [NaN] changed every row
+                            // on the engine and none here). A column an
+                            // index MIGHT be ranged on keeps today's reading.
+                            WireParam::Double(d)
+                                if d.is_nan()
+                                    && matches!(op, Cmp::Gt | Cmp::Ge)
+                                    && self.unindexed.contains(fid) =>
+                            {
                                 Term::TextNumCmp(*fid, Cmp::Ge, Rhs::Dbl(f64::NEG_INFINITY))
                             }
                             WireParam::Double(d) => {
@@ -13551,6 +13581,43 @@ fn index_key_fids(db: &Database, rel: u16, descs: &[Descriptor]) -> Vec<usize> {
         .filter(|op| op.retrievable)
         .filter_map(|op| op.segs.first().map(|(fid, _, _, _)| *fid))
         .collect()
+}
+
+/// The columns of `rel` that NO live index leads with, read straight
+/// from the index root page - every index counts, including one this
+/// server cannot otherwise read, a partial one and one being dropped; an
+/// EXPRESSION index cannot match a plain column and is passed over. Any
+/// read failure answers EMPTY (unknown), never a guess.
+fn unindexed_fids(db: &Database, rel: u16, descs: &[Descriptor]) -> Vec<usize> {
+    // memoised per relation like [resolve_index_ops]: finding the index
+    // root scans the pages, and every WHERE plan asks
+    db.meta_memo("unindexed-fids", &rel.to_string(), || unindexed_fids_uncached(db, rel, descs))
+        .as_ref()
+        .clone()
+}
+
+fn unindexed_fids_uncached(db: &Database, rel: u16, descs: &[Descriptor]) -> Vec<usize> {
+    use fire_crab_ods::btw;
+    let image = db.bytes();
+    let Some(irt) = fire_crab_ods::btr::find_index_root(&image, db.page_size, rel) else {
+        return (0..descs.len()).collect(); // no index root: no index at all
+    };
+    let mut led: Vec<usize> = Vec::new();
+    for e in irt.live_entries() {
+        let Some((segs, iflags)) =
+            btw::index_segments(&image, db.page_size, rel, e.id, e.key_count as usize)
+        else {
+            return Vec::new();
+        };
+        if iflags & btw::IRT_EXPRESSION != 0 {
+            continue;
+        }
+        match segs.first() {
+            Some((field, _)) => led.push(*field as usize),
+            None => return Vec::new(),
+        }
+    }
+    (0..descs.len()).filter(|f| !led.contains(f)).collect()
 }
 
 /// Bind an optional filter's parameters, if it has any.
@@ -39028,7 +39095,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                     .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))
                     // the engine's own keyable columns: an unconvertible
                     // literal on one of them raises at OPEN
-                    .map(|p| p.with_keys(index_key_fids(db, rel, descs)))?,
+                    .map(|p| p.with_keys(index_key_fids(db, rel, descs)).with_unindexed(unindexed_fids(db, rel, descs)))?,
             )
         }
     };
@@ -39235,7 +39302,7 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                     .and_then(|raw| resolve_predicate(raw, &columns, descs, &mut params))
                     // the engine's own keyable columns: an unconvertible
                     // literal on one of them raises at OPEN
-                    .map(|p| p.with_keys(index_key_fids(db, rel, descs)))?,
+                    .map(|p| p.with_keys(index_key_fids(db, rel, descs)).with_unindexed(unindexed_fids(db, rel, descs)))?,
             )
         }
     };
@@ -65550,7 +65617,7 @@ fn plan_query_inner_at_body(
             .and_then(|raw| resolve_predicate(raw, &columns, &descs, params))
             // the engine's own keyable columns: an unconvertible literal
             // on one of them raises at OPEN
-            .map(|p| p.with_keys(index_key_fids(db, rel, &descs)))
+            .map(|p| p.with_keys(index_key_fids(db, rel, &descs)).with_unindexed(unindexed_fids(db, rel, &descs)))
         {
             Some(p) => Some(p),
             None => {
