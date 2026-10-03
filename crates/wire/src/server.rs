@@ -42836,7 +42836,12 @@ fn execute_dml_collecting_inner(
                         // that way since [ExecErr] gained its Eval arm,
                         // and flattening it here was the one place the
                         // two halves of an UPDATE disagreed.
-                        let v = e.eval(&old_values).map_err(ExecErr::Eval)?;
+                        // a stored call in the value reads the pre-pass's
+                        // values for this record ([dml_fn_prepass])
+                        DML_ROW_KEY.with(|k| k.set(Some((page, slot))));
+                        let v = e.eval(&old_values);
+                        DML_ROW_KEY.with(|k| k.set(None));
+                        let v = v.map_err(ExecErr::Eval)?;
                         // a folded SQL BOOLEAN into a text column spells
                         // TRUE/FALSE (probed) - the parameter arm's
                         // '1'/'0' is the client-bound rule
@@ -126295,14 +126300,16 @@ fn dml_fn_plannable(plan: &Plan, calls: &[FnCall], db: &Option<Database>) -> boo
     if FN_NESTED.with(|n| n.get()) {
         return false;
     }
-    let filter_only = match plan {
+    // the calls stand in the WHERE or an UPDATE's SET values - a subquery
+    // ([FN_NESTED]), a ROWS clause, a generator-drawing WHERE keep theirs
+    let placed = match plan {
         Plan::Delete { filter, gen_filter: None, limit: None, .. } => filter_calls_fn(filter),
         Plan::Update { filter, sets, gen_filter: None, limit: None, .. } => {
-            filter_calls_fn(filter) && !sets.iter().any(|(_, v)| matches!(v, SetVal::Expr(e) if expr_has_user_fn(e)))
+            filter_calls_fn(filter) || sets.iter().any(|(_, v)| matches!(v, SetVal::Expr(e) if expr_has_user_fn(e)))
         }
         _ => false,
     };
-    filter_only && calls.iter().all(|c| user_fn_pure(db, &c.name, &mut Vec::new()))
+    placed && calls.iter().all(|c| user_fn_pure(db, &c.name, &mut Vec::new()))
 }
 
 /// THE PRE-PASS of a DML statement whose WHERE calls a stored function:
@@ -126342,11 +126349,32 @@ fn dml_fn_prepass(
             })
             .collect()
     };
+    // an UPDATE's SET values that call, bound as the write loop binds
+    // them, evaluated for the rows the WHERE keeps, left to right
+    let set_exprs: Vec<Expr> = match plan {
+        Plan::Update { sets, .. } => sets
+            .iter()
+            .filter_map(|(_, v)| match v {
+                SetVal::Expr(e) if expr_has_user_fn(e) => {
+                    Some(if expr_has_param(e) { subst_params_expr(e, args).ok_or(EvalErr::Unsupported) } else { Ok(e.clone()) })
+                }
+                _ => None,
+            })
+            .collect::<Result<_, _>>()?,
+        _ => Vec::new(),
+    };
     let mut out = std::collections::HashMap::new();
-    let Some(p) = &filter else { return Ok(out) };
     for (page, slot, values) in rows {
         FN_VALS.with(|m| m.borrow_mut().clear());
-        lazy_fn_eval(database, calls, args, ctx, &values, &|| p.matches(&values))?;
+        let kept = match &filter {
+            Some(p) => lazy_fn_eval(database, calls, args, ctx, &values, &|| p.matches(&values))?,
+            None => true,
+        };
+        if kept {
+            for e in &set_exprs {
+                lazy_fn_eval(database, calls, args, ctx, &values, &|| e.eval(&values))?;
+            }
+        }
         out.insert((page, slot), FN_VALS.with(|m| std::mem::take(&mut *m.borrow_mut())));
     }
     FN_VALS.with(|m| m.borrow_mut().clear());

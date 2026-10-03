@@ -43,8 +43,9 @@
 # generator, context or event, and their callees the same) runs its calls
 # in a PRE-PASS over the target walk's own candidates - the same index
 # range, written order - and the walk that writes reads each record's
-# values by its (page, slot). An impure call, a call in the SET list or
-# under RETURNING refuse (8b): the engine's calls see the statement's own
+# values by its (page, slot); an UPDATE's SET values that call run there
+# too, for the rows the WHERE keeps. An impure call, or one under
+# RETURNING, refuses (8b): the engine's calls see the statement's own
 # earlier writes (`DELETE FROM T WHERE ID < FC()`, FC counting T, deletes
 # one row of three), which no pre-pass reproduces.
 #
@@ -338,13 +339,18 @@ both "8 a pure function calling a pure one"         "UPDATE T SET N = 0 WHERE FN
 both "8 the index range bounds the calls"           "DELETE FROM TI WHERE FZ(ID) > 0 AND ID = 1" '[]' "SELECT ID FROM TI ORDER BY ID"
 both "8 a text call"                                "UPDATE T SET V = 'y' WHERE F2(V, ID) = 'b-2'" '[]' "$RT"
 both "8 nothing matches"                            "DELETE FROM T WHERE F1(ID) > 100" '[]' "$RT"
+both "8 SET V = F2(V, ID) - a call in the SET list" "UPDATE T SET V = F2(V, ID) WHERE ID = 2" '[]' "$RT"
+both "8 SET ID = F1(ID) WHERE F1(ID) < 5 - both"    "UPDATE T SET ID = F1(ID) WHERE F1(ID) < 5" '[]' "$RT"
+both "8 SET N = FZ(ID) raises at row 2"            "UPDATE T SET N = FZ(ID)" '[]' "SELECT ID, N FROM T ORDER BY ID"
+both "8 SET under IIF never runs FZ(2)"            "UPDATE T SET N = IIF(ID = 2, 0, FZ(ID))" '[]' "SELECT ID, N FROM T ORDER BY ID"
+both "8 SET simultaneous: both read the old row"   "UPDATE T SET N = F1(ID), V = F2(V, ID) WHERE ID <> 2" '[]' "SELECT ID, V, N FROM T ORDER BY ID"
 both "8 CONTROL - a DML with no call"               "UPDATE T SET V = 'z' WHERE ID = 3" '[]' "$RT"
 both "8 CONTROL - a SELECT after the DML lexed a call" "SELECT ID FROM T WHERE ID = 1" '[]'
 echo "--- 8b RECORDED - an IMPURE function: the engine's calls see the statement's own writes"
 # `DELETE FROM T WHERE ID < FC()`, FC counting T: the engine deletes ONE
 # row of three (the count falls as rows go); a pre-pass cannot reproduce it
 eng_only "8b DELETE .. WHERE ID < FC() - FC reads the target" "DELETE FROM T WHERE ID < FC()" '[]'
-eng_only "8b a call in the SET list"                "UPDATE T SET V = F2(V, ID) WHERE ID = 2" '[]'
+eng_only "8b a ? argument of a call in the SET list" "UPDATE T SET V = F2(V, ?) WHERE ID = 1" '[7]'
 eng_only "8b a call with RETURNING"                 "UPDATE T SET V = 'q' WHERE F1(ID) = 2 RETURNING ID" '[]'
 
 echo "--- panic check"
@@ -353,6 +359,6 @@ if grep -aq 'panicked at' "/tmp/fc-serve-fnwhere-$PORT.log"; then echo "FAIL the
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 159 on the 2026-10-03 binary, 159 OK
-if [ "$ran" -lt 159 ]; then echo "FAIL only $ran checks ran (floor 159) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 164 on the 2026-10-03 binary, 164 OK
+if [ "$ran" -lt 164 ]; then echo "FAIL only $ran checks ran (floor 164) - cells went missing"; fail=1; fi
 exit $fail
