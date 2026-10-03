@@ -102096,8 +102096,23 @@ impl Expr {
                 // Scaled(0, -2) is NOT equal to it - num_cmp is the
                 // exact i128 alignment the engine's dialect-3 compare
                 // uses. `NULLIF(0, 0.00)` is NULL in the engine.
+                // A NaN IS NEVER EQUAL, NOT EVEN TO ITSELF - the equality
+                // rule `serve-real-nanrow.sh` measured for every predicate,
+                // and NULLIF is an equality test. [value_cmp] gives a NaN
+                // its TOTAL-ORDER key (that is what sorts it), under which
+                // two NaNs are Equal - so `NULLIF(D, D)` answered NULL on a
+                // NaN row where the engine answers the NaN, and `WHERE
+                // NULLIF(D, D) IS NULL` took the rows the engine leaves
+                // (measured 2026-10-03; a DELETE with it removed them)
+                let nan = |v: &Value| match v {
+                    Value::Double(d) => d.is_nan(),
+                    Value::Float(f) => f.is_nan(),
+                    _ => false,
+                };
                 let equal = !matches!(x, Value::Null)
                     && !matches!(y, Value::Null)
+                    && !nan(&x)
+                    && !nan(&y)
                     && match num_cmp(&x, &y) {
                         Some(o) => o == std::cmp::Ordering::Equal,
                         None => value_cmp(&x, &y) == std::cmp::Ordering::Equal,

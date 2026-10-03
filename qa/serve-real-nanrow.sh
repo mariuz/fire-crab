@@ -378,6 +378,27 @@ both             "4 ORDER BY D - IEEE totalOrder with the sign: +NaN ABOVE +Inf 
 both             "4 COUNT of DISTINCT D - the engine dedups BY THE SORT KEY, so the two +NaN rows COLLAPSE (agreed 2026-09-26)" "SELECT COUNT(*) A FROM (SELECT DISTINCT D FROM M) X"
 both             "4 COUNT of the GROUP BY groups - GROUP BY uses EQUALITY instead, so the same two rows do NOT collapse (agreed 2026-09-26: a NaN key is its own group)" "SELECT COUNT(*) A FROM (SELECT D FROM M GROUP BY D) X"
 
+
+echo "-- 5. NULLIF IS AN EQUALITY TEST, SO A NaN NEVER MATCHES - not even itself --"
+# [value_cmp] gives a NaN its TOTAL-ORDER key (section 4's sort), under
+# which two NaNs are Equal - and NULLIF compared through it.  So `NULLIF(D,
+# D)` answered NULL on a NaN row where the engine answers the NaN, and the
+# DML built on it was SILENTLY DESTRUCTIVE: `DELETE .. WHERE NULLIF(D, D)
+# IS NULL` EMPTIED the table where the engine keeps the two NaN rows, the
+# bound-NaN DELETE took rows the engine keeps, and `SET D = NULLIF(D, D)`
+# wrote NULL over a NaN (measured 2026-10-03; roadmap item (b)).
+both             "5 NULLIF(D, D) - a NaN row answers the NaN"        "SELECT ID, NULLIF(D, D) FROM M ORDER BY ID"
+both             "5 WHERE NULLIF(D, D) IS NULL - the NaN rows stay out" "SELECT ID FROM M WHERE NULLIF(D, D) IS NULL ORDER BY ID"
+both             "5 the INDEXED twin"                                "SELECT ID FROM MI WHERE NULLIF(D, D) IS NULL ORDER BY ID"
+both             "5 NULLIF(FL, FL) - a FLOAT NaN"                    "SELECT ID, NULLIF(FL, FL) FROM M ORDER BY ID"
+both             "5 NULLIF(D, FL) - across the two widths"           "SELECT ID, NULLIF(D, FL) FROM M ORDER BY ID"
+both             "5 NULLIF(D, D2) - two columns"                     "SELECT ID, NULLIF(D, D2) FROM M ORDER BY ID"
+both             "5 CONTROL NULLIF(D, 1.5) - a finite match still nulls" "SELECT ID, NULLIF(D, 1.5) FROM M ORDER BY ID"
+both             "5 NULLIF(D, ?) ['#NaN'] IS NULL - only the NULL row" "SELECT ID FROM M WHERE NULLIF(D, ?) IS NULL ORDER BY ID" '["#NaN"]'
+both             "5 NULLIF(?, D) ['#NaN'] - the bound NaN on the left" "SELECT ID, NULLIF(?, D) FROM M ORDER BY ID" '["#NaN"]'
+dml_rb           "5 DELETE .. WHERE NULLIF(D, D) IS NULL - the engine keeps the NaN rows" "DELETE FROM M WHERE NULLIF(D, D) IS NULL" '[]' "SELECT ID FROM M ORDER BY ID"
+dml_rb           "5 DELETE .. WHERE NULLIF(D, ?) IS NULL ['#NaN']"    "DELETE FROM M WHERE NULLIF(D, ?) IS NULL" '["#NaN"]' "SELECT ID FROM M ORDER BY ID"
+dml_rb           "5 UPDATE SET D = NULLIF(D, D) - a NaN is kept, not nulled" "UPDATE M SET D = NULLIF(D, D)" '[]' "SELECT ID, D FROM M ORDER BY ID"
 # the server's stderr log is the ONE place a PANIC shows
 panic_free() {
     ran=$((ran + 1))
@@ -396,7 +417,8 @@ kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$ENG" "$FC"
 echo "ran $ran checks"
 # THE FLOOR IS COUNTED FROM A MEASURED RUN, never typed.
-if [ "$ran" -lt 44 ]; then
-    echo "FAIL only $ran checks ran; 44 were measured - cells went missing"; fail=1
+# 44 measured, + section 5's 12 (2026-10-03) = 56
+if [ "$ran" -lt 56 ]; then
+    echo "FAIL only $ran checks ran; 56 were measured - cells went missing"; fail=1
 fi
 exit $fail
