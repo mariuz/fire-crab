@@ -60619,6 +60619,237 @@ fn limit_lint_scan(sql: &str, known: &dyn Fn(&str, bool) -> bool) -> LimitLint {
 /// Returns (query without the modifiers, distinct, skip, take), or None
 /// when there is nothing to strip. `Err` shape: an out-of-order head
 /// yields Some with `bad` set so the caller can raise.
+/// One operand of a row window that may be BOUND: a literal, or the
+/// statement's n-th window parameter at the head (FIRST / SKIP) or tail
+/// (ROWS / OFFSET / FETCH).
+#[derive(Clone, Copy, Debug)]
+enum RowWinArg {
+    Lit(i64),
+    Head(usize),
+    Tail(usize),
+}
+
+/// A SELECT's row window whose counts are `?` ([window_template]).
+#[derive(Clone, Debug, Default)]
+struct RowWindow {
+    first: Option<RowWinArg>,
+    skip: Option<RowWinArg>,
+    rows: Option<(RowWinArg, Option<RowWinArg>)>,
+    offset: Option<RowWinArg>,
+    fetch: Option<RowWinArg>,
+    head_n: usize,
+    tail_n: usize,
+}
+
+impl RowWindow {
+    /// The (skip, take) the bound values make - the engine's laws,
+    /// measured on 2196: a NULL count delivers no row and a NULL skip
+    /// skips none; `ROWS m TO n` is FIRST n - m + 1, SKIP m - 1, NULL if
+    /// either is; a negative count is `isc_bad_limit_param`, a negative
+    /// skip `isc_bad_skip_param`, the count judged first; a fractional
+    /// value rounds.
+    fn window(&self, args: &[WireParam]) -> Result<(usize, Option<usize>), EvalErr> {
+        let val = |a: RowWinArg| -> Result<Option<i64>, EvalErr> {
+            let p = match a {
+                RowWinArg::Lit(v) => return Ok(Some(v)),
+                RowWinArg::Head(i) => args.get(i),
+                RowWinArg::Tail(j) => args.get(args.len().checked_sub(self.tail_n).ok_or(EvalErr::Unsupported)? + j),
+            };
+            Ok(match p.ok_or(EvalErr::Unsupported)? {
+                WireParam::Null => None,
+                WireParam::Int(v, sc) => {
+                    let mut f = *v as f64;
+                    if *sc < 0 {
+                        f /= 10f64.powi(-(*sc as i32));
+                    } else {
+                        f *= 10f64.powi(*sc as i32);
+                    }
+                    Some(f.round() as i64)
+                }
+                WireParam::Int128(v, sc) => Some(((*v as f64) * 10f64.powi(*sc as i32)).round() as i64),
+                WireParam::Double(f) => Some(f.round() as i64),
+                WireParam::Text(t) | WireParam::TextCs(t, _) => {
+                    let f: f64 = t.trim().parse().map_err(|_| EvalErr::ConversionError(Some(t.clone())))?;
+                    Some(f.round() as i64)
+                }
+                _ => return Err(EvalErr::Unsupported),
+            })
+        };
+        let (take, has_take) = match (self.first, self.rows, self.fetch) {
+            (Some(a), _, _) | (None, Some((a, None)), _) | (None, None, Some(a)) => (val(a)?, true),
+            (None, Some((m, Some(n))), _) => match (val(m)?, val(n)?) {
+                (Some(m), Some(n)) => (Some(n - m + 1), true),
+                _ => (None, true),
+            },
+            _ => (None, false),
+        };
+        let (skip, has_skip) = match (self.skip, self.offset, self.rows) {
+            (Some(a), _, _) | (None, Some(a), _) => (val(a)?, true),
+            (None, None, Some((m, Some(_)))) => (val(m)?.map(|m| m - 1), true),
+            _ => (None, false),
+        };
+        let take = if has_take {
+            let t = take.unwrap_or(0);
+            if t < 0 {
+                return Err(EvalErr::BadLimitParam);
+            }
+            Some(t as usize)
+        } else {
+            None
+        };
+        let skip = if has_skip {
+            let s = skip.unwrap_or(0);
+            if s < 0 {
+                return Err(EvalErr::BadSkipParam);
+            }
+            s as usize
+        } else {
+            0
+        };
+        Ok((skip, take))
+    }
+}
+
+/// A SELECT whose row window counts are `?` - `FIRST ?` / `FIRST (?)` /
+/// `SKIP ?` at the head, `ROWS ? [TO ?]`, `OFFSET ? ROWS`, `FETCH
+/// {FIRST|NEXT} ? ROWS ONLY` at the tail - as the text planned with each
+/// `?` replaced by a placeholder count, and the window to compute at
+/// EXECUTE ([RowWindow::window]). Each such parameter is described `INT64`
+/// NOT NULL (measured on 2196), the head's before every other parameter
+/// of the statement and the tail's after. None when no window count is a
+/// `?`, and for a UNION's head (that FIRST is its first member's).
+fn window_template(sql: &str) -> Option<(String, RowWindow)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = mask_literals(&s.to_ascii_uppercase());
+    if find_word(&up, "SELECT", 0) != Some(0) || !up.contains('?') {
+        return None;
+    }
+    let b = up.as_bytes();
+    let skip_ws = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let word = |i: usize| -> (&str, usize) {
+        let mut j = i;
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'$') {
+            j += 1;
+        }
+        (&up[i..j], j)
+    };
+    // an operand at i: `?`, `(?)`, a literal or `(literal)`; its value and
+    // end, and the byte range of a `?` to replace
+    let operand = |i: usize| -> Option<(Option<i64>, usize, Option<usize>)> {
+        let i = skip_ws(i);
+        let (inner, wrap) = if b.get(i) == Some(&b'(') { (skip_ws(i + 1), true) } else { (i, false) };
+        let (lit, q, mut end) = if b.get(inner) == Some(&b'?') {
+            (None, Some(inner), inner + 1)
+        } else {
+            let mut j = inner;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j == inner {
+                return None;
+            }
+            (Some(up[inner..j].parse::<i64>().ok()?), None, j)
+        };
+        if wrap {
+            end = skip_ws(end);
+            if b.get(end) != Some(&b')') {
+                return None;
+            }
+            end += 1;
+        }
+        Some((lit, end, q))
+    };
+    let mut spec = RowWindow::default();
+    let mut swaps: Vec<(usize, &'static str)> = Vec::new();
+    let mut head = |lit: Option<i64>, q: Option<usize>, ph: &'static str, spec: &mut RowWindow, swaps: &mut Vec<(usize, &'static str)>| {
+        match (lit, q) {
+            (Some(v), _) => RowWinArg::Lit(v),
+            (None, Some(at)) => {
+                swaps.push((at, ph));
+                spec.head_n += 1;
+                RowWinArg::Head(spec.head_n - 1)
+            }
+            _ => RowWinArg::Lit(0),
+        }
+    };
+    let union = split_union(s).is_some();
+    let mut at = skip_ws("SELECT".len());
+    let (w, end) = word(at);
+    if w == "FIRST" {
+        let (lit, e, q) = operand(end)?;
+        if union && q.is_some() {
+            return None;
+        }
+        spec.first = Some(head(lit, q, "1", &mut spec, &mut swaps));
+        at = skip_ws(e);
+    }
+    let (w, end) = word(at);
+    if w == "SKIP" {
+        let (lit, e, q) = operand(end)?;
+        if union && q.is_some() {
+            return None;
+        }
+        spec.skip = Some(head(lit, q, "0", &mut spec, &mut swaps));
+    }
+    let mut tail = |lit: Option<i64>, q: Option<usize>, ph: &'static str, spec: &mut RowWindow, swaps: &mut Vec<(usize, &'static str)>| {
+        match (lit, q) {
+            (Some(v), _) => RowWinArg::Lit(v),
+            (None, Some(at)) => {
+                swaps.push((at, ph));
+                spec.tail_n += 1;
+                RowWinArg::Tail(spec.tail_n - 1)
+            }
+            _ => RowWinArg::Lit(0),
+        }
+    };
+    let off_kw = find_word_depth0(&up, "OFFSET", 0);
+    let fetch_kw = find_word_depth0(&up, "FETCH", 0);
+    if off_kw.is_some() || fetch_kw.is_some() {
+        if let Some(o) = off_kw {
+            let (lit, _, q) = operand(o + "OFFSET".len())?;
+            spec.offset = Some(tail(lit, q, "0", &mut spec, &mut swaps));
+        }
+        if let Some(f) = fetch_kw {
+            let (w, e) = word(skip_ws(f + "FETCH".len()));
+            if w != "FIRST" && w != "NEXT" {
+                return None;
+            }
+            if let Some((lit, _, q)) = operand(e) {
+                spec.fetch = Some(tail(lit, q, "1", &mut spec, &mut swaps));
+            }
+        }
+    } else if let Some(kw) = find_word_depth0(&up, "ROWS", 0) {
+        let (lit, e, q) = operand(kw + "ROWS".len())?;
+        let m = tail(lit, q, "1", &mut spec, &mut swaps);
+        let (w, e2) = word(skip_ws(e));
+        let n = if w == "TO" {
+            let (lit, _, q) = operand(e2)?;
+            Some(tail(lit, q, "1", &mut spec, &mut swaps))
+        } else {
+            None
+        };
+        spec.rows = Some((m, n));
+    }
+    if swaps.is_empty() {
+        return None;
+    }
+    swaps.sort_unstable_by_key(|(at, _)| *at);
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0;
+    for (at, ph) in swaps {
+        out.push_str(&s[last..at]);
+        out.push_str(ph);
+        last = at + 1;
+    }
+    out.push_str(&s[last..]);
+    Some((out, spec))
+}
+
 fn strip_modifiers(sql: &str) -> Option<(String, bool, usize, Option<usize>, bool)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = mask_literals(&s.to_ascii_uppercase());
@@ -134904,6 +135135,9 @@ fn after_auth(
     let mut scrollable: std::collections::HashSet<i32> = std::collections::HashSet::new();
     // the user-function calls the CURRENT plan holds (see [FnCall])
     let mut fn_calls: std::rc::Rc<Vec<FnCall>> = std::rc::Rc::new(Vec::new());
+    // a prepared SELECT's row window whose counts are `?`, by handle
+    // ([window_template]): computed from the bound values at each execute
+    let mut row_windows: std::collections::HashMap<i32, RowWindow> = std::collections::HashMap::new();
     let mut scroll: std::collections::HashMap<i32, ScrollState> = std::collections::HashMap::new();
     // the open BATCH per statement (op_batch_create .. op_batch_rls):
     // the input message layout and the messages queued so far - see
@@ -135498,6 +135732,7 @@ fn after_auth(
                         // a new text has no calls until its own planner
                         // gathers them
                         fn_calls = std::rc::Rc::new(Vec::new());
+                        row_windows.remove(&cur_stmt);
                         stmt_sql = rewrite_entry_literals(entry_strip_comments(&raw_sql), att_cs.id);
                         // a CAST to a DOMAIN spelled as its type ([rewrite_domain_casts])
                         if let Some(t) = rewrite_domain_casts(&stmt_sql, &database) {
@@ -135966,6 +136201,14 @@ fn after_auth(
                     // computed - and a plan is a function of the schema
                     // and the text again.
                     let gen = database.as_ref().map_or(0, |d| d.meta.generation());
+                    // A ROW WINDOW COUNTED BY `?` plans as a placeholder
+                    // count; the bound counts replace it at each execute
+                    // ([window_template])
+                    let row_window = window_template(&stmt_sql);
+                    let written_sql = stmt_sql.clone();
+                    if let Some((t, _)) = &row_window {
+                        stmt_sql = t.clone();
+                    }
                     // a text that CALLS a user function plans outside the
                     // cache: its call list ([FN_CALLS]) is gathered while
                     // planning, and a cached plan would not gather it
@@ -136001,6 +136244,24 @@ fn after_auth(
                     LEX_USER_FNS.with(|a| a.set(false));
                     fn_calls = std::rc::Rc::new(FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut())));
                     let p = if !calls_fn || fn_plannable(&p, &fn_calls, &database) { p } else { std::rc::Rc::new(Plan::Refused) };
+                    stmt_sql = written_sql;
+                    // the window's parameters join the describe where the
+                    // text holds them: the head's first, the tail's last -
+                    // each `INT64` NOT NULL (measured on 2196)
+                    let (p, ps) = match row_window {
+                        Some((_, w)) if matches!(&*p, Plan::Modified { .. }) => {
+                            let d = Descriptor { dtype: dtype::INT64, scale: 0, length: 8, sub_type: 0, flags: PARAM_NOT_NULL, offset: 0 };
+                            let mut all: Vec<Descriptor> = vec![d.clone(); w.head_n];
+                            all.extend(ps.iter().cloned());
+                            all.extend(std::iter::repeat_n(d, w.tail_n));
+                            row_windows.insert(cur_stmt, w);
+                            (p, std::rc::Rc::new(all))
+                        }
+                        Some(_) if !matches!(&*p, Plan::Refused | Plan::RefusedEval(_)) => {
+                            (std::rc::Rc::new(Plan::Refused), ps)
+                        }
+                        _ => (p, ps),
+                    };
                     // A REFUSED STATEMENT FAILS AT PREPARE, which is where
                     // the engine fails an unsupported one too. Answering
                     // the prepare and then raising at fetch left the error
@@ -136100,11 +136361,39 @@ fn after_auth(
                 if std::env::var("FC_SRV_TRACE").is_ok() && !bound_args.is_empty() {
                     eprintln!("[srv] execute params: {:?}", bound_args);
                 }
+                // A ROW WINDOW COUNTED BY `?`: its counts come off the
+                // message here, the window is computed (a bad count raises
+                // now, at open - [RowWindow::window]) and the rest of the
+                // statement sees only its own parameters
+                let mut exec_params = stmt_params.clone();
+                if let (Some(w), true) = (row_windows.get(&cur_stmt).cloned(), bound_args.len() == stmt_params.len()) {
+                    match w.window(&bound_args) {
+                        Ok((skip, take)) => {
+                            if let Plan::Modified { inner, cols, distinct, .. } = &*plan {
+                                plan = std::rc::Rc::new(Plan::Modified {
+                                    inner: inner.clone(),
+                                    cols: cols.clone(),
+                                    distinct: *distinct,
+                                    skip,
+                                    take,
+                                });
+                            }
+                            let end = bound_args.len() - w.tail_n;
+                            bound_args = bound_args[w.head_n..end].to_vec();
+                            exec_params = std::rc::Rc::new(stmt_params[w.head_n..end].to_vec());
+                        }
+                        Err(e) => {
+                            last_dml = (0, 0, 0);
+                            respond_eval_error(&mut s, &mut enc, &e)?;
+                            continue;
+                        }
+                    }
+                }
                 // PROJECTION PARAMETERS bound here, once, so every fetch
                 // path below evaluates a param-free projection (the CAST
                 // over each `?` converts the bound value). A no-op for a
                 // plan whose projection has none.
-                if bound_args.len() == stmt_params.len() && plan_has_proj_param(&plan) {
+                if bound_args.len() == exec_params.len() && plan_has_proj_param(&plan) {
                     if let Some(p) = bind_plan_params(&plan, &bound_args) {
                         plan = std::rc::Rc::new(p);
                     }
@@ -136136,7 +136425,7 @@ fn after_auth(
                 // the client must supply exactly the parameters the
                 // describe announced - fewer or more is an error, not a
                 // guess
-                if bound_args.len() != stmt_params.len() {
+                if bound_args.len() != exec_params.len() {
                     last_dml = (0, 0, 0);
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                 } else if let Some(e) = ddl_savepoint_refusal(&stmt_sql, &database) {
@@ -136144,7 +136433,7 @@ fn after_auth(
                     // is written ([ddl_savepoint_refusal])
                     last_dml = (0, 0, 0);
                     respond_eval_error(&mut s, &mut enc, &e)?;
-                } else if let Some(t) = chunk_new_text_off_grammar(&stmt_params, &bound_args) {
+                } else if let Some(t) = chunk_new_text_off_grammar(&exec_params, &bound_args) {
                     // K2 (round 12): a text off the canonical grammar into
                     // a chunk-new numeric slot raises the engine's
                     // conversion error before a row is read or written - a

@@ -62,7 +62,7 @@
 # impure call there refuses (9b). A condition over a derived source or a
 # CTE and a join's ON are routers of their own; each lexes calls too.
 #
-# A window over a NAVIGATED key, and ROWS ?, refuse - recorded (section 6).
+# A window over a NAVIGATED key refuses - recorded (section 6).
 #
 # Usage: qa/serve-real-fnwhere.sh [port]
 set -u
@@ -268,7 +268,7 @@ both     "6 a call inside a correlated EXISTS - PROMOTED (the memo)" "SELECT ID 
 both     "6 a derived table - PROMOTED (the memo)"                  "SELECT ID FROM (SELECT ID FROM T WHERE F1(ID) > 3) ORDER BY ID" '[]'
 both     "6 a join - PROMOTED (the memo)"                           "SELECT T.ID FROM T JOIN TI ON TI.ID = T.ID WHERE F1(T.ID) > 3 ORDER BY 1" '[]'
 both     "6 a UNION branch - PROMOTED (the memo)"                   "SELECT ID FROM T WHERE F1(ID) > 3 UNION ALL SELECT 9 $R" '[]'
-eng_only "6 ROWS ? - a bound window"          "SELECT ID FROM T WHERE F1(ID) > ? ROWS ?" '[1, 1]'
+both     "6 ROWS ? - a bound window - PROMOTED (serve-real-boundwindow.sh)"          "SELECT ID FROM T WHERE F1(ID) > ? ROWS ?" '[1, 1]'
 eng_only "6 FIRST over a NAVIGATED key"       "SELECT FIRST 1 ID FROM TI WHERE ID > 2 AND FZ(ID) > 0 ORDER BY ID" '[]'
 
 echo "--- 7 a FOLD: a call in the WHERE, an aggregate's argument, a key, HAVING,"

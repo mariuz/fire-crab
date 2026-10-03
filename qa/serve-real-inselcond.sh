@@ -447,7 +447,8 @@ both "6 a CTE's item, and the outer WHERE ?" "WITH c AS (SELECT ID, $C AS K FROM
 # `FIRST ?`, and a second UNION branch after a first one's WHERE `?`
 dml_refused "6 .. and a NUMERIC condition ? - K1"       "SELECT ID, IIF(ID > ?, 1, 0), $C FROM T ORDER BY ID" '[1,1]'
 dml_refused "6 the SAME subquery text twice"            "SELECT ID, $C, $C FROM T ORDER BY ID" '[1,2]'
-dml_refused "6 FIRST ? ahead of the select list"        "SELECT FIRST ? ID, $C FROM T ORDER BY ID" '[2,1]'
+# PROMOTED 2026-10-03: a bound row window answers (serve-real-boundwindow.sh)
+both "6 FIRST ? ahead of the select list"               "SELECT FIRST ? ID, $C FROM T ORDER BY ID" '[2,1]'
 dml_refused "6 a UNION's second branch after a WHERE ?" "SELECT ID, 0 FROM T WHERE ID > ? UNION ALL SELECT ID, (SELECT COUNT(*) FROM T T3 WHERE T3.ID < ?) FROM T WHERE ID = 3" '[2,3]'
 
 # ---------------------------------------------------------------

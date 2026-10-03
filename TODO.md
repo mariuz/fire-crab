@@ -57,5 +57,7 @@ Short, actionable items. The long-form engineering backlog lives in
 - [x] UPDATE / DELETE whose WHERE calls PURE stored functions (fnwhere section 8).
 - [x] A PURE stored call in a derived table, a join, a UNION branch or a subquery (fnwhere section 9,
       the memo fallback).
-- [ ] Still refused: ROWS ?, a window over a navigated key (6); an impure call in DML (8b); an impure
+- [x] A row window counted by `?` (FIRST ? / SKIP ? / ROWS ? [TO ?] / OFFSET ? / FETCH ?) -
+      `qa/serve-real-boundwindow.sh`.
+- [ ] Still refused: a window over a navigated key (6); an impure call in DML (8b); an impure
       call in those shapes (9b).
