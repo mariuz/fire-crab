@@ -22,11 +22,12 @@
 #    which the engine weighs identically (SORT NATURAL under ORDER BY ID
 #    alone, SORT INDEX beside `ID > 0`) - where DROPPING it navigated.
 #  - A SORT KEY over a call is computed per kept row, and FIRST / SKIP /
-#    ROWS cut the window before the select list runs; an unsorted window
+#    ROWS cut the window before the select list runs (after the unique
+#    sort under DISTINCT, which projects every kept row); an unsorted window
 #    stops the scan (`FIRST 1 .. WHERE FZ(ID) < 0` answers [1]).
 #
 # A call inside a subquery, a derived table, a view, a join, an
-# aggregate, DISTINCT, GROUP BY or UNION, and a window over a NAVIGATED
+# aggregate, GROUP BY or UNION, and a window over a NAVIGATED
 # key, refuse at prepare - recorded (section 6).  So does DML: only a
 # client SELECT arms the tokenizer.
 #
@@ -183,6 +184,19 @@ both "4 ROWS 1"                               "SELECT ID FROM T WHERE F1(ID) > 3
 both "4 OFFSET 1 ROWS FETCH NEXT 1 ROWS ONLY" "SELECT ID FROM T WHERE F1(ID) > 1 OFFSET 1 ROWS FETCH NEXT 1 ROWS ONLY" '[]'
 both "4 FIRST 1 / 2 .. TI WHERE FZ(ID) <> 0 - unsorted" "SELECT FIRST 2 ID FROM TI WHERE FZ(ID) <> 0" '[]'
 
+echo "--- 4b DISTINCT: every kept row's list runs, then the unique sort, then the window"
+both "4b DISTINCT V .. WHERE F1(ID) > 3"       "SELECT DISTINCT V FROM T WHERE F1(ID) > 3" '[]'
+both "4b DISTINCT F1(ID) / 4"                  "SELECT DISTINCT F1(ID) / 4 FROM T" '[]'
+both "4b DISTINCT .. ORDER BY 1 DESC"          "SELECT DISTINCT F1(ID) / 4 FROM T ORDER BY 1 DESC" '[]'
+both "4b DISTINCT FZ(ID) - raises"             "SELECT DISTINCT FZ(ID) FROM T" '[]'
+both "4b DISTINCT .. ID <> 2 AND FZ(ID) <> 0"  "SELECT DISTINCT ID FROM T WHERE ID <> 2 AND FZ(ID) <> 0" '[]'
+both "4b FIRST 1 DISTINCT F1(ID) / 4"          "SELECT FIRST 1 DISTINCT F1(ID) / 4 FROM T" '[]'
+both "4b FIRST 1 DISTINCT .. FZ(ID) < 0 - DISTINCT does not stop the scan" "SELECT FIRST 1 DISTINCT ID FROM T WHERE FZ(ID) < 0" '[]'
+both "4b DISTINCT F2(V, 1)"                    "SELECT DISTINCT F2(V, 1) FROM T" '[]'
+both "4b DISTINCT F1(N) - a NULL among them"   "SELECT DISTINCT F1(N) FROM T" '[]'
+both "4b DISTINCT 1 .. WHERE F1(ID) > 1"       "SELECT DISTINCT 1 FROM T WHERE F1(ID) > 1" '[]'
+both "4b DISTINCT two items, a ?"              "SELECT DISTINCT F1(ID) / 4, V FROM T WHERE F1(ID) > ?" '[1]'
+
 echo "--- 5 CONTROLS: a select-list condition still parses as it did"
 # the first build lexed a call in EVERY condition of a select prepare, and
 # an IIF's condition then refused under a NONE attachment (the isql
@@ -195,7 +209,6 @@ both "5 CONTROL a keyed WHERE"                "SELECT ID FROM TI WHERE ID = 2" '
 
 echo "--- 6 RECORDED - the engine answers, this server refuses at prepare"
 eng_only "6 COUNT(*) .. WHERE F1(ID) > 3"     "SELECT COUNT(*) FROM T WHERE F1(ID) > 3" '[]'
-eng_only "6 DISTINCT"                         "SELECT DISTINCT V FROM T WHERE F1(ID) > 3" '[]'
 eng_only "6 GROUP BY"                         "SELECT ID FROM T WHERE F1(ID) > 3 GROUP BY ID" '[]'
 eng_only "6 a call inside an IN subquery"     "SELECT ID FROM T WHERE ID IN (SELECT ID FROM T WHERE F1(ID) > 3) ORDER BY ID" '[]'
 eng_only "6 a call inside a correlated EXISTS" "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM T T2 WHERE F1(T2.ID) = T.ID * 2 AND T2.ID > 1) ORDER BY ID" '[]'
@@ -212,6 +225,6 @@ if grep -aq 'panicked at' "/tmp/fc-serve-fnwhere-$PORT.log"; then echo "FAIL the
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 73 on the 2026-10-03 binary, 73 OK
-if [ "$ran" -lt 73 ]; then echo "FAIL only $ran checks ran (floor 73) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 83 on the 2026-10-03 binary, 83 OK
+if [ "$ran" -lt 83 ]; then echo "FAIL only $ran checks ran (floor 83) - cells went missing"; fail=1; fi
 exit $fail

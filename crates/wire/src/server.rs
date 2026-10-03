@@ -92464,8 +92464,9 @@ fn fn_filter_plannable(plan: &Plan) -> bool {
     }
     let outer = plan;
     let plan = match plan {
-        // FIRST / SKIP / ROWS - the runner cuts the window itself
-        Plan::Modified { inner, distinct: false, .. } => &**inner,
+        // FIRST / SKIP / ROWS / DISTINCT - the runner cuts the window and
+        // runs the unique sort itself
+        Plan::Modified { inner, .. } => &**inner,
         p => p,
     };
     // a WINDOW over a NAVIGATED key stops the walk early, and the engine
@@ -125057,10 +125058,11 @@ fn materialise_user_fn_rows(
     // and an unsorted scan stops at the window's end, as the engine's
     // cursor does (measured: `SELECT FIRST 1 ID FROM T WHERE F1(ID) > 1
     // ORDER BY ID DESC` answers 3)
-    let (inner, window, mcols) = match plan {
-        Plan::Modified { inner, cols, distinct: false, skip, take } => (&**inner, Some((*skip, *take)), Some(cols)),
-        Plan::Modified { .. } => return Err(EvalErr::Unsupported),
-        p => (p, None, None),
+    // DISTINCT dedups the PROJECTED rows, so every kept row's select list
+    // runs first - the window is cut after the unique sort
+    let (inner, window, mcols, distinct) = match plan {
+        Plan::Modified { inner, cols, distinct, skip, take } => (&**inner, Some((*skip, *take)), Some(cols), *distinct),
+        p => (p, None, None, false),
     };
     let Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index, defer, windows, .. } = inner else {
         return Err(EvalErr::Unsupported);
@@ -125095,7 +125097,7 @@ fn materialise_user_fn_rows(
     let sort_here = lazy && !navigated && !order_by.is_empty();
     // the rows the window needs, when nothing sorts after the filter
     let enough = match window {
-        Some((skip, Some(take))) if !sort_here => Some(skip + take),
+        Some((skip, Some(take))) if !sort_here && !distinct => Some(skip + take),
         _ => None,
     };
     let base: Vec<Vec<Value>> = {
@@ -125157,7 +125159,7 @@ fn materialise_user_fn_rows(
             })
             .collect::<Result<_, _>>()?;
     }
-    if let Some((skip, take)) = window {
+    if let (Some((skip, take)), false) = (window, distinct) {
         kept = kept.into_iter().skip(skip).take(take.unwrap_or(usize::MAX)).collect();
     }
     let mut out = Vec::with_capacity(kept.len());
@@ -125169,12 +125171,20 @@ fn materialise_user_fn_rows(
         for c in cols {
             row.push(lazy_fn_eval(database, calls, args, ctx, &values, &|| c.value_of(&values))?);
         }
-        if let Some(mc) = mcols {
-            row = mc.iter().map(|c| c.value_of(&row)).collect::<Result<_, _>>()?;
-        }
         out.push(row);
     }
     FN_VALS.with(|m| m.borrow_mut().clear());
+    if distinct {
+        // the same unique sort the plain modifier runs ([distinct_rows])
+        let oc = output_cols_of(inner);
+        distinct_rows(&mut out, plan_is_ordered(inner), &plan_coll_cols(inner, &oc), &varying_cols(&oc), distinct_tie_unknown(inner))?;
+        if let Some((skip, take)) = window {
+            out = out.into_iter().skip(skip).take(take.unwrap_or(usize::MAX)).collect();
+        }
+    }
+    if let Some(mc) = mcols {
+        out = out.iter().map(|row| mc.iter().map(|c| c.value_of(row)).collect()).collect::<Result<_, _>>()?;
+    }
     Ok(out)
 }
 
