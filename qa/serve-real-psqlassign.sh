@@ -1019,7 +1019,9 @@ for CH in "" UTF8 WIN1252; do
   pin  "11d [${CH:-NONE}] the ASCII-only controls" $'SELECT * FROM XBA1; SELECT * FROM XBA2;' $'C|1|S|60'
 done
 for CH in "" UTF8; do
-  refused "11d [${CH:-NONE}] MAX(SFN(U)) INTO R: the refused statement returns non-ASCII text, which the executor's guard keeps refusing" $'SELECT * FROM XB3;' $'R|fé'
+  # PROMOTED 2026-10-03: a call inside an aggregate's argument folds now
+  # (the fnwhere chunk's [group_fn_rows]) - recorded as refused until then
+  pin  "11d [${CH:-NONE}] MAX(SFN(U)) INTO R: a call inside the fold's argument, non-ASCII text out" $'SELECT * FROM XB3;' $'R|fé'
 done
 CH=""
 

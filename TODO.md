@@ -26,4 +26,23 @@ Short, actionable items. The long-form engineering backlog lives in
       an earlier wedge at ~01:52 had the same symptom). Every time during a `-j 4` sweep; the first two
       predate any of this work's code. Symptom in gates: `rc=124` timeouts and "the engine printed no
       describe". Check `ss -ltn | grep 3050` (Recv-Q) and the log, restart, re-run the affected gates
-      alone; sweeps now run at `-j 3`. Possibly worth an upstream report once it has a narrower trigger.
+      alone; sweeps now run at `-j 3`. Possibly worth an upstream report once it has a narrower trigger.- [x] **The reference engine moved to 6.0.0.2196 (56d656b) on 2026-10-03** (previous install kept as
+      `/opt/firebird_20261003_1116.tar.gz`). Two of its laws reached the gates and are followed now:
+      DDL under a user savepoint is refused 0A000 (`qa/serve-real-ddlsavepoint.sh`; ddltx, savepointtx,
+      gendurable and gencomp adjusted), and an exponent literal whose significand is exactly 2^63 is
+      DECFLOAT(34), the INT128 quirk gone (`qa/serve-real-explit.sh`).
+- [ ] After that upgrade node-firebird could not log in as SYSDBA (isql could): the installer's SRP
+      verifier for SYSDBA tripped node-firebird's SRP client while fresh users worked. Re-setting the
+      same password (`ALTER USER SYSDBA PASSWORD 'masterkey'`, a new salt) cleared it. Probably a
+      node-firebird SRP edge case (salt / verifier padding) - worth a reproduction from the old
+      `security6.fdb` in the tarball and an upstream report, if it reproduces.
+
+## Recorded gaps found on the way (2026-10-03)
+
+- [ ] `CAST(LIST(..) AS VARCHAR(n))` refuses at prepare (no stored call needed).
+- [ ] A schema-qualified CREATE TABLE (`CREATE TABLE PUBLIC.T7 ..`) refuses at prepare.
+- [ ] An empty PSQL body (`AS BEGIN END`) and a trigger body of a lone `EXIT;` refuse at prepare.
+- [ ] A schema-qualified DML target that does not exist answers a bare Dynamic SQL Error where the
+      engine answers -204 `"PUBLIC"."S2"` (recorded in `qa/serve-real-dmlunknown.sh` section 2).
+- [ ] A stored function call in a join, a derived table, a subquery, UNION, ROWS ? or DML still
+      refuses at prepare (recorded in `qa/serve-real-fnwhere.sh` section 6).

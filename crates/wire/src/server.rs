@@ -1869,6 +1869,9 @@ const GDS_PRC_OUT_PARAM_MISMATCH: i32 = 335544850;
 /// `<VERB> @1 failed` code, the last the specific reason; isql renders
 /// the three and derives the SQLSTATE from the reason.
 const GDS_NO_META_UPDATE: i32 = 335544351;
+/// isc_user_savepoint - "Running under user savepoint @1, DDL prohibited"
+/// (-901, 0A000), JRD 1023, new in 6.0.0.2196
+const GDS_USER_SAVEPOINT: i32 = 335545343;
 
 /// The `(<CREATE> @1 failed, <reason> @1)` code pair for a DUPLICATE
 /// create, by object - all measured, the reason being the DYN
@@ -1973,6 +1976,226 @@ fn ddl_dup_codes(plan: &Plan) -> Option<(i32, i32, String)> {
         Plan::CreateProcedure { name, .. } => Some((336397265, 336068743, q(name))),
         _ => None,
     }
+}
+
+/// DDL UNDER A USER SAVEPOINT IS REFUSED (Firebird 6.0.0.2196, upstream
+/// acf041e5 "Disable DDL under user savepoint"): `DsqlDdlRequest::execute`
+/// walks the transaction's savepoint stack before the node runs and
+/// raises `isc_user_savepoint` naming the INNERMOST user savepoint, inside
+/// the DDL wrapper - `unsuccessful metadata update / <VERB> @1 failed /
+/// Running under user savepoint @1, DDL prohibited` (0A000). Every DDL
+/// statement is refused, an object that does not exist included (the check
+/// comes first); DML and GEN_ID still run. The `<VERB> @1 failed` item is
+/// the one the statement's OWN FORM names, measured per form on 2196: a
+/// RECREATE or a CREATE OR ALTER its own verb, CREATE GENERATOR the
+/// SEQUENCE one, SET STATISTICS INDEX the ALTER INDEX one; GRANT, REVOKE
+/// and ALTER DATABASE carry no object; a role, user, mapping or filter is
+/// printed bare, COMMENT ON ROLE and a schema quoted alone, a character
+/// set under SYSTEM, a column as `"PUBLIC"."T".C`, everything else
+/// `"<schema>"."<name>"`.
+fn ddl_savepoint_refusal(text: &str, database: &Option<Database>) -> Option<EvalErr> {
+    ddl_savepoint_vector(text, database.as_ref()?.savepoints.last()?)
+}
+
+/// [ddl_savepoint_refusal]'s vector for one statement text under the
+/// innermost user savepoint `sp` - None when the text is no DDL form.
+fn ddl_savepoint_vector(text: &str, sp: &str) -> Option<EvalErr> {
+    let sp = sp.to_string();
+    #[derive(Clone)]
+    enum W {
+        Word(String),
+        Quoted(String),
+        Dot,
+        Other,
+    }
+    // the statement's leading words: identifiers (upper-cased), quoted
+    // identifiers (as written), dots; comments skipped
+    let mut toks: Vec<W> = Vec::new();
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() && toks.len() < 16 {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+        } else if c.is_ascii_alphabetic() {
+            let st = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                i += 1;
+            }
+            toks.push(W::Word(text[st..i].to_ascii_uppercase()));
+        } else if c == b'"' {
+            let mut v = String::new();
+            i += 1;
+            loop {
+                match b.get(i) {
+                    None => break,
+                    Some(b'"') if b.get(i + 1) == Some(&b'"') => {
+                        v.push('"');
+                        i += 2;
+                    }
+                    Some(b'"') => {
+                        i += 1;
+                        break;
+                    }
+                    Some(_) => {
+                        let ch = text[i..].chars().next()?;
+                        v.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+            }
+            toks.push(W::Quoted(v));
+        } else if c == b'.' {
+            toks.push(W::Dot);
+            i += 1;
+        } else {
+            toks.push(W::Other);
+            i += 1;
+        }
+    }
+    let word = |k: usize| match toks.get(k) {
+        Some(W::Word(w)) => w.as_str(),
+        _ => "",
+    };
+    let ident = |k: usize| match toks.get(k) {
+        Some(W::Word(w)) => Some(w.clone()),
+        Some(W::Quoted(q)) => Some(q.clone()),
+        _ => None,
+    };
+    // a dotted name from token k: its parts
+    let parts = |mut k: usize| -> Vec<String> {
+        let mut v = Vec::new();
+        while let Some(n) = ident(k) {
+            v.push(n);
+            if matches!(toks.get(k + 1), Some(W::Dot)) {
+                k += 2;
+            } else {
+                break;
+            }
+        }
+        v
+    };
+    let qq = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+    // "<schema>"."<name>" - an unqualified name lives in PUBLIC
+    let schema_obj = |k: usize| -> Option<String> {
+        let p = parts(k);
+        match p.as_slice() {
+            [n] => Some(format!("{}.{}", qq("PUBLIC"), qq(n))),
+            [s, n] => Some(format!("{}.{}", qq(s), qq(n))),
+            _ => None,
+        }
+    };
+    let bare = |k: usize| ident(k);
+    const BASE: i32 = 0x14000000 | (13 << 16);
+    let code = |n: i32| BASE + n;
+    // (create, alter, create-or-alter, recreate, drop) per kind, 0 = none
+    let kind_codes = |k: &str| -> Option<[i32; 5]> {
+        Some(match k {
+            "TABLE" => [998, 999, 0, 1001, 1000],
+            "VIEW" => [1010, 1011, 1012, 1013, 1014],
+            "PROCEDURE" => [977, 978, 979, 981, 980],
+            "FUNCTION" => [972, 973, 974, 976, 975],
+            "TRIGGER" => [982, 983, 984, 986, 985],
+            "EXCEPTION" => [992, 993, 994, 995, 996],
+            "DOMAIN" => [989, 990, 0, 0, 991],
+            "SEQUENCE" | "GENERATOR" => [997, 1035, 0, 1016, 1015],
+            "INDEX" => [1028, 1024, 0, 0, 1017],
+            "ROLE" => [1022, 1023, 0, 0, 1020],
+            "PACKAGE" => [1002, 1003, 1004, 1006, 1005],
+            "COLLATION" => [987, 0, 0, 0, 988],
+            "USER" => [1029, 1030, 0, 1046, 1021],
+            "SCHEMA" => [1048, 1051, 1052, 1050, 1049],
+            _ => return None,
+        })
+    };
+    let refuse = |items: Vec<StatusItem>| {
+        let mut v = vec![StatusItem::Gds(GDS_NO_META_UPDATE)];
+        v.extend(items);
+        v.push(StatusItem::Gds(GDS_USER_SAVEPOINT));
+        v.push(StatusItem::Str(sp.clone()));
+        Some(EvalErr::Status(v))
+    };
+    let failed = |n: i32, obj: Option<String>| {
+        let mut v = vec![StatusItem::Gds(code(n))];
+        v.extend(obj.map(StatusItem::Str));
+        refuse(v)
+    };
+    match (word(0), word(1), word(2)) {
+        ("GRANT", ..) => return failed(1031, None),
+        ("REVOKE", ..) => return failed(1032, None),
+        ("ALTER", "DATABASE", _) => return failed(1025, None),
+        ("SET", "GENERATOR", _) => return failed(1037, Some(schema_obj(2)?)),
+        ("SET", "STATISTICS", "INDEX") => return failed(1024, Some(schema_obj(3)?)),
+        ("DECLARE", "FILTER", _) => return failed(1027, Some(bare(2)?)),
+        ("COMMENT", "ON", k) => {
+            let obj = match k {
+                "COLUMN" => {
+                    let p = parts(3);
+                    match p.as_slice() {
+                        [t, c] => format!("{}.{}.{}", qq("PUBLIC"), qq(t), c),
+                        [s, t, c] => format!("{}.{}.{}", qq(s), qq(t), c),
+                        _ => return None,
+                    }
+                }
+                "ROLE" => qq(&ident(3)?),
+                "TABLE" | "VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EXCEPTION" | "DOMAIN" | "SEQUENCE"
+                | "GENERATOR" | "INDEX" | "COLLATION" => schema_obj(3)?,
+                _ => return None,
+            };
+            return failed(971, Some(obj));
+        }
+        _ => {}
+    }
+    // CREATE / ALTER / DROP / RECREATE / CREATE OR ALTER <kind> <name>
+    let (mode, mut k) = match (word(0), word(1), word(2)) {
+        ("CREATE", "OR", "ALTER") => (2, 3),
+        ("CREATE", ..) => (0, 1),
+        ("ALTER", ..) => (1, 1),
+        ("RECREATE", ..) => (3, 1),
+        ("DROP", ..) => (4, 1),
+        _ => return None,
+    };
+    // the qualifiers a kind may carry before it
+    if word(k) == "GLOBAL" && word(k + 1) == "TEMPORARY" {
+        k += 2;
+    }
+    while matches!(word(k), "UNIQUE" | "ASC" | "ASCENDING" | "DESC" | "DESCENDING") {
+        k += 1;
+    }
+    let kind = word(k);
+    if kind == "CHARACTER" && word(k + 1) == "SET" && mode == 1 {
+        let n = ident(k + 2)?;
+        return failed(970, Some(format!("{}.{}", qq("SYSTEM"), qq(&n))));
+    }
+    if kind == "MAPPING" || (kind == "GLOBAL" && word(k + 1) == "MAPPING") {
+        // "@2 MAPPING @1 failed" - @2 the statement's own verb
+        let n = if kind == "GLOBAL" { k + 2 } else { k + 1 };
+        let verb = ["CREATE", "ALTER", "CREATE OR ALTER", "RECREATE", "DROP"][mode];
+        return refuse(vec![StatusItem::Gds(code(1034)), StatusItem::Str(bare(n)?), StatusItem::Str(verb.to_string())]);
+    }
+    let body = kind == "PACKAGE" && word(k + 1) == "BODY";
+    let codes = if body { [1007, 0, 0, 1009, 1008] } else { kind_codes(kind)? };
+    let n = codes[mode];
+    if n == 0 {
+        return None;
+    }
+    let at = if body { k + 2 } else { k + 1 };
+    let obj = match kind {
+        "ROLE" | "USER" => bare(at)?,
+        "SCHEMA" => qq(&ident(at)?),
+        _ => schema_obj(at)?,
+    };
+    failed(n, Some(obj))
 }
 
 /// Answer a DDL error the engine's way when it is a DUPLICATE create -
@@ -18553,15 +18776,18 @@ fn ddl_verb_gds(event: u32) -> Option<i32> {
         DDL_CREATE_VIEW => 1010,
         DDL_ALTER_VIEW => 1011,
         DDL_DROP_VIEW => 1014,
-        DDL_CREATE_PROCEDURE => 985,
-        DDL_ALTER_PROCEDURE => 986,
-        DDL_DROP_PROCEDURE => 988,
-        DDL_CREATE_FUNCTION => 980,
-        DDL_ALTER_FUNCTION => 981,
-        DDL_DROP_FUNCTION => 983,
-        DDL_CREATE_TRIGGER => 973,
-        DDL_ALTER_TRIGGER => 974,
-        DDL_DROP_TRIGGER => 976,
+        // (sqlerr.h on 2196: these three kinds sat eight numbers off -
+        // a CREATE PROCEDURE a DDL trigger refused printed "DROP TRIGGER
+        // @1 failed"; measured: the engine prints CREATE PROCEDURE)
+        DDL_CREATE_PROCEDURE => 977,
+        DDL_ALTER_PROCEDURE => 978,
+        DDL_DROP_PROCEDURE => 980,
+        DDL_CREATE_FUNCTION => 972,
+        DDL_ALTER_FUNCTION => 973,
+        DDL_DROP_FUNCTION => 975,
+        DDL_CREATE_TRIGGER => 982,
+        DDL_ALTER_TRIGGER => 983,
+        DDL_DROP_TRIGGER => 985,
         DDL_CREATE_EXCEPTION => 992,
         DDL_ALTER_EXCEPTION => 993,
         DDL_DROP_EXCEPTION => 996,
@@ -59345,6 +59571,122 @@ fn limit_lint_scan_db(sql: &str, db: &Option<Database>) -> LimitLint {
     }
 }
 
+/// The -204 *Table unknown* of a DML statement whose TARGET names no
+/// relation, at prepare - measured on 2196 over the wire (node sends the
+/// text verbatim): an INSERT is placed at the INSERT keyword itself
+/// (`   INSERT INTO S2 ..` is column 4, a text two newlines down line 3),
+/// an UPDATE, a DELETE and a MERGE at the target's name (a delimited one
+/// at its opening quote, `DELETE\n FROM "s2"` line 2 column 7), and an
+/// UPDATE OR INSERT at line 0, column 0. It answered a bare Dynamic SQL
+/// Error here - which the savepoint law made visible, since an INSERT into
+/// the table a refused CREATE TABLE never made is the next statement every
+/// such script runs. A qualified target (`S.T`) keeps its own path.
+fn dml_missing_target(sql: &str, kw: &str, db: &Option<Database>) -> Option<EvalErr> {
+    let db = db.as_ref()?;
+    let b = sql.as_bytes();
+    let skip_ws = |mut i: usize| {
+        loop {
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if b.get(i) == Some(&b'-') && b.get(i + 1) == Some(&b'-') {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else if b.get(i) == Some(&b'/') && b.get(i + 1) == Some(&b'*') {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            } else {
+                return i;
+            }
+        }
+    };
+    // the word at i, and where it ends
+    let word_at = |i: usize| {
+        let mut j = i;
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'$') {
+            j += 1;
+        }
+        (sql[i..j].to_ascii_uppercase(), j)
+    };
+    let start = skip_ws(0);
+    let (w0, mut at) = word_at(start);
+    if w0 != kw {
+        return None;
+    }
+    let mut upsert = false;
+    // the keyword(s) before the target's name
+    let expect: &[&str] = match kw {
+        "INSERT" | "MERGE" => &["INTO"],
+        "DELETE" => &["FROM"],
+        "UPDATE" => {
+            let (w, j) = word_at(skip_ws(at));
+            if w == "OR" {
+                let (w2, j2) = word_at(skip_ws(j));
+                if w2 != "INSERT" {
+                    return None;
+                }
+                upsert = true;
+                at = j2;
+                &["INTO"]
+            } else {
+                &[]
+            }
+        }
+        _ => return None,
+    };
+    for e in expect {
+        let (w, j) = word_at(skip_ws(at));
+        if w != *e {
+            return None;
+        }
+        at = j;
+    }
+    let ns = skip_ws(at);
+    let (name, ne) = if b.get(ns) == Some(&b'"') {
+        let mut j = ns + 1;
+        let mut v = String::new();
+        loop {
+            match b.get(j) {
+                None => return None,
+                Some(b'"') if b.get(j + 1) == Some(&b'"') => {
+                    v.push('"');
+                    j += 2;
+                }
+                Some(b'"') => break,
+                Some(_) => {
+                    let ch = sql[j..].chars().next()?;
+                    v.push(ch);
+                    j += ch.len_utf8();
+                }
+            }
+        }
+        (v, j + 1)
+    } else {
+        let (w, j) = word_at(ns);
+        if w.is_empty() || w.as_bytes()[0].is_ascii_digit() {
+            return None;
+        }
+        (w, j)
+    };
+    // a qualified target keeps its own path
+    if b.get(skip_ws(ne)) == Some(&b'.') {
+        return None;
+    }
+    if relation_schema(db, &name).is_some() {
+        return None;
+    }
+    let (line, col) = if upsert {
+        (0, 0)
+    } else {
+        line_col_of(&sql[..if kw == "INSERT" { start } else { ns }])
+    };
+    Some(EvalErr::TableUnknown { name: format!("\"{}\"", name), line, col })
+}
+
 /// What [limit_lint_scan] found in a statement.
 struct LimitLint {
     /// the verdict at PREPARE: the parser's Token unknown, else the
@@ -65864,7 +66206,18 @@ fn plan_query_inner_at_body(
     // by sum(id)` answers, `order by id` is its "Invalid expression in
     // the ORDER BY clause"): the group machinery resolves it, so the
     // fast path stands aside
-    if group_s.is_none() && having_s.is_none() && order_s.is_none() && items.len() == 1 && params.is_empty() && !where_corr {
+    // A STORED CALL IN THE WHERE keeps it off too: the probe over an
+    // EMPTY relation succeeds (no row reaches the call), and the scalar
+    // plan it leaves would evaluate the call without running it at fetch
+    // - the group machinery runs it ([group_fn_rows])
+    if group_s.is_none()
+        && having_s.is_none()
+        && order_s.is_none()
+        && items.len() == 1
+        && params.is_empty()
+        && !where_corr
+        && !(FN_LEXED.with(|f| f.get()) && filter_calls_fn(&filter))
+    {
         if let SelItem::Agg(func, target, alias) = &items[0] {
             // the integer fast path computes at prepare; the shapes it
             // declines (MIN/MAX over text or temporal, SUM/AVG over
@@ -67654,7 +68007,7 @@ fn walk_aggs(e: &RawExpr, out: &mut Vec<(AggFn, AggTarget)>) {
             walk_aggs(b, out);
         }
         RawExpr::Cast(a, _) => walk_aggs(a, out),
-        RawExpr::Coalesce(v) | RawExpr::Func(_, v) => {
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) | RawExpr::UserFn(_, v) => {
             for a in v {
                 walk_aggs(a, out);
             }
@@ -67675,6 +68028,24 @@ fn walk_aggs(e: &RawExpr, out: &mut Vec<(AggFn, AggTarget)>) {
         }
         RawExpr::Cond(c) => walk_cond_aggs(c, out),
         _ => {}
+    }
+}
+
+/// Does a raw expression call a stored function - through the shapes
+/// [walk_aggs] walks?
+fn raw_calls_user_fn(e: &RawExpr) -> bool {
+    match e {
+        RawExpr::UserFn(..) => true,
+        RawExpr::Neg(a) | RawExpr::Cast(a, _) => raw_calls_user_fn(a),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
+            raw_calls_user_fn(a) || raw_calls_user_fn(b)
+        }
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) => v.iter().any(raw_calls_user_fn),
+        RawExpr::Iif(_, a, b) => raw_calls_user_fn(a) || raw_calls_user_fn(b),
+        RawExpr::Case(branches, else_, _) => {
+            branches.iter().any(|(_, t)| raw_calls_user_fn(t)) || else_.as_deref().is_some_and(raw_calls_user_fn)
+        }
+        _ => false,
     }
 }
 
@@ -67741,6 +68112,9 @@ fn substitute_aggs(e: &RawExpr, slot_of: &dyn Fn(&AggFn, &AggTarget) -> Option<S
         RawExpr::Func(f, v) => {
             RawExpr::Func(*f, v.iter().map(sub).collect::<Option<Vec<_>>>()?)
         }
+        // a stored call over a group's aggregate (`F1(COUNT(*))`) runs
+        // over the folded row ([group_fn_rows])
+        RawExpr::UserFn(n, v) => RawExpr::UserFn(n.clone(), v.iter().map(sub).collect::<Option<Vec<_>>>()?),
         RawExpr::Iif(c, a, b) => RawExpr::Iif(
             Box::new(substitute_cond_aggs(c, slot_of)?),
             subb(a)?,
@@ -68666,7 +69040,16 @@ fn plan_group(
     let having = match having_s {
         None => None,
         Some(hs) => Some(
-            tokenize(hs)
+            {
+                // the OUTERMOST statement's HAVING may lex a stored call
+                // too, as its WHERE does ([LEX_WHERE]) - it runs over the
+                // folded rows ([group_fn_rows])
+                let outermost = PLAN_BODY_DEPTH.with(|d| d.get()) == 1 && FN_SCOPE.with(|d| d.get()) == 0;
+                LEX_WHERE.with(|a| a.set(outermost));
+                let toks = tokenize(hs);
+                LEX_WHERE.with(|a| a.set(false));
+                toks
+            }
                 .and_then(|t| parse_predicate(&t, &mut having_np))
                 .and_then(|raw| {
                     resolve_having(
@@ -81518,6 +81901,13 @@ thread_local! {
     /// the call a `UserFn` node found no value for ([FN_VALS]) - what
     /// [lazy_fn_eval] runs before it evaluates again
     static FN_NEED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// while a fold runs over rows whose calls ran beforehand
+    /// ([group_fn_rows]): the slot each input row carries its index in,
+    /// and per index that row's call values - what a `UserFn` node with
+    /// no value in [FN_VALS] reads
+    static FN_ROW_TAG: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static FN_ROW_VALS: std::cell::RefCell<Vec<std::collections::HashMap<u32, Value>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// ARMED by a client SELECT's prepare: the condition tokenizer lexes
     /// a stored function call as an expression token ([tokenize]) - in a
     /// table projection's WHERE only ([LEX_WHERE]); every other caller
@@ -85354,7 +85744,6 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                             Some(bits) => RawExpr::DecFloat34(bits),
                             None => RawExpr::Double(d),
                         },
-                        ExpLit::Int128(n) => RawExpr::Int128(n),
                         ExpLit::DecFloat34(x) => RawExpr::DecFloat34(x),
                     });
                 }
@@ -92478,8 +92867,17 @@ fn fn_filter_plannable(plan: &Plan) -> bool {
             return false;
         }
     }
-    !FN_NESTED.with(|n| n.get())
-        && matches!(plan, Plan::Project { gen_cols, windows, .. } if gen_cols.is_empty() && windows.is_empty())
+    if FN_NESTED.with(|n| n.get()) {
+        return false;
+    }
+    match plan {
+        Plan::Project { gen_cols, windows, .. } => gen_cols.is_empty() && windows.is_empty(),
+        // a fold: the WHERE, the aggregates' arguments, the keys, HAVING,
+        // the ORDER BY and the select list all run their calls
+        // ([group_fn_rows])
+        Plan::Group { .. } => true,
+        _ => false,
+    }
 }
 
 /// Record one user-function CALL for the statement ([FN_CALLS]) and
@@ -97148,7 +97546,6 @@ fn value_as_dec(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
 /// The outcome of typing an EXPONENT-form numeric literal.
 enum ExpLit {
     Double(f64),
-    Int128(i128),
     DecFloat34(u128),
 }
 
@@ -97203,19 +97600,16 @@ fn decfloat_value_text(v: &Value) -> Option<String> {
 ///
 ///   M <= 2^63-1   -> DOUBLE          (`1e5`, `1.5e38`, even `1e40`;
 ///                                     the significand is just `1`)
-///   M == 2^63     -> INT128          (a lone quirk: EXACTLY
-///                                     9223372036854775808, and only a
-///                                     whole scale-0 value - `...808e0`,
-///                                     `...808e5`)
-///   M >= 2^63+1   -> DECFLOAT(34)    (`9999999999999999999e0`,
+///   M >= 2^63     -> DECFLOAT(34)    (`9999999999999999999e0`,
 ///                                     `12345678901234567890e0`,
 ///                                     `1.2345678901234567890e5`)
 ///
+/// (Through 6.0.0.2182 EXACTLY 2^63 - `9223372036854775808e0` - was an
+/// INT128 quirk, and its scaled forms refused here; 2196 types it, and
+/// `922337203685477580.8e1` / `...808e-1`, DECFLOAT(34) like any larger
+/// significand - measured.)
+///
 /// The DOUBLE branch parses the ORIGINAL text, byte-identical to before.
-/// `None` REFUSES a 2^63 significand that would need a SCALED or ROUNDED
-/// INT128 (a fractional mantissa or a negative exponent) - no literal
-/// form carries an Int128 scale, and the engine types these INT128, so a
-/// DOUBLE would be a confident WRONG TYPE; refusing is law-safe.
 fn classify_exp_literal(text: &str) -> Option<ExpLit> {
     let (sig, exp) = text.split_once(['e', 'E'])?;
     let exp: i32 = exp.parse().ok()?;
@@ -97241,7 +97635,6 @@ fn classify_exp_literal(text: &str) -> Option<ExpLit> {
     }
     let d = digits.trim_start_matches('0');
     const I64MAX: u128 = 9_223_372_036_854_775_807;
-    const TWO63: u128 = 9_223_372_036_854_775_808;
     let m = match d.parse::<u128>() {
         Ok(m) => m,
         // an ALL-ZERO significand (`0.0e0`, `0e5`) trims to an empty string:
@@ -97290,17 +97683,6 @@ fn classify_exp_literal(text: &str) -> Option<ExpLit> {
             }
         });
         Some(ExpLit::Double(d))
-    } else if m == TWO63 {
-        // the 2^63 INT128 quirk: representable only as a scale-0 i128
-        if frac == 0 && exp >= 0 {
-            let mut v: i128 = TWO63 as i128;
-            for _ in 0..exp {
-                v = v.checked_mul(10)?; // refuse on i128 overflow, never wrap
-            }
-            Some(ExpLit::Int128(if neg { -v } else { v }))
-        } else {
-            None
-        }
     } else {
         text_to_dec128_clamped(text).ok().map(ExpLit::DecFloat34)
     }
@@ -104443,7 +104825,7 @@ impl Expr {
                     }
                 }
             }
-            Expr::UserFn { id, .. } => match FN_VALS.with(|m| m.borrow().get(id).cloned()) {
+            Expr::UserFn { id, .. } => match FN_VALS.with(|m| m.borrow().get(id).cloned()).or_else(|| fn_row_val(*id, values)) {
                 Some(v) => v,
                 None => {
                     // not run yet: name the call, so [lazy_fn_eval] can
@@ -113682,7 +114064,6 @@ fn numeric_tok(s: &str, b: &[u8], start: usize, i: &mut usize) -> Option<Tok> {
                     Some(bits) => Tok::DecFloat34(bits),
                     None => Tok::FnExpr(RawExpr::Double(d)),
                 },
-                ExpLit::Int128(n) => Tok::Int128(n),
                 ExpLit::DecFloat34(x) => Tok::DecFloat34(x),
             });
         }
@@ -125064,6 +125445,22 @@ fn materialise_user_fn_rows(
         Plan::Modified { inner, cols, distinct, skip, take } => (&**inner, Some((*skip, *take)), Some(cols), *distinct),
         p => (p, None, None, false),
     };
+    if let Plan::Group { .. } = inner {
+        // a fold whose WHERE calls: the kept rows fold, then the window
+        // and DISTINCT run over the folded rows as they do over any
+        let mut out = group_fn_rows(database, inner, calls, args, ctx)?;
+        if distinct {
+            let oc = output_cols_of(inner);
+            distinct_rows(&mut out, plan_is_ordered(inner), &plan_coll_cols(inner, &oc), &varying_cols(&oc), distinct_tie_unknown(inner))?;
+        }
+        if let Some((skip, take)) = window {
+            out = out.into_iter().skip(skip).take(take.unwrap_or(usize::MAX)).collect();
+        }
+        if let Some(mc) = mcols {
+            out = out.iter().map(|row| mc.iter().map(|c| c.value_of(row)).collect()).collect::<Result<_, _>>()?;
+        }
+        return Ok(out);
+    }
     let Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index, defer, windows, .. } = inner else {
         return Err(EvalErr::Unsupported);
     };
@@ -125186,6 +125583,226 @@ fn materialise_user_fn_rows(
         out = out.iter().map(|row| mc.iter().map(|c| c.value_of(row)).collect()).collect::<Result<_, _>>()?;
     }
     Ok(out)
+}
+
+/// The folded rows of a GROUP plan (a global aggregate is the one group)
+/// whose statement calls a stored function. The leaf is read inside the
+/// index's range and each row is filtered by the lazy conjunct walk
+/// ([lazy_fn_eval], written order - measured: `COUNT(*) .. WHERE
+/// FZ(ID) > 0 AND ID <> 2` raises where `ID <> 2 AND FZ(ID) > 0` counts
+/// 1). A call inside an aggregate's argument or a GROUP BY key runs per
+/// kept row BEFORE the fold, through the same lazy walk over the whole
+/// argument (`SUM(IIF(ID = 2, 0, FZ(ID)))` never runs FZ(2)); the row
+/// carries its index in one hidden slot at `synth_base` and the fold's
+/// own evaluation reads that row's values back ([fn_row_val]) - so the
+/// fold, its tie order and its grouping sort are exactly the plain
+/// Group arm's. HAVING, the ORDER BY and the select list then run over
+/// the folded rows, a call among them run as each reaches it.
+fn group_fn_rows(
+    database: &mut Option<Database>,
+    plan: &Plan,
+    calls: &[FnCall],
+    args: &[WireParam],
+    ctx: &SessionCtx,
+) -> Result<Vec<Vec<Value>>, EvalErr> {
+    let Plan::Group { rel, formats, cols, gitems, key_fids, key_exprs, synth_base, filter, having, order_by, index, defer } =
+        plan
+    else {
+        return Err(EvalErr::Unsupported);
+    };
+    let filter = bind_filter_eval(filter, args)?;
+    let having = bind_filter_eval(having, args)?;
+    let descs_now: Vec<Descriptor> =
+        formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.clone()).unwrap_or_default();
+    let base = {
+        let db = database.as_ref().ok_or(EvalErr::Unsupported)?;
+        // the fold's ORDER BY sorts the OUTPUT, so the leaf navigates by
+        // nothing, as the plain Group arm resolves it
+        let index = resolve_access(index, defer, db, *rel, &descs_now, &filter, &[]);
+        leaf_source(*rel, formats.to_vec(), &index).rows(db)?
+    };
+    // the argument and key expressions that call, in the order the
+    // engine's sort record builds them: the keys, then the folds
+    let mut pre: Vec<&Expr> = key_exprs.iter().filter(|e| expr_has_user_fn(e)).collect();
+    for g in gitems {
+        if let GItem::Agg(_, src, _) = g {
+            pre.extend(agg_src_exprs(src).into_iter().filter(|e| expr_has_user_fn(e)));
+        }
+    }
+    let mut kept = Vec::with_capacity(base.len());
+    let mut row_vals = Vec::new();
+    for values in base {
+        FN_VALS.with(|m| m.borrow_mut().clear());
+        if let Some(p) = &filter {
+            if !lazy_fn_eval(database, calls, args, ctx, &values, &|| p.matches(&values))? {
+                continue;
+            }
+        }
+        if pre.is_empty() {
+            kept.push(values);
+            continue;
+        }
+        for e in &pre {
+            lazy_fn_eval(database, calls, args, ctx, &values, &|| e.eval(&values))?;
+        }
+        let mut values = values;
+        values.resize(*synth_base, Value::Null);
+        values.push(Value::Int(row_vals.len() as i64));
+        row_vals.push(FN_VALS.with(|m| std::mem::take(&mut *m.borrow_mut())));
+        kept.push(values);
+    }
+    FN_VALS.with(|m| m.borrow_mut().clear());
+    // the hidden slot sits where the synthetic key slots began, which
+    // move up one
+    let tagged = !pre.is_empty();
+    let key_coll = keys_coll(&descs_now, key_fids, key_exprs, *synth_base).unwrap_or_default();
+    let shift = |f: usize| if tagged && f >= *synth_base { f + 1 } else { f };
+    let gitems: Vec<GItem> = gitems
+        .iter()
+        .map(|g| match g {
+            GItem::Key(f) => GItem::Key(shift(*f)),
+            g => g.clone(),
+        })
+        .collect();
+    let key_fids: Vec<usize> = key_fids.iter().map(|f| shift(*f)).collect();
+    // the fold the plain Group arm's Aggregate node runs, called directly:
+    // that node reads its INPUT'S SHAPE - the filter's fields order a
+    // LIST's ties, and a relation leaf's descriptors lay out the grouping
+    // sort's record image - which rows already in hand would lose
+    if tagged {
+        FN_ROW_TAG.with(|t| t.set(Some(*synth_base)));
+        FN_ROW_VALS.with(|v| *v.borrow_mut() = row_vals);
+    }
+    let folded = group_rows(
+        kept,
+        &gitems,
+        &key_fids,
+        key_exprs,
+        *synth_base + usize::from(tagged),
+        &None,
+        filter.as_ref(),
+        true,
+        &key_coll,
+        formats.last().map(|f| &f.1[..]),
+    );
+    FN_ROW_TAG.with(|t| t.set(None));
+    FN_ROW_VALS.with(|v| v.borrow_mut().clear());
+    let folded = folded?;
+    // HAVING over each folded row, then the sort, then the select list
+    type Kept = (Vec<Value>, std::collections::HashMap<u32, Value>);
+    let mut rows: Vec<Kept> = Vec::with_capacity(folded.len());
+    for r in folded {
+        FN_VALS.with(|m| m.borrow_mut().clear());
+        if let Some(h) = &having {
+            if !lazy_fn_eval(database, calls, args, ctx, &r, &|| h.matches(&r))? {
+                continue;
+            }
+        }
+        rows.push((r, FN_VALS.with(|m| std::mem::take(&mut *m.borrow_mut()))));
+    }
+    if order_by.iter().any(|k| k.expr.as_ref().is_some_and(expr_has_user_fn)) {
+        rows = sort_fn_keyed(database, calls, args, ctx, rows, order_by)?;
+    } else if !order_by.is_empty() {
+        // a stable sort over the rows, their values riding beside them
+        let n = rows.first().map_or(0, |(r, _)| r.len());
+        let mut keyed: Vec<Vec<Value>> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (r, _))| {
+                let mut r = r.clone();
+                r.resize(n, Value::Null);
+                r.push(Value::Int(i as i64));
+                r
+            })
+            .collect();
+        keyed = sort_rows_spilling(keyed, order_by)?;
+        let mut taken: Vec<Option<Kept>> = rows.into_iter().map(Some).collect();
+        rows = keyed
+            .iter()
+            .map(|r| match r.get(n) {
+                Some(Value::Int(i)) => taken.get_mut(*i as usize).and_then(Option::take).ok_or(EvalErr::Unsupported),
+                _ => Err(EvalErr::Unsupported),
+            })
+            .collect::<Result<_, _>>()?;
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for (r, vals) in rows {
+        FN_VALS.with(|m| *m.borrow_mut() = vals);
+        let mut row = Vec::with_capacity(cols.len());
+        for c in cols {
+            row.push(lazy_fn_eval(database, calls, args, ctx, &r, &|| c.value_of(&r))?);
+        }
+        out.push(row);
+    }
+    FN_VALS.with(|m| m.borrow_mut().clear());
+    Ok(out)
+}
+
+/// Sort rows by ORDER BY keys that call: each row's keys run for it (its
+/// values parked beside it, as the filter left them), one slot per key,
+/// and the stable sort then compares values and evaluates nothing.
+fn sort_fn_keyed(
+    database: &mut Option<Database>,
+    calls: &[FnCall],
+    args: &[WireParam],
+    ctx: &SessionCtx,
+    mut rows: Vec<(Vec<Value>, std::collections::HashMap<u32, Value>)>,
+    order_by: &[OrderKey],
+) -> Result<Vec<(Vec<Value>, std::collections::HashMap<u32, Value>)>, EvalErr> {
+    let n = rows.iter().map(|(r, _)| r.len()).max().unwrap_or(0);
+    let mut keyed: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+    for (i, (values, vals)) in rows.iter_mut().enumerate() {
+        let mut r = values.clone();
+        r.resize(n, Value::Null);
+        r.push(Value::Int(i as i64));
+        FN_VALS.with(|m| *m.borrow_mut() = std::mem::take(vals));
+        for k in order_by {
+            r.push(match &k.expr {
+                Some(e) => lazy_fn_eval(database, calls, args, ctx, values, &|| e.eval(values))?,
+                None => values.get(k.field).cloned().unwrap_or(Value::Null),
+            });
+        }
+        *vals = FN_VALS.with(|m| std::mem::take(&mut *m.borrow_mut()));
+        keyed.push(r);
+    }
+    let keys: Vec<OrderKey> = order_by
+        .iter()
+        .enumerate()
+        .map(|(j, k)| OrderKey { field: n + 1 + j, expr: None, ..k.clone() })
+        .collect();
+    sort_rows(&mut keyed, &keys)?;
+    let mut taken: Vec<Option<_>> = rows.into_iter().map(Some).collect();
+    keyed
+        .iter()
+        .map(|r| match r.get(n) {
+            Some(Value::Int(i)) => taken.get_mut(*i as usize).and_then(Option::take).ok_or(EvalErr::Unsupported),
+            _ => Err(EvalErr::Unsupported),
+        })
+        .collect()
+}
+
+/// A `UserFn` node's value from the row's own hidden index slot, while a
+/// fold runs over rows whose calls ran beforehand ([group_fn_rows])
+fn fn_row_val(id: u32, values: &[Value]) -> Option<Value> {
+    let slot = FN_ROW_TAG.with(|t| t.get())?;
+    let Some(Value::Int(i)) = values.get(slot) else { return None };
+    FN_ROW_VALS.with(|v| v.borrow().get(*i as usize).and_then(|m| m.get(&id).cloned()))
+}
+
+/// Every expression an aggregate's source evaluates per row.
+fn agg_src_exprs(s: &AggSrc) -> Vec<&Expr> {
+    match s {
+        AggSrc::Star | AggSrc::Field(_) | AggSrc::CollField(..) => Vec::new(),
+        AggSrc::Expr(e) => vec![e],
+        AggSrc::Pair(a, b) => vec![a, b],
+        AggSrc::Percentile { frac, order, .. } => vec![frac, order],
+        AggSrc::List { arg, sep, order, .. } => {
+            let mut v = vec![arg];
+            v.extend(sep.iter());
+            v.extend(order.iter().map(|(e, _, _)| e));
+            v
+        }
+    }
 }
 
 /// Does this expression call a stored function anywhere?
@@ -132291,7 +132908,10 @@ fn resolve_having(
                 // engine answers every one). Over the group-row view a
                 // group key resolves and any other column refuses.
                 let null_test = matches!(rt.kind, RawKind::IsNull | RawKind::IsNotNull);
-                if raw_has_agg(raw_e) || rhs_e.is_some() || raw_has_param(raw_e) || null_test {
+                // ... or a stored call over a group key (`HAVING F2(C, 1)
+                // <> 'x'`), which runs over the folded row as one over an
+                // aggregate does
+                if raw_has_agg(raw_e) || rhs_e.is_some() || raw_has_param(raw_e) || null_test || raw_calls_user_fn(raw_e) {
                     let mut aggs = collect_aggs(raw_e);
                     if let Some(r) = rhs_e {
                         for a in collect_aggs(r) {
@@ -133855,6 +134475,11 @@ fn after_auth(
                 match planned {
                     // execute only zero-parameter statements here
                     // (op_exec_immediate carries no message)
+                    Some((_, ps)) if ps.is_empty() && ddl_savepoint_refusal(&text, &database).is_some() => {
+                        if let Some(e) = ddl_savepoint_refusal(&text, &database) {
+                            respond_eval_error(&mut s, &mut enc, &e)?;
+                        }
+                    }
                     Some((p, ps)) if ps.is_empty() => {
                         match execute_dml(&p, &mut database, &[], &SessionCtx { user, attach_id }) {
                             Ok(counts) => {
@@ -134356,7 +134981,11 @@ fn after_auth(
                         (None, Some(_)) => first_unresolved_qualifier(&stmt_sql, &database),
                         _ => None,
                     };
-                    let planned = if let Some(e) = dml_lint.or(dml_unresolved) {
+                    // ...after the target: one that names no relation is
+                    // the -204 at prepare ([dml_missing_target]), placed in
+                    // the text as the client SENT it
+                    let dml_missing = dml_missing_target(&client_sql, kw, &database);
+                    let planned = if let Some(e) = dml_lint.or(dml_missing).or(dml_unresolved) {
                         Some((std::rc::Rc::new(Plan::RefusedEval(e)), std::rc::Rc::new(Vec::new())))
                     } else { timed("plan(dml)", || {
                         let build = || {
@@ -134671,6 +135300,11 @@ fn after_auth(
                 if bound_args.len() != stmt_params.len() {
                     last_dml = (0, 0, 0);
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                } else if let Some(e) = ddl_savepoint_refusal(&stmt_sql, &database) {
+                    // DDL under a user savepoint, refused before anything
+                    // is written ([ddl_savepoint_refusal])
+                    last_dml = (0, 0, 0);
+                    respond_eval_error(&mut s, &mut enc, &e)?;
                 } else if let Some(t) = chunk_new_text_off_grammar(&stmt_params, &bound_args) {
                     // K2 (round 12): a text off the canonical grammar into
                     // a chunk-new numeric slot raises the engine's
@@ -152463,6 +153097,49 @@ mod tests {
             split_qualified_name("PUBLIC.PADD"),
             Some((Some("PUBLIC".to_string()), "PADD".to_string()))
         );
+    }
+
+    #[test]
+    fn ddl_under_a_savepoint_names_the_statements_own_verb() {
+        // the `<VERB> @1 failed` item and its object, per form (measured
+        // on 2196 - serve-real-ddlsavepoint.sh holds the wire side)
+        let item = |t: &str| match ddl_savepoint_vector(t, "S") {
+            Some(EvalErr::Status(v)) => v
+                .iter()
+                .skip(1)
+                .take_while(|i| !matches!(i, StatusItem::Gds(GDS_USER_SAVEPOINT)))
+                .map(|i| match i {
+                    StatusItem::Gds(c) => format!("#{}", c - 0x140D0000),
+                    StatusItem::Str(s) => s.clone(),
+                    StatusItem::Num(n) => n.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            Some(_) => "?".into(),
+            None => "-".into(),
+        };
+        assert_eq!(item("CREATE TABLE T2 (X INTEGER)"), "#998 \"PUBLIC\".\"T2\"");
+        assert_eq!(item("create table \"t q\" (x int)"), "#998 \"PUBLIC\".\"t q\"");
+        assert_eq!(item("CREATE GLOBAL TEMPORARY TABLE GT (X INT)"), "#998 \"PUBLIC\".\"GT\"");
+        assert_eq!(item("RECREATE VIEW VW AS SELECT 1 FROM RDB$DATABASE"), "#1013 \"PUBLIC\".\"VW\"");
+        assert_eq!(item("CREATE OR ALTER PROCEDURE P1 AS BEGIN END"), "#979 \"PUBLIC\".\"P1\"");
+        assert_eq!(item("CREATE GENERATOR G2"), "#997 \"PUBLIC\".\"G2\"");
+        assert_eq!(item("SET GENERATOR SQ TO 7"), "#1037 \"PUBLIC\".\"SQ\"");
+        assert_eq!(item("SET STATISTICS INDEX TIX"), "#1024 \"PUBLIC\".\"TIX\"");
+        assert_eq!(item("CREATE UNIQUE DESCENDING INDEX UX ON T (ID)"), "#1028 \"PUBLIC\".\"UX\"");
+        assert_eq!(item("DROP PACKAGE BODY PK"), "#1008 \"PUBLIC\".\"PK\"");
+        assert_eq!(item("CREATE ROLE R2"), "#1022 R2");
+        assert_eq!(item("GRANT SELECT ON T TO R1"), "#1031");
+        assert_eq!(item("ALTER DATABASE SET DEFAULT CHARACTER SET UTF8"), "#1025");
+        assert_eq!(item("COMMENT ON COLUMN T.ID IS 'c'"), "#971 \"PUBLIC\".\"T\".ID");
+        assert_eq!(item("COMMENT ON ROLE R1 IS 'c'"), "#971 \"R1\"");
+        assert_eq!(item("CREATE MAPPING MP USING ANY PLUGIN FROM ANY USER TO USER U1"), "#1034 MP CREATE");
+        assert_eq!(item("ALTER CHARACTER SET UTF8 SET DEFAULT COLLATION UNICODE"), "#970 \"SYSTEM\".\"UTF8\"");
+        // not DDL: no refusal
+        assert_eq!(item("ALTER SESSION RESET"), "-");
+        assert_eq!(item("INSERT INTO T VALUES (1)"), "-");
+        assert_eq!(item("SAVEPOINT S2"), "-");
+        assert_eq!(item("SET TRANSACTION"), "-");
     }
 
     #[test]

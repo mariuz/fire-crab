@@ -26,10 +26,21 @@
 #    sort under DISTINCT, which projects every kept row); an unsorted window
 #    stops the scan (`FIRST 1 .. WHERE FZ(ID) < 0` answers [1]).
 #
-# A call inside a subquery, a derived table, a view, a join, an
-# aggregate, GROUP BY or UNION, and a window over a NAVIGATED
-# key, refuse at prepare - recorded (section 6).  So does DML: only a
-# client SELECT arms the tokenizer.
+# A FOLD (section 7): a global aggregate or a GROUP BY whose WHERE calls
+# filters lazily as above and then folds; a call inside an aggregate's
+# argument or a GROUP BY key runs per kept row, lazily over the whole
+# argument (`SUM(IIF(ID = 2, 0, FZ(ID)))` never runs FZ(2)), and the fold
+# reads each row's values back - so its tie order (a LIST's, read off the
+# fields the statement references, a WHERE-only one included) and its
+# grouping order are the plain fold's; a call over an aggregate or a key
+# in HAVING, the ORDER BY or the select list runs over the folded row.
+# The lone-aggregate fast path stands aside for a calling WHERE: over an
+# EMPTY table its prepare-time probe "succeeded" and left a plan that
+# could not run the call.
+#
+# A call inside a subquery, a derived table, a view, a join or UNION,
+# and a window over a NAVIGATED key, refuse at prepare - recorded
+# (section 6).  So does DML: only a client SELECT arms the tokenizer.
 #
 # Usage: qa/serve-real-fnwhere.sh [port]
 set -u
@@ -48,7 +59,16 @@ mkdir -p "$D"; rm -f "$ENG" "$FC"
 CREATE TABLE T (ID INTEGER, V VARCHAR(20), N NUMERIC(9,2));
 CREATE TABLE E (ID INTEGER);
 CREATE TABLE TI (ID INTEGER PRIMARY KEY);
+CREATE TABLE G (ID INTEGER, K VARCHAR(5), C CHAR(3), N NUMERIC(9,2));
 COMMIT;
+INSERT INTO G VALUES (5, 'zz', 'b', 2.25);
+INSERT INTO G VALUES (1, 'a', 'b', 1.10);
+INSERT INTO G VALUES (7, 'zz', 'a', NULL);
+INSERT INTO G VALUES (2, 'M', 'a', 3.00);
+INSERT INTO G VALUES (4, 'a', 'c', -1.50);
+INSERT INTO G VALUES (3, 'zz', 'c', 0.75);
+INSERT INTO G VALUES (6, NULL, 'b', 2.00);
+INSERT INTO G VALUES (8, 'M', NULL, 9.99);
 INSERT INTO T VALUES (1, 'a', 1.50);
 INSERT INTO T VALUES (2, 'b', 10);
 INSERT INTO T VALUES (3, 'c', NULL);
@@ -83,13 +103,19 @@ fail=0; ran=0
 qrb() { FC_DB="$2" FC_PORT="$1" FC_Q="$3" FC_P="$4" FC_RB="$5" timeout 25 node -e '
   process.on("uncaughtException",()=>{console.log("CONN_ERR");process.exit(1);});
   const F=require("node-firebird");
-  const fmt=r=>(!r||!r.length)?"(none)":r.map(x=>Object.values(x).map(v=>v===null?"NULL":(v instanceof Date?v.toISOString():v)).join()).join(";");
+  // a BLOB value (a LIST) arrives as a reader: read it in the SAME
+  // transaction, before the rollback, as its text
+  const rd=(tr,v)=>new Promise(res=>{if(typeof v!=="function")return res(v);
+    v(tr,(e,n,em)=>{if(e)return res("BLOBERR");const b=[];em.on("data",c=>b.push(c));em.on("end",()=>res(Buffer.concat(b).toString()));});});
+  const fmt=async(tr,r)=>{if(!r||!r.length)return "(none)";const o=[];
+    for(const x of r){const vs=[];for(const v0 of Object.values(x)){const v=await rd(tr,v0);vs.push(v===null?"NULL":(v instanceof Date?v.toISOString():v));}o.push(vs.join());}
+    return o.join(";");};
   F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,user:"SYSDBA",password:"masterkey"},(e,db)=>{
     if(e){console.log("CONN_ERR");process.exit(1);}
     db.transaction(F.ISOLATION_READ_COMMITTED,(et,tr)=>{
-      tr.query(process.env.FC_Q,JSON.parse(process.env.FC_P),(e2,r1)=>{
-        const d=e2?("ERR "+e2.message.replace(/\s+/g," ").trim()):("ok "+fmt(r1));
-        tr.query(process.env.FC_RB,[],(e3,r)=>{tr.rollback(()=>{console.log(d+" | rb="+(e3?"ERR":fmt(r)));db.detach();process.exit(0);});});
+      tr.query(process.env.FC_Q,JSON.parse(process.env.FC_P),async(e2,r1)=>{
+        const d=e2?("ERR "+e2.message.replace(/\s+/g," ").trim()):("ok "+await fmt(tr,r1));
+        tr.query(process.env.FC_RB,[],async(e3,r)=>{const rb=e3?"ERR":await fmt(tr,r);tr.rollback(()=>{console.log(d+" | rb="+rb);db.detach();process.exit(0);});});
       });
     });
   });' 2>/dev/null; }
@@ -208,8 +234,6 @@ both "5 CONTROL a built-in in a WHERE"        "SELECT ID FROM T WHERE UPPER(V) =
 both "5 CONTROL a keyed WHERE"                "SELECT ID FROM TI WHERE ID = 2" '[]'
 
 echo "--- 6 RECORDED - the engine answers, this server refuses at prepare"
-eng_only "6 COUNT(*) .. WHERE F1(ID) > 3"     "SELECT COUNT(*) FROM T WHERE F1(ID) > 3" '[]'
-eng_only "6 GROUP BY"                         "SELECT ID FROM T WHERE F1(ID) > 3 GROUP BY ID" '[]'
 eng_only "6 a call inside an IN subquery"     "SELECT ID FROM T WHERE ID IN (SELECT ID FROM T WHERE F1(ID) > 3) ORDER BY ID" '[]'
 eng_only "6 a call inside a correlated EXISTS" "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM T T2 WHERE F1(T2.ID) = T.ID * 2 AND T2.ID > 1) ORDER BY ID" '[]'
 eng_only "6 a derived table"                  "SELECT ID FROM (SELECT ID FROM T WHERE F1(ID) > 3) ORDER BY ID" '[]'
@@ -219,12 +243,79 @@ eng_only "6 ROWS ? - a bound window"          "SELECT ID FROM T WHERE F1(ID) > ?
 eng_only "6 FIRST over a NAVIGATED key"       "SELECT FIRST 1 ID FROM TI WHERE ID > 2 AND FZ(ID) > 0 ORDER BY ID" '[]'
 eng_only "6 UPDATE .. WHERE F1(ID) > 3 - DML is not armed" "UPDATE T SET V = V WHERE F1(ID) > 3" '[]'
 
+echo "--- 7 a FOLD: a call in the WHERE, an aggregate's argument, a key, HAVING,"
+echo "      the ORDER BY and the select list over the folded rows"
+both "7 COUNT(*) F1>3" "SELECT COUNT(*) FROM T WHERE F1(ID) > 3" '[]'
+both "7 SUM/MIN/MAX" "SELECT SUM(ID), MIN(V), MAX(N), COUNT(N) FROM T WHERE F1(ID) > 2" '[]'
+both "7 COUNT ? " "SELECT COUNT(*) FROM T WHERE F1(ID) > ?" '[3]'
+both "7 COUNT order raise" "SELECT COUNT(*) FROM T WHERE FZ(ID) > 0 AND ID <> 2" '[]'
+both "7 COUNT order ok" "SELECT COUNT(*) FROM T WHERE ID <> 2 AND FZ(ID) > 0" '[]'
+both "7 COUNT empty" "SELECT COUNT(*) FROM E WHERE FZ(2) > 0" '[]'
+both "7 COUNT keyed" "SELECT COUNT(*) FROM TI WHERE FZ(ID) > 0 AND ID = 1" '[]'
+both "7 GROUP BY" "SELECT ID FROM T WHERE F1(ID) > 3 GROUP BY ID" '[]'
+both "7 GROUP BY V count" "SELECT V, COUNT(*) FROM T WHERE F1(ID) >= 2 GROUP BY V ORDER BY V DESC" '[]'
+both "7 HAVING" "SELECT V, COUNT(*) FROM T WHERE F1(ID) >= 2 GROUP BY V HAVING COUNT(*) > 0 ORDER BY 1" '[]'
+both "7 SUM(F1)" "SELECT SUM(F1(ID)) FROM T" '[]'
+both "7 GROUP BY F1" "SELECT F1(ID), COUNT(*) FROM T GROUP BY F1(ID)" '[]'
+both "7 HAVING F" "SELECT V FROM T GROUP BY V HAVING F1(COUNT(*)) = 2" '[]'
+both "7 agg raise in arg" "SELECT SUM(FZ(ID)) FROM T" '[]'
+both "7 COUNT empty col" "SELECT COUNT(*) FROM E WHERE FZ(ID) > 0" '[]'
+both "7 COUNT T const" "SELECT COUNT(*) FROM T WHERE F1(2) > 0" '[]'
+both "7 COUNT T const raise" "SELECT COUNT(*) FROM T WHERE FZ(2) > 0" '[]'
+both "7 MAX E const" "SELECT MAX(ID) FROM E WHERE FZ(2) > 0" '[]'
+both "7 ID E const" "SELECT ID FROM E WHERE FZ(2) > 0" '[]'
+both "7 G K no order" "SELECT K, COUNT(*), SUM(N) FROM G WHERE F1(ID) > 2 GROUP BY K" '[]'
+both "7 G C no order" "SELECT C, MAX(ID), AVG(N) FROM G WHERE F1(ID) <> 6 GROUP BY C" '[]'
+both "7 G two keys" "SELECT C, K, COUNT(*) FROM G WHERE F1(ID) > 0 GROUP BY C, K" '[]'
+both "7 G LIST ties" "SELECT LIST(K) FROM G WHERE F1(ID) > 2 AND C <> 'q'" '[]'
+both "7 G LIST group" "SELECT C, LIST(ID) FROM G WHERE F1(ID) > 0 GROUP BY C" '[]'
+both "7 G COUNT DISTINCT" "SELECT COUNT(DISTINCT K), COUNT(K), MIN(K) FROM G WHERE F1(ID) > 3" '[]'
+both "7 G having order" "SELECT K, SUM(ID) FROM G WHERE F1(ID) > 0 GROUP BY K HAVING SUM(ID) > 3 ORDER BY 2 DESC" '[]'
+both "7 G FIRST" "SELECT FIRST 2 K, COUNT(*) FROM G WHERE F1(ID) > 0 GROUP BY K ORDER BY K" '[]'
+both "7 G SKIP" "SELECT SKIP 1 K FROM G WHERE F1(ID) > 0 GROUP BY K" '[]'
+both "7 G DISTINCT" "SELECT DISTINCT COUNT(*) FROM G WHERE F1(ID) > 0 GROUP BY C" '[]'
+both "7 G raise" "SELECT K, COUNT(*) FROM G WHERE FZ(ID) > 0 AND ID <> 2 GROUP BY K" '[]'
+both "7 G raise avoided" "SELECT K, COUNT(*) FROM G WHERE ID <> 2 AND FZ(ID) > -100 GROUP BY K ORDER BY 1" '[]'
+both "7 G having ?" "SELECT K, COUNT(*) FROM G WHERE F1(ID) > ? GROUP BY K HAVING COUNT(*) > ? ORDER BY 1" '[4, 1]'
+both "7 G expr key" "SELECT ID / 3, COUNT(*) FROM G WHERE F1(ID) > 2 GROUP BY ID / 3" '[]'
+both "7 G F2 text" "SELECT C, COUNT(*) FROM G WHERE F2(K, ID) STARTING WITH 'zz' GROUP BY C" '[]'
+both "7 G empty fold" "SELECT COUNT(*), SUM(N), LIST(K) FROM G WHERE F1(ID) > 100" '[]'
+both "7 G empty group" "SELECT K, COUNT(*) FROM G WHERE F1(ID) > 100 GROUP BY K" '[]'
+both "7 G no-fn control" "SELECT K, COUNT(*), SUM(N) FROM G WHERE ID > 1 GROUP BY K" '[]'
+both "7 G COUNT DISTINCT" "SELECT COUNT(DISTINCT K) AS A, COUNT(K) AS B, MIN(K) AS M2 FROM G WHERE F1(ID) > 3" '[]'
+both "7 G ? in proj" "SELECT K, COUNT(*) + CAST(? AS INTEGER) FROM G WHERE F1(ID) > ? GROUP BY K ORDER BY 1" '[10, 4]'
+both "7 G LIST where-field ties" "SELECT LIST(C, '|') FROM G WHERE F1(ID) > 0 AND N > -5" '[]'
+both "7 G LIST ctl" "SELECT LIST(K) FROM G WHERE ID > 2 AND C <> 'q'" '[]'
+both "7 G LIST distinct" "SELECT C, LIST(DISTINCT K) FROM G WHERE F1(ID) > 1 GROUP BY C" '[]'
+both "7 agg IIF lazy" "SELECT SUM(IIF(ID = 2, 0, FZ(ID))) FROM T" '[]'
+both "7 COUNT(F) nulls" "SELECT COUNT(F1(N)) AS A, COUNT(*) AS B FROM T" '[]'
+both "7 GROUP BY F2 key" "SELECT F2(C, 1), COUNT(*) FROM G GROUP BY F2(C, 1)" '[]'
+both "7 G SUM F1 by K" "SELECT K, SUM(F1(ID)) FROM G GROUP BY K" '[]'
+both "7 G MAX F2" "SELECT C, MAX(F2(K, ID)) FROM G GROUP BY C" '[]'
+both "7 G LIST F2" "SELECT C, LIST(F2(K, ID)) FROM G WHERE ID > 1 GROUP BY C" '[]'
+both "7 G LIST F2 global" "SELECT LIST(F2(K, ID), '/') FROM G WHERE F1(ID) > 4" '[]'
+both "7 G HAVING F sum" "SELECT K, SUM(ID) FROM G GROUP BY K HAVING F1(SUM(ID)) > 12 ORDER BY 1" '[]'
+both "7 G proj F over agg" "SELECT K, F1(COUNT(*)) FROM G GROUP BY K ORDER BY 1" '[]'
+both "7 G proj F over key" "SELECT C, F2(C, COUNT(*)) FROM G GROUP BY C" '[]'
+both "7 G order F" "SELECT K, COUNT(*) FROM G GROUP BY K ORDER BY F1(COUNT(*)) DESC, 1" '[]'
+both "7 G HAVING raise" "SELECT K FROM G GROUP BY K HAVING FZ(COUNT(*)) > 0" '[]'
+both "7 G proj raise" "SELECT K, FZ(COUNT(*)) FROM G GROUP BY K" '[]'
+both "7 G expr key F" "SELECT F1(ID) / 4, COUNT(*) FROM G GROUP BY F1(ID) / 4" '[]'
+both "7 G key raise" "SELECT FZ(ID), COUNT(*) FROM G GROUP BY FZ(ID)" '[]'
+both "7 G avg F1 N" "SELECT C, AVG(F1(N)) FROM G GROUP BY C" '[]'
+both "7 G ? in arg" "SELECT SUM(F1(ID) + CAST(? AS INTEGER)) FROM G" '[100]'
+both "7 G call ? arg" "SELECT SUM(F1(?)) FROM G" '[3]'
+both "7 G HAVING key call" "SELECT C FROM G GROUP BY C HAVING F2(C, 1) <> 'b  -1'" '[]'
+both "7 G HAVING call ?" "SELECT K FROM G GROUP BY K HAVING F1(COUNT(*)) > ?" '[3]'
+both "7 G HAVING order lazy" "SELECT K FROM G GROUP BY K HAVING COUNT(*) > 2 OR FZ(COUNT(*)) > 0" '[]'
+both "7 G HAVING order raise" "SELECT K FROM G GROUP BY K HAVING FZ(COUNT(*)) > 0 OR COUNT(*) > 2" '[]'
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-fnwhere-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 83 on the 2026-10-03 binary, 83 OK
-if [ "$ran" -lt 83 ]; then echo "FAIL only $ran checks ran (floor 83) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 145 on the 2026-10-03 binary, 145 OK
+if [ "$ran" -lt 145 ]; then echo "FAIL only $ran checks ran (floor 145) - cells went missing"; fail=1; fi
 exit $fail

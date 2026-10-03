@@ -187,12 +187,15 @@ SELECT COUNT(*) FROM AU;"
 gfixok "5"
 
 # --- 6. what the ENGINE does with fc's file after all of it ---------------
+# (S3 left these two checks on 2026-10-03: section 2 made it under a
+# savepoint, which 6.0.0.2196 refuses - the DDL-under-savepoint law,
+# serve-real-ddlsavepoint.sh - so neither file has it any more)
 check "6 the ENGINE writes into fc's surviving tables" \
-    "$(engf "INSERT INTO S3 VALUES (5); INSERT INTO AU VALUES (2); COMMIT; SELECT SUM(X) FROM S3; SELECT COUNT(*) FROM AU; SELECT COUNT(*) FROM KEEP;")" "9|2|3|"
+    "$(engf "INSERT INTO AU VALUES (2); COMMIT; SELECT COUNT(*) FROM AU; SELECT COUNT(*) FROM KEEP;")" "2|3|"
 "$GFIX" -sweep -user "$U" -pas "$P" "$DBF" >/dev/null 2>&1
 gfixok "6 after the engine's sweep"
 check "6 ...and the sweep kept every row" \
-    "$(engf "SELECT SUM(X) FROM S3; SELECT COUNT(*) FROM AU; SELECT COUNT(*) FROM KEEP; SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME IN ('T', 'S2', 'D1');")" "9|2|3|0|"
+    "$(engf "SELECT COUNT(*) FROM AU; SELECT COUNT(*) FROM KEEP; SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME IN ('T', 'S2', 'D1');")" "2|3|0|"
 
 # --- 7. RECORDED: who sees an uncommitted DDL ---------------------------
 # The engine shows a transaction's uncommitted CREATE TABLE to that

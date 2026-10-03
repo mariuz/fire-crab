@@ -24,6 +24,13 @@
 # (an undone identity RESTART WITH 100: engine writes ID 100, fc wrote
 # ID 2) is the P16 pair.
 #
+# 6.0.0.2196 REFUSES DDL UNDER A USER SAVEPOINT (serve-real-ddlsavepoint.sh),
+# and SET GENERATOR / ALTER SEQUENCE / ALTER TABLE .. RESTART are DDL: every
+# set inside a SAVEPOINT below now fails 0A000 on the engine, which under
+# `isql -b` aborted the whole script (0 cells). The matrix runs WITHOUT -b
+# since 2026-10-03, so each cell still compares the two servers - what it
+# measures now is the refusal and the values that survive it.
+#
 #   qa/serve-real-gencomp.sh [port]
 
 set -u
@@ -150,9 +157,9 @@ INSERT INTO AID (V) VALUES (4);
 SELECT '"'"'TAG P16-post-commit-draws-page '"'"' || MAX(ID) AS T FROM AID;
 COMMIT;'
 
-e_out=$(echo "$MATRIX" | "$ISQL" -q -b -user "$U" -pas "$P" "$RE" 2>&1 \
+e_out=$(echo "$MATRIX" | "$ISQL" -q -user "$U" -pas "$P" "$RE" 2>&1 \
     | grep -oE 'TAG [^ ]* -?[0-9]+' | sed 's/  */ /g')
-f_out=$(echo "$MATRIX" | "$ISQL" -q -b -user "$U" -pas "$P" "localhost/$PORT:$FC" 2>&1 \
+f_out=$(echo "$MATRIX" | "$ISQL" -q -user "$U" -pas "$P" "localhost/$PORT:$FC" 2>&1 \
     | grep -oE 'TAG [^ ]* -?[0-9]+' | sed 's/  */ /g')
 
 cells=$(echo "$e_out" | grep -c 'TAG')
@@ -178,7 +185,7 @@ done <<< "$e_out"
 # own read answers 3.
 xatt() { # <conn-string> -> "mid other post"
     local conn="$1"
-    "$ISQL" -q -b -user "$U" -pas "$P" "$conn" <<'EOF' >/tmp/fc-gencomp-hold.log 2>&1 &
+    "$ISQL" -q -user "$U" -pas "$P" "$conn" <<'EOF' >/tmp/fc-gencomp-hold.log 2>&1 &
 SET AUTODDL OFF; SET LIST ON;
 SET GENERATOR G TO 50; COMMIT;
 SAVEPOINT SP;
@@ -209,7 +216,7 @@ chmod 666 "$RE" 2>/dev/null
 e_x=$(xatt "localhost:$RE")
 f_x=$(xatt "localhost/$PORT:$FC")
 if [ -n "$e_x" ] && [ "$e_x" = "$f_x" ]; then
-    echo "OK   the cache is private: holder/other/post [$f_x] identical (want 3 50 50)"
+    echo "OK   the cache is private: holder/other/post [$f_x] identical (3 50 50 through 2182)"
 else
     echo "DIFF cross-attachment: engine [$e_x] fc [$f_x]"
     fail=1

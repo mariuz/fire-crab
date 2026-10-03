@@ -5,9 +5,7 @@
 # the exponent's magnitude - the significand is the mantissa digits with
 # the '.' removed and leading zeros dropped, read as a magnitude M:
 #   M <= 2^63-1  -> DOUBLE(480)        (1e5, 1e40, 1.5e38 - significand 1/15)
-#   M == 2^63    -> INT128(32752)      (a lone quirk: exactly
-#                                       9223372036854775808, whole scale-0)
-#   M >= 2^63+1  -> DECFLOAT(34)(32762)(9999999999999999999e0,
+#   M >= 2^63    -> DECFLOAT(34)(32762)(9999999999999999999e0,
 #                                       12345678901234567890e0,
 #                                       1.2345678901234567890e5)
 # fire-crab used to type EVERY exponent literal DOUBLE, so a
@@ -21,6 +19,11 @@
 # comparison type); that is a documented known-refuse, not a wrong value.
 # The DOUBLE-side last-digit binary64 rounding (9223372036854775807e0)
 # is a pre-existing divergence - TYPE is asserted there, not the value.
+#
+# Through 6.0.0.2182 a significand of EXACTLY 2^63 was an INT128 quirk
+# (and its scaled forms refused here); 2196 types it DECFLOAT(34) like any
+# larger one, `9223372036854775808e-1` and `9.223372036854775808e18` too -
+# measured 2026-10-03, the quirk branch removed and both refusals promoted.
 #
 # Usage: qa/serve-real-explit.sh [port]   (default 4148)
 set -u
@@ -55,18 +58,15 @@ where_agree(){ local e f; e=$(whr "$E" "$1"); f=$(whr "$F" "$1"); \
 fc_refuses() { local f; f=$(whr "$F" "$1"); \
   [ "$f" = "R" ] && echo "OK   refuse-in-WHERE $1  (engine answers; fc refuses, as a plain DECFLOAT literal does)" \
   || { echo "FAIL refuse $1  expected fc R, got [$f]"; fail=1; }; }
-fc_refuses_sel() { local f; f=$(printf 'set list on;\nselect %s x from rdb$database;\n' "$1" \
-  | "$ISQL" -q -user "$U" -pas "$P" "$F" 2>&1 | grep -ci 'failed\|error'); \
-  [ "$f" != 0 ] && echo "OK   refuse $1  (2^63 scaled INT128, no literal form)" || { echo "FAIL refuse $1 (expected fc refuse)"; fail=1; }; }
-
 echo "== DOUBLE side: type + value =="
 for c in "1e5" "1e40" "1.5e38" "15e-1" "1.23456789012345e0" "1.234567890123456789e30"; do
   type_agree "$c"; val_agree "$c"; where_agree "$c"; done
 echo "== DOUBLE side: type only (pre-existing binary64 last-digit) =="
 type_agree "9223372036854775807e0"
 
-echo "== INT128 quirk: type + value + WHERE (all faithful) =="
-for c in "9223372036854775808e0" "9223372036854775808e1" "9223372036854775808e5"; do
+echo "== EXACTLY 2^63 (the INT128 quirk through 2182): DECFLOAT(34) on 2196 =="
+for c in "9223372036854775808e0" "9223372036854775808e1" "9223372036854775808e5" \
+         "9223372036854775808e-1" "9.223372036854775808e18" "-9223372036854775808e0"; do
   type_agree "$c"; val_agree "$c"; where_agree "$c"; done
 
 echo "== DECFLOAT(34) side: type + value (SELECT) + WHERE (a DECFLOAT literal compares in decimal since the dfliteral chunk, 2026-09-15) =="
@@ -75,9 +75,6 @@ for c in "9223372036854775809e0" "9999999999999999999e0" "12345678901234567890e0
          "1234567890123456789012345678901234567890e0"; do
   type_agree "$c"; val_agree "$c"; where_agree "$c"; done
 
-echo "== known-refuse: a 2^63 significand needing a SCALED/ROUNDED INT128 =="
-fc_refuses_sel "9223372036854775808e-1"
-fc_refuses_sel "9.223372036854775808e18"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 [ $fail = 0 ] && echo "PASS explit" || echo "FAIL explit"

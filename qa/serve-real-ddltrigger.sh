@@ -187,6 +187,30 @@ both "a policy that guards ONE object refuses only that one" \
   "DROP TABLE PROTECTED;
    SELECT COUNT(*) AS STILL FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME = 'PROTECTED';"
 
+# ---- THE VERB a refused routine names ----------------------------------
+# `<VERB> @1 failed` for a PROCEDURE, a FUNCTION and a TRIGGER sat eight
+# message numbers off: a CREATE PROCEDURE a DDL trigger refused printed
+# "DROP TRIGGER @1 failed" here (sqlerr.h; measured on 2196)
+for db in "$A" "$B"; do
+"$ISQL" -q -user "$U" -pas "$P" "$db" >/dev/null 2>&1 <<'SQL'
+SET TERM ^ ;
+CREATE TRIGGER D_ROUT BEFORE CREATE PROCEDURE OR CREATE FUNCTION OR CREATE TRIGGER POSITION 11 AS
+BEGIN
+  EXCEPTION EXD;
+END^
+SET TERM ; ^
+COMMIT;
+SQL
+done
+wipe
+both "a refused CREATE PROCEDURE / FUNCTION / TRIGGER names its own verb" \
+  "SET TERM ^ ;
+   CREATE PROCEDURE PR1 AS BEGIN EXIT; END^
+   CREATE FUNCTION FN1 RETURNS INTEGER AS BEGIN RETURN 1; END^
+   CREATE TRIGGER TR1 FOR KEEP BEFORE INSERT AS BEGIN NEW.A = 1; END^
+   SET TERM ; ^
+   SELECT COUNT(*) AS ROUTINES FROM RDB\$PROCEDURES WHERE RDB\$PROCEDURE_NAME = 'PR1';"
+
 # ---- ...AND THIS SERVER WRITES ONE --------------------------------------
 # the other half: CREATE TRIGGER for a DDL trigger compiled HERE, its
 # catalog row and BLR compared BYTE FOR BYTE with the engine's for the
