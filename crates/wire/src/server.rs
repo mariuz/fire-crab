@@ -67972,9 +67972,20 @@ fn agg_result_desc(
         };
     }
     Some(match func {
-        // a LIST result is a computed BLOB: no scalar slot descriptor -
-        // LIST inside an expression stays refused (recorded boundary)
-        AggFn::List => return None,
+        // a LIST result is a computed TEXT BLOB - the slot holds the
+        // minted blob, as a blob column's does - in the ARGUMENT'S
+        // character set (the first text column it references; a literal,
+        // a number, a temporal NONE - ListAggNode::make, measured). An
+        // expression over it reads it as a blob operand does
+        // ([Expr::BlobText]): `CAST(LIST(K) AS VARCHAR(n))`, `LIST(K) ||
+        // '!'`, `UPPER(..)`, `CHAR_LENGTH(..)` (measured on 2196)
+        AggFn::List => {
+            let cs = match target {
+                AggTarget::List { arg, .. } => raw_first_text_charset(arg, columns, descs),
+                _ => 0,
+            };
+            Descriptor { dtype: dtype::BLOB, scale: cs as i8, length: 8, sub_type: 1, flags: 0, offset: 0 }
+        }
         AggFn::Count => int64(0),
         AggFn::Min | AggFn::Max => match target {
             // MIN/MAX OVER A BLOB REFUSES rather than answering the wrong
@@ -82429,6 +82440,29 @@ thread_local! {
 /// bare literal or a non-text argument (measured: LIST('lit') and
 /// LIST(ID) describe charset 0, LIST(S) and LIST(S || 'x') the
 /// column's).
+/// [list_arg_charset] over the RAW argument, by the catalog's columns:
+/// the first text (or text blob) column the argument references, NONE when
+/// it references none.
+fn raw_first_text_charset(e: &RawExpr, columns: &[RelationColumn], descs: &[Descriptor]) -> i32 {
+    fn walk(e: &RawExpr, columns: &[RelationColumn], descs: &[Descriptor]) -> Option<i32> {
+        let w = |x: &RawExpr| walk(x, columns, descs);
+        match e {
+            RawExpr::Col(n) => find_col(columns, n).and_then(|c| descs.get(c.field_id as usize)).and_then(|d| match d.dtype {
+                dtype::TEXT | dtype::VARYING => Some((d.sub_type as i32) & 0xFF),
+                dtype::BLOB if d.sub_type == 1 => Some(d.scale as i32),
+                _ => None,
+            }),
+            RawExpr::Neg(a) | RawExpr::Cast(a, _) => w(a),
+            RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => w(a).or_else(|| w(b)),
+            RawExpr::Iif(_, a, b) => w(a).or_else(|| w(b)),
+            RawExpr::Coalesce(v) | RawExpr::Func(_, v) | RawExpr::UserFn(_, v) => v.iter().find_map(w),
+            RawExpr::Case(arms, els, _) => arms.iter().find_map(|(_, x)| w(x)).or_else(|| els.as_deref().and_then(w)),
+            _ => None,
+        }
+    }
+    walk(e, columns, descs).unwrap_or(0)
+}
+
 fn list_arg_charset(e: &Expr, descs: &[Descriptor]) -> i32 {
     fn walk(e: &Expr, descs: &[Descriptor]) -> Option<i32> {
         match e {

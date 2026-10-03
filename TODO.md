@@ -39,7 +39,10 @@ Short, actionable items. The long-form engineering backlog lives in
 
 ## Recorded gaps found on the way (2026-10-03)
 
-- [ ] `CAST(LIST(..) AS VARCHAR(n))` refuses at prepare (no stored call needed).
+- [x] `CAST(LIST(..) AS VARCHAR(n))` answers (`qa/serve-real-listexpr.sh`).
+- [ ] Other expressions over a LIST refuse: `LIST(K) || '!'`, UPPER / SUBSTRING / COALESCE, CHAR/OCTET_LENGTH
+      (listexpr section 2), and LIST in a condition (`HAVING LIST(ID) = '1,2'`, `LIKE`, `IS NULL`, `IIF`, `CASE
+      WHEN`) or an ORDER BY key.
 - [x] Schema-qualified DDL (`CREATE TABLE PUBLIC.T7 ..`, every kind, a view body over `PUBLIC.T`) and an
       unknown schema's vector (`qa/serve-real-ddlqualified.sh`).
 - [ ] A select list holding `GEN_ID(..)` beside a stored function call prepares but fails at fetch.
