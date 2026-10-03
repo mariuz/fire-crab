@@ -93371,9 +93371,8 @@ fn fn_native_plannable(plan: &Plan) -> Option<bool> {
         return None;
     }
     match plan {
-        Plan::Project { gen_cols, windows, .. } if gen_cols.is_empty() && windows.is_empty() => Some(true),
-        // a generator column or a window beside a call: no runner takes
-        // it (the generic row path would answer the generator NULL)
+        Plan::Project { windows, .. } if windows.is_empty() => Some(true),
+        // a window beside a call: no runner takes it
         Plan::Project { .. } => Some(false),
         // a fold: the WHERE, the aggregates' arguments, the keys, HAVING,
         // the ORDER BY and the select list all run their calls
@@ -125996,7 +125995,7 @@ fn materialise_user_fn_rows(
     let Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index, defer, windows, .. } = inner else {
         return Err(EvalErr::Unsupported);
     };
-    if !gen_cols.is_empty() || !windows.is_empty() {
+    if !windows.is_empty() {
         return Err(EvalErr::Unsupported);
     }
     if window.is_some_and(|(_, t)| t == Some(0)) {
@@ -126090,6 +126089,22 @@ fn materialise_user_fn_rows(
     }
     if let (Some((skip, take)), false) = (window, distinct) {
         kept = kept.into_iter().skip(skip).take(take.unwrap_or(usize::MAX)).collect();
+    }
+    // GENERATOR COLUMNS beside a call: drawn once per delivered row, in
+    // delivery order, before the select list runs - the advance the plain
+    // projection makes ([advance_generators]), persisted as it persists
+    if !gen_cols.is_empty() {
+        let slots: Vec<(usize, String, Option<i64>)> =
+            gen_cols.iter().map(|g| (g.value_index, g.name.clone(), g.step)).collect();
+        let mut rows: Vec<Vec<Value>> = kept.iter_mut().map(|(v, _)| std::mem::take(v)).collect();
+        let writes = {
+            let db = database.as_ref().ok_or(EvalErr::Unsupported)?;
+            advance_generators(db, &slots, &mut rows)
+        };
+        for ((v, _), r) in kept.iter_mut().zip(rows) {
+            *v = r;
+        }
+        persist_generators(database.as_mut(), &writes);
     }
     let mut out = Vec::with_capacity(kept.len());
     for (values, vals) in kept {

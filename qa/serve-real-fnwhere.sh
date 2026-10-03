@@ -82,6 +82,7 @@ CREATE TABLE T (ID INTEGER, V VARCHAR(20), N NUMERIC(9,2));
 CREATE TABLE E (ID INTEGER);
 CREATE TABLE TI (ID INTEGER PRIMARY KEY);
 CREATE TABLE G (ID INTEGER, K VARCHAR(5), C CHAR(3), N NUMERIC(9,2));
+CREATE SEQUENCE GS;
 COMMIT;
 INSERT INTO G VALUES (5, 'zz', 'b', 2.25);
 INSERT INTO G VALUES (1, 'a', 'b', 1.10);
@@ -414,12 +415,23 @@ echo "--- 9b RECORDED"
 # answer may move between rows
 eng_only "9b an impure call in a derived table"     "SELECT D.ID FROM (SELECT ID FROM T WHERE ID < FC()) D" '[]'
 
+echo "--- 10 a GENERATOR column beside a call: drawn per delivered row, before the select list"
+# (a generator is not transactional: every cell's draws - and its describe
+# run's - persist, identically on both twins, so the read-back shows them)
+RG="SELECT GEN_ID(GS, 0) FROM RDB\$DATABASE"
+both "10 GEN_ID(GS, 0) beside F1(1)"               "SELECT GEN_ID(GS, 0) AS G, F1(1) AS F $R" '[]' "$RG"
+both "10 GEN_ID(GS, 1) per row beside F1(ID)"      "SELECT ID, GEN_ID(GS, 1) AS G, F1(ID) AS F FROM T ORDER BY ID" '[]' "$RG"
+both "10 NEXT VALUE FOR beside a WHERE call"       "SELECT ID, NEXT VALUE FOR GS AS G FROM T WHERE F1(ID) > 3 ORDER BY ID" '[]' "$RG"
+both "10 the raise avoided: draws for kept rows"   "SELECT ID, GEN_ID(GS, 1) AS G FROM T WHERE ID <> 2 AND FZ(ID) > 0" '[]' "$RG"
+both "10 the WHERE raises: no draw delivered"      "SELECT ID, GEN_ID(GS, 1) AS G FROM T WHERE FZ(ID) > 0 AND ID <> 2" '[]' "$RG"
+eng_only "10 RECORDED - a generator inside a call's argument" "SELECT ID, F1(GEN_ID(GS, 1)) AS G FROM T ORDER BY ID" '[]'
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-fnwhere-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 198 on the 2026-10-03 binary, 198 OK
-if [ "$ran" -lt 198 ]; then echo "FAIL only $ran checks ran (floor 198) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 204 on the 2026-10-03 binary, 204 OK
+if [ "$ran" -lt 204 ]; then echo "FAIL only $ran checks ran (floor 204) - cells went missing"; fail=1; fi
 exit $fail
