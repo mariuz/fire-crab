@@ -137,9 +137,9 @@ echo "--- 4 RECORDED"
 # cross-type text into a temporal parameter by design (bind_proc_args)
 eng_only "4 DATE input from text '2020-01-31'"     "$EB (DT DATE = ?) RETURNS (R DATE) AS BEGIN R = DT + 1; SUSPEND; END" '["2020-01-31"]'
 # a stored FUNCTION called with a `?` - promoted the day it landed
-# (`serve-real-fnparam.sh`); one in a WHERE is still a router of its own
+# (`serve-real-fnparam.sh`), and one in a WHERE with `serve-real-fnwhere.sh`
 both     "4 SELECT F1(?) - a PSQL function's argument (promoted with fnparam)" "SELECT F1(?) FROM RDB\$DATABASE" '[21]'
-eng_only "4 WHERE F1(ID) > ?"                       "SELECT ID FROM T WHERE F1(ID) > ? ORDER BY ID" '[3]'
+both     "4 WHERE F1(ID) > ? (promoted with fnwhere)" "SELECT ID FROM T WHERE F1(ID) > ? ORDER BY ID" '[3]'
 
 echo "--- panic check"
 ran=$((ran + 1))

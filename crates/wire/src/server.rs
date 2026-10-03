@@ -13690,6 +13690,13 @@ fn bind_filter_eval(
 /// no row slot. `Term::Unknown` is NOT one of them - it stands for a
 /// column against NULL, which the engine evaluates per row.
 fn term_row_independent(t: &Term) -> bool {
+    // A STORED FUNCTION CALL IS NEVER AN INVARIANT, whatever its
+    // arguments: measured on 2182, `WHERE FZ(2) > 0` (FZ divides by zero
+    // at 2) answers an EMPTY table with no raise and raises per row over
+    // a full one, where `1/0 = 1` raises before the scan
+    if term_fn_seen(t).0 {
+        return false;
+    }
     match t {
         Term::Const(_) | Term::Never => true,
         Term::ExprCond(c) => !cond_has_col(c),
@@ -13741,6 +13748,33 @@ fn expr_reads_zoned_col(e: &Expr, descs: &[Descriptor]) -> bool {
     })
 }
 
+thread_local! {
+    /// set by [expr_reads] when its walk passes a stored function call -
+    /// how [expr_has_user_fn] and [filter_calls_fn] find one with the
+    /// walkers the slot questions already use
+    static FN_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Does this filter call a stored function anywhere? A term the walker
+/// does not know answers yes - the lazy path is right for any filter.
+fn filter_calls_fn(filter: &Option<Predicate>) -> bool {
+    let Some(p) = filter else { return false };
+    p.groups.iter().flatten().any(term_calls_fn)
+}
+
+/// Does this term call a stored function? (Unknown to the walker: yes.)
+fn term_calls_fn(t: &Term) -> bool {
+    let (seen, known) = term_fn_seen(t);
+    seen || !known
+}
+
+/// Did the walker see a call in this term, and does it know the term?
+fn term_fn_seen(t: &Term) -> (bool, bool) {
+    let before = FN_SEEN.with(|s| s.replace(false));
+    let known = collect_term_fids(t, &|_| false);
+    (FN_SEEN.with(|s| s.replace(before)), known)
+}
+
 /// Does this resolved expression read a row slot the test accepts? A
 /// generator value counts as read whatever the test says - it is a slot
 /// with no field of its own. The whole-expression question is
@@ -13783,7 +13817,13 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
             expr_reads(a, f) || expr_reads(b, f)
         }
-        Expr::Coalesce(args) | Expr::Func(_, args) | Expr::UserFn { args, .. } => args.iter().any(|a| expr_reads(a, f)),
+        Expr::Coalesce(args) | Expr::Func(_, args) => args.iter().any(|a| expr_reads(a, f)),
+        // a call reads what its arguments read - and says it was there
+        // ([FN_SEEN]), for the questions only a call answers
+        Expr::UserFn { args, .. } => {
+            FN_SEEN.with(|s| s.set(true));
+            args.iter().any(|a| expr_reads(a, f))
+        }
         Expr::Cond(c) => cond_reads(c, f),
         Expr::Iif(c, a, b) => cond_reads(c, f) || expr_reads(a, f) || expr_reads(b, f),
         Expr::Case(branches, else_) => {
@@ -54004,6 +54044,8 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
             false
         }
     });
+    // a nested plan's stored function calls read ITS rows ([FN_SCOPE])
+    let _scope = (!outermost).then(FnScope::enter);
     // the limit-clause grammar around UNION is the PARSER's, so it is
     // judged on the text as sent, before any rewrite ([limit_clause_lint])
     let lint = if outermost { Some(limit_lint_scan_db(sql, db)) } else { None };
@@ -54082,6 +54124,8 @@ fn plan_query_outer(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>)
     });
     ARRAY_TABLE.with(|t| *t.borrow_mut() = None);
     FN_CALLS.with(|l| l.borrow_mut().clear());
+    FN_LEXED.with(|f| f.set(false));
+    FN_NESTED.with(|f| f.set(false));
     clear_corr_registry();
     PREPARE_REFUSAL.with(|r| *r.borrow_mut() = None);
     PREPARE_WARNINGS.with(|p| p.borrow_mut().clear());
@@ -62847,6 +62891,14 @@ fn plan_query_inner_at_body(
     in_view: bool,
     base: usize,
 ) -> Option<Plan> {
+    struct Depth;
+    impl Drop for Depth {
+        fn drop(&mut self) {
+            PLAN_BODY_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+    PLAN_BODY_DEPTH.with(|d| d.set(d.get() + 1));
+    let _depth = Depth;
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
     {
         let up = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
@@ -63526,7 +63578,12 @@ fn plan_query_inner_at_body(
         // stripped FIRST/ROWS limit stays visible to the access-path
         // decision as the engine's ambient first-rows mode.
         let _first_rows = FirstRowsGuard::set(take.is_some());
-        let Some(plan) = plan_query_inner(&inner_sql, db, params) else {
+        // the stripped statement is THIS statement, not a nested one: its
+        // WHERE is still the outermost ([PLAN_BODY_DEPTH])
+        PLAN_BODY_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        let inner_plan = plan_query_inner(&inner_sql, db, params);
+        PLAN_BODY_DEPTH.with(|d| d.set(d.get() + 1));
+        let Some(plan) = inner_plan else {
             return Some(Plan::Refused);
         };
         // A SPECIFIC refusal from the inner plan travels UP unchanged -
@@ -65610,7 +65667,12 @@ fn plan_query_inner_at_body(
         // predicate parser ever sees it (see SUBQ_MARK above)
         Some(ws) => match extract_subqueries(ws)
             .and_then(|(rewritten, subs)| {
-                let toks = tokenize(&rewritten)?;
+                // this WHERE may lex a stored function call ([LEX_WHERE])
+                let outermost = PLAN_BODY_DEPTH.with(|d| d.get()) == 1 && FN_SCOPE.with(|d| d.get()) == 0;
+                LEX_WHERE.with(|a| a.set(outermost));
+                let toks = tokenize(&rewritten);
+                LEX_WHERE.with(|a| a.set(false));
+                let toks = toks?;
                 if subs.is_empty() {
                     Some(toks)
                 } else {
@@ -65662,14 +65724,29 @@ fn plan_query_inner_at_body(
     // `ID > (fold) ORDER BY ID` with T ORDER RDB$PRIMARY1, and fcopt
     // answers ORDER for the reconstruction). With no fold this IS the
     // original text and nothing changes.
-    let opt_sql: String = with_first_rows(match &folded_where {
-        Some(w) => format!(
+    // A STORED FUNCTION CALL IN THE WHERE leaves the gatekeeper text
+    // ([strip_fn_conjuncts]): fcopt reads no call, and refusing the index
+    // over it made the per-row runner call the function on rows the
+    // engine's index never reads (measured: `TI WHERE FZ(ID) > 0 AND ID =
+    // 1` answers no row on 2182 - FZ(2) divides by zero, ID = 1 keys)
+    let gate_where = where_s.filter(|_| FN_LEXED.with(|f| f.get())).and_then(|ws| {
+        let col = columns.first().map(|c| render_canon_ref(&c.name))?;
+        strip_fn_conjuncts(folded_where.as_deref().unwrap_or(ws), &format!("{} <> 0", col))
+    });
+    let opt_sql: String = with_first_rows(match (&gate_where, &folded_where) {
+        (Some(w), _) => format!(
+            "SELECT 1 FROM {}{}{}",
+            render_canon_ref(table),
+            if w.is_empty() { String::new() } else { format!(" WHERE {}", w) },
+            order_s.map(|o| format!(" ORDER BY {}", o)).unwrap_or_default()
+        ),
+        (None, Some(w)) => format!(
             "SELECT 1 FROM {} WHERE {}{}",
             render_canon_ref(table),
             w,
             order_s.map(|o| format!(" ORDER BY {}", o)).unwrap_or_default()
         ),
-        None => sql.to_string(),
+        (None, None) => sql.to_string(),
     });
 
     let items = match proj {
@@ -81425,12 +81502,12 @@ thread_local! {
     /// function call from a column
     static USER_FNS: std::cell::RefCell<std::collections::HashMap<String, (Descriptor, Vec<String>, usize)>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
-    /// the user-function values of the row being projected, by call id
     /// each user function's INPUT parameter descriptors, by the same keys
     /// as [USER_FNS] - what a bare `?` argument is described as
     /// ([user_function_sigs] fills it)
     static USER_FN_PARAMS: std::cell::RefCell<std::collections::HashMap<String, Vec<Descriptor>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    /// the user-function values of the row being projected, by call id
     static FN_VALS: std::cell::RefCell<std::collections::HashMap<u32, Value>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     /// the calls the prepare in progress resolved, in POST-ORDER (an
@@ -81438,6 +81515,31 @@ thread_local! {
     /// prepare into the statement's [FnCall] list
     static FN_CALLS: std::cell::RefCell<Vec<FnCall>> = std::cell::RefCell::new(Vec::new());
     static NEXT_FN_CALL: std::cell::Cell<u32> = std::cell::Cell::new(1);
+    /// the call a `UserFn` node found no value for ([FN_VALS]) - what
+    /// [lazy_fn_eval] runs before it evaluates again
+    static FN_NEED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// ARMED by a client SELECT's prepare: the condition tokenizer lexes
+    /// a stored function call as an expression token ([tokenize]) - in a
+    /// table projection's WHERE only ([LEX_WHERE]); every other caller
+    /// (DML, a PSQL body, a CHECK, a select-list condition, which the
+    /// expression parser already reads) is as it was
+    static LEX_USER_FNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// set while a table projection's WHERE is tokenized - the OUTERMOST
+    /// statement's only ([PLAN_BODY_DEPTH] 1): a subquery, a view or a
+    /// derived table planned inside it is a deeper level, whatever
+    /// router planned it, and parses as it always did
+    static LEX_WHERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// how many [plan_query_inner_at_body] frames are live
+    static PLAN_BODY_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// set when the armed tokenizer lexed a call - the prepare then checks
+    /// the plan can run it ([fn_filter_plannable])
+    static FN_LEXED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// how deep the planner is inside a NESTED plan (a view, a derived
+    /// table, a subquery): a call registered there reads that plan's
+    /// rows, which the top level's per-row runner never sees
+    static FN_SCOPE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// a call was registered inside a nested plan ([FN_SCOPE])
+    static FN_NESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// a NAMED refusal the parser met on the way (an unknown function,
     /// a call with the wrong argument count): [plan_query] answers it
     /// in place of the generic refusal when the text does not plan
@@ -92275,6 +92377,110 @@ fn conditional_finish(branches_param_free: bool) -> impl Fn(Expr, &[Descriptor])
     }
 }
 
+/// A WHERE's text with each top-level conjunct that calls a stored
+/// function swapped for `residual` - a conjunct no index serves, spelled
+/// so fcopt reads it - which is what the index gate reads
+/// ([choose_index]). The engine weighs a call's conjunct as it weighs any
+/// unindexable one (measured on 2182 over a 3-row keyed table: `FZ(ID) <
+/// 0`, `FZ(1) < 0` and `ID <> 0` each SORT NATURAL under `ORDER BY ID`,
+/// and each SORT INDEX beside `ID > 0` or `ID = 1`); DROPPING it made the
+/// gate navigate the key where the engine sorts. Every row is still
+/// filtered whole, so the rows answered cannot move. A top-level OR (a
+/// dropped disjunct would lose its rows' band) answers None: the text
+/// stays as it is. A BETWEEN's AND is its own, not a conjunction.
+fn strip_fn_conjuncts(w: &str, residual: &str) -> Option<String> {
+    let up = w.to_ascii_uppercase();
+    let b = up.as_bytes();
+    let word_at = |i: usize, kw: &str| {
+        up[i..].starts_with(kw)
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$'))
+            && b.get(i + kw.len()).is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$'))
+    };
+    let (mut depth, mut quote, mut start) = (0i32, false, 0usize);
+    // a BETWEEN's own AND is part of its conjunct
+    let mut between = false;
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if quote {
+            quote = c != b'\'';
+        } else if c == b'\'' {
+            quote = true;
+        } else if c == b'(' {
+            depth += 1;
+        } else if c == b')' {
+            depth -= 1;
+        } else if depth == 0 && word_at(i, "OR") {
+            return None;
+        } else if depth == 0 && word_at(i, "BETWEEN") {
+            between = true;
+        } else if depth == 0 && between && word_at(i, "AND") {
+            between = false;
+        } else if depth == 0 && word_at(i, "AND") {
+            parts.push(&w[start..i]);
+            start = i + 3;
+            i += 3;
+            continue;
+        }
+        i += 1;
+    }
+    parts.push(&w[start..]);
+    let calls = |p: &str| {
+        let pu = p.to_ascii_uppercase();
+        USER_FNS.with(|m| m.borrow().keys().any(|n| sql_calls_name(&pu, n)))
+    };
+    let kept: Vec<&str> = parts.iter().map(|p| if calls(p) { residual } else { p.trim() }).collect();
+    Some(kept.join(" AND "))
+}
+
+/// One level of [FN_SCOPE], released on every exit path.
+struct FnScope;
+
+impl FnScope {
+    fn enter() -> FnScope {
+        FN_SCOPE.with(|d| d.set(d.get() + 1));
+        FnScope
+    }
+}
+
+impl Drop for FnScope {
+    fn drop(&mut self) {
+        FN_SCOPE.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Can the plan run the stored function calls its CONDITION lexed
+/// ([FN_LEXED])? Only the per-row runner runs one in a filter
+/// ([materialise_user_fn_rows]), and it serves a plain table projection
+/// (under FIRST / SKIP / ROWS too) whose calls all read that
+/// projection's own rows. A call inside a
+/// nested plan ([FN_NESTED]), an aggregate, a join, a window or a
+/// generated column refuses at prepare - where an unsupported statement
+/// fails on the engine too.
+fn fn_filter_plannable(plan: &Plan) -> bool {
+    if !FN_LEXED.with(|f| f.get()) {
+        return true;
+    }
+    let outer = plan;
+    let plan = match plan {
+        // FIRST / SKIP / ROWS - the runner cuts the window itself
+        Plan::Modified { inner, distinct: false, .. } => &**inner,
+        p => p,
+    };
+    // a WINDOW over a NAVIGATED key stops the walk early, and the engine
+    // may sort there instead (`ID > 0 AND <unindexable> ORDER BY ID` is
+    // SORT INDEX on 2182, a navigation here): which rows reach the call
+    // would then differ - refused, recorded
+    if let (Plan::Modified { .. }, Plan::Project { index: Some(a), .. }) = (outer, plan) {
+        if a.navigate() {
+            return false;
+        }
+    }
+    !FN_NESTED.with(|n| n.get())
+        && matches!(plan, Plan::Project { gen_cols, windows, .. } if gen_cols.is_empty() && windows.is_empty())
+}
+
 /// Record one user-function CALL for the statement ([FN_CALLS]) and
 /// build its node - its value is computed per row, by id, before the row
 /// is projected ([materialise_user_fn_rows]).
@@ -92285,6 +92491,9 @@ fn register_user_fn_call(name: &str, args: Vec<Expr>, ret: Descriptor, descs: &[
         v
     });
     let arg_cs = args.iter().map(|a| cmp_text_charset(a, descs)).collect();
+    if FN_SCOPE.with(|d| d.get()) > 0 {
+        FN_NESTED.with(|n| n.set(true));
+    }
     FN_CALLS.with(|l| l.borrow_mut().push(FnCall { id, name: name.to_string(), args: args.clone(), arg_cs }));
     Expr::UserFn { name: name.to_string(), args, ret, id }
 }
@@ -104233,9 +104442,16 @@ impl Expr {
                     }
                 }
             }
-            Expr::UserFn { id, .. } => {
-                FN_VALS.with(|m| m.borrow().get(id).cloned()).ok_or(EvalErr::Unsupported)?
-            }
+            Expr::UserFn { id, .. } => match FN_VALS.with(|m| m.borrow().get(id).cloned()) {
+                Some(v) => v,
+                None => {
+                    // not run yet: name the call, so [lazy_fn_eval] can
+                    // run it and evaluate again - a call runs only when
+                    // the evaluation reaches it
+                    FN_NEED.with(|n| n.set(Some(*id)));
+                    return Err(EvalErr::Unsupported);
+                }
+            },
             Expr::Func(f, args) => {
                 // every function here propagates NULL: any NULL argument
                 // makes the result NULL (probed for each one) - except
@@ -108810,6 +109026,7 @@ fn plan_correlated_select(
     params: &mut Vec<Option<Descriptor>>,
     trace: bool,
 ) -> Option<Plan> {
+    let _scope = FnScope::enter();
     let (from, join) = parse_from(table_s)?;
     if !join.is_empty() {
         return Some(Plan::Refused); // a correlated subquery over a join
@@ -113852,7 +114069,14 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 // simple CASE, and outside this list a WHERE over it read
                 // `DECODE` as a column and refused (measured: `WHERE
                 // DECODE(1, 1, 'a') = 'a'` answers the row on 2182)
+                // ...and, under a client SELECT's prepare, a STORED
+                // function's call ([LEX_USER_FNS]) - the expression parser
+                // reads it as [RawExpr::UserFn] by the same catalog list
+                let user_fn = LEX_USER_FNS.with(|a| a.get())
+                    && LEX_WHERE.with(|a| a.get())
+                    && USER_FNS.with(|m| m.borrow().contains_key(&upper));
                 if sysfn_named(&upper).is_some()
+                    || user_fn
                     || matches!(upper.as_str(), "CAST" | "COALESCE" | "NULLIF" | "IIF" | "DECODE" | "FC$CORR")
                 {
                     let mut j = i;
@@ -113875,6 +114099,9 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                                     return None;
                                 }
                             }
+                        }
+                        if user_fn {
+                            FN_LEXED.with(|f| f.set(true));
                         }
                         out.push(Tok::FnExpr(raw));
                         i = close + 1;
@@ -124825,73 +125052,223 @@ fn materialise_user_fn_rows(
     args: &[WireParam],
     ctx: &SessionCtx,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
-    let Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index, windows, .. } = plan else {
+    // FIRST / SKIP / ROWS over the projection: the window is cut BEFORE
+    // the select list runs, so a call runs for the delivered rows only,
+    // and an unsorted scan stops at the window's end, as the engine's
+    // cursor does (measured: `SELECT FIRST 1 ID FROM T WHERE F1(ID) > 1
+    // ORDER BY ID DESC` answers 3)
+    let (inner, window, mcols) = match plan {
+        Plan::Modified { inner, cols, distinct: false, skip, take } => (&**inner, Some((*skip, *take)), Some(cols)),
+        Plan::Modified { .. } => return Err(EvalErr::Unsupported),
+        p => (p, None, None),
+    };
+    let Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index, defer, windows, .. } = inner else {
         return Err(EvalErr::Unsupported);
     };
     if !gen_cols.is_empty() || !windows.is_empty() {
         return Err(EvalErr::Unsupported);
     }
+    if window.is_some_and(|(_, t)| t == Some(0)) {
+        return Ok(Vec::new());
+    }
+    let filter = bind_filter_eval(filter, args)?;
+    // a `?`-keyed band is built now, from the bound filter, as the plain
+    // projection builds it - the rows outside it are rows the engine
+    // never reads, so never a call's
+    let index = &{
+        let db = database.as_ref().ok_or(EvalErr::Unsupported)?;
+        let descs_now: Vec<Descriptor> =
+            formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.clone()).unwrap_or_default();
+        resolve_access(index, defer, db, *rel, &descs_now, &filter, order_by)
+    };
+    let navigated = index.as_ref().is_some_and(|a| a.navigate());
+    // A CALL IN THE FILTER runs only where the conjunct walk reaches it
+    // ([Predicate::matches], written order), and a call in a SORT KEY
+    // only for a row the filter kept - so the rows are scanned with no
+    // filter and no sort - inside the index's range, which is all the
+    // engine reads (measured: `TI WHERE FZ(ID) > 0 AND ID = 1` over a
+    // keyed ID answers no row and never reaches FZ(2)'s divide by zero)
+    // - then filtered here, then sorted. Anything else keeps the scan it
+    // always had.
+    let key_calls = !navigated && order_by.iter().any(|k| k.expr.as_ref().is_some_and(expr_has_user_fn));
+    let lazy = key_calls || filter_calls_fn(&filter);
+    let sort_here = lazy && !navigated && !order_by.is_empty();
+    // the rows the window needs, when nothing sorts after the filter
+    let enough = match window {
+        Some((skip, Some(take))) if !sort_here => Some(skip + take),
+        _ => None,
+    };
     let base: Vec<Vec<Value>> = {
         let db = database.as_ref().ok_or(EvalErr::Unsupported)?;
-        let filter = bind_filter_eval(filter, args)?;
-        let src = RowSource::scan_filter_sort(*rel, formats.clone(), filter, order_by.clone(), index.clone());
+        let src = if lazy {
+            RowSource::scan_filter_sort(*rel, formats.clone(), None, Vec::new(), index.clone())
+        } else {
+            RowSource::scan_filter_sort(*rel, formats.clone(), filter.clone(), order_by.clone(), index.clone())
+        };
         src.rows(db)?
     };
-    let mut out = Vec::with_capacity(base.len());
-    for values in &base {
+    type Kept = (Vec<Value>, std::collections::HashMap<u32, Value>);
+    let mut kept: Vec<Kept> = Vec::with_capacity(base.len());
+    for values in base {
+        if enough.is_some_and(|n| kept.len() >= n) {
+            break;
+        }
         FN_VALS.with(|m| m.borrow_mut().clear());
-        for c in calls {
-            let mut argv = Vec::with_capacity(c.args.len());
-            for a in &c.args {
-                // a bound `?` argument becomes its value first
-                if expr_has_param(a) {
-                    let bound = subst_params_expr(a, args).ok_or(EvalErr::Unsupported)?;
-                    argv.push(bound.eval(values)?);
+        if lazy {
+            if let Some(p) = &filter {
+                if !lazy_fn_eval(database, calls, args, ctx, &values, &|| p.matches(&values))? {
                     continue;
                 }
-                argv.push(a.eval(values)?);
             }
-            // the BLR executor first (the full expression surface), then
-            // the arithmetic-only source interpreter for what it declines
-            let v = match with_call_arg_cs(Some(c.arg_cs.clone()), || {
-                try_function_blr(database, &c.name, &argv)
-            }) {
-                FnBlrOutcome::Value(v) => v,
-                FnBlrOutcome::Runtime(ev) => {
-                    return Err(with_call_arg_cs(Some(c.arg_cs.clone()), || {
-                        fn_runtime_with_position(database, &c.name, &argv, ctx, ev)
-                    }))
-                }
-                FnBlrOutcome::Outside => {
-                    with_call_arg_cs(Some(c.arg_cs.clone()), || {
-                        run_function(database, &c.name, &argv, ctx)
-                    })
-                    .map_err(|e| {
-                        if std::env::var("FC_SRV_TRACE").is_ok() {
-                            eprintln!("[srv] user function {}({:?}) failed: {}", c.name, argv, e);
-                        }
-                        // A RAISE (or any runtime error) inside the body is
-                        // NOT a refusal: the source interpreter already
-                        // built the engine's own vector - a user exception's
-                        // number/name/message, a divide-by-zero, a numeric
-                        // overflow - in the ProcErr's status. Surface it, so
-                        // `EXCEPTION E_NEG` from a function raises what it
-                        // does from a procedure. Only a genuine "cannot run
-                        // this body" (status None) stays Unsupported.
-                        e.status.unwrap_or(EvalErr::Unsupported)
-                    })?
-                }
-            };
-            FN_VALS.with(|m| m.borrow_mut().insert(c.id, v));
         }
+        kept.push((values, FN_VALS.with(|m| std::mem::take(&mut *m.borrow_mut()))));
+    }
+    if sort_here {
+        // each row's sort keys, a call among them run for it now: the
+        // record, its place, then one slot per key - and the keys read
+        // those slots, so the sort compares values and evaluates nothing
+        let n = kept.first().map_or(0, |(r, _)| r.len());
+        let mut keyed: Vec<Vec<Value>> = Vec::with_capacity(kept.len());
+        for (i, (values, vals)) in kept.iter_mut().enumerate() {
+            let mut r = values.clone();
+            r.push(Value::Int(i as i64));
+            FN_VALS.with(|m| *m.borrow_mut() = std::mem::take(vals));
+            for k in order_by.iter() {
+                r.push(match &k.expr {
+                    Some(e) => lazy_fn_eval(database, calls, args, ctx, values, &|| e.eval(values))?,
+                    None => values.get(k.field).cloned().unwrap_or(Value::Null),
+                });
+            }
+            *vals = FN_VALS.with(|m| std::mem::take(&mut *m.borrow_mut()));
+            keyed.push(r);
+        }
+        let keys: Vec<OrderKey> = order_by
+            .iter()
+            .enumerate()
+            .map(|(j, k)| OrderKey { field: n + 1 + j, expr: None, ..k.clone() })
+            .collect();
+        sort_rows(&mut keyed, &keys)?;
+        let mut taken: Vec<Option<Kept>> = kept.into_iter().map(Some).collect();
+        kept = keyed
+            .iter()
+            .map(|r| match r.get(n) {
+                Some(Value::Int(i)) => taken.get_mut(*i as usize).and_then(Option::take).ok_or(EvalErr::Unsupported),
+                _ => Err(EvalErr::Unsupported),
+            })
+            .collect::<Result<_, _>>()?;
+    }
+    if let Some((skip, take)) = window {
+        kept = kept.into_iter().skip(skip).take(take.unwrap_or(usize::MAX)).collect();
+    }
+    let mut out = Vec::with_capacity(kept.len());
+    for (values, vals) in kept {
+        // the values the filter and the keys already computed for this
+        // row stand; the select list runs the rest as it reaches them
+        FN_VALS.with(|m| *m.borrow_mut() = vals);
         let mut row = Vec::with_capacity(cols.len());
         for c in cols {
-            row.push(c.value_of(values)?);
+            row.push(lazy_fn_eval(database, calls, args, ctx, &values, &|| c.value_of(&values))?);
+        }
+        if let Some(mc) = mcols {
+            row = mc.iter().map(|c| c.value_of(&row)).collect::<Result<_, _>>()?;
         }
         out.push(row);
     }
     FN_VALS.with(|m| m.borrow_mut().clear());
     Ok(out)
+}
+
+/// Does this expression call a stored function anywhere?
+fn expr_has_user_fn(e: &Expr) -> bool {
+    let before = FN_SEEN.with(|s| s.replace(false));
+    expr_reads(e, &|_| false);
+    FN_SEEN.with(|s| s.replace(before))
+}
+
+/// Evaluate `f` over the row `values`, running each stored function call
+/// it reaches when it reaches it: a `UserFn` with no value yet names its
+/// call ([FN_NEED]) and fails, the call runs (its own arguments the same
+/// way, so an inner call runs first), its value is parked in [FN_VALS]
+/// and `f` evaluates again. A call the evaluation never reaches never
+/// runs - the engine's order (measured: `ID <> 2 AND FZ(ID) > 0` answers
+/// row 3 where FZ(2) divides by zero; `FZ(ID) > 0 AND ID <> 2` raises).
+fn lazy_fn_eval<T>(
+    database: &mut Option<Database>,
+    calls: &[FnCall],
+    args: &[WireParam],
+    ctx: &SessionCtx,
+    values: &[Value],
+    f: &dyn Fn() -> Result<T, EvalErr>,
+) -> Result<T, EvalErr> {
+    // every pass runs one new call, so the calls bound the passes
+    let mut budget = calls.len() + 1;
+    loop {
+        FN_NEED.with(|n| n.set(None));
+        let r = f();
+        let Some(id) = FN_NEED.with(|n| n.take()) else { return r };
+        if budget == 0 || FN_VALS.with(|m| m.borrow().contains_key(&id)) {
+            return Err(EvalErr::Unsupported);
+        }
+        budget -= 1;
+        let c = calls.iter().find(|c| c.id == id).ok_or(EvalErr::Unsupported)?;
+        let v = run_user_fn_call(database, calls, c, args, ctx, values)?;
+        FN_VALS.with(|m| m.borrow_mut().insert(id, v));
+    }
+}
+
+/// Run one call over the row: its arguments (a bound `?` becomes its
+/// value first; an inner call runs through [lazy_fn_eval]), then the
+/// body. The row's parked values are kept across the body, which may
+/// run statements of its own that use [FN_VALS].
+fn run_user_fn_call(
+    database: &mut Option<Database>,
+    calls: &[FnCall],
+    c: &FnCall,
+    args: &[WireParam],
+    ctx: &SessionCtx,
+    values: &[Value],
+) -> Result<Value, EvalErr> {
+    let mut argv = Vec::with_capacity(c.args.len());
+    for a in &c.args {
+        let bound;
+        let a = if expr_has_param(a) {
+            bound = subst_params_expr(a, args).ok_or(EvalErr::Unsupported)?;
+            &bound
+        } else {
+            a
+        };
+        argv.push(lazy_fn_eval(database, calls, args, ctx, values, &|| a.eval(values))?);
+    }
+    let saved = FN_VALS.with(|m| std::mem::take(&mut *m.borrow_mut()));
+    let v = run_user_fn_body(database, c, &argv, ctx);
+    FN_VALS.with(|m| *m.borrow_mut() = saved);
+    v
+}
+
+fn run_user_fn_body(database: &mut Option<Database>, c: &FnCall, argv: &[Value], ctx: &SessionCtx) -> Result<Value, EvalErr> {
+    // the BLR executor first (the full expression surface), then
+    // the arithmetic-only source interpreter for what it declines
+    match with_call_arg_cs(Some(c.arg_cs.clone()), || try_function_blr(database, &c.name, argv)) {
+        FnBlrOutcome::Value(v) => Ok(v),
+        FnBlrOutcome::Runtime(ev) => Err(with_call_arg_cs(Some(c.arg_cs.clone()), || {
+            fn_runtime_with_position(database, &c.name, argv, ctx, ev)
+        })),
+        FnBlrOutcome::Outside => with_call_arg_cs(Some(c.arg_cs.clone()), || run_function(database, &c.name, argv, ctx))
+            .map_err(|e| {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] user function {}({:?}) failed: {}", c.name, argv, e);
+                }
+                // A RAISE (or any runtime error) inside the body is
+                // NOT a refusal: the source interpreter already
+                // built the engine's own vector - a user exception's
+                // number/name/message, a divide-by-zero, a numeric
+                // overflow - in the ProcErr's status. Surface it, so
+                // `EXCEPTION E_NEG` from a function raises what it
+                // does from a procedure. Only a genuine "cannot run
+                // this body" (status None) stays Unsupported.
+                e.status.unwrap_or(EvalErr::Unsupported)
+            }),
+    }
 }
 
 /// A FUNCTION's BLR-path runtime error WITH THE FRAME the engine names:
@@ -134123,6 +134500,7 @@ fn after_auth(
                     // again after, since a cache hit never reaches the
                     // planner that would have taken the flag
                     SEMANTIC_SCAN_ARMED.with(|a| a.set(true));
+                    LEX_USER_FNS.with(|a| a.set(calls_fn));
                     let (p, ps) = timed("plan(select)", || match database.as_ref() {
                         Some(db) if !calls_fn => db
                             .stmts
@@ -134142,7 +134520,9 @@ fn after_auth(
                         }
                     });
                     SEMANTIC_SCAN_ARMED.with(|a| a.set(false));
+                    LEX_USER_FNS.with(|a| a.set(false));
                     fn_calls = std::rc::Rc::new(FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut())));
+                    let p = if fn_filter_plannable(&p) { p } else { std::rc::Rc::new(Plan::Refused) };
                     // A REFUSED STATEMENT FAILS AT PREPARE, which is where
                     // the engine fails an unsupported one too. Answering
                     // the prepare and then raising at fetch left the error

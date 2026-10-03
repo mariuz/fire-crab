@@ -134,7 +134,8 @@ both "2 CONTROL EXECUTE PROCEDURE PE(?) [NULL]"          "EXECUTE PROCEDURE PE(?
 echo "--- 3 RECORDED"
 eng_only "3 F1(F1(?)) - a ? under a nested call"   "SELECT F1(F1(?)) $R" '[3]'
 eng_only "3 F1(? + 1) - a ? under arithmetic"      "SELECT F1(? + 1) $R" '[3]'
-eng_only "3 a stored function in a WHERE at all"   "SELECT ID FROM T WHERE F1(ID) > 3 ORDER BY ID" '[]'
+# promoted with `serve-real-fnwhere.sh`, which owns the WHERE surface
+both     "3 a stored function in a WHERE (promoted with fnwhere)" "SELECT ID FROM T WHERE F1(ID) > 3 ORDER BY ID" '[]'
 
 echo "--- panic check"
 ran=$((ran + 1))

@@ -14,7 +14,8 @@ Short, actionable items. The long-form engineering backlog lives in
 ## Environment follow-ups (this box)
 
 - [ ] Decide which engine build is the reference for the engine-side pins that are red here
-      (`serve-real-widenum.sh` 24, `serve-real-semchk.sh` 47, `serve-real-unionlimit.sh` 6), and for
+      (`serve-real-widenum.sh` 24, `serve-real-semchk.sh` 47, `serve-real-unionlimit.sh` 6,
+      `serve-real-errvec.sh` 3 - the same AND-operand-order class as semchk), and for
       `serve-real-gbak.sh` (external table after an engine restore) and `serve-real-tz.sh` (named zone).
       All of them are red identically on the binary before 2026-10-02, so they aren't regressions. See the
       roadmap's "ENVIRONMENT FINDING".
