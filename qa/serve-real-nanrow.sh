@@ -399,6 +399,34 @@ both             "5 NULLIF(?, D) ['#NaN'] - the bound NaN on the left" "SELECT I
 dml_rb           "5 DELETE .. WHERE NULLIF(D, D) IS NULL - the engine keeps the NaN rows" "DELETE FROM M WHERE NULLIF(D, D) IS NULL" '[]' "SELECT ID FROM M ORDER BY ID"
 dml_rb           "5 DELETE .. WHERE NULLIF(D, ?) IS NULL ['#NaN']"    "DELETE FROM M WHERE NULLIF(D, ?) IS NULL" '["#NaN"]' "SELECT ID FROM M ORDER BY ID"
 dml_rb           "5 UPDATE SET D = NULLIF(D, D) - a NaN is kept, not nulled" "UPDATE M SET D = NULLIF(D, D)" '[]' "SELECT ID, D FROM M ORDER BY ID"
+
+echo "-- 6. AN ENGINE BUG, RECORDED (not reproduced): a WHERE IN-subquery loses a 0 behind a NULL --"
+# Found 2026-10-03 while measuring NULLIF's neighbours, and NOT about NaN:
+# `WHERE N IN (SELECT N FROM M M2 WHERE M2.ID IN (4, 7))` - row 4's N is
+# NULL, row 7's is 0 - answers NO ROW on the engine, though row 7's own
+# 0 is in the set; INTEGER, NUMERIC and DOUBLE alike.  The engine's own
+# PROJECTION evaluates the same predicate TRUE for row 7, and so does the
+# WHERE once the semi-join rewrite is defeated (`OR 1 = 0`) or the 0 is
+# streamed BEFORE the NULL (`ORDER BY .. DESC`).  The mechanism is in the
+# engine's source: HashJoin::computeHash (src/jrd/recsrc/HashJoin.cpp)
+# zeroes the key buffer and writes nothing for a NULL value, so a NULL key
+# and a 0 key are byte-identical, and the semi-join settles on the first
+# colliding candidate - the NULL, whose residual equality is UNKNOWN.
+# This server answers the SQL meaning (row 7), which is the engine's own
+# projection answer; the divergence is pinned with BOTH answers so it
+# fails loudly the day the engine is fixed (promote it then) or this
+# server moves.
+divergence       "6 WHERE N IN (SELECT N .. ID IN (4, 7)) - the NULL streams first" "SELECT ID FROM M WHERE N IN (SELECT N FROM M M2 WHERE M2.ID IN (4, 7)) ORDER BY ID" '[]' "(none)" "7"
+divergence       "6 the same over NUMERIC"           "SELECT ID FROM M WHERE NM IN (SELECT NM FROM M M2 WHERE M2.ID IN (4, 7)) ORDER BY ID" '[]' "(none)" "7"
+divergence       "6 the same over DOUBLE"            "SELECT ID FROM M WHERE D IN (SELECT D2 FROM M M2 WHERE M2.ID IN (4, 7)) ORDER BY ID" '[]' "(none)" "7"
+divergence       "6 the whole table"                 "SELECT ID FROM M WHERE N IN (SELECT N FROM M M2) ORDER BY ID" '[]' "1;2;3;5;6;8" "1;2;3;5;6;7;8"
+divergence       "6 = ANY is the same rewrite"       "SELECT ID FROM M WHERE D = ANY (SELECT D2 FROM M M2) ORDER BY ID" '[]' "5" "5;7"
+# CONTROLS - the engine's own other routes to the same predicate agree
+# with this server, which is what makes the cells above an engine bug
+both             "6 CONTROL the 0 streamed BEFORE the NULL (ORDER BY .. DESC)" "SELECT ID FROM M WHERE N IN (SELECT N FROM M M2 WHERE M2.ID IN (4, 7) ORDER BY N DESC) ORDER BY ID"
+both             "6 CONTROL the semi-join rewrite defeated (OR 1 = 0)"         "SELECT ID FROM M WHERE N IN (SELECT N FROM M M2 WHERE M2.ID IN (4, 7)) OR 1 = 0 ORDER BY ID"
+both             "6 CONTROL no NULL in the set (COALESCE)"                     "SELECT ID FROM M WHERE N IN (SELECT COALESCE(N, 99) FROM M M2 WHERE M2.ID IN (4, 7)) ORDER BY ID"
+both             "6 CONTROL a non-zero value behind the NULL is found"         "SELECT ID FROM M WHERE D IN (SELECT D2 FROM M M2 WHERE M2.ID IN (4, 8)) ORDER BY ID"
 # the server's stderr log is the ONE place a PANIC shows
 panic_free() {
     ran=$((ran + 1))
@@ -417,8 +445,8 @@ kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$ENG" "$FC"
 echo "ran $ran checks"
 # THE FLOOR IS COUNTED FROM A MEASURED RUN, never typed.
-# 44 measured, + section 5's 12 (2026-10-03) = 56
-if [ "$ran" -lt 56 ]; then
-    echo "FAIL only $ran checks ran; 56 were measured - cells went missing"; fail=1
+# 44 measured, + section 5's 12 + section 6's 9 (2026-10-03) = 65
+if [ "$ran" -lt 65 ]; then
+    echo "FAIL only $ran checks ran; 65 were measured - cells went missing"; fail=1
 fi
 exit $fail
