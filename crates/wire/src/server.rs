@@ -25078,7 +25078,6 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         | TrigStmt::Close { .. }
         | TrigStmt::Leave { .. }
         | TrigStmt::Continue { .. }
-        | TrigStmt::Exit { .. }
         | TrigStmt::Return { .. }
         | TrigStmt::ReturnText { .. }
         | TrigStmt::AssignText { .. }
@@ -27240,7 +27239,6 @@ fn emit_trigger_stmt(
         | TrigStmt::Close { .. }
         | TrigStmt::Leave { .. }
         | TrigStmt::Continue { .. }
-        | TrigStmt::Exit { .. }
         | TrigStmt::Return { .. }
         | TrigStmt::ReturnText { .. }
         | TrigStmt::AssignText { .. }
@@ -27251,6 +27249,14 @@ fn emit_trigger_stmt(
         | TrigStmt::CallProc { .. }
         | TrigStmt::Call { .. }
         | TrigStmt::DmlInto { .. } => {}
+        // EXIT leaves the body's own label, 0, wherever it stands
+        // (measured on 2196: `AS BEGIN EXIT; END` is `label 0, begin,
+        // begin, leave 0, end, end`), its debug entry at the leave
+        TrigStmt::Exit { src_off } => {
+            dbg.push((*src_off, b.len()));
+            b.push(18); // blr_leave
+            b.push(0);
+        }
         TrigStmt::Assign { target, expr, src_off, .. } => {
             dbg.push((*src_off, b.len()));
             b.push(1); // blr_assignment

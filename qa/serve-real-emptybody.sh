@@ -13,6 +13,10 @@
 # SUSPEND is the engine's "not selectable", a function without a RETURN
 # answers NULL.
 #
+# ...and a TRIGGER BODY WITH EXIT (section 4) stores too: EXIT is `blr_leave
+# 0` - the body's own label, from inside an IF or a WHILE alike - with its
+# debug entry at the leave. It refused at prepare as "interpreter-only".
+#
 # Each statement runs against the ENGINE on one file and fire-crab on its
 # twin; the stored BLR is then read back from both through the engine's
 # own server (node, the blob as hex) and compared.
@@ -31,6 +35,7 @@ node -e 'require("node-firebird")' 2>/dev/null || { echo "SKIP node-firebird not
 mkdir -p "$D"; rm -f "$ENG" "$FC"
 printf "CREATE DATABASE '127.0.0.1/%s:%s' USER '%s' PASSWORD '%s';
 CREATE TABLE T (ID INTEGER);
+CREATE TABLE T2 (ID INTEGER);
 COMMIT;\n" "$REAL" "$ENG" "$U" "$P" | "$ISQL" -q -b > /tmp/emptybody-build.log 2>&1
 [ -s "$ENG" ] || { echo "FAIL fixture not created"; sed 's/^/   /' /tmp/emptybody-build.log; exit 1; }
 cp "$ENG" "$FC"; chmod 666 "$FC"
@@ -110,12 +115,25 @@ both "3 a function with no RETURN answers NULL" "SELECT F1() FROM ${R}DATABASE^"
 both "3 the triggers fire" "INSERT INTO T VALUES (5)^
 SELECT ID FROM T^"
 
+echo "--- 4 EXIT in a trigger body: blr_leave 0, and it leaves"
+both "4 EXIT alone, under an IF, inside a WHILE" \
+"CREATE TRIGGER TX1 FOR T2 BEFORE INSERT POSITION 1 AS BEGIN EXIT; END^
+CREATE TRIGGER TX2 FOR T2 BEFORE INSERT POSITION 2 AS BEGIN IF (NEW.ID = 1) THEN EXIT; NEW.ID = NEW.ID * 10; END^
+CREATE TRIGGER TX3 FOR T2 BEFORE INSERT POSITION 3 AS DECLARE I INTEGER; BEGIN I = 0; WHILE (I < 3) DO BEGIN I = I + 1; IF (I = 2) THEN EXIT; END NEW.ID = 0; END^"
+for n in TX1 TX2 TX3; do
+    same_blr "4 trigger $n BLR" "SELECT ${R}TRIGGER_BLR FROM ${R}TRIGGERS WHERE ${R}TRIGGER_NAME = '$n'"
+    same_blr "4 trigger $n debug info" "SELECT ${R}DEBUG_INFO FROM ${R}TRIGGERS WHERE ${R}TRIGGER_NAME = '$n'"
+done
+both "4 the EXITs leave: 1 stays 1, 2 is 20, never 0" "INSERT INTO T2 VALUES (1)^
+INSERT INTO T2 VALUES (2)^
+SELECT ID FROM T2 ORDER BY ID^"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-emptybody-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 17 on the 2026-10-03 binary, 17 OK
-if [ "$ran" -lt 17 ]; then echo "FAIL only $ran checks ran (floor 17) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 25 on the 2026-10-03 binary, 25 OK
+if [ "$ran" -lt 25 ]; then echo "FAIL only $ran checks ran (floor 25) - cells went missing"; fail=1; fi
 exit $fail
