@@ -52,5 +52,6 @@ Short, actionable items. The long-form engineering backlog lives in
 - [ ] CREATE PROCEDURE / FUNCTION stores no `RDB$DEBUG_INFO` (the engine writes one; triggers do).
 - [x] A duplicate CREATE TRIGGER / INDEX / DOMAIN / ROLE answers the engine's already-exists vector (metaupdate).
 - [x] A schema-qualified DML target that does not exist answers the -204 `"PUBLIC"."S2"` (dmlunknown section 2).
-- [ ] A stored function call in a join, a derived table, a subquery, UNION, ROWS ? or DML still
-      refuses at prepare (recorded in `qa/serve-real-fnwhere.sh` section 6).
+- [x] UPDATE / DELETE whose WHERE calls PURE stored functions (fnwhere section 8).
+- [ ] A stored function call in a join, a derived table, a subquery, UNION or ROWS ? still refuses at
+      prepare (fnwhere section 6); in DML, an impure call, a call in the SET list or under RETURNING (8b).

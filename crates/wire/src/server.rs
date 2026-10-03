@@ -39676,7 +39676,12 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
             Some(
                 extract_subqueries(ws)
                     .and_then(|(rewritten, subs)| {
-                        let toks = tokenize(&rewritten)?;
+                        // under a client DML prepare the WHERE may lex a
+                        // stored call ([LEX_USER_FNS], [dml_fn_prepass])
+                        LEX_WHERE.with(|a| a.set(true));
+                        let toks = tokenize(&rewritten);
+                        LEX_WHERE.with(|a| a.set(false));
+                        let toks = toks?;
                         let folded = if subs.is_empty() {
                             toks
                         } else {
@@ -39782,6 +39787,21 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     // serve-real-index's FC_NO_INDEX twin asserts ZERO "index scan:"
     // lines over a log full of plain DML, and a distinct string keeps
     // that claim and this one independently greppable.
+    // a stored call's conjunct is read by the gate as an unindexable one
+    // ([strip_fn_conjuncts]), as the SELECT path reads it: the index range
+    // bounds the calls (measured: `DELETE FROM TI WHERE FZ(ID) > 0 AND ID =
+    // 1` never reaches FZ(2) on 2196)
+    // (a folded WHERE holding a call renders to no text - the WHERE as
+    // written stands in, as the SELECT path's does)
+    let folded_where = match (FN_LEXED.with(|f| f.get()), columns.first()) {
+        (true, Some(c)) => folded_where
+            .clone()
+            .or_else(|| where_kw.map(|w| s[w + "WHERE".len()..].to_string()))
+            .and_then(|w| strip_fn_conjuncts(&w, &format!("{} <> 0", render_canon_ref(&c.name))))
+            .filter(|w| !w.trim().is_empty())
+            .or(folded_where),
+        _ => folded_where,
+    };
     let opt_sql = folded_where.as_ref().map(|w| format!("SELECT 1 FROM {} WHERE {}", render_canon_ref(table), w));
     let index = opt_sql
         .as_deref()
@@ -39888,7 +39908,12 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
             Some(
                 extract_subqueries(ws)
                     .and_then(|(rewritten, subs)| {
-                        let toks = tokenize(&rewritten)?;
+                        // under a client DML prepare the WHERE may lex a
+                        // stored call ([LEX_USER_FNS], [dml_fn_prepass])
+                        LEX_WHERE.with(|a| a.set(true));
+                        let toks = tokenize(&rewritten);
+                        LEX_WHERE.with(|a| a.set(false));
+                        let toks = toks?;
                         let folded = if subs.is_empty() {
                             toks
                         } else {
@@ -39942,6 +39967,21 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     let (_, fk_children) = fk_partners(db, table, &columns)?;
     // the same reconstruction and the same DISTINCT trace pair as
     // plan_update - see the law stated there
+    // a stored call's conjunct is read by the gate as an unindexable one
+    // ([strip_fn_conjuncts]), as the SELECT path reads it: the index range
+    // bounds the calls (measured: `DELETE FROM TI WHERE FZ(ID) > 0 AND ID =
+    // 1` never reaches FZ(2) on 2196)
+    // (a folded WHERE holding a call renders to no text - the WHERE as
+    // written stands in, as the SELECT path's does)
+    let folded_where = match (FN_LEXED.with(|f| f.get()), columns.first()) {
+        (true, Some(c)) => folded_where
+            .clone()
+            .or_else(|| where_kw.map(|w| s[w + "WHERE".len()..].to_string()))
+            .and_then(|w| strip_fn_conjuncts(&w, &format!("{} <> 0", render_canon_ref(&c.name))))
+            .filter(|w| !w.trim().is_empty())
+            .or(folded_where),
+        _ => folded_where,
+    };
     let opt_sql = folded_where.as_ref().map(|w| format!("SELECT 1 FROM {} WHERE {}", render_canon_ref(table), w));
     let index = opt_sql
         .as_deref()
@@ -40074,7 +40114,10 @@ fn dml_targets_at(
             .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
         let Some((_, descs)) = descs else { continue };
         let values = decode_stored(&image, descs, formats, &fc_defaults);
-        if filter.as_ref().map_or(Ok(true), |p| p.matches(&values))? {
+        DML_ROW_KEY.with(|k| k.set(Some((dp_no, r.slot))));
+        let hit = filter.as_ref().map_or(Ok(true), |p| p.matches(&values));
+        DML_ROW_KEY.with(|k| k.set(None));
+        if hit? {
             // a snapshot cannot write over a concurrent commit
             if let Some(tx) = view.snapshot_conflict(&r) {
                 return Err(EvalErr::UpdateConflict(tx));
@@ -40603,7 +40646,10 @@ fn collect_dml_targets(
             let values = decode_stored(&image, descs, formats, &fc_defaults);
             // a WHERE eval error (divide by zero) aborts the DML like
             // the engine's - never a partial row set
-            if filter.as_ref().map_or(Ok(true), |p| p.matches(&values))? {
+            DML_ROW_KEY.with(|k| k.set(Some((dp_no, r.slot))));
+            let hit = filter.as_ref().map_or(Ok(true), |p| p.matches(&values));
+            DML_ROW_KEY.with(|k| k.set(None));
+            if hit? {
                 // a snapshot cannot write over a concurrent commit
                 if let Some(tx) = view.snapshot_conflict(&r) {
                     return Err(EvalErr::UpdateConflict(tx));
@@ -82285,6 +82331,12 @@ thread_local! {
     /// and per index that row's call values - what a `UserFn` node with
     /// no value in [FN_VALS] reads
     static FN_ROW_TAG: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// while a DML statement whose WHERE calls runs ([dml_fn_prepass]):
+    /// the record the target walk is judging, by (data page, slot), and
+    /// per record the call values the pre-pass computed for it
+    static DML_ROW_KEY: std::cell::Cell<Option<(u32, u16)>> = const { std::cell::Cell::new(None) };
+    static FN_DML_VALS: std::cell::RefCell<std::collections::HashMap<(u32, u16), std::collections::HashMap<u32, Value>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
     static FN_ROW_VALS: std::cell::RefCell<Vec<std::collections::HashMap<u32, Value>>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// ARMED by a client SELECT's prepare: the condition tokenizer lexes
@@ -105227,7 +105279,11 @@ impl Expr {
                     }
                 }
             }
-            Expr::UserFn { id, .. } => match FN_VALS.with(|m| m.borrow().get(id).cloned()).or_else(|| fn_row_val(*id, values)) {
+            Expr::UserFn { id, .. } => match FN_VALS
+                .with(|m| m.borrow().get(id).cloned())
+                .or_else(|| fn_row_val(*id, values))
+                .or_else(|| fn_dml_val(*id))
+            {
                 Some(v) => v,
                 None => {
                     // not run yet: name the call, so [lazy_fn_eval] can
@@ -126201,6 +126257,109 @@ fn fn_row_val(id: u32, values: &[Value]) -> Option<Value> {
     FN_ROW_VALS.with(|v| v.borrow().get(*i as usize).and_then(|m| m.get(&id).cloned()))
 }
 
+/// Does this stored function read or write nothing but its arguments -
+/// judged from its SOURCE, conservatively: no statement that reads or
+/// writes a relation, runs SQL, draws a generator, sets a context or posts
+/// an event, and every stored function it calls the same. A DML whose
+/// WHERE calls only such functions may run its calls in a pre-pass
+/// ([dml_fn_prepass]); one that reads the target would see the statement's
+/// own earlier writes on the engine (measured on 2196: `DELETE FROM T
+/// WHERE ID < FC()`, FC counting T, deletes ONE row of three - the count
+/// falls as the rows go), which a pre-pass cannot reproduce.
+fn user_fn_pure(db: &Database, name: &str, seen: &mut Vec<String>) -> bool {
+    let key = name.to_ascii_uppercase();
+    if seen.contains(&key) {
+        return true;
+    }
+    seen.push(key);
+    let Some(meta) = load_function(db, name) else { return false };
+    let up = mask_literals(&meta.source.to_ascii_uppercase());
+    for w in [
+        "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "EXECUTE", "GEN_ID", "NEXT", "RDB$SET_CONTEXT", "POST_EVENT",
+        "AUTONOMOUS", "CURSOR", "FOR",
+    ] {
+        if find_word(&up, w, 0).is_some() {
+            return false;
+        }
+    }
+    let callees: Vec<String> = user_function_sigs(db).keys().filter(|n| sql_calls_name(&up, n)).cloned().collect();
+    callees.iter().all(|c| user_fn_pure(db, c, seen))
+}
+
+/// May this UPDATE / DELETE run the stored calls its WHERE holds - the
+/// only place they may stand (a SET value, a subquery, a RETURNING list,
+/// a ROWS clause keep their refusal), each of a pure function
+/// ([user_fn_pure])?
+fn dml_fn_plannable(plan: &Plan, calls: &[FnCall], db: &Option<Database>) -> bool {
+    let Some(db) = db.as_ref() else { return false };
+    if FN_NESTED.with(|n| n.get()) {
+        return false;
+    }
+    let filter_only = match plan {
+        Plan::Delete { filter, gen_filter: None, limit: None, .. } => filter_calls_fn(filter),
+        Plan::Update { filter, sets, gen_filter: None, limit: None, .. } => {
+            filter_calls_fn(filter) && !sets.iter().any(|(_, v)| matches!(v, SetVal::Expr(e) if expr_has_user_fn(e)))
+        }
+        _ => false,
+    };
+    filter_only && calls.iter().all(|c| user_fn_pure(db, &c.name, &mut Vec::new()))
+}
+
+/// THE PRE-PASS of a DML statement whose WHERE calls a stored function:
+/// the target walk's own candidates - the same index range, unfiltered -
+/// each judged by the lazy conjunct walk ([lazy_fn_eval], written order:
+/// measured, `DELETE .. WHERE ID <> 2 AND FZ(ID) > 0` deletes row 3 where
+/// `FZ(ID) > 0 AND ID <> 2` raises at FZ(2)), its call values parked by
+/// the record's (page, slot) for the walk that then writes
+/// ([fn_dml_val]). Pure functions only ([dml_fn_plannable]), so running
+/// them before the writes is running them as the engine does; a raise is
+/// the statement's, before anything is written.
+fn dml_fn_prepass(
+    database: &mut Option<Database>,
+    plan: &Plan,
+    calls: &[FnCall],
+    args: &[WireParam],
+    ctx: &SessionCtx,
+) -> Result<std::collections::HashMap<(u32, u16), std::collections::HashMap<u32, Value>>, EvalErr> {
+    let (rel, formats, filter, index, defer) = match plan {
+        Plan::Delete { rel, formats, filter, index, defer, .. } | Plan::Update { rel, formats, filter, index, defer, .. } => {
+            (*rel, formats, filter, index, defer)
+        }
+        _ => return Err(EvalErr::Unsupported),
+    };
+    let filter = bind_filter_eval(filter, args)?;
+    let rows: Vec<(u32, u16, Vec<Value>)> = {
+        let db = database.as_ref().ok_or(EvalErr::Unsupported)?;
+        let descs_now: Vec<Descriptor> =
+            formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.clone()).unwrap_or_default();
+        let index = resolve_access(index, defer, db, rel, &descs_now, &filter, &[]);
+        let fc_defaults = newest_format_defaults(db, rel);
+        collect_dml_targets(db, rel, formats, &None, &index)?
+            .into_iter()
+            .filter_map(|(page, slot, fmt, image)| {
+                let (_, descs) = formats.iter().find(|(n, _)| *n == fmt).or_else(|| formats.iter().max_by_key(|(n, _)| *n))?;
+                Some((page, slot, decode_stored(&image, descs, formats, &fc_defaults)))
+            })
+            .collect()
+    };
+    let mut out = std::collections::HashMap::new();
+    let Some(p) = &filter else { return Ok(out) };
+    for (page, slot, values) in rows {
+        FN_VALS.with(|m| m.borrow_mut().clear());
+        lazy_fn_eval(database, calls, args, ctx, &values, &|| p.matches(&values))?;
+        out.insert((page, slot), FN_VALS.with(|m| std::mem::take(&mut *m.borrow_mut())));
+    }
+    FN_VALS.with(|m| m.borrow_mut().clear());
+    Ok(out)
+}
+
+/// A `UserFn` node's value for the record the DML target walk is judging
+/// ([DML_ROW_KEY]), as [dml_fn_prepass] computed it.
+fn fn_dml_val(id: u32) -> Option<Value> {
+    let key = DML_ROW_KEY.with(|k| k.get())?;
+    FN_DML_VALS.with(|m| m.borrow().get(&key).and_then(|v| v.get(&id).cloned()))
+}
+
 /// Every expression an aggregate's source evaluates per row.
 fn agg_src_exprs(s: &AggSrc) -> Vec<&Expr> {
     match s {
@@ -133789,6 +133948,10 @@ struct StmtSlot {
     params: std::rc::Rc<Vec<Descriptor>>,
     bound: Vec<WireParam>,
     last_dml: (i32, i32, i32),
+    /// the stored-function calls the statement's prepare resolved - its
+    /// own, parked with it (one connection-wide list let a statement run
+    /// another handle's calls when two were interleaved)
+    fn_calls: std::rc::Rc<Vec<FnCall>>,
 }
 
 /// Make `to` the live statement, parking whatever was live before.
@@ -133802,6 +133965,7 @@ fn switch_stmt(
     params: &mut std::rc::Rc<Vec<Descriptor>>,
     bound: &mut Vec<WireParam>,
     last_dml: &mut (i32, i32, i32),
+    fn_calls: &mut std::rc::Rc<Vec<FnCall>>,
 ) {
     if to == *cur {
         return;
@@ -133822,6 +133986,7 @@ fn switch_stmt(
             params: std::mem::take(params),
             bound: std::mem::take(bound),
             last_dml: *last_dml,
+            fn_calls: std::mem::take(fn_calls),
         },
     );
     match slots.remove(&to) {
@@ -133831,6 +133996,7 @@ fn switch_stmt(
             *params = sl.params;
             *bound = sl.bound;
             *last_dml = sl.last_dml;
+            *fn_calls = sl.fn_calls;
         }
         // a handle the client allocated but never prepared
         None => {
@@ -133844,6 +134010,7 @@ fn switch_stmt(
             *params = std::rc::Rc::new(Vec::new());
             bound.clear();
             *last_dml = (0, 0, 0);
+            *fn_calls = std::rc::Rc::new(Vec::new());
         }
     }
     *cur = to;
@@ -134553,6 +134720,7 @@ fn after_auth(
                 &mut stmt_params,
                 &mut bound_args,
                 &mut last_dml,
+                &mut fn_calls,
             )
         };
     }
@@ -135119,6 +135287,9 @@ fn after_auth(
                             eprintln!("[srv] prepare raw = {:?}", raw_sql);
                         }
                         RAW_STMT.with(|r| *r.borrow_mut() = raw_sql.clone());
+                        // a new text has no calls until its own planner
+                        // gathers them
+                        fn_calls = std::rc::Rc::new(Vec::new());
                         stmt_sql = rewrite_entry_literals(entry_strip_comments(&raw_sql), att_cs.id);
                         // a CAST to a DOMAIN spelled as its type ([rewrite_domain_casts])
                         if let Some(t) = rewrite_domain_casts(&stmt_sql, &database) {
@@ -135402,6 +135573,19 @@ fn after_auth(
                     // the -204 at prepare ([dml_missing_target]), placed in
                     // the text as the client SENT it
                     let dml_missing = dml_missing_target(&client_sql, kw, &database);
+                    // an UPDATE / DELETE that names a stored function may
+                    // call it in its WHERE ([dml_fn_prepass]): its planner
+                    // lexes the call, outside the statement cache (a
+                    // cached plan would gather no call list)
+                    let dml_calls_fn = matches!(kw, "UPDATE" | "DELETE")
+                        && database.as_ref().is_some_and(|db| {
+                            let up = dml_sql.to_ascii_uppercase();
+                            user_function_sigs(db).keys().any(|n| sql_calls_name(&up, n))
+                        });
+                    FN_CALLS.with(|l| l.borrow_mut().clear());
+                    FN_LEXED.with(|f| f.set(false));
+                    FN_NESTED.with(|f| f.set(false));
+                    LEX_USER_FNS.with(|a| a.set(dml_calls_fn));
                     let planned = if let Some(e) = dml_lint.or(dml_missing).or(dml_unresolved) {
                         Some((std::rc::Rc::new(Plan::RefusedEval(e)), std::rc::Rc::new(Vec::new())))
                     } else { timed("plan(dml)", || {
@@ -135431,7 +135615,7 @@ fn after_auth(
                             })
                         };
                         match database.as_ref() {
-                            Some(db) => db.stmts.plan_if(
+                            Some(db) if !dml_calls_fn => db.stmts.plan_if(
                                 gen,
                                 &dml_sql,
                                 || {
@@ -135440,11 +135624,29 @@ fn after_auth(
                                 },
                                 || plan_cacheable(),
                             ),
-                            None => build().map(|(p, d)| {
+                            _ => build().map(|(p, d)| {
                                 (std::rc::Rc::new(p), std::rc::Rc::new(d))
                             }),
                         }
                     }) };
+                    LEX_USER_FNS.with(|a| a.set(false));
+                    // ...and the lexer's mark is this statement's too: left
+                    // set, the NEXT prepare's call check read it (a cached
+                    // plan skips the reset) and refused a plain ROLLBACK
+                    FN_LEXED.with(|f| f.set(false));
+                    // the calls it gathered are this statement's; a plan
+                    // that cannot run them refuses ([dml_fn_plannable])
+                    let dml_calls = FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut()));
+                    let planned = match planned {
+                        Some((p, _))
+                            if !dml_calls.is_empty()
+                                && (returning.is_some() || !dml_fn_plannable(&p, &dml_calls, &database)) =>
+                        {
+                            Some((std::rc::Rc::new(Plan::RefusedEval(EvalErr::Unsupported)), std::rc::Rc::new(Vec::new())))
+                        }
+                        other => other,
+                    };
+                    fn_calls = std::rc::Rc::new(dml_calls);
                     let planned = match (planned, &returning) {
                         // VECTOR-AT-PREPARE: wrap_returning over a
                         // refused plan would produce Returning{inner:
@@ -135578,7 +135780,7 @@ fn after_auth(
                     SEMANTIC_SCAN_ARMED.with(|a| a.set(false));
                     LEX_USER_FNS.with(|a| a.set(false));
                     fn_calls = std::rc::Rc::new(FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut())));
-                    let p = if fn_filter_plannable(&p) { p } else { std::rc::Rc::new(Plan::Refused) };
+                    let p = if !calls_fn || fn_filter_plannable(&p) { p } else { std::rc::Rc::new(Plan::Refused) };
                     // A REFUSED STATEMENT FAILS AT PREPARE, which is where
                     // the engine fails an unsupported one too. Answering
                     // the prepare and then raising at fetch left the error
@@ -136139,9 +136341,21 @@ fn after_auth(
                             }
                         }
                     } else {
-                    match timed("execute", || {
-                        execute_dml(&*plan, &mut database, &bound_args, &SessionCtx { user, attach_id })
-                    }) {
+                    // a WHERE that calls: its pre-pass first ([dml_fn_prepass])
+                    let prepass = if fn_calls.is_empty() {
+                        Ok(())
+                    } else {
+                        dml_fn_prepass(&mut database, &plan, &fn_calls, &bound_args, &SessionCtx { user, attach_id })
+                            .map(|vals| FN_DML_VALS.with(|m| *m.borrow_mut() = vals))
+                    };
+                    let executed = match prepass {
+                        Ok(()) => timed("execute", || {
+                            execute_dml(&*plan, &mut database, &bound_args, &SessionCtx { user, attach_id })
+                        }),
+                        Err(e) => Err(ExecErr::Eval(e)),
+                    };
+                    FN_DML_VALS.with(|m| m.borrow_mut().clear());
+                    match executed {
                         Ok(counts) => {
                             last_dml = counts;
                             if std::env::var("FC_SRV_TRACE").is_ok() {

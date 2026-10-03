@@ -38,9 +38,19 @@
 # EMPTY table its prepare-time probe "succeeded" and left a plan that
 # could not run the call.
 #
+# UPDATE / DELETE (section 8): a WHERE that calls only PURE functions
+# (judged from their source: no relation read or write, no SQL, no
+# generator, context or event, and their callees the same) runs its calls
+# in a PRE-PASS over the target walk's own candidates - the same index
+# range, written order - and the walk that writes reads each record's
+# values by its (page, slot). An impure call, a call in the SET list or
+# under RETURNING refuse (8b): the engine's calls see the statement's own
+# earlier writes (`DELETE FROM T WHERE ID < FC()`, FC counting T, deletes
+# one row of three), which no pre-pass reproduces.
+#
 # A call inside a subquery, a derived table, a view, a join or UNION,
 # and a window over a NAVIGATED key, refuse at prepare - recorded
-# (section 6).  So does DML: only a client SELECT arms the tokenizer.
+# (section 6).
 #
 # Usage: qa/serve-real-fnwhere.sh [port]
 set -u
@@ -80,6 +90,8 @@ SET TERM ^;
 CREATE FUNCTION F1 (X INTEGER) RETURNS INTEGER AS BEGIN RETURN X * 2; END^
 CREATE FUNCTION F2 (S VARCHAR(10), K INTEGER) RETURNS VARCHAR(30) AS BEGIN RETURN S || '-' || K; END^
 CREATE FUNCTION FZ (X INTEGER) RETURNS INTEGER AS BEGIN RETURN 6 / (X - 2); END^
+CREATE FUNCTION FC RETURNS INTEGER AS BEGIN RETURN (SELECT COUNT(*) FROM T); END^
+CREATE FUNCTION FN (X INTEGER) RETURNS INTEGER AS BEGIN IF (X IS NULL) THEN RETURN -1; RETURN F1(X) + 1; END^
 SET TERM ;^
 COMMIT;
 SQL
@@ -121,7 +133,9 @@ qrb() { FC_DB="$2" FC_PORT="$1" FC_Q="$3" FC_P="$4" FC_RB="$5" timeout 25 node -
   });' 2>/dev/null; }
 # the input describe, through isql (it prints the INPUT message for a
 # statement it cannot then bind)
-dsc() { printf 'SET SQLDA_DISPLAY ON;\nSET TERM ^;\n%s^\n' "$2" \
+# (rolled back: isql EXECUTES the statement it describes, and a DML cell
+# would otherwise commit its write into every later cell's table)
+dsc() { printf 'SET SQLDA_DISPLAY ON;\nSET TERM ^;\n%s^\nROLLBACK^\n' "$2" \
     | timeout 25 "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' \
     | grep -aiE 'sqltype' | sed 's/^ *//' | tr -s ' ' | paste -sd'|'; }
 RB0="SELECT 1 FROM RDB\$DATABASE"
@@ -131,7 +145,8 @@ both() { # <label> <sql> <json> [read-back]
     ev=$(qrb "$REAL" "$ENG" "$2" "$3" "$rb"); fv=$(qrb "$PORT" "$FC" "$2" "$3" "$rb")
     ed=$(dsc "127.0.0.1/$REAL:$ENG" "$2"); fd=$(dsc "127.0.0.1/$PORT:$FC" "$2")
     if [ -z "$ev" ] || [ "$ev" = CONN_ERR ] || [ "$fv" = CONN_ERR ]; then echo "FAIL $1 [the cell never ran: eng=$ev]"; fail=1
-    elif [ -z "$ed" ]; then echo "FAIL $1 [the ENGINE printed no describe]"; fail=1
+    # (a DML with no parameter has no describe line at all)
+    elif [ -z "$ed" ] && [ "${2%% *}" = SELECT ]; then echo "FAIL $1 [the ENGINE printed no describe]"; fail=1
     elif [ "$ev" != "$fv" ]; then echo "FAIL $1"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
     elif [ "$ed" != "$fd" ]; then echo "FAIL $1 (DESCRIBE)"; echo "     eng=[$ed]"; echo "     fc =[$fd]"; fail=1
     else echo "OK   $1 [$ev]"; fi
@@ -241,7 +256,6 @@ eng_only "6 a join"                           "SELECT T.ID FROM T JOIN TI ON TI.
 eng_only "6 a UNION branch"                   "SELECT ID FROM T WHERE F1(ID) > 3 UNION ALL SELECT 9 $R" '[]'
 eng_only "6 ROWS ? - a bound window"          "SELECT ID FROM T WHERE F1(ID) > ? ROWS ?" '[1, 1]'
 eng_only "6 FIRST over a NAVIGATED key"       "SELECT FIRST 1 ID FROM TI WHERE ID > 2 AND FZ(ID) > 0 ORDER BY ID" '[]'
-eng_only "6 UPDATE .. WHERE F1(ID) > 3 - DML is not armed" "UPDATE T SET V = V WHERE F1(ID) > 3" '[]'
 
 echo "--- 7 a FOLD: a call in the WHERE, an aggregate's argument, a key, HAVING,"
 echo "      the ORDER BY and the select list over the folded rows"
@@ -310,12 +324,35 @@ both "7 G HAVING call ?" "SELECT K FROM G GROUP BY K HAVING F1(COUNT(*)) > ?" '[
 both "7 G HAVING order lazy" "SELECT K FROM G GROUP BY K HAVING COUNT(*) > 2 OR FZ(COUNT(*)) > 0" '[]'
 both "7 G HAVING order raise" "SELECT K FROM G GROUP BY K HAVING FZ(COUNT(*)) > 0 OR COUNT(*) > 2" '[]'
 
+echo "--- 8 UPDATE / DELETE whose WHERE calls a PURE function: a pre-pass, then the writes"
+# (DML refused at prepare until 2026-10-03.) Each cell runs and reads back
+# in one rolled-back transaction.
+RT="SELECT ID, V FROM T ORDER BY ID"
+both "8 UPDATE .. WHERE F1(ID) > 3"                 "UPDATE T SET V = 'x' WHERE F1(ID) > 3" '[]' "$RT"
+both "8 UPDATE .. WHERE F1(ID) > ? - a bound ?"     "UPDATE T SET V = 'x' WHERE F1(ID) > ?" '[3]' "$RT"
+both "8 DELETE .. WHERE F1(ID) = 4"                 "DELETE FROM T WHERE F1(ID) = 4" '[]' "$RT"
+both "8 written order: ID <> 2 AND FZ(ID) > 0"      "DELETE FROM T WHERE ID <> 2 AND FZ(ID) > 0" '[]' "$RT"
+both "8 written order: FZ(ID) > 0 AND ID <> 2 raises" "DELETE FROM T WHERE FZ(ID) > 0 AND ID <> 2" '[]' "$RT"
+both "8 an OR, a NULL argument"                     "DELETE FROM T WHERE FN(N) = -1 OR F1(ID) = 2" '[]' "$RT"
+both "8 a pure function calling a pure one"         "UPDATE T SET N = 0 WHERE FN(ID) = 5" '[]' "SELECT ID, N FROM T ORDER BY ID"
+both "8 the index range bounds the calls"           "DELETE FROM TI WHERE FZ(ID) > 0 AND ID = 1" '[]' "SELECT ID FROM TI ORDER BY ID"
+both "8 a text call"                                "UPDATE T SET V = 'y' WHERE F2(V, ID) = 'b-2'" '[]' "$RT"
+both "8 nothing matches"                            "DELETE FROM T WHERE F1(ID) > 100" '[]' "$RT"
+both "8 CONTROL - a DML with no call"               "UPDATE T SET V = 'z' WHERE ID = 3" '[]' "$RT"
+both "8 CONTROL - a SELECT after the DML lexed a call" "SELECT ID FROM T WHERE ID = 1" '[]'
+echo "--- 8b RECORDED - an IMPURE function: the engine's calls see the statement's own writes"
+# `DELETE FROM T WHERE ID < FC()`, FC counting T: the engine deletes ONE
+# row of three (the count falls as rows go); a pre-pass cannot reproduce it
+eng_only "8b DELETE .. WHERE ID < FC() - FC reads the target" "DELETE FROM T WHERE ID < FC()" '[]'
+eng_only "8b a call in the SET list"                "UPDATE T SET V = F2(V, ID) WHERE ID = 2" '[]'
+eng_only "8b a call with RETURNING"                 "UPDATE T SET V = 'q' WHERE F1(ID) = 2 RETURNING ID" '[]'
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-fnwhere-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 145 on the 2026-10-03 binary, 145 OK
-if [ "$ran" -lt 145 ]; then echo "FAIL only $ran checks ran (floor 145) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 159 on the 2026-10-03 binary, 159 OK
+if [ "$ran" -lt 159 ]; then echo "FAIL only $ran checks ran (floor 159) - cells went missing"; fail=1; fi
 exit $fail

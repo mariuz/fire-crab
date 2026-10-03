@@ -324,7 +324,8 @@ pin  "8b EXTRACT(YEAR) in a PSQL assignment" "$(eb "execute block returns (r int
 echo "--- 8. RECORDED: the engine answers, this server refuses"
 refused "8 a VIEW whose select item is IS NOT DISTINCT (the compiler has no boolean item)" "create view vd4 as select id, val is not distinct from 20 b from w; commit; select count(*) from rdb\$relations where rdb\$relation_name = 'VD4';" "COUNT|1"
 refused "8 a VIEW over OVERLAY (the compiler knows no OVERLAY)" "create view vd5 as select overlay(s placing 'x' from 1) o from d; commit; select count(*) from rdb\$relations where rdb\$relation_name = 'VD5';" "COUNT|1"
-refused "8 LIST cast" "select cast(list(v) as varchar(50)) from t;" "CAST|b,a"
+# PROMOTED 2026-10-03: a CAST over a LIST answers (serve-real-listexpr.sh)
+pin  "8 LIST cast" "select cast(list(v) as varchar(50)) from t;" "CAST|b,a"
 refused "8 LIST concatenated" "select list(v) || '!' from t;" "CONCATENATION|0:2|CONCATENATION:|b,a!"
 refused "8 LIST measured" "select char_length(list(v)) from t;" "CHAR_LENGTH|3"
 refused "8 SUBSTRING over LIST (was -204 \"1\")" "select substring(list(v) from 1 for 3) from t;" "SUBSTRING|0:2|SUBSTRING:|b,a"
