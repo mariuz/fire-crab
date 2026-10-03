@@ -39478,7 +39478,19 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                     // every other (the INSERT arm's twin): the `?` is wrapped
                     // in a CAST to the destination's type, so the decimal
                     // arithmetic runs on the converted value
-                    let e = resolve_dest_param_expr(&raw, &dest, &columns, descs, &mut params)?;
+                    // ...or, an argument of a STORED CALL, the type of
+                    // the function's declared input - the projection's
+                    // own rule ([resolve_proj_expr_body]'s UserFn arm)
+                    let base = params.clone();
+                    let e = match resolve_dest_param_expr(&raw, &dest, &columns, descs, &mut params) {
+                        Some(e) => e,
+                        None if raw_calls_user_fn(&raw) => {
+                            // the failed attempt's claims go first
+                            params = base;
+                            resolve_proj_expr_body(&raw, &columns, descs, &mut params)?
+                        }
+                        None => return None,
+                    };
                     // NO type gate here: a `?` has no type until it is
                     // bound (`? * 2` types None at prepare), and the
                     // BOUND tree is gated at execute instead - where the
@@ -126328,6 +126340,11 @@ fn dml_fn_prepass(
     args: &[WireParam],
     ctx: &SessionCtx,
 ) -> Result<std::collections::HashMap<(u32, u16), std::collections::HashMap<u32, Value>>, EvalErr> {
+    // a RETURNING statement's walk is its inner DML's
+    let plan = match plan {
+        Plan::Returning { inner, .. } => &**inner,
+        p => p,
+    };
     let (rel, formats, filter, index, defer) = match plan {
         Plan::Delete { rel, formats, filter, index, defer, .. } | Plan::Update { rel, formats, filter, index, defer, .. } => {
             (*rel, formats, filter, index, defer)
@@ -135668,7 +135685,11 @@ fn after_auth(
                     let planned = match planned {
                         Some((p, _))
                             if !dml_calls.is_empty()
-                                && (returning.is_some() || !dml_fn_plannable(&p, &dml_calls, &database)) =>
+                                && (returning.as_ref().is_some_and(|list| {
+                                    // a call in the RETURNING list itself keeps its refusal
+                                    let up = list.to_ascii_uppercase();
+                                    database.as_ref().is_some_and(|db| user_function_sigs(db).keys().any(|n| sql_calls_name(&up, n)))
+                                }) || !dml_fn_plannable(&p, &dml_calls, &database)) =>
                         {
                             Some((std::rc::Rc::new(Plan::RefusedEval(EvalErr::Unsupported)), std::rc::Rc::new(Vec::new())))
                         }
@@ -136201,9 +136222,22 @@ fn after_auth(
                         let mark = Some(undo_window_push(&mut database, WindowKind::Nested));
                         // RETURNING waits and re-reads too - the write
                         // inside it is the same write
-                        match with_conflict_wait(&mut database, |db| {
-                            execute_dml_collecting(&inner, db, &bound_args, &ctx, Some(&mut affected))
-                        }) {
+                        // a WHERE / SET that calls: its pre-pass first
+                        // ([dml_fn_prepass])
+                        let prepass = if fn_calls.is_empty() {
+                            Ok(())
+                        } else {
+                            dml_fn_prepass(&mut database, &inner, &fn_calls, &bound_args, &ctx)
+                                .map(|vals| FN_DML_VALS.with(|m| *m.borrow_mut() = vals))
+                        };
+                        let executed = match prepass {
+                            Ok(()) => with_conflict_wait(&mut database, |db| {
+                                execute_dml_collecting(&inner, db, &bound_args, &ctx, Some(&mut affected))
+                            }),
+                            Err(e) => Err(ExecErr::Eval(e)),
+                        };
+                        FN_DML_VALS.with(|m| m.borrow_mut().clear());
+                        match executed {
                             Ok(counts) => {
                                 last_dml = counts;
                                 // the FULL decoded record per row: a ProjCol
@@ -137239,7 +137273,9 @@ fn after_auth(
                     w.send(&mut s, &mut enc)?;
                     continue;
                 }
-                if !fn_calls.is_empty() && !scroll.contains_key(&cur_stmt) {
+                // (a RETURNING cursor's rows were made at execute - its
+                // calls were the DML's)
+                if !fn_calls.is_empty() && !scroll.contains_key(&cur_stmt) && !matches!(&*plan, Plan::Rows { .. }) {
                     // the select list calls user functions: the rows are
                     // computed NOW, the cursor served from the buffer
                     let calls = fn_calls.clone();

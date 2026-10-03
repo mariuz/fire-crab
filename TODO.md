@@ -54,4 +54,4 @@ Short, actionable items. The long-form engineering backlog lives in
 - [x] A schema-qualified DML target that does not exist answers the -204 `"PUBLIC"."S2"` (dmlunknown section 2).
 - [x] UPDATE / DELETE whose WHERE calls PURE stored functions (fnwhere section 8).
 - [ ] A stored function call in a join, a derived table, a subquery, UNION or ROWS ? still refuses at
-      prepare (fnwhere section 6); in DML, an impure call, a `?` argument in a SET call, or RETURNING (8b).
+      prepare (fnwhere section 6); in DML, an impure call or a call IN the RETURNING list (8b).

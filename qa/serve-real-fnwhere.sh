@@ -44,8 +44,9 @@
 # in a PRE-PASS over the target walk's own candidates - the same index
 # range, written order - and the walk that writes reads each record's
 # values by its (page, slot); an UPDATE's SET values that call run there
-# too, for the rows the WHERE keeps. An impure call, or one under
-# RETURNING, refuses (8b): the engine's calls see the statement's own
+# too, for the rows the WHERE keeps (a `?` argument typed by the function's
+# declared input), RETURNING over it too. An impure call, or one IN the
+# RETURNING list, refuses (8b): the engine's calls see the statement's own
 # earlier writes (`DELETE FROM T WHERE ID < FC()`, FC counting T, deletes
 # one row of three), which no pre-pass reproduces.
 #
@@ -344,14 +345,23 @@ both "8 SET ID = F1(ID) WHERE F1(ID) < 5 - both"    "UPDATE T SET ID = F1(ID) WH
 both "8 SET N = FZ(ID) raises at row 2"            "UPDATE T SET N = FZ(ID)" '[]' "SELECT ID, N FROM T ORDER BY ID"
 both "8 SET under IIF never runs FZ(2)"            "UPDATE T SET N = IIF(ID = 2, 0, FZ(ID))" '[]' "SELECT ID, N FROM T ORDER BY ID"
 both "8 SET simultaneous: both read the old row"   "UPDATE T SET N = F1(ID), V = F2(V, ID) WHERE ID <> 2" '[]' "SELECT ID, V, N FROM T ORDER BY ID"
+# a `?` argument takes the function's declared input type, as in a SELECT
+# (refused at prepare until 2026-10-03, recorded in 8b)
+both "8 SET with a bound ? argument"               "UPDATE T SET V = F2(V, ?) WHERE ID = ?" '[7, 1]' "$RT"
+both "8 SET F1(?) + ID - arithmetic over the call" "UPDATE T SET N = F1(?) + ID WHERE ID < 3" '[5]' "SELECT ID, N FROM T ORDER BY ID"
+both "8 SET F2(?, ?) - both arguments bound"       "UPDATE T SET V = F2(?, ?) WHERE ID = 3" '["q", 9]' "$RT"
+# RETURNING over a DML whose WHERE / SET calls: the rows the pre-passed
+# walk touched (refused until 2026-10-03, recorded in 8b)
+both "8 UPDATE .. WHERE F1(ID) = 2 RETURNING ID, V" "UPDATE T SET V = 'q' WHERE F1(ID) = 2 RETURNING ID, V" '[]' "$RT"
+both "8 SET call RETURNING OLD.V, NEW.V"           "UPDATE T SET V = F2(V, ID) WHERE ID = 3 RETURNING OLD.V AS O, NEW.V AS NV" '[]' "$RT"
+both "8 DELETE .. WHERE F1(ID) = 4 RETURNING ID"    "DELETE FROM T WHERE F1(ID) = 4 RETURNING ID, N" '[]' "$RT"
 both "8 CONTROL - a DML with no call"               "UPDATE T SET V = 'z' WHERE ID = 3" '[]' "$RT"
 both "8 CONTROL - a SELECT after the DML lexed a call" "SELECT ID FROM T WHERE ID = 1" '[]'
 echo "--- 8b RECORDED - an IMPURE function: the engine's calls see the statement's own writes"
 # `DELETE FROM T WHERE ID < FC()`, FC counting T: the engine deletes ONE
 # row of three (the count falls as rows go); a pre-pass cannot reproduce it
 eng_only "8b DELETE .. WHERE ID < FC() - FC reads the target" "DELETE FROM T WHERE ID < FC()" '[]'
-eng_only "8b a ? argument of a call in the SET list" "UPDATE T SET V = F2(V, ?) WHERE ID = 1" '[7]'
-eng_only "8b a call with RETURNING"                 "UPDATE T SET V = 'q' WHERE F1(ID) = 2 RETURNING ID" '[]'
+eng_only "8b a call IN the RETURNING list"          "UPDATE T SET N = 1 WHERE ID = 1 RETURNING F1(ID)" '[]'
 
 echo "--- panic check"
 ran=$((ran + 1))
@@ -359,6 +369,6 @@ if grep -aq 'panicked at' "/tmp/fc-serve-fnwhere-$PORT.log"; then echo "FAIL the
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 164 on the 2026-10-03 binary, 164 OK
-if [ "$ran" -lt 164 ]; then echo "FAIL only $ran checks ran (floor 164) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 169 on the 2026-10-03 binary, 169 OK
+if [ "$ran" -lt 169 ]; then echo "FAIL only $ran checks ran (floor 169) - cells went missing"; fail=1; fi
 exit $fail
