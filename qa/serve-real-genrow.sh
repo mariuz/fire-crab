@@ -293,6 +293,18 @@ check "a generator column the outer never selects" \
 check "a CTE level is the same shape" \
     "$(fc_rows 'WITH C AS (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) SELECT N FROM C')" \
     "$(en_rows 'WITH C AS (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) SELECT N FROM C')"
+# A WINDOW over a generator column (refused until 2026-10-03): the engine
+# draws for the DELIVERED rows only - FIRST 2 twice, SKIP 1 of 3 twice,
+# ROWS 2 TO 3 twice (measured on 2196)
+check "FIRST 2 draws for the two delivered rows" \
+    "$(fc_rows 'SELECT FIRST 2 NEXT VALUE FOR SEQD FROM SRC')" \
+    "$(en_rows 'SELECT FIRST 2 NEXT VALUE FOR SEQD FROM SRC')"
+check "SKIP 1 draws only after the skip" \
+    "$(fc_rows 'SELECT SKIP 1 GEN_ID(SEQD, 1) FROM SRC ORDER BY X')" \
+    "$(en_rows 'SELECT SKIP 1 GEN_ID(SEQD, 1) FROM SRC ORDER BY X')"
+check "ROWS 2 TO 3 draws twice" \
+    "$(fc_rows 'SELECT NEXT VALUE FOR SEQD FROM SRC ORDER BY X DESC ROWS 2 TO 3')" \
+    "$(en_rows 'SELECT NEXT VALUE FOR SEQD FROM SRC ORDER BY X DESC ROWS 2 TO 3')"
 check "the GEN_ID spelling through a derived table" \
     "$(fc_rows 'SELECT Z.N FROM (SELECT GEN_ID(SEQD, 1) AS N FROM SRC) Z')" \
     "$(en_rows 'SELECT Z.N FROM (SELECT GEN_ID(SEQD, 1) AS N FROM SRC) Z')"
@@ -320,9 +332,10 @@ done
 # outage: the engine bumps lazily in a CASE (an untaken branch does not
 # advance), per matching row in a WHERE, per compared row in an ORDER
 # BY, only for EMITTED rows under FIRST, and 19-bumps-for-5-rows
-# messily under GROUP BY. `FIRST 2 NEXT VALUE FOR SEQ` used to ANSWER
-# here - every value NULL and the sequence never moved - so its line is
-# the regression pin for that bug. These run against fire-crab only (a
+# messily under GROUP BY, TWICE PER ROW under DISTINCT. `FIRST 2 NEXT
+# VALUE FOR SEQ` used to ANSWER here - every value NULL and the sequence
+# never moved; it answers right now (the FIRST / SKIP / ROWS checks
+# above), and DISTINCT took its place as the pin. These run against fire-crab only (a
 # refusal advances nothing, so the twins stay in lockstep).
 # ... including ORDER BY reaching the generator through an ORDINAL or
 # an ALIAS - the spelled form refuses at resolution, but these two
@@ -335,7 +348,7 @@ for st in "SELECT X FROM SRC WHERE NEXT VALUE FOR SEQ > 0" \
           "SELECT NEXT VALUE FOR SEQ AS A, X FROM SRC ORDER BY A DESC" \
           "SELECT (NEXT VALUE FOR SEQ) + 0 AS A, X FROM SRC ORDER BY 1" \
           "SELECT CASE WHEN X > 15 THEN NEXT VALUE FOR SEQ ELSE -1 END FROM SRC" \
-          "SELECT FIRST 2 NEXT VALUE FOR SEQ FROM SRC" \
+          "SELECT FIRST 2 DISTINCT NEXT VALUE FOR SEQ FROM SRC" \
           "SELECT COUNT(*), NEXT VALUE FOR SEQ FROM SRC" \
           "SELECT COALESCE(X, NEXT VALUE FOR SEQ) FROM SRC"; do
     r=$(fc_rows "$st")

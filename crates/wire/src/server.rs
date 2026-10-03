@@ -64655,7 +64655,13 @@ fn plan_query_inner_at_body(
         // sequence never moved, which is worse than the refusal. The
         // engine bumps only for the emitted rows; matching that is a
         // real slice, not a patch.
-        if matches!(&plan, Plan::Project { gen_cols, .. } if !gen_cols.is_empty()) {
+        // FIRST / SKIP / ROWS over one answer now ([materialise_user_fn_rows]
+        // draws for the DELIVERED rows only, after the window - measured on
+        // 2196: FIRST 2 draws twice, SKIP 3 of 4 once, ROWS 2 TO 3 twice);
+        // DISTINCT keeps the refusal: the engine draws TWICE per row there
+        // (`SELECT DISTINCT GEN_ID(G, 1) FROM T` over 4 rows moves G by 8
+        // and delivers the second four values)
+        if distinct && matches!(&plan, Plan::Project { gen_cols, .. } if !gen_cols.is_empty()) {
             return Some(Plan::Refused);
         }
         // a WINDOW under FIRST/SKIP/DISTINCT answers now: the engine
@@ -137750,7 +137756,11 @@ fn after_auth(
                 }
                 // (a RETURNING cursor's rows were made at execute - its
                 // calls were the DML's)
-                if !fn_calls.is_empty()
+                // (...and a window over GENERATOR columns: the runner draws
+                // for the delivered rows only)
+                let windowed_gen = matches!(&*plan, Plan::Modified { inner, distinct: false, .. }
+                    if matches!(&**inner, Plan::Project { gen_cols, .. } if !gen_cols.is_empty()));
+                if (!fn_calls.is_empty() || windowed_gen)
                     && !scroll.contains_key(&cur_stmt)
                     && !matches!(&*plan, Plan::Rows { .. } | Plan::RefusedEval(_) | Plan::Refused)
                 {
