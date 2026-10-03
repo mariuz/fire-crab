@@ -4544,9 +4544,6 @@ fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
     } else if p.i != p.t.len() {
         return None;
     }
-    if stmts.is_empty() {
-        return None;
-    }
 
     let n = params.len();
     // where local declares number from (see local_vars above)
@@ -4633,11 +4630,17 @@ fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
     out.push(blr::LABEL);
     out.push(0);
     out.push(blr::BEGIN);
-    out.push(blr::BEGIN);
-    for st in &stmts {
-        emit_trig_stmt(&mut out, st);
+    // AN EMPTY BODY (`AS BEGIN END`) has no statement list at all - the
+    // block is its wrapper alone (measured on 2196: P1 is `label 0, begin,
+    // end, end` where a one-statement body is `label 0, begin, begin ..,
+    // end, end, end`)
+    if !stmts.is_empty() {
+        out.push(blr::BEGIN);
+        for st in &stmts {
+            emit_trig_stmt(&mut out, st);
+        }
+        out.push(blr::END);
     }
-    out.push(blr::END);
     out.push(blr::END);
     out.push(blr::END);
     if func {
@@ -5112,6 +5115,12 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 None => out.push(blr::END),
             }
         }
+        // an EMPTY block is its wrapper alone - `begin end` (measured on
+        // 2196, nested and as an IF's branch alike)
+        TrigStmt::Block(stmts) if stmts.is_empty() => {
+            out.push(blr::BEGIN);
+            out.push(blr::END);
+        }
         TrigStmt::Block(stmts) => {
             out.push(blr::BEGIN);
             out.push(blr::BEGIN);
@@ -5271,6 +5280,12 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 // a BLOCK as the handler's body nests blr_block AGAIN
                 // with no handler section of its own (probed)
                 match handler {
+                    // ...but an EMPTY one is `begin end`, no blr_block
+                    // (measured: `WHEN ANY DO BEGIN END` on 2196)
+                    TrigStmt::Block(inner) if inner.is_empty() => {
+                        out.push(blr::BEGIN);
+                        out.push(blr::END);
+                    }
                     TrigStmt::Block(inner) => {
                         out.push(blr::BLOCK);
                         out.push(blr::BEGIN);
@@ -10406,7 +10421,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
     while !p.kw("END") {
         stmts.push(p.trig_stmt()?);
     }
-    if p.i != p.t.len() || stmts.is_empty() {
+    if p.i != p.t.len() {
         return None;
     }
     let mut out = vec![blr::VERSION5, blr::BEGIN];
@@ -10434,11 +10449,15 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         out.push(blr::VARIABLE);
         out.extend_from_slice(&(vi as u16).to_le_bytes());
     }
-    out.extend_from_slice(&[blr::LABEL, 0, blr::BEGIN, blr::BEGIN]);
-    for st in &stmts {
-        emit_trig_stmt(&mut out, st);
+    out.extend_from_slice(&[blr::LABEL, 0, blr::BEGIN]);
+    // an empty body is its block's wrapper alone (see the routine's)
+    if !stmts.is_empty() {
+        out.push(blr::BEGIN);
+        for st in &stmts {
+            emit_trig_stmt(&mut out, st);
+        }
+        out.push(blr::END);
     }
-    out.push(blr::END);
     out.push(blr::END);
     out.push(blr::END);
     out.push(blr::EOC);
@@ -13064,14 +13083,22 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_body_is_its_wrapper_alone() {
+        // measured on 2196 (qa/serve-real-emptybody.sh holds the wire side):
+        // `label 0, begin, end` - no statement list at all
+        assert_eq!(
+            compile_trigger("CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN END"),
+            Some(vec![blr::VERSION5, blr::BEGIN, blr::LABEL, 0, blr::BEGIN, blr::END, blr::END, blr::EOC])
+        );
+    }
+
+    #[test]
     fn trigger_refusals() {
         for sql in [
             // OLD targets are read-only in the engine
             "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN OLD.A = 5; END",
             // bare column names are ambiguous between OLD and NEW
             "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN A = 5; END",
-            // an empty body stores nothing worth comparing
-            "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN END",
             // database-level triggers: a different wrapper, unprobed
             "CREATE TRIGGER X FOR T ON CONNECT AS BEGIN NEW.A = 1; END",
         ] {

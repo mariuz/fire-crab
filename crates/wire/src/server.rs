@@ -27442,7 +27442,14 @@ fn emit_trigger_stmt(
             // entry points at the wrapper (probed). Raises bracket in
             // savepoints exactly within handler-carrying scopes.
             dbg.push((*src_off, b.len()));
-            if handlers.is_empty() {
+            if handlers.is_empty() && stmts.is_empty() {
+                // AN EMPTY BLOCK is its wrapper alone, no statement list
+                // (measured on 2196: `AS BEGIN END` is `label 0, begin,
+                // end`, a nested `BEGIN END` and an IF's empty branch
+                // `begin end`); it stored `begin begin end end` here
+                b.push(2);
+                b.push(255);
+            } else if handlers.is_empty() {
                 b.push(2); // the block wrapper
                 b.push(2); // the statement list
                 for st in stmts {

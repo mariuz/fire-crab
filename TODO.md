@@ -41,7 +41,10 @@ Short, actionable items. The long-form engineering backlog lives in
 
 - [ ] `CAST(LIST(..) AS VARCHAR(n))` refuses at prepare (no stored call needed).
 - [ ] A schema-qualified CREATE TABLE (`CREATE TABLE PUBLIC.T7 ..`) refuses at prepare.
-- [ ] An empty PSQL body (`AS BEGIN END`) and a trigger body of a lone `EXIT;` refuse at prepare.
+- [x] An empty PSQL body (`AS BEGIN END`) compiles to the engine's BLR (`qa/serve-real-emptybody.sh`).
+- [ ] A trigger body of a lone `EXIT;` refuses at prepare.
+- [ ] CREATE PROCEDURE / FUNCTION stores no `RDB$DEBUG_INFO` (the engine writes one; triggers do).
+- [ ] A duplicate CREATE TRIGGER answers a bare Dynamic SQL Error, not `Trigger @1 already exists`.
 - [ ] A schema-qualified DML target that does not exist answers a bare Dynamic SQL Error where the
       engine answers -204 `"PUBLIC"."S2"` (recorded in `qa/serve-real-dmlunknown.sh` section 2).
 - [ ] A stored function call in a join, a derived table, a subquery, UNION, ROWS ? or DML still
