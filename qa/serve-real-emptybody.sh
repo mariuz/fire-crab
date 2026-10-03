@@ -17,6 +17,10 @@
 # 0` - the body's own label, from inside an IF or a WHILE alike - with its
 # debug entry at the leave. It refused at prepare as "interpreter-only".
 #
+# ...and A TRIGGER'S DECLARE WITH AN INITIALISER (section 5: `= <value>`,
+# `DEFAULT <value>`) stores the value in the NULL's place of the variable's
+# opening assignment; it refused at prepare (the runtime already ran it).
+#
 # Each statement runs against the ENGINE on one file and fire-crab on its
 # twin; the stored BLR is then read back from both through the engine's
 # own server (node, the blob as hex) and compared.
@@ -36,6 +40,7 @@ mkdir -p "$D"; rm -f "$ENG" "$FC"
 printf "CREATE DATABASE '127.0.0.1/%s:%s' USER '%s' PASSWORD '%s';
 CREATE TABLE T (ID INTEGER);
 CREATE TABLE T2 (ID INTEGER);
+CREATE TABLE T3 (ID INTEGER, V VARCHAR(20));
 COMMIT;\n" "$REAL" "$ENG" "$U" "$P" | "$ISQL" -q -b > /tmp/emptybody-build.log 2>&1
 [ -s "$ENG" ] || { echo "FAIL fixture not created"; sed 's/^/   /' /tmp/emptybody-build.log; exit 1; }
 cp "$ENG" "$FC"; chmod 666 "$FC"
@@ -128,12 +133,26 @@ both "4 the EXITs leave: 1 stays 1, 2 is 20, never 0" "INSERT INTO T2 VALUES (1)
 INSERT INTO T2 VALUES (2)^
 SELECT ID FROM T2 ORDER BY ID^"
 
+echo "--- 5 a trigger's DECLARE with an initialiser"
+both "5 = a literal, DEFAULT, an expression, text, and the WHILE/EXIT shape" \
+"CREATE TRIGGER TI1 FOR T3 BEFORE INSERT POSITION 1 AS DECLARE I INTEGER = 7; BEGIN NEW.ID = NEW.ID + I; END^
+CREATE TRIGGER TI2 FOR T3 BEFORE INSERT POSITION 2 AS DECLARE VARIABLE N BIGINT DEFAULT 5; BEGIN NEW.ID = NEW.ID * N; END^
+CREATE TRIGGER TI3 FOR T3 BEFORE INSERT POSITION 3 AS DECLARE A SMALLINT = 1 + 2; DECLARE B INTEGER; BEGIN NEW.ID = NEW.ID + A; END^
+CREATE TRIGGER TI4 FOR T3 BEFORE INSERT POSITION 4 AS DECLARE W VARCHAR(10) = 'ab'; BEGIN NEW.V = W || 'c'; END^
+CREATE TRIGGER TI5 FOR T3 BEFORE INSERT POSITION 5 AS DECLARE I INTEGER = 0; BEGIN WHILE (I < 3) DO BEGIN I = I + 1; IF (I = 2) THEN EXIT; END NEW.ID = 0; END^"
+for n in TI1 TI2 TI3 TI4 TI5; do
+    same_blr "5 trigger $n BLR" "SELECT ${R}TRIGGER_BLR FROM ${R}TRIGGERS WHERE ${R}TRIGGER_NAME = '$n'"
+    same_blr "5 trigger $n debug info" "SELECT ${R}DEBUG_INFO FROM ${R}TRIGGERS WHERE ${R}TRIGGER_NAME = '$n'"
+done
+both "5 the initialised values: (1 + 7) * 5 + 3, 'abc'" "INSERT INTO T3 (ID) VALUES (1)^
+SELECT ID, V FROM T3^"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-emptybody-$PORT.log"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 25 on the 2026-10-03 binary, 25 OK
-if [ "$ran" -lt 25 ]; then echo "FAIL only $ran checks ran (floor 25) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 37 on the 2026-10-03 binary, 37 OK
+if [ "$ran" -lt 37 ]; then echo "FAIL only $ran checks ran (floor 37) - cells went missing"; fail=1; fi
 exit $fail

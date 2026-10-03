@@ -43,7 +43,7 @@ Short, actionable items. The long-form engineering backlog lives in
 - [ ] A schema-qualified CREATE TABLE (`CREATE TABLE PUBLIC.T7 ..`) refuses at prepare.
 - [x] An empty PSQL body (`AS BEGIN END`) compiles to the engine's BLR (`qa/serve-real-emptybody.sh`).
 - [x] A trigger body with `EXIT;` stores `blr_leave 0` (emptybody section 4).
-- [ ] A trigger's `DECLARE V INTEGER = 0;` (a declared initializer) refuses at prepare.
+- [x] A trigger's `DECLARE V INTEGER = 0;` initializer stores the engine's BLR (emptybody section 5).
 - [ ] CREATE PROCEDURE / FUNCTION stores no `RDB$DEBUG_INFO` (the engine writes one; triggers do).
 - [ ] A duplicate CREATE TRIGGER answers a bare Dynamic SQL Error, not `Trigger @1 already exists`.
 - [ ] A schema-qualified DML target that does not exist answers a bare Dynamic SQL Error where the

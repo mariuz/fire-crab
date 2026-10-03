@@ -27194,6 +27194,21 @@ fn emit_trigger_blr(
     // in exactly that byte).
     first_ctx: u8,
 ) -> Vec<u8> {
+    emit_trigger_blr_init(body, declares, &[], dbg, first_ctx)
+}
+
+/// [emit_trigger_blr] with each declared variable's INITIALISER (`DECLARE
+/// I INTEGER = 0;`, aligned with `declares`; None or absent = NULL): the
+/// value takes the NULL's place in the variable's opening assignment
+/// (measured on 2196: `01 15 08 00 00 00 00 00 1a 00 00` where an
+/// uninitialised one is `01 2d 1a 00 00`), the debug entry unmoved.
+fn emit_trigger_blr_init(
+    body: &TrigStmt,
+    declares: &[(String, DeclType, usize)],
+    inits: &[Option<fire_crab_ods::expr::Expr>],
+    dbg: &mut Vec<(usize, usize)>,
+    first_ctx: u8,
+) -> Vec<u8> {
     let mut b = vec![5u8, 2]; // version5, begin
     for (i, (_, dtype, _)) in declares.iter().enumerate() {
         b.push(3); // blr_dcl_variable
@@ -27202,8 +27217,11 @@ fn emit_trigger_blr(
     }
     for (i, (_, _, src_off)) in declares.iter().enumerate() {
         dbg.push((*src_off, b.len()));
-        b.push(1); // blr_assignment: NULL -> the variable
-        b.push(45); // blr_null
+        b.push(1); // blr_assignment: the initialiser (or NULL) -> the variable
+        match inits.get(i).and_then(|e| e.as_ref()) {
+            Some(e) => e.emit(&mut b),
+            None => b.push(45), // blr_null
+        }
         b.push(26); // blr_variable
         b.extend_from_slice(&(i as u16).to_le_bytes());
     }
@@ -28044,10 +28062,18 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             return None;
         }
         let semi = s[at..begin_kw].find(';')? + at;
+        // an INITIALISER (`= <value>` / `DEFAULT <value>`) ends the type;
+        // its value is read below, through the runtime's own parser
+        // ([declared_var_inits])
+        let core_end = masked[at..semi]
+            .find('=')
+            .map(|i| at + i)
+            .or_else(|| find_word(&masked[at..semi], "DEFAULT", 0).map(|i| at + i))
+            .unwrap_or(semi);
         // the VARIABLE keyword is optional (`DECLARE X INTEGER;` is the
         // same declaration, the same BLR - measured on engine 2182)
-        let mut words: Vec<&str> = masked[at..semi].split_whitespace().collect();
-        let mut raw_words: Vec<&str> = s[at..semi].split_whitespace().collect();
+        let mut words: Vec<&str> = masked[at..core_end].split_whitespace().collect();
+        let mut raw_words: Vec<&str> = s[at..core_end].split_whitespace().collect();
         if words.get(1) != Some(&"VARIABLE") && words.len() >= 3 {
             words.insert(1, "VARIABLE");
             raw_words.insert(1, "VARIABLE");
@@ -28095,6 +28121,17 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         return None;
     }
     let var_names: Vec<String> = declares.iter().map(|(n, _, _)| n.clone()).collect();
+    // each variable's initialiser as an expression, in slot order - one
+    // kept AS WRITTEN has nothing to emit and refuses
+    let mut inits: Vec<Option<fire_crab_ods::expr::Expr>> = vec![None; declares.len()];
+    for st in declared_var_inits(&s[as_kw + "AS".len()..begin_kw], &var_names, &[]).ok()? {
+        match st {
+            TrigStmt::Assign { target: TrigTarget::Var(slot), expr, raw: None, .. } => {
+                *inits.get_mut(slot as usize)? = Some(expr);
+            }
+            _ => return None,
+        }
+    }
     let body = parse_trigger_body(s, begin_kw, end_kw + "END".len(), &var_names)?;
     // a trigger body must be fully compilable to BLR - see
     // [body_has_uninterpretable_blr]
@@ -28482,7 +28519,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     }
 
     let mut dbg_entries = Vec::new();
-    let blr = emit_trigger_blr(&body, &declares, &mut dbg_entries, if table.is_empty() { 0 } else { 2 });
+    let blr = emit_trigger_blr_init(&body, &declares, &inits, &mut dbg_entries, if table.is_empty() { 0 } else { 2 });
     let debug = trigger_debug_blob(s, &declares, &dbg_entries);
     Some((
         Plan::CreateTrigger {
