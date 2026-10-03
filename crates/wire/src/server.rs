@@ -38959,7 +38959,22 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                                     .then(|| relation_schema(db, table).map(|s| (s, table)))
                                     .flatten(),
                             };
-                            resolve_subqueries(&toks, &subs, db, db_outer, &columns, &bind, descs, true, None)?
+                            // the WHERE's subqueries number their own `?`s from
+                            // where the statement has reached (the SET list's
+                            // lead), and ONLY the slots this call claims are
+                            // published - a DML plan does not clear the
+                            // registry, so it may hold an earlier statement's
+                            let mark = corr_claimed_mark();
+                            let folded = resolve_subqueries(
+                                &toks, &subs, db, db_outer, &columns, &bind, descs, true, Some(next_param),
+                            )?;
+                            for (slot, d) in corr_claimed_since(mark) {
+                                if params.len() <= slot {
+                                    params.resize(slot + 1, None);
+                                }
+                                params[slot] = Some(d);
+                            }
+                            folded
                         };
                         folded_where = render_toks(&folded);
                         Some(folded)
@@ -39151,7 +39166,22 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                                     .then(|| relation_schema(db, table).map(|s| (s, table)))
                                     .flatten(),
                             };
-                            resolve_subqueries(&toks, &subs, db, db_outer, &columns, &bind, descs, true, None)?
+                            // the WHERE's subqueries number their own `?`s from
+                            // where the statement has reached (the SET list's
+                            // lead), and ONLY the slots this call claims are
+                            // published - a DML plan does not clear the
+                            // registry, so it may hold an earlier statement's
+                            let mark = corr_claimed_mark();
+                            let folded = resolve_subqueries(
+                                &toks, &subs, db, db_outer, &columns, &bind, descs, true, Some(next_param),
+                            )?;
+                            for (slot, d) in corr_claimed_since(mark) {
+                                if params.len() <= slot {
+                                    params.resize(slot + 1, None);
+                                }
+                                params[slot] = Some(d);
+                            }
+                            folded
                         };
                         folded_where = render_toks(&folded);
                         Some(folded)
@@ -106075,6 +106105,17 @@ fn bump_exec_epoch() {
 fn clear_corr_registry() {
     CORR_REG.with(|r| r.borrow_mut().clear());
     CORR_PRM.with(|r| r.borrow_mut().clear());
+}
+
+/// How many subquery slot claims are on record - a mark taken before a
+/// planner registers its own, so [corr_claimed_since] publishes only those.
+fn corr_claimed_mark() -> usize {
+    CORR_PRM.with(|r| r.borrow().len())
+}
+
+/// The subquery slot claims made since [corr_claimed_mark].
+fn corr_claimed_since(mark: usize) -> Vec<(usize, Descriptor)> {
+    CORR_PRM.with(|r| r.borrow().get(mark..).map(|v| v.to_vec()).unwrap_or_default())
 }
 
 /// The slots every subquery registered so far claimed, for the describe.

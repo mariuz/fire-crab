@@ -414,6 +414,28 @@ dml_refused "6 FIRST ? ahead of the select list"        "SELECT FIRST ? ID, $C F
 dml_refused "6 a UNION's second branch after a WHERE ?" "SELECT ID, 0 FROM T WHERE ID > ? UNION ALL SELECT ID, (SELECT COUNT(*) FROM T T3 WHERE T3.ID < ?) FROM T WHERE ID = 3" '[2,3]'
 
 # ---------------------------------------------------------------
+echo "--- 7 a DML WHERE's subquery carrying a ? (rolled back)"
+# UPDATE / DELETE lift their WHERE's subqueries exactly as a SELECT does,
+# but registered them with no slot to number from: every one with a `?`
+# refused.  They now number from where the statement has reached (the SET
+# list's lead), publishing ONLY this call's claims - a DML plan does not
+# clear the registry (corr_claimed_mark / corr_claimed_since).
+M="(SELECT MIN(T2.ID) FROM T T2 WHERE T2.ID > ?)"
+dml "7 UPDATE .. WHERE ID = <subquery ?>"           "UPDATE U SET TAG = 'x' WHERE ID = $M RETURNING ID" '[1]'
+dml "7 UPDATE SET TAG = ? .. WHERE ID = <subquery ?> [zz,1]" "UPDATE U SET TAG = ? WHERE ID = $M RETURNING ID, TAG" '["zz",1]'
+dml "7 ..[zz,0] - the order discriminates"          "UPDATE U SET TAG = ? WHERE ID = $M RETURNING ID, TAG" '["zz",0]'
+dml "7 UPDATE .. WHERE ID > ? AND ID IN (<subquery ?>)" "UPDATE U SET TAG = 'x' WHERE ID > ? AND ID IN (SELECT T2.ID FROM T T2 WHERE T2.ID < ?) RETURNING ID" '[1,3]'
+dml "7 UPDATE .. WHERE ID IN (<subquery ?>) AND ID > ?" "UPDATE U SET TAG = 'x' WHERE ID IN (SELECT T2.ID FROM T T2 WHERE T2.ID < ?) AND ID > ? RETURNING ID" '[3,1]'
+dml "7 DELETE .. WHERE ID = <subquery ?>"           "DELETE FROM U WHERE ID = $M RETURNING ID" '[1]'
+dml "7 DELETE .. WHERE ID IN (.. T2.N382 LIKE ?) - the non-text spelling" "DELETE FROM U WHERE ID IN (SELECT T2.ID FROM T T2 WHERE T2.N382 LIKE ?) RETURNING ID" '["1%"]'
+dml "7 DELETE .. WHERE EXISTS(.. T2.ID > ?) - correlated" "DELETE FROM U WHERE EXISTS(SELECT 1 FROM T T2 WHERE T2.ID = U.ID AND T2.ID > ?) RETURNING ID" '[1]'
+dml         "7 DELETE .. WHERE ID = <subquery ?> [NULL] - no row" "DELETE FROM U WHERE ID = $M RETURNING ID" '[null]'
+dml "7 INSERT .. SELECT <select-list subquery ?>"   "INSERT INTO U (ID, TAG) SELECT ID + 10, (SELECT MAX(T2.V) FROM T T2 WHERE T2.ID < ?) FROM T RETURNING ID, TAG" '[3]'
+# RECORDED: a subquery in the SET list, and in an INSERT's VALUES
+dml_refused "7 UPDATE SET TAG = (<subquery ?>)"    "UPDATE U SET TAG = (SELECT MAX(T2.V) FROM T T2 WHERE T2.ID < ?) WHERE ID = 1 RETURNING TAG" '[3]'
+dml_refused "7 UPDATE SET ID = (<subquery ?>) WHERE ID = ?" "UPDATE U SET ID = (SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?) WHERE ID = ? RETURNING ID" '[1,2]'
+
+# ---------------------------------------------------------------
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "/tmp/fc-serve-inselcond-$PORT.log"; then
@@ -423,6 +445,6 @@ elif ! kill -0 $srv 2>/dev/null; then
 else echo "OK   no panic and the server is still up"; fi
 
 echo "ran $ran checks"
-# the floor is the MEASURED count: 134 on the 2026-10-02 binary, 134 OK
-if [ "$ran" -lt 134 ]; then echo "FAIL only $ran checks ran (floor 134) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 146 on the 2026-10-02 binary, 146 OK
+if [ "$ran" -lt 146 ]; then echo "FAIL only $ran checks ran (floor 146) - cells went missing"; fail=1; fi
 exit $fail

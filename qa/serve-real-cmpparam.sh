@@ -1817,7 +1817,7 @@ both_err "X3 conversion error: '0x2' into b.D" "SELECT ID FROM T WHERE ID IN (SE
 both_err "X3 conversion error: '2.5x' into b.D" "SELECT ID FROM T WHERE ID IN (SELECT b.ID FROM T b WHERE IIF(b.D = ?, 1, 0) = 1)" '["2.5x"]'
 both_err "X3 conversion error: an INTEGER bind into the TEXT slot b.S [2]" "SELECT ID FROM T WHERE ID IN (SELECT b.ID FROM T b WHERE IIF(b.S = ?, 1, 0) = 1)" '[2]'
 both_err "X3 conversion error in an EXISTS body: 'abc' into b.ID" "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM T b WHERE b.ID = T.ID AND IIF(b.ID = ?, 1, 0) = 1)" '["abc"]'
-dml_rb_eng_only "X3 DML: UPDATE T SET N = 99 WHERE ID IN (SELECT b.ID .. IIF(b.D = ?, 1, 0) = 1) ['2 .5'] (engine row 2; a whole-side ? in a DML's subquery body is refused at prepare on both binaries - recorded)" "UPDATE T SET N = 99 WHERE ID IN (SELECT b.ID FROM T b WHERE IIF(b.D = ?, 1, 0) = 1)" '["2 .5"]'
+boundary_err "X3 DML: UPDATE T SET N = 99 WHERE ID IN (SELECT b.ID .. IIF(b.D = ?, 1, 0) = 1) ['2 .5'] (engine row 2; a DML's WHERE subquery numbers its ? since 2026-10-02 (inselcond section 7) and this off-grammar text takes K2's conversion error, exactly as the SELECT twin does)" "UPDATE T SET N = 99 WHERE ID IN (SELECT b.ID FROM T b WHERE IIF(b.D = ?, 1, 0) = 1)" '["2 .5"]'
 # X4 IN FULL: SIGN and MOD over an approximate operand, every spelling,
 # parameter-free (they prepared and failed at execute on both binaries)
 both "X4 SIGN(-D) -> -1;-1;-1" "SELECT SIGN(-D) AS X FROM T ORDER BY ID"
@@ -2023,8 +2023,8 @@ both "F IIF(b.C = ?, 1, 0) = 1 ['2024-01-10 12:30:00'] -> none" "SELECT ID FROM 
 both "F IIF(b.C = ?, 1, 0) = 1 ['ab'] -> 1;3" "SELECT ID FROM TS WHERE ID IN (SELECT b.ID FROM TS b WHERE IIF(b.C = ?, 1, 0) = 1)" '["ab"]'
 both "F IIF(b.C = ?, 1, 0) = 1 ['ab   '] -> 1;3 (five chars, blank-padded compare)" "SELECT ID FROM TS WHERE ID IN (SELECT b.ID FROM TS b WHERE IIF(b.C = ?, 1, 0) = 1)" '["ab   "]'
 both "F control: the outer IIF(S = ?, 1, 0) = 1 ['abcdefghijklmnopqrstu'] -> none" "SELECT ID FROM T WHERE IIF(S = ?, 1, 0) = 1" '["abcdefghijklmnopqrstu"]'
-dml_rb_eng_only "F design boundary DML: UPDATE T SET N = 99 WHERE ID IN (SELECT .. CASE b.ID WHEN ? ..) ['2.00000000000000000000000000000000000001'] (engine row 2; a whole-side ? in a DML's subquery body is refused at prepare on both binaries - recorded)" "UPDATE T SET N = 99 WHERE ID IN (SELECT b.ID FROM T b WHERE CASE b.ID WHEN ? THEN 1 ELSE 0 END = 1)" '["2.00000000000000000000000000000000000001"]'
-dml_rb_eng_only "F design boundary DML: UPDATE T SET N = 99 WHERE ID IN (SELECT .. IIF(b.S = ?, 1, 0) = 1) ['abcdefghijklmnopqrstu'] (engine: no row)" "UPDATE T SET N = 99 WHERE ID IN (SELECT b.ID FROM T b WHERE IIF(b.S = ?, 1, 0) = 1)" '["abcdefghijklmnopqrstu"]'
+boundary_err "F design boundary DML: UPDATE T SET N = 99 WHERE ID IN (SELECT .. CASE b.ID WHEN ? ..) ['2.00000000000000000000000000000000000001'] (engine row 2; a DML's WHERE subquery numbers its ? since 2026-10-02 (inselcond section 7) and this off-grammar text takes K2's conversion error, exactly as the SELECT twin does)" "UPDATE T SET N = 99 WHERE ID IN (SELECT b.ID FROM T b WHERE CASE b.ID WHEN ? THEN 1 ELSE 0 END = 1)" '["2.00000000000000000000000000000000000001"]'
+dml_rb "F design boundary DML: UPDATE T SET N = 99 WHERE ID IN (SELECT .. IIF(b.S = ?, 1, 0) = 1) ['abcdefghijklmnopqrstu'] (engine: no row)" "UPDATE T SET N = 99 WHERE ID IN (SELECT b.ID FROM T b WHERE IIF(b.S = ?, 1, 0) = 1)" '["abcdefghijklmnopqrstu"]'
 # G: with B's rule an Add/Sub whose BOTH operands are untyped is untypable
 # in a simple-CASE / DECODE / COALESCE value - the engine's -802 (the
 # previous binary answered: a refusal replacing a wrong answer); the
