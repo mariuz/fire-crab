@@ -35445,6 +35445,30 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         // an item that is not one of the staged token shapes below can be
         // handed WHOLE to the expression parser
         let inner = &tail[1..tail.len() - 1];
+        // A SUBQUERY CARRYING A `?` AS A VALUE cannot be folded at prepare
+        // (its value arrives at execute), and the engine's VALUES row is
+        // exactly the one row `SELECT <the values> FROM RDB$DATABASE`
+        // produces - measured 2026-10-03, row for row: `VALUES ((SELECT
+        // COUNT(*) .. T2.ID > ?), 'n')` [1] inserts 2,n; `VALUES (7, (SELECT
+        // T2.V .. T2.ID > ?))` [5] inserts 7,NULL; `VALUES (7 + (..), 'n')`
+        // 9,n. So such a list is planned AS that INSERT .. SELECT, whose
+        // select-list subqueries number their `?`s - but only when EVERY
+        // `?` sits inside a subquery (a bare value `?` is typed from its
+        // target column, which this spelling would not do) and no DEFAULT
+        // item is written (it has no SELECT spelling).
+        {
+            let mi = mask_literals(inner);
+            let up = mi.to_ascii_uppercase();
+            if mi.contains('?') && find_word(&up, "SELECT", 0).is_some() && find_word(&up, "DEFAULT", 0).is_none() {
+                if let Some((_, subs)) = extract_subqueries(inner) {
+                    let in_subs: usize = subs.iter().map(|q| mask_literals(q).matches('?').count()).sum();
+                    if in_subs == mi.matches('?').count() {
+                        let as_select = format!("{}SELECT {} FROM RDB$DATABASE", &s[..vals_kw], inner);
+                        return plan_insert(&as_select, db);
+                    }
+                }
+            }
+        }
         // A SUBQUERY AS A VALUE - `VALUES (1, (SELECT MAX(V) FROM P))`.
         // A value list has no outer row, so every subquery here is a
         // CONSTANT for the statement: it is answered once and folded

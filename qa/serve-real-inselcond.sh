@@ -236,6 +236,43 @@ dml() {
     elif [ "$ed" != "$fd" ]; then echo "FAIL $1 (DESCRIBE)"; echo "     eng=[$ed]"; echo "     fc =[$fd]"; fail=1
     else echo "OK   $1 [$ev]"; fi
 }
+# DML with a READ-BACK, inside a rolled-back transaction: node-firebird
+# fetches NO RETURNING row for `INSERT .. VALUES` (the engine's own answer
+# reads "(none)" too), so a VALUES cell compares what was WRITTEN instead -
+# a RETURNING comparison there would be two empty answers agreeing
+qrb() { FC_DB="$2" FC_PORT="$1" FC_Q="$3" FC_P="$4" FC_RB="$5" timeout 25 node -e '
+  process.on("uncaughtException",()=>{console.log("CONN_ERR");process.exit(1);});
+  const F=require("node-firebird");
+  const fmt=r=>(!r||!r.length)?"(none)":r.map(x=>Object.values(x).map(v=>v===null?"NULL":v).join()).join(";");
+  F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,user:"SYSDBA",password:"masterkey"},(e,db)=>{
+    if(e){console.log("CONN_ERR");process.exit(1);}
+    db.transaction(F.ISOLATION_READ_COMMITTED,(et,tr)=>{
+      tr.query(process.env.FC_Q,JSON.parse(process.env.FC_P),(e2)=>{
+        const d=e2?("ERR "+e2.message.replace(/\s+/g," ").trim()):"ok";
+        tr.query(process.env.FC_RB,[],(e3,r)=>{
+          const rb=e3?"ERR":fmt(r);
+          tr.rollback(()=>{console.log("dml="+d+" rb="+rb);db.detach();process.exit(0);});
+        });
+      });
+    });
+  });' 2>/dev/null; }
+dml_rb() { # <label> <sql> <json> <read-back>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(qrb "$REAL" "$ENG" "$2" "$3" "$4"); fv=$(qrb "$PORT" "$FC" "$2" "$3" "$4")
+    if [ "$ev" = CONN_ERR ] || [ "$fv" = CONN_ERR ] || [ -z "$ev" ]; then echo "FAIL $1 [CONN_ERR]"; fail=1
+    elif [ "${ev#dml=ok}" = "$ev" ]; then echo "FAIL $1 - the ENGINE did not write [$ev]"; fail=1
+    elif [ "$ev" != "$fv" ]; then echo "FAIL $1"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
+    else echo "OK   $1 [$ev] (rolled back)"; fi
+}
+dml_rb_refused() { # <label> <sql> <json> <read-back>
+    ran=$((ran + 1))
+    local ev fv
+    ev=$(qrb "$REAL" "$ENG" "$2" "$3" "$4"); fv=$(qrb "$PORT" "$FC" "$2" "$3" "$4")
+    if [ "${ev#dml=ok}" = "$ev" ]; then echo "FAIL $1 - the ENGINE no longer writes [$ev]"; fail=1
+    elif [ "${fv#dml=ERR Dynamic SQL Error}" = "$fv" ]; then echo "FAIL $1 - this server moved [$fv] (engine [$ev]); promote if they agree"; fail=1
+    else echo "OK   $1 (engine [$ev], this server refuses - recorded)"; fi
+}
 # the engine WRITES/ANSWERS and this server refuses - recorded
 dml_refused() {
     ran=$((ran + 1))
@@ -449,7 +486,25 @@ dml "7 SET TAG = COALESCE((<subquery ?>), 'none')"  "UPDATE U SET TAG = COALESCE
 dml "7 SET ID = 10 + (<subquery ?>)"                "UPDATE U SET ID = 10 + $K WHERE ID = 1 RETURNING ID" '[1]'
 # RECORDED: a `?` beside the subquery in the same value, and an INSERT's VALUES
 dml_refused "7 SET ID = ? + (<subquery ?>)"         "UPDATE U SET ID = ? + $K WHERE ID = 1 RETURNING ID" '[10,1]'
-dml_refused "7 INSERT .. VALUES ((<subquery ?>), ..)" "INSERT INTO U (ID, TAG) VALUES ((SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?), 'n') RETURNING ID, TAG" '[1]'
+# AN INSERT's VALUES with a subquery `?`: the engine's row is exactly the
+# one `SELECT <values> FROM RDB$DATABASE` makes, so such a list is planned
+# as that INSERT .. SELECT - when every `?` sits inside a subquery and no
+# DEFAULT is written.  Compared by READ-BACK (see qrb).
+RB="SELECT ID, TAG FROM U ORDER BY ID"
+I="INSERT INTO U (ID, TAG) VALUES"
+dml_rb "7 VALUES ((<sub ?>), 'n')"          "$I ($K, 'n')" '[1]' "$RB"
+dml_rb "7 VALUES (7, (<sub ?>))"            "$I (7, $X)" '[3]' "$RB"
+dml_rb "7 VALUES (7, (<sub ?> - no row))"   "$I (7, (SELECT T2.V FROM T T2 WHERE T2.ID > ?))" '[5]' "$RB"
+dml_rb "7 VALUES (7 + (<sub ?>), 'n')"      "$I (7 + $K, 'n')" '[1]' "$RB"
+dml_rb "7 VALUES ((<sub ?>), (<sub ?>))"    "$I ($K, $X)" '[1,3]' "$RB"
+dml_rb "7 VALUES with the columns reordered" "INSERT INTO U (TAG, ID) VALUES ($X, 5)" '[3]' "$RB"
+dml_rb "7 VALUES with no column list"       "INSERT INTO U VALUES ($K, 'n')" '[1]' "$RB"
+dml_rb "7 VALUES (.., 'it''s') - a quote"   "$I ($K, 'it''s')" '[1]' "$RB"
+dml_rb "7 VALUES ((<sub ?>), 'n') [NULL]"   "$I ($K, 'n')" '[null]' "$RB"
+dml_rb "7 VALUES ((<sub ?>), (<sub LIKE ?>))" "$I ((SELECT COUNT(*) FROM T T2 WHERE T2.ID > ?), (SELECT FIRST 1 T2.V FROM T T2 WHERE T2.V LIKE ?))" '[0,"10%"]' "$RB"
+# RECORDED: a bare value `?` beside it (typed from its target), a DEFAULT
+dml_rb_refused "7 VALUES (?, (<sub ?>)) - a bare value ?" "$I (?, $X)" '[8,3]' "$RB"
+dml_rb_refused "7 VALUES ((<sub ?>), DEFAULT)"           "$I ($K, DEFAULT)" '[1]' "$RB"
 
 # ---------------------------------------------------------------
 echo "--- panic check"
@@ -461,6 +516,6 @@ elif ! kill -0 $srv 2>/dev/null; then
 else echo "OK   no panic and the server is still up"; fi
 
 echo "ran $ran checks"
-# the floor is the MEASURED count: 157 on the 2026-10-03 binary, 157 OK
-if [ "$ran" -lt 157 ]; then echo "FAIL only $ran checks ran (floor 157) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 168 on the 2026-10-03 binary, 168 OK
+if [ "$ran" -lt 168 ]; then echo "FAIL only $ran checks ran (floor 168) - cells went missing"; fail=1; fi
 exit $fail
