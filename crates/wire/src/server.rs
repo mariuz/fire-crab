@@ -9962,6 +9962,9 @@ enum Plan {
         /// the body's (line, column) in the whole statement text - what
         /// the engine's `At block` item counts
         body_at: (usize, usize),
+        /// its INPUT parameters, as [Plan::ExecBlockSelect] carries them
+        in_names: Vec<String>,
+        in_descs: Vec<Descriptor>,
     },
     /// `EXECUTE BLOCK RETURNS (...) AS ... BEGIN ... SUSPEND ... END` - a
     /// SELECTABLE anonymous block: the body is interpreted, its SUSPENDed
@@ -9973,6 +9976,10 @@ enum Plan {
         out_names: Vec<String>,
         out_descs: Vec<Descriptor>,
         cols: Vec<ProjCol>,
+        /// the block's INPUT parameters (`EXECUTE BLOCK (X INTEGER = ?, ..)`),
+        /// in order; input `i` takes statement slot `i`, bound at execute
+        in_names: Vec<String>,
+        in_descs: Vec<Descriptor>,
     },
     /// `SELECT ... FROM <proc>(args)` before the body has run - a
     /// SELECTABLE procedure as a row source. Like ProcInvoke it executes
@@ -63620,18 +63627,40 @@ fn plan_query_inner_at_body(
     }
     // EXECUTE BLOCK is a body with no DDL around it - prepared like any
     // statement, run at execute because it may write.
-    if let Some(p) = parse_execute_block_select(sql, db) {
+    if let Some(p) = parse_execute_block_select(sql, db, params) {
         return Some(p);
     }
-    if let Some((source, body_at)) = parse_execute_block(sql) {
+    if let Some((source, body_at, ins_decl, in_names)) = parse_execute_block(sql) {
         // judged before it runs, as a selectable block's body is: the BLR
         // compiler first, and [block_prepare_verdict] where it declines
-        let synth = format!("CREATE PROCEDURE FC$BLOCK AS {}", source);
+        let ins_clause = if in_names.is_empty() { String::new() } else { format!("({}) ", ins_decl) };
+        let synth = format!("CREATE PROCEDURE FC$BLOCK {}AS {}", ins_clause, source);
         fire_crab_dsql::set_catalog(dsql_catalog_for(db, &synth));
-        let compiled = fire_crab_dsql::compile_procedure_full_with_funcs(&synth, &plain_function_arities(db)).is_some();
+        let c = fire_crab_dsql::compile_procedure_full_with_funcs(&synth, &plain_function_arities(db));
         fire_crab_dsql::set_catalog(Vec::new());
+        let compiled = c.is_some();
+        // THE INPUTS' SLOTS are their declared types - the compiler's
+        // reading, or the column-type reader for one it cannot type
+        let mut in_descs: Vec<Descriptor> = Vec::new();
+        if !in_names.is_empty() {
+            let typed = match &c {
+                Some(c) if c.ins.len() == in_names.len() => {
+                    c.ins.iter().map(desc_from_proc_meta).collect::<Option<Vec<_>>>()
+                }
+                _ => block_input_descs(&ins_decl, &plain_function_arities(db))
+                    .filter(|d| d.len() == in_names.len()),
+            };
+            in_descs = typed?;
+            block_text_in_att_cs(&format!("RETURNS ({})", ins_decl), &mut in_descs);
+            for (i, d) in in_descs.iter().enumerate() {
+                if params.len() <= i {
+                    params.resize(i + 1, None);
+                }
+                params[i] = Some(*d);
+            }
+        }
         let meta = ProcMeta {
-            ins: Vec::new(),
+            ins: block_in_params(&in_names, &in_descs),
             outs: Vec::new(),
             source: source.clone(),
             body_at: Some(body_at),
@@ -63641,7 +63670,7 @@ fn plan_query_inner_at_body(
         if let Some(refused) = block_prepare_gate(&meta, db, compiled) {
             return refused;
         }
-        return Some(Plan::ExecBlock { source, body_at });
+        return Some(Plan::ExecBlock { source, body_at, in_names, in_descs });
     }
     // EXECUTE PROCEDURE is not a SELECT, but isql prepares and FETCHES
     // it like one, so it resolves to a plan here (see PSQL EXECUTION).
@@ -81913,6 +81942,11 @@ fn wireparam_arg_value(wp: &WireParam) -> Option<Value> {
         WireParam::Int(v, sc) => Value::Scaled(*v, *sc),
         WireParam::Text(t) | WireParam::TextCs(t, _) => Value::Text(t.clone()),
         WireParam::Double(d) => Value::Double(*d),
+        // a BOOLEAN message (a client's typed true / false) is the value
+        // itself - it had no arm, so a BOOLEAN procedure or block input
+        // bound from one refused as "unbound" (measured 2026-10-03,
+        // `EXECUTE BLOCK (B BOOLEAN = ?) ..` [true])
+        WireParam::Bool(b) => Value::Bool(*b),
         _ => return None,
     })
 }
@@ -125539,16 +125573,18 @@ fn run_execute_block(
     source: &str,
     body_at: (usize, usize),
     ctx: &SessionCtx,
+    ins: Vec<ProcParam>,
+    args: &[Value],
 ) -> Result<(), ProcErr> {
     let meta = ProcMeta {
-        ins: Vec::new(),
+        ins,
         outs: Vec::new(),
         source: source.to_string(),
         body_at: Some(body_at),
         prc_type: None,
         is_function: false,
     };
-    run_body_source(database, ANONYMOUS_BLOCK, &meta, &[], ctx, None).map(|_| ())
+    run_body_source(database, ANONYMOUS_BLOCK, &meta, args, ctx, None).map(|_| ())
 }
 
 /// The name [run_body_source] runs an anonymous block under. The engine
@@ -126942,7 +126978,11 @@ fn desc_from_proc_meta(m: &fire_crab_dsql::ProcParamMeta) -> Option<Descriptor> 
 /// block. Input parameters (`EXECUTE BLOCK (p type = ?) ...`) need a
 /// client message and are not taken; a block with no RETURNS is the
 /// plain (non-selectable) form parse_execute_block handles.
-fn parse_execute_block_select(sql: &str, db: &Option<Database>) -> Option<Plan> {
+fn parse_execute_block_select(
+    sql: &str,
+    db: &Option<Database>,
+    params: &mut Vec<Option<Descriptor>>,
+) -> Option<Plan> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
@@ -126953,23 +126993,39 @@ fn parse_execute_block_select(sql: &str, db: &Option<Database>) -> Option<Plan> 
     if up["EXECUTE".len()..block].trim() != "" {
         return None;
     }
-    let after = block + "BLOCK".len();
+    let mut after = block + "BLOCK".len();
+    // AN INPUT-PARAMETER LIST - `EXECUTE BLOCK (X INTEGER = ?, S
+    // VARCHAR(10) = ?) RETURNS (..) AS ..`: each input is declared WITH
+    // ITS TYPE and bound from a `?`, so it is the synthesized procedure's
+    // input list ([block_input_list]), its declared type is the slot the
+    // engine describes, and the bound value moves into it by the same law
+    // a procedure argument does ([bind_proc_args]). Every input must be
+    // `<name> <type> = ?`; anything else refuses.
+    let mut ins_decl = String::new();
+    let mut in_names: Vec<String> = Vec::new();
+    if s[after..].trim_start().starts_with('(') {
+        let lead = s[after..].len() - s[after..].trim_start().len();
+        let open = after + lead;
+        let close = matching_paren(masked.as_bytes(), open)?;
+        let (decl, names) = block_input_list(&s[open + 1..close])?;
+        ins_decl = decl;
+        in_names = names;
+        after = close + 1;
+    }
     let as_kw = find_word(&masked, "AS", after)?;
-    // between BLOCK and AS must be `RETURNS (...)` - a leading `(` is an
-    // input-parameter list, out of this slice
-    let between = up[after..as_kw].trim();
+    // between the inputs and AS must be `RETURNS (...)`
     if find_word(&masked, "RETURNS", after) != Some(after + (up[after..].len() - up[after..].trim_start().len())) {
         return None;
     }
-    let _ = between;
     let returns_text = s[after..as_kw].trim();
+    let ins_clause = if in_names.is_empty() { String::new() } else { format!("({}) ", ins_decl) };
     let body_off = as_kw + "AS".len();
     let body = s[body_off..].trim();
     let lead = s[body_off..].len() - s[body_off..].trim_start().len();
     let at = source_line_col(s, body_off + lead);
     // recover the output metadata (and validate the body) through the
     // procedure compiler, then interpret the body as a nameless block
-    let synth = format!("CREATE PROCEDURE FC$BLOCK {} AS {}", returns_text, body);
+    let synth = format!("CREATE PROCEDURE FC$BLOCK {}{} AS {}", ins_clause, returns_text, body);
     // the compiler resolves a bare column across streams through the
     // catalog of the tables and procedures the body names, and a call
     // through the functions it knows: compiled against an empty
@@ -126994,14 +127050,18 @@ fn parse_execute_block_select(sql: &str, db: &Option<Database>) -> Option<Plan> 
     let c = match c {
         Some(c) => Some(c),
         None => {
-            let head = format!("CREATE PROCEDURE FC$BLOCK {} AS BEGIN SUSPEND; END", returns_text);
+            let head = format!("CREATE PROCEDURE FC$BLOCK {}{} AS BEGIN SUSPEND; END", ins_clause, returns_text);
             fire_crab_dsql::compile_procedure_full_with_funcs(&head, &plain_funcs)
         }
     };
+    let mut in_descs: Vec<Descriptor> = Vec::new();
     let (out_names, out_descs) = match c {
         Some(c) => {
-            if !c.ins.is_empty() || c.outs.is_empty() {
-                return None; // no input params here; a RETURNS with columns
+            if c.ins.len() != in_names.len() || c.outs.is_empty() {
+                return None; // the inputs as declared; a RETURNS with columns
+            }
+            for m in &c.ins {
+                in_descs.push(desc_from_proc_meta(m)?);
             }
             let mut names = Vec::new();
             let mut descs = Vec::new();
@@ -127012,15 +127072,50 @@ fn parse_execute_block_select(sql: &str, db: &Option<Database>) -> Option<Plan> 
             (names, descs)
         }
         // ...and a header the compiler has no type for - BOOLEAN, DOUBLE
-        // PRECISION, FLOAT - is read by the column-type reader
-        None => block_returns_scalar(returns_text)?,
+        // PRECISION, FLOAT - is read by the column-type reader (outputs
+        // only: inputs it cannot type refuse)
+        None if in_names.is_empty() => block_returns_scalar(returns_text)?,
+        // ...and an INPUT it has no type for (DOUBLE PRECISION, BOOLEAN)
+        // is read by the same reader, from the declarations
+        None => {
+            in_descs = block_input_descs(&ins_decl, &plain_funcs)?;
+            if in_descs.len() != in_names.len() {
+                return None;
+            }
+            // the OUTPUTS on their own: the input the compiler could not
+            // type is what failed the header, not the RETURNS list
+            let head = format!("CREATE PROCEDURE FC$BLOCK {} AS BEGIN SUSPEND; END", returns_text);
+            match fire_crab_dsql::compile_procedure_full_with_funcs(&head, &plain_funcs) {
+                Some(h) if !h.outs.is_empty() => {
+                    let mut names = Vec::new();
+                    let mut descs = Vec::new();
+                    for m in &h.outs {
+                        names.push(m.name.clone());
+                        descs.push(desc_from_proc_meta(m)?);
+                    }
+                    (names, descs)
+                }
+                _ => block_returns_scalar(returns_text)?,
+            }
+        }
     };
+    // an input's undeclared text set is the attachment's, as a block's
+    // locals and outputs are
+    if !in_names.is_empty() {
+        block_text_in_att_cs(&format!("RETURNS ({})", ins_decl), &mut in_descs);
+        for (i, d) in in_descs.iter().enumerate() {
+            if params.len() <= i {
+                params.resize(i + 1, None);
+            }
+            params[i] = Some(*d);
+        }
+    }
     let mut out_descs = out_descs;
     block_text_in_att_cs(returns_text, &mut out_descs);
     // ...and the body the compiler did not judge is judged here, before
     // a statement of it runs ([block_prepare_verdict])
     let meta = ProcMeta {
-        ins: Vec::new(),
+        ins: block_in_params(&in_names, &in_descs),
         outs: out_names
             .iter()
             .zip(out_descs.iter())
@@ -127039,7 +127134,65 @@ fn parse_execute_block_select(sql: &str, db: &Option<Database>) -> Option<Plan> 
         // the engine describes a block column with an EMPTY table/owner
         cols.push(proc_out_col(n.clone(), Some(n.clone()), "", None, i, d));
     }
-    Some(Plan::ExecBlockSelect { source: body.to_string(), body_at: at, out_names, out_descs, cols })
+    Some(Plan::ExecBlockSelect { source: body.to_string(), body_at: at, out_names, out_descs, cols, in_names, in_descs })
+}
+
+/// An EXECUTE BLOCK's input list, `X INTEGER = ?, S VARCHAR(10) = ?`, as
+/// a procedure's input declarations (`X INTEGER, S VARCHAR(10)`) and the
+/// names in order. Every item must end in `= ?` - a block input is always
+/// bound - or the list refuses.
+fn block_input_list(inner: &str) -> Option<(String, Vec<String>)> {
+    let mut decls = Vec::new();
+    let mut names = Vec::new();
+    for item in split_top_level_commas(inner) {
+        let t = item.trim();
+        let masked = mask_literals(t);
+        let eq = masked.rfind('=')?;
+        if masked[eq + 1..].trim() != "?" {
+            return None;
+        }
+        let decl = t[..eq].trim();
+        let name = decl.split_whitespace().next()?;
+        if decl.len() <= name.len() {
+            return None; // a name with no type
+        }
+        names.push(canon_ident(name)?);
+        decls.push(decl.to_string());
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some((decls.join(", "), names))
+}
+
+/// Each block INPUT's descriptor, typed ON ITS OWN: the procedure
+/// compiler where it has the type, the column-type reader where it does
+/// not (DOUBLE PRECISION, FLOAT, BOOLEAN) - one input the compiler cannot
+/// type must not take the others' types down with it.
+fn block_input_descs(ins_decl: &str, plain_funcs: &[(String, usize, usize)]) -> Option<Vec<Descriptor>> {
+    let mut out = Vec::new();
+    for decl in split_top_level_commas(ins_decl) {
+        let decl = decl.trim();
+        let head = format!("CREATE PROCEDURE FC$BLOCK ({}) AS BEGIN EXIT; END", decl); // the compiler takes no empty body
+        let d = match fire_crab_dsql::compile_procedure_full_with_funcs(&head, plain_funcs) {
+            Some(c) if c.ins.len() == 1 => desc_from_proc_meta(&c.ins[0])?,
+            _ => {
+                let (_, descs) = block_returns_scalar(&format!("RETURNS ({})", decl))?;
+                *descs.first()?
+            }
+        };
+        out.push(d);
+    }
+    Some(out)
+}
+
+/// The block's inputs as the [ProcParam]s its body binds.
+fn block_in_params(names: &[String], descs: &[Descriptor]) -> Vec<ProcParam> {
+    names
+        .iter()
+        .zip(descs.iter())
+        .map(|(n, d)| ProcParam { name: n.clone(), desc: *d, collated: false, default: None, default_ctx: None, default_cs: None })
+        .collect()
 }
 
 /// An EXECUTE BLOCK's `RETURNS (<name> <type>, ...)` read by the COLUMN
@@ -127129,7 +127282,12 @@ fn block_returns_scalar(returns_text: &str) -> Option<(Vec<String>, Vec<Descript
 }
 
 
-fn parse_execute_block(sql: &str) -> Option<(String, (usize, usize))> {
+/// `EXECUTE BLOCK [(<inputs>)] AS ...`: the body, where it sits, and the
+/// input list as declarations plus names ([block_input_list]; empty
+/// when there is none).
+type PlainBlock = (String, (usize, usize), String, Vec<String>);
+
+fn parse_execute_block(sql: &str) -> Option<PlainBlock> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
@@ -127140,9 +127298,20 @@ fn parse_execute_block(sql: &str) -> Option<(String, (usize, usize))> {
     if up["EXECUTE".len()..block].trim() != "" {
         return None;
     }
-    let after = block + "BLOCK".len();
+    let mut after = block + "BLOCK".len();
+    // an INPUT list `(X INTEGER = ?, ..)`, as the selectable form takes it
+    let mut ins_decl = String::new();
+    let mut in_names = Vec::new();
+    if s[after..].trim_start().starts_with('(') {
+        let open = after + (s[after..].len() - s[after..].trim_start().len());
+        let close = matching_paren(masked.as_bytes(), open)?;
+        let (decl, names) = block_input_list(&s[open + 1..close])?;
+        ins_decl = decl;
+        in_names = names;
+        after = close + 1;
+    }
     let as_kw = find_word(&masked, "AS", after)?;
-    // anything between BLOCK and AS is a parameter list or RETURNS
+    // anything else between BLOCK and AS is RETURNS - the selectable form
     if up[after..as_kw].trim() != "" {
         return None;
     }
@@ -127155,7 +127324,7 @@ fn parse_execute_block(sql: &str) -> Option<(String, (usize, usize))> {
     // procedure has to recover this from its RDB$DEBUG_INFO because the
     // catalog keeps only the body; a block has the statement in hand.
     let at = source_line_col(s, body_off + lead);
-    Some((s[body_off..].trim().to_string(), at))
+    Some((s[body_off..].trim().to_string(), at, ins_decl, in_names))
 }
 
 fn parse_execute_procedure(sql: &str) -> Option<(Vec<String>, Vec<Option<Value>>)> {
@@ -134603,19 +134772,29 @@ fn after_auth(
                 } else if matches!(&*plan, Plan::ExecBlockSelect { .. }) {
                     // a selectable EXECUTE BLOCK: interpret the body and
                     // keep the rows it SUSPENDed for the fetch
-                    let (source, body_at, out_names, out_descs, bcols) = match &*plan {
-                        Plan::ExecBlockSelect { source, body_at, out_names, out_descs, cols } => (
+                    let (source, body_at, out_names, out_descs, bcols, in_names, in_descs) = match &*plan {
+                        Plan::ExecBlockSelect { source, body_at, out_names, out_descs, cols, in_names, in_descs } => (
                             source.clone(),
                             *body_at,
                             out_names.clone(),
                             out_descs.clone(),
                             cols.clone(),
+                            in_names.clone(),
+                            in_descs.clone(),
                         ),
                         _ => unreachable!(),
                     };
+                    // the block's inputs are the statement's slots, in order
+                    let Some(block_args) = (0..in_names.len())
+                        .map(|i| bound_args.get(i).and_then(wireparam_arg_value))
+                        .collect::<Option<Vec<Value>>>()
+                    else {
+                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        continue;
+                    };
                     let ctx = SessionCtx { user, attach_id };
                     let meta = ProcMeta {
-                        ins: Vec::new(),
+                        ins: block_in_params(&in_names, &in_descs),
                         outs: out_names
                             .iter()
                             .zip(out_descs.iter())
@@ -134626,7 +134805,7 @@ fn after_auth(
                         prc_type: None,
                         is_function: false,
                     };
-                    match run_body_source(&mut database, ANONYMOUS_BLOCK, &meta, &[], &ctx, None) {
+                    match run_body_source(&mut database, ANONYMOUS_BLOCK, &meta, &block_args, &ctx, None) {
                         Ok((_, suspended)) => {
                             plan = std::rc::Rc::new(Plan::ProcRows { cols: bcols, rows: suspended, then: None });
                             respond(&mut s, &mut enc, resp_tx)?;
@@ -134718,12 +134897,28 @@ fn after_auth(
                     // EXECUTE PROCEDURE does: it may WRITE. It projects
                     // nothing, so there is no plan to replace it with -
                     // the response is the whole answer.
-                    let (source, body_at) = match &*plan {
-                        Plan::ExecBlock { source, body_at } => (source.clone(), *body_at),
+                    let (source, body_at, in_names, in_descs) = match &*plan {
+                        Plan::ExecBlock { source, body_at, in_names, in_descs } => {
+                            (source.clone(), *body_at, in_names.clone(), in_descs.clone())
+                        }
                         _ => unreachable!(),
                     };
+                    let Some(block_args) = (0..in_names.len())
+                        .map(|i| bound_args.get(i).and_then(wireparam_arg_value))
+                        .collect::<Option<Vec<Value>>>()
+                    else {
+                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        continue;
+                    };
                     let ctx = SessionCtx { user, attach_id };
-                    match run_execute_block(&mut database, &source, body_at, &ctx) {
+                    match run_execute_block(
+                        &mut database,
+                        &source,
+                        body_at,
+                        &ctx,
+                        block_in_params(&in_names, &in_descs),
+                        &block_args,
+                    ) {
                         Ok(()) => respond(&mut s, &mut enc, resp_tx)?,
                         Err(e) => {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
