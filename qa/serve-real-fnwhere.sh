@@ -45,8 +45,9 @@
 # range, written order - and the walk that writes reads each record's
 # values by its (page, slot); an UPDATE's SET values that call run there
 # too, for the rows the WHERE keeps (a `?` argument typed by the function's
-# declared input), RETURNING over it too. An impure call, or one IN the
-# RETURNING list, refuses (8b): the engine's calls see the statement's own
+# declared input), RETURNING over it too, and a pure call IN the RETURNING
+# list (UPDATE, DELETE, INSERT) runs per returned row after the write. An
+# impure call refuses (8b): the engine's calls see the statement's own
 # earlier writes (`DELETE FROM T WHERE ID < FC()`, FC counting T, deletes
 # one row of three), which no pre-pass reproduces.
 #
@@ -121,7 +122,8 @@ qrb() { FC_DB="$2" FC_PORT="$1" FC_Q="$3" FC_P="$4" FC_RB="$5" timeout 25 node -
   // transaction, before the rollback, as its text
   const rd=(tr,v)=>new Promise(res=>{if(typeof v!=="function")return res(v);
     v(tr,(e,n,em)=>{if(e)return res("BLOBERR");const b=[];em.on("data",c=>b.push(c));em.on("end",()=>res(Buffer.concat(b).toString()));});});
-  const fmt=async(tr,r)=>{if(!r||!r.length)return "(none)";const o=[];
+  // (a singleton INSERT .. RETURNING row arrives as an object, not a list)
+  const fmt=async(tr,r)=>{if(r&&!Array.isArray(r))r=[r];if(!r||!r.length)return "(none)";const o=[];
     for(const x of r){const vs=[];for(const v0 of Object.values(x)){const v=await rd(tr,v0);vs.push(v===null?"NULL":(v instanceof Date?v.toISOString():v));}o.push(vs.join());}
     return o.join(";");};
   F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,user:"SYSDBA",password:"masterkey"},(e,db)=>{
@@ -355,13 +357,21 @@ both "8 SET F2(?, ?) - both arguments bound"       "UPDATE T SET V = F2(?, ?) WH
 both "8 UPDATE .. WHERE F1(ID) = 2 RETURNING ID, V" "UPDATE T SET V = 'q' WHERE F1(ID) = 2 RETURNING ID, V" '[]' "$RT"
 both "8 SET call RETURNING OLD.V, NEW.V"           "UPDATE T SET V = F2(V, ID) WHERE ID = 3 RETURNING OLD.V AS O, NEW.V AS NV" '[]' "$RT"
 both "8 DELETE .. WHERE F1(ID) = 4 RETURNING ID"    "DELETE FROM T WHERE F1(ID) = 4 RETURNING ID, N" '[]' "$RT"
+# a call IN the RETURNING list: run per returned row, after the write (a
+# raise undoes the write) - the cursor form and INSERT's singleton form
+both "8 RETURNING F1(ID)"                          "UPDATE T SET V = 'r' WHERE ID = 1 RETURNING F1(ID)" '[]' "$RT"
+both "8 RETURNING a lazy IIF over FZ"              "UPDATE T SET V = 'w' RETURNING ID, IIF(ID = 2, 0, FZ(ID))" '[]' "$RT"
+both "8 RETURNING FZ(2) raises, the write undone"  "UPDATE T SET V = 'w' WHERE ID = 2 RETURNING FZ(ID)" '[]' "$RT"
+both "8 INSERT .. VALUES RETURNING calls (singleton)" "INSERT INTO T (ID, V) VALUES (7, 'g') RETURNING F1(ID), F2(V, ID)" '[]' "$RT"
+both "8 INSERT .. VALUES RETURNING FZ(2) raises"   "INSERT INTO T (ID, V) VALUES (2, 'k') RETURNING FZ(ID)" '[]' "$RT"
+both "8 INSERT .. SELECT RETURNING F1"             "INSERT INTO T (ID, V) SELECT ID + 10, V FROM T RETURNING F1(ID)" '[]' "$RT"
 both "8 CONTROL - a DML with no call"               "UPDATE T SET V = 'z' WHERE ID = 3" '[]' "$RT"
 both "8 CONTROL - a SELECT after the DML lexed a call" "SELECT ID FROM T WHERE ID = 1" '[]'
 echo "--- 8b RECORDED - an IMPURE function: the engine's calls see the statement's own writes"
 # `DELETE FROM T WHERE ID < FC()`, FC counting T: the engine deletes ONE
 # row of three (the count falls as rows go); a pre-pass cannot reproduce it
 eng_only "8b DELETE .. WHERE ID < FC() - FC reads the target" "DELETE FROM T WHERE ID < FC()" '[]'
-eng_only "8b a call IN the RETURNING list"          "UPDATE T SET N = 1 WHERE ID = 1 RETURNING F1(ID)" '[]'
+eng_only "8b an IMPURE call in a RETURNING list"     "UPDATE T SET N = 1 WHERE ID = 1 RETURNING FC()" '[]'
 
 echo "--- panic check"
 ran=$((ran + 1))
@@ -369,6 +379,6 @@ if grep -aq 'panicked at' "/tmp/fc-serve-fnwhere-$PORT.log"; then echo "FAIL the
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 169 on the 2026-10-03 binary, 169 OK
-if [ "$ran" -lt 169 ]; then echo "FAIL only $ran checks ran (floor 169) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 175 on the 2026-10-03 binary, 175 OK
+if [ "$ran" -lt 175 ]; then echo "FAIL only $ran checks ran (floor 175) - cells went missing"; fail=1; fi
 exit $fail

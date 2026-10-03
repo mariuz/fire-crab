@@ -126349,7 +126349,9 @@ fn dml_fn_prepass(
         Plan::Delete { rel, formats, filter, index, defer, .. } | Plan::Update { rel, formats, filter, index, defer, .. } => {
             (*rel, formats, filter, index, defer)
         }
-        _ => return Err(EvalErr::Unsupported),
+        // an INSERT's calls can stand only in its RETURNING list, which
+        // runs at the projection
+        _ => return Ok(std::collections::HashMap::new()),
     };
     let filter = bind_filter_eval(filter, args)?;
     let rows: Vec<(u32, u16, Vec<Value>)> = {
@@ -135679,23 +135681,16 @@ fn after_auth(
                     // set, the NEXT prepare's call check read it (a cached
                     // plan skips the reset) and refused a plain ROLLBACK
                     FN_LEXED.with(|f| f.set(false));
-                    // the calls it gathered are this statement's; a plan
-                    // that cannot run them refuses ([dml_fn_plannable])
+                    // the WHERE / SET calls, judged before the RETURNING
+                    // wrap ([dml_fn_plannable]); the list's own calls are
+                    // gathered by the wrap below
                     let dml_calls = FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut()));
                     let planned = match planned {
-                        Some((p, _))
-                            if !dml_calls.is_empty()
-                                && (returning.as_ref().is_some_and(|list| {
-                                    // a call in the RETURNING list itself keeps its refusal
-                                    let up = list.to_ascii_uppercase();
-                                    database.as_ref().is_some_and(|db| user_function_sigs(db).keys().any(|n| sql_calls_name(&up, n)))
-                                }) || !dml_fn_plannable(&p, &dml_calls, &database)) =>
-                        {
+                        Some((p, _)) if !dml_calls.is_empty() && !dml_fn_plannable(&p, &dml_calls, &database) => {
                             Some((std::rc::Rc::new(Plan::RefusedEval(EvalErr::Unsupported)), std::rc::Rc::new(Vec::new())))
                         }
                         other => other,
                     };
-                    fn_calls = std::rc::Rc::new(dml_calls);
                     let planned = match (planned, &returning) {
                         // VECTOR-AT-PREPARE: wrap_returning over a
                         // refused plan would produce Returning{inner:
@@ -135741,6 +135736,21 @@ fn after_auth(
                         },
                         (planned, _) => planned,
                     };
+                    // a call IN the RETURNING list runs at the projection,
+                    // after the write - a PURE one only, whose answer the
+                    // engine's per-row interleaving cannot change
+                    let ret_calls = FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut()));
+                    let ret_ok = ret_calls.is_empty()
+                        || (!FN_NESTED.with(|n| n.get())
+                            && database.as_ref().is_some_and(|db| {
+                                ret_calls.iter().all(|c| user_fn_pure(db, &c.name, &mut Vec::new()))
+                            }));
+                    let planned = if ret_ok { planned } else {
+                        Some((std::rc::Rc::new(Plan::RefusedEval(EvalErr::Unsupported)), std::rc::Rc::new(Vec::new())))
+                    };
+                    let mut dml_calls = dml_calls;
+                    dml_calls.extend(ret_calls);
+                    fn_calls = std::rc::Rc::new(dml_calls);
                     match planned {
                         // UPDATE OR INSERT on a PK-less table without
                         // MATCHING: the engine's specific vector at
@@ -136320,24 +136330,39 @@ fn after_auth(
                                     BLOB_CTX.with(|c| *c.borrow_mut() = database.as_ref().map(|d| (d.bytes(), d.page_size)));
                                     let projected: Result<Vec<Vec<Value>>, EvalErr> = {
                                     let _pre = pre_img.as_ref().map(|i| SubqImageGuard::arm(i.clone()));
-                                    rows
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, r)| {
-                                            cols.iter()
-                                                .enumerate()
-                                                .map(|(ci, c)| {
-                                                    if del.get(i) == Some(&true)
-                                                        && new_cols.contains(&ci)
-                                                    {
-                                                        Ok(Value::Null)
-                                                    } else {
-                                                        c.value_of(r)
-                                                    }
-                                                })
-                                                .collect()
-                                        })
-                                        .collect()
+                                    // a stored call IN the list runs per
+                                    // returned row, as each item reaches
+                                    // it ([lazy_fn_eval]); a raise undoes
+                                    // the write like any item's
+                                    let calls = fn_calls.clone();
+                                    let mut out: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+                                    let mut failed = None;
+                                    'rows: for (i, r) in rows.iter().enumerate() {
+                                        FN_VALS.with(|m| m.borrow_mut().clear());
+                                        let mut row = Vec::with_capacity(cols.len());
+                                        for (ci, c) in cols.iter().enumerate() {
+                                            let v = if del.get(i) == Some(&true) && new_cols.contains(&ci) {
+                                                Ok(Value::Null)
+                                            } else if calls.is_empty() {
+                                                c.value_of(r)
+                                            } else {
+                                                lazy_fn_eval(&mut database, &calls, &bound_args, &ctx, r, &|| c.value_of(r))
+                                            };
+                                            match v {
+                                                Ok(v) => row.push(v),
+                                                Err(e) => {
+                                                    failed = Some(e);
+                                                    break 'rows;
+                                                }
+                                            }
+                                        }
+                                        out.push(row);
+                                    }
+                                    FN_VALS.with(|m| m.borrow_mut().clear());
+                                    match failed {
+                                        Some(e) => Err(e),
+                                        None => Ok(out),
+                                    }
                                     };
                                     match projected {
                                         Ok(p) => {
@@ -137275,7 +137300,10 @@ fn after_auth(
                 }
                 // (a RETURNING cursor's rows were made at execute - its
                 // calls were the DML's)
-                if !fn_calls.is_empty() && !scroll.contains_key(&cur_stmt) && !matches!(&*plan, Plan::Rows { .. }) {
+                if !fn_calls.is_empty()
+                    && !scroll.contains_key(&cur_stmt)
+                    && !matches!(&*plan, Plan::Rows { .. } | Plan::RefusedEval(_) | Plan::Refused)
+                {
                     // the select list calls user functions: the rows are
                     // computed NOW, the cursor served from the buffer
                     let calls = fn_calls.clone();
@@ -139542,7 +139570,19 @@ fn after_auth(
                                 let _pre = pre_img.as_ref().map(|i| SubqImageGuard::arm(i.clone()));
                                 match &record {
                                     None => Ok(Vec::new()),
-                                    Some(r) => rcols.iter().map(|c| c.value_of(r)).collect(),
+                                    Some(r) if fn_calls.is_empty() => rcols.iter().map(|c| c.value_of(r)).collect(),
+                                    // a stored call IN the list, run as each
+                                    // item reaches it ([lazy_fn_eval])
+                                    Some(r) => {
+                                        let calls = fn_calls.clone();
+                                        FN_VALS.with(|m| m.borrow_mut().clear());
+                                        let v = rcols
+                                            .iter()
+                                            .map(|c| lazy_fn_eval(&mut database, &calls, &exec2_args, &ctx, r, &|| c.value_of(r)))
+                                            .collect();
+                                        FN_VALS.with(|m| m.borrow_mut().clear());
+                                        v
+                                    }
                                 }
                             };
                             match projected {
