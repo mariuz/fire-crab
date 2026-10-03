@@ -2004,6 +2004,52 @@ fn ddl_savepoint_refusal(text: &str, database: &Option<Database>) -> Option<Eval
     ddl_savepoint_vector(text, database.as_ref()?.savepoints.last()?)
 }
 
+/// A CREATE-family DDL whose object names a SCHEMA THAT DOES NOT EXIST
+/// is refused at PREPARE with `<VERB> "S"."N" failed / Schema "S" not
+/// found` (DYN 257, 42000) - no meta-update wrapper; measured on 2196,
+/// where it beats even the savepoint law (whose check is execute's first).
+/// An index (whose message is the schema mismatch with its table) and the
+/// SYSTEM schema (its own 28000) keep their refusal.
+fn ddl_unknown_schema(sql: &str, db: &Option<Database>) -> Option<EvalErr> {
+    let db = db.as_ref()?;
+    let Some(EvalErr::Status(items)) = ddl_savepoint_vector(sql, "") else { return None };
+    // [NO_META_UPDATE, verb, object.., USER_SAVEPOINT, sp]
+    let (StatusItem::Gds(verb), Some(StatusItem::Str(obj))) = (items.get(1)?, items.get(2)) else { return None };
+    const CREATES: &[i32] = &[
+        998, 1001, 1010, 1012, 1013, 977, 979, 981, 972, 974, 976, 982, 984, 986, 992, 994, 995, 989, 997, 1016,
+        1002, 1004, 1006, 987,
+    ];
+    if !CREATES.iter().any(|n| 0x140D0000 + n == *verb) {
+        return None;
+    }
+    // `"S"."N"` - the schema is the first quoted part
+    let rest = obj.strip_prefix('"')?;
+    let mut schema = String::new();
+    let mut it = rest.chars().peekable();
+    loop {
+        match it.next()? {
+            '"' if it.peek() == Some(&'"') => {
+                it.next();
+                schema.push('"');
+            }
+            '"' => break,
+            c => schema.push(c),
+        }
+    }
+    if it.next() != Some('.') || schema == "PUBLIC" || schema == "SYSTEM" {
+        return None;
+    }
+    if catalog_has(db, "RDB$SCHEMAS", &[("RDB$SCHEMA_NAME", Some(&schema))]) {
+        return None;
+    }
+    Some(EvalErr::Status(vec![
+        StatusItem::Gds(*verb),
+        StatusItem::Str(obj.clone()),
+        StatusItem::Gds(336068865), // DYN 257, Schema @1 not found
+        StatusItem::Str(format!("\"{}\"", schema.replace('"', "\"\""))),
+    ]))
+}
+
 /// [ddl_savepoint_refusal]'s vector for one statement text under the
 /// innermost user savepoint `sp` - None when the text is no DDL form.
 fn ddl_savepoint_vector(text: &str, sp: &str) -> Option<EvalErr> {
@@ -28698,6 +28744,249 @@ fn if_exists_name(t: &str) -> Option<(String, &str)> {
 /// mapping, a user, a filter, a shadow) keeps its refusal. The guard is
 /// read when the statement is PREPARED, which is when isql and every
 /// DSQL client runs it.
+/// A query text with every `PUBLIC.` qualifier dropped (`PUBLIC.T7`,
+/// `"PUBLIC".T7`, `PUBLIC.T7.X`) - outside literals and comments - for a
+/// compiler that reads unqualified names only. The BLR is the same either
+/// way (measured on 2196: `CREATE VIEW .. FROM PUBLIC.T7` and `FROM T7`
+/// store byte-identical RDB$VIEW_BLR, a WHERE over `PUBLIC.T7.X` too); the
+/// stored SOURCE keeps the text as written.
+fn strip_public_qualifiers(sql: &str) -> String {
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut last = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+        } else if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+        } else if c.is_ascii_alphabetic() || c == b'"' {
+            let st = i;
+            let public = if c == b'"' {
+                let ok = sql[i..].starts_with("\"PUBLIC\"");
+                // past the delimited name, whatever it is
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'"' {
+                        if b.get(i + 1) == Some(&b'"') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                ok
+            } else {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                    i += 1;
+                }
+                sql[st..i].eq_ignore_ascii_case("PUBLIC")
+            };
+            // a name word must not be the tail of a dotted path
+            let after_dot = sql[..st].trim_end().ends_with('.');
+            let next_dot = b.get(i) == Some(&b'.');
+            let named = matches!(b.get(i + 1), Some(n) if n.is_ascii_alphabetic() || *n == b'"');
+            if public && !after_dot && next_dot && named {
+                out.push_str(&sql[last..st]);
+                last = i + 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&sql[last.min(sql.len())..]);
+    out
+}
+
+/// A DDL statement's OBJECT NAMES with their `PUBLIC.` qualifier taken
+/// off - `CREATE TABLE PUBLIC.T7`, `CREATE INDEX PUBLIC.IX ON PUBLIC.T`,
+/// `"PUBLIC"."T8"` - or None when it carries none. This server serves the
+/// PUBLIC schema, where an unqualified name lives, so the two spellings
+/// are one object (measured on 2196: every kind accepts it, and its
+/// messages print `"PUBLIC"."T7"` either way); every planner here read
+/// the qualified one as a malformed name and refused. Only the NAME SLOTS
+/// move - the object, an index's ON table, a trigger's FOR / ON table,
+/// a REFERENCES target, the name of COMMENT ON / GRANT .. ON / SET
+/// GENERATOR / SET STATISTICS INDEX - never a routine's or a view's body,
+/// whose stored source is the text as written. Another schema keeps its
+/// refusal.
+fn ddl_public_unqualify(sql: &str) -> Option<String> {
+    #[derive(PartialEq)]
+    enum K {
+        Word,
+        Quoted,
+        Dot,
+        Other,
+    }
+    // (kind, start, end, upper-cased text)
+    let b = sql.as_bytes();
+    let mut toks: Vec<(K, usize, usize, String)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+        } else if c == b'\'' {
+            // a literal: skipped whole ('' doubles inside)
+            let st = i;
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i = (i + 1).min(b.len());
+            toks.push((K::Other, st, i, String::new()));
+        } else if c.is_ascii_alphabetic() {
+            let st = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                i += 1;
+            }
+            toks.push((K::Word, st, i, sql[st..i].to_ascii_uppercase()));
+        } else if c == b'"' {
+            let st = i;
+            i += 1;
+            let mut v = String::new();
+            while i < b.len() {
+                if b[i] == b'"' {
+                    if b.get(i + 1) == Some(&b'"') {
+                        v.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                let ch = sql[i..].chars().next()?;
+                v.push(ch);
+                i += ch.len_utf8();
+            }
+            i = (i + 1).min(b.len());
+            toks.push((K::Quoted, st, i, v));
+        } else if c == b'.' {
+            toks.push((K::Dot, i, i + 1, String::new()));
+            i += 1;
+        } else {
+            toks.push((K::Other, i, i + 1, String::new()));
+            i += 1;
+        }
+        if toks.len() > 4096 {
+            return None;
+        }
+    }
+    let word = |k: usize| match toks.get(k) {
+        Some((K::Word, _, _, w)) => w.as_str(),
+        _ => "",
+    };
+    // the first body keyword: no slot is looked for past it
+    let body_at = |from: usize| (from..toks.len()).find(|&k| word(k) == "AS").unwrap_or(toks.len());
+    let mut slots: Vec<usize> = Vec::new();
+    match (word(0), word(1), word(2)) {
+        ("SET", "GENERATOR", _) => slots.push(2),
+        ("SET", "STATISTICS", "INDEX") => slots.push(3),
+        ("COMMENT", "ON", _) => slots.push(3),
+        ("GRANT", ..) | ("REVOKE", ..) => {
+            if let Some(on) = (1..toks.len()).find(|&k| word(k) == "ON") {
+                let at = if matches!(word(on + 1), "TABLE" | "VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "GENERATOR" | "EXCEPTION" | "DOMAIN" | "PACKAGE") {
+                    on + 2
+                } else {
+                    on + 1
+                };
+                slots.push(at);
+            }
+        }
+        ("CREATE" | "ALTER" | "DROP" | "RECREATE", ..) => {
+            let mut k = if word(0) == "CREATE" && word(1) == "OR" && word(2) == "ALTER" { 3 } else { 1 };
+            if word(k) == "GLOBAL" && word(k + 1) == "TEMPORARY" {
+                k += 2;
+            }
+            while matches!(word(k), "UNIQUE" | "ASC" | "ASCENDING" | "DESC" | "DESCENDING") {
+                k += 1;
+            }
+            let kind = word(k).to_string();
+            if kind == "PACKAGE" && word(k + 1) == "BODY" {
+                k += 1;
+            }
+            if !matches!(
+                kind.as_str(),
+                "TABLE" | "VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EXCEPTION" | "DOMAIN" | "SEQUENCE"
+                    | "GENERATOR" | "INDEX" | "PACKAGE" | "COLLATION"
+            ) {
+                return None;
+            }
+            slots.push(k + 1);
+            let end = body_at(k + 1);
+            match kind.as_str() {
+                "INDEX" => slots.extend((k + 1..end).find(|&j| word(j) == "ON").map(|j| j + 1)),
+                "TRIGGER" => slots.extend((k + 1..end).find(|&j| matches!(word(j), "FOR" | "ON")).map(|j| j + 1)),
+                "TABLE" => slots.extend((k + 1..toks.len()).filter(|&j| word(j) == "REFERENCES").map(|j| j + 1)),
+                _ => {}
+            }
+        }
+        _ => return None,
+    }
+    // the qualifier at a slot: PUBLIC (any quoting) then a dot then a name
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    for at in slots {
+        let Some((kind, st, _, text)) = toks.get(at) else { continue };
+        let public = (*kind == K::Word || *kind == K::Quoted) && text == "PUBLIC";
+        let dot = matches!(toks.get(at + 1), Some((K::Dot, ..)));
+        let named = matches!(toks.get(at + 2), Some((K::Word | K::Quoted, ..)));
+        if public && dot && named {
+            cuts.push((*st, toks[at + 2].1));
+        }
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut out = String::with_capacity(sql.len());
+    let mut last = 0;
+    for (a, z) in cuts {
+        out.push_str(&sql[last..a]);
+        last = z;
+    }
+    out.push_str(&sql[last..]);
+    Some(out)
+}
+
 fn if_exists_rewrite(sql: &str, db: &Option<Database>) -> Option<IfExists> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -31042,7 +31331,10 @@ fn plan_create_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descr
     }
     // the expression columns' BLR over the view's streams (the engine's
     // RDB$COMPUTED_BLR on their auto-domains), one slot per select item
-    let Some(col_blrs) = fire_crab_dsql::compile_view_columns(select) else {
+    // the compilers read unqualified names; the BLR is the same
+    // ([strip_public_qualifiers]) and the stored source stays as written
+    let compiled = strip_public_qualifiers(select);
+    let Some(col_blrs) = fire_crab_dsql::compile_view_columns(&compiled) else {
         tr("the column BLR (outside the dsql crate's surface)");
         return None;
     };
@@ -31090,7 +31382,7 @@ fn plan_create_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descr
             fields.push(fire_crab_ods::ddl::ViewFieldSpec { name, base: None, expr: Some(col), computed_blr: Some(cblr) });
         }
     }
-    let Some(blr) = fire_crab_dsql::compile_view_select(select) else {
+    let Some(blr) = fire_crab_dsql::compile_view_select(&compiled) else {
         tr("the BLR (outside the dsql crate's surface)");
         return None;
     };
@@ -59702,7 +59994,25 @@ fn dml_missing_target(sql: &str, kw: &str, db: &Option<Database>) -> Option<Eval
         }
         at = j;
     }
-    let ns = skip_ws(at);
+    let mut ns = skip_ws(at);
+    // a PUBLIC-qualified target is the same relation, and the engine
+    // prints the qualified spelling (`"PUBLIC"."S2"`) placed at the
+    // QUALIFIER - except UPDATE OR INSERT, whose unqualified line 0 column
+    // 0 becomes the DOT's place (`UPDATE OR INSERT INTO PUBLIC.S2 ..` is
+    // column 29) - all measured on 2196; any other schema keeps its own path
+    let name_at = ns;
+    let mut dot_at = None;
+    {
+        let (w, j) = word_at(ns);
+        let quoted_public = sql[ns..].starts_with("\"PUBLIC\"");
+        let after = if quoted_public { ns + "\"PUBLIC\"".len() } else { j };
+        let dot = skip_ws(after);
+        if (w == "PUBLIC" || quoted_public) && b.get(dot) == Some(&b'.') {
+            ns = skip_ws(dot + 1);
+            dot_at = Some(dot);
+        }
+    }
+    let qualified = dot_at.is_some();
     let (name, ne) = if b.get(ns) == Some(&b'"') {
         let mut j = ns + 1;
         let mut v = String::new();
@@ -59736,12 +60046,13 @@ fn dml_missing_target(sql: &str, kw: &str, db: &Option<Database>) -> Option<Eval
     if relation_schema(db, &name).is_some() {
         return None;
     }
-    let (line, col) = if upsert {
-        (0, 0)
-    } else {
-        line_col_of(&sql[..if kw == "INSERT" { start } else { ns }])
+    let (line, col) = match (upsert, dot_at) {
+        (true, None) => (0, 0),
+        (true, Some(d)) => line_col_of(&sql[..d]),
+        _ => line_col_of(&sql[..if kw == "INSERT" { start } else { name_at }]),
     };
-    Some(EvalErr::TableUnknown { name: format!("\"{}\"", name), line, col })
+    let name = if qualified { format!("\"PUBLIC\".\"{}\"", name) } else { format!("\"{}\"", name) };
+    Some(EvalErr::TableUnknown { name, line, col })
 }
 
 /// What [limit_lint_scan] found in a statement.
@@ -118862,6 +119173,16 @@ fn recreate_drop_plan(create: &Plan) -> Option<Plan> {
 /// DDL a client is served.
 fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let (ddl_kw, dml_kw) = immediate_verb(text);
+    // the object names' `PUBLIC.` qualifier ([ddl_public_unqualify]), and
+    // a schema that does not exist ([ddl_unknown_schema])
+    if ddl_kw {
+        if let Some(t) = ddl_public_unqualify(text) {
+            return plan_immediate(&t, database);
+        }
+        if let Some(e) = ddl_unknown_schema(text, database) {
+            return Some((Plan::RefusedEval(e), Vec::new()));
+        }
+    }
     // an IF [NOT] EXISTS guard ([if_exists_rewrite])
     if ddl_kw {
         match if_exists_rewrite(text, database) {
@@ -134842,6 +135163,9 @@ fn after_auth(
                     // ...and an IF [NOT] EXISTS guard is read here: the
                     // statement does nothing, or runs without it
                     // ([if_exists_rewrite])
+                    // a `PUBLIC.` qualifier on the object names comes off
+                    // first ([ddl_public_unqualify])
+                    let stmt_sql = ddl_public_unqualify(&stmt_sql).unwrap_or_else(|| stmt_sql.clone());
                     let guard = if_exists_rewrite(&stmt_sql, &database);
                     let stmt_sql = match &guard {
                         Some(IfExists::Run(t)) => t.clone(),
@@ -134850,7 +135174,9 @@ fn after_auth(
                     let planned = if matches!(guard, Some(IfExists::Skip)) {
                         Some((Plan::DdlNoop, Vec::new()))
                     } else {
-                        None
+                        // an object in a schema that does not exist: refused
+                        // here, at prepare ([ddl_unknown_schema])
+                        ddl_unknown_schema(&stmt_sql, &database).map(|e| (Plan::RefusedEval(e), Vec::new()))
                     };
                     let planned = planned
                         .or_else(|| plan_comment(&stmt_sql))

@@ -14,8 +14,8 @@
 #
 # Every script that runs DDL under a savepoint meets it: 6.0.0.2196 refuses
 # the CREATE TABLE (serve-real-ddlsavepoint.sh) and the INSERT that follows
-# names a table that was never made.  A schema-QUALIFIED target keeps its
-# own path - recorded (section 2).
+# names a table that was never made.  A PUBLIC-qualified target prints
+# `"PUBLIC"."S2"` (section 2).
 #
 #   qa/serve-real-dmlunknown.sh [port]
 set -u
@@ -66,15 +66,6 @@ both() { # <label> <sql>
     elif [ "$ev" != "$fv" ]; then echo "FAIL $1"; echo "     eng=[$ev]"; echo "     fc =[$fv]"; fail=1
     else echo "OK   $1 [$ev]"; fi
 }
-recorded() { # <label> <sql> - the engine's -204, this server's bare refusal
-    ran=$((ran + 1))
-    local ev fv
-    ev=$(q "$2" "$REAL" "$ENG"); fv=$(q "$2" "$PORT" "$FC")
-    if [ "${ev#*Table unknown}" = "$ev" ]; then echo "FAIL $1 - the ENGINE no longer answers -204 [$ev]"; fail=1
-    elif [ "$ev" = "$fv" ]; then echo "FAIL $1 - this server now matches [$fv]; promote the cell"; fail=1
-    elif [ "$fv" != "ERR Dynamic SQL Error" ]; then echo "FAIL $1 - this server moved [$fv]"; fail=1
-    else echo "OK   $1 (recorded: engine [$ev], this server refuses bare)"; fi
-}
 
 echo "--- 1 the target names no relation: -204 at prepare, placed per verb"
 both "1 INSERT - at the INSERT keyword"         "INSERT INTO S2 VALUES (1)"
@@ -88,8 +79,15 @@ both "1 DELETE - a delimited name at its quote" $'DELETE\n FROM "s2"'
 both "1 MERGE - at the name"                    "MERGE INTO S2 USING KEEP ON 1 = 1 WHEN MATCHED THEN DELETE"
 both "1 UPDATE OR INSERT - line 0, column 0"    "UPDATE OR INSERT INTO S2 VALUES (1) MATCHING (A)"
 
-echo "--- 2 RECORDED - a schema-qualified target keeps its own path"
-recorded "2 INSERT INTO PUBLIC.S2"              "INSERT INTO PUBLIC.S2 VALUES (1)"
+echo "--- 2 a PUBLIC-qualified target: printed qualified, placed at the qualifier"
+# (recorded as a bare refusal until 2026-10-03; UPDATE OR INSERT's qualified
+# form is placed at the DOT where its unqualified one is line 0, column 0)
+both "2 INSERT INTO PUBLIC.S2"                  "INSERT INTO PUBLIC.S2 VALUES (1)"
+both "2 UPDATE PUBLIC.S2 - at PUBLIC"           "UPDATE PUBLIC.S2 SET A = 1"
+both "2 DELETE FROM \"PUBLIC\".S2"             'DELETE FROM "PUBLIC".S2'
+both "2 MERGE INTO PUBLIC.S2"                   "MERGE INTO PUBLIC.S2 USING KEEP ON 1 = 1 WHEN MATCHED THEN DELETE"
+both "2 UPDATE OR INSERT INTO PUBLIC.S2 - at the dot" "UPDATE OR INSERT INTO PUBLIC.S2 VALUES (1) MATCHING (A)"
+both "2 UPDATE PUBLIC . S2 - spaced"            "UPDATE PUBLIC . S2 SET A = 1"
 
 echo "--- 3 CONTROLS - a target that exists is untouched"
 both "3 INSERT into a GTT"                      "INSERT INTO GT VALUES (1)"
@@ -103,6 +101,6 @@ if grep -aq 'panicked at' "/tmp/fc-serve-dmlunk-$PORT.log"; then echo "FAIL the 
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 16 on the 2026-10-03 binary, 16 OK
-if [ "$ran" -lt 16 ]; then echo "FAIL only $ran checks ran (floor 16) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 21 on the 2026-10-03 binary, 21 OK
+if [ "$ran" -lt 21 ]; then echo "FAIL only $ran checks ran (floor 21) - cells went missing"; fail=1; fi
 exit $fail

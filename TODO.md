@@ -40,13 +40,14 @@ Short, actionable items. The long-form engineering backlog lives in
 ## Recorded gaps found on the way (2026-10-03)
 
 - [ ] `CAST(LIST(..) AS VARCHAR(n))` refuses at prepare (no stored call needed).
-- [ ] A schema-qualified CREATE TABLE (`CREATE TABLE PUBLIC.T7 ..`) refuses at prepare.
+- [x] Schema-qualified DDL (`CREATE TABLE PUBLIC.T7 ..`, every kind, a view body over `PUBLIC.T`) and an
+      unknown schema's vector (`qa/serve-real-ddlqualified.sh`).
+- [ ] A select list holding `GEN_ID(..)` beside a stored function call prepares but fails at fetch.
 - [x] An empty PSQL body (`AS BEGIN END`) compiles to the engine's BLR (`qa/serve-real-emptybody.sh`).
 - [x] A trigger body with `EXIT;` stores `blr_leave 0` (emptybody section 4).
 - [x] A trigger's `DECLARE V INTEGER = 0;` initializer stores the engine's BLR (emptybody section 5).
 - [ ] CREATE PROCEDURE / FUNCTION stores no `RDB$DEBUG_INFO` (the engine writes one; triggers do).
 - [x] A duplicate CREATE TRIGGER / INDEX / DOMAIN / ROLE answers the engine's already-exists vector (metaupdate).
-- [ ] A schema-qualified DML target that does not exist answers a bare Dynamic SQL Error where the
-      engine answers -204 `"PUBLIC"."S2"` (recorded in `qa/serve-real-dmlunknown.sh` section 2).
+- [x] A schema-qualified DML target that does not exist answers the -204 `"PUBLIC"."S2"` (dmlunknown section 2).
 - [ ] A stored function call in a join, a derived table, a subquery, UNION, ROWS ? or DML still
       refuses at prepare (recorded in `qa/serve-real-fnwhere.sh` section 6).
