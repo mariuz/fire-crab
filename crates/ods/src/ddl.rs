@@ -12275,8 +12275,14 @@ pub fn blr_names_resolve(
     blr: &[u8],
     own: &str,
     own_relation: Option<&str>,
+    // false: a procedure name is left to the caller (an anonymous block
+    // names an unknown one with the engine's own -204 at run time)
+    check_procs: bool,
 ) -> Result<(), String> {
-    let decoded = crate::blr::decode(blr).map_err(|e| format!("BLR: {e}"))?;
+    // a BLR this walker cannot decode (a verb it does not know - a scroll
+    // FETCH) is not evidence of a bad name: nothing is checked, and the
+    // body stands or falls on everything else, as it did before
+    let Ok(decoded) = crate::blr::decode(blr) else { return Ok(()) };
     let mut ctx: std::collections::HashMap<u8, CtxBind> = std::collections::HashMap::new();
     if let Some(rel) = own_relation {
         ctx.insert(0, CtxBind::Relation(rel.to_string()));
@@ -12286,10 +12292,15 @@ pub fn blr_names_resolve(
     for ev in &decoded.deps {
         match ev {
             crate::blr::DepEvent::RelCtx { ctx: c, name: r } => {
-                if crate::resolve_relation(file, page_size, r.trim()).is_none() {
+                if crate::resolve_relation(file, page_size, r.trim()).is_some() {
+                    ctx.insert(*c, CtxBind::Relation(r.clone()));
+                } else if procedure_id(file, page_size, r).is_some() || is_own(r) {
+                    // `FROM PE4` - a selectable procedure read without
+                    // its parentheses
+                    ctx.insert(*c, CtxBind::Procedure(r.clone()));
+                } else {
                     return Err(format!("Table unknown {}", r.trim()));
                 }
-                ctx.insert(*c, CtxBind::Relation(r.clone()));
             }
             crate::blr::DepEvent::ModifyCtx { org, new } => {
                 if let Some(b) = ctx.get(org).cloned() {
@@ -12297,7 +12308,7 @@ pub fn blr_names_resolve(
                 }
             }
             crate::blr::DepEvent::ProcCtx { ctx: c, name: p } => {
-                if !is_own(p) && procedure_id(file, page_size, p).is_none() {
+                if check_procs && !is_own(p) && procedure_id(file, page_size, p).is_none() {
                     return Err(format!("Procedure unknown {}", p.trim()));
                 }
                 ctx.insert(*c, CtxBind::Procedure(p.clone()));
@@ -12310,7 +12321,7 @@ pub fn blr_names_resolve(
                 }
             }
             crate::blr::DepEvent::ExecProc { name: p } => {
-                if !is_own(p) && procedure_id(file, page_size, p).is_none() {
+                if check_procs && !is_own(p) && procedure_id(file, page_size, p).is_none() {
                     return Err(format!("Procedure unknown {}", p.trim()));
                 }
             }

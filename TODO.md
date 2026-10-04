@@ -26,7 +26,9 @@ Short, actionable items. The long-form engineering backlog lives in
       an earlier wedge at ~01:52 had the same symptom). Every time during a `-j 4` sweep; the first two
       predate any of this work's code. Symptom in gates: `rc=124` timeouts and "the engine printed no
       describe". Check `ss -ltn | grep 3050` (Recv-Q) and the log, restart, re-run the affected gates
-      alone; sweeps now run at `-j 3`. Possibly worth an upstream report once it has a narrower trigger.- [x] **The reference engine moved to 6.0.0.2196 (56d656b) on 2026-10-03** (previous install kept as
+      alone; sweeps now run at `-j 3`. Possibly worth an upstream report once it has a narrower trigger.
+      Again 2026-10-04 ~06:45 during a `-j 3` sweep (accept queue 117/128; `sudo systemctl restart firebird`).
+- [x] **The reference engine moved to 6.0.0.2196 (56d656b) on 2026-10-03** (previous install kept as
       `/opt/firebird_20261003_1116.tar.gz`). Two of its laws reached the gates and are followed now:
       DDL under a user savepoint is refused 0A000 (`qa/serve-real-ddlsavepoint.sh`; ddltx, savepointtx,
       gendurable and gencomp adjusted), and an exponent literal whose significand is exactly 2^63 is
@@ -95,10 +97,11 @@ Short, actionable items. The long-form engineering backlog lives in
       DSQL compiler told the database's default charset (`qa/serve-real-trigbody.sh`).
 - [x] The parser's Token unknown for an unknown first word and for `WHERE ORDER BY` (`qa/serve-real-parseword.sh`).
 - [x] A `;` after a nested block's END is refused (the engine's -104) - it was accepted in procedures too.
-- [ ] PROCEDURES (dsql-compiled) still accept a bare variable inside DML and unknown tables / columns /
-      exceptions the engine refuses at CREATE (measured: `INSERT .. VALUES (V, 1)` is -206, `DELETE FROM NOSUCH`
-      -204) - the trigger fallback checks both now (`bare_var_in_dml`, `ddl::blr_names_resolve`); wire them into
-      plan_create_procedure with a gate.
+- [x] PROCEDURES and FUNCTIONS (dsql-compiled) accepted a bare variable inside DML and unknown tables / columns /
+      exceptions / sequences / procedures the engine refuses at CREATE; checked now (`qa/serve-real-procnames.sh`).
+- [x] A target variable needs no colon (`INTO N`, `FETCH C INTO N`, `RETURNING_VALUES N`) - procnames 3.
+- [ ] The PSQL runtime cannot run `G = NEXT VALUE FOR SQ` in a procedure ("uses PSQL this server does not
+      interpret").
 - [ ] A trigger compiled that way stores an empty RDB$DEBUG_INFO, as a procedure does; and a procedure this server
       created raises without the `At procedure .. line: L, col: C` item (no debug map to place it).
 - [ ] `SET DECFLOAT TRAPS TO [..]` / `SET DECFLOAT ROUND <mode>` refuse (session state; measured: untrapped 1/0 is

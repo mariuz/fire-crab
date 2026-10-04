@@ -7046,10 +7046,11 @@ impl<'a> P<'a> {
         let mut into: Vec<u16> = Vec::new();
         if self.kw("INTO") {
             loop {
-                if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
-                    return None;
+                // the colon is OPTIONAL on a target variable: `INTO N`, `FETCH C INTO N`,
+                // `RETURNING_VALUES N` are the engine's too (measured on 2196)
+                if matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                    self.i += 1;
                 }
-                self.i += 1;
                 let Some(Tok::Ident(name)) = self.t.get(self.i) else {
                     return None;
                 };
@@ -7340,10 +7341,11 @@ impl<'a> P<'a> {
         }
         let mut out = Vec::new();
         for c in cols {
-            if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
-                return None;
+            // the colon is OPTIONAL on a target variable: `INTO N`, `FETCH C INTO N`,
+            // `RETURNING_VALUES N` are the engine's too (measured on 2196)
+            if matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                self.i += 1;
             }
-            self.i += 1;
             let Some(Tok::Ident(v)) = self.t.get(self.i) else {
                 return None;
             };
@@ -8241,10 +8243,11 @@ impl<'a> P<'a> {
         }
         let mut into = Vec::new();
         loop {
-            if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
-                return None;
+            // the colon is OPTIONAL on a target variable: `INTO N`, `FETCH C INTO N`,
+            // `RETURNING_VALUES N` are the engine's too (measured on 2196)
+            if matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                self.i += 1;
             }
-            self.i += 1;
             let Some(Tok::Ident(vn)) = self.t.get(self.i) else {
                 return None;
             };
@@ -8632,10 +8635,11 @@ impl<'a> P<'a> {
                 }
                 let mut vars = Vec::new();
                 loop {
-                    if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
-                        return None;
+                    // the colon is OPTIONAL on a target variable: `INTO N`, `FETCH C INTO N`,
+                    // `RETURNING_VALUES N` are the engine's too (measured on 2196)
+                    if matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                        self.i += 1;
                     }
-                    self.i += 1;
                     let Some(Tok::Ident(v)) = self.t.get(self.i) else {
                         return None;
                     };
@@ -8731,10 +8735,11 @@ impl<'a> P<'a> {
                         return None;
                     }
                     loop {
-                        if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
-                            return None;
+                        // the colon is OPTIONAL on a target variable: `INTO N`, `FETCH C INTO N`,
+                        // `RETURNING_VALUES N` are the engine's too (measured on 2196)
+                        if matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                            self.i += 1;
                         }
-                        self.i += 1;
                         let Some(Tok::Ident(v)) = self.t.get(self.i) else {
                             return None;
                         };
@@ -8837,10 +8842,11 @@ impl<'a> P<'a> {
             {
                 self.i += 1;
                 loop {
-                    if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
-                        return None;
+                    // the colon is OPTIONAL on a target variable: `INTO N`, `FETCH C INTO N`,
+                    // `RETURNING_VALUES N` are the engine's too (measured on 2196)
+                    if matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                        self.i += 1;
                     }
-                    self.i += 1;
                     let Some(Tok::Ident(v)) = self.t.get(self.i) else {
                         return None;
                     };
@@ -9016,10 +9022,11 @@ impl<'a> P<'a> {
             }
             let mut vars = Vec::new();
             loop {
-                if !matches!(self.t.get(self.i), Some(Tok::Colon)) {
-                    return None;
+                // the colon is OPTIONAL on a target variable: `INTO N`, `FETCH C INTO N`,
+                // `RETURNING_VALUES N` are the engine's too (measured on 2196)
+                if matches!(self.t.get(self.i), Some(Tok::Colon)) {
+                    self.i += 1;
                 }
-                self.i += 1;
                 let Some(Tok::Ident(v)) = self.t.get(self.i) else {
                     return None;
                 };

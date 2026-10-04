@@ -28210,7 +28210,13 @@ fn plan_create_trigger_dsql(sql: &str, db: &Option<Database>) -> Option<(Plan, V
         generator_id(dbr, &g)?;
     }
     let begin_kw = find_word(&masked, "BEGIN", as_kw)?;
-    if bare_var_in_dml(&s[begin_kw..], &declared_names(&s[as_kw..begin_kw])) {
+    let columns_of = |w: &str| -> Vec<String> {
+        canon_ident(w)
+            .filter(|n| fire_crab_ods::resolve_relation(&dbr.bytes(), dbr.page_size, n).is_some())
+            .map(|n| dbr.columns(&n).iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default()
+    };
+    if bare_var_in_dml(&s[begin_kw..], &declared_names(&s[as_kw..begin_kw]), &columns_of) {
         return None; // the engine's -206 on the bare name
     }
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
@@ -28225,7 +28231,7 @@ fn plan_create_trigger_dsql(sql: &str, db: &Option<Database>) -> Option<(Plan, V
     def.blr = blr?;
     // every name the BLR carries must resolve, as the engine's compiler
     // checks (a table, a column, a procedure, a sequence, an exception)
-    fire_crab_ods::ddl::blr_names_resolve(&dbr.bytes(), dbr.page_size, &def.blr, &def.name, Some(&table)).ok()?;
+    fire_crab_ods::ddl::blr_names_resolve(&dbr.bytes(), dbr.page_size, &def.blr, &def.name, Some(&table), true).ok()?;
     def.source = raw_source(s, &s[as_kw..]);
     def.debug = Vec::new();
     Some((Plan::CreateTrigger { table, def }, Vec::new()))
@@ -28285,7 +28291,7 @@ fn expand_listless_inserts(text: &str, db: &Database) -> Option<String> {
 /// variable either way. True when any statement does it; the INTO lists
 /// (`SELECT .. INTO V`, `RETURNING .. INTO V`) take variables and are
 /// skipped, as is a dotted or a colon-prefixed name.
-fn bare_var_in_dml(body: &str, vars: &[String]) -> bool {
+fn bare_var_in_dml(body: &str, vars: &[String], columns_of: &dyn Fn(&str) -> Vec<String>) -> bool {
     if vars.is_empty() {
         return false;
     }
@@ -28349,6 +28355,27 @@ fn bare_var_in_dml(body: &str, vars: &[String]) -> bool {
             }
             let region = region.as_str();
             let rb = region.as_bytes();
+            // the COLUMNS of every relation the statement names: a bare
+            // name that is one of them is that column - legitimately, the
+            // engine reads it (`FOR SELECT PROJ_ID FROM EMPLOYEE_PROJECT ..
+            // INTO :PROJ_ID` beside an output PROJ_ID: the employee
+            // sample's own GET_EMP_PROJ)
+            let mut cols: Vec<String> = Vec::new();
+            {
+                let mut j = 0;
+                while j < rb.len() {
+                    if is_ident_byte(rb[j]) && (j == 0 || !is_ident_byte(rb[j - 1])) {
+                        let mut e = j;
+                        while e < rb.len() && is_ident_byte(rb[e]) {
+                            e += 1;
+                        }
+                        cols.extend(columns_of(&region[j..e]));
+                        j = e;
+                    } else {
+                        j += 1;
+                    }
+                }
+            }
             let mut j = 0;
             while j < rb.len() {
                 if is_ident_byte(rb[j]) && (j == 0 || !is_ident_byte(rb[j - 1])) {
@@ -28362,7 +28389,10 @@ fn bare_var_in_dml(body: &str, vars: &[String]) -> bool {
                     let set_target = next.starts_with('=')
                         && (prev.ends_with(',') || prev.ends_with("SET"));
                     let qualified = prev.ends_with(':') || prev.ends_with('.') || set_target;
-                    if !qualified && vars.iter().any(|v| v.eq_ignore_ascii_case(word)) {
+                    if !qualified
+                        && vars.iter().any(|v| v.eq_ignore_ascii_case(word))
+                        && !cols.iter().any(|c| c.eq_ignore_ascii_case(word))
+                    {
                         return true;
                     }
                     j = e;
@@ -31179,6 +31209,40 @@ fn dsql_catalog_for(db: &Option<Database>, sql: &str) -> Vec<(String, Vec<String
     out
 }
 
+/// WHAT THE ENGINE'S COMPILER REFUSES IN A ROUTINE BODY that the DSQL
+/// compiler takes: a name its BLR carries that resolves to nothing (a
+/// table, a column, a procedure, a sequence, an exception, a function -
+/// [fire_crab_ods::ddl::blr_names_resolve]), and a parameter or local
+/// variable written bare inside a DML statement, which the engine reads as
+/// a COLUMN ([bare_var_in_dml]). Measured on 2196: `INSERT INTO LOG (X, Y)
+/// VALUES (V, 1)` over a declared V is -206 Column unknown, `DELETE FROM
+/// NOSUCH` -204, `UPDATE LOG SET NOPE = 1` -206 - this server stored all
+/// three. False refuses the CREATE.
+fn routine_names_ok(sql: &str, db: &Option<Database>, blr: &[u8], own: &str, params: &[String]) -> bool {
+    let Some(dbr) = db.as_ref() else { return true };
+    // an anonymous block leaves a procedure it calls to its own run-time
+    // -204 ("Procedure unknown"), which names it as the engine does
+    let check_procs = own != "FC$BLOCK";
+    if fire_crab_ods::ddl::blr_names_resolve(&dbr.bytes(), dbr.page_size, blr, own, None, check_procs).is_err() {
+        return false;
+    }
+    let up = mask_literals(&sql.to_ascii_uppercase());
+    let Some(as_kw) = find_word(&up, "AS", 0) else { return true };
+    let Some(begin_kw) = find_word(&up, "BEGIN", as_kw) else { return true };
+    let mut names: Vec<String> = params.to_vec();
+    names.extend(declared_names(&sql[as_kw..begin_kw]));
+    // a relation's columns - or a selectable procedure's outputs, which
+    // a `SELECT R FROM PY(:I)` reads by name as columns too
+    let columns_of = |w: &str| -> Vec<String> {
+        let Some(n) = canon_ident(w) else { return Vec::new() };
+        if fire_crab_ods::resolve_relation(&dbr.bytes(), dbr.page_size, &n).is_some() {
+            return dbr.columns(&n).iter().map(|c| c.name.clone()).collect();
+        }
+        load_procedure(dbr, &n).map(|m| m.outs.iter().map(|p| p.name.clone()).collect()).unwrap_or_default()
+    };
+    !bare_var_in_dml(&sql[begin_kw..], &names, &columns_of)
+}
+
 fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let up = sql.trim_start().to_ascii_uppercase();
     if find_word(&up, "CREATE", 0) != Some(0)
@@ -31193,6 +31257,10 @@ fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<
     let c = fire_crab_dsql::compile_procedure_full_with_funcs(sql, &plain_funcs);
     fire_crab_dsql::set_catalog(Vec::new());
     let mut c = c?;
+    let params: Vec<String> = c.ins.iter().chain(c.outs.iter()).map(|m| m.name.clone()).collect();
+    if !routine_names_ok(sql, db, &c.blob, &c.name, &params) {
+        return None;
+    }
     // the stored source is the client's text, comments included
     c.source = raw_source(sql, &c.source);
     if c.calls_user_fn && !exe_can_run(&c.blob) {
@@ -32064,6 +32132,10 @@ fn plan_create_function(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         __pf.push(sig);
     }
     let c = fire_crab_dsql::compile_function_full_with_funcs(s, &__pf)?;
+    let params: Vec<String> = c.ins.iter().map(|m| m.name.clone()).collect();
+    if !routine_names_ok(s, db, &c.blob, &c.name, &params) {
+        return None;
+    }
     if c.calls_user_fn && !exe_can_run(&c.blob) {
         return None; // stores BLR fc could not itself run - refuse instead
     }
@@ -65507,6 +65579,11 @@ fn plan_query_inner_at_body(
         let c = fire_crab_dsql::compile_procedure_full_with_funcs(&synth, &plain_function_arities(db));
         fire_crab_dsql::set_catalog(Vec::new());
         let compiled = c.is_some();
+        // held to the names it carries, after the gate's own vectors
+        let names_bad = c.as_ref().is_some_and(|cc| {
+            let params: Vec<String> = cc.ins.iter().chain(cc.outs.iter()).map(|m| m.name.clone()).collect();
+            !routine_names_ok(&synth, db, &cc.blob, "FC$BLOCK", &params)
+        });
         // THE INPUTS' SLOTS are their declared types - the compiler's
         // reading, or the column-type reader for one it cannot type
         let mut in_descs: Vec<Descriptor> = Vec::new();
@@ -65537,6 +65614,9 @@ fn plan_query_inner_at_body(
         };
         if let Some(refused) = block_prepare_gate(&meta, db, compiled) {
             return refused;
+        }
+        if names_bad {
+            return None;
         }
         return Some(Plan::ExecBlock { source, body_at, in_names, in_descs });
     }
@@ -123678,6 +123758,29 @@ fn exec_psql_stmt_inner(
                             .ok_or(PsqlStop::Unsupported)?,
                     )
                 }
+                // ...and a DRAW as the whole right-hand side, `G = NEXT
+                // VALUE FOR SQ` / `G = GEN_ID(SQ, n)`: this arm holds the
+                // database, so the draw is performed here exactly as a
+                // statement's own `SELECT NEXT VALUE FOR` performs it -
+                // every procedure drawing a sequence refused, where the
+                // engine answers 1, 2, 3 (measured)
+                fire_crab_ods::expr::Expr::GenId2 { name } if matches!(f.gen.borrow().mode, GenMode::Refuse) => {
+                    Value::Int(gen_id_increment(db, name, None).map_err(|_| PsqlStop::Unsupported)?)
+                }
+                fire_crab_ods::expr::Expr::GenId { name, step }
+                    if matches!(f.gen.borrow().mode, GenMode::Refuse)
+                        && matches!(
+                            **step,
+                            fire_crab_ods::expr::Expr::IntLiteral(_) | fire_crab_ods::expr::Expr::Int64Literal(_)
+                        ) =>
+                {
+                    let n = match **step {
+                        fire_crab_ods::expr::Expr::IntLiteral(n) => n as i64,
+                        fire_crab_ods::expr::Expr::Int64Literal(n) => n,
+                        _ => unreachable!(),
+                    };
+                    Value::Int(gen_id_increment(db, name, Some(n)).map_err(|_| PsqlStop::Unsupported)?)
+                }
                 _ => match (eval_psql_expr(expr, f), fallback) {
                     // no arithmetic rule for these values: the planner's
                     (Err(PsqlStop::Unsupported), Some((text, binds))) => {
@@ -125389,6 +125492,16 @@ fn psql_rows(
     db: &mut Option<Database>,
     ctx: &SessionCtx,
 ) -> Result<Vec<Vec<Value>>, PsqlStop> {
+    // A DRAW: `G = NEXT VALUE FOR SQ`, `G = GEN_ID(SQ, 1)` and `SELECT
+    // NEXT VALUE FOR SQ FROM RDB$DATABASE INTO :G` plan as the generator
+    // increment op_execute performs for a statement of its own - and a
+    // body met it as a plan it could not run: every procedure drawing a
+    // sequence refused ("uses PSQL this server does not interpret"),
+    // where the engine answers 1, 2, 3 (measured)
+    if let Plan::GenIdIncrement { name, step } = plan {
+        let v = gen_id_increment(db, name, *step).map_err(|_| PsqlStop::Unsupported)?;
+        return Ok(vec![vec![Value::Int(v)]]);
+    }
     let rows = if calls.is_empty() {
         let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
         branch_rows_res(plan, dbr, &[])
@@ -130076,6 +130189,16 @@ fn parse_execute_block_select(
     // reaches - and a body it cannot read still refuses, at execute,
     // with the same bare 42000.
     let compiled = c.is_some();
+    // ...and a body that DID compile is held to the names it carries, as
+    // a procedure's is ([routine_names_ok]): `SELECT NOSUCH FROM T1 INTO N`
+    // in a branch never taken is the engine's -206 at prepare - this
+    // answered 1 once `INTO N` compiled
+    // (acted on AFTER block_prepare_gate, which names the engine's own
+    // vector where it has one - an unknown procedure's -204)
+    let names_bad = c.as_ref().is_some_and(|cc| {
+        let params: Vec<String> = cc.ins.iter().chain(cc.outs.iter()).map(|m| m.name.clone()).collect();
+        !routine_names_ok(&synth, db, &cc.blob, "FC$BLOCK", &params)
+    });
     let c = match c {
         Some(c) => Some(c),
         None => {
@@ -130157,6 +130280,9 @@ fn parse_execute_block_select(
     };
     if let Some(refused) = block_prepare_gate(&meta, db, compiled) {
         return refused;
+    }
+    if names_bad {
+        return None;
     }
     let mut cols = Vec::new();
     for (i, (n, d)) in out_names.iter().zip(out_descs.iter()).enumerate() {
