@@ -127,13 +127,14 @@ sleep 5
 after=$(fc "SELECT COUNT(*) AS N FROM MON\$ATTACHMENTS;")
 check "the count follows the connections (1, then 2, then 1)" \
     "$alone/$held/$after" "N 1|/N 2|/N 1|"
-# the columns a CLIENT sends and this server does not retain answer
-# NULL rather than a guess
+# the columns a CLIENT sends answer what it said (isql sends its pid and
+# process name; until 2026-10-04 they were NULL - qa/serve-real-session.sh
+# owns the law)
 ran=$((ran + 1))
 r=$(fc "SELECT COUNT(*) AS N FROM MON\$ATTACHMENTS
-        WHERE MON\$REMOTE_PID IS NULL AND MON\$REMOTE_PROCESS IS NULL;")
+        WHERE MON\$REMOTE_PID > 0 AND MON\$REMOTE_PROCESS CONTAINING 'isql';")
 case "$r" in
-    "N 1|") echo "OK   the DPB-sent columns answer NULL, not a guess" ;;
+    "N 1|") echo "OK   the DPB-sent columns answer what the client said" ;;
     *) echo "DIFF DPB columns: [$r]"; fail=1 ;;
 esac
 # ---- MON$TRANSACTIONS names the live transactions ----------------------

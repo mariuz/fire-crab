@@ -16,9 +16,10 @@
 # DECFLOAT / ext-conn-pool defaults, a read/write default transaction)
 # now match the engine exactly. An unknown key raises the engine's own
 # message. A key that is VALID but bound to this connection/transaction/
-# database (DB_NAME, SESSION_ID, TRANSACTION_ID, CLIENT_*, WIRE_ENCRYPTED,
-# DB_GUID, ...) answers NULL rather than raise or fabricate a value - a
-# recorded divergence pending a session/tx thread-local. RDB$SET_CONTEXT
+# transaction or database that fire-crab has no faithful source for
+# (TRANSACTION_ID, DB_FILE_ID, DB_GUID, the commit numbers) answers NULL
+# rather than raise or fabricate a value - a recorded divergence. The
+# session's own keys answer (qa/serve-real-session.sh). RDB$SET_CONTEXT
 # / GET of USER_SESSION was already correct and is a regression control.
 #
 # Usage: qa/serve-real-getcontext.sh [port]   (default 4153)
@@ -73,9 +74,9 @@ for k in DATABASE_NAME REPLICA GDS_VERSION FOOBAR NOPE; do
     matches "$k"
 done
 echo "-- valid-but-deferred keys: fc answers NULL (honest), never a raise --"
-for k in REPLICA_MODE DB_NAME SESSION_ID TRANSACTION_ID CLIENT_ADDRESS CLIENT_HOST \
-         CLIENT_PID CLIENT_PROCESS WIRE_ENCRYPTED WIRE_CRYPT_PLUGIN DB_FILE_ID DB_GUID \
-         SNAPSHOT_NUMBER GLOBAL_CN; do
+# (DB_NAME, SESSION_ID, CLIENT_*, WIRE_ENCRYPTED and WIRE_CRYPT_PLUGIN
+# answer since 2026-10-04 - qa/serve-real-session.sh owns them)
+for k in REPLICA_MODE TRANSACTION_ID DB_FILE_ID DB_GUID SNAPSHOT_NUMBER GLOBAL_CN; do
     fc_null "$k"
 done
 echo "-- REPLICA_MODE is a VALID key: NULL on BOTH, must not raise --"

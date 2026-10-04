@@ -3278,11 +3278,23 @@ struct ConnectUserId {
     plugin: String,
     plugins: String,
     specific: String,
+    /// the client's OS user (CNCT_user, 1) and host (CNCT_host, 4) - what
+    /// the engine's remote server adds to the dpb as isc_dpb_os_user and
+    /// isc_dpb_host_name, and answers as CLIENT_OS_USER / CLIENT_HOST
+    os_user: Option<String>,
+    host: Option<String>,
 }
 
 fn parse_user_id_full(uid: &[u8]) -> ConnectUserId {
     let mut i = 0;
-    let mut out = ConnectUserId { login: String::new(), plugin: String::new(), plugins: String::new(), specific: String::new() };
+    let mut out = ConnectUserId {
+        login: String::new(),
+        plugin: String::new(),
+        plugins: String::new(),
+        specific: String::new(),
+        os_user: None,
+        host: None,
+    };
     let mut specific: Vec<u8> = Vec::new();
     while i + 1 < uid.len() {
         let tag = uid[i];
@@ -3292,6 +3304,8 @@ fn parse_user_id_full(uid: &[u8]) -> ConnectUserId {
             9 => out.login = String::from_utf8_lossy(data).into_owned(), // CNCT_login
             8 => out.plugin = String::from_utf8_lossy(data).into_owned(), // CNCT_plugin_name
             10 => out.plugins = String::from_utf8_lossy(data).into_owned(), // CNCT_plugin_list
+            1 => out.os_user = Some(String::from_utf8_lossy(data).into_owned()), // CNCT_user
+            4 => out.host = Some(String::from_utf8_lossy(data).into_owned()), // CNCT_host
             7 => {
                 // CNCT_specific_data: first byte is the chunk sequence
                 if !data.is_empty() {
@@ -4106,6 +4120,9 @@ struct AttachRow {
     encrypted: bool,
     /// the protocol version agreed at connect, as `P<n>`
     protocol: Option<String>,
+    /// the client's own words - its process, host, OS user, library
+    /// version - and the cipher ([SessionInfo])
+    session: SessionInfo,
     /// the transactions this attachment has open right now
     txs: Vec<TxRow>,
     /// ...and the statements it has prepared
@@ -9025,11 +9042,11 @@ fn mon_transaction_rows(db: &Database, formats: &[(u8, Vec<Descriptor>)]) -> Vec
 /// The `MON$ATTACHMENTS` rows: every attachment this server has open on
 /// the file, as its own session recorded it at the attach.
 ///
-/// The columns a client sends in its DPB - its process id and name, its
-/// host, its OS user, its library version - are NOT retained by this
-/// server, so they answer NULL rather than a guess. What is answered is
-/// what the server itself knows: who attached, over what, when, and
-/// whether the wire is encrypted.
+/// What is answered is what the server itself knows - who attached, over
+/// what, when, whether the wire is encrypted or compressed and by which
+/// plugin - and what the client said of itself: its process id and name
+/// and library version (the dpb), its host and OS user (the connect
+/// block). A client that did not say one answers NULL, as on the engine.
 fn mon_attachment_rows(db: &Database, formats: &[(u8, Vec<Descriptor>)]) -> Vec<Vec<Value>> {
     let image = db.bytes();
     let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else { return Vec::new() };
@@ -9059,8 +9076,25 @@ fn mon_attachment_rows(db: &Database, formats: &[(u8, Vec<Descriptor>)]) -> Vec<
             put("MON$STAT_ID", Value::Int(a.id as i64));
             put("MON$IDLE_TIMEOUT", Value::Int(0));
             put("MON$STATEMENT_TIMEOUT", Value::Int(0));
-            put("MON$WIRE_COMPRESSED", Value::Bool(false));
+            put("MON$WIRE_COMPRESSED", Value::Bool(a.session.compressed));
             put("MON$WIRE_ENCRYPTED", Value::Bool(a.encrypted));
+            let si = &a.session;
+            if let Some(p) = &si.crypt_plugin {
+                put("MON$WIRE_CRYPT_PLUGIN", Value::Text(p.clone()));
+            }
+            if let Some(v) = si.pid {
+                put("MON$REMOTE_PID", Value::Int(v));
+            }
+            for (col, v) in [
+                ("MON$REMOTE_PROCESS", &si.process),
+                ("MON$REMOTE_HOST", &si.host),
+                ("MON$REMOTE_OS_USER", &si.os_user),
+                ("MON$CLIENT_VERSION", &si.client_version),
+            ] {
+                if let Some(v) = v {
+                    put(col, Value::Text(v.clone()));
+                }
+            }
             if let Some(addr) = &a.address {
                 put("MON$REMOTE_ADDRESS", Value::Text(addr.clone()));
                 put("MON$REMOTE_PROTOCOL", Value::Text("TCPv4".into()));
@@ -12002,6 +12036,10 @@ enum AggSrc {
         coll: u16,
         /// the WITHIN GROUP sort keys (DESC, NULLS FIRST flags beside them)
         order: Vec<(Expr, bool, bool)>,
+        /// a DISTINCT fold's direction: its keys are not sort keys - the
+        /// list is in VALUE order, descending only when the FIRST key is
+        /// the argument itself and says DESC ([list_fold])
+        desc: bool,
         /// the list's character set - the argument's ([list_arg_charset]):
         /// its blob is minted in it ([list_fold])
         cs: u8,
@@ -22541,6 +22579,25 @@ fn text_sub_type(e: &Expr, descs: &[Descriptor]) -> i32 {
 fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<ProjCol> {
     // USER / CURRENT_USER / CURRENT_ROLE: VARCHAR(63) CHARACTER SET UTF8
     // (252 bytes), named USER / ROLE, no relation (SQLDA measured)
+    if matches!(e, Expr::CtxConn) {
+        let d = Descriptor { dtype: dtype::INT64, scale: 0, length: 8, sub_type: 0, flags: 0, offset: 0 };
+        let (wire, sql_type, length, scale, sub_type) = wire_for(&d);
+        return Some(ProjCol {
+            name: name.to_string(),
+            fname: Some("CURRENT_CONNECTION".to_string()),
+            relation: None,
+            rel_alias: None,
+            field_id: 0,
+            wire,
+            // NOT NULL: a session always has an id
+            sql_type,
+            length,
+            oct_length: length,
+            scale,
+            sub_type,
+            expr: Some(e),
+        });
+    }
     if matches!(e, Expr::CtxUser | Expr::CtxRole) {
         let d = Descriptor { dtype: dtype::VARYING, scale: 0, length: 254, sub_type: 4, flags: 0, offset: 0 };
         let (wire, sql_type, length, scale, sub_type) = wire_for(&d);
@@ -38403,6 +38460,36 @@ impl AttCs {
         let id: u8 = engine_charset_id(name).unwrap_or(255);
         AttCs::by_id(id)
     }
+}
+
+/// The client's identity from an attach/create dpb: isc_dpb_process_id
+/// (71, a little-endian integer), isc_dpb_process_name (74) and
+/// isc_dpb_client_version (80). What the client did not send is None.
+fn parse_dpb_client(dpb: &[u8]) -> (Option<i64>, Option<String>, Option<String>) {
+    let mut out = (None, None, None);
+    if dpb.first() != Some(&1) {
+        return out;
+    }
+    let mut i = 1;
+    while i + 1 < dpb.len() {
+        let (tag, len) = (dpb[i], dpb[i + 1] as usize);
+        let end = i + 2 + len;
+        let Some(data) = dpb.get(i + 2..end) else { break };
+        match tag {
+            71 if (1..=8).contains(&len) => {
+                let mut v: i64 = 0;
+                for (k, b) in data.iter().enumerate() {
+                    v |= (*b as i64) << (8 * k);
+                }
+                out.0 = Some(v);
+            }
+            74 => out.1 = Some(String::from_utf8_lossy(data).into_owned()),
+            80 => out.2 = Some(String::from_utf8_lossy(data).into_owned()),
+            _ => {}
+        }
+        i = end;
+    }
+    out
 }
 
 /// Read `isc_dpb_lc_ctype` (tag 48) out of an attach/create dpb: byte 0
@@ -68423,7 +68510,10 @@ fn expr_nullable(e: &Expr, is_nn: &dyn Fn(usize) -> bool) -> bool {
         | Expr::TimeLit(_)
         | Expr::TsLit(..)
         | Expr::TimeTzLit(..)
-        | Expr::TsTzLit(..) => false,
+        | Expr::TsTzLit(..)
+        // a session always has an id (measured: CURRENT_CONNECTION + 1
+        // describes NOT NULL)
+        | Expr::CtxConn => false,
         Expr::Neg(a)
         | Expr::Cast(a, ..)
         | Expr::TextNum(a, _)
@@ -68926,17 +69016,50 @@ fn resolve_agg_src(
             let coll = if *distinct { expr_key_coll(&a, descs)? } else { 0 };
             // the WITHIN GROUP keys sort by value; a key under a real
             // collation (or reading an ICU column through a form that
-            // names none) would need its collation's sort key, and refuses
+            // names none) would need its collation's sort key, and refuses.
+            // A NON-TEXT key has no collation (a NUMERIC column's sub_type
+            // 1 is not one), and a text key in its set's DEFAULT collation
+            // over NONE / OCTETS / ASCII / UNICODE_FSS / UTF8 sorts in
+            // code-point order - the value order: `LISTAGG(V) WITHIN GROUP
+            // (ORDER BY V)` and `ORDER BY A` over a NUMERIC(10,2) refused
+            // under a UTF8 database (the paper's samples/nodejs/windows.js)
             let mut keys = Vec::with_capacity(order.len());
             for (k, desc, nulls_first) in order {
                 let e = resolve_expr_sink(k, columns, descs, sink)?;
-                if e.type_of(descs).is_none() || expr_key_coll(&e, descs)? != 0 {
+                if e.type_of(descs).is_none() {
                     return None;
+                }
+                if !expr_is_nontext(&e, descs) {
+                    let tt = expr_key_coll(&e, descs)?;
+                    if tt >> 8 != 0 || !matches!(tt & 0xFF, 0..=4) {
+                        return None;
+                    }
                 }
                 keys.push((e, *desc, *nulls_first));
             }
+            // A DISTINCT fold is in VALUE order whatever the keys say: the
+            // first key turns it DESCENDING only when it is the argument
+            // itself (a qualified spelling of the same column, or the same
+            // expression) and says DESC. Measured on 2196 over V = {b, a,
+            // b, c, NULL, x, y}: `LISTAGG(DISTINCT V, '-') WITHIN GROUP
+            // (ORDER BY V DESC)` is y-x-c-b-a, `S.V DESC` and `V DESC, ID`
+            // the same; `ORDER BY ID`, `ID DESC`, `ID, V DESC`, `UPPER(V)
+            // DESC` and `R DESC` are a-b-c-x-y; `LISTAGG(DISTINCT -ID)
+            // .. (ORDER BY ID DESC)` is -7..-1. Which of two spellings a
+            // real collation calls one survives a descending fold is not
+            // measured, and refuses.
+            let mut list_desc = false;
+            if *distinct {
+                if let (Some((k, true, _)), Some((e, ..))) = (order.first(), keys.first()) {
+                    list_desc = k == arg || matches!((e, &a), (Expr::Col(x), Expr::Col(y)) if x == y);
+                }
+                if list_desc && (coll >> 8 != 0 || !matches!(coll & 0xFF, 0..=4)) {
+                    return None;
+                }
+                keys.clear();
+            }
             let cs = list_arg_charset(&a, descs) as u8;
-            (AggSrc::List { arg: a, sep: s, distinct: *distinct, pad, coll, order: keys, cs }, false)
+            (AggSrc::List { arg: a, sep: s, distinct: *distinct, pad, coll, order: keys, desc: list_desc, cs }, false)
         }
     };
     Some(out)
@@ -69467,6 +69590,7 @@ fn raw_is_constant(e: &RawExpr) -> bool {
         | RawExpr::TimeLit(_)
         | RawExpr::TsLit(..)
         | RawExpr::CtxUser
+        | RawExpr::CtxConn
         | RawExpr::CtxRole => true,
         RawExpr::Neg(a) => raw_is_constant(a),
         RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) => raw_is_constant(a) && raw_is_constant(b),
@@ -76805,6 +76929,7 @@ fn list_fold(
     arg: &Expr,
     sep: Option<&Expr>,
     distinct: bool,
+    desc: bool,
     pad: Option<(usize, usize)>,
     coll: u16,
 ) -> Result<Value, EvalErr> {
@@ -76861,6 +76986,9 @@ fn list_fold(
                 false
             }
         });
+        if desc {
+            vals.reverse();
+        }
         count = vals.len();
         if count > 0 {
             let sep_bytes = match rows.last() {
@@ -77574,11 +77702,11 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                     }
                 }
                 GItem::Const(v) => v.clone(), // a per-group constant slot
-                GItem::Agg(AggFn::List, AggSrc::List { arg, sep, distinct, pad, coll, order, cs }, _) => {
+                GItem::Agg(AggFn::List, AggSrc::List { arg, sep, distinct, pad, coll, order, desc, cs }, _) => {
                     let v = if order.is_empty() {
-                        list_fold(rows, arg, sep.as_ref(), *distinct, *pad, *coll)?
+                        list_fold(rows, arg, sep.as_ref(), *distinct, *desc, *pad, *coll)?
                     } else {
-                        list_fold(&list_sorted(rows, order, arg, *pad)?, arg, sep.as_ref(), *distinct, *pad, *coll)?
+                        list_fold(&list_sorted(rows, order, arg, *pad)?, arg, sep.as_ref(), *distinct, false, *pad, *coll)?
                     };
                     list_in_set(v, *cs)?
                 }
@@ -81797,8 +81925,9 @@ fn subst_params_aggsrc(s: &AggSrc, args: &[WireParam]) -> Option<AggSrc> {
             order: subst_params_expr(order, args)?,
             desc: *desc,
         },
-        AggSrc::List { arg, sep, distinct, pad, coll, order, cs } => AggSrc::List {
+        AggSrc::List { arg, sep, distinct, pad, coll, order, desc, cs } => AggSrc::List {
             cs: *cs,
+            desc: *desc,
             arg: subst_params_expr(arg, args)?,
             sep: match sep {
                 Some(x) => Some(subst_params_expr(x, args)?),
@@ -83833,6 +83962,35 @@ thread_local! {
     /// connection (`att_current_timezone`); `None` = the attachment's
     /// original, which is what `SET TIME ZONE LOCAL` restores.
     static SESSION_ZONE: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+    /// THIS CONNECTION'S OWN FACTS, for `CURRENT_CONNECTION` and the
+    /// SYSTEM context keys bound to the session. A connection is one
+    /// thread ([handle]), so the connect block's client identity, the
+    /// cipher, the attach's dpb and its registry row all land here once.
+    static SESSION_INFO: std::cell::RefCell<SessionInfo> = std::cell::RefCell::new(SessionInfo::default());
+}
+
+/// See [SESSION_INFO]. Every field the engine answers from the client's
+/// own words is `None` when the client did not say it.
+#[derive(Clone, Default)]
+struct SessionInfo {
+    attach_id: Option<i32>,
+    /// the file, as `MON$ATTACHMENT_NAME` spells it
+    db_name: Option<String>,
+    address: Option<String>,
+    os_user: Option<String>,
+    host: Option<String>,
+    /// isc_dpb_process_id (71) / isc_dpb_process_name (74)
+    pid: Option<i64>,
+    process: Option<String>,
+    /// isc_dpb_client_version (80)
+    client_version: Option<String>,
+    /// the wire-crypt plugin op_crypt named, when the wire is encrypted
+    crypt_plugin: Option<String>,
+    compressed: bool,
+}
+
+fn session_info() -> SessionInfo {
+    SESSION_INFO.with(|s| s.borrow().clone())
 }
 
 fn session_zone_id() -> u16 {
@@ -85518,6 +85676,8 @@ enum RawExpr {
     Subscript(String, Vec<RawExpr>),
     /// `USER` / `CURRENT_USER`: the attachment's user name
     CtxUser,
+    /// `CURRENT_CONNECTION`: the attachment's id
+    CtxConn,
     /// `CURRENT_ROLE`: the attachment's role (NONE when none)
     CtxRole,
     /// `<value> COLLATE <name>` - an EXPLICIT collation on an
@@ -88022,6 +88182,11 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                     match word.to_ascii_uppercase().as_str() {
                         "USER" | "CURRENT_USER" => return Some(RawExpr::CtxUser),
                         "CURRENT_ROLE" => return Some(RawExpr::CtxRole),
+                        // only where this session knows its id - a
+                        // planner with none keeps refusing it
+                        "CURRENT_CONNECTION" if session_info().attach_id.is_some() => {
+                            return Some(RawExpr::CtxConn)
+                        }
                         _ => {}
                     }
                 }
@@ -88070,7 +88235,7 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
     match e {
         RawExpr::Param(_) | RawExpr::Subq(_) => None,
         RawExpr::Subscript(_, subs) => walk_all(subs),
-        RawExpr::CtxUser | RawExpr::CtxRole => None,
+        RawExpr::CtxUser | RawExpr::CtxRole | RawExpr::CtxConn => None,
         // the wrapper decides nothing about literals; walk through it
         RawExpr::Collate(inner, _) => raw_bad_substring_len(inner),
         RawExpr::UserFn(_, args) => walk_all(args),
@@ -95046,6 +95211,7 @@ fn resolve_expr_inner(
         RawExpr::Double(d) => Expr::Double(*d),
         RawExpr::Bool(b) => Expr::Bool(*b),
         RawExpr::CtxUser => Expr::CtxUser,
+        RawExpr::CtxConn => Expr::CtxConn,
         RawExpr::CtxRole => Expr::CtxRole,
         // the bare-column-as-condition marker resolves ONLY at the two
         // sites that check the tested side is BOOLEAN; anywhere else it
@@ -95911,6 +96077,9 @@ enum Expr {
     /// `USER` / `CURRENT_USER` - the attachment's user name, VARCHAR(63)
     /// UTF8 named USER (SQLDA measured)
     CtxUser,
+    /// `CURRENT_CONNECTION` - the attachment's id, BIGINT NOT NULL named
+    /// CURRENT_CONNECTION (SQLDA measured on 2196)
+    CtxConn,
     /// `CURRENT_ROLE` - VARCHAR(63) UTF8 named ROLE, NONE when no role
     CtxRole,
     /// one element of the ARRAY column `fid`: the subscripts, and the
@@ -103348,6 +103517,7 @@ impl Expr {
             Expr::BlobText(..) => Some(ExprType::Text),
             Expr::ArrayElem { elem, .. } => expr_type_of_desc(elem).map(|(t, _)| t),
             Expr::CtxUser | Expr::CtxRole => Some(ExprType::Text),
+            Expr::CtxConn => Some(ExprType::Int),
             // a BINARY literal is TEXT, at charset OCTETS
             Expr::Hex(_) => Some(ExprType::Text),
             // a `?` is untyped on its own - it is always wrapped by the
@@ -104203,6 +104373,7 @@ impl Expr {
         match self {
             Expr::BlobOf(..) => None,
             Expr::CtxUser | Expr::CtxRole => None,
+            Expr::CtxConn => Some(NumRank::I64),
             // an array element ranks by the element's stored dtype, as
             // a column does by its own
             Expr::ArrayElem { elem, .. } => match elem.dtype {
@@ -104578,6 +104749,7 @@ impl Expr {
             Expr::Bool(b) => Value::Bool(*b),
             Expr::CtxUser => Value::Text(CURRENT_USER_NAME.with(|u| u.borrow().clone())),
             Expr::CtxRole => Value::Text("NONE".into()),
+            Expr::CtxConn => Value::Int(session_info().attach_id.unwrap_or(0) as i64),
             // three-valued: UNKNOWN is the SQL NULL of the boolean type
             Expr::Cond(c) => match c.eval(values)? {
                 Some(b) => Value::Bool(b),
@@ -106967,17 +107139,16 @@ impl Expr {
                             // no wire compression, the DECFLOAT and
                             // ext-conn-pool defaults, a read/write
                             // default transaction) match the engine
-                            // exactly. Keys whose value is bound to THIS
-                            // connection/transaction/database (the db
-                            // path, the session and transaction ids, the
-                            // peer address, the wire-crypt state) or that
-                            // fire-crab has no faithful source for (the
-                            // client host/pid/process, the db file id and
-                            // GUID, the commit numbers) answer NULL - the
-                            // key is VALID so it must not raise, and an
-                            // honest NULL beats a fabricated value. These
-                            // are recorded for the day a session/tx
-                            // thread-local carries the datum to `eval`.
+                            // exactly. Keys bound to THIS connection (the
+                            // db path, the session id, the peer, the
+                            // cipher, the client's own process/host/user)
+                            // read [SessionInfo]. Keys fire-crab has no
+                            // faithful source for (the transaction id - a
+                            // transaction has none before its first write
+                            // here - the db file id and GUID, the commit
+                            // numbers) answer NULL: the key is VALID so it
+                            // must not raise, and an honest NULL beats a
+                            // fabricated value.
                             "SYSTEM" => match name.to_ascii_uppercase().as_str() {
                                 "SEARCH_PATH" => Value::Text("\"PUBLIC\", \"SYSTEM\"".into()),
                                 "CURRENT_SCHEMA" => Value::Text("PUBLIC".into()),
@@ -106997,7 +107168,39 @@ impl Expr {
                                 "SESSION_IDLE_TIMEOUT" | "STATEMENT_TIMEOUT" => {
                                     Value::Text("0".into())
                                 }
-                                "WIRE_COMPRESSED" => Value::Text("FALSE".into()),
+                                "WIRE_COMPRESSED" => Value::Text(
+                                    if session_info().compressed { "TRUE" } else { "FALSE" }.into(),
+                                ),
+                                // THE SESSION'S OWN FACTS ([SessionInfo]):
+                                // the file, the peer, the cipher, and what
+                                // the client said of itself - NULL where it
+                                // said nothing, as on the engine
+                                "SESSION_ID" => match session_info().attach_id {
+                                    Some(id) => Value::Text(id.to_string()),
+                                    None => Value::Null,
+                                },
+                                "WIRE_ENCRYPTED" => Value::Text(
+                                    if session_info().crypt_plugin.is_some() { "TRUE" } else { "FALSE" }.into(),
+                                ),
+                                "CLIENT_PID" => match session_info().pid {
+                                    Some(p) => Value::Text(p.to_string()),
+                                    None => Value::Null,
+                                },
+                                k @ ("DB_NAME" | "CLIENT_ADDRESS" | "CLIENT_HOST" | "CLIENT_PROCESS"
+                                | "CLIENT_OS_USER" | "WIRE_CRYPT_PLUGIN") => {
+                                    let si = session_info();
+                                    match match k {
+                                        "DB_NAME" => si.db_name,
+                                        "CLIENT_ADDRESS" => si.address,
+                                        "CLIENT_HOST" => si.host,
+                                        "CLIENT_PROCESS" => si.process,
+                                        "CLIENT_OS_USER" => si.os_user,
+                                        _ => si.crypt_plugin,
+                                    } {
+                                        Some(v) => Value::Text(v),
+                                        None => Value::Null,
+                                    }
+                                }
                                 "DECFLOAT_ROUND" => Value::Text("HALF_UP".into()),
                                 "DECFLOAT_TRAPS" => {
                                     Value::Text("Division_by_zero,Invalid_operation,Overflow".into())
@@ -107021,16 +107224,7 @@ impl Expr {
                                 // fabricated value). Recorded for the
                                 // session/tx thread-local follow-up.
                                 "REPLICA_MODE"
-                                | "DB_NAME"
-                                | "SESSION_ID"
                                 | "TRANSACTION_ID"
-                                | "CLIENT_ADDRESS"
-                                | "CLIENT_HOST"
-                                | "CLIENT_PID"
-                                | "CLIENT_PROCESS"
-                                | "CLIENT_OS_USER"
-                                | "WIRE_ENCRYPTED"
-                                | "WIRE_CRYPT_PLUGIN"
                                 | "DB_FILE_ID"
                                 | "DB_GUID"
                                 | "SNAPSHOT_NUMBER"
@@ -115001,11 +115195,6 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
             Some((a, s)) => (a.trim().to_string(), Some(parse_raw_expr_any(s.trim())?)),
             None => (rest.to_string(), None),
         };
-        // a DISTINCT fold is already ordered by its own dedupe sort; the
-        // two together are not modelled
-        if distinct && !order.is_empty() {
-            return None;
-        }
         return Some((
             func,
             AggTarget::List { arg: parse_raw_expr_any(&a)?, sep, distinct, order },
@@ -115177,7 +115366,7 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         // the bare clock keywords LOOK like column names but are
         // expressions - route them to the expression parser before the
         // ident path reads them as a (nonexistent) column
-        let clock_kw = ["CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP", "CURRENT_USER", "USER", "CURRENT_ROLE"]
+        let clock_kw = ["CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP", "CURRENT_USER", "USER", "CURRENT_ROLE", "CURRENT_CONNECTION"]
             .iter()
             .any(|k| body.trim().eq_ignore_ascii_case(k));
         if clock_kw {
@@ -115436,6 +115625,7 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Subscript(n, _) => return n.to_ascii_uppercase(),
         RawExpr::CtxUser => "USER",
         RawExpr::CtxRole => "ROLE",
+        RawExpr::CtxConn => "CURRENT_CONNECTION",
         // `S COLLATE X` describes as CAST, name and alias both -
         // the engine builds a CastNode for it (measured)
         RawExpr::Collate(..) => "CAST",
@@ -116276,8 +116466,16 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                     }
                 }
                 // the CLOCK keywords take no parentheses, so they need
-                // their own arm or they lex as column names
-                if matches!(upper.as_str(), "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP") {
+                // their own arm or they lex as column names - and so do
+                // the SESSION ones: `WHERE CURRENT_USER = 'SYSDBA'` and
+                // `WHERE MON$ATTACHMENT_ID = CURRENT_CONNECTION` read a
+                // column of that name and refused (a delimited `"USER"`
+                // takes the quoted arm above and stays a name)
+                if matches!(
+                    upper.as_str(),
+                    "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP"
+                        | "CURRENT_USER" | "USER" | "CURRENT_ROLE" | "CURRENT_CONNECTION"
+                ) {
                     out.push(Tok::FnExpr(parse_raw_expr_any(word)?));
                     continue;
                 }
@@ -133802,7 +134000,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         Expr::BlobOf(..) => false,
         // an array element read can raise (a subscript out of bounds)
         Expr::ArrayElem { .. } => false,
-        Expr::CtxUser | Expr::CtxRole => true,
+        Expr::CtxUser | Expr::CtxRole | Expr::CtxConn => true,
         // a literal never raises
         Expr::Hex(_) => true,
         // a parameter's value is substituted before eval; the CAST above
@@ -135673,6 +135871,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     let ptype = 3 | if compress { PFLAG_COMPRESS } else { 0 };
     let cu = parse_user_id_full(&uid);
     let (login, a_hex) = (cu.login.clone(), cu.specific.clone());
+    SESSION_INFO.with(|si| {
+        let mut si = si.borrow_mut();
+        si.os_user = cu.os_user.clone();
+        si.host = cu.host.clone();
+        si.compressed = compress;
+    });
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!("[srv] login={} plugin={} list={} keylen={} compress={}", login, cu.plugin, cu.plugins, a_hex.len(), compress);
     }
@@ -135822,6 +136026,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 }
                 enc = Some(e);
                 dec = Some(d);
+                SESSION_INFO.with(|si| si.borrow_mut().crypt_plugin = Some(plugin.clone()));
                 respond(&mut s, &mut enc, 0)?; // op_crypt reply, encrypted from here on
             }
             _ => {
@@ -136199,11 +136404,23 @@ fn after_auth(
     // THIS ATTACHMENT IS ON THE RECORD from here, so `MON$ATTACHMENTS`
     // can name it. Removed wherever the session ends - see the teardown.
     if let Some(db) = database.as_ref() {
+        let address = s.peer_addr().ok().map(|a| format!("{}/{}", a.ip(), a.port()));
+        let client = parse_dpb_client(&dpb);
+        SESSION_INFO.with(|si| {
+            let mut si = si.borrow_mut();
+            si.attach_id = Some(attach_id);
+            si.db_name = Some(db.path.clone());
+            si.address = address.clone();
+            si.pid = client.0;
+            si.process = client.1;
+            si.client_version = client.2;
+        });
         let row = AttachRow {
             id: attach_id,
             user: user.to_string(),
             name: db.path.clone(),
-            address: s.peer_addr().ok().map(|a| format!("{}/{}", a.ip(), a.port())),
+            address,
+            session: session_info(),
             at: std::time::SystemTime::now(),
             charset: db_default_charset(&db.bytes(), db.page_size),
             encrypted: enc.is_some(),

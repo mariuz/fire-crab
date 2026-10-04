@@ -111,8 +111,19 @@ Short, actionable items. The long-form engineering backlog lives in
 - [ ] Non-ASCII text CAST into a NONE text blob counts double (`OCTET_LENGTH(CAST('abcéé' AS BLOB SUB_TYPE TEXT
       CHARACTER SET NONE))` 11, engine 7); passing it through transcode_text made it 19 - the source set the CAST
       arm is handed is not what it looks like.
-- [ ] `COUNT(*) FILTER (WHERE ..)`, `LIST(.. ) WITHIN GROUP (ORDER BY ..)` (samples/windows.js).
-- [ ] A `?` as RDB$GET_CONTEXT's variable name; RDB$GET_CONTEXT('SYSTEM', 'ENGINE_VERSION' | 'NETWORK_PROTOCOL').
+- [x] `COUNT(*) FILTER (WHERE ..)` was already answered (`qa/serve-real-aggfilter.sh`); the windows.js refusal was
+      `LISTAGG .. WITHIN GROUP` over a text or NUMERIC key under a UTF8 database, and DISTINCT with WITHIN GROUP
+      (`qa/serve-real-listagg8.sh`). Recorded there: a WIN1252 key, a UNICODE_CI key, a DISTINCT UNICODE_CI
+      argument descending.
+- [ ] A `?` as RDB$GET_CONTEXT's variable name. (ENGINE_VERSION / NETWORK_PROTOCOL already answered; the session's
+      keys, CURRENT_CONNECTION and the MON$ATTACHMENTS client columns answer since 2026-10-04 -
+      `qa/serve-real-session.sh`.)
+- [ ] CURRENT_TRANSACTION / TRANSACTION_ID: a transaction has no id here before its first write (the engine's has one
+      from its start) - recorded in `qa/serve-real-session.sh`.
+- [ ] A HAVING over a literal-only condition refuses (`HAVING 1 = 1`, `HAVING COUNT(*) > 0 AND 'a' = 'a'`,
+      `HAVING CURRENT_USER = 'SYSDBA'`); CURRENT_DATE has its own path and answers.
+- [ ] MON$ATTACHMENTS lists only client attachments; the engine also lists its system ones (garbage collector, cache
+      writer - NULL address).
 - [ ] CREATE / DROP SCHEMA; ALTER DATABASE .. PUBLICATION; CREATE / DROP SHADOW; ALTER EXTERNAL CONNECTIONS POOL.
 - [ ] A new table's RDB$RELATION_ID: 129 here where the engine reuses 128 (samples/metadata_cache.js).
 - [ ] The MON$ surface the samples read (MON$SERVER_PID, MON$IO_STATS, MON$PARALLEL_WORKERS, MON$WIRE_CRYPT_PLUGIN).
