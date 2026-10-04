@@ -48,16 +48,17 @@ Short, actionable items. The long-form engineering backlog lives in
       `B > 9` is text order, `LIST(ID) = 3` no 22018) - it compared numerically (`qa/serve-real-blobcmp.sh`).
 - [ ] A BOOLEAN against a blob: the engine's 22018 names the string "BLOB", this server's the content (blobcmp 9).
 - [ ] A `?` compared with a blob refuses at prepare (unmeasured).
-- [x] `ALTER TABLE T ADD A .., ADD B ..` - several column ADDs, ONE format; the duplicate-column vector
-      (`qa/serve-real-altermulti.sh`).
-- [ ] A multi-clause ALTER with a constraint, DROP or ALTER clause, or a COMPUTED column, refuses (altermulti 4).
-      The engine applies the column clauses first, then the constraints (a UNIQUE may name a column added
-      later in the statement).
-- [ ] A sibling transaction's snapshot (isql's main one beside its DDL transaction) reads NO ROW for an altered
-      table: the old RDB$RELATIONS version is purged at the DDL's commit (altermulti 5, recorded). Holding every
-      purge back while a sibling lives piles up dead catalog versions (blobgc / blobsweep red) - the fix is the
-      engine's intermediate GC: keep exactly the versions a live snapshot can still see.
-- [ ] The multi-clause CONSTRAINT and FK numbering cells (altermulti 1b) - measure on build.
+- [x] `ALTER TABLE T ADD A .., ADD B .. [, ADD CONSTRAINT ..]` - the columns under ONE format, then the
+      constraints in clause order (the engine's order); the duplicate-column vector (`qa/serve-real-altermulti.sh`).
+- [ ] A multi-clause ALTER with a DROP or ALTER clause, a CHECK over a column the same statement adds, or a
+      COMPUTED column beside others, refuses (altermulti 4).
+- [x] A sibling transaction's snapshot (isql's main one beside its DDL transaction) read NO ROW for an altered
+      table: the commit purged the old RDB$RELATIONS version. The purge now keeps exactly the versions a live
+      sibling snapshot reads and collects the rest, blobs included (`gc::purge_row_chain_keeping`, altermulti 5).
+- [ ] ...but a COMMENT rewritten twice under such a snapshot reads the NEWEST description where the engine reads
+      the one it began with (altermulti 5, recorded) - cause not yet traced.
+- [ ] A key added over duplicate rows (single or multi-clause) answers a bare Dynamic SQL Error; the engine names
+      the constraint and the key value (altermulti 1b, recorded).
 - [x] Schema-qualified DDL (`CREATE TABLE PUBLIC.T7 ..`, every kind, a view body over `PUBLIC.T`) and an
       unknown schema's vector (`qa/serve-real-ddlqualified.sh`).
 - [x] A select list holding `GEN_ID(..)` / NEXT VALUE FOR beside a stored function call (fnwhere section 10).

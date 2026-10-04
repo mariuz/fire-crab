@@ -336,6 +336,127 @@ pub(crate) fn purge_row_chain(
     }
 }
 
+/// [purge_row_chain] for a commit that knows the SNAPSHOTS still live
+/// beside it - the engine's intermediate GC (vio.cpp:1655, the active
+/// snapshots list) narrowed to one catalog row: a back version a live
+/// snapshot still READS (the newest one whose transaction it sees, where
+/// it cannot see the head's) stays, relinked behind the head in chain
+/// order; every other back version goes, and with it every blob it names
+/// that no surviving version (the head or a kept one) names too.
+///
+/// Measured why: isql runs its DDL in a transaction of its own beside its
+/// main SNAPSHOT one, and that snapshot, opened before an ALTER, read NO
+/// ROW for the table in RDB$RELATIONS once the old version was purged at
+/// the DDL's commit (the engine reads it, at the old format). Holding the
+/// whole purge back instead piles the catalog's dead versions up, since
+/// isql always has that main transaction - a version made AFTER the
+/// snapshot began is one it can never read, and the engine collects it.
+///
+/// Returns the blob ids the KEPT versions name - the commit's own
+/// superseded-blob frees must spare them. `None`: the chain could not be
+/// read whole (a delta, a fragment, a format that does not resolve) and
+/// NOTHING was touched; the caller then holds every free back.
+pub fn purge_row_chain_keeping(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel: u16,
+    page: u32,
+    slot: u16,
+    snaps: &[crate::tra::Snapshot],
+) -> Option<Vec<(u16, u64)>> {
+    let hdr = crate::page_at(file, page_size, page)
+        .and_then(DataPage::decode)?
+        .record(slot)?
+        .clone();
+    if hdr.back_page == 0 {
+        return Some(Vec::new());
+    }
+    let chain = chain_members(file, page_size, hdr.back_page, hdr.back_line)?;
+    // a delta anywhere would need its front version to stay its front:
+    // relinking around it is outside what is proven here
+    if hdr.flags & flags::DELTA != 0 || chain.iter().any(|m| m.flags & flags::DELTA != 0) {
+        return None;
+    }
+    let mut kept: Vec<usize> = Vec::new();
+    for s in snaps {
+        if s.sees(hdr.transaction) {
+            continue;
+        }
+        if let Some(i) = chain.iter().position(|m| s.sees(m.transaction)) {
+            if !kept.contains(&i) {
+                kept.push(i);
+            }
+        }
+    }
+    if kept.is_empty() {
+        purge_row_chain(file, page_size, page, slot);
+        return Some(Vec::new());
+    }
+    kept.sort_unstable();
+    // every version's blob ids, by its own format, BEFORE anything moves
+    let names: std::collections::HashMap<u16, String> =
+        crate::list_relations(file, page_size).into_iter().collect();
+    let head_img = crate::data::assembled_image(file, page_size, &hdr)?;
+    let staying_head = blob_ids_of(file, page_size, rel, &names, &head_img, hdr.format)?;
+    let imgs = chain_images(file, page_size, &chain, hdr.flags, head_img)?;
+    let mut ids_of: Vec<Vec<(u16, u64)>> = Vec::with_capacity(chain.len());
+    for (m, im) in chain.iter().zip(imgs.iter()) {
+        if m.flags & flags::DELETED != 0 {
+            ids_of.push(Vec::new());
+            continue;
+        }
+        let fmt = crate::page_at(file, page_size, m.page)
+            .and_then(DataPage::decode)
+            .and_then(|d| d.record(m.slot).map(|r| r.format))?;
+        ids_of.push(blob_ids_of(file, page_size, rel, &names, im, fmt)?);
+    }
+    let kept_ids: Vec<(u16, u64)> = kept.iter().flat_map(|i| ids_of[*i].iter().copied()).collect();
+    let mut going: Vec<(u16, u64)> = Vec::new();
+    for (i, ids) in ids_of.iter().enumerate() {
+        if kept.contains(&i) {
+            continue;
+        }
+        for id in ids {
+            if !kept_ids.contains(id) && !staying_head.contains(id) && !going.contains(id) {
+                going.push(*id);
+            }
+        }
+    }
+    // relink: head -> kept[0] -> kept[1] -> ... -> nothing
+    let set_back = |file: &mut crate::Image, page: u32, slot: u16, to: Option<(u32, u16)>| {
+        if let Some(p) = crate::page_mut(file, page_size, page) {
+            let dir = crate::data::DPG_RPT_OFFSET + slot as usize * 4;
+            if dir + 4 > p.len() {
+                return;
+            }
+            let off = crate::u16_at(p, dir) as usize;
+            let len = crate::u16_at(p, dir + 2) as usize;
+            if len >= 10 && off + len <= p.len() {
+                let (bp, bl) = to.unwrap_or((0, 0));
+                crate::dml::put_u16(p, off + 4, (bp & 0xFFFF) as u16);
+                crate::dml::put_u16(p, off + 6, (bp >> 16) as u16);
+                crate::dml::put_u16(p, off + 8, bl);
+            }
+        }
+    };
+    let at = |i: usize| (chain[i].page, chain[i].slot);
+    set_back(file, page, slot, Some(at(kept[0])));
+    for w in 0..kept.len() {
+        let next = kept.get(w + 1).map(|j| at(*j));
+        let (p, l) = at(kept[w]);
+        set_back(file, p, l, next);
+    }
+    for (i, m) in chain.iter().enumerate() {
+        if !kept.contains(&i) {
+            free_version_slot(file, page_size, m.page, m.slot);
+        }
+    }
+    for (brel, num) in going {
+        free_blob(file, page_size, brel, num);
+    }
+    Some(kept_ids)
+}
+
 /// Free ONE blob's storage by id - blb::delete_blob (blb.cpp:2174) +
 /// the slot purge DPM_delete does (dpm.epp:822): a level-0 blob is
 /// inline in its slot and frees nothing else; a level-1 blob's data

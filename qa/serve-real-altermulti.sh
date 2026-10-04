@@ -137,30 +137,74 @@ recorded "4 DROP beside ADD"                 "ALTER TABLE T ADD H INTEGER, DROP 
 recorded "4 a CHECK over a column added beside it" "ALTER TABLE T ADD H INTEGER, ADD CONSTRAINT CK5 CHECK (H > 0);"
 recorded "4 a COMPUTED column over one added beside it" "ALTER TABLE T ADD K INTEGER, ADD L COMPUTED BY (K + 1);"
 
-echo "--- 5 RECORDED - a SIBLING transaction's snapshot loses the old catalog row"
+echo "--- 5 a SIBLING transaction's snapshot keeps the catalog row it reads"
 # isql (AUTODDL ON) runs each DDL statement in a transaction of its own
 # beside the main one; the main SNAPSHOT, opened before the ALTER, still
-# reads the RDB\$RELATIONS row at format 1 on the engine. This server
-# purges the old version at the DDL's commit (a sibling of the SAME
-# attachment is not counted as a reader) and the snapshot reads NO ROW.
-# Holding every purge back while a sibling lives is no fix - isql always
-# has one, and the catalog's dead versions pile up (blobgc / blobsweep
-# measured it); the engine keeps exactly the versions a live snapshot
-# can still see. Pinned: both answers, so a move either way is seen.
-ran=$((ran + 1))
-fresh
-S5="SELECT COUNT(*) AS T1 FROM T;
+# reads the RDB\$RELATIONS row at the old format on the engine. This
+# server purged that old version at the DDL's commit (a sibling of the
+# SAME attachment was not counted as a reader) and the snapshot read NO
+# ROW - recorded until 2026-10-04. Holding every purge back while a
+# sibling lives is no fix: isql always has one, and the catalog's dead
+# versions pile up (blobgc / blobsweep measured it). The commit now keeps
+# exactly the versions a live sibling snapshot reads and collects the
+# rest - the engine's intermediate GC.
+sib() { # <label> <script> - one isql session, the whole output, then gfix
+    ran=$((ran + 1))
+    fresh
+    local e c gf
+    e=$(printf '%s\n' "$2" | timeout 60 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$ENG" 2>&1 | norm)
+    c=$(printf '%s\n' "$2" | timeout 60 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$FC" 2>&1 | norm)
+    if [ "${e#*F2}" = "$e" ]; then echo "FAIL $1 [the engine never read: $e]"; fail=1
+    elif [ "$c" = "$e" ]; then echo "OK   $1"
+    else echo "DIFF $1"; echo "     eng: [$e]"; echo "     fc:  [$c]"; fail=1; fi
+    gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$FC" 2>&1)
+    ran=$((ran + 1))
+    if [ -n "$gf" ]; then echo "FAIL $1 - gfix -v -full: $gf"; fail=1; else echo "OK   $1 - gfix clean"; fi
+}
+sib "5 one ADD under a sibling snapshot" "SELECT COUNT(*) AS T1 FROM T;
 ALTER TABLE T ADD Q INTEGER;
-SELECT ${R}FORMAT AS F2 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';
+SELECT ${R}FORMAT AS F2, ${R}FIELD_ID AS I2 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';
 COMMIT;
 SELECT ${R}FORMAT AS F3 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';"
-e=$(printf '%s\n' "$S5" | timeout 60 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$ENG" 2>&1 | norm)
-c=$(printf '%s\n' "$S5" | timeout 60 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$FC" 2>&1 | norm)
-we=" T1|=====================| 1| F2|=======| 1| F3|=======| 2|"
-wc=" T1|=====================| 1| F3|=======| 2|"
-if [ "$e" = "$c" ]; then echo "FAIL 5 the sibling snapshot - IT AGREES NOW; promote the cell"; fail=1
-elif [ "$e" = "$we" ] && [ "$c" = "$wc" ]; then echo "OK   5 the sibling snapshot (recorded: the engine reads format 1, this server no row)"
-else echo "FAIL 5 the sibling snapshot moved"; echo "     eng: [$e]"; echo "     fc:  [$c]"; fail=1; fi
+sib "5 a multi-clause ADD under a sibling snapshot" "SELECT COUNT(*) AS T1 FROM T;
+ALTER TABLE T ADD Q INTEGER, ADD Q2 DATE;
+SELECT ${R}FORMAT AS F2, ${R}FIELD_ID AS I2 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';
+SELECT COUNT(*) AS N2 FROM ${R}RELATION_FIELDS WHERE ${R}RELATION_NAME = 'T';
+COMMIT;
+SELECT ${R}FORMAT AS F3 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';"
+sib "5 four ALTERs under one snapshot: it reads the FIRST version" "SELECT COUNT(*) AS T1 FROM T;
+ALTER TABLE T ADD Q1 INTEGER;
+ALTER TABLE T ADD Q2 INTEGER;
+ALTER TABLE T ADD Q3 INTEGER;
+ALTER TABLE T ADD Q4 INTEGER;
+SELECT ${R}FORMAT AS F2, ${R}FIELD_ID AS I2 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';
+COMMIT;
+SELECT ${R}FORMAT AS F3, ${R}FIELD_ID AS I3 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';
+SELECT COUNT(*) AS NF FROM ${R}FORMATS F JOIN ${R}RELATIONS R ON R.${R}RELATION_ID = F.${R}RELATION_ID WHERE R.${R}RELATION_NAME = 'T';"
+# RECORDED: a COMMENT is not this purge - its new version is written
+# under an id the snapshot already counts as committed (a DDL-only
+# transaction reserves none; "its catalog rows are settled as they are
+# written"), so the snapshot reads the NEWEST description where the engine
+# reads the one it began with. Pinned both ways.
+ran=$((ran + 1))
+fresh
+S5C="COMMENT ON TABLE T IS 'one';
+COMMIT;
+SELECT COUNT(*) AS T1 FROM T;
+COMMENT ON TABLE T IS 'two';
+COMMENT ON TABLE T IS 'three';
+SELECT CAST(${R}DESCRIPTION AS VARCHAR(10)) AS F2 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';
+COMMIT;
+SELECT CAST(${R}DESCRIPTION AS VARCHAR(10)) AS F3 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';"
+e=$(printf '%s\n' "$S5C" | timeout 60 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$ENG" 2>&1 | norm)
+c=$(printf '%s\n' "$S5C" | timeout 60 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$FC" 2>&1 | norm)
+if [ "$e" = "$c" ]; then echo "FAIL 5 a COMMENT under a snapshot - IT AGREES NOW; promote the cell"; fail=1
+elif [ "$e" = " T1|=====================| 1|F2|==========|one|F3|==========|three|" ] && [ "$c" = " T1|=====================| 1|F2|==========|three|F3|==========|three|" ]; then
+    echo "OK   5 a COMMENT under a snapshot (recorded: the engine reads 'one', this server the newest)"
+else echo "FAIL 5 a COMMENT under a snapshot moved"; echo "     eng: [$e]"; echo "     fc:  [$c]"; fail=1; fi
+sib "5 the snapshot isql opens at CONNECT, before the first ALTER" "ALTER TABLE T ADD Q INTEGER;
+SELECT ${R}FORMAT AS F2 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';
+COMMIT;"
 
 echo "--- panic check"
 ran=$((ran + 1))
@@ -168,5 +212,5 @@ if grep -aq 'panicked at' "/tmp/fc-serve-altermulti-$PORT.log"; then echo "FAIL 
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 46 ]; then echo "FAIL only $ran checks ran (floor 46) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 54 ]; then echo "FAIL only $ran checks ran (floor 54) - cells went missing"; fail=1; fi
 exit $fail

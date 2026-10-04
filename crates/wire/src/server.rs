@@ -5175,6 +5175,38 @@ impl Database {
                             | fire_crab_ods::DdlDeferred::PurgeRowChain { .. }
                     )
                 });
+            } else {
+                // A SIBLING OF THIS ATTACHMENT holding a SNAPSHOT (isql's
+                // main transaction beside its DDL one) still reads the
+                // version each purge would take: the purge keeps exactly
+                // the versions such a snapshot reads and collects the rest
+                // ([fire_crab_ods::gc::purge_row_chain_keeping]); the frees
+                // spare every blob a kept version names
+                let snaps: Vec<fire_crab_ods::tra::Snapshot> = self
+                    .txns
+                    .iter()
+                    .filter(|(h, _)| **h != self.cur_handle)
+                    .filter_map(|(_, sl)| sl.snapshot.clone())
+                    .collect();
+                if !snaps.is_empty() {
+                    let mut spared: Vec<(u16, u64)> = Vec::new();
+                    let mut hold_all = false;
+                    for d in &deferred {
+                        if let fire_crab_ods::DdlDeferred::PurgeRowChain { rel, page, slot } = d {
+                            match fire_crab_ods::gc::purge_row_chain_keeping(&mut work, self.page_size, *rel, *page, *slot, &snaps) {
+                                Some(ids) => spared.extend(ids),
+                                None => hold_all = true,
+                            }
+                        }
+                    }
+                    deferred.retain(|d| match d {
+                        fire_crab_ods::DdlDeferred::PurgeRowChain { .. } => false,
+                        fire_crab_ods::DdlDeferred::FreeBlob { rel, recno } => {
+                            !hold_all && !spared.contains(&(*rel, *recno))
+                        }
+                        _ => true,
+                    });
+                }
             }
             if let Err(e) = fire_crab_ods::dml::apply_ddl_deferred(&mut work, self.page_size, &deferred) {
                 if trace_on() {
