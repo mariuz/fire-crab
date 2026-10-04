@@ -345,6 +345,9 @@ pub struct KeyDef {
     pub columns: Vec<String>,
     /// PRIMARY KEY (true) or UNIQUE (false)
     pub primary: bool,
+    /// `USING [ASC | DESC] INDEX <name>`: the backing index's own name and
+    /// direction (RDB$INDEX_TYPE 1 when descending - measured on 2196)
+    pub index: Option<(String, bool)>,
 }
 
 /// One `[CONSTRAINT <name>] CHECK (<condition>)` of a CREATE TABLE: the
@@ -5007,6 +5010,8 @@ pub struct ForeignKeyDef {
     pub on_update: RefAction,
     pub on_delete: RefAction,
     pub place: ConstraintPlace,
+    /// `USING [ASC | DESC] INDEX <name>` - see [KeyDef::index]
+    pub index: Option<(String, bool)>,
 }
 
 pub fn create_table(
@@ -5753,7 +5758,11 @@ fn write_key(
     table: &str,
     key: &KeyDef,
 ) -> Result<(), String> {
-    let (cname, iname) = if key.name.is_empty() {
+    let (cname, iname) = if let (true, Some((ix, _))) = (key.name.is_empty(), &key.index) {
+        // USING INDEX names the index; the constraint is still INTEG_<n>
+        // (measured: `ADD UNIQUE (K) USING INDEX UXC` is INTEG_3 over UXC)
+        (next_integ_name(file, page_size)?, ix.clone())
+    } else if key.name.is_empty() {
         let n = next_index_number(file, page_size)?;
         let iname = if key.primary {
             format!("RDB$PRIMARY{}", n)
@@ -5761,14 +5770,16 @@ fn write_key(
             format!("RDB${}", n)
         };
         (next_integ_name(file, page_size)?, iname)
+    } else if let Some((ix, _)) = &key.index {
+        (key.name.clone(), ix.clone())
     } else {
         // a named constraint's index takes the constraint's name - unless
         // a restore says what the file called it (INTEG_5 / RDB$PRIMARY2)
         let iname = restore_key_index_name(&key.name).unwrap_or_else(|| key.name.clone());
         (key.name.clone(), iname)
     };
-    create_index(
-        file, page_size, table, &iname, &key.columns, true, false, key.primary, None,
+    create_index_for(
+        file, page_size, table, &iname, &key.columns, true, key.index.as_ref().is_some_and(|(_, d)| *d), key.primary, None, true,
     )
     // the build met a key twice: the message names the CONSTRAINT, an
     // unnamed one by the INTEG_<n> it was given (measured: "INTEG_2")
@@ -8556,6 +8567,10 @@ fn update_relation_runtime(file: &mut crate::Image, page_size: usize, table: &st
 /// constraint is INTEG_<n> with its index RDB$FOREIGN<m> from the shared
 /// index counter; a named one names its index after itself.
 fn fk_names(file: &mut crate::Image, page_size: usize, fk: &ForeignKeyDef) -> Result<(String, String), String> {
+    if let Some((ix, _)) = &fk.index {
+        let cname = if fk.name.is_empty() { next_integ_name(file, page_size)? } else { fk.name.clone() };
+        return Ok((cname, ix.clone()));
+    }
     if fk.name.is_empty() {
         let cname = next_integ_name(file, page_size)?;
         let iname = format!("RDB$FOREIGN{}", next_index_number(file, page_size)?);
@@ -8636,7 +8651,7 @@ fn write_foreign_key_full(
         }
     }
     create_index(
-        file, page_size, table, index_name, &fk.columns, false, false, false,
+        file, page_size, table, index_name, &fk.columns, false, fk.index.as_ref().is_some_and(|(_, d)| *d), false,
         Some(&partner_index),
     )?;
     sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
@@ -9278,6 +9293,29 @@ pub fn create_index(
     // schema column is the ODS-14 field the older attempts missed.
     foreign_key: Option<&str>,
 ) -> Result<(), String> {
+    let constraint = primary || foreign_key.is_some();
+    create_index_for(file, page_size, table, index_name, col_names, unique, descending, primary, foreign_key, constraint)
+}
+
+/// [create_index], told whether the index backs a CONSTRAINT - a UNIQUE
+/// one included, which neither `primary` nor `foreign_key` says. A
+/// constraint's index leaves RDB$INDEX_TYPE NULL unless it is DESCENDING
+/// (1); only a bare CREATE INDEX writes 0 / 1 (measured on 2196: `UNIQUE
+/// (B)`, `ADD CONSTRAINT UQA UNIQUE (A)` and an unnamed UNIQUE read NULL,
+/// `USING DESCENDING INDEX` 1; this wrote 0 for every UNIQUE constraint).
+#[allow(clippy::too_many_arguments)]
+pub fn create_index_for(
+    file: &mut crate::Image,
+    page_size: usize,
+    table: &str,
+    index_name: &str,
+    col_names: &[String],
+    unique: bool,
+    descending: bool,
+    primary: bool,
+    foreign_key: Option<&str>,
+    constraint: bool,
+) -> Result<(), String> {
     let rel = crate::resolve_relation(file, page_size, table)
         .ok_or_else(|| format!("table {} not found", table))?;
     if rel < 128 {
@@ -9348,10 +9386,13 @@ pub fn create_index(
         ("RDB$INDEX_INACTIVE", SysVal::I(0)),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
     ];
-    // probe: a PK's RDB$INDEX_TYPE is NULL, a user index carries 0/1; a
-    // FOREIGN KEY index also leaves RDB$INDEX_TYPE NULL (engine-probed)
-    if !primary && foreign_key.is_none() {
+    // probe: a CONSTRAINT's index (PK, UNIQUE, FK) leaves RDB$INDEX_TYPE
+    // NULL - 1 when declared DESCENDING (USING DESC INDEX); a user index
+    // carries 0/1 (engine-probed)
+    if !constraint {
         ivals.push(("RDB$INDEX_TYPE", SysVal::I(if descending { 1 } else { 0 })));
+    } else if descending {
+        ivals.push(("RDB$INDEX_TYPE", SysVal::I(1)));
     }
     // a foreign-key index names its partner (referenced unique) index. Both
     // the name AND its schema are required: MET_lookup_partner's self-join
@@ -15528,6 +15569,7 @@ mod tests {
                 name: String::new(),
                 columns: Vec::new(),
                 primary,
+                index: None,
             }),
             place,
         }
@@ -15544,6 +15586,7 @@ mod tests {
             on_update: RefAction::Restrict,
             on_delete: RefAction::Restrict,
             place,
+            index: None,
         }
     }
 

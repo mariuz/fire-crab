@@ -61,7 +61,10 @@ Short, actionable items. The long-form engineering backlog lives in
       (`qa/serve-real-txrestart.sh`; the COMMENT-under-a-snapshot cell of altermulti was the same cause).
 - [x] A key added over duplicate rows (ADD CONSTRAINT, single or multi-clause, and CREATE UNIQUE INDEX) answers
       the engine's vector, naming the first key in index order (`qa/serve-real-keydup.sh`).
-- [ ] `ADD CONSTRAINT .. USING [DESCENDING] INDEX ..` refuses at prepare (keydup 3, recorded).
+- [x] `.. USING [ASC | DESC] INDEX <name>` on a PRIMARY KEY / UNIQUE / FOREIGN KEY, in CREATE and ALTER TABLE
+      (`qa/serve-real-usingindex.sh`); a constraint's index leaves RDB$INDEX_TYPE NULL unless DESCENDING - this
+      wrote 0 for every UNIQUE constraint.
+- [ ] `SET PLAN ON` prints no PLAN lines here (isql's plan request).
 - [x] The backup wrote auto-domains under INVENTED RDB$<n> names in table-then-column order - right only while the
       catalog rows sat in that order; a reused RDB$RELATIONS slot restored them under other names than the engine's
       backup of the same file (empbackup). They keep their real names now.

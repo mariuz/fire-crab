@@ -12,8 +12,7 @@
 # `("ID" = NULL, "V" = 'e')`; all-NULL keys do not). This server answered
 # a bare Dynamic SQL Error for every one of them.
 #
-# Recorded: `USING DESCENDING INDEX` on a constraint refuses at prepare
-# here (section 3).
+# `USING DESCENDING INDEX` on a constraint names 5 (section 3).
 #
 #   qa/serve-real-keydup.sh [port]
 set -u
@@ -84,16 +83,8 @@ both "2 ...over a text column"                     "CREATE UNIQUE INDEX UX7 ON D
 echo "--- 4 CONTROLS - no duplicate: the key is made"
 both "4 UNIQUE over distinct rows"                 "DELETE FROM D WHERE ID = 3 OR V = 'e'; COMMIT; ALTER TABLE D ADD CONSTRAINT U1 UNIQUE (V);"
 both "4 all-NULL keys do not collide"              "DELETE FROM D WHERE V <> 'e'; COMMIT; ALTER TABLE D ADD CONSTRAINT U1 UNIQUE (ID);"
-echo "--- 3 RECORDED - USING DESCENDING INDEX on a constraint refuses at prepare here"
-ran=$((ran + 1))
-fresh
-S3="ALTER TABLE D ADD CONSTRAINT U4 UNIQUE (ID) USING DESCENDING INDEX UX4;"
-e=$(printf '%s\n' "$S3" | timeout 60 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$ENG" 2>&1 | norm)
-c=$(printf '%s\n' "$S3" | timeout 60 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$FC" 2>&1 | norm)
-if [ "$e" = "$c" ]; then echo "FAIL 3 USING DESCENDING INDEX - IT AGREES NOW; promote the cell"; fail=1
-elif [ "${e#*Problematic key value is (\"ID\" = 5)}" != "$e" ] && [ "${c#Statement failed, SQLSTATE = 42000|Dynamic SQL Error|}" != "$c" ]; then
-    echo "OK   3 USING DESCENDING INDEX (recorded: the engine names 5, this server refuses at prepare)"
-else echo "FAIL 3 USING DESCENDING INDEX moved"; echo "     eng: [$e]"; echo "     fc:  [$c]"; fail=1; fi
+echo "--- 3 USING DESCENDING INDEX on a constraint: 5 comes first (refused at prepare until 2026-10-04)"
+both "3 ADD CONSTRAINT .. USING DESCENDING INDEX"  "ALTER TABLE D ADD CONSTRAINT U4 UNIQUE (ID) USING DESCENDING INDEX UX4;"
 
 echo "--- panic check"
 ran=$((ran + 1))

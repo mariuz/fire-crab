@@ -7470,6 +7470,7 @@ fn run_gbak_restore_core(
                             name: pk_name,
                             columns: ix.segments.clone(),
                             primary: true,
+                            index: None,
                         },
                     );
                     fire_crab_ods::ddl::set_restore_names(None);
@@ -7496,6 +7497,7 @@ fn run_gbak_restore_core(
                             name: cname.clone(),
                             columns: ix.segments.clone(),
                             primary: false,
+                            index: None,
                         },
                     );
                     fire_crab_ods::ddl::set_restore_names(None);
@@ -7605,6 +7607,7 @@ fn run_gbak_restore_core(
                     on_delete: restore_ref_action(&fk.delete_rule)?,
                     // one FK added per call: nothing to order against
                     place: fire_crab_ods::ddl::ConstraintPlace::Table { decl: 0 },
+                    index: None,
                 },
             )?;
         }
@@ -29617,6 +29620,7 @@ fn plan_create_table(sql: &str, db: Option<&Database>) -> Option<(Plan, Vec<Desc
                         name: kname,
                         columns: vec![col.name.clone()],
                         primary,
+                        index: None,
                     },
                 ),
                 place: fire_crab_ods::ddl::ConstraintPlace::Inline {
@@ -29858,6 +29862,39 @@ fn plan_create_table(sql: &str, db: Option<&Database>) -> Option<(Plan, Vec<Desc
     ))
 }
 
+/// A key clause's trailing `USING [ASC[ENDING] | DESC[ENDING]] INDEX
+/// <name>` - the backing index's name and direction (measured on 2196:
+/// the index takes that name, RDB$INDEX_TYPE 1 when descending, for a
+/// PRIMARY KEY, a UNIQUE and a FOREIGN KEY, in CREATE TABLE and ALTER
+/// TABLE alike). The clause text before it, and None when it is absent;
+/// the outer None is a USING that does not parse.
+fn strip_using_index(t: &str) -> Option<(&str, Option<(String, bool)>)> {
+    let up = t.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let Some(at) = find_word_depth0(&masked, "USING", 0) else {
+        return Some((t, None));
+    };
+    let mut words = t[at + "USING".len()..].split_whitespace();
+    let mut w = words.next()?;
+    let mut desc = false;
+    match w.to_ascii_uppercase().as_str() {
+        "ASC" | "ASCENDING" => w = words.next()?,
+        "DESC" | "DESCENDING" => {
+            desc = true;
+            w = words.next()?;
+        }
+        _ => {}
+    }
+    if !w.eq_ignore_ascii_case("INDEX") {
+        return None;
+    }
+    let name = canon_ident(words.next()?)?;
+    if words.next().is_some() {
+        return None;
+    }
+    Some((t[..at].trim_end(), Some((name, desc))))
+}
+
 /// Parse one table-level `[CONSTRAINT <name>] PRIMARY KEY|UNIQUE
 /// (<cols>)` clause from an already-uppercased CREATE TABLE item.
 /// None if the item is something else (a column definition or another
@@ -29879,12 +29916,13 @@ fn parse_key_clause(up_item: &str) -> Option<fire_crab_ods::ddl::KeyDef> {
     } else {
         return None;
     };
+    let (rest, index) = strip_using_index(rest.trim())?;
     let rest = rest.trim();
     if !(rest.starts_with('(') && rest.ends_with(')')) {
         return None;
     }
     let columns = split_ident_list(&rest[1..rest.len() - 1])?;
-    Some(fire_crab_ods::ddl::KeyDef { name, columns, primary })
+    Some(fire_crab_ods::ddl::KeyDef { name, columns, primary, index })
 }
 
 /// Parse one table-level `[CONSTRAINT <name>] FOREIGN KEY (<cols>)
@@ -29915,6 +29953,7 @@ fn parse_fk_clause(
         return None;
     }
     let after = rest[close + 1..].trim_start().strip_prefix("REFERENCES")?;
+    let (after, index) = strip_using_index(after)?;
     let (ref_table, ref_columns, on_update, on_delete) = parse_references_tail(after)?;
     Some(fire_crab_ods::ddl::ForeignKeyDef {
         name,
@@ -29924,6 +29963,7 @@ fn parse_fk_clause(
         on_update,
         on_delete,
         place,
+        index,
     })
 }
 
@@ -30071,6 +30111,7 @@ fn parse_inline_references(
         on_update,
         on_delete,
         place: fire_crab_ods::ddl::ConstraintPlace::Inline { col, at },
+        index: None,
     })
 }
 
