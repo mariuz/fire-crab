@@ -41717,9 +41717,15 @@ fn execute_dml_collecting_inner(
             (0, 0, 0)
         }
         Plan::CreateIndex { table, name, cols, unique, descending } => {
-            fire_crab_ods::ddl::create_index(
+            if let Err(e) = fire_crab_ods::ddl::create_index(
                 &mut work, db.page_size, table, name, cols, *unique, *descending, false, None,
-            )?;
+            ) {
+                // a UNIQUE index over duplicate rows: isc_no_dup inside
+                // "CREATE INDEX @1 failed" ([dup_key_build_err])
+                let obj = format!("\"PUBLIC\".\"{}\"", name.trim().trim_matches('"'));
+                return Err(dup_key_build_err(&work, db.page_size, table, cols, &e, 336397316, obj, Some(name))
+                    .unwrap_or_else(|| e.into()));
+            }
             (0, 0, 0)
         }
         Plan::DropTable { name } => {
@@ -42147,7 +42153,11 @@ fn execute_dml_collecting_inner(
             for step in then {
                 match step {
                     Plan::AlterTableAddKey { table, key } => {
-                        fire_crab_ods::ddl::alter_table_add_key(&mut work, db.page_size, table, key)?
+                        if let Err(e) = fire_crab_ods::ddl::alter_table_add_key(&mut work, db.page_size, table, key) {
+                            let obj = format!("\"PUBLIC\".\"{}\"", table.trim_end());
+                            return Err(dup_key_build_err(&work, db.page_size, table, &key.columns, &e, ALTER_TABLE_FAILED, obj, None)
+                                .unwrap_or_else(|| e.into()));
+                        }
                     }
                     Plan::AlterTableAddFk { table, fk } => {
                         fire_crab_ods::ddl::alter_table_add_foreign_key(&mut work, db.page_size, table, fk)?
@@ -42259,7 +42269,11 @@ fn execute_dml_collecting_inner(
             (0, 0, 0)
         }
         Plan::AlterTableAddKey { table, key } => {
-            fire_crab_ods::ddl::alter_table_add_key(&mut work, db.page_size, table, key)?;
+            if let Err(e) = fire_crab_ods::ddl::alter_table_add_key(&mut work, db.page_size, table, key) {
+                let obj = format!("\"PUBLIC\".\"{}\"", table.trim_end());
+                return Err(dup_key_build_err(&work, db.page_size, table, &key.columns, &e, ALTER_TABLE_FAILED, obj, None)
+                    .unwrap_or_else(|| e.into()));
+            }
             (0, 0, 0)
         }
         Plan::AlterTableDrop { table, column } => {
@@ -45447,6 +45461,63 @@ fn check_violation_err(table: &str, c: &TableCheck) -> ExecErr {
 /// codes). The key text is the written row's own values on the index's
 /// columns; when it cannot render, the key item is omitted, as the
 /// engine omits it when `print_key` throws.
+/// A KEY BUILT OVER ROWS THAT HOLD IT TWICE - `ALTER TABLE .. ADD
+/// [CONSTRAINT ..] PRIMARY KEY | UNIQUE`, `CREATE UNIQUE INDEX` - is the
+/// engine's unique-key violation (a bare unique index: isc_no_dup) inside
+/// the statement's "<VERB> @1 failed", naming the FIRST key the build met
+/// twice in the index's own order (measured on 2196: duplicates of 5 and
+/// of 3 name `("ID" = 3)`; a partial-NULL compound key collides,
+/// `("ID" = NULL, "V" = 'e')`). It answered a bare Dynamic SQL Error.
+/// `e` is the build's own message ([fire_crab_ods::btw::build_index_bulk]
+/// carries the record, [fire_crab_ods::ddl] the constraint name).
+fn dup_key_build_err(
+    work: &fire_crab_ods::Image,
+    page_size: usize,
+    table: &str,
+    cols: &[String],
+    e: &str,
+    verb: i32,
+    object: String,
+    bare_index: Option<&str>,
+) -> Option<ExecErr> {
+    let rest = e.strip_prefix("duplicate key in unique index at record ")?;
+    let (recno, constraint) = match rest.split_once(" constraint ") {
+        Some((r, c)) => (r.trim().parse::<u64>().ok()?, Some(c.trim().to_string())),
+        None => (rest.trim().parse::<u64>().ok()?, None),
+    };
+    let rel = fire_crab_ods::resolve_relation(work, page_size, table)?;
+    let formats = fire_crab_ods::relation_formats(work, page_size, rel);
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let values = fire_crab_ods::ddl::record_values_at(work, page_size, rel, recno, descs)?;
+    let columns = relation_columns(work, page_size, table);
+    let mut owned: Vec<(String, Value)> = Vec::with_capacity(cols.len());
+    for c in cols {
+        let rc = columns.iter().find(|rc| col_name_is(&rc.name, c))?;
+        let fid = rc.field_id as usize;
+        let v = values.get(fid).cloned().unwrap_or(Value::Null);
+        // a CHAR prints without its pad, a byte carrier as its bytes - as
+        // [unique_violation_err] prints a DML's key
+        let v = match (v, descs.get(fid)) {
+            (Value::Text(t), Some(d)) if d.dtype == dtype::TEXT => Value::Text(carrier_key_text(t.trim_end_matches(' '), d)),
+            (Value::Text(t), Some(d)) if d.dtype == dtype::VARYING => Value::Text(carrier_key_text(&t, d)),
+            (v, _) => v,
+        };
+        owned.push((rc.name.clone(), v));
+    }
+    let parts: Vec<(String, &Value)> = owned.iter().map(|(n, v)| (n.clone(), v)).collect();
+    let key = constraint_key_text(&parts);
+    let inner = match (constraint, bare_index) {
+        (Some(c), _) => EvalErr::UniqueKeyViolation {
+            constraint: quoted_bare(&c),
+            table: quoted_qualified(table),
+            key,
+        },
+        (None, Some(ix)) => EvalErr::NoDup { index: quoted_qualified(ix), key },
+        (None, None) => return None,
+    };
+    Some(ExecErr::Eval(EvalErr::DdlFailed { verb, object, inner: Box::new(inner) }))
+}
+
 fn unique_violation_err(
     db: &Database,
     table: &str,
@@ -135735,9 +135806,10 @@ fn after_auth(
                     };
                     if std::env::var("FC_SRV_TRACE").is_ok() {
                         eprintln!(
-                            "[srv] op_transaction: {} snapshot={:?}",
+                            "[srv] op_transaction: {} snapshot={:?} tpb={:?}",
                             if read_committed { "read committed" } else { "concurrency" },
-                            db.snapshot
+                            db.snapshot,
+                            tpb
                         );
                     }
                 }
@@ -137039,8 +137111,20 @@ fn after_auth(
                             );
                         }
                         last_dml = (0, 0, 0);
+                        // THE TRANSACTION IS GONE, and the answer says so:
+                        // the engine's object field is 0 after a DSQL
+                        // COMMIT / ROLLBACK (only RETAIN keeps it), and the
+                        // client drops its transaction object on a 0
+                        // (client/interface.cpp:3802) - so isql opens its
+                        // next one with `SET TRANSACTION`, a SNAPSHOT.
+                        // Echoing the old handle kept isql on a dead one,
+                        // which this server then ran READ COMMITTED: a
+                        // SELECT after `COMMIT` saw another attachment's
+                        // later commit (measured: engine 1 row, here 2;
+                        // MON$ISOLATION_MODE 1 on the engine)
+                        let resp_obj = if *retain { resp_tx } else { 0 };
                         match ended {
-                            Ok(()) => respond(&mut s, &mut enc, resp_tx)?,
+                            Ok(()) => respond(&mut s, &mut enc, resp_obj)?,
                             Err(e) => {
                                 let path =
                                     database.as_ref().map(|d| d.path.clone()).unwrap_or_default();

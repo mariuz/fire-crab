@@ -118,7 +118,11 @@ FA2=$(blobs_of "$A" 'RDB$FIELDS')
 check "...the rolled-back mints stay beside their dead versions (+2)" "$FA2" "$((FA + 2))"
 "$GFIX" -sweep -user "$U" -pas "$P" "$A" >/dev/null 2>&1
 FA3=$(blobs_of "$A" 'RDB$FIELDS')
-check "...and the ENGINE's sweep collects dead versions and mints together" "$FA3" "$FA"
+# (AT MOST FA, not exactly: since 2026-10-04 a commit keeps the catalog
+# version a live sibling snapshot still reads - isql's main transaction
+# beside its DDL one - and once that session is gone the sweep collects
+# it and its blob as well)
+bounded "...and the ENGINE's sweep collects dead versions and mints together" "$FA3" "$FA"
 
 # --- GRANT/REVOKE + COMMENT churn: the ACL and description blobs ---
 { printf 'CREATE TABLE GT (ID INTEGER);\nCOMMIT;\n'

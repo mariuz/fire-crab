@@ -55,10 +55,16 @@ Short, actionable items. The long-form engineering backlog lives in
 - [x] A sibling transaction's snapshot (isql's main one beside its DDL transaction) read NO ROW for an altered
       table: the commit purged the old RDB$RELATIONS version. The purge now keeps exactly the versions a live
       sibling snapshot reads and collects the rest, blobs included (`gc::purge_row_chain_keeping`, altermulti 5).
-- [ ] ...but a COMMENT rewritten twice under such a snapshot reads the NEWEST description where the engine reads
-      the one it began with (altermulti 5, recorded) - cause not yet traced.
-- [ ] A key added over duplicate rows (single or multi-clause) answers a bare Dynamic SQL Error; the engine names
-      the constraint and the key value (altermulti 1b, recorded).
+- [x] The transaction isql opens after a DSQL COMMIT / ROLLBACK ran READ COMMITTED here: the answer echoed the
+      ended transaction's handle where the engine answers object 0, so isql never re-opened with `SET
+      TRANSACTION` (a SNAPSHOT) and a SELECT after COMMIT saw another attachment's later commit
+      (`qa/serve-real-txrestart.sh`; the COMMENT-under-a-snapshot cell of altermulti was the same cause).
+- [x] A key added over duplicate rows (ADD CONSTRAINT, single or multi-clause, and CREATE UNIQUE INDEX) answers
+      the engine's vector, naming the first key in index order (`qa/serve-real-keydup.sh`).
+- [ ] `ADD CONSTRAINT .. USING [DESCENDING] INDEX ..` refuses at prepare (keydup 3, recorded).
+- [x] The backup wrote auto-domains under INVENTED RDB$<n> names in table-then-column order - right only while the
+      catalog rows sat in that order; a reused RDB$RELATIONS slot restored them under other names than the engine's
+      backup of the same file (empbackup). They keep their real names now.
 - [x] Schema-qualified DDL (`CREATE TABLE PUBLIC.T7 ..`, every kind, a view body over `PUBLIC.T`) and an
       unknown schema's vector (`qa/serve-real-ddlqualified.sh`).
 - [x] A select list holding `GEN_ID(..)` / NEXT VALUE FOR beside a stored function call (fnwhere section 10).

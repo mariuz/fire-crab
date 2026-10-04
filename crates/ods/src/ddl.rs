@@ -5769,7 +5769,10 @@ fn write_key(
     };
     create_index(
         file, page_size, table, &iname, &key.columns, true, false, key.primary, None,
-    )?;
+    )
+    // the build met a key twice: the message names the CONSTRAINT, an
+    // unnamed one by the INTEG_<n> it was given (measured: "INTEG_2")
+    .map_err(|e| if e.starts_with("duplicate key in unique index at record") { format!("{e} constraint {cname}") } else { e })?;
     sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
         ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
         ("RDB$CONSTRAINT_TYPE",
@@ -9657,6 +9660,33 @@ fn backfill_index_inner(
         k.then(a.1.cmp(&b.1))
     });
     btw::build_index_bulk(file, page_size, rel, slot as u8, &keyed, unique, primary)
+}
+
+/// The VISIBLE version of record `recno` of `rel`, decoded under
+/// `descs` - the read [backfill_index] keys a row from, for the message
+/// that names a key the build found twice.
+pub fn record_values_at(
+    file: &crate::Image,
+    page_size: usize,
+    rel: u16,
+    recno: u64,
+    descs: &[Descriptor],
+) -> Option<Vec<Value>> {
+    let recs = max_recs_per_dp(page_size);
+    let (seq, line) = (recno / recs, (recno % recs) as u16);
+    let tips = crate::tra::TipChain::read(file, page_size);
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
+            continue;
+        };
+        if dp.sequence as u64 != seq {
+            continue;
+        }
+        let r = dp.records().find(|r| r.slot == line)?;
+        let img = crate::data::catalog_image(file, page_size, &r, tips.as_ref())?;
+        return Some(decode_record(&img, descs));
+    }
+    None
 }
 
 /// Walk a system relation like [walk_rows], also yielding each row's

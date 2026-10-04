@@ -852,6 +852,9 @@ pub fn write_backup_verbose(
     let field_cats = read_field_cats(image, page_size);
     let mut rel_cols: Vec<(u16, String, Vec<Col>)> = Vec::new();
     let mut next_source = 1usize;
+    // the highest real RDB$<n> a column keeps - the invented names
+    // (parameters, arguments, view expressions) continue past it
+    let mut real_max = 0usize;
     for (id, name) in &user_rels {
         let formats = fire_crab_ods::relation_formats(image, page_size, *id);
         let descs = formats
@@ -899,8 +902,20 @@ pub fn write_backup_verbose(
             // a column bound to a user-NAMED domain keeps the real
             // name through the file; invented RDB$n only for the rest
             let orig = column_source_of(image, page_size, name, &names[i].name);
+            // AN AUTO-DOMAIN KEEPS ITS OWN NAME, as the engine's gbak writes
+            // it (and the restore keeps it): inventing RDB$1, RDB$2, .. in
+            // table-then-column order named them the file's way only while
+            // the catalog rows sat in that order - a reused RDB$RELATIONS
+            // slot (CUSTOMER ahead of PHONE_LIST) restored CUSTOMER.CUSTOMER
+            // as RDB$10 where the engine's backup of the SAME file kept it
+            // RDB$15 (measured)
             let (source, named_domain) = match orig {
                 Some(o) if !o.starts_with("RDB$") => (o, true),
+                Some(o) if o["RDB$".len()..].parse::<usize>().is_ok() => {
+                    let n: usize = o["RDB$".len()..].parse().unwrap_or(0);
+                    real_max = real_max.max(n);
+                    (o, false)
+                }
                 _ => {
                     let s = format!("RDB${}", next_source);
                     next_source += 1;
@@ -939,6 +954,7 @@ pub fn write_backup_verbose(
     // the procedure parameters' invented domains continue the same
     // counter the table columns draw from; the assignment is kept so
     // the rec 28 records can name them
+    next_source = next_source.max(real_max + 1);
     let mut param_domains: Vec<(String, String, String)> = Vec::new(); // (proc, param, RDB$n)
     for pr in &procedures {
         for pp in &pr.params {

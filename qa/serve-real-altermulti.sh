@@ -118,20 +118,10 @@ both "1b interleaved: NOT NULL, PK, a column, CHECK on an old one" "ALTER TABLE 
 both "1b UNNAMED: a PRIMARY KEY and a UNIQUE"  "ALTER TABLE E ADD H INTEGER NOT NULL, ADD PRIMARY KEY (H), ADD UNIQUE (ID); COMMIT; $KEYS"
 both "1b a FOREIGN KEY to a new key"           "CREATE TABLE P (K INTEGER NOT NULL PRIMARY KEY); COMMIT; ALTER TABLE E ADD PK INTEGER, ADD FOREIGN KEY (PK) REFERENCES P (K), ADD CONSTRAINT FK2 FOREIGN KEY (ID) REFERENCES P; COMMIT; $KEYS"
 # a UNIQUE over duplicate rows fails the statement and NOTHING stays - the
-# column clause before it included; the VECTOR is recorded: the engine
-# names the constraint and the key ("U9" on "PUBLIC"."T", ("ID" = 1)),
-# this server's index build reports no key and it answers a bare
-# Dynamic SQL Error - the single-clause ADD CONSTRAINT the same
-ran=$((ran + 1))
-fresh
-S1B="INSERT INTO T VALUES (1); COMMIT; ALTER TABLE T ADD Z INTEGER, ADD CONSTRAINT U9 UNIQUE (ID); COMMIT; $KEYS"
-e=$(printf 'SET LIST ON;\n%s\n%s\n' "$S1B" "$READ" | timeout 60 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$ENG" 2>&1 | norm)
-c=$(printf 'SET LIST ON;\n%s\n%s\n' "$S1B" "$READ" | timeout 60 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$FC" 2>&1 | norm)
-if [ "${e#*violation of PRIMARY or UNIQUE KEY constraint \"U9\"}" = "$e" ]; then echo "FAIL 1b a duplicate - the ENGINE moved [$e]"; fail=1
-elif [ "RDB\$RELATION_NAME${e#*RDB\$RELATION_NAME}" != "RDB\$RELATION_NAME${c#*RDB\$RELATION_NAME}" ]; then
-    echo "DIFF 1b a duplicate: the state after it"; echo "     eng: [$e]"; echo "     fc:  [$c]"; fail=1
-elif [ "$e" = "$c" ]; then echo "FAIL 1b a duplicate - THE VECTOR AGREES NOW; make it a both cell"; fail=1
-else echo "OK   1b a duplicate over the row fails it whole, nothing stays (recorded: the vector)"; fi
+# column clause before it included; the vector names the constraint and
+# the key (recorded as a bare Dynamic SQL Error until 2026-10-04 -
+# serve-real-keydup.sh)
+both "1b a duplicate over the row: the UNIQUE fails, nothing stays" "INSERT INTO T VALUES (1); COMMIT; ALTER TABLE T ADD Z INTEGER, ADD CONSTRAINT U9 UNIQUE (ID); COMMIT; $KEYS"
 echo "--- 4 RECORDED - a clause that is not an ADD, or a COMPUTED column beside others"
 recorded "4 DROP beside ADD"                 "ALTER TABLE T ADD H INTEGER, DROP ID;"
 recorded "4 a CHECK over a column added beside it" "ALTER TABLE T ADD H INTEGER, ADD CONSTRAINT CK5 CHECK (H > 0);"
@@ -181,14 +171,11 @@ SELECT ${R}FORMAT AS F2, ${R}FIELD_ID AS I2 FROM ${R}RELATIONS WHERE ${R}RELATIO
 COMMIT;
 SELECT ${R}FORMAT AS F3, ${R}FIELD_ID AS I3 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';
 SELECT COUNT(*) AS NF FROM ${R}FORMATS F JOIN ${R}RELATIONS R ON R.${R}RELATION_ID = F.${R}RELATION_ID WHERE R.${R}RELATION_NAME = 'T';"
-# RECORDED: a COMMENT is not this purge - its new version is written
-# under an id the snapshot already counts as committed (a DDL-only
-# transaction reserves none; "its catalog rows are settled as they are
-# written"), so the snapshot reads the NEWEST description where the engine
-# reads the one it began with. Pinned both ways.
-ran=$((ran + 1))
-fresh
-S5C="COMMENT ON TABLE T IS 'one';
+# a COMMENT rewritten twice under the snapshot isql opens after a COMMIT:
+# recorded until 2026-10-04 (the snapshot read the NEWEST description) -
+# the cause was the transaction after the COMMIT, not the purge
+# (serve-real-txrestart.sh)
+sib "5 a COMMENT's blob, rewritten under a snapshot" "COMMENT ON TABLE T IS 'one';
 COMMIT;
 SELECT COUNT(*) AS T1 FROM T;
 COMMENT ON TABLE T IS 'two';
@@ -196,12 +183,6 @@ COMMENT ON TABLE T IS 'three';
 SELECT CAST(${R}DESCRIPTION AS VARCHAR(10)) AS F2 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';
 COMMIT;
 SELECT CAST(${R}DESCRIPTION AS VARCHAR(10)) AS F3 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';"
-e=$(printf '%s\n' "$S5C" | timeout 60 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$ENG" 2>&1 | norm)
-c=$(printf '%s\n' "$S5C" | timeout 60 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$FC" 2>&1 | norm)
-if [ "$e" = "$c" ]; then echo "FAIL 5 a COMMENT under a snapshot - IT AGREES NOW; promote the cell"; fail=1
-elif [ "$e" = " T1|=====================| 1|F2|==========|one|F3|==========|three|" ] && [ "$c" = " T1|=====================| 1|F2|==========|three|F3|==========|three|" ]; then
-    echo "OK   5 a COMMENT under a snapshot (recorded: the engine reads 'one', this server the newest)"
-else echo "FAIL 5 a COMMENT under a snapshot moved"; echo "     eng: [$e]"; echo "     fc:  [$c]"; fail=1; fi
 sib "5 the snapshot isql opens at CONNECT, before the first ALTER" "ALTER TABLE T ADD Q INTEGER;
 SELECT ${R}FORMAT AS F2 FROM ${R}RELATIONS WHERE ${R}RELATION_NAME = 'T';
 COMMIT;"
@@ -212,5 +193,5 @@ if grep -aq 'panicked at' "/tmp/fc-serve-altermulti-$PORT.log"; then echo "FAIL 
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 54 ]; then echo "FAIL only $ran checks ran (floor 54) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 56 ]; then echo "FAIL only $ran checks ran (floor 56) - cells went missing"; fail=1; fi
 exit $fail

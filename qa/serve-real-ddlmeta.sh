@@ -137,16 +137,12 @@ pin  "1 ...and on a SECOND commit too (the cache held the empty list)" \
      "CREATE GLOBAL TEMPORARY TABLE G3 (A INTEGER) ON COMMIT DELETE ROWS; COMMIT; INSERT INTO G3 VALUES (1); COMMIT; INSERT INTO G3 VALUES (2); COMMIT; SELECT COUNT(*) FROM G3;" "COUNT|0"
 pin  "1 before the COMMIT the rows are there" \
      "CREATE GLOBAL TEMPORARY TABLE G4 (A INTEGER) ON COMMIT DELETE ROWS; COMMIT; INSERT INTO G4 VALUES (1); SELECT COUNT(*) FROM G4; COMMIT;" "COUNT|1"
-# COMMIT RETAIN keeps the rows on the engine. Here the rows are purged
-# by the plain op_commit isql sends for its OTHER transaction (the DDL
-# one) right after it: the purge walks the rows its transaction SEES,
-# and a retained commit made them committed. Not new - the same happens
-# on the unchanged server for a GTT the fixture made, once the session
-# has run any DDL and a COMMIT - so it is recorded, not fixed here: the
-# fix is to purge only the rows of the committing transaction's own ids
-# (and the ids its retaining commits handed on), which this server does
-# not track per transaction yet.
-recorded "1 COMMIT RETAIN keeps them (another transaction's commit purges them here)" \
+# COMMIT RETAIN keeps the rows on the engine. PROMOTED 2026-10-04: they
+# were purged here by the commit isql sends for its OTHER transaction
+# after a DSQL COMMIT - which happened only because this server answered
+# that COMMIT with the old transaction's handle and isql went on using a
+# transaction that had ended (serve-real-txrestart.sh)
+pin  "1 COMMIT RETAIN keeps them" \
      "CREATE GLOBAL TEMPORARY TABLE G5 (A INTEGER) ON COMMIT DELETE ROWS; COMMIT; INSERT INTO G5 VALUES (1); COMMIT RETAIN; SELECT COUNT(*) FROM G5; COMMIT; SELECT COUNT(*) FROM G5;" "COUNT|1|COUNT|0"
 pin  "1 CONTROL a ROLLBACK takes them back" \
      "CREATE GLOBAL TEMPORARY TABLE G7 (A INTEGER) ON COMMIT DELETE ROWS; COMMIT; INSERT INTO G7 VALUES (1); ROLLBACK; SELECT COUNT(*) FROM G7;" "COUNT|0"
@@ -374,11 +370,10 @@ pin  "13 INCREMENT BY: the next value steps by it, the row carries it" \
      "CREATE SEQUENCE SF START WITH 10 INCREMENT BY 5; COMMIT; ALTER SEQUENCE SF INCREMENT BY 100; SELECT NEXT VALUE FOR SF FROM RDB\$DATABASE; SELECT NEXT VALUE FOR SF FROM RDB\$DATABASE; COMMIT; SELECT RDB\$GENERATOR_INCREMENT FROM RDB\$GENERATORS WHERE RDB\$GENERATOR_NAME = 'SF';" \
      "NEXT_VALUE|105|NEXT_VALUE|205|RDB\$GENERATOR_INCREMENT|100"
 # isql's snapshot, begun before the ALTER, still reads the OLD step off
-# RDB$GENERATORS on the engine; here that SELECT already sees the new
-# one - the catalog-snapshot gap the first pass recorded for a dropped
-# column, a new domain and a new sequence (a user SELECT of those rows
-# is not held to its snapshot here). Recorded, not fixed.
-recorded "13 the old snapshot's SELECT of RDB\$GENERATORS reads the old step" \
+# RDB$GENERATORS on the engine. PROMOTED 2026-10-04: here that SELECT saw
+# the new one because isql's transaction after a COMMIT was served READ
+# COMMITTED (serve-real-txrestart.sh)
+pin  "13 the old snapshot's SELECT of RDB\$GENERATORS reads the old step" \
      "CREATE SEQUENCE S5 START WITH 10 INCREMENT BY 5; COMMIT; ALTER SEQUENCE S5 INCREMENT BY 100; SELECT RDB\$GENERATOR_INCREMENT FROM RDB\$GENERATORS WHERE RDB\$GENERATOR_NAME = 'S5'; COMMIT;" \
      "RDB\$GENERATOR_INCREMENT|5"
 pin  "13 RESTART WITH + INCREMENT BY, a bare RESTART, INCREMENT without BY" \

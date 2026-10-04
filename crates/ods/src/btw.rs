@@ -1127,7 +1127,11 @@ pub fn build_index_bulk(
             let (a, b) = (&w[0], &w[1]);
             let dup_counts = (unique && !a.0.is_empty() && !a.2 && !b.2) || primary;
             if dup_counts && a.0 == b.0 && a.1 != b.1 {
-                return Err("duplicate key in unique index".into());
+                // the record the build met SECOND - the first collision in
+                // the index's own order, which is the key the engine's
+                // message names (measured: duplicates of 5 and of 3 name
+                // 3 ascending, 5 descending)
+                return Err(format!("duplicate key in unique index at record {}", b.1));
             }
         }
     }
