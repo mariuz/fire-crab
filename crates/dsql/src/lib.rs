@@ -522,14 +522,16 @@ fn emit_dsc(out: &mut Vec<u8>, d: Dsc) {
             out.push(sc as u8);
         }
         Dsc::Text(l) => {
+            let (cs, bpc) = DEFAULT_CS.with(|c| c.get());
             out.push(blr::TEXT2);
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&l.to_le_bytes());
+            out.extend_from_slice(&cs.to_le_bytes());
+            out.extend_from_slice(&l.saturating_mul(bpc).to_le_bytes());
         }
         Dsc::Varying(l) => {
+            let (cs, bpc) = DEFAULT_CS.with(|c| c.get());
             out.push(blr::VARYING2);
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&l.to_le_bytes());
+            out.extend_from_slice(&cs.to_le_bytes());
+            out.extend_from_slice(&l.saturating_mul(bpc).to_le_bytes());
         }
         Dsc::Date => out.push(blr::DATE),
         Dsc::Time => out.push(blr::TIME),
@@ -8554,9 +8556,13 @@ impl<'a> P<'a> {
             if !self.kw("END") {
                 return None;
             }
-            // an optional ; after END
+            // NO `;` after a block's END: a block is a compound statement,
+            // which takes no terminator - `BEGIN BEGIN EXIT; END; END` is
+            // the engine's -104 Token unknown at that `;` (measured on 2196
+            // for procedures, triggers and EXECUTE BLOCK alike, after a
+            // plain block, a WHILE's and an IF's). This accepted it.
             if matches!(self.t.get(self.i), Some(Tok::Semi)) {
-                self.i += 1;
+                return None;
             }
             return Some(if handlers.is_empty() {
                 TrigStmt::Block(stmts)
@@ -10132,10 +10138,21 @@ struct Typing {
 }
 
 thread_local! {
+    /// the DATABASE's default character set for a text type written
+    /// without one - (charset id, bytes per character); (0, 1) is NONE,
+    /// the only database this crate was measured against before
+    static DEFAULT_CS: std::cell::Cell<(u16, u16)> = const { std::cell::Cell::new((0, 1)) };
     static TYPING: std::cell::RefCell<Typing> = std::cell::RefCell::new(Typing::default());
     /// (relation or procedure name, its column or output names): what a
     /// bare column name across several streams resolves through
     static CATALOG: std::cell::RefCell<Vec<(String, Vec<String>)>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// The database's default character set, for the text types a body
+/// declares without one (`DECLARE W VARCHAR(60)` in a UTF8 database is
+/// `blr_varying2` charset 4, 240 BYTES - measured). (0, 1) restores NONE.
+pub fn set_default_charset(charset: u16, bytes_per_char: u16) {
+    DEFAULT_CS.with(|c| c.set((charset, bytes_per_char.max(1))));
 }
 
 /// Hand the compiler the columns of the tables (and the outputs of the

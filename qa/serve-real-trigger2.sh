@@ -146,10 +146,13 @@ case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS BEGIN V = 1; END')" 
 case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS DECLARE VARIABLE V VARCHAR(5); BEGIN NEW.B = 1; END')" in
     ERR*) echo "DIFF vartype: a text variable should compile now"; fail=1 ;;
     *) echo "OK   a text variable type compiles"; node_run 'DROP TRIGGER TX' >/dev/null 2>&1 ;; esac
-# ...while a type whose BLR shape is still unprobed refuses
+# ...and a TIMESTAMP one too since 2026-10-04: the DSQL compiler's
+# blr_timestamp declaration is the engine's byte for byte (measured), so
+# what was the unprobed-shape refusal is an answer; dropped again for
+# the whole-set comparisons below
 case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS DECLARE VARIABLE V TIMESTAMP; BEGIN NEW.B = 1; END')" in
-    ERR*) echo "OK   a variable type with no probed shape still refuses" ;;
-    *) echo "DIFF vartype refusal"; fail=1 ;; esac
+    ERR*) echo "DIFF vartype: a TIMESTAMP variable should compile now"; fail=1 ;;
+    *) echo "OK   a TIMESTAMP variable compiles"; node_run 'DROP TRIGGER TX' >/dev/null 2>&1 ;; esac
 case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS BEGIN ELSE NEW.B = 1; END')" in
     ERR*) echo "OK   ELSE without an IF refuses" ;;
     *) echo "DIFF else refusal"; fail=1 ;; esac

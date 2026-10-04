@@ -518,9 +518,12 @@ SET TERM ;^
 SQL
 )
 case "$out" in
+    # ACCEPTED since 2026-10-04: the DSQL compiler emits a FOR SELECT body,
+    # its BLR the engine's byte for byte (serve-real-trigbody.sh compares
+    # the stored rows and has the engine fire them)
     *"Statement failed"*|*error*|*ERROR*)
-        echo "OK   teeth: a trigger body with FOR SELECT is refused, not silently emitted" ;;
-    *) echo "DIFF a trigger with FOR SELECT was accepted: [$out]"; fail=1 ;;
+        echo "DIFF a trigger body with FOR SELECT refused: [$out]"; fail=1 ;;
+    *) echo "OK   a trigger body with FOR SELECT compiles" ;;
 esac
 
 # --- STATEMENT-LEVEL ATOMICITY ----------------------------------------

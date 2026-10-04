@@ -24719,6 +24719,22 @@ fn expr_resolve_vars(
 fn parse_store_expr(text: &str, vars: &[String]) -> Option<fire_crab_ods::expr::Expr> {
     let (cleaned, marked) = colon_clean(text, vars)?;
     let e = parse_expr(cleaned.trim())?;
+    // A CONTEXT VARIABLE is not a column: the arithmetic parser reads
+    // `CURRENT_TIMESTAMP` as a field NAME, and the store then wrote
+    // `"CURRENT_TIMESTAMP"` - a column nobody has - so a trigger storing
+    // it refused every INSERT on its table (measured: `INSERT INTO AL (L,
+    // W) VALUES (CURRENT_TIMESTAMP, 'y')` in a trigger body). Declined
+    // here, the value is kept as written and evaluated by the planner,
+    // the path the same value already took without a column list.
+    if e.field_refs().iter().any(|f| {
+        matches!(
+            f.to_ascii_uppercase().as_str(),
+            "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIME" | "LOCALTIMESTAMP"
+                | "CURRENT_USER" | "CURRENT_ROLE" | "USER" | "CURRENT_CONNECTION" | "CURRENT_TRANSACTION"
+        )
+    }) {
+        return None;
+    }
     Some(expr_resolve_marked(&e, vars, &marked))
 }
 
@@ -27066,6 +27082,7 @@ fn parse_trig_stmt(
         // split the value list on TOP-LEVEL commas
         let body = &text[vopen + 1..vclose];
         let mut exprs = Vec::new();
+        let mut unparsed = false;
         let mut depth = 0i32;
         let mut seg = 0usize;
         for (i, ch) in body.char_indices() {
@@ -27073,7 +27090,13 @@ fn parse_trig_stmt(
                 '(' => depth += 1,
                 ')' => depth -= 1,
                 ',' if depth == 0 => {
-                    exprs.push(parse_store_expr(body[seg..i].trim(), vars)?);
+                    // a value the arithmetic grammar cannot hold keeps the
+                    // whole VALUES text instead (below) - it does not
+                    // refuse the statement
+                    match parse_store_expr(body[seg..i].trim(), vars) {
+                        Some(e) => exprs.push(e),
+                        None => unparsed = true,
+                    }
                     seg = i + 1;
                 }
                 _ => {}
@@ -27084,7 +27107,7 @@ fn parse_trig_stmt(
         // (unchanged), and if any does not the VALUES TEXT is kept
         // whole for the planner to read.
         let last = parse_store_expr(body[seg..].trim(), vars);
-        let all_parsed = last.is_some() && exprs.len() + 1 == cols.len();
+        let all_parsed = !unparsed && last.is_some() && exprs.len() + 1 == cols.len();
         if all_parsed {
             exprs.push(last?);
             return Some(TrigStmt::Store { table, cols, exprs, raw: None, src_off: start });
@@ -27996,7 +28019,385 @@ fn plan_trigger_table(table: &str) -> Option<&str> {
     (!table.is_empty()).then_some(table)
 }
 
+/// THE SQL-2003 TRIGGER HEADER - `CREATE TRIGGER T [ACTIVE | INACTIVE]
+/// {BEFORE | AFTER} <event> [OR <event> ..] ON <table> [POSITION n] AS ..`
+/// - rewritten into the Firebird `FOR <table>` form the planner reads.
+/// The two declare the same trigger (measured on 2196: identical
+/// RDB$TRIGGERS rows - type, sequence, inactive flag, relation); only the
+/// body after AS is stored, so the header's spelling leaves no trace.
+/// None for every other header (a `FOR` one, a database `ON CONNECT`
+/// one, a DDL one).
+fn sql2003_trigger_header(sql: &str) -> Option<String> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let trig_kw = find_word(&masked, "TRIGGER", 0)?;
+    let as_kw = find_word(&masked, "AS", trig_kw + "TRIGGER".len())?;
+    let head = &masked[trig_kw + "TRIGGER".len()..as_kw];
+    if find_word(head, "FOR", 0).is_some() {
+        return None;
+    }
+    let base = trig_kw + "TRIGGER".len();
+    let first = ["ACTIVE", "INACTIVE", "BEFORE", "AFTER"]
+        .iter()
+        .filter_map(|k| find_word(head, k, 0))
+        .min()?;
+    let on_at = find_word(head, "ON", first)?;
+    let name = s[base..base + first].trim();
+    if name.is_empty() {
+        return None;
+    }
+    // the words between the name and ON: [ACTIVE|INACTIVE] BEFORE|AFTER
+    // <INSERT|UPDATE|DELETE> [OR ...] - nothing else
+    let mid: Vec<&str> = head[first..on_at].split_whitespace().collect();
+    let mut i = 0;
+    if matches!(mid.get(i), Some(&"ACTIVE") | Some(&"INACTIVE")) {
+        i += 1;
+    }
+    if !matches!(mid.get(i), Some(&"BEFORE") | Some(&"AFTER")) {
+        return None;
+    }
+    i += 1;
+    loop {
+        if !matches!(mid.get(i), Some(&"INSERT") | Some(&"UPDATE") | Some(&"DELETE")) {
+            return None;
+        }
+        i += 1;
+        match mid.get(i) {
+            Some(&"OR") => i += 1,
+            None => break,
+            _ => return None,
+        }
+    }
+    // after ON: the table, then an optional POSITION n
+    let after_on = &s[base + on_at + "ON".len()..as_kw];
+    let tail_up: Vec<&str> = masked[base + on_at + "ON".len()..as_kw].split_whitespace().collect();
+    let (table, position) = match tail_up.as_slice() {
+        [_t] => (after_on.trim().to_string(), String::new()),
+        [_t, "POSITION", n] if n.parse::<i64>().is_ok() => {
+            let p = find_word(&masked[..as_kw], "POSITION", base + on_at)?;
+            (s[base + on_at + "ON".len()..p].trim().to_string(), format!(" POSITION {n}"))
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "{} {} FOR {} {}{} {}",
+        &s[..base],
+        name,
+        table,
+        &s[base + first..base + on_at].trim(),
+        position,
+        &s[as_kw..]
+    ))
+}
+
 fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    plan_create_trigger_strict(sql, db).or_else(|| plan_create_trigger_dsql(sql, db))
+}
+
+/// A RELATION TRIGGER WHOSE BODY THIS SERVER'S OWN EMITTER CANNOT
+/// EXPRESS - a CURRENT_TIMESTAMP or a COALESCE in a stored value, an
+/// INSERT without a column list, a TIMESTAMP target column, FOR SELECT,
+/// SELECT INTO - compiled by the DSQL compiler instead, whose trigger BLR
+/// is the engine's byte for byte (`qa/dsql-trig-blr.sh`), with the
+/// catalog of the tables the text names. The header is the strict
+/// planner's own reading (over an empty body); the NEW./OLD. names are
+/// checked against the table and the event as the engine checks them;
+/// the dependency rows come from the stored BLR as for every trigger.
+/// What is NOT the engine's: RDB$DEBUG_INFO is left empty (the compiler
+/// keeps no source map - the same recorded gap as a procedure's).
+fn plan_create_trigger_dsql(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let rewritten = sql2003_trigger_header(sql);
+    let sql = rewritten.as_deref().unwrap_or(sql);
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "CREATE", 0) != Some(0) {
+        return None;
+    }
+    let trig_kw = find_word(&masked, "TRIGGER", "CREATE".len())?;
+    let as_kw = find_word(&masked, "AS", trig_kw + "TRIGGER".len())?;
+    let (head_plan, _) = plan_create_trigger_strict(&format!("{} AS BEGIN END", &s[..as_kw]), db)?;
+    let Plan::CreateTrigger { table, mut def } = head_plan else { return None };
+    if table.is_empty() {
+        return None; // a database trigger has no NEW/OLD to check here
+    }
+    let dbr = db.as_ref()?;
+    let columns = dbr.columns(&table);
+    let head = &masked[trig_kw..as_kw];
+    let before = find_word(head, "BEFORE", 0).is_some();
+    let ev = |w: &str| find_word(head, w, 0).is_some();
+    let (old_ok, new_ok) = (ev("UPDATE") || ev("DELETE"), ev("INSERT") || ev("UPDATE"));
+    // every NEW.<col> / OLD.<col>: a column of the table, a context the
+    // events give, and NEW assigned only BEFORE an INSERT or UPDATE
+    let body = &masked[as_kw..];
+    let bb = body.as_bytes();
+    for (ctx, ok) in [("NEW.", new_ok), ("OLD.", old_ok)] {
+        let mut from = 0;
+        while let Some(i) = body[from..].find(ctx).map(|i| i + from) {
+            from = i + ctx.len();
+            if i > 0 && is_ident_byte(bb[i - 1]) {
+                continue; // a longer name ending in NEW / OLD
+            }
+            if !ok {
+                return None;
+            }
+            let rest = &s[as_kw + i + ctx.len()..];
+            let (name, used) = scan_canon_ref(rest, 0, 1, false)?;
+            if !columns.iter().any(|c| c.name == name) {
+                return None;
+            }
+            let after = body[i + ctx.len() + used..].trim_start();
+            let assigns = after.starts_with('=') && !after.starts_with("==");
+            let prev = body[..i].trim_end();
+            let stmt_start = prev.is_empty()
+                || prev.ends_with(';')
+                || ["BEGIN", "THEN", "ELSE", "DO", "AS"].iter().any(|k| prev.ends_with(k));
+            if assigns && stmt_start && (ctx == "OLD." || !before) {
+                return None;
+            }
+        }
+    }
+    // the OBJECTS the body names must exist - the engine refuses a CREATE
+    // naming an exception or a sequence nobody defined (measured:
+    // `EXCEPTION NOSUCH` is `exception "PUBLIC"."NOSUCH" not defined`);
+    // the DSQL compiler emits the name without asking
+    let named_after = |kw: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut from = as_kw;
+        while let Some(k) = find_word(&masked, kw, from) {
+            from = k + kw.len();
+            let at = from + (masked[from..].len() - masked[from..].trim_start().len());
+            let rest = &s[at..];
+            if rest.starts_with(';') || rest.starts_with('(') {
+                continue; // a bare re-raise, or GEN_ID's own paren below
+            }
+            if let Some((n, _)) = scan_canon_ref(rest, 0, 1, false) {
+                out.push(n);
+            }
+        }
+        out
+    };
+    for e in named_after("EXCEPTION") {
+        if !exception_exists(dbr, &e) {
+            return None;
+        }
+    }
+    let mut seqs: Vec<String> = Vec::new();
+    let mut from = as_kw;
+    while let Some(k) = find_word(&masked, "VALUE", from) {
+        from = k + "VALUE".len();
+        let at = from + (masked[from..].len() - masked[from..].trim_start().len());
+        if find_word(&masked[at..], "FOR", 0) == Some(0) {
+            let n_at = at + 3 + (masked[at + 3..].len() - masked[at + 3..].trim_start().len());
+            if let Some((n, _)) = scan_canon_ref(&s[n_at..], 0, 1, false) {
+                seqs.push(n);
+            }
+        }
+    }
+    let mut from = as_kw;
+    while let Some(k) = find_word(&masked, "GEN_ID", from) {
+        from = k + "GEN_ID".len();
+        let at = from + (masked[from..].len() - masked[from..].trim_start().len());
+        if s[at..].starts_with('(') {
+            let n_at = at + 1 + (masked[at + 1..].len() - masked[at + 1..].trim_start().len());
+            if let Some((n, _)) = scan_canon_ref(&s[n_at..], 0, 1, false) {
+                seqs.push(n);
+            }
+        }
+    }
+    for g in seqs {
+        generator_id(dbr, &g)?;
+    }
+    let begin_kw = find_word(&masked, "BEGIN", as_kw)?;
+    if bare_var_in_dml(&s[begin_kw..], &declared_names(&s[as_kw..begin_kw])) {
+        return None; // the engine's -206 on the bare name
+    }
+    let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+    let body_text = expand_listless_inserts(&s[as_kw..], dbr)?;
+    let synth = format!("CREATE TRIGGER X FOR {} BEFORE INSERT {}", quoted, body_text);
+    fire_crab_dsql::set_catalog(dsql_catalog_for(db, &synth));
+    let cs = db_default_charset(&dbr.bytes(), dbr.page_size);
+    fire_crab_dsql::set_default_charset(cs as u16, fire_crab_ods::intl::bytes_per_char(cs) as u16);
+    let blr = fire_crab_dsql::compile_trigger(&synth);
+    fire_crab_dsql::set_default_charset(0, 1);
+    fire_crab_dsql::set_catalog(Vec::new());
+    def.blr = blr?;
+    // every name the BLR carries must resolve, as the engine's compiler
+    // checks (a table, a column, a procedure, a sequence, an exception)
+    fire_crab_ods::ddl::blr_names_resolve(&dbr.bytes(), dbr.page_size, &def.blr, &def.name, Some(&table)).ok()?;
+    def.source = raw_source(s, &s[as_kw..]);
+    def.debug = Vec::new();
+    Some((Plan::CreateTrigger { table, def }, Vec::new()))
+}
+
+/// `INSERT INTO <t> VALUES (..)` / `INSERT INTO <t> SELECT ..` with no
+/// column list, spelled with one: the table's READ-WRITE columns (a
+/// COMPUTED one is not among them) in POSITION order - the engine's own
+/// mapping (measured on 2196: over `(A, C COMPUTED, B, I IDENTITY)` three
+/// values land in A, B, I; after `ALTER .. B POSITION 1` in B, A, I; four
+/// values are -804 "Count of read-write columns does not equal count of
+/// values"). None when a named table is not in the catalog.
+fn expand_listless_inserts(text: &str, db: &Database) -> Option<String> {
+    let up = text.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    let mut from = 0usize;
+    while let Some(ins) = find_word(&masked, "INSERT", from) {
+        from = ins + "INSERT".len();
+        let Some(into) = find_word(&masked, "INTO", from) else { continue };
+        if !masked[from..into].trim().is_empty() {
+            continue;
+        }
+        let name_at = into + "INTO".len();
+        let name_at = name_at + (masked[name_at..].len() - masked[name_at..].trim_start().len());
+        let Some((table, used)) = scan_canon_ref(&text[name_at..], 0, 1, false) else { continue };
+        let after = name_at + used;
+        let rest = masked[after..].trim_start();
+        if !(rest.starts_with("VALUES") || rest.starts_with("SELECT")) {
+            continue; // a column list (or something else) follows
+        }
+        let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, &table)?;
+        let formats = relation_formats(&db.bytes(), db.page_size, rel);
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+        let mut cols: Vec<RelationColumn> = db.columns(&table).as_ref().clone();
+        cols.sort_by_key(|c| c.position);
+        let names: Vec<String> = cols
+            .iter()
+            .filter(|c| !descs.get(c.field_id as usize).is_some_and(|d| d.offset == 0 && d.length != 0))
+            .map(|c| format!("\"{}\"", c.name.replace('"', "\"\"")))
+            .collect();
+        out.push_str(&text[last..after]);
+        out.push_str(&format!(" ({})", names.join(", ")));
+        last = after;
+    }
+    out.push_str(&text[last..]);
+    Some(out)
+}
+
+/// A LOCAL NAME WRITTEN BARE INSIDE A DML STATEMENT of a PSQL body. The
+/// engine resolves every bare name in a SELECT / INSERT / UPDATE / DELETE /
+/// MERGE as a COLUMN - a variable there needs its colon - so `VALUES (V,
+/// 1)` and `SET Y = V` over a declared V are its -206 "Column unknown V"
+/// at CREATE (measured on 2196, for triggers and procedures alike), and a
+/// V that IS also a column reads the column. The DSQL compiler binds the
+/// variable either way. True when any statement does it; the INTO lists
+/// (`SELECT .. INTO V`, `RETURNING .. INTO V`) take variables and are
+/// skipped, as is a dotted or a colon-prefixed name.
+fn bare_var_in_dml(body: &str, vars: &[String]) -> bool {
+    if vars.is_empty() {
+        return false;
+    }
+    let up = body.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let b = masked.as_bytes();
+    for kw in ["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"] {
+        let mut from = 0;
+        while let Some(k) = find_word(&masked, kw, from) {
+            from = k + kw.len();
+            // the statement runs to `;` or a loop's DO at paren depth 0
+            let mut depth = 0i32;
+            let mut end = masked.len();
+            let mut i = k;
+            while i < b.len() {
+                match b[i] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    b';' if depth <= 0 => {
+                        end = i;
+                        break;
+                    }
+                    _ if depth <= 0 && masked[i..].starts_with("DO") && i > 0 && !is_ident_byte(b[i - 1])
+                        && !b.get(i + 2).is_some_and(|c| is_ident_byte(*c)) =>
+                    {
+                        end = i;
+                        break;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let region = &masked[k..end];
+            // an INTO list that is not INSERT INTO's table runs to the end
+            let mut cut = region.len();
+            let mut f = 0;
+            while let Some(into) = find_word(region, "INTO", f) {
+                f = into + 4;
+                let before = region[..into].trim_end();
+                if before.ends_with("INSERT") || before.ends_with("MERGE") {
+                    continue;
+                }
+                cut = cut.min(into);
+            }
+            // the names that are COLUMNS by position, never values: an
+            // INSERT's column list, and an UPDATE's SET targets
+            let mut region = region[..cut].to_string();
+            if kw == "INSERT" {
+                if let Some(into) = find_word(&region, "INTO", 0) {
+                    let at = into + 4 + (region[into + 4..].len() - region[into + 4..].trim_start().len());
+                    let name_end = region[at..]
+                        .find(|c: char| !(is_ident_byte(c as u8) || c == '"'))
+                        .map_or(region.len(), |i| at + i);
+                    let open = name_end + (region[name_end..].len() - region[name_end..].trim_start().len());
+                    if region.as_bytes().get(open) == Some(&b'(') {
+                        if let Some(close) = matching_paren(region.as_bytes(), open) {
+                            region.replace_range(open..=close, &" ".repeat(close + 1 - open));
+                        }
+                    }
+                }
+            }
+            let region = region.as_str();
+            let rb = region.as_bytes();
+            let mut j = 0;
+            while j < rb.len() {
+                if is_ident_byte(rb[j]) && (j == 0 || !is_ident_byte(rb[j - 1])) {
+                    let mut e = j;
+                    while e < rb.len() && is_ident_byte(rb[e]) {
+                        e += 1;
+                    }
+                    let word = &region[j..e];
+                    let prev = region[..j].trim_end();
+                    let next = region[e..].trim_start();
+                    let set_target = next.starts_with('=')
+                        && (prev.ends_with(',') || prev.ends_with("SET"));
+                    let qualified = prev.ends_with(':') || prev.ends_with('.') || set_target;
+                    if !qualified && vars.iter().any(|v| v.eq_ignore_ascii_case(word)) {
+                        return true;
+                    }
+                    j = e;
+                } else {
+                    j += 1;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The names a PSQL body DECLAREs between AS and its BEGIN.
+fn declared_names(head: &str) -> Vec<String> {
+    let up = mask_literals(&head.to_ascii_uppercase());
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(d) = find_word(&up, "DECLARE", from) {
+        from = d + "DECLARE".len();
+        let mut words = head[from..].split_whitespace();
+        let mut w = words.next().unwrap_or("");
+        if w.eq_ignore_ascii_case("VARIABLE") {
+            w = words.next().unwrap_or("");
+        }
+        let w = w.trim_end_matches(';');
+        if let Some(n) = canon_ident(w) {
+            out.push(n);
+        }
+    }
+    out
+}
+
+fn plan_create_trigger_strict(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let rewritten = sql2003_trigger_header(sql);
+    let sql = rewritten.as_deref().unwrap_or(sql);
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
@@ -28665,7 +29066,11 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             table: table.to_string(),
             def: fire_crab_ods::ddl::UserTriggerDef {
                 name: name.to_ascii_uppercase(),
-                inactive: false,
+                // the header's INACTIVE: it was parsed and then written
+                // as false, so `CREATE TRIGGER .. INACTIVE ..` made an
+                // ACTIVE trigger that fired (measured; the engine stores
+                // RDB$TRIGGER_INACTIVE 1 and never runs it)
+                inactive,
                 trigger_type,
                 sequence,
                 source,
@@ -54238,6 +54643,49 @@ fn bare_star_token(sql: &str) -> Option<usize> {
 /// attachment down with it - the 08006 a slice inside a character cost
 /// every later statement of the connection. The panic still reaches the
 /// server log.
+/// Two refusals of the grammar itself, the parser's Token unknown at the
+/// word (measured on 2196 through node-firebird and isql):
+///
+/// * a statement whose FIRST WORD starts no statement - `SELEC 1 FROM
+///   rdb$database` is `Token unknown - line 1, column 1 / SELEC`;
+/// * a `WHERE` with no condition before the next clause - `SELECT emp_no
+///   FROM employee WHERE ORDER BY 1` names `ORDER` at its own line and
+///   column.
+///
+/// This server answered both with a bare Dynamic SQL Error.
+fn grammar_word_verdict(sql: &str) -> Option<EvalErr> {
+    let lead = sql.len() - sql.trim_start().len();
+    let first_end = sql[lead..]
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .map_or(sql.len(), |i| lead + i);
+    let first = &sql[lead..first_end];
+    const STARTS: [&str; 22] = [
+        "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "EXECUTE", "CREATE", "ALTER", "DROP",
+        "RECREATE", "COMMENT", "GRANT", "REVOKE", "SET", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE",
+        "DECLARE", "CALL", "UPSERT",
+    ];
+    if !first.is_empty()
+        && first.bytes().all(|b| b.is_ascii_alphabetic())
+        && !STARTS.iter().any(|w| first.eq_ignore_ascii_case(w))
+    {
+        let (line, col) = text_line_col(sql, &sql[lead..first_end])?;
+        return Some(EvalErr::TokenUnknown { line, col, token: first.to_string() });
+    }
+    let up = mask_literals(&sql.to_ascii_uppercase());
+    let w = find_word_depth0(&up, "WHERE", 0)?;
+    let after = w + "WHERE".len();
+    let next_at = after + (up[after..].len() - up[after..].trim_start().len());
+    let next_end = up[next_at..]
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map_or(up.len(), |i| next_at + i);
+    let next = &up[next_at..next_end];
+    if matches!(next, "ORDER" | "GROUP" | "HAVING" | "UNION" | "PLAN" | "ROWS" | "FETCH" | "OFFSET" | "WINDOW" | "WHERE") {
+        let (line, col) = text_line_col(sql, &sql[next_at..next_end])?;
+        return Some(EvalErr::TokenUnknown { line, col, token: sql[next_at..next_end].to_string() });
+    }
+    None
+}
+
 fn diagnose_refusal(sql: &str, dbo: &Option<Database>) -> Option<EvalErr> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| diagnose_refusal_inner(sql, dbo))).ok().flatten()
 }
@@ -54253,6 +54701,9 @@ fn diagnose_refusal_inner(sql: &str, dbo: &Option<Database>) -> Option<EvalErr> 
         return None;
     }
     if let Some(e) = token_unknown_verdict(sql) {
+        return Some(e);
+    }
+    if let Some(e) = grammar_word_verdict(sql) {
         return Some(e);
     }
     let body = sql.trim_start();
@@ -119993,7 +120444,8 @@ fn plan_recreate(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descript
         .or_else(|| plan_create_procedure(&create_sql, db))
         .or_else(|| plan_create_exception(&create_sql))
         .or_else(|| plan_create_sequence(&create_sql))
-        .or_else(|| plan_create_function(&create_sql, db))?;
+        .or_else(|| plan_create_function(&create_sql, db))
+        .or_else(|| plan_create_trigger(&create_sql, db))?;
     // a CREATE VIEW the engine refuses at execute is served UNWRAPPED, so
     // nothing is dropped: the statement fails as a whole and the old view
     // stays (measured), under the RECREATE VIEW verb
@@ -120014,6 +120466,7 @@ fn recreate_drop_plan(create: &Plan) -> Option<Plan> {
         Plan::CreateException { name, .. } => Plan::DropException { name: name.clone() },
         Plan::CreateSequence { name, .. } => Plan::DropSequence { name: name.clone() },
         Plan::CreateFunction { name, .. } => Plan::DropFunction { name: name.clone() },
+        Plan::CreateTrigger { def, .. } => Plan::DropTrigger { name: def.name.clone() },
         _ => return None,
     })
 }

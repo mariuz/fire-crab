@@ -86,3 +86,28 @@ Short, actionable items. The long-form engineering backlog lives in
       `qa/serve-real-boundwindow.sh`.
 - [ ] Still refused: a window over a navigated key (6); an impure call in DML (8b); an impure
       call in those shapes (9b).
+
+## Found running the paper's samples/nodejs against this server (2026-10-04)
+
+- [x] Triggers as applications write them: the SQL-2003 header (`BEFORE INSERT ON T`), INACTIVE (was ignored -
+      the trigger FIRED), RECREATE TRIGGER, and bodies the strict emitter cannot express compiled by the DSQL
+      compiler (CURRENT_TIMESTAMP / COALESCE stores, INSERT without a column list, FOR SELECT, SELECT INTO), the
+      DSQL compiler told the database's default charset (`qa/serve-real-trigbody.sh`).
+- [x] The parser's Token unknown for an unknown first word and for `WHERE ORDER BY` (`qa/serve-real-parseword.sh`).
+- [x] A `;` after a nested block's END is refused (the engine's -104) - it was accepted in procedures too.
+- [ ] PROCEDURES (dsql-compiled) still accept a bare variable inside DML and unknown tables / columns /
+      exceptions the engine refuses at CREATE (measured: `INSERT .. VALUES (V, 1)` is -206, `DELETE FROM NOSUCH`
+      -204) - the trigger fallback checks both now (`bare_var_in_dml`, `ddl::blr_names_resolve`); wire them into
+      plan_create_procedure with a gate.
+- [ ] A trigger compiled that way stores an empty RDB$DEBUG_INFO, as a procedure does; and a procedure this server
+      created raises without the `At procedure .. line: L, col: C` item (no debug map to place it).
+- [ ] `SET DECFLOAT TRAPS TO [..]` / `SET DECFLOAT ROUND <mode>` refuse (session state; measured: untrapped 1/0 is
+      Infinity, 0/0 NaN, the context variable reads `None`, CEILING rounds at the 16th digit).
+- [ ] `BLOB_APPEND(..)` refuses.
+- [ ] `COUNT(*) FILTER (WHERE ..)`, `LIST(.. ) WITHIN GROUP (ORDER BY ..)` (samples/windows.js).
+- [ ] A `?` as RDB$GET_CONTEXT's variable name; RDB$GET_CONTEXT('SYSTEM', 'ENGINE_VERSION' | 'NETWORK_PROTOCOL').
+- [ ] CREATE / DROP SCHEMA; ALTER DATABASE .. PUBLICATION; CREATE / DROP SHADOW; ALTER EXTERNAL CONNECTIONS POOL.
+- [ ] A new table's RDB$RELATION_ID: 129 here where the engine reuses 128 (samples/metadata_cache.js).
+- [ ] The MON$ surface the samples read (MON$SERVER_PID, MON$IO_STATS, MON$PARALLEL_WORKERS, MON$WIRE_CRYPT_PLUGIN).
+- [ ] Engine quirk, NOT to emulate: a procedure created in the same attachment is selectable there although
+      RDB$PROCEDURE_TYPE is 2; a fresh attachment gets "not selectable" (both measured on 2196).

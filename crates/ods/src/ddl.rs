@@ -12260,6 +12260,81 @@ enum CtxBind {
 /// field) as the engine's store lookups do, and inserted in the REVERSE
 /// of encounter order - `MET_store_dependencies` pops its array. The
 /// object's existing rows of this type go first (`MET_delete_dependencies`).
+/// EVERY NAME A COMPILED BODY'S BLR CARRIES RESOLVES - the checks the
+/// engine's compiler makes before it stores a routine or a trigger, and
+/// that a compiler which emits names without asking (the DSQL one) does
+/// not: a relation opened as a stream, a field of a relation context, a
+/// procedure called or selected, a sequence drawn, an exception raised or
+/// handled, a user function invoked. `own` is the object being defined
+/// (a recursive call names it before it exists) and `own_relation` a
+/// trigger's table (contexts 0 and 1, OLD and NEW). Err names the first
+/// name that does not resolve.
+pub fn blr_names_resolve(
+    file: &crate::Image,
+    page_size: usize,
+    blr: &[u8],
+    own: &str,
+    own_relation: Option<&str>,
+) -> Result<(), String> {
+    let decoded = crate::blr::decode(blr).map_err(|e| format!("BLR: {e}"))?;
+    let mut ctx: std::collections::HashMap<u8, CtxBind> = std::collections::HashMap::new();
+    if let Some(rel) = own_relation {
+        ctx.insert(0, CtxBind::Relation(rel.to_string()));
+        ctx.insert(1, CtxBind::Relation(rel.to_string()));
+    }
+    let is_own = |n: &str| n.trim().eq_ignore_ascii_case(own.trim());
+    for ev in &decoded.deps {
+        match ev {
+            crate::blr::DepEvent::RelCtx { ctx: c, name: r } => {
+                if crate::resolve_relation(file, page_size, r.trim()).is_none() {
+                    return Err(format!("Table unknown {}", r.trim()));
+                }
+                ctx.insert(*c, CtxBind::Relation(r.clone()));
+            }
+            crate::blr::DepEvent::ModifyCtx { org, new } => {
+                if let Some(b) = ctx.get(org).cloned() {
+                    ctx.insert(*new, b);
+                }
+            }
+            crate::blr::DepEvent::ProcCtx { ctx: c, name: p } => {
+                if !is_own(p) && procedure_id(file, page_size, p).is_none() {
+                    return Err(format!("Procedure unknown {}", p.trim()));
+                }
+                ctx.insert(*c, CtxBind::Procedure(p.clone()));
+            }
+            crate::blr::DepEvent::Field { ctx: c, name: f } => {
+                if let Some(CtxBind::Relation(r)) = ctx.get(c) {
+                    if !relation_columns(file, page_size, r.trim()).iter().any(|col| col.name == *f) {
+                        return Err(format!("Column unknown {}.{}", r.trim(), f));
+                    }
+                }
+            }
+            crate::blr::DepEvent::ExecProc { name: p } => {
+                if !is_own(p) && procedure_id(file, page_size, p).is_none() {
+                    return Err(format!("Procedure unknown {}", p.trim()));
+                }
+            }
+            crate::blr::DepEvent::GenId { name: g } => {
+                if find_generator(file, page_size, g).is_none() {
+                    return Err(format!("Generator unknown {}", g.trim()));
+                }
+            }
+            crate::blr::DepEvent::Exception { name: e } => {
+                if find_exception(file, page_size, e).is_none() {
+                    return Err(format!("Exception unknown {}", e.trim()));
+                }
+            }
+            crate::blr::DepEvent::Function { name: f } => {
+                if !is_own(f) && function_id_plain(file, page_size, f).is_none() {
+                    return Err(format!("Function unknown {}", f.trim()));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn store_dependencies_deferred(file: &mut crate::Image, page_size: usize, kind: i64, name: &str) -> Result<(), String> {
     let _wide = crate::tra::ReaderViewGuard::wide();
     let (blr, own_relation): (Vec<u8>, Option<String>) = match kind {
