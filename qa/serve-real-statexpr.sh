@@ -174,18 +174,23 @@ rvf() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/sx6.sql" 2>&1 | norm; }
 check "review catches: guard-before-coercion, ORDER BY alias slot, divide-not-multiply f64, text PERCENTILE HAVING, describe rules" \
     "$(rvf "127.0.0.1/$PORT:$A")" "$(rvf "127.0.0.1/$REAL:$B")"
 
+# PROMOTED 2026-10-03 (serve-real-listexpr.sh): a LIST inside an
+# expression answers - it was the first of the boundaries below. The blob
+# id each server numbers its own way is cut; the content is compared.
+lxf() { printf 'SET LIST ON;\nSET BLOB ALL;\nSELECT LIST(T) || '"'x'"' AS LX FROM S;\n' | "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | grep -v '^LX ' | norm; }
+check "LIST inside an expression answers" "$(lxf "127.0.0.1/$PORT:$A")" "$(lxf "127.0.0.1/$REAL:$B")"
+
 # --- boundaries stay refusals (fc-only pins; the engine serves or
 # --- spells its own -104s) ---
 ran=$((ran + 1))
 bf=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 <<'SQL' | norm
 SET LIST ON;
-SELECT LIST(T) || 'x' FROM S;
 SELECT VAR_SAMP(DISTINCT N) * 2 FROM S;
 SELECT G FROM S WHERE VAR_SAMP(N) > 1;
 SQL
 )
-case "$bf" in *"Dynamic SQL Error"*"Dynamic SQL Error"*"Dynamic SQL Error"*)
-    echo "OK   boundaries refuse: LIST-in-expression, DISTINCT in the family, aggregate in WHERE";;
+case "$bf" in *"Dynamic SQL Error"*"Dynamic SQL Error"*)
+    echo "OK   boundaries refuse: DISTINCT in the family, aggregate in WHERE";;
     *) echo "DIFF boundary refusals: [$bf]"; fail=1;; esac
 
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)

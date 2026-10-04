@@ -1890,6 +1890,7 @@ fn ddl_relation_target(plan: &Plan) -> Option<&str> {
     match plan {
         Plan::DropTable { name } => Some(name),
         Plan::AlterTableAdd { table, .. }
+        | Plan::AlterTableAddMany { table, .. }
         | Plan::AlterTableAddFk { table, .. }
         | Plan::AlterTableDropConstraint { table, .. }
         | Plan::AlterTableAddCheck { table, .. }
@@ -2770,9 +2771,40 @@ fn respond_ddl_meta(
             return Ok(true);
         }
     }
+    // ADD of a column the table already has - or one the same statement
+    // adds twice - is the unique-key violation on RDB$RELATION_FIELDS'
+    // name index, inside the ALTER TABLE wrapper (measured on 2196, the
+    // key quoting the field and the bare relation name); this answered a
+    // bare "Dynamic SQL Error"
+    if lc.starts_with("column ") && lc.ends_with(" already exists") {
+        if let Plan::AlterTableAdd { table, .. } | Plan::AlterTableAddMany { table, .. } = plan {
+            let f = &err_text["column ".len()..err_text.len() - " already exists".len()];
+            let t = table.trim_end();
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(ALTER_TABLE_FAILED).int(2).bytes(format!("\"PUBLIC\".\"{}\"", t).as_bytes())
+                .int(1).int(GDS_UNIQUE_KEY_VIOLATION)
+                .int(2).bytes(b"\"RDB$INDEX_72\"")
+                .int(2).bytes(b"\"SYSTEM\".\"RDB$RELATION_FIELDS\"")
+                .int(1).int(GDS_IDX_KEY_VALUE)
+                .int(2).bytes(format!(
+                    "(\"RDB$FIELD_NAME\" = '{}', \"RDB$SCHEMA_NAME\" = 'PUBLIC', \"RDB$PACKAGE_NAME\" = NULL, \"RDB$RELATION_NAME\" = '{}')",
+                    f.replace('\'', "''"), t.replace('\'', "''")
+                ).as_bytes())
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
     if lc.contains("because there are nulls present") {
         let names = match plan {
             Plan::AlterTableAdd { table, col } => Some((col.name.clone(), table.clone())),
+            // several columns: the message names the one that failed
+            Plan::AlterTableAddMany { table, .. } => err_text
+                .split_once("Cannot make field ")
+                .and_then(|(_, r)| r.split_once(" of table "))
+                .map(|(f, _)| (f.to_string(), table.clone())),
             Plan::AlterColumnNull { table, column, .. } => Some((column.trim().to_string(), table.clone())),
             _ => None,
         };
@@ -10648,6 +10680,16 @@ AlterDomainRename {
     AlterTableAdd {
         table: String,
         col: fire_crab_ods::ddl::ColumnDef,
+    },
+    /// `ALTER TABLE <table> ADD <a> .., ADD <b> ..`: several columns in
+    /// one statement - ONE new format ([fire_crab_ods::ddl::alter_table_add_columns])
+    AlterTableAddMany {
+        table: String,
+        cols: Vec<fire_crab_ods::ddl::ColumnDef>,
+        /// the statement's CONSTRAINT clauses, in clause order - applied
+        /// after every column ([Plan::AlterTableAddKey] / `AddFk` /
+        /// `AddCheck` only)
+        then: Vec<Plan>,
     },
     /// `ALTER TABLE <table> ADD [CONSTRAINT <name>] FOREIGN KEY (...)
     /// REFERENCES ...`: add a foreign key to an existing table - the FK
@@ -33282,6 +33324,90 @@ fn plan_alter_index(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
 /// plain column. A NOT NULL or PRIMARY KEY on the added column is a
 /// constraint over the table's existing rows and is left for later
 /// (returns None, so the statement errors rather than half-applying).
+/// `ALTER TABLE <t> ADD <a> .., ADD <b> ..` - several clauses split at the
+/// top-level commas. Every clause must plan as a plain column ADD on its
+/// own; the columns are then written under ONE format, as the engine's
+/// one statement does (measured on 2196: three ADDs in one statement take
+/// a table from format 1 to 2). Any other mix - a constraint, a DROP, an
+/// ALTER beside an ADD, or a computed column over a column of the same
+/// statement - refuses here (it plans as nothing, not as a partial ALTER).
+fn plan_alter_table_multi(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "ALTER", 0) != Some(0) {
+        return None;
+    }
+    let table_kw = find_word(&masked, "TABLE", "ALTER".len())?;
+    if masked[..table_kw].trim() != "ALTER" {
+        return None;
+    }
+    let add_kw = find_word(&masked, "ADD", table_kw + "TABLE".len())?;
+    let head = &s[..add_kw];
+    // the clause boundaries: commas at paren depth 0, outside literals and
+    // delimited names (`mask_literals` blanks a literal's body; a quote is
+    // tracked here for a delimited identifier)
+    let mb = masked.as_bytes();
+    let mut cuts = Vec::new();
+    let (mut depth, mut in_dq) = (0i32, false);
+    for (i, &b) in mb.iter().enumerate().skip(add_kw) {
+        match b {
+            b'"' => in_dq = !in_dq,
+            b'(' if !in_dq => depth += 1,
+            b')' if !in_dq => depth -= 1,
+            b',' if !in_dq && depth == 0 => cuts.push(i),
+            _ => {}
+        }
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut from = add_kw;
+    for c in cuts.iter().copied().chain(std::iter::once(s.len())) {
+        parts.push(s[from..c].trim());
+        from = c + 1;
+    }
+    let mut table = None;
+    let mut cols = Vec::with_capacity(parts.len());
+    let mut then = Vec::new();
+    for part in parts {
+        // each clause must itself be an ADD of a column
+        let pu = part.to_ascii_uppercase();
+        if find_word(&pu, "ADD", 0) != Some(0) {
+            return None;
+        }
+        let one = format!("{} {}", head.trim_end(), part);
+        match plan_alter_table_add(&one, db)? {
+            (Plan::AlterTableAdd { table: t, col }, _) => {
+                // a computed column types itself from the CATALOG, which
+                // does not hold a column this same statement adds
+                if col.computed.is_some() {
+                    return None;
+                }
+                table = Some(t);
+                cols.push(col);
+            }
+            // a constraint: planned against the catalog as it stands (a
+            // CHECK over a column this statement adds does not plan, and
+            // refuses), applied after the columns
+            (step @ (Plan::AlterTableAddKey { .. } | Plan::AlterTableAddFk { .. } | Plan::AlterTableAddCheck { .. }), _) => {
+                then.push(step);
+            }
+            _ => return None,
+        }
+    }
+    let table = table.or_else(|| {
+        then.iter().find_map(|p| match p {
+            Plan::AlterTableAddKey { table, .. } | Plan::AlterTableAddFk { table, .. } | Plan::AlterTableAddCheck { table, .. } => {
+                Some(table.clone())
+            }
+            _ => None,
+        })
+    })?;
+    Some((Plan::AlterTableAddMany { table, cols, then }, Vec::new()))
+}
+
 fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -41965,6 +42091,41 @@ fn execute_dml_collecting_inner(
                 None
             };
             fire_crab_ods::ddl::alter_table_add_column(&mut work, db.page_size, table, &col, fmt_default)?;
+            (0, 0, 0)
+        }
+        Plan::AlterTableAddMany { table, cols, then } => {
+            let mut cols = cols.clone();
+            apply_db_charset(&mut cols, db_default_charset(&work, db.page_size));
+            let mut batch = Vec::with_capacity(cols.len());
+            for col in cols {
+                let fmt_default = if col.not_null && col.identity.is_none() {
+                    add_column_format_default(&col, ctx)?
+                } else {
+                    None
+                };
+                batch.push((col, fmt_default));
+            }
+            if !batch.is_empty() {
+                fire_crab_ods::ddl::alter_table_add_columns(&mut work, db.page_size, table, &batch)?;
+            }
+            // THEN THE CONSTRAINTS, in clause order: the engine applies
+            // every column clause first (measured: `ADD CONSTRAINT U2
+            // UNIQUE (H2), ADD H2 INTEGER` makes both, and a column's
+            // INTEG_<n> NOT NULL precedes a PRIMARY KEY written before it)
+            for step in then {
+                match step {
+                    Plan::AlterTableAddKey { table, key } => {
+                        fire_crab_ods::ddl::alter_table_add_key(&mut work, db.page_size, table, key)?
+                    }
+                    Plan::AlterTableAddFk { table, fk } => {
+                        fire_crab_ods::ddl::alter_table_add_foreign_key(&mut work, db.page_size, table, fk)?
+                    }
+                    Plan::AlterTableAddCheck { table, check } => {
+                        fire_crab_ods::ddl::alter_table_add_check(&mut work, db.page_size, table, check)?
+                    }
+                    _ => return Err("an ALTER TABLE clause outside this server's surface".into()),
+                }
+            }
             (0, 0, 0)
         }
         Plan::AlterTableAddFk { table, fk } => {
@@ -76792,7 +76953,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::GrantRole { .. }
         | Plan::GrantProcedure { .. }
         | Plan::GrantUsage { .. }
-        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
+        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddMany { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableAddCheck { .. } | Plan::CreateTrigger { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. } | Plan::AlterColumnRename { .. } | Plan::AlterColumnIdentity { .. } => {
@@ -76918,7 +77079,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::GrantRole { .. }
         | Plan::GrantProcedure { .. }
         | Plan::GrantUsage { .. }
-        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
+        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddMany { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableAddCheck { .. } | Plan::CreateTrigger { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. } | Plan::AlterColumnRename { .. } | Plan::AlterColumnIdentity { .. } => 5,
@@ -81112,7 +81273,7 @@ fn emit_rows_inner(
         | Plan::GrantRole { .. }
         | Plan::GrantProcedure { .. }
         | Plan::GrantUsage { .. }
-        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddFk { .. }
+        | Plan::AlterTableAdd { .. } | Plan::AlterTableAddMany { .. } | Plan::AlterTableAddFk { .. }
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableAddCheck { .. } | Plan::CreateTrigger { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. } | Plan::AlterColumnRename { .. } | Plan::AlterColumnIdentity { .. }
@@ -119789,6 +119950,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_drop_domain(text))
                     .or_else(|| plan_alter_domain(text))
                     .or_else(|| plan_alter_index(text))
+                    .or_else(|| plan_alter_table_multi(text, database))
                     .or_else(|| plan_alter_table_add(text, database))
                     .or_else(|| plan_alter_table_drop(text))
                     .or_else(|| plan_alter_table_alter_type(text))
@@ -132111,6 +132273,47 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
     if matches!(lhs, Expr::Null) || matches!(rhs, Expr::Null) {
         return Some((lhs, rhs));
     }
+    // A TEXT BLOB AGAINST A NUMBER OR A TEMPORAL compares AS TEXT: the
+    // engine's blob compare (CVT2_blob_compare) makes the OTHER operand a
+    // string and compares strings, so `B = 3` matches '3' and not '3.0',
+    // `B = 3.0` the reverse, `B > 9` matches '9x' and not '10', and
+    // `LIST(ID) = 3` is false for '1,2' with no conversion error (measured
+    // on 2196; a BINARY blob the same, its raw bytes). This server read
+    // the blob as a VARCHAR operand, which converts the text to the
+    // number - every one of those answered otherwise, and `LIST(ID) = 3`
+    // raised 22018. (A BOOLEAN against a blob is the engine's 22018 on
+    // the string "BLOB" - not this, and left as it was.)
+    let blob_side = |e: &Expr| {
+        blob_result(e, descs).is_some()
+            || matches!(synthetic_inner(e), Expr::Col(f) if descs.get(*f).is_some_and(|d| d.dtype == dtype::BLOB && matches!(d.sub_type, 0 | 1)))
+    };
+    let to_text = |e: Expr| -> Option<Expr> {
+        let ok = is_decfloat_arith(&e, descs)
+            || matches!(
+                e.type_of(descs),
+                Some(ExprType::Int | ExprType::Numeric | ExprType::Approx | ExprType::Temporal(_))
+            );
+        ok.then(|| {
+            Expr::Cast(
+                Box::new(e),
+                CastTarget::Text { len: 255, pad: false, synthetic: true, cs: None },
+                fire_crab_ods::intl::CS_UTF8,
+            )
+        })
+    };
+    match (blob_side(&lhs), blob_side(&rhs)) {
+        (true, false) => {
+            if let Some(r) = to_text(rhs.clone()) {
+                return Some((lhs, r));
+            }
+        }
+        (false, true) => {
+            if let Some(l) = to_text(lhs.clone()) {
+                return Some((l, rhs));
+            }
+        }
+        _ => {}
+    }
     // a DECFLOAT side (a column, an arithmetic tree `df + 1 > 5`, or a
     // CAST) has no ExprType of its own - it compares in decimal. The other
     // side may be exact-numeric OR APPROXIMATE: value_cmp converts an
@@ -134013,7 +134216,11 @@ fn resolve_having(
             // ONLY when the kind carries a right-side expression, so the
             // keyed column path below is untouched for every literal form.
             let lifted = match &rt.lhs {
-                RawLhs::Agg(f, t) if has_rhs_expr => Some(RawTerm {
+                // ...and a LIST under ANY kind: the keyed path below compares
+                // integer folds only, so `HAVING LIST(ID) = '1,2'`, LIKE,
+                // STARTING, CONTAINING and IS NULL refused where the mirrored
+                // `'1,2' = LIST(ID)` (already an expression) answered
+                RawLhs::Agg(f, t) if has_rhs_expr || matches!(f, AggFn::List) => Some(RawTerm {
                     lhs: RawLhs::Expr(RawExpr::Agg(*f, Box::new(t.clone()))),
                     kind: rt.kind.clone(),
                     mirrored: rt.mirrored,
@@ -136034,6 +136241,7 @@ fn after_auth(
                         .or_else(|| plan_drop_domain(&stmt_sql))
                         .or_else(|| plan_alter_domain(&stmt_sql))
                         .or_else(|| plan_alter_index(&stmt_sql))
+                        .or_else(|| plan_alter_table_multi(&stmt_sql, &database))
                         .or_else(|| plan_alter_table_add(&stmt_sql, &database))
                         .or_else(|| plan_alter_table_drop(&stmt_sql))
                         .or_else(|| plan_alter_table_alter_type(&stmt_sql))
@@ -136650,6 +136858,7 @@ fn after_auth(
                         | Plan::GrantProcedure { .. }
                         | Plan::GrantUsage { .. }
                         | Plan::AlterTableAdd { .. }
+                        | Plan::AlterTableAddMany { .. }
                         | Plan::AlterTableAddFk { .. }
                         | Plan::AlterTableAddKey { .. }
                         | Plan::AlterTableAddCheck { .. }

@@ -756,12 +756,24 @@ fn write_format_blob_carried(
     descs: &[Descriptor],
     extra: Option<(u16, Descriptor, Vec<u8>)>,
 ) -> Result<u64, String> {
+    write_format_blob_carried_many(file, page_size, rel, descs, extra.into_iter().collect())
+}
+
+/// [write_format_blob_carried] with a default for SEVERAL new fields (one
+/// statement adding several NOT NULL columns over rows already there)
+fn write_format_blob_carried_many(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel: u16,
+    descs: &[Descriptor],
+    extras: Vec<(u16, Descriptor, Vec<u8>)>,
+) -> Result<u64, String> {
     let mut defaults: Vec<(u16, Descriptor, Vec<u8>)> =
         crate::format::newest_format_default_section(file, page_size, rel)
             .into_iter()
             .filter(|(f, _, _)| descs.get(*f as usize).is_some_and(|d| !(d.dtype == 0 && d.length == 0)))
             .collect();
-    if let Some(x) = extra {
+    for x in extras {
         defaults.retain(|(f, _, _)| *f != x.0);
         defaults.push(x);
     }
@@ -1521,17 +1533,35 @@ pub fn alter_table_add_column(
     col: &ColumnDef,
     format_default: Option<(Descriptor, Vec<u8>)>,
 ) -> Result<(), String> {
+    alter_table_add_columns(file, page_size, table, &[(col.clone(), format_default)])
+}
+
+/// `ALTER TABLE <table> ADD <a> .., ADD <b> ..` - SEVERAL columns in ONE
+/// statement, under ONE new format (measured on 2196: `ADD A, ADD B, ADD
+/// C` takes the table from format 1 to 2, where three statements take it
+/// to 4). Each column's catalog rows are written in clause order - its
+/// RDB$<n> domain, its INTEG_<n> NOT NULL constraint, its identity
+/// generator, its position and field id - exactly as that many single
+/// ADDs would number them; only the format is drawn once. The whole
+/// statement fails as one: the caller's working image is discarded.
+pub fn alter_table_add_columns(
+    file: &mut crate::Image,
+    page_size: usize,
+    table: &str,
+    batch: &[(ColumnDef, Option<(Descriptor, Vec<u8>)>)],
+) -> Result<(), String> {
     let table = table.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &table)
         .ok_or_else(|| format!("table {} not found", table))?;
 
     // existing columns: reject a duplicate name, find the next field id
     let existing = relation_columns(file, page_size, &table);
-    if existing
-        .iter()
-        .any(|c| c.name == col.name)
-    {
-        return Err(format!("column {} already exists", col.name));
+    for (i, (col, _)) in batch.iter().enumerate() {
+        if existing.iter().any(|c| c.name == col.name)
+            || batch[..i].iter().any(|(c, _)| c.name == col.name)
+        {
+            return Err(format!("column {} already exists", col.name));
+        }
     }
     // THE NEW FIELD'S ID IS THE RELATION'S NEXT-ID COUNTER, never one a
     // dropped field had: records stored under the older formats still
@@ -1566,8 +1596,9 @@ pub fn alter_table_add_column(
     // with the UNRESOLVED zero-typed ColumnDef under a fresh carrier -
     // a column the engine reads as length-0 garbage, and every later
     // DML on the table refused; review-caught.)
-    let resolved_col: ColumnDef;
-    let (col, domain_source): (&ColumnDef, Option<String>) = match &col.domain {
+    let mut resolved: Vec<(ColumnDef, Option<String>, Option<(Descriptor, Vec<u8>)>)> = Vec::with_capacity(batch.len());
+    for (col, format_default) in batch {
+    let (col, domain_source): (ColumnDef, Option<String>) = match &col.domain {
         Some(dname) => {
             let dname = dname.trim().trim_matches('"').to_ascii_uppercase();
             let dt = resolve_domain_type(file, page_size, &dname)
@@ -1590,11 +1621,12 @@ pub fn alter_table_add_column(
             rc.char_len = dt.char_len;
             rc.dims = dt.dims.clone();
             rc.charset_id = dt.charset_id;
-            resolved_col = rc;
-            (&resolved_col, Some(dname))
+            (rc, Some(dname))
         }
-        None => (col, None),
+        None => (col.clone(), None),
     };
+    resolved.push((col, domain_source, format_default.clone()));
+    }
 
     // the new full format: existing descriptors + the new field, offsets
     // recomputed by the same ini.epp walk (append-stable, so the existing
@@ -1604,6 +1636,7 @@ pub fn alter_table_add_column(
         .iter()
         .max_by_key(|(n, _)| *n)
         .ok_or("relation has no format")?;
+    for (col, _, _) in &resolved {
     // a computed column has no storage to constrain or default into
     if col.computed.is_some() && (col.not_null || col.default.is_some() || col.identity.is_some())
     {
@@ -1629,6 +1662,7 @@ pub fn alter_table_add_column(
             col.name, table
         ));
     }
+    }
     // existing COMPUTED fields (descriptor at offset 0) keep their
     // offset-0 descriptors through the recompute; the stored-offset walk
     // skips them, so existing stored fields keep their offsets and a new
@@ -1646,8 +1680,12 @@ pub fn alter_table_add_column(
     while fields.len() < new_fid as usize {
         fields.push((0, 0, 0, 0, false));
     }
-    let (dt, l, s, st) = col_field_of(col);
-    fields.push((dt, l, s, st, col.computed.is_some()));
+    // each new field takes the next id and the next position, in clause order
+    let first_fid = new_fid;
+    for (col, _, _) in &resolved {
+        let (dt, l, s, st) = col_field_of(col);
+        fields.push((dt, l, s, st, col.computed.is_some()));
+    }
     let new_descs = zero_placeholders(compute_format_mixed(&fields));
     if new_descs.len() != fields.len() {
         return Err("format computation failed".into());
@@ -1683,9 +1721,11 @@ pub fn alter_table_add_column(
     // without one, the engine's deferred check finds the NULLs and the
     // whole ALTER fails (22006, measured the same for an identity
     // column, whose generator never fills a stored row)
+    let mut extras = Vec::new();
+    for (i, (col, _, format_default)) in resolved.iter().enumerate() {
     let not_null = col.not_null || col.identity.is_some();
-    let extra = match (not_null, format_default) {
-        (true, Some((d, v))) if col.identity.is_none() => Some((new_fid, d, v)),
+    match (not_null, format_default.clone()) {
+        (true, Some((d, v))) if col.identity.is_none() => extras.push((first_fid + i as u16, d, v)),
         (true, _) => {
             if relation_has_rows(file, page_size, rel) {
                 return Err(format!(
@@ -1693,11 +1733,11 @@ pub fn alter_table_add_column(
                     col.name, table
                 ));
             }
-            None
         }
-        (false, _) => None,
-    };
-    let fmt_blob = write_format_blob_carried(file, page_size, rel, &new_descs, extra)?;
+        (false, _) => {}
+    }
+    }
+    let fmt_blob = write_format_blob_carried_many(file, page_size, rel, &new_descs, extras)?;
     sys_insert(
         file,
         page_size,
@@ -1717,6 +1757,10 @@ pub fn alter_table_add_column(
     // read NULL for every inserted row (measured: the engine answers
     // ID 1, 2 for two inserts after `add id integer generated by
     // default as identity`, RDB$NULL_FLAG 1, RDB$IDENTITY_TYPE 1)
+    for (i, (col, domain_source, _)) in resolved.iter().enumerate() {
+    let new_fid = first_fid + i as u16;
+    let new_pos = new_pos + i as u16;
+    let not_null = col.not_null || col.identity.is_some();
     let identity_gen: Option<(String, IdentityDef)> = match &col.identity {
         Some(id) => {
             let g = format!("RDB${}", next_generator_number(file, page_size, 1)?);
@@ -1869,6 +1913,7 @@ pub fn alter_table_add_column(
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ])?;
     }
+    } // each column
 
     // --- rebuild RDB$RUNTIME for all fields (incl. the new one, now in
     // RDB$RELATION_FIELDS) so DSQL resolves the added column ------------
@@ -1890,7 +1935,7 @@ pub fn alter_table_add_column(
     };
     let old_rt = rel_field("RDB$RUNTIME").and_then(|f| old_blob_at(&rel_image, rel_descs, f));
     patch(&mut rel_image, "RDB$FORMAT", SysVal::I(new_format_no))?;
-    patch(&mut rel_image, "RDB$FIELD_ID", SysVal::I((new_fid + 1) as i64))?;
+    patch(&mut rel_image, "RDB$FIELD_ID", SysVal::I((first_fid + resolved.len() as u16) as i64))?;
     patch(&mut rel_image, "RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime)))?;
     dml::update_records(
         file,

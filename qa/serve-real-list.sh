@@ -294,8 +294,14 @@ bref() { # $1 label, $2 sql - fc must refuse, engine answers or refuses its way
     case "$c" in *"Dynamic SQL Error"*|*"feature is not supported"*) echo "OK   $1 (refused)";;
         *) echo "DIFF $1 answered: [$c]"; fail=1;; esac
 }
-bref "LIST inside an expression refuses" "SELECT CHAR_LENGTH(LIST(S)) FROM T;"
-bref "HAVING over a LIST refuses" "SELECT G FROM T GROUP BY G HAVING LIST(S) = 'aa,bb';"
+# PROMOTED 2026-10-03 (serve-real-listexpr.sh): an expression over a LIST
+# and a LIST in HAVING's condition answer - these two cells were the
+# boundary until then
+iqof() { echo "$2" | "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | norm; }
+check "LIST inside an expression answers" \
+    "$(iqof "127.0.0.1/$PORT:$A" "SELECT CHAR_LENGTH(LIST(S)) FROM T;")" "$(iqof "127.0.0.1/$REAL:$B" "SELECT CHAR_LENGTH(LIST(S)) FROM T;")"
+check "HAVING over a LIST answers" \
+    "$(iqof "127.0.0.1/$PORT:$A" "SELECT G FROM T GROUP BY G HAVING LIST(S) = 'aa,bb';")" "$(iqof "127.0.0.1/$REAL:$B" "SELECT G FROM T GROUP BY G HAVING LIST(S) = 'aa,bb';")"
 bref "a scalar-subquery LIST refuses" "SELECT (SELECT LIST(X.S) FROM T X WHERE X.G = T.G) FROM T WHERE ID = 1;"
 bref "the window form refuses" "SELECT LIST(S) OVER () FROM T;"
 # PROMOTED 2026-09-20: this was an `eng_only` boundary (fc refused a

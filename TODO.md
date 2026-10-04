@@ -43,7 +43,21 @@ Short, actionable items. The long-form engineering backlog lives in
 - [x] Every other expression over a LIST (`||`, UPPER, SUBSTRING, COALESCE, CHAR/OCTET_LENGTH, IIF, CASE WHEN,
       ORDER BY) answers, and a computed blob is minted and delivered in its own character set (UTF8 / NONE /
       WIN1252 attachments - listexpr sections 2 and 4).
-- [ ] A LIST in HAVING's comparison or LIKE (`HAVING LIST(ID) = '1,2'`) still refuses (listexpr 2b).
+- [x] A LIST in HAVING's condition (`= 'text'`, LIKE, STARTING, IS NULL, IN, BETWEEN) answers (listexpr 2b).
+- [x] A BLOB against a number or a temporal compares AS TEXT, the other side rendered (`B = 3` is not '3.0',
+      `B > 9` is text order, `LIST(ID) = 3` no 22018) - it compared numerically (`qa/serve-real-blobcmp.sh`).
+- [ ] A BOOLEAN against a blob: the engine's 22018 names the string "BLOB", this server's the content (blobcmp 9).
+- [ ] A `?` compared with a blob refuses at prepare (unmeasured).
+- [x] `ALTER TABLE T ADD A .., ADD B ..` - several column ADDs, ONE format; the duplicate-column vector
+      (`qa/serve-real-altermulti.sh`).
+- [ ] A multi-clause ALTER with a constraint, DROP or ALTER clause, or a COMPUTED column, refuses (altermulti 4).
+      The engine applies the column clauses first, then the constraints (a UNIQUE may name a column added
+      later in the statement).
+- [ ] A sibling transaction's snapshot (isql's main one beside its DDL transaction) reads NO ROW for an altered
+      table: the old RDB$RELATIONS version is purged at the DDL's commit (altermulti 5, recorded). Holding every
+      purge back while a sibling lives piles up dead catalog versions (blobgc / blobsweep red) - the fix is the
+      engine's intermediate GC: keep exactly the versions a live snapshot can still see.
+- [ ] The multi-clause CONSTRAINT and FK numbering cells (altermulti 1b) - measure on build.
 - [x] Schema-qualified DDL (`CREATE TABLE PUBLIC.T7 ..`, every kind, a view body over `PUBLIC.T`) and an
       unknown schema's vector (`qa/serve-real-ddlqualified.sh`).
 - [x] A select list holding `GEN_ID(..)` / NEXT VALUE FOR beside a stored function call (fnwhere section 10).

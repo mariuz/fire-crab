@@ -19,7 +19,8 @@
 # expression shipped as id 0:0, EMPTY at the client - a wrong answer); and
 # a computed blob read by a LATER op of its statement (the fold runs at
 # execute, the select list at the fetch) was looked for only in the mint.
-# A LIST in HAVING's comparison or LIKE still refuses (2b, recorded).
+# A LIST in HAVING's condition answers too (2b), compared AS TEXT against
+# a number (the engine's blob compare - serve-real-blobcmp.sh).
 #
 #   qa/serve-real-listexpr.sh [port]
 set -u
@@ -98,9 +99,17 @@ both "2 a WIN1252 argument's octets"           "SELECT OCTET_LENGTH(LIST(W)), CH
 both "2 IIF over a LIST"                       "SELECT IIF(LIST(K) = 'a,b', 1, 0) FROM G;"
 both "2 CASE WHEN a LIST IS NULL"              "SELECT CASE WHEN LIST(K) IS NULL THEN 'n' ELSE 'y' END FROM G;"
 both "2 ORDER BY a LIST"                       "SELECT C, COUNT(*) FROM G GROUP BY C ORDER BY LIST(ID);"
-echo "--- 2b RECORDED - the engine answers, this server refuses"
-recorded "2b HAVING LIST(..) = 'text'"         "SELECT C FROM G GROUP BY C HAVING LIST(ID) = '1,2';"
-recorded "2b HAVING LIST(..) LIKE"             "SELECT C FROM G GROUP BY C HAVING LIST(ID) LIKE '1%';"
+echo "--- 2b a LIST in HAVING's condition (recorded refusals until 2026-10-03: the keyed path compares integer folds only)"
+both "2b HAVING LIST(..) = 'text'"         "SELECT C FROM G GROUP BY C HAVING LIST(ID) = '1,2';"
+both "2b HAVING LIST(..) LIKE"             "SELECT C FROM G GROUP BY C HAVING LIST(ID) LIKE '1%';"
+both "2b HAVING LIST(..) IS NULL"          "SELECT C FROM G GROUP BY C HAVING LIST(K) IS NULL;"
+both "2b STARTING / CONTAINING / SIMILAR"  "SELECT C FROM G GROUP BY C HAVING LIST(ID) STARTING '1' OR LIST(ID) CONTAINING '3' OR LIST(ID) SIMILAR TO '9%';"
+both "2b IN, BETWEEN, NOT, <>"             "SELECT C FROM G GROUP BY C HAVING LIST(ID) IN ('1,2', '7') AND LIST(ID) BETWEEN '0' AND '2' AND NOT LIST(ID, '-') <> '1-2';"
+both "2b LIST(DISTINCT ..) = text, OR an integer fold" "SELECT C FROM G GROUP BY C HAVING LIST(DISTINCT C) = 'y' OR COUNT(*) = 2;"
+both "2b against a NUMBER: text, no 22018" "SELECT C FROM G GROUP BY C HAVING LIST(ID) = 3;"
+both "2b against a number, ordered as text" "SELECT C FROM G GROUP BY C HAVING LIST(ID) > 10;"
+both "2b against MAX(ID)"                   "SELECT C FROM G GROUP BY C HAVING LIST(ID) = MAX(ID);"
+both "2b a projected LIST(ID) = 3"          "SELECT C, LIST(ID) = 3 AS B FROM G GROUP BY C ORDER BY C;"
 
 echo "--- 4 THE SETS: a computed blob's bytes, under UTF8, NONE and WIN1252 attachments"
 # a LIST is minted in its argument's set and a blob-valued expression in
@@ -127,6 +136,6 @@ if grep -aq 'panicked at' "/tmp/fc-serve-listexpr-$PORT.log"; then echo "FAIL th
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 40 on the 2026-10-03 binary, 40 OK
-if [ "$ran" -lt 40 ]; then echo "FAIL only $ran checks ran (floor 40) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 48 on the 2026-10-03 binary, 48 OK
+if [ "$ran" -lt 48 ]; then echo "FAIL only $ran checks ran (floor 48) - cells went missing"; fail=1; fi
 exit $fail
