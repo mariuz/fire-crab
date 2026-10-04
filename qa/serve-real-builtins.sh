@@ -937,11 +937,12 @@ pinu '16 ... a decoded blob' 'SELECT CAST(HEX_DECODE(HEX_ENCODE(BT)) AS VARCHAR(
      'CAST|..a'
 pin  'CONTROL 16 ... OCTETS, POSITION, a text blob: the raw bytes' 'SELECT ID, HEX_ENCODE(CAST(BB AS VARCHAR(20) CHARACTER SET OCTETS)), POSITION('"'"'B'"'"' IN BB) FROM TBB WHERE ID < 4 ORDER BY ID;' \
      'ID HEX_ENCODE POSITION|1 00FF41 0|2 410A42 3|3 410A0A42 4'
+# promoted 2026-10-04 (BLOB_APPEND lands; serve-real-blobappend.sh owns the law)
+pinb '13 BLOB_APPEND - a NULL first argument is skipped' 'SELECT BLOB_APPEND(NULL, '"'"'a'"'"', '"'"'b'"'"') FROM RDB$DATABASE;' \
+     'BLOB_APPEND|<blob>|BLOB_APPEND:|ab'
 echo '--- 13. RECORDED: the shapes this server still refuses (clean refusals)'
 rec  '13 SUBSTRING ... SIMILAR' 'SELECT SUBSTRING('"'"'abcdef'"'"' SIMILAR '"'"'a#"bc#"%'"'"' ESCAPE '"'"'#'"'"') FROM RDB$DATABASE;' \
      'SUBSTRING|bc' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
-rec  '13 BLOB_APPEND' 'SELECT BLOB_APPEND(NULL, '"'"'a'"'"', '"'"'b'"'"') FROM RDB$DATABASE;' \
-     'BLOB_APPEND|<blob>|BLOB_APPEND:|ab' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error' sessb
 rec  '13 CAST ... FORMAT to text' 'SELECT CAST(DATE '"'"'2024-02-29'"'"' AS VARCHAR(30) FORMAT '"'"'DD/MM/YY'"'"') FROM RDB$DATABASE;' \
      'CAST|29/02/24' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
 rec  '13 CAST ... FORMAT from text' 'SELECT CAST('"'"'29.02.2024'"'"' AS DATE FORMAT '"'"'DD.MM.YYYY'"'"') FROM RDB$DATABASE;' \

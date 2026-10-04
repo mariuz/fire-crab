@@ -106,7 +106,11 @@ Short, actionable items. The long-form engineering backlog lives in
       created raises without the `At procedure .. line: L, col: C` item (no debug map to place it).
 - [ ] `SET DECFLOAT TRAPS TO [..]` / `SET DECFLOAT ROUND <mode>` refuse (session state; measured: untrapped 1/0 is
       Infinity, 0/0 NaN, the context variable reads `None`, CEILING rounds at the 16th digit).
-- [ ] `BLOB_APPEND(..)` refuses.
+- [x] `BLOB_APPEND(..)` (`qa/serve-real-blobappend.sh`); recorded: it describes Nullable where the engine says
+      NOT NULL (and still delivers NULL).
+- [ ] Non-ASCII text CAST into a NONE text blob counts double (`OCTET_LENGTH(CAST('abcéé' AS BLOB SUB_TYPE TEXT
+      CHARACTER SET NONE))` 11, engine 7); passing it through transcode_text made it 19 - the source set the CAST
+      arm is handed is not what it looks like.
 - [ ] `COUNT(*) FILTER (WHERE ..)`, `LIST(.. ) WITHIN GROUP (ORDER BY ..)` (samples/windows.js).
 - [ ] A `?` as RDB$GET_CONTEXT's variable name; RDB$GET_CONTEXT('SYSTEM', 'ENGINE_VERSION' | 'NETWORK_PROTOCOL').
 - [ ] CREATE / DROP SCHEMA; ALTER DATABASE .. PUBLICATION; CREATE / DROP SHADOW; ALTER EXTERNAL CONNECTIONS POOL.

@@ -85673,6 +85673,10 @@ enum RawExpr {
 /// live engine before it was written down - see qa/serve-real-functions.sh.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SysFn {
+    /// BLOB_APPEND(a, b, ..): the arguments' text, NULLs SKIPPED, NULL only
+    /// when every argument is - resolved under a CAST to the BLOB the first
+    /// argument decides ([lower_blob_append])
+    BlobAppend,
     /// RDB$GET_CONTEXT(namespace, name): a USER_SESSION / USER_TRANSACTION
     /// variable of this attachment (the SYSTEM ones fold at prepare)
     GetContext,
@@ -86110,6 +86114,7 @@ impl SysFn {
             SysFn::Replace => "REPLACE",
             SysFn::Position => "POSITION",
             SysFn::Reverse => "REVERSE",
+            SysFn::BlobAppend => "BLOB_APPEND",
             SysFn::Abs => "ABS",
             SysFn::Mod => "MOD",
             SysFn::Sign => "SIGN",
@@ -88182,6 +88187,7 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
         "REPLACE" => SysFn::Replace,
         "POSITION" => SysFn::Position,
         "REVERSE" => SysFn::Reverse,
+        "BLOB_APPEND" => SysFn::BlobAppend,
         "ABS" => SysFn::Abs,
         "MOD" => SysFn::Mod,
         "SIGN" => SysFn::Sign,
@@ -88761,6 +88767,7 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         SysFn::UuidToChar(_) | SysFn::CharToUuid(_) => (1, 1),
         // evlMaxMinValue takes one argument or more (MAXVALUE(5) is 5)
         SysFn::MaxMin(_) => (1, usize::MAX),
+        SysFn::BlobAppend => (2, usize::MAX),
         SysFn::Ceil | SysFn::Ceiling | SysFn::Floor => (1, 1),
         SysFn::Round | SysFn::Trunc => (1, 2),
         SysFn::Power | SysFn::Log | SysFn::Atan2 => (2, 2),
@@ -95090,6 +95097,41 @@ fn resolve_expr_inner(
             Box::new(resolve_expr(a, columns, descs)?),
             Box::new(resolve_expr(b, columns, descs)?),
         ),
+        RawExpr::Func(SysFn::BlobAppend, args) => {
+            // the value is `||` over the non-NULL arguments - NULL when all
+            // are - so every operand's character set is negotiated as a
+            // concatenation's is; the first argument names the blob
+            let first = resolve_expr(args.first()?, columns, descs)?;
+            let target = blob_append_target(&first, args, descs)?;
+            let live: Vec<&RawExpr> = args.iter().filter(|a| !matches!(a, RawExpr::Null)).collect();
+            if live.is_empty() {
+                Expr::Cast(Box::new(Expr::Null), target, fire_crab_ods::intl::CS_UTF8)
+            } else {
+                // a literal is never NULL: it is concatenated as written
+                // (a COALESCE around it re-typed its character set), and
+                // one present means the call is never NULL either
+                let lit = |a: &RawExpr| matches!(a, RawExpr::Str(_) | RawExpr::Int(_));
+                let piece = |a: &RawExpr| {
+                    if lit(a) { a.clone() } else { RawExpr::Coalesce(vec![a.clone(), RawExpr::Str(String::new())]) }
+                };
+                let mut cat = piece(live[0]);
+                for a in &live[1..] {
+                    cat = RawExpr::Concat(Box::new(cat), Box::new(piece(a)));
+                }
+                let raw = if live.iter().any(|a| lit(a)) {
+                    cat
+                } else {
+                    let all_null = RawCond::And(live.iter().map(|a| RawCond::IsNull(Box::new((*a).clone()))).collect());
+                    RawExpr::Iif(Box::new(all_null), Box::new(RawExpr::Null), Box::new(cat))
+                };
+                let inner = resolve_expr(&raw, columns, descs)?;
+                let src = cast_source_charset(&inner, &target, descs);
+                // (the engine DESCRIBES this NOT NULL - 520 - and delivers a
+                // NULL through it all the same; described Nullable here, so
+                // the NULL travels - a recorded describe-only difference)
+                Expr::Cast(Box::new(inner), target, src)
+            }
+        }
         RawExpr::Func(f, args) => {
             // MAXVALUE / MINVALUE / GREATEST / LEAST resolve AS the searched
             // CASE that answers what evlMaxMinValue does ([lower_maxmin]):
@@ -102079,6 +102121,39 @@ fn tz_local_timestamp(date: i32, utc: u32, zone: u16) -> Option<(i32, u32)> {
 /// A function argument as text - the engine's CVT string coercion:
 /// text stays itself (CHAR padding included), a number renders
 /// (CHAR_LENGTH(A) with A = -7 is 2, probed).
+/// The BLOB `BLOB_APPEND(a, b, ..)` (FB 5) answers: its arguments' text
+/// appended in order, a NULL argument SKIPPED - NULL only when every one is
+/// - into a blob whose subtype and character set the FIRST argument
+/// decides. Measured on 2196: a text blob keeps its set, a binary blob
+/// gives subtype 0, a string literal or a NULL gives text in NONE, a
+/// number ASCII, a text column its own set; the describe is NOT NULL (520)
+/// - only an all-NULL call is the nullable binary 521 - and the name is
+/// BLOB_APPEND. Every call refused here (found running the paper's
+/// samples/nodejs/blobs.js).
+fn blob_append_target(first: &Expr, raw: &[RawExpr], descs: &[Descriptor]) -> Option<CastTarget> {
+    if raw.iter().all(|a| matches!(a, RawExpr::Null)) {
+        return Some(CastTarget::Blob { sub_type: 0, cs: 0 });
+    }
+    let (sub_type, cs): (i16, u8) = if let Some(b) = blob_result(first, descs) {
+        b
+    } else {
+        match first {
+            Expr::Null | Expr::Str(_) => (1, 0),
+            _ => match first.type_of(descs) {
+                Some(ExprType::Int | ExprType::Numeric | ExprType::Approx) => (1, 2),
+                _ if is_decfloat_arith(first, descs) => (1, 2),
+                Some(ExprType::Text) => match text_form(first, descs) {
+                    Some((_, _, TfCs::Ttype(t))) => (1, (t & 0xFF) as u8),
+                    _ => return None,
+                },
+                // a temporal or a boolean first argument is unmeasured
+                _ => return None,
+            },
+        }
+    };
+    Some(CastTarget::Blob { sub_type, cs })
+}
+
 fn fn_text(v: &Value) -> String {
     v.render()
 }
@@ -103857,6 +103932,7 @@ impl Expr {
                     SysFn::DecKey => args.first().and_then(|a| a.type_of(descs)),
                     SysFn::BlobBinText => Some(ExprType::Text),
                     SysFn::MaxMin(_) => None,
+                    SysFn::BlobAppend => Some(ExprType::Text),
                     // ASCII_VAL(text) -> SMALLINT (an integer); a wrong-typed
                     // operand refuses (an unpinned conversion).
                     // A BARE `NULL` LITERAL IS A LEGAL OPERAND. It types as
@@ -106590,12 +106666,23 @@ impl Expr {
                 let mut vs = Vec::with_capacity(args.len());
                 for (i, a) in args.iter().enumerate() {
                     let v = a.eval(values)?;
+                    // BLOB_APPEND SKIPS a NULL instead
+                    if matches!(v, Value::Null) && matches!(f, SysFn::BlobAppend) {
+                        continue;
+                    }
                     if matches!(v, Value::Null) && !(matches!(f, SysFn::SetContext) && i == 2) {
                         return Ok(Value::Null);
                     }
                     vs.push(v);
                 }
                 match f {
+                    // a marker over the lowered `||` ([blob_append_target])
+                    SysFn::BlobAppend => {
+                        if vs.is_empty() {
+                            return Ok(Value::Null);
+                        }
+                        vs.swap_remove(0)
+                    }
                     SysFn::Overlay => {
                         let s: Vec<char> = fn_text(&vs[0]).chars().collect();
                         let p = fn_text(&vs[1]);
@@ -133890,7 +133977,8 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 | SysFn::BlobStr(_)
                 | SysFn::DecKey
                 | SysFn::BlobBinText
-                | SysFn::MaxMin(_) => false,
+                | SysFn::MaxMin(_)
+                | SysFn::BlobAppend => false,
             }
         }
     }
