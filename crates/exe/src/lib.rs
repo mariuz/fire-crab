@@ -152,6 +152,9 @@ mod blr {
     pub const DT_TEXT2: u8 = 15;
     pub const DT_VARYING: u8 = 37;
     pub const DT_VARYING2: u8 = 38;
+    pub const DT_SQL_DATE: u8 = 12;
+    pub const DT_SQL_TIME: u8 = 13;
+    pub const DT_TIMESTAMP: u8 = 35;
 }
 
 /// One slot of a message: its BLR dtype and, for text, the declared
@@ -529,6 +532,10 @@ impl<'a> P<'a> {
             blr::DT_TEXT2 | blr::DT_VARYING2 => {
                 let ttype = self.u16()?;
                 MsgSlot { dtype, length: self.u16()?, scale: 0, ttype }
+            }
+            // the temporal kinds carry no length, scale or set
+            blr::DT_SQL_DATE | blr::DT_SQL_TIME | blr::DT_TIMESTAMP => {
+                MsgSlot { dtype, length: 0, scale: 0, ttype: 0 }
             }
             other => return Err(format!("message dtype {} unconverted", other)),
         })
@@ -1448,6 +1455,26 @@ fn coerce_text(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
     Ok(Value::Text(out))
 }
 
+/// An assignment into a DATE / TIME / TIMESTAMP slot: a value of that
+/// very kind (or NULL) moves as it is; any other - a text to parse, a
+/// timestamp to narrow - is a conversion this executor does not make, and
+/// it refuses so the source interpreter answers it.
+fn coerce_temporal(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
+    let ok = match (slot.map(|s| s.dtype), &v) {
+        (_, Value::Null) => true,
+        (Some(blr::DT_SQL_DATE), Value::Date(_)) => true,
+        (Some(blr::DT_SQL_TIME), Value::Time(_)) => true,
+        (Some(blr::DT_TIMESTAMP), Value::Timestamp(..)) => true,
+        (Some(blr::DT_SQL_DATE | blr::DT_SQL_TIME | blr::DT_TIMESTAMP), _) => false,
+        _ => true,
+    };
+    if ok {
+        Ok(v)
+    } else {
+        Err("temporal assignment outside this executor".into())
+    }
+}
+
 fn coerce_num(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
     let (raw, from) = match num_parts(&v) {
         Some(p) => p,
@@ -1701,6 +1728,26 @@ pub fn bind_and_execute_mode(
     args: &[Value],
     halt_at_stall: bool,
 ) -> Result<Vec<(u8, Vec<Value>)>, String> {
+    // A COMPARISON THIS EXECUTOR CANNOT ORDER FAILS THE RUN ([value_cmp]):
+    // the flag is saved and restored around it, so a nested call (a user
+    // function run inside the request) neither clears an outer hit nor
+    // leaks its own
+    let prev = INCOMPARABLE.with(|f| f.replace(false));
+    let out = bind_and_execute_mode_inner(file, page_size, request, args, halt_at_stall);
+    let hit = INCOMPARABLE.with(|f| f.replace(prev));
+    if hit {
+        return Err("a comparison outside this executor".into());
+    }
+    out
+}
+
+fn bind_and_execute_mode_inner(
+    file: &fire_crab_ods::Image,
+    page_size: usize,
+    request: &Request,
+    args: &[Value],
+    halt_at_stall: bool,
+) -> Result<Vec<(u8, Vec<Value>)>, String> {
     let mut max_msg = 0u8;
     for (n, _) in &request.messages {
         max_msg = max_msg.max(*n);
@@ -1816,6 +1863,7 @@ impl<'a> Exec<'a> {
                 };
                 let v = coerce_num(v, tslot.as_ref())?;
                 let v = coerce_text(v, tslot.as_ref())?;
+                let v = coerce_temporal(v, tslot.as_ref())?;
                 match to {
                     Target::Variable(n) => {
                         let slot = self
@@ -3675,6 +3723,14 @@ fn int_of(v: &Value) -> Option<i64> {
 /// integer (never text-compare mixed shapes), text compares with
 /// trailing spaces insignificant (PAD SPACE). NULL beside anything is
 /// UNKNOWN (`None`).
+thread_local! {
+    /// set by [value_cmp] when two NON-NULL values meet that it has no
+    /// order for - a sort would call them equal, MIN / MAX keep the first,
+    /// a WHERE the unknown: a silently wrong answer each time. The run
+    /// reads it and refuses instead ([bind_and_execute_mode])
+    static INCOMPARABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn value_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     use Value::*;
     let num = |v: &Value| -> Option<(i128, i8)> {
@@ -3691,9 +3747,16 @@ pub fn value_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Text(x), Text(y)) => {
             Some(x.trim_end_matches(' ').cmp(y.trim_end_matches(' ')))
         }
+        // a temporal value against one of its own kind: days, then the
+        // 1/10000 s ticks
+        (Date(x), Date(y)) => Some(x.cmp(y)),
+        (Time(x), Time(y)) => Some(x.cmp(y)),
+        (Timestamp(xd, xt), Timestamp(yd, yt)) => Some((xd, xt).cmp(&(yd, yt))),
         _ => {
-            let (ar, asc) = num(a)?;
-            let (br, bsc) = num(b)?;
+            let (Some((ar, asc)), Some((br, bsc))) = (num(a), num(b)) else {
+                INCOMPARABLE.with(|f| f.set(true));
+                return None;
+            };
             // align to the smaller (more negative) scale
             let scale = asc.min(bsc);
             let lift = |raw: i128, s: i8| -> i128 {

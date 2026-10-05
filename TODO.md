@@ -15,7 +15,15 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       (INI_format) instead of the engine's empty file. With it: MON$OWNER / MON$CREATION_DATE answer (they were NULL), and
       a view's text column carries its set in the view's format (a UTF8 database's view described NONE to the engine).
 - [ ] **P0** Pick the reference engine build; re-measure the stale backlog
-- [ ] **P1** Move SQL execution out of `wire::server` into `dsql` → `opt` → `exe`, one statement family at a time
+- [ ] **P1** Move SQL execution out of `wire::server` into `dsql` → `opt` → `exe`, one statement family at a time.
+      Slice 1 (`qa/serve-real-exeselect.sh`): under FC_EXEC_SELECT a parameterless SELECT whose outputs are exact
+      numerics or temporals is compiled as `FOR <select> INTO .. DO SUSPEND` by dsql and served from exe's record
+      sources; any decline falls back to the interpreter, FC_EXEC_SELECT_TRACE names where. A sweep with the switch
+      ON measures the rest. Found on the way: exe ordered no temporal value (MAX(DATE) answered the earliest) - the
+      kinds order now, and a pair of non-NULL values exe cannot order FAILS the run instead of answering; dsql
+      refused an ORDER BY ordinal (CREATE PROCEDURE .. ORDER BY 1 was refused) - it compiles byte-for-byte now.
+      Next slices: text outputs (the charset the describe announces, the collation guard), parameters, DOUBLE /
+      BOOLEAN / DECFLOAT in the BLR compiler and the executor.
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** Redo the dropped rounds 6–8 SQL work; the FLOAT/ROUND/DECFLOAT wrong answers first

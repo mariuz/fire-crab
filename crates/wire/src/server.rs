@@ -129876,6 +129876,126 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     Some(ProcMeta { ins, outs, source, body_at, prc_type: None, is_function: true })
 }
 
+/// A SELECT SERVED BY THE BLR PATH - SQL -> fire-crab-dsql's BLR ->
+/// fire-crab-exe's record sources -> rows - instead of this crate's
+/// interpreter: item 3 of docs/full-conversion-plan.md, moving SQL
+/// execution out of `wire`, one statement family at a time. EXPERIMENTAL
+/// and OFF unless FC_EXEC_SELECT is set, so a sweep run with it ON measures
+/// the BLR path against every gate the interpreter already passes.
+///
+/// The statement is compiled as the selectable procedure the engine's own
+/// DSQL would make of it - `FOR <select> INTO :o.. DO SUSPEND`, its RETURNS
+/// typed exactly as the prepare described each column - and the suspended
+/// rows answer it ([Plan::ProcRows], the columns made positional). Slice 1:
+/// no parameters, and every output an exact numeric or a temporal (a text
+/// column's set is the attachment's business - its describe rides
+/// sentinels - and the BLR compiler has no DOUBLE, BOOLEAN or DECFLOAT
+/// descriptor). Every step that declines - the compile, the parse, a
+/// generator, a runtime error, a message of another shape - leaves the
+/// statement to the interpreter, which answers it as it always has.
+fn exe_select(plan: &Plan, sql: &str, database: &Option<Database>, args: &[WireParam]) -> Option<Plan> {
+    if std::env::var("FC_EXEC_SELECT").is_err() || !args.is_empty() {
+        return None;
+    }
+    let db = database.as_ref()?;
+    let text = sql.trim().trim_end_matches(';').trim();
+    if !text.get(..6)?.eq_ignore_ascii_case("SELECT") || mask_literals(text).contains(';') {
+        return None;
+    }
+    // where the BLR path declined, for a sweep run to count
+    // (FC_EXEC_SELECT_TRACE): the gaps item 3 has left to close
+    let decline = |step: &str| -> Option<Plan> {
+        if std::env::var("FC_EXEC_SELECT_TRACE").is_ok() {
+            eprintln!("[srv] exe_select declined at {}: {:?}", step, text);
+        }
+        None
+    };
+    let cols = output_cols_of(plan);
+    if cols.is_empty() {
+        return decline("no output columns");
+    }
+    let mut decls = Vec::with_capacity(cols.len());
+    let mut slots = Vec::with_capacity(cols.len());
+    for (i, c) in cols.iter().enumerate() {
+        let sc = -c.scale;
+        let ty = match c.sql_type & !1 {
+            500 if sc > 0 => format!("NUMERIC(4,{})", sc),
+            500 => "SMALLINT".to_string(),
+            496 if sc > 0 => format!("NUMERIC(9,{})", sc),
+            496 => "INTEGER".to_string(),
+            580 if sc > 0 => format!("NUMERIC(18,{})", sc),
+            580 => "BIGINT".to_string(),
+            570 => "DATE".to_string(),
+            560 => "TIME".to_string(),
+            510 => "TIMESTAMP".to_string(),
+            other => return decline(&format!("output type {}", other)),
+        };
+        decls.push(format!("FC$O{} {}", i, ty));
+        slots.push(format!(":FC$O{}", i));
+    }
+    let synth = format!(
+        "CREATE PROCEDURE FC$SELECT RETURNS ({}) AS BEGIN FOR {} INTO {} DO SUSPEND; END",
+        decls.join(", "),
+        text,
+        slots.join(", ")
+    );
+    let funcs = plain_function_arities(database);
+    fire_crab_dsql::set_catalog(dsql_catalog_for(database, &synth));
+    let compiled = fire_crab_dsql::compile_procedure_full_with_funcs(&synth, &funcs);
+    fire_crab_dsql::set_catalog(Vec::new());
+    let Some(compiled) = compiled else { return decline("compile") };
+    if compiled.calls_user_fn || compiled.outs.len() != cols.len() {
+        return decline("compile shape");
+    }
+    let req = match fire_crab_exe::parse(&compiled.blob) {
+        Ok(r) => r,
+        Err(e) => return decline(&format!("parse ({})", e)),
+    };
+    if req.uses_generators {
+        return decline("generators");
+    }
+    let sends = match fire_crab_exe::bind_and_execute_mode(&db.bytes(), db.page_size, &req, &[], false) {
+        Ok(s) => s,
+        Err(e) => return decline(&format!("execute ({})", e)),
+    };
+    // message 1: (value, null-flag) pairs and the EOF short, as a
+    // procedure's ([try_procedure_blr_at])
+    let out_slots = req.messages.iter().find(|(n, _)| *n == 1).map(|(_, s)| s.len());
+    if out_slots != Some(2 * cols.len() + 1) {
+        return decline("message shape");
+    }
+    let mut rows = Vec::new();
+    for (msg, buf) in sends {
+        if msg != 1 || !matches!(buf.get(2 * cols.len()), Some(Value::Int(1))) {
+            continue;
+        }
+        rows.push(
+            (0..cols.len())
+                .map(|i| {
+                    if matches!(buf.get(2 * i + 1), Some(Value::Int(f)) if *f != 0) {
+                        Value::Null
+                    } else {
+                        buf.get(2 * i).cloned().unwrap_or(Value::Null)
+                    }
+                })
+                .collect(),
+        );
+    }
+    if std::env::var("FC_SRV_TRACE").is_ok() || std::env::var("FC_EXEC_SELECT_TRACE").is_ok() {
+        eprintln!("[srv] exe_select served {} rows: {:?}", rows.len(), text);
+    }
+    let cols = cols
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut c)| {
+            c.field_id = i;
+            c.expr = None;
+            c
+        })
+        .collect();
+    Some(Plan::ProcRows { cols, rows, then: None })
+}
+
 /// Run a PSQL FUNCTION from its source: the one output is its answer.
 fn run_function(
     database: &mut Option<Database>,
@@ -140085,6 +140205,13 @@ fn after_auth(
                         }
                     }
                     continue;
+                } else if let Some(p) = (!plan_has_procselect(&plan))
+                    .then(|| exe_select(&plan, &stmt_sql, &database, &bound_args))
+                    .flatten()
+                {
+                    // THE BLR PATH SERVES IT ([exe_select], FC_EXEC_SELECT)
+                    plan = std::rc::Rc::new(p);
+                    respond(&mut s, &mut enc, resp_tx)?;
                 } else if plan_has_procselect(&plan) {
                     // A SELECTABLE PROCEDURE ANYWHERE IN THE PLAN: the
                     // bare call, and now also a derived table, a grouped

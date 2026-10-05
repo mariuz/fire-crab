@@ -6803,15 +6803,33 @@ impl<'a> P<'a> {
                 let key = self.val()?;
                 // over an aggregate the key REBUILDS against the
                 // map; elsewhere the raw expression IS the sort key
-                // (both probed) - but a bare literal is a POSITION
-                // to the engine, not a value: refuse
-                if matches!(
-                    key,
-                    Val::Int(..) | Val::Int64(..) | Val::Dec(..)
-                ) {
+                // (both probed) - and a bare integer is a POSITION in
+                // the select list, compiled to the BLR of the item it
+                // names: `ORDER BY 2 DESC, 1` is byte-for-byte `ORDER BY
+                // N DESC, ID`, `ORDER BY 2` over `G, COUNT(*)` is `ORDER
+                // BY COUNT(*)`, `ORDER BY 1` over `ID * 2` is `ORDER BY
+                // ID * 2` (RDB$PROCEDURE_BLR on 2196). A scaled literal
+                // is no position, and a window item has no such key:
+                // both refuse.
+                let position = match key {
+                    Val::Int(n) => Some(n as i64),
+                    Val::Int64(n) => Some(n),
+                    _ => None,
+                };
+                if matches!(key, Val::Dec(..)) {
                     return None;
                 }
-                let key = if aggregate {
+                let key = if let Some(n) = position {
+                    let i = usize::try_from(n).ok()?.checked_sub(1)?;
+                    if aggregate {
+                        agg_vals.as_ref()?.get(i)?.clone()
+                    } else {
+                        match items.get(i)? {
+                            Item::Col(v) | Item::Expr(v) => v.clone(),
+                            _ => return None,
+                        }
+                    }
+                } else if aggregate {
                     map_val_to_fid(&self.agg_map, &key, self.agg_fid_ctx)?
                 } else {
                     key
@@ -13307,10 +13325,37 @@ mod tests {
     }
 
     #[test]
+    fn order_by_position_is_the_item_it_names() {
+        // byte-for-byte the named key (RDB$PROCEDURE_BLR on 2196): plain
+        // columns, an aggregate's map slot, an expression
+        for (pos, named) in [
+            ("ORDER BY 2 DESC, 1", "ORDER BY A DESC, ID"),
+            ("ORDER BY 1", "ORDER BY ID * 2"),
+        ] {
+            let wrap = |o: &str, sel: &str| {
+                format!("CREATE PROCEDURE X RETURNS (R1 BIGINT, R2 INTEGER) AS BEGIN FOR SELECT {} FROM T {} INTO :R1, :R2 DO SUSPEND; END", sel, o)
+            };
+            let sel = if named.contains('*') { "ID * 2, A" } else { "ID, A" };
+            assert_eq!(compile_procedure(&wrap(pos, sel)), compile_procedure(&wrap(named, sel)), "{pos}");
+            assert!(compile_procedure(&wrap(pos, sel)).is_some(), "{pos}");
+        }
+        let grp = |o: &str| {
+            format!("CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 BIGINT) AS BEGIN FOR SELECT A, COUNT(*) FROM T GROUP BY A {} INTO :R1, :R2 DO SUSPEND; END", o)
+        };
+        // an aggregate's position compiles to its map slot (the engine's
+        // PO3 bytes, checked through fcdsql); the AGGREGATE written out as
+        // the key (`ORDER BY COUNT(*)`) is not taken by this compiler yet
+        assert!(compile_procedure(&grp("ORDER BY 2 DESC")).is_some());
+        assert!(compile_procedure(&grp("ORDER BY COUNT(*) DESC")).is_none());
+    }
+
+    #[test]
     fn procedure_refusals() {
         for sql in [
-            // ORDER BY <position> and expressions: unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T ORDER BY 1 INTO :R1 DO SUSPEND; END",
+            // ORDER BY <position> past the select list (the engine's -104
+            // *Invalid column position*), and a scaled one
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T ORDER BY 2 INTO :R1 DO SUSPEND; END",
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T ORDER BY 1.0 INTO :R1 DO SUSPEND; END",
             // INTO must name RETURNS parameters, one per column
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID FROM T INTO :NOPE DO SUSPEND; END",
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT ID, A FROM T INTO :R1 DO SUSPEND; END",
