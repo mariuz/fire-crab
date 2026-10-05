@@ -6431,6 +6431,18 @@ fn restore_view_with(
             .ok_or_else(|| format!("view {}: domain {} not found", name, f.source))?;
         let dt = field_type_to_dtype(ft)
             .ok_or_else(|| format!("view {}: field type {} unsupported", name, ft))?;
+        // a TEXT field's descriptor carries its TTYPE - the set, the
+        // collation above it - not RDB$FIELD_SUB_TYPE, which is 0 for one:
+        // a view over a UTF8 column described as NONE to the engine
+        // (measured in a DEFAULT CHARACTER SET UTF8 database: the
+        // engine's own format holds 0004)
+        let st = if matches!(dt, crate::format::dtype::TEXT | crate::format::dtype::VARYING) {
+            let cs = domain_charset_id(file, page_size, &f.source).unwrap_or(0);
+            let coll = domain_collation_id(file, page_size, &f.source).unwrap_or(0);
+            (cs | (coll << 8)) as i16
+        } else {
+            st
+        };
         fields_ty.push((dt, len, sc, st));
     }
     let descs: Vec<Descriptor> = compute_format(&fields_ty);

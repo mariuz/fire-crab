@@ -2267,6 +2267,24 @@ fn respond_ddl_meta(
         format!("\"PUBLIC\".\"{}\"", n.trim().trim_matches('"').to_ascii_uppercase())
     };
     let lc = err_text.to_ascii_lowercase();
+    // ALTER DATABASE's own failure names nothing: *ALTER DATABASE failed*,
+    // then the reason - an unknown DEFAULT CHARACTER SET is 2C000
+    // *CHARACTER SET "PUBLIC"."NOSUCH" is not defined* (measured)
+    if let (Plan::AlterDatabaseCharset { name: Some(n) }, true) = (plan, lc.contains("is not defined")) {
+        let mut w = W::default();
+        w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+        w.int(1) // isc_arg_gds - unsuccessful metadata update
+            .int(GDS_NO_META_UPDATE)
+            .int(1) // isc_arg_gds - ALTER DATABASE failed
+            .int(336397313)
+            .int(1) // isc_arg_gds - CHARACTER SET @1 is not defined
+            .int(335544509)
+            .int(2)
+            .bytes(format!("\"PUBLIC\".\"{}\"", n).as_bytes())
+            .int(0);
+        w.send(s, enc)?;
+        return Ok(true);
+    }
     // the statement's "<VERB> @1 failed" item for the relation DDL that
     // writes a foreign key or a view - CREATE TABLE, ALTER TABLE ...,
     // CREATE / ALTER / RECREATE VIEW (the verb the planner chose)
@@ -6095,13 +6113,54 @@ fn classify_attach_failure(path: &str) -> AttachRefusal {
     }
 }
 
-/// Materialise an empty real database at `path` (op_create). fire-crab
-/// serves and mutates real ODS files; synthesising a valid one from
-/// nothing is a separate large conversion, so op_create has the engine
-/// create it - `isql -o /dev/null` running a CREATE DATABASE - exactly
-/// as every gate builds its scratch db. The binary is taken from
-/// $FC_ISQL, else `isql` on PATH. The client's own DDL/DML then runs
-/// through fire-crab against the file.
+/// THE ENGINE'S OWN EMPTY DATABASE, one per page size it creates: a bare
+/// `CREATE DATABASE '<p>' USER 'SYSDBA' .. PAGE_SIZE <n>` on 6.0.0.2196,
+/// zlib-compressed (crates/ods/templates). Two creations differ only in
+/// the header's transaction counters, its GUID and its creation time, the
+/// index roots' and the TIP's page generations, and - under DEFAULT
+/// CHARACTER SET - one RDB$DATABASE record version (measured byte for
+/// byte, 2026-10-05), so op_create writes this and makes it its own
+/// ([create_database_file]) rather than spawning the engine's isql.
+const EMPTY_DATABASES: [(usize, &[u8]); 3] = [
+    (8192, include_bytes!("../../ods/templates/empty-8192.fdb.z")),
+    (16384, include_bytes!("../../ods/templates/empty-16384.fdb.z")),
+    (32768, include_bytes!("../../ods/templates/empty-32768.fdb.z")),
+];
+
+/// The page size the engine creates for an `isc_dpb_page_size` of `asked`:
+/// the NEAREST of 8192 / 16384 / 32768, a tie going up, nothing below 8192
+/// or above 32768, 0 or none the default 8192 (measured on 2196: 1, 4096,
+/// 10000 and 12287 are 8192; 12288, 16000 and 24575 16384; 24576 and 65536
+/// 32768).
+fn engine_page_size(asked: Option<u32>) -> usize {
+    match asked.unwrap_or(0) {
+        0..=12287 => 8192,
+        12288..=24575 => 16384,
+        _ => 32768,
+    }
+}
+
+/// A random (version 4) GUID in the header's STORAGE order - its first
+/// three groups little-endian, so the version nibble is byte 7's high
+/// one, as in every header the engine writes (`..ae49 90..`).
+fn header_guid() -> [u8; 16] {
+    let mut g = fresh_guid();
+    g[7] = (g[7] & 0x0f) | 0x40;
+    g[8] = (g[8] & 0x3f) | 0x80;
+    g
+}
+
+/// Materialise an empty real database at `path` (op_create), natively:
+/// the engine's own empty database for the page size asked
+/// ([EMPTY_DATABASES], [engine_page_size]) made this database's - a new
+/// GUID (header bytes 84..100) and creation time (100..108, an
+/// ISC_TIMESTAMP in UTC) - and, for a DEFAULT CHARACTER SET, its name in
+/// RDB$DATABASE, spelled as the client spelled it (upper-cased: `utf8` is
+/// UTF8, the alias `WIN_1252` stays WIN_1252, measured). A set the catalog
+/// does not name leaves NONE, as the engine's create leaves the file it
+/// made before its own ALTER DATABASE refused. The client's own DDL/DML
+/// then runs through fire-crab against the file. No Firebird install is
+/// needed: this once spawned the engine's `isql` ($FC_ISQL).
 fn create_database_file(path: &str, want: CreateDpb) -> Result<(), String> {
     let p = path.trim();
     if p.is_empty() {
@@ -6113,42 +6172,28 @@ fn create_database_file(path: &str, want: CreateDpb) -> Result<(), String> {
     }
     let _ = std::fs::remove_file(p);
     fire_crab_cch::pool::forget(p);
-    let isql = std::env::var("FC_ISQL").unwrap_or_else(|_| "isql".to_string());
-    let user = std::env::var("FC_CREATE_USER").unwrap_or_else(|_| "SYSDBA".to_string());
-    let pass = std::env::var("FC_CREATE_PASSWORD").unwrap_or_else(|_| "masterkey".to_string());
-    // THE PAGE SIZE THE CLIENT ASKED FOR. gbak carries the backup's own
-    // page size (or its -p switch) in the create DPB, and a restore that
-    // silently lands on 8192 is not the database that was backed up.
-    let page_size = want.page_size.unwrap_or(8192);
-    let charset = match &want.db_charset {
-        Some(cs) => format!(" DEFAULT CHARACTER SET {}", cs),
-        None => String::new(),
-    };
-    let sql = format!(
-        "CREATE DATABASE '{}' USER '{}' PASSWORD '{}' PAGE_SIZE {}{};\n",
-        p.replace('\'', "''"),
-        user,
-        pass,
-        page_size,
-        charset
-    );
-    let out = std::process::Command::new(&isql)
-        .args(["-q", "-o", "/dev/null"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child.stdin.take().unwrap().write_all(sql.as_bytes())?;
-            child.wait_with_output()
-        })
-        .map_err(|e| format!("spawn {}: {}", isql, e))?;
-    if !out.status.success() && load_database(p).is_none() {
-        return Err(format!(
-            "isql create failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    let page_size = engine_page_size(want.page_size);
+    let packed = EMPTY_DATABASES
+        .iter()
+        .find(|(n, _)| *n == page_size)
+        .map(|(_, b)| *b)
+        .ok_or_else(|| format!("no empty database for page size {}", page_size))?;
+    let mut inflater = crate::zlib::Inflater::new();
+    inflater.feed(packed)?;
+    let mut image: Vec<u8> = inflater.out.drain(..).collect();
+    if image.len() < page_size || image.len() % page_size != 0 {
+        return Err("the empty database did not inflate whole".into());
+    }
+    image[84..100].copy_from_slice(&header_guid());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    // days since 1858-11-17 (the Unix epoch is day 40587) and 1/10000 s
+    let date = (now.as_secs() / 86400) as i32 + 40587;
+    let ticks = ((now.as_secs() % 86400) * 10_000 + u64::from(now.subsec_micros()) / 100) as u32;
+    image[100..104].copy_from_slice(&date.to_le_bytes());
+    image[104..108].copy_from_slice(&ticks.to_le_bytes());
+    std::fs::write(p, &image).map_err(|e| format!("write {}: {}", p, os_error_text(&e)))?;
+    if let Some(cs) = want.db_charset.as_deref().map(|c| c.trim().to_ascii_uppercase()).filter(|c| c != "NONE") {
+        set_default_charset(p, &cs)?;
     }
     if load_database(p).is_none() {
         return Err("created file is not a decodable database".into());
@@ -6225,6 +6270,65 @@ fn remove_public_schema_grants(path: &str) -> Result<(), String> {
 /// as it does everywhere else here - a conflicting entry counts only
 /// while its record still builds that key - so the name can be stored
 /// again immediately.
+/// Does the catalog name the character set `name` - RDB$CHARACTER_SETS,
+/// or one of its aliases in RDB$TYPES (`UTF_FSS`, `WIN_1252`)?
+fn catalog_names_charset(db: &Database, name: &str) -> bool {
+    let mut known = false;
+    for (rel_name, field, alias) in [("RDB$CHARACTER_SETS", "RDB$CHARACTER_SET_NAME", false), ("RDB$TYPES", "RDB$TYPE_NAME", true)] {
+        let (Some((cols, descs)), Some(rel)) =
+            (sys_rel(db, rel_name), fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, rel_name))
+        else {
+            continue;
+        };
+        let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+        let (Some(name_f), kind_f) = (fid(field), fid("RDB$FIELD_NAME")) else { continue };
+        for_each_catalog_record(db, rel, &[(0u8, descs)], usize::MAX, |v| {
+            let named = matches!(v.get(name_f), Some(Value::Text(t)) if t.trim_end() == name);
+            let of_sets = !alias
+                || kind_f.is_some_and(|k| matches!(v.get(k), Some(Value::Text(t)) if t.trim_end() == "RDB$CHARACTER_SET_NAME"));
+            if named && of_sets {
+                known = true;
+            }
+        });
+    }
+    known
+}
+
+/// THE DATABASE'S DEFAULT CHARACTER SET: `name`, as the client spelled it
+/// (upper-cased unless quoted), into RDB$DATABASE - or the engine's 2C000
+/// *CHARACTER SET "PUBLIC"."<name>" is not defined* under *ALTER DATABASE
+/// failed* ([respond_ddl_meta]) for a name the catalog does not carry.
+fn set_default_charset_in(work: &mut fire_crab_ods::Image, db: &Database, name: &str) -> Result<(), String> {
+    if !catalog_names_charset(db, name) {
+        return Err(format!("CHARACTER SET \"PUBLIC\".\"{}\" is not defined", name));
+    }
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$DATABASE")
+        .ok_or("no RDB$DATABASE in the database")?;
+    fire_crab_ods::ddl::patch_system_row(
+        work,
+        db.page_size,
+        "RDB$DATABASE",
+        rel,
+        |_| true,
+        &[("RDB$CHARACTER_SET_NAME", fire_crab_ods::ddl::SysValue::Text(name))],
+    )
+}
+
+/// The new database's DEFAULT CHARACTER SET from its create DPB
+/// ([create_database_file]): as [set_default_charset_in], except that a set
+/// the catalog does not name leaves NONE.
+fn set_default_charset(path: &str, name: &str) -> Result<(), String> {
+    let mut db = load_database(path).ok_or("created file is not a decodable database")?;
+    if !catalog_names_charset(&db, name) {
+        return Ok(());
+    }
+    let mut work = db.work_copy()?;
+    set_default_charset_in(&mut work, &db, name)?;
+    db.install_dirty(work);
+    db.flush_dirty()?;
+    Ok(())
+}
+
 fn remove_public_schema(path: &str) -> Result<(), String> {
     let mut db = load_database(path).ok_or("created file is not a decodable database")?;
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$SCHEMAS")
@@ -8555,7 +8659,7 @@ fn run_nrest(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
     // A FRESH DATABASE GUID (offset 84, 16 bytes) - the engine writes
     // one on every restore, and the gate asserts it CHANGED.
     if image.len() >= 100 {
-        image[84..100].copy_from_slice(&fresh_guid());
+        image[84..100].copy_from_slice(&header_guid());
     }
     let mut out = std::fs::OpenOptions::new()
         .write(true)
@@ -9211,12 +9315,34 @@ fn mon_rows(
     put("MON$FORCED_WRITES", Value::Int((head.flags & hdr_flags::FORCE_WRITE != 0) as i64));
     put("MON$RESERVE_SPACE", Value::Int((head.flags & hdr_flags::NO_RESERVE == 0) as i64));
     put("MON$PAGES", Value::Int(image.pages().count() as i64));
+    // the header's creation time, which the engine keeps in GMT and shows
+    // WITH TIME ZONE (`2026-10-05 12:45:40.4672 GMT`, measured)
+    put("MON$CREATION_DATE", Value::TimestampTz(head.creation_date.0, head.creation_date.1, 65535));
+    // the database's owner: the owner of RDB$DATABASE's own RDB$RELATIONS
+    // row, which the create stamps with the creating user
+    if let Some((rcols, rdescs)) = sys_rel(db, "RDB$RELATIONS") {
+        let fid = |n: &str| rcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+        if let (Some(name_f), Some(owner_f), Some(rel)) =
+            (fid("RDB$RELATION_NAME"), fid("RDB$OWNER_NAME"), fire_crab_ods::resolve_relation(&image, db.page_size, "RDB$RELATIONS"))
+        {
+            let mut owner = None;
+            for_each_catalog_record(db, rel, &[(0u8, rdescs)], usize::MAX, |v| {
+                if matches!(v.get(name_f), Some(Value::Text(t)) if t.trim_end() == "RDB$DATABASE") {
+                    if let Some(Value::Text(o)) = v.get(owner_f) {
+                        owner = Some(o.trim_end().to_string());
+                    }
+                }
+            });
+            if let Some(o) = owner {
+                put("MON$OWNER", Value::Text(o));
+            }
+        }
+    }
     // WHAT IS LEFT NULL, and why: MON$PAGE_BUFFERS is the RUNTIME cache
     // size (the engine's default where the header says 0, and this
-    // server's cache is not the engine's), MON$OWNER, MON$FILE_ID,
-    // MON$CREATION_DATE, MON$NEXT_STATEMENT. Each would be a guess, and
-    // a guess in a monitoring table is the kind of answer nobody can
-    // act on.
+    // server's cache is not the engine's), MON$FILE_ID, MON$NEXT_STATEMENT.
+    // Each would be a guess, and a guess in a monitoring table is the kind
+    // of answer nobody can act on.
     Some(vec![row])
 }
 
@@ -10662,6 +10788,11 @@ enum Plan {
     /// `ALTER DATABASE BEGIN BACKUP` / `END BACKUP` - the nbackup
     /// difference-file mode
     AlterDatabaseBackup { begin: bool },
+    /// `ALTER DATABASE SET DEFAULT CHARACTER SET <cs>`, and the `CREATE
+    /// DATABASE ..` text a client re-sends on the attachment its op_create
+    /// opened (its DEFAULT CHARACTER SET, if any - the rest of it rode in
+    /// the DPB): the name into RDB$DATABASE ([set_default_charset_in])
+    AlterDatabaseCharset { name: Option<String> },
     /// `DROP ROLE <name>`: the row and its security class go
     DropRole { name: String },
     /// `CREATE DOMAIN <name> [AS] <type> [NOT NULL] [CHECK (...)]`: a
@@ -32574,10 +32705,45 @@ fn plan_create_role(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     Some((Plan::CreateRole { name: unquote_ident(toks[2])? }, Vec::new()))
 }
 
-/// Parse `ALTER DATABASE BEGIN BACKUP` / `ALTER DATABASE END BACKUP`.
+/// Parse `ALTER DATABASE BEGIN BACKUP` / `ALTER DATABASE END BACKUP`,
+/// `ALTER DATABASE SET DEFAULT CHARACTER SET <cs>`, and the `CREATE
+/// DATABASE` text a client executes on the attachment its op_create
+/// opened - the engine runs that as an ALTER of the new database (its
+/// refusal of an unknown set says *ALTER DATABASE failed*, measured),
+/// taking the DEFAULT CHARACTER SET; a COLLATION after it stays refused.
 /// Everything else ALTER DATABASE says stays refused.
 fn plan_alter_database(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
+    let up = mask_literals(&s.to_ascii_uppercase());
+    let words: Vec<&str> = up.split_whitespace().collect();
+    let default_cs = |at: usize| -> Option<Option<String>> {
+        // DEFAULT CHARACTER SET <cs> at word `at`, the end of the text
+        // or of this clause after it
+        let rest = &words[at..];
+        if rest.len() < 4 || rest[..3] != ["DEFAULT", "CHARACTER", "SET"] {
+            return None;
+        }
+        if rest.get(4).is_some_and(|w| *w == "COLLATION") {
+            return None;
+        }
+        let raw = s.split_whitespace().nth(at + 3)?;
+        Some(Some(match raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+            Some(q) => q.to_string(),
+            None => raw.to_ascii_uppercase(),
+        }))
+    };
+    if words.len() == 7 && words[..3] == ["ALTER", "DATABASE", "SET"] {
+        let name = default_cs(3)?;
+        return Some((Plan::AlterDatabaseCharset { name }, Vec::new()));
+    }
+    if words.len() >= 3 && words[..2] == ["CREATE", "DATABASE"] {
+        let at = words.iter().position(|w| *w == "DEFAULT");
+        let name = match at {
+            Some(i) => default_cs(i)?,
+            None => None,
+        };
+        return Some((Plan::AlterDatabaseCharset { name }, Vec::new()));
+    }
     let toks: Vec<&str> = s.split_whitespace().collect();
     if toks.len() != 4
         || !toks[0].eq_ignore_ascii_case("ALTER")
@@ -42962,6 +43128,12 @@ fn execute_dml_collecting_inner(
         }
         Plan::CreateRole { name } => {
             fire_crab_ods::ddl::create_role(&mut work, db.page_size, name, &[])?;
+            (0, 0, 0)
+        }
+        Plan::AlterDatabaseCharset { name } => {
+            if let Some(n) = name {
+                set_default_charset_in(&mut work, db, n)?;
+            }
             (0, 0, 0)
         }
         Plan::AlterDatabaseBackup { begin } => {
@@ -78643,7 +78815,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
-        | Plan::AlterDatabaseBackup { .. }
+        | Plan::AlterDatabaseBackup { .. } | Plan::AlterDatabaseCharset { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
         | Plan::AlterDomainNotNull { .. }
@@ -78770,7 +78942,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
-        | Plan::AlterDatabaseBackup { .. }
+        | Plan::AlterDatabaseBackup { .. } | Plan::AlterDatabaseCharset { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
         | Plan::AlterDomainNotNull { .. }
@@ -82969,7 +83141,7 @@ fn emit_rows_inner(
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
-        | Plan::AlterDatabaseBackup { .. }
+        | Plan::AlterDatabaseBackup { .. } | Plan::AlterDatabaseCharset { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
         | Plan::AlterDomainNotNull { .. }
@@ -139244,7 +139416,7 @@ fn after_auth(
                         | Plan::DropException { .. }
                         | Plan::CreateRole { .. }
                         | Plan::DropRole { .. }
-                        | Plan::AlterDatabaseBackup { .. }
+                        | Plan::AlterDatabaseBackup { .. } | Plan::AlterDatabaseCharset { .. }
                         | Plan::CreateDomain { .. }
                         | Plan::DropDomain { .. }
                         | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
