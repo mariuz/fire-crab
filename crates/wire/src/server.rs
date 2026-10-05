@@ -43349,6 +43349,10 @@ fn execute_dml_collecting_inner(
                 let recno = recno_of(&work, db.page_size, out.page_no, out.slot)?;
                 let values = decode_record(image, descs);
                 for op in index_ops {
+                    // a PARTIAL index holds only the rows its condition takes
+                    if !op.holds(&values)? {
+                        continue;
+                    }
                     let (key, all_null) = op
                         .key_for(&values)
                         .ok_or("unsupported value for an index key")?;
@@ -44946,9 +44950,47 @@ struct IndexOp {
     /// over the reactivated one, and with the slot's flags gone a DESC
     /// tree was read as ascending and missed rows.
     retrievable: bool,
+    /// an EXPRESSION index's key and a PARTIAL index's condition, compiled
+    /// from their catalog sources ([IdxEval]); None for a plain index
+    eval: Option<std::sync::Arc<IdxEval>>,
+}
+
+/// What an expression or partial index computes per record, compiled
+/// from RDB$EXPRESSION_SOURCE / RDB$CONDITION_SOURCE through the same
+/// resolver a statement's own expressions take. Compared and printed by
+/// its SOURCES (the compiled forms carry neither).
+#[derive(Clone)]
+struct IdxEval {
+    /// the expression's text, and its key segment (itype, charset)
+    expr: Option<(String, Expr, u16, u8)>,
+    cond: Option<(String, Predicate)>,
+}
+
+impl std::fmt::Debug for IdxEval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IdxEval({:?}, {:?})", self.expr.as_ref().map(|e| &e.0), self.cond.as_ref().map(|c| &c.0))
+    }
+}
+
+impl PartialEq for IdxEval {
+    fn eq(&self, o: &Self) -> bool {
+        self.expr.as_ref().map(|e| &e.0) == o.expr.as_ref().map(|e| &e.0)
+            && self.cond.as_ref().map(|c| &c.0) == o.cond.as_ref().map(|c| &c.0)
+    }
 }
 
 impl IndexOp {
+    /// Does this record belong in the index? A PARTIAL index holds only
+    /// the records its condition accepts - TRUE, not NULL (the engine's
+    /// `CREATE INDEX .. WHERE` keys a row when the condition is true);
+    /// every other index holds every record.
+    fn holds(&self, values: &[Value]) -> Result<bool, String> {
+        match self.eval.as_ref().and_then(|e| e.cond.as_ref()) {
+            Some((_, p)) => p.matches(values).map_err(|e| format!("index condition: {:?}", e)),
+            None => Ok(true),
+        }
+    }
+
     /// Build this index's key for a decoded record: the full
     /// [btw::build_index_key] shape - compound stuffing, descending
     /// complement - plus the all-NULL marker that disables unique
@@ -44958,6 +45000,16 @@ impl IndexOp {
     fn key_for(&self, values: &[Value]) -> Option<(Vec<u8>, bool)> {
         use fire_crab_ods::btw;
         let null = Value::Null;
+        // an EXPRESSION index keys the expression's value, one segment
+        if let Some((_, e, itype, charset)) = self.eval.as_ref().and_then(|ev| ev.expr.as_ref()) {
+            let v = e.eval(values).ok()?;
+            let scale = match &v {
+                Value::Scaled(_, sc) | Value::Rounded(_, sc) | Value::Int128(_, sc) => *sc,
+                _ => 0,
+            };
+            let seg = btw::KeySeg { itype: *itype, value: &v, scale, charset: *charset };
+            return btw::build_index_key(&[seg], self.descending);
+        }
         let segs: Vec<btw::KeySeg<'_>> = self
             .segs
             .iter()
@@ -45729,8 +45781,28 @@ fn resolve_index_ops_uncached(db: &Database, rel: u16, descs: &[Descriptor]) -> 
         if segs.is_empty() {
             return None;
         }
+        // an EXPRESSION or PARTIAL index is maintained from its compiled
+        // sources ([IdxEval]) and never drives a retrieval; one this
+        // server cannot compile - or a UNIQUE expression index, whose
+        // duplicate message names the expression - still refuses the
+        // write, as every such index did
+        let mut eval: Option<IdxEval> = None;
         if iflags & (btw::IRT_EXPRESSION | btw::IRT_CONDITION) != 0 {
-            return None;
+            if iflags & btw::IRT_EXPRESSION != 0 && iflags & btw::IRT_UNIQUE != 0 {
+                return None;
+            }
+            eval = Some(compile_index_eval(db, rel, e.id, descs, iflags, &segs)?);
+        }
+        if let Some(IdxEval { expr: Some(_), .. }) = &eval {
+            ops.push(IndexOp {
+                id: e.id,
+                segs: Vec::new(),
+                descending: iflags & btw::IRT_DESCENDING != 0,
+                unique: false,
+                retrievable: false,
+                eval: eval.map(std::sync::Arc::new),
+            });
+            continue;
         }
         let mut op_segs = Vec::with_capacity(segs.len());
         for (field, itype) in segs {
@@ -45766,15 +45838,133 @@ fn resolve_index_ops_uncached(db: &Database, rel: u16, descs: &[Descriptor]) -> 
             let d = descs.get(field as usize)?;
             op_segs.push((field as usize, itype, d.scale, fire_crab_ods::intl::charset_id(d.sub_type)));
         }
+        let partial = eval.is_some();
         ops.push(IndexOp {
             id: e.id,
             segs: op_segs,
             descending: iflags & btw::IRT_DESCENDING != 0,
             unique: iflags & btw::IRT_UNIQUE != 0 && !dropping,
-            retrievable: !dropping,
+            retrievable: !dropping && !partial,
+            eval: eval.map(std::sync::Arc::new),
         });
     }
     Some(ops)
+}
+
+/// Compile an expression or partial index's catalog sources against its
+/// relation ([IdxEval]). None for anything not answerable byte-exactly:
+/// a source that does not parse or resolve, an expression whose value
+/// cannot be keyed in the index's itype (a text expression under a real
+/// collation, a type the key builder does not encode).
+fn compile_index_eval(
+    db: &Database,
+    rel: u16,
+    index_id: u8,
+    descs: &[Descriptor],
+    iflags: u16,
+    segs: &[(u16, u16)],
+) -> Option<IdxEval> {
+    use fire_crab_ods::btw;
+    let image = db.bytes();
+    let rel_name = fire_crab_ods::catalog::list_relations(&image, db.page_size)
+        .into_iter()
+        .find(|(id, _)| *id == rel)
+        .map(|(_, n)| n.trim_end().to_string())?;
+    let (expr_src, cond_src) = index_sources(db, &rel_name, index_id)?;
+    let columns = relation_columns(&image, db.page_size, &rel_name);
+    let mut out = IdxEval { expr: None, cond: None };
+    if iflags & btw::IRT_EXPRESSION != 0 {
+        let src = expr_src?;
+        let raw = parse_raw_expr_any(src.trim())?;
+        let e = resolve_expr(&raw, &columns, descs)?;
+        let [(_, itype)] = segs else { return None };
+        let charset = match e.type_of(descs)? {
+            ExprType::Text => {
+                if expr_key_coll(&e, descs)? >> 8 != 0 {
+                    return None;
+                }
+                (expr_text_ttype(&e, descs)? & 0xFF) as u8
+            }
+            ExprType::Int | ExprType::Numeric | ExprType::Approx | ExprType::Bool | ExprType::Temporal(_) => 0,
+            _ => return None,
+        };
+        let ok = matches!(
+            *itype,
+            btw::IDX_STRING
+                | btw::IDX_METADATA
+                | btw::IDX_NUMERIC
+                | btw::IDX_NUMERIC2
+                | btw::IDX_SQL_DATE
+                | btw::IDX_SQL_TIME
+                | btw::IDX_TIMESTAMP
+                | btw::IDX_BOOLEAN
+        ) || btw::intl_binary_charset(*itype).is_some();
+        if !ok {
+            return None;
+        }
+        out.expr = Some((src, e, *itype, charset));
+    }
+    if iflags & btw::IRT_CONDITION != 0 {
+        let src = cond_src?;
+        let body = src.trim();
+        let body = body
+            .get(..5)
+            .filter(|w| w.eq_ignore_ascii_case("WHERE"))
+            .and(body.get(5..))
+            .unwrap_or(body)
+            .trim();
+        let toks = tokenize(body)?;
+        let mut np = 0usize;
+        let raw = parse_predicate(&toks, &mut np)?;
+        let mut params = Vec::new();
+        let p = resolve_predicate(raw, &columns, descs, &mut params)?;
+        if !params.is_empty() {
+            return None;
+        }
+        out.cond = Some((src, p));
+    }
+    Some(out)
+}
+
+/// An index's RDB$EXPRESSION_SOURCE and RDB$CONDITION_SOURCE, by its
+/// relation and index-root slot (RDB$INDEX_ID stores slot + 1).
+fn index_sources(db: &Database, rel_name: &str, index_id: u8) -> Option<(Option<String>, Option<String>)> {
+    let formats =
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$INDICES")?;
+    let (_, idescs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(&db.bytes(), db.page_size, "RDB$INDICES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (rn_f, id_f, ex_f, co_f) = (
+        fid("RDB$RELATION_NAME")?,
+        fid("RDB$INDEX_ID")?,
+        fid("RDB$EXPRESSION_SOURCE")?,
+        fid("RDB$CONDITION_SOURCE")?,
+    );
+    let irel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$INDICES")?;
+    let fmts = vec![(0u8, idescs.clone())];
+    let mut found: Option<(Value, Value)> = None;
+    for_each_catalog_record(db, irel, &fmts, usize::MAX, |values| {
+        if found.is_some() {
+            return;
+        }
+        let on_rel = matches!(values.get(rn_f), Some(Value::Text(t)) if t.trim_end() == rel_name);
+        let on_id = matches!(values.get(id_f), Some(Value::Int(i)) if *i == index_id as i64 + 1);
+        if on_rel && on_id {
+            found = Some((
+                values.get(ex_f).cloned().unwrap_or(Value::Null),
+                values.get(co_f).cloned().unwrap_or(Value::Null),
+            ));
+        }
+    });
+    let (ex, co) = found?;
+    let text = |v: Value| -> Option<String> {
+        match v {
+            Value::Blob(r, n) => fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, r, n)
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+            _ => None,
+        }
+    };
+    Some((text(ex), text(co)))
 }
 
 /// Check a parameterised SELECT's values against its plan by binding
@@ -45872,10 +46062,17 @@ fn write_updated_row(
     let old_values = decode_record(old_img, descs);
     let new_values = decode_record(new_img, descs);
     for op in index_ops {
+        // a PARTIAL index: the new version is keyed when the condition
+        // takes it - and keyed afresh when the OLD version was not in the
+        // index at all, whatever the two keys are
+        if !op.holds(&new_values)? {
+            continue;
+        }
+        let old_held = op.holds(&old_values)?;
         let (old_key, _) = op.key_for(&old_values).ok_or("unsupported value for an index key")?;
         let (new_key, all_null) =
             op.key_for(&new_values).ok_or("unsupported value for an index key")?;
-        if new_key != old_key {
+        if new_key != old_key || !old_held {
             insert_entry_verified(
                 work,
                 db.page_size,
@@ -46320,7 +46517,7 @@ fn unique_conflict(
     let view = ReadView::over(work, page_size, own.clone());
     records_at_in(work, page_size, rel, formats, defaults, &others, &view)
         .iter()
-        .any(|values| op.key_for(values).is_some_and(|(k, _)| k == key))
+        .any(|values| op.holds(values).unwrap_or(true) && op.key_for(values).is_some_and(|(k, _)| k == key))
 }
 
 fn recno_of(work: &fire_crab_ods::Image, page_size: usize, page_no: u32, slot: u16) -> Result<u64, String> {
@@ -121808,6 +122005,24 @@ fn insert_select(
             fire_crab_ods::intl::CS_UTF8
         })
         .collect();
+    // ...and which columns carry GENUINE UTF8 text - a UTF8 column or an
+    // expression typed UTF8 - as opposed to the attachment's set
+    // ([ATT_SUBTYPE]: a literal under a NONE attachment, whose value is
+    // its bytes and not UTF-8 content)
+    let src_utf8: Vec<bool> = output_cols_of(src)
+        .iter()
+        .map(|c| {
+            let cs = if c.sub_type <= -2 {
+                // a text expression's real set, behind [enc_real_cs]
+                Some((-2 - c.sub_type) as u8)
+            } else if (0..=i16::MAX as i32).contains(&c.sub_type) {
+                Some(fire_crab_ods::intl::charset_id(c.sub_type as i16))
+            } else {
+                None // ATT_SUBTYPE: the attachment's own set
+            };
+            cs == Some(fire_crab_ods::intl::CS_UTF8)
+        })
+        .collect();
 
     let mark = undo_window_push(database, WindowKind::Nested);
     let mut n = 0i32;
@@ -121830,7 +122045,14 @@ fn insert_select(
                         return Some("?".to_string());
                     }
                     let cs = src_cs.get(i).copied().unwrap_or(fire_crab_ods::intl::CS_UTF8);
-                    if cs != fire_crab_ods::intl::CS_UTF8 {
+                    // ...and a NON-ASCII UTF8 value too: spelled as a
+                    // literal it re-parsed in the ATTACHMENT's set, so
+                    // under a NONE attachment `INSERT INTO P SELECT ID +
+                    // 10, T FROM P` over a UTF8 'Déf' refused the row
+                    // (measured; the engine copies it)
+                    let non_ascii = src_utf8.get(i).copied().unwrap_or(false)
+                        && matches!(v, Value::Text(t) if !t.is_ascii());
+                    if cs != fire_crab_ods::intl::CS_UTF8 || non_ascii {
                         if let Value::Text(t) = v {
                             bound.push(WireParam::TextCs(t.clone(), cs));
                             return Some("?".to_string());
@@ -158818,10 +159040,10 @@ mod tests {
     /// makes fire-crab's patch-then-write order indistinguishable.
     #[test]
     fn filter_pins_one_row_wants_a_full_unique_key_equality() {
-        let uniq = IndexOp { id: 1, segs: vec![(0, 8, 0, 0)], descending: false, unique: true , retrievable: true };
+        let uniq = IndexOp { id: 1, segs: vec![(0, 8, 0, 0)], descending: false, unique: true , retrievable: true, eval: None };
         let compound =
-            IndexOp { id: 2, segs: vec![(0, 8, 0, 0), (1, 8, 0, 0)], descending: false, unique: true , retrievable: true };
-        let nonuniq = IndexOp { id: 3, segs: vec![(0, 8, 0, 0)], descending: false, unique: false , retrievable: true };
+            IndexOp { id: 2, segs: vec![(0, 8, 0, 0), (1, 8, 0, 0)], descending: false, unique: true , retrievable: true, eval: None };
+        let nonuniq = IndexOp { id: 3, segs: vec![(0, 8, 0, 0)], descending: false, unique: false , retrievable: true, eval: None };
         let eq0 = || Term::Cmp(0, Cmp::Eq, Rhs::Int(3));
         let eq1 = || Term::Cmp(1, Cmp::Eq, Rhs::Int(4));
         // no WHERE at all is the whole table
@@ -158952,7 +159174,7 @@ mod tests {
         // scan and an index retrieval differ in what they READ, and the
         // Filter/Sort above them is identical either way
         let pick = IndexPick {
-            op: IndexOp { id: 2, segs: vec![(0, 8, 0, 0)], descending: false, unique: true , retrievable: true },
+            op: IndexOp { id: 2, segs: vec![(0, 8, 0, 0)], descending: false, unique: true , retrievable: true, eval: None },
             lo: Some((vec![0xC0, 8], true)),
             hi: Some((vec![0xC0, 8], true)),
             navigate: false,
@@ -159047,6 +159269,7 @@ mod tests {
             descending: false,
             unique: true,
             retrievable: true,
+            eval: None,
         };
         let pick = IndexPick { op: op.clone(), lo: None, hi: None, navigate: false };
         let row_now = vec![Value::Int(20)];

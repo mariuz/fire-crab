@@ -130,9 +130,16 @@ Short, actionable items. The long-form engineering backlog lives in
       folds 'a' and 'a ' (4 of 5) where the default does not (5). Needs its own comparator in every route.
 - [ ] samples/nodejs/psql.js: an exception raised in a procedure lacks the engine's `At procedure "PUBLIC"."HIRE" line:
       4, col: 29` context line.
+- [x] A table carrying an EXPRESSION or PARTIAL index (engine-made) was read-only here; its writes now maintain both
+      from the catalog sources, and the engine reads this server's file through them identically with gfix clean
+      (`qa/serve-real-exprindex.sh`). Still refused: a UNIQUE expression index; an expression over a collated column.
+- [ ] CREATE INDEX .. COMPUTED BY (..) and CREATE INDEX .. WHERE through this server (samples/nodejs/indexes.js):
+      the expression / condition BLR must be generated as the engine writes it.
+- [x] INSERT .. SELECT of non-ASCII UTF8 text under a NONE attachment refused (`qa/serve-real-inselutf8.sh`).
 - [ ] serve-real-gbakverbose.sh went red in sweeps 65 and 66 on "the restore streams are byte-equal" and passes
-      alone (3/3) and under synthetic load (8/8, on this binary and d92cb5c's). Its DIFF now prints the differing lines
-      (it printed 400 bytes of each stream, which hid them) - read them the next time it trips.
+      alone (3/3) and under synthetic load (8/8, on this binary and d92cb5c's). With the wider DIFF it showed the ENGINE's
+      own `gbak -b` through its service manager failing - "Invalid clumplet buffer structure: string length doesn't
+      match with clumplet (6)", engine rc 1 - an engine-side intermittent, not this server's.
 - [ ] samples/nodejs/types.js: a DECFLOAT column fetches through node here and does not on the engine (`-804 SQLDA
       missing or incorrect version`) - a describe difference to measure.
 - [ ] CURRENT_TRANSACTION / TRANSACTION_ID: a transaction has no id here before its first write (the engine's has one

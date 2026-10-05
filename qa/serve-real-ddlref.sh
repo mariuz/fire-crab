@@ -373,8 +373,8 @@ refused "7 cast to a collated domain - recorded" "SELECT CAST('A' AS D_CI) FROM 
 refused "7 a domain column with a COLLATE override - recorded" "CREATE TABLE Q4 (V D_VC COLLATE UNICODE_CI); COMMIT; SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME = 'Q4';" "COUNT|1"
 
 echo "--- 8. RECORDED: STILL REFUSED"
-refused "8 insert under an expression index" "INSERT INTO EX1 VALUES ('abc'); SELECT * FROM EX1; ROLLBACK;" "B|abc"
-refused "8 insert under a partial unique index" "INSERT INTO EX3 VALUES (1); SELECT * FROM EX3; ROLLBACK;" "A|1"
+pin "8 insert under an expression index (promoted 2026-10-05, serve-real-exprindex.sh)" "INSERT INTO EX1 VALUES ('abc'); SELECT * FROM EX1; ROLLBACK;" "B|abc"
+pin "8 insert under a partial unique index (promoted 2026-10-05)" "INSERT INTO EX3 VALUES (1); SELECT * FROM EX3; ROLLBACK;" "A|1"
 refused "8 insert under a DECFLOAT unique index" "INSERT INTO DFC VALUES (1.5); SELECT * FROM DFC; ROLLBACK;" "X|1.5"
 refused "8 insert under a TIME WITH TIME ZONE index" "INSERT INTO X3 VALUES (TIME '10:00:00 UTC'); SELECT COUNT(*) FROM X3; ROLLBACK;" "COUNT|1"
 refused "8 computed by over a numeric" "CREATE TABLE C1 (X NUMERIC(10,2), Y COMPUTED BY (X * 2)); COMMIT; SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME = 'C1';" "COUNT|1"
