@@ -298,11 +298,12 @@ pin  "8 CONTROL a union's FOR UPDATE" "select id from t1 where id < 3 union sele
 pin  "8 CONTROL FOR UPDATE then WITH LOCK" "select id from t1 where id < 3 for update of id with lock;" "ID|1|2"
 pin  "8 CONTROL FOR UPDATE then OPTIMIZE" "select id from t1 where id < 3 for update optimize for all rows;" "ID|1|2"
 pin  "8 CONTROL a union's ROWS then OPTIMIZE" "select id from t1 union select id from t2 rows 1 optimize for first rows;" "ID|1"
-# the lint must not call a PSQL cursor's FOR UPDATE unknown: this server
-# refuses the block (cursors), but bare - never with a made-up -104
-differs "8 CONTROL a PSQL cursor's FOR UPDATE is its own" "set term ^;
+# the lint must not call a PSQL cursor's FOR UPDATE unknown - and the
+# block answers now (PROMOTED: a cursor's FOR UPDATE is dropped from the
+# query it plans as a derived table, the engine's BLR being the bare one)
+same "8 CONTROL a PSQL cursor's FOR UPDATE is its own" "set term ^;
 execute block returns (r integer) as declare c cursor for (select id from t1 for update); begin open c; fetch c into :r; close c; suspend; end^
-set term ;^" "R|1" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
+set term ;^"
 
 echo "--- 9. which comes first: an unknown table's -204 or FIRST/SKIP's -104"
 pin  "9 a comma-joined unknown table (it was the -104)" "select first 1 id from t1, nosuch rows 1;" "$(TU NOSUCH 1 28)"

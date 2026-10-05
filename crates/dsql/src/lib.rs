@@ -511,6 +511,14 @@ enum Val {
 enum Dsc {
     /// blr_short / blr_long / blr_int64 with a scale byte
     Num(u8, i8),
+    /// blr_text2 / blr_varying2 in an EXPLICIT set: (characters, set id) -
+    /// `CHAR(n) CHARACTER SET <name>`, whatever the database's default
+    TextCs(u16, u16),
+    VaryingCs(u16, u16),
+    /// blr_dec64 / blr_dec128 - DECFLOAT(16) / DECFLOAT(34): the dtype
+    /// byte alone (probed: a DECFLOAT(16) parameter's message slot is `18`)
+    Dec64,
+    Dec128,
     /// blr_text2, charset 0 (a NONE-charset database), length
     Text(u16),
     /// blr_varying2, charset 0, length
@@ -518,6 +526,195 @@ enum Dsc {
     Date,
     Time,
     Timestamp,
+}
+
+/// Every character set the engine carries: (name or alias, RDB$CHARACTER_SET_ID),
+/// read off 6.0.0.2196's RDB$CHARACTER_SETS and the RDB$TYPES aliases of
+/// RDB$CHARACTER_SET_NAME - an explicit `CHARACTER SET <name>` in a type.
+const CHARSET_NAMES: &[(&str, u16)] = &[
+    ("ANSI", 21),
+    ("ASCII", 2),
+    ("ASCII7", 2),
+    ("BIG5", 56),
+    ("BIG_5", 56),
+    ("BINARY", 1),
+    ("CP943C", 68),
+    ("CYRL", 50),
+    ("DOS437", 10),
+    ("DOS737", 9),
+    ("DOS775", 15),
+    ("DOS850", 11),
+    ("DOS852", 45),
+    ("DOS857", 46),
+    ("DOS858", 16),
+    ("DOS860", 13),
+    ("DOS861", 47),
+    ("DOS862", 17),
+    ("DOS863", 14),
+    ("DOS864", 18),
+    ("DOS865", 12),
+    ("DOS866", 48),
+    ("DOS869", 49),
+    ("DOS_437", 10),
+    ("DOS_737", 9),
+    ("DOS_775", 15),
+    ("DOS_850", 11),
+    ("DOS_852", 45),
+    ("DOS_857", 46),
+    ("DOS_858", 16),
+    ("DOS_860", 13),
+    ("DOS_861", 47),
+    ("DOS_862", 17),
+    ("DOS_863", 14),
+    ("DOS_864", 18),
+    ("DOS_865", 12),
+    ("DOS_866", 48),
+    ("DOS_869", 49),
+    ("DOS_936", 57),
+    ("DOS_949", 44),
+    ("DOS_950", 56),
+    ("EUCJ", 6),
+    ("EUCJ_0208", 6),
+    ("GB18030", 69),
+    ("GB2312", 57),
+    ("GBK", 67),
+    ("GB_2312", 57),
+    ("ISO-8859-13", 40),
+    ("ISO-8859-2", 22),
+    ("ISO-8859-3", 23),
+    ("ISO-8859-4", 34),
+    ("ISO-8859-5", 35),
+    ("ISO-8859-6", 36),
+    ("ISO-8859-7", 37),
+    ("ISO-8859-8", 38),
+    ("ISO-8859-9", 39),
+    ("ISO88591", 21),
+    ("ISO885913", 40),
+    ("ISO88592", 22),
+    ("ISO88593", 23),
+    ("ISO88594", 34),
+    ("ISO88595", 35),
+    ("ISO88596", 36),
+    ("ISO88597", 37),
+    ("ISO88598", 38),
+    ("ISO88599", 39),
+    ("ISO8859_1", 21),
+    ("ISO8859_13", 40),
+    ("ISO8859_2", 22),
+    ("ISO8859_3", 23),
+    ("ISO8859_4", 34),
+    ("ISO8859_5", 35),
+    ("ISO8859_6", 36),
+    ("ISO8859_7", 37),
+    ("ISO8859_8", 38),
+    ("ISO8859_9", 39),
+    ("KOI8R", 63),
+    ("KOI8U", 64),
+    ("KSC5601", 44),
+    ("KSC_5601", 44),
+    ("LATIN1", 21),
+    ("LATIN2", 22),
+    ("LATIN3", 23),
+    ("LATIN4", 34),
+    ("LATIN5", 39),
+    ("LATIN7", 40),
+    ("NEXT", 19),
+    ("NONE", 0),
+    ("OCTETS", 1),
+    ("SJIS", 5),
+    ("SJIS_0208", 5),
+    ("SQL_TEXT", 3),
+    ("TIS620", 66),
+    ("UNICODE_FSS", 3),
+    ("USASCII", 2),
+    ("UTF-8", 4),
+    ("UTF8", 4),
+    ("UTF_FSS", 3),
+    ("WIN1250", 51),
+    ("WIN1251", 52),
+    ("WIN1252", 53),
+    ("WIN1253", 54),
+    ("WIN1254", 55),
+    ("WIN1255", 58),
+    ("WIN1256", 59),
+    ("WIN1257", 60),
+    ("WIN1258", 65),
+    ("WIN_1250", 51),
+    ("WIN_1251", 52),
+    ("WIN_1252", 53),
+    ("WIN_1253", 54),
+    ("WIN_1254", 55),
+    ("WIN_1255", 58),
+    ("WIN_1256", 59),
+    ("WIN_1257", 60),
+    ("WIN_1258", 65),
+    ("WIN_936", 57),
+    ("WIN_949", 44),
+    ("WIN_950", 56),
+];
+
+/// RDB$BYTES_PER_CHARACTER of each set ([CHARSET_NAMES]).
+const CHARSET_BPC: &[(u16, u16)] = &[
+    (0, 1),
+    (1, 1),
+    (2, 1),
+    (3, 3),
+    (4, 4),
+    (5, 2),
+    (6, 2),
+    (9, 1),
+    (10, 1),
+    (11, 1),
+    (12, 1),
+    (13, 1),
+    (14, 1),
+    (15, 1),
+    (16, 1),
+    (17, 1),
+    (18, 1),
+    (19, 1),
+    (21, 1),
+    (22, 1),
+    (23, 1),
+    (34, 1),
+    (35, 1),
+    (36, 1),
+    (37, 1),
+    (38, 1),
+    (39, 1),
+    (40, 1),
+    (44, 2),
+    (45, 1),
+    (46, 1),
+    (47, 1),
+    (48, 1),
+    (49, 1),
+    (50, 1),
+    (51, 1),
+    (52, 1),
+    (53, 1),
+    (54, 1),
+    (55, 1),
+    (56, 2),
+    (57, 2),
+    (58, 1),
+    (59, 1),
+    (60, 1),
+    (63, 1),
+    (64, 1),
+    (65, 1),
+    (66, 1),
+    (67, 2),
+    (68, 2),
+    (69, 4),
+];
+
+/// An explicit set's (id, bytes per character), or None for a name the
+/// engine does not carry.
+fn charset_by_name(name: &str) -> Option<(u16, u16)> {
+    let id = CHARSET_NAMES.iter().find(|(n, _)| *n == name).map(|(_, i)| *i)?;
+    let bpc = CHARSET_BPC.iter().find(|(i, _)| *i == id).map(|(_, b)| *b)?;
+    Some((id, bpc))
 }
 
 fn emit_dsc(out: &mut Vec<u8>, d: Dsc) {
@@ -538,6 +735,14 @@ fn emit_dsc(out: &mut Vec<u8>, d: Dsc) {
             out.extend_from_slice(&cs.to_le_bytes());
             out.extend_from_slice(&l.saturating_mul(bpc).to_le_bytes());
         }
+        Dsc::TextCs(l, cs) | Dsc::VaryingCs(l, cs) => {
+            let bpc = CHARSET_BPC.iter().find(|(i, _)| *i == cs).map_or(1, |(_, b)| *b);
+            out.push(if matches!(d, Dsc::TextCs(..)) { blr::TEXT2 } else { blr::VARYING2 });
+            out.extend_from_slice(&cs.to_le_bytes());
+            out.extend_from_slice(&l.saturating_mul(bpc).to_le_bytes());
+        }
+        Dsc::Dec64 => out.push(24),
+        Dsc::Dec128 => out.push(25),
         Dsc::Date => out.push(blr::DATE),
         Dsc::Time => out.push(blr::TIME),
         Dsc::Timestamp => out.push(blr::TIMESTAMP),
@@ -1217,6 +1422,31 @@ impl<'a> P<'a> {
             sub_procs: Vec::new(),
             sub_funcs: Vec::new(),
         }
+    }
+
+    /// `FOR UPDATE [OF <col> [, ..]]` - consumed and dropped: the engine's
+    /// BLR is byte-for-byte the clause-less one (RDB$PROCEDURE_BLR on
+    /// 2196, with and without `OF B`); only `WITH LOCK` writes a byte. A
+    /// FOR not followed by UPDATE is left where it is.
+    fn skip_for_update(&mut self) -> Option<()> {
+        if !(matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "FOR")
+            && matches!(self.t.get(self.i + 1), Some(Tok::Ident(w)) if w == "UPDATE"))
+        {
+            return Some(());
+        }
+        self.i += 2;
+        if self.kw("OF") {
+            loop {
+                let Some(Tok::Ident(_)) = self.t.get(self.i) else { return None };
+                self.i += 1;
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        Some(())
     }
 
     fn kw(&mut self, w: &str) -> bool {
@@ -2644,23 +2874,49 @@ impl<'a> P<'a> {
                     Dsc::Num(dt, -sc)
                 }
             },
-            "VARCHAR" => {
+            "VARCHAR" | "CHAR" | "CHARACTER" => {
                 let (l, sc) = paren_num(self)?;
                 if sc != 0 {
                     return None;
                 }
-                Dsc::Varying(u16::try_from(l).ok()?)
-            }
-            "CHAR" | "CHARACTER" => {
-                let (l, sc) = paren_num(self)?;
-                if sc != 0 {
-                    return None;
+                let l = u16::try_from(l).ok()?;
+                let varying = name == "VARCHAR";
+                // an explicit `CHARACTER SET <name>`: the set the engine
+                // carries by that name or alias (a COLLATE after it is
+                // unprobed and refuses)
+                if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "CHARACTER")
+                    && matches!(self.t.get(self.i + 1), Some(Tok::Ident(w)) if w == "SET")
+                {
+                    self.i += 2;
+                    let Some(Tok::Ident(cs_name)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    let (cs, _) = charset_by_name(cs_name)?;
+                    self.i += 1;
+                    if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "COLLATE") {
+                        return None;
+                    }
+                    if varying {
+                        Dsc::VaryingCs(l, cs)
+                    } else {
+                        Dsc::TextCs(l, cs)
+                    }
+                } else if varying {
+                    Dsc::Varying(l)
+                } else {
+                    Dsc::Text(l)
                 }
-                Dsc::Text(u16::try_from(l).ok()?)
             }
             "DATE" => Dsc::Date,
             "TIME" => Dsc::Time,
             "TIMESTAMP" => Dsc::Timestamp,
+            // DECFLOAT(16) / DECFLOAT(34); a bare DECFLOAT is 34
+            "DECFLOAT" => match paren_num(self) {
+                None => Dsc::Dec128,
+                Some((16, 0)) => Dsc::Dec64,
+                Some((34, 0)) => Dsc::Dec128,
+                Some(_) => return None,
+            },
             _ => return None,
         })
     }
@@ -2840,7 +3096,7 @@ impl<'a> P<'a> {
             // and CHECK trigger BLR); without that type the shape is
             // unknown and refuses
             let items: Vec<Val> = match typing_of(&left) {
-                Some(d @ (Dsc::Text(_) | Dsc::Varying(_))) => items
+                Some(d @ (Dsc::Text(_) | Dsc::Varying(_) | Dsc::TextCs(..) | Dsc::VaryingCs(..))) => items
                     .into_iter()
                     .map(|it| match it {
                         Val::Str(_) => Val::Cast(d, Box::new(it)),
@@ -3219,7 +3475,13 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
         Val::Str(s) => {
             out.push(blr::LITERAL);
             out.push(blr::TEXT2);
-            out.extend_from_slice(&0u16.to_le_bytes()); // charset (NONE)
+            // the literal's set is the ATTACHMENT's ([set_literal_charset]):
+            // its bytes here are UTF-8, so a set whose bytes they are -
+            // or any set, for an all-ASCII literal - is stamped; another
+            // (a non-ASCII literal under a codepage set) keeps NONE
+            let cs = LIT_CS.with(|c| c.get());
+            let cs = if s.is_ascii() || matches!(cs, 0 | 2..=4) { cs } else { 0 };
+            out.extend_from_slice(&cs.to_le_bytes());
             out.extend_from_slice(&(s.len() as u16).to_le_bytes());
             out.extend_from_slice(s.as_bytes());
         }
@@ -7073,6 +7335,7 @@ impl<'a> P<'a> {
                 return None;
             }
         }
+        self.skip_for_update()?;
         // WITH LOCK - probed beside a WHERE and alone; the shapes
         // beyond the probes (aggregates, FIRST/SKIP, ORDER BY) refuse
         let lock = if self.kw("WITH") {
@@ -7874,6 +8137,7 @@ impl<'a> P<'a> {
             }
         }
         self.sub = saved;
+        self.skip_for_update()?;
         // WITH LOCK - refused over aggregates and sorts (unprobed)
         let lock = if self.kw("WITH") {
             if !self.kw("LOCK")
@@ -10265,6 +10529,10 @@ thread_local! {
     /// without one - (charset id, bytes per character); (0, 1) is NONE,
     /// the only database this crate was measured against before
     static DEFAULT_CS: std::cell::Cell<(u16, u16)> = const { std::cell::Cell::new((0, 1)) };
+    /// the set a string LITERAL's descriptor names - the attachment's, on
+    /// the engine (a routine compiled under a UTF8 attachment stores
+    /// `blr_literal blr_text2 4 ..`, under NONE `.. 0 ..`, measured on 2196)
+    static LIT_CS: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
     static TYPING: std::cell::RefCell<Typing> = std::cell::RefCell::new(Typing::default());
     /// (relation or procedure name, its column or output names): what a
     /// bare column name across several streams resolves through
@@ -10274,6 +10542,12 @@ thread_local! {
 /// The database's default character set, for the text types a body
 /// declares without one (`DECLARE W VARCHAR(60)` in a UTF8 database is
 /// `blr_varying2` charset 4, 240 BYTES - measured). (0, 1) restores NONE.
+/// The set string literals are stamped with ([LIT_CS]) - the attachment's;
+/// 0 restores the NONE every other compile keeps.
+pub fn set_literal_charset(charset: u16) {
+    LIT_CS.with(|c| c.set(charset));
+}
+
 pub fn set_default_charset(charset: u16, bytes_per_char: u16) {
     DEFAULT_CS.with(|c| c.set((charset, bytes_per_char.max(1))));
 }
@@ -10626,6 +10900,9 @@ pub struct ProcParamMeta {
     pub sub_type: i16,
     /// RDB$FIELD_PRECISION: the declared p of a NUMERIC/DECIMAL parameter
     pub precision: Option<i16>,
+    /// a TEXT parameter's EXPLICIT `CHARACTER SET` (its id); None takes the
+    /// database's default
+    pub charset: Option<u16>,
     /// an input parameter DEFAULT value SOURCE (`5`, `'x'`, `NULL`); None
     /// for outputs and undefaulted inputs. The wire turns it into the
     /// stored RDB$DEFAULT_SOURCE / VALUE.
@@ -10646,8 +10923,10 @@ fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
         Dsc::Num(7, sc) => (7, 2, *sc as i16),
         Dsc::Num(8, sc) => (8, 4, *sc as i16),
         Dsc::Num(_, sc) => (16, 8, *sc as i16),
-        Dsc::Text(l) => (14, *l, 0),
-        Dsc::Varying(l) => (37, *l, 0),
+        Dsc::Text(l) | Dsc::TextCs(l, _) => (14, *l, 0),
+        Dsc::Varying(l) | Dsc::VaryingCs(l, _) => (37, *l, 0),
+        Dsc::Dec64 => (24, 8, 0),
+        Dsc::Dec128 => (25, 16, 0),
         Dsc::Date => (12, 4, 0),
         Dsc::Time => (13, 4, 0),
         Dsc::Timestamp => (35, 8, 0),
@@ -10661,8 +10940,17 @@ fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
         // 1); a plain integer or a non-numeric type is 0. DECIMAL (2) is
         // not distinguished from NUMERIC by the Dsc here - a boundary.
         sub_type: if scale != 0 { 1 } else { 0 },
-        precision: None,
+        // a DECFLOAT's RDB$FIELD_PRECISION is its digits (16 / 34, probed)
+        precision: match d {
+            Dsc::Dec64 => Some(16),
+            Dsc::Dec128 => Some(34),
+            _ => None,
+        },
         default: None,
+        charset: match d {
+            Dsc::TextCs(_, cs) | Dsc::VaryingCs(_, cs) => Some(*cs),
+            _ => None,
+        },
     }
 }
 
@@ -13322,6 +13610,23 @@ mod tests {
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }
+    }
+
+    #[test]
+    fn explicit_character_set_types_the_descriptor_and_the_parameter() {
+        // `VARCHAR(10) CHARACTER SET UTF8` is blr_varying2, set 4, 40 bytes -
+        // whatever the default - and the parameter meta carries the set
+        let c = compile_procedure_full(
+            "CREATE PROCEDURE P (X CHAR(2) CHARACTER SET WIN_1252) RETURNS (R VARCHAR(10) CHARACTER SET UTF8) AS BEGIN R = X; SUSPEND; END",
+        )
+        .expect("compiles");
+        assert!(c.blob.windows(5).any(|w| w == [blr::VARYING2, 4, 0, 40, 0]));
+        assert!(c.blob.windows(5).any(|w| w == [blr::TEXT2, 53, 0, 2, 0]));
+        assert_eq!(c.outs[0].charset, Some(4));
+        assert_eq!(c.ins[0].charset, Some(53));
+        // an unknown set, and a COLLATE after a set, refuse
+        assert!(compile_procedure("CREATE PROCEDURE P RETURNS (R VARCHAR(10) CHARACTER SET NOSUCH) AS BEGIN SUSPEND; END").is_none());
+        assert!(compile_procedure("CREATE PROCEDURE P RETURNS (R VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE) AS BEGIN SUSPEND; END").is_none());
     }
 
     #[test]

@@ -7816,6 +7816,7 @@ fn run_gbak_restore_core(
                     sub_type: *st as i16,
                     precision: None,
                     default: pp.default.clone(),
+                    charset: None,
                 })
             };
             let mut ins = Vec::new();
@@ -7887,6 +7888,7 @@ fn run_gbak_restore_core(
                     inline,
                     precision,
                     mech: a.mech,
+                    charset: None,
                 });
             }
             args.sort_by_key(|a| a.position);
@@ -11428,11 +11430,12 @@ AlterDomainRename {
     /// execute-immediate route acknowledges as success)
     SetTimeZoneRefused(EvalErr),
     /// `SET DECFLOAT TRAPS TO [..]` - the session's trap mask
-    /// ([DECFLOAT_TRAPS]); `None` is `SET DECFLOAT ROUND HALF_UP`, the
-    /// rounding every DECFLOAT operation here already uses. Reported, like
-    /// every session statement, as isc_info_sql_stmt_ddl.
+    /// ([DECFLOAT_TRAPS]) - and `SET DECFLOAT ROUND <mode>`, the decimal
+    /// context's rounding ([fire_crab_ods::decfloat::Rounding]). Reported,
+    /// like every session statement, as isc_info_sql_stmt_ddl.
     SetDecfloat {
         traps: Option<u8>,
+        round: Option<fire_crab_ods::decfloat::Rounding>,
     },
 }
 
@@ -31665,7 +31668,7 @@ fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<
     // the compiler resolves a bare column across streams through the
     // catalog of the tables and procedures the body names
     fire_crab_dsql::set_catalog(dsql_catalog_for(db, sql));
-    let c = fire_crab_dsql::compile_procedure_full_with_funcs(sql, &plain_funcs);
+    let c = with_routine_default_cs(|| fire_crab_dsql::compile_procedure_full_with_funcs(sql, &plain_funcs));
     fire_crab_dsql::set_catalog(Vec::new());
     let mut c = c?;
     let params: Vec<String> = c.ins.iter().chain(c.outs.iter()).map(|m| m.name.clone()).collect();
@@ -31693,6 +31696,7 @@ fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<
         scale: m.scale,
         sub_type: m.sub_type,
         precision: m.precision,
+        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m.field_type)),
     };
     Some((
         Plan::CreateProcedure {
@@ -31895,11 +31899,9 @@ fn plan_create_package_body(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             // the compiler resolves a bare column across streams through the
             // catalog of the tables and procedures the body names
             fire_crab_dsql::set_catalog(Vec::new()); // a synthesized header names no table
-            let c = fire_crab_dsql::compile_procedure_full_in_package(
-                &format!("CREATE {}", seg),
-                &name,
-                &member_names,
-            );
+            let c = with_routine_default_cs(|| {
+                fire_crab_dsql::compile_procedure_full_in_package(&format!("CREATE {}", seg), &name, &member_names)
+            });
             fire_crab_dsql::set_catalog(Vec::new());
             let c = c?;
             members.push(fire_crab_ods::ddl::PackageBodyMember::Procedure {
@@ -31910,11 +31912,9 @@ fn plan_create_package_body(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
                 blr: c.blob,
             });
         } else if find_word(&su, "FUNCTION", 0) == Some(0) {
-            let c = fire_crab_dsql::compile_function_full_in_package(
-                &format!("CREATE {}", seg),
-                &name,
-                &member_names,
-            )?;
+            let c = with_routine_default_cs(|| {
+                fire_crab_dsql::compile_function_full_in_package(&format!("CREATE {}", seg), &name, &member_names)
+            })?;
             if c.outs.len() != 1 {
                 return None;
             }
@@ -31945,6 +31945,28 @@ fn plan_create_package_body(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
 fn param_default_marker(src: Option<&str>) -> Option<(Vec<u8>, String)> {
     src.map(|s| proc_default_of(s).unwrap_or_else(|| (Vec::new(), s.to_string())))
 }
+/// A routine's TEXT parameter takes the DATABASE'S DEFAULT SET, as the
+/// engine's DSQL types an unqualified CHAR / VARCHAR ([DDL_DB_CS]): a UTF8
+/// database's `X VARCHAR(5)` is 20 bytes of set 4, where this wrote set 0
+/// over 5 bytes and the engine, reading the procedure, refused a 'héllo'
+/// argument as *string right truncation* (measured). Non-text: None.
+fn routine_text_cs(field_type: i16) -> Option<u8> {
+    matches!(field_type, 14 | 37).then(|| DDL_DB_CS.with(|c| c.get()).unwrap_or(0))
+}
+
+/// Compile a routine under the database's default set ([routine_text_cs]):
+/// the BLR's text descriptors carry it, as the engine's do.
+fn with_routine_default_cs<T>(f: impl FnOnce() -> T) -> T {
+    let cs = DDL_DB_CS.with(|c| c.get()).unwrap_or(0);
+    fire_crab_dsql::set_default_charset(cs as u16, fire_crab_ods::intl::bytes_per_char(cs).max(1) as u16);
+    // ...and its string literals in the ATTACHMENT's set, as the engine's
+    fire_crab_dsql::set_literal_charset(CURRENT_ATT_CS.with(|c| c.get()) as u16);
+    let out = f();
+    fire_crab_dsql::set_literal_charset(0);
+    fire_crab_dsql::set_default_charset(0, 1);
+    out
+}
+
 fn proc_param_of(m: &fire_crab_dsql::ProcParamMeta) -> fire_crab_ods::ddl::ProcParamDef {
     fire_crab_ods::ddl::ProcParamDef {
         // an output param never has one (the parser captures input defaults only)
@@ -31952,6 +31974,7 @@ fn proc_param_of(m: &fire_crab_dsql::ProcParamMeta) -> fire_crab_ods::ddl::ProcP
         name: m.name.clone(), field_type: m.field_type,
         length: m.length, scale: m.scale, sub_type: m.sub_type,
         precision: m.precision,
+        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m.field_type)),
     }
 }
 fn fn_arg_of(m: &fire_crab_dsql::ProcParamMeta, position: i64, named: bool) -> fire_crab_ods::ddl::FnArgDef {
@@ -31964,6 +31987,7 @@ fn fn_arg_of(m: &fire_crab_dsql::ProcParamMeta, position: i64, named: bool) -> f
         // create_package_body guard refuses a > i32 body default too
         default: if named { param_default_marker(m.default.as_deref()) } else { None },
         inline: false, precision: None, mech: -1,
+        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m.field_type)),
     }
 }
 
@@ -32024,6 +32048,7 @@ fn plan_create_package(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         name: m.name.clone(), field_type: m.field_type,
         length: m.length, scale: m.scale, sub_type: m.sub_type,
         precision: m.precision,
+        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m.field_type)),
     };
     let fnarg = |m: &fire_crab_dsql::ProcParamMeta, position: i64, named: bool| fire_crab_ods::ddl::FnArgDef {
         name: if named { Some(m.name.to_ascii_uppercase()) } else { None },
@@ -32031,6 +32056,7 @@ fn plan_create_package(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         sub_type: m.sub_type, null_flag: false,
         default: if named { m.default.as_deref().and_then(proc_default_of) } else { None },
         inline: false, precision: None, mech: -1,
+        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m.field_type)),
     };
     // refuse a header member whose default source cannot be encoded (a > i32
     // integer), the way plan_create_function / plan_create_procedure do
@@ -32040,7 +32066,7 @@ fn plan_create_package(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     for d in decls {
         let dup = d.to_ascii_uppercase();
         if find_word(&dup, "PROCEDURE", 0) == Some(0) {
-            let c = fire_crab_dsql::compile_procedure_full(&format!("CREATE {} AS BEGIN EXIT; END", d))?;
+            let c = with_routine_default_cs(|| fire_crab_dsql::compile_procedure_full(&format!("CREATE {} AS BEGIN EXIT; END", d)))?;
             if unencodable(&c.ins) {
                 return None;
             }
@@ -32048,7 +32074,7 @@ fn plan_create_package(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
                 name: c.name, ins: c.ins.iter().map(&conv).collect(), outs: c.outs.iter().map(&conv).collect(),
             });
         } else if find_word(&dup, "FUNCTION", 0) == Some(0) {
-            let c = fire_crab_dsql::compile_function_full(&format!("CREATE {} AS BEGIN RETURN NULL; END", d))?;
+            let c = with_routine_default_cs(|| fire_crab_dsql::compile_function_full(&format!("CREATE {} AS BEGIN RETURN NULL; END", d)))?;
             if c.outs.len() != 1 {
                 return None;
             }
@@ -32484,8 +32510,16 @@ fn projcol_to_coldef(c: &ProjCol, name: &str) -> Option<fire_crab_ods::ddl::Colu
         496 => (8, dtype::LONG, 4, None, Some(9), c.sub_type as i16),
         580 => (16, dtype::INT64, 8, None, Some(18), c.sub_type as i16),
         32752 => (26, dtype::INT128, 16, None, Some(38), c.sub_type as i16),
-        448 => (37, dtype::VARYING, (c.length.max(0) as u16).saturating_add(2), Some(c.length.max(0) as u16), None, 0),
-        452 => (14, dtype::TEXT, c.length.max(0) as u16, Some(c.length.max(0) as u16), None, 0),
+        // a TEXT column in its own set ([view_text_cs]): the byte width,
+        // the character count beside it
+        448 => {
+            let (bytes, chars) = view_text_width(c);
+            (37, dtype::VARYING, bytes.saturating_add(2), Some(chars), None, 0)
+        }
+        452 => {
+            let (bytes, chars) = view_text_width(c);
+            (14, dtype::TEXT, bytes, Some(chars), None, 0)
+        }
         480 => (27, dtype::DOUBLE, 8, None, None, 0),
         482 => (10, dtype::REAL, 4, None, None, 0),
         570 => (12, dtype::SQL_DATE, 4, None, None, 0),
@@ -32507,7 +32541,7 @@ fn projcol_to_coldef(c: &ProjCol, name: &str) -> Option<fire_crab_ods::ddl::Colu
         char_len,
         dims: Vec::new(),
         segment_length: None,
-        charset_id: None,
+        charset_id: if matches!(t, 448 | 452) { view_text_cs(c) } else { None },
         precision,
         not_null: false,
         not_null_constraint: false,
@@ -32517,6 +32551,39 @@ fn projcol_to_coldef(c: &ProjCol, name: &str) -> Option<fire_crab_ods::ddl::Colu
         identity: None,
         computed: None,
     })
+}
+
+/// A view's TEXT expression column's set, as its describe resolves it: a
+/// plain ttype's, or an expression's real-set sentinel ([enc_real_cs]).
+/// The engine stores it on the column's auto-domain - `CAST(S AS VARCHAR(9)
+/// CHARACTER SET OCTETS)` is set 1, where this wrote none and the engine
+/// read the view's column as NONE (measured). The attachment's set
+/// ([ATT_SUBTYPE]) keeps the old NONE.
+fn view_text_cs(c: &ProjCol) -> Option<u8> {
+    if c.sub_type >= 0 {
+        Some(fire_crab_ods::intl::charset_id(c.sub_type as i16))
+    } else if c.sub_type <= -2 {
+        Some((-2 - c.sub_type) as u8)
+    } else {
+        None
+    }
+}
+
+/// A view's text column's (byte width, character count): a plain ttype's
+/// describe length is BYTES, a real-set sentinel's is CHARACTERS.
+fn view_text_width(c: &ProjCol) -> (u16, u16) {
+    let len = c.length.max(0) as u16;
+    match view_text_cs(c) {
+        Some(cs) if c.sub_type >= 0 => {
+            let bpc = fire_crab_ods::intl::bytes_per_char(cs).max(1) as u16;
+            (len, len / bpc)
+        }
+        Some(cs) => {
+            let bpc = fire_crab_ods::intl::bytes_per_char(cs).max(1) as u16;
+            (len.saturating_mul(bpc), len)
+        }
+        None => (len, len),
+    }
 }
 
 /// `CREATE FUNCTION ...`: the dsql crate's function compiler (byte for byte
@@ -32542,7 +32609,7 @@ fn plan_create_function(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         __pf.retain(|(n, _, _)| *n != sig.0);
         __pf.push(sig);
     }
-    let c = fire_crab_dsql::compile_function_full_with_funcs(s, &__pf)?;
+    let c = with_routine_default_cs(|| fire_crab_dsql::compile_function_full_with_funcs(s, &__pf))?;
     let params: Vec<String> = c.ins.iter().map(|m| m.name.clone()).collect();
     if !routine_names_ok(s, db, &c.blob, &c.name, &params) {
         return None;
@@ -32573,6 +32640,7 @@ fn plan_create_function(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         inline: false,
         precision: None,
         mech: -1, // a PSQL function's RDB$MECHANISM is NULL (probed)
+        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m.field_type)),
     };
     let mut args: Vec<fire_crab_ods::ddl::FnArgDef> = vec![arg(&c.outs[0], 0, false)];
     for (i, m) in c.ins.iter().enumerate() {
@@ -35264,13 +35332,19 @@ fn plan_set_decfloat(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             if it.next().is_some() {
                 return None;
             }
-            match mode.as_str() {
-                "HALF_UP" => Some((Plan::SetDecfloat { traps: None }, Vec::new())),
-                "CEILING" | "UP" | "HALF_EVEN" | "HALF_DOWN" | "DOWN" | "FLOOR" | "REROUND" => {
-                    refuse(EvalErr::Unsupported)
-                }
-                _ => refuse(EvalErr::Status(vec![StatusItem::Gds(335545155), StatusItem::Str(mode)])),
-            }
+            use fire_crab_ods::decfloat::Rounding;
+            let round = match mode.as_str() {
+                "CEILING" => Rounding::Ceiling,
+                "UP" => Rounding::Up,
+                "HALF_UP" => Rounding::HalfUp,
+                "HALF_EVEN" => Rounding::HalfEven,
+                "HALF_DOWN" => Rounding::HalfDown,
+                "DOWN" => Rounding::Down,
+                "FLOOR" => Rounding::Floor,
+                "REROUND" => Rounding::ReRound,
+                _ => return refuse(EvalErr::Status(vec![StatusItem::Gds(335545155), StatusItem::Str(mode)])),
+            };
+            Some((Plan::SetDecfloat { traps: None, round: Some(round) }, Vec::new()))
         }
         Some("TRAPS") => {
             if it.next() != Some("TO") {
@@ -35292,7 +35366,7 @@ fn plan_set_decfloat(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
                     }
                 };
             }
-            Some((Plan::SetDecfloat { traps: Some(mask) }, Vec::new()))
+            Some((Plan::SetDecfloat { traps: Some(mask), round: None }, Vec::new()))
         }
         _ => None,
     }
@@ -42312,9 +42386,12 @@ fn execute_dml(
     if let Plan::SetTimeZoneRefused(e) = plan {
         return Err(ExecErr::Eval(e.clone()));
     }
-    if let Plan::SetDecfloat { traps } = plan {
+    if let Plan::SetDecfloat { traps, round } = plan {
         if let Some(m) = traps {
             DECFLOAT_TRAPS.with(|c| c.set(*m));
+        }
+        if let Some(r) = round {
+            fire_crab_ods::decfloat::set_rounding(*r);
         }
         return Ok((0, 0, 0));
     }
@@ -56464,16 +56541,11 @@ thread_local! {
 
 fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     // a COLLATE with no CHARACTER SET names a collation of the DATABASE's
-    // default set (`B VARCHAR(10) COLLATE UCS_BASIC` in a UTF8 database);
-    // the column parser has no database, so it is handed over here
-    DDL_DB_CS.with(|c| {
-        c.set(match db {
-            Some(d) if sql.to_ascii_uppercase().contains("COLLATE") => {
-                Some(db_default_charset(&d.bytes(), d.page_size))
-            }
-            _ => None,
-        })
-    });
+    // default set (`B VARCHAR(10) COLLATE UCS_BASIC` in a UTF8 database),
+    // and a routine's unqualified text parameter is of that set
+    // ([routine_text_cs]); the parsers have no database, so it is handed
+    // over here (memoised - no catalog read per statement)
+    DDL_DB_CS.with(|c| c.set(db.as_ref().map(db_default_cs)));
     // the OUTERMOST call records the statement; a nested one (a view, a
     // derived table re-planned from its own text) leaves it as it is
     let outermost = STMT_TEXT.with(|t| {
@@ -108430,7 +108502,22 @@ impl Expr {
                                         None => Value::Null,
                                     }
                                 }
-                                "DECFLOAT_ROUND" => Value::Text("HALF_UP".into()),
+                                "DECFLOAT_ROUND" => {
+                                    use fire_crab_ods::decfloat::Rounding;
+                                    Value::Text(
+                                        match fire_crab_ods::decfloat::rounding() {
+                                            Rounding::Ceiling => "CEILING",
+                                            Rounding::Up => "UP",
+                                            Rounding::HalfUp => "HALF_UP",
+                                            Rounding::HalfEven => "HALF_EVEN",
+                                            Rounding::HalfDown => "HALF_DOWN",
+                                            Rounding::Down => "DOWN",
+                                            Rounding::Floor => "FLOOR",
+                                            Rounding::ReRound => "REROUND",
+                                        }
+                                        .into(),
+                                    )
+                                }
                                 // the session's mask, in the engine's order;
                                 // an empty one is `None` (measured)
                                 "DECFLOAT_TRAPS" => {
@@ -127810,6 +127897,40 @@ fn collated_relations(db: &Database) -> std::sync::Arc<Vec<String>> {
     })
 }
 
+/// Does this BLR read a relation with a text column in a CODEPAGE set -
+/// one ordered and compared by its bytes ([single_byte_order_cs]), which
+/// the BLR executor's code-point comparison would get wrong? An
+/// undecodable BLR counts as one.
+fn blr_reads_codepage_relation(db: &Database, blr: &[u8]) -> bool {
+    let codepaged = db.meta_memo("codepage-relations", "", || {
+        let image = db.bytes();
+        let ps = db.page_size;
+        fire_crab_ods::catalog::list_relations(&image, ps)
+            .into_iter()
+            .filter(|(id, _)| {
+                fire_crab_ods::format::relation_formats(&image, ps, *id).iter().any(|(_, descs)| {
+                    descs.iter().any(|d| {
+                        matches!(col_kind(d), Some(ColKind::Text))
+                            && d.sub_type >= 0
+                            && !matches!(fire_crab_ods::intl::charset_id(d.sub_type), 0..=4)
+                    })
+                })
+            })
+            .map(|(_, name)| name.trim_end().to_ascii_uppercase())
+            .collect::<Vec<String>>()
+    });
+    if codepaged.is_empty() {
+        return false;
+    }
+    match fire_crab_ods::blr::decode(blr) {
+        Err(_) => true,
+        Ok(decoded) => decoded
+            .relations
+            .iter()
+            .any(|n| codepaged.iter().any(|c| c.eq_ignore_ascii_case(n.trim_end()))),
+    }
+}
+
 /// Does this BLR read a relation that carries a COLLATED text column?
 ///
 /// The BLR executor compares text with no descriptor in reach - it
@@ -129928,6 +130049,30 @@ fn exe_select(plan: &Plan, sql: &str, database: &Option<Database>, args: &[WireP
             570 => "DATE".to_string(),
             560 => "TIME".to_string(),
             510 => "TIMESTAMP".to_string(),
+            // A TEXT OUTPUT IN ITS OWN SET: a plain column's ttype (the
+            // length in bytes), or an expression's real-set sentinel (the
+            // length in characters); the attachment's set ([ATT_SUBTYPE])
+            // depends on who asks, and a collation the executor cannot
+            // compare by - both decline
+            448 | 452 => {
+                let (cs, chars) = if c.sub_type >= 0 {
+                    if fire_crab_ods::intl::collation_id(c.sub_type as i16) != 0 {
+                        return decline("a collated text output");
+                    }
+                    let cs = fire_crab_ods::intl::charset_id(c.sub_type as i16);
+                    let bpc = fire_crab_ods::intl::bytes_per_char(cs).max(1) as i32;
+                    (cs, c.length / bpc)
+                } else if c.sub_type <= -2 {
+                    ((-2 - c.sub_type) as u8, c.length)
+                } else {
+                    return decline("a text output in the attachment's set");
+                };
+                let Some(name) = charset_sql_name(cs).filter(|_| matches!(cs, 0..=4)) else {
+                    return decline("a text output in a codepage set");
+                };
+                let kw = if c.sql_type & !1 == 448 { "VARCHAR" } else { "CHAR" };
+                format!("{}({}) CHARACTER SET {}", kw, chars.max(1), name)
+            }
             other => return decline(&format!("output type {}", other)),
         };
         decls.push(format!("FC$O{} {}", i, ty));
@@ -129946,6 +130091,16 @@ fn exe_select(plan: &Plan, sql: &str, database: &Option<Database>, args: &[WireP
     let Some(compiled) = compiled else { return decline("compile") };
     if compiled.calls_user_fn || compiled.outs.len() != cols.len() {
         return decline("compile shape");
+    }
+    // THE EXECUTOR COMPARES TEXT BY CODE POINT, blank-trimmed: right for
+    // NONE, OCTETS, ASCII, UNICODE_FSS and UTF8's own collation, wrong for
+    // a COLLATED column ([blr_reads_collated_relation]) and for a codepage
+    // set, which orders by its BYTES (WIN1252's 0xE9 against 'z')
+    if blr_reads_collated_relation(db, &compiled.blob) {
+        return decline("a collated relation");
+    }
+    if blr_reads_codepage_relation(db, &compiled.blob) {
+        return decline("a codepage relation");
     }
     let req = match fire_crab_exe::parse(&compiled.blob) {
         Ok(r) => r,
@@ -131705,7 +131860,28 @@ fn declared_cursor_at(header: &str, at: usize) -> Option<(String, String)> {
             _ => {}
         }
     }
-    Some((name, rest[open + 1..close?].trim().to_string()))
+    Some((name, strip_for_update(rest[open + 1..close?].trim()).to_string()))
+}
+
+/// A cursor query's trailing `FOR UPDATE [OF <col> [, ..]]` dropped: it
+/// changes nothing without WITH LOCK (the engine's BLR is the clause-less
+/// one, measured), and the query is planned as a DERIVED table
+/// ([VerdictCx::cursor_query]), where it is no grammar - a cursor `FOR
+/// (SELECT ID FROM T FOR UPDATE OF S)` refused its procedure whole. A `WITH
+/// LOCK` after it is kept, as written.
+fn strip_for_update(q: &str) -> &str {
+    let masked = mask_literals(&q.to_ascii_uppercase());
+    let mut at = 0;
+    while let Some(f) = find_word(&masked, "FOR", at) {
+        let tail: Vec<&str> = masked[f..].split(|c: char| c.is_whitespace() || c == ',').filter(|w| !w.is_empty()).collect();
+        if tail.get(1) == Some(&"UPDATE")
+            && (tail.len() == 2 || (tail.get(2) == Some(&"OF") && tail.len() > 3 && tail[3..].iter().all(|w| ident_ok(w.trim_matches('"')))))
+        {
+            return q[..f].trim_end();
+        }
+        at = f + "FOR".len();
+    }
+    q
 }
 
 /// Every cursor a procedure's header declares, in order.
@@ -131956,8 +132132,17 @@ fn declared_var_inits(
 /// recovered (mirrors load_procedure's domain_desc, but off inline types).
 fn desc_from_proc_meta(m: &fire_crab_dsql::ProcParamMeta) -> Option<Descriptor> {
     let dtype = fire_crab_ods::ddl::field_type_to_dtype(m.field_type)?;
-    let length = if dtype == dtype::VARYING { m.length + 2 } else { m.length };
-    Some(Descriptor { dtype, scale: m.scale as i8, length, sub_type: m.sub_type, flags: 0, offset: 0 })
+    // a TEXT parameter of an EXPLICIT set carries it - the set as its
+    // ttype, the length in that set's BYTES (`VARCHAR(20) CHARACTER SET
+    // UTF8` is 80 + 2); it was described in NONE over the character count
+    let (sub_type, bytes) = match (dtype, m.charset) {
+        (dtype::TEXT | dtype::VARYING, Some(cs)) => {
+            (cs as i16, m.length.saturating_mul(fire_crab_ods::intl::bytes_per_char(cs as u8).max(1) as u16))
+        }
+        _ => (m.sub_type, m.length),
+    };
+    let length = if dtype == dtype::VARYING { bytes + 2 } else { bytes };
+    Some(Descriptor { dtype, scale: m.scale as i8, length, sub_type, flags: 0, offset: 0 })
 }
 
 /// `EXECUTE BLOCK RETURNS (...) AS <body>` - a selectable anonymous
@@ -132108,6 +132293,19 @@ fn parse_execute_block_select(
     }
     let mut out_descs = out_descs;
     block_text_in_att_cs(returns_text, &mut out_descs);
+    // UNDER A NONE ATTACHMENT a block's literals are OCTETS, and an output
+    // typed in another, EXPLICIT set is where the engine checks them: an
+    // LPAD / SUBSTRING that cut a two-octet 'é' is *Malformed string* into a
+    // UTF8 output. This interpreter decodes such octets lossily and answered
+    // a replacement character - so that output refuses, as it did before the
+    // BLR compiler took a CHARACTER SET (psqlassign 8d)
+    if CURRENT_ATT_CS.with(|c| c.get()) == 0
+        && out_descs.iter().any(|d| {
+            matches!(d.dtype, dtype::TEXT | dtype::VARYING) && fire_crab_ods::intl::charset_id(d.sub_type) != 0
+        })
+    {
+        return None;
+    }
     // ...and the body the compiler did not judge is judged here, before
     // a statement of it runs ([block_prepare_verdict])
     let meta = ProcMeta {
@@ -138876,16 +139074,10 @@ fn after_auth(
                         // here, at prepare ([ddl_unknown_schema])
                         ddl_unknown_schema(&stmt_sql, &database).map(|e| (Plan::RefusedEval(e), Vec::new()))
                     };
-                    // a COLLATE with no CHARACTER SET resolves against the
+                    // a COLLATE with no CHARACTER SET, and a routine's
+                    // unqualified text parameter, resolve against the
                     // database's default set ([DDL_DB_CS])
-                    DDL_DB_CS.with(|c| {
-                        c.set(match &database {
-                            Some(d) if stmt_sql.to_ascii_uppercase().contains("COLLATE") => {
-                                Some(db_default_charset(&d.bytes(), d.page_size))
-                            }
-                            _ => None,
-                        })
-                    });
+                    DDL_DB_CS.with(|c| c.set(database.as_ref().map(db_default_cs)));
                     let planned = planned
                         .or_else(|| plan_comment(&stmt_sql))
                         .or_else(|| plan_grant_procedure(&stmt_sql))

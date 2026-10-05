@@ -22,12 +22,13 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       ON measures the rest. Found on the way: exe ordered no temporal value (MAX(DATE) answered the earliest) - the
       kinds order now, and a pair of non-NULL values exe cannot order FAILS the run instead of answering; dsql
       refused an ORDER BY ordinal (CREATE PROCEDURE .. ORDER BY 1 was refused) - it compiles byte-for-byte now.
-      Next slices: text outputs (the charset the describe announces, the collation guard), parameters, DOUBLE /
-      BOOLEAN / DECFLOAT in the BLR compiler and the executor.
+      Slice 2: text outputs in their own set (a plain column's, an expression's real set) - declined under a COLLATED
+      relation and a CODEPAGE relation (the executor orders by code point). Next slices: parameters, the attachment's
+      set (ATT_SUBTYPE outputs), DOUBLE / BOOLEAN / DECFLOAT in the BLR compiler and the executor.
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** Redo the dropped rounds 6–8 SQL work; the FLOAT/ROUND/DECFLOAT wrong answers first
-- [ ] **P2** DECFLOAT left: ROUND modes beyond HALF_UP, GROUP BY a DECFLOAT expression (NaN / cohort laws), CREATE PROCEDURE with a DECFLOAT parameter
+- [ ] **P2** DECFLOAT left: GROUP BY a DECFLOAT expression (NaN / cohort laws). (Done: CREATE PROCEDURE / FUNCTION with a DECFLOAT parameter; `SET DECFLOAT ROUND` - all eight modes, dftraps 7)
 - [x] **P2** DECFLOAT traps, specials, signed zero, the four DECFLOAT functions (`e07317d`); DECFLOAT in PSQL (`7fdb054`)
 - [ ] **P2** Optimizer gaps (merge join, RIGHT/FULL in a chain, HAVING plans, `SET PLAN`)
 - [ ] **P2** Refused DDL (USER, SHADOW, ALTER DATABASE, SCHEMA, PUBLICATION, LTT, ...)
@@ -42,6 +43,10 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
   - Draft issue: [`docs/upstream/firebird-hashjoin-semi-null-zero.md`](docs/upstream/firebird-hashjoin-semi-null-zero.md)
   - Easy reproduction (two rows, pure SQL, creates and drops its own database): [`docs/upstream/firebird-hashjoin-semi-null-zero.sql`](docs/upstream/firebird-hashjoin-semi-null-zero.sql)
     `isql -q -user SYSDBA -pas masterkey -i docs/upstream/firebird-hashjoin-semi-null-zero.sql`
+- [ ] **Candidate report** (not filed): the engine's compiled-statement cache reuses a PREPARE-TIME fold made under
+  another `SET DECFLOAT ROUND` mode - one session, the same text `SELECT CAST(12345678901234567895 AS DECFLOAT(16))
+  ..` after `SET DECFLOAT ROUND DOWN` answers 1.234567890123457E+19 (the CEILING fold of its first prepare) where a
+  fresh text answers ..456. Reproduce: run the same SELECT under two modes in one isql session.
 - [ ] Watch [#9158](https://github.com/FirebirdSQL/firebird/issues/9158): when the engine is fixed, promote the five pinned divergences in `qa/serve-real-nanrow.sh` section 6 to `both` cells, and re-run the repro script.
 
 ## Environment follow-ups (this box)
@@ -160,8 +165,31 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       24/25 map to DEC64/DEC128. Recorded: `R = 2.5e0` (the engine reads the literal's text: 2.5; here 2.500000000000000).
 - [x] A stored PROCEDURE / FUNCTION with DECFLOAT parameters or result, made by the ENGINE, runs (source_only_param
       takes DEC64/DEC128; a DECFLOAT user function is a decfloat leaf) - dfpsql 4.
-- [ ] CREATE PROCEDURE / FUNCTION with a DECFLOAT parameter refuses here: the BLR compiler (crates/dsql) has no
-      DECFLOAT dsc (blr_dec64 24 / blr_dec128 25). Recorded (dfpsql 5).
+- [x] A routine's unqualified TEXT parameter is of the DATABASE'S DEFAULT SET (`qa/serve-real-utf8routines.sh`): the
+      domain row (set, byte length, character length) and the BLR descriptors - a UTF8 database's procedure made here
+      was set 0 over character-count bytes, and the ENGINE refused a 'héllo' argument as string right truncation.
+- [x] A string literal in a routine's BLR carries the ATTACHMENT's set (0150F04000 under UTF8) - every routine's BLR
+      is now the engine's byte for byte (utf8routines). Views / triggers / CHECKs still stamp NONE: unmeasured.
+- [x] An explicit `CHARACTER SET` on a routine parameter (or a CAST) - crates/dsql carries the engine's 52 sets and 119
+      aliases (read off RDB$CHARACTER_SETS / RDB$TYPES): the domain row, the BLR, a non-ASCII call all the engine's
+      (utf8routines). A COLLATE after it still refuses. With it: a VIEW's text expression column carries its set on
+      its auto-domain (a CAST to OCTETS read as NONE by the engine), and an EXECUTE BLOCK output of an explicit set is
+      described in that set. Under a NONE attachment such an output still refuses: the interpreter decodes NONE-literal
+      octets lossily where the engine raises Malformed string (psqlassign 8d, recorded).
+- [ ] Rounds 6-8, re-measured 2026-10-05: multi-column UNION, CTE shapes (recursive too), text-to-DOUBLE and store
+      conversions agree. Still refused: a MIXED multi-clause ALTER TABLE (`ADD X1 INT, ALTER COLUMN B TYPE ..`, `DROP X3,
+      ALTER COLUMN X2 TO X2B` - the engine writes ONE new format; ADD-only lists already take one here), and `UPDATE ..
+      WHERE CURRENT OF <cursor>` in an EXECUTE BLOCK (the engine answers it).
+- [ ] RDB$DB_KEY: refused whole here (SELECT RDB$DB_KEY, `WHERE RDB$DB_KEY = x'8000000001000000'` in UPDATE /
+      DELETE). The engine's key is 8 bytes: the relation id and the record number, little-endian (128 / 1-based numbers
+      on a fresh table). It is the foundation positioned DML needs: crates/dsql now compiles `FOR UPDATE [OF ..]
+      [WITH LOCK]` byte-for-byte, but the source interpreter has no `WHERE CURRENT OF` (a declared cursor's FETCH, a
+      FOR SELECT .. AS CURSOR).
+- [ ] `SELECT CHAR_LENGTH(R) FROM <proc>(..)` - a function over a selectable procedure's output column - refuses.
+- [x] CREATE PROCEDURE / FUNCTION with a DECFLOAT parameter: crates/dsql's blr_dec64 (24) / blr_dec128 (25) dsc, the
+      domain's precision 16 / 34 - catalog and BLR the engine's byte for byte, run by both (dfpsql 5, utf8routines).
+- [ ] `CAST(<a BLR blob> AS VARCHAR(n) CHARACTER SET OCTETS)` - sub_type 2 into text - is *filter not found to
+      convert type 2 to type 1* here; the engine converts it (HEX_ENCODE over RDB$PROCEDURE_BLR).
 - [ ] EXECUTE BLOCK: a duplicate output name is the engine's -637 *duplicate specification*, a bare refusal here; an
       error location after a non-ASCII literal is 2 columns past the engine's (`C = 'é'; R = 1 / 0` col 63 vs 61).
 - [ ] GROUP BY a DECFLOAT column holding a NaN (pre-existing): the engine's group break is its COMPARE of the group

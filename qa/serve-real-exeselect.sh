@@ -41,6 +41,13 @@ CREATE TABLE U (ID INT, T_ID INT, V NUMERIC(18,4));
 INSERT INTO U VALUES (10, 1, 0.5);
 INSERT INTO U VALUES (11, 1, 1.25);
 INSERT INTO U VALUES (12, 4, -3);
+CREATE TABLE W (ID INT, V VARCHAR(10) CHARACTER SET UTF8, K CHAR(3) CHARACTER SET UTF8);
+INSERT INTO W VALUES (1, 'café', 'é');
+INSERT INTO W VALUES (2, 'Zeta', 'ab');
+INSERT INTO W VALUES (3, NULL, NULL);
+INSERT INTO W VALUES (4, 'abc', 'ab');
+CREATE TABLE X (ID INT, P VARCHAR(5) CHARACTER SET WIN1252);
+INSERT INTO X VALUES (1, 'x');
 COMMIT;\n" "$REAL" "$ENG" "$U" "$P" | "$ISQL" -q -b > /tmp/exs-build.log 2>&1
 [ -s "$ENG" ] || { echo "FAIL fixture not created"; sed 's/^/   /' /tmp/exs-build.log; exit 1; }
 cp "$ENG" "$FC"; chmod 666 "$FC"
@@ -54,7 +61,7 @@ done
 kill -0 $srv 2>/dev/null || { echo "FAIL fcwire is not running - port $PORT already in use?"; exit 1; }
 
 fail=0; ran=0
-run() { printf "%s\nSELECT 'DONE' AS X FROM RDB\$DATABASE;\n" "$2" | timeout -s KILL 60 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' | grep -av '^$' | sed 's/  */ /g; s/ *$//'; }
+run() { printf "%s\nSELECT 'DONE' AS X FROM RDB\$DATABASE;\n" "$2" | timeout -s KILL 60 "$ISQL" -q -ch "${CS:-NONE}" -user "$U" -pas "$P" "$1" 2>&1 | tr -d '\r' | grep -av '^$' | sed 's/  */ /g; s/ *$//'; }
 # route <label> <served|declined> <one SELECT, no trailing ;>
 route() {
     ran=$((ran + 1))
@@ -89,8 +96,17 @@ route "3 GROUP BY a SMALLINT, HAVING" served "SELECT G, COUNT(*), SUM(N) FROM T 
 route "3 an inner join, a NUMERIC(18,4) output" served "SELECT T.ID, U.V FROM T JOIN U ON U.T_ID = T.ID ORDER BY U.ID"
 route "3 EXISTS" served "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U WHERE U.T_ID = T.ID) ORDER BY ID"
 
+echo "--- 6 text outputs in their own set (slice 2)"
+route "6 a NONE text output, sorted" served "SELECT ID, S FROM T ORDER BY S, ID"
+CS=UTF8 route "6 UTF8 text outputs under a UTF8 attachment: VARCHAR / CHAR padding, sorted" served "SELECT ID, V, K FROM W ORDER BY V, ID"
+CS=UTF8 route "6 MAX / MIN of text, a text predicate, GROUP BY text" served "SELECT MAX(V), MIN(K) FROM W"
+CS=UTF8 route "6 ...a range over text" served "SELECT ID FROM W WHERE V > 'c' ORDER BY ID"
+CS=UTF8 route "6 ...GROUP BY a CHAR" served "SELECT K, COUNT(*) FROM W GROUP BY K ORDER BY K"
+CS=UTF8 route "6 ...LIKE / STARTING WITH" served "SELECT ID, V FROM W WHERE V STARTING WITH 'c' OR V LIKE 'Z%' ORDER BY 1"
+route "6 UTF8 outputs under a NONE attachment" served "SELECT ID, V FROM W ORDER BY ID"
+
 echo "--- 4 DECLINED: the interpreter answers, right"
-route "4 a text output (slice 1 types no text column)" declined "SELECT ID, S FROM T ORDER BY ID"
+route "4 a codepage relation (the executor orders by code point, WIN1252 by byte)" declined "SELECT ID FROM X ORDER BY ID"
 route "4 a DATE literal in the predicate (the BLR compiler takes none)" declined "SELECT ID FROM T WHERE D > DATE '2024-02-01' ORDER BY ID"
 route "4 a CAST to TIMESTAMP (the executor has no such cast)" declined "SELECT CAST(D AS TIMESTAMP) FROM T ORDER BY ID"
 route "4 a DOUBLE output" declined "SELECT CAST(N AS DOUBLE PRECISION) FROM T ORDER BY ID"
@@ -121,5 +137,5 @@ if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 21 ]; then echo "FAIL only $ran checks ran (floor 21) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 28 ]; then echo "FAIL only $ran checks ran (floor 28) - cells went missing"; fail=1; fi
 exit $fail

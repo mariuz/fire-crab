@@ -368,6 +368,81 @@ pub fn encode_dec64(neg: bool, mut coeff: u64, mut exp: i32) -> u64 {
     v
 }
 
+/// THE CONTEXT'S ROUNDING MODE - `SET DECFLOAT ROUND <mode>`, decNumber's
+/// rounding names. It decides every rounding the decimal context makes: an
+/// operation's result to 34 digits, a narrowing to 16, a text or an exact
+/// numeric converted in, a CAST out to an exact numeric, ROUND and
+/// QUANTIZE (measured on 2196: `2/3` is ..667 under HALF_UP / UP /
+/// CEILING and ..666 under DOWN / FLOOR / REROUND, `QUANTIZE(-2.5, 1)` -2
+/// under CEILING and -3 under FLOOR); TRUNC / CEILING / FLOOR keep their
+/// own direction and a square root its own HALF-EVEN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rounding {
+    Ceiling,
+    Up,
+    HalfUp,
+    HalfEven,
+    HalfDown,
+    Down,
+    Floor,
+    /// decNumber's DEC_ROUND_05UP: away from zero only when the kept last
+    /// digit is 0 or 5 (and something non-zero was dropped)
+    ReRound,
+}
+
+thread_local! {
+    /// the session's mode ([Rounding]); HALF_UP is the engine's default
+    static ROUNDING: std::cell::Cell<Rounding> = const { std::cell::Cell::new(Rounding::HalfUp) };
+}
+
+/// The session's rounding mode.
+pub fn rounding() -> Rounding {
+    ROUNDING.with(|r| r.get())
+}
+
+/// Set the session's rounding mode (`SET DECFLOAT ROUND`).
+pub fn set_rounding(mode: Rounding) {
+    ROUNDING.with(|r| r.set(mode));
+}
+
+/// Does dropping digits round the KEPT MAGNITUDE up (away from zero), under
+/// the session's mode? `last` is the last kept digit, `first` the first
+/// dropped one and `rest` whether any later dropped digit is non-zero.
+pub fn rounds_up(neg: bool, last: u8, first: u8, rest: bool) -> bool {
+    let dropped = first != 0 || rest;
+    match rounding() {
+        Rounding::HalfUp => first >= 5,
+        Rounding::HalfEven => first > 5 || (first == 5 && (rest || last % 2 == 1)),
+        Rounding::HalfDown => first > 5 || (first == 5 && rest),
+        Rounding::Up => dropped,
+        Rounding::Down => false,
+        Rounding::Ceiling => dropped && !neg,
+        Rounding::Floor => dropped && neg,
+        Rounding::ReRound => dropped && (last == 0 || last == 5),
+    }
+}
+
+/// [rounds_up] over ASCII digit strings: the kept digits' last, and the
+/// dropped run.
+fn rounds_up_ascii(neg: bool, kept: &[u8], dropped: &[u8]) -> bool {
+    let last = kept.last().map_or(0, |d| d - b'0');
+    let first = dropped.first().map_or(0, |d| d - b'0');
+    let rest = dropped.iter().skip(1).any(|d| *d != b'0');
+    !dropped.is_empty() && rounds_up(neg, last, first, rest)
+}
+
+/// [rounds_up] for an integer `q` kept after dividing by `p = 10^n` with
+/// remainder `r`.
+fn rounds_up_rem(neg: bool, q: u128, r: u128, p: u128) -> bool {
+    if p <= 1 {
+        return false;
+    }
+    let tenth = p / 10;
+    let first = (r / tenth) as u8;
+    let rest = r % tenth != 0;
+    rounds_up(neg, (q % 10) as u8, first, rest)
+}
+
 /// [dec128_from_int_digits] for a DECFLOAT(16): rounds to 16 significant
 /// digits (HALF-UP) and encodes as decimal64. Used when a wide integer
 /// literal targets a DECFLOAT(16) column.
@@ -381,7 +456,7 @@ pub fn dec64_from_int_digits(neg: bool, digits: &[u8]) -> u64 {
     let mut coeff = fold(&sig[..16]);
     let rest = &sig[16..];
     let mut exp = rest.len() as i32;
-    if rest[0] >= b'5' {
+    if rounds_up_ascii(neg, &sig[..16], rest) {
         coeff += 1;
         if coeff == 10u64.pow(16) {
             coeff /= 10;
@@ -404,7 +479,7 @@ pub fn round_to_dec16(neg: bool, coeff: u128, exp: i32) -> Dec {
     let drop = digits.len() - 16;
     let mut c: u128 = digits[..16].parse().unwrap();
     let mut e = exp + drop as i32;
-    if digits.as_bytes()[16] >= b'5' {
+    if rounds_up_ascii(neg, &digits.as_bytes()[..16], &digits.as_bytes()[16..]) {
         c += 1;
         if c == 10u128.pow(16) {
             c /= 10;
@@ -484,13 +559,13 @@ pub(crate) fn umul(a: &[u8], b: &[u8]) -> Vec<u8> {
 }
 /// Round MSD-first digits to at most 34 significant, HALF-UP; returns the
 /// kept digits and how many places were dropped (added to the exponent).
-fn round34(d: &[u8]) -> (Vec<u8>, i64) {
+fn round34(d: &[u8], neg: bool) -> (Vec<u8>, i64) {
     if d.len() <= 34 {
         return (d.to_vec(), 0);
     }
     let mut drop = (d.len() - 34) as i64;
     let mut kept = d[..34].to_vec();
-    if d[34] >= b'5' {
+    if rounds_up_ascii(neg, &d[..34], &d[34..]) {
         kept = uadd(&kept, b"1");
         if kept.len() > 34 {
             // carried to 35 digits (all-nines): renormalise
@@ -547,7 +622,7 @@ pub(crate) fn finite(neg: bool, digits: Vec<u8>, exp: i64) -> Dec {
             d = vec![b'0'];
         } else {
             let keep = d.len() - drop;
-            let up = d[keep] >= b'5';
+            let up = rounds_up_ascii(neg, &d[..keep], &d[keep..]);
             d.truncate(keep);
             if d.is_empty() {
                 d.push(b'0');
@@ -646,7 +721,7 @@ pub fn div(a: &Dec, b: &Dec) -> Dec {
         rem = r;
         exp -= 1;
     }
-    let (kept, drop) = round34(&strip0(q));
+    let (kept, drop) = round34(&strip0(q), na != nb);
     finite_signed(na != nb, kept, exp + drop)
 }
 
@@ -706,7 +781,7 @@ pub fn add(a: &Dec, b: &Dec) -> Dec {
     };
     // two zeros of ONE sign sum to that sign (`-0 + -0` and `-0 - 0` are -0,
     // IEEE 754); opposite signs cancel to +0 above
-    let (kept, drop) = round34(&mag);
+    let (kept, drop) = round34(&mag, sign);
     finite_signed(sign, kept, e + drop)
 }
 
@@ -733,7 +808,7 @@ pub fn mul(a: &Dec, b: &Dec) -> Dec {
     }
     let (na, ca, ea) = parts(a);
     let (nb, cb, eb) = parts(b);
-    let (kept, drop) = round34(&umul(&ca, &cb));
+    let (kept, drop) = round34(&umul(&ca, &cb), na != nb);
     finite_signed(na != nb, kept, ea + eb + drop)
 }
 
@@ -770,7 +845,7 @@ pub fn fma(a: &Dec, b: &Dec, c: &Dec) -> Dec {
     };
     // two zeros of ONE sign sum to that sign (`-0 + -0` and `-0 - 0` are -0,
     // IEEE 754); opposite signs cancel to +0 above
-    let (kept, drop) = round34(&mag);
+    let (kept, drop) = round34(&mag, sign);
     finite_signed(sign, kept, e + drop)
 }
 
@@ -943,7 +1018,7 @@ pub fn fit_dec64(neg: bool, coeff: u128, exp: i32) -> Option<u64> {
         c = match 10u128.checked_pow(drop) {
             Some(p) => {
                 let (q, r) = (c / p, c % p);
-                if r * 2 >= p { q + 1 } else { q }
+                if rounds_up_rem(neg, q, r, p) { q + 1 } else { q }
             }
             None => 0,
         };
@@ -983,9 +1058,9 @@ pub fn dec128_from_int_digits(neg: bool, digits: &[u8]) -> u128 {
     let mut coeff = fold(&sig[..34]);
     let rest = &sig[34..];
     let mut exp = rest.len() as i32;
-    // HALF-UP: the first dropped digit alone decides (>= 5 rounds up),
-    // because 5000.. and 5001.. both round away from zero
-    if rest[0] >= b'5' {
+    // the session's mode decides ([rounds_up]); under HALF-UP the first
+    // dropped digit alone (5000.. and 5001.. both round away from zero)
+    if rounds_up_ascii(neg, &sig[..34], rest) {
         coeff += 1;
         if coeff == 10u128.pow(34) {
             coeff /= 10;
@@ -1018,14 +1093,12 @@ pub fn round_to_exp(d: &Dec, target_exp: i32) -> Option<i128> {
         // scale UP: coeff * 10^(exp - target_exp), exact
         coeff.checked_mul(10u128.checked_pow((exp - target_exp) as u32)?)?
     } else {
-        // scale DOWN by (target_exp - exp) digits, rounding half away
-        // from zero on the dropped part
+        // scale DOWN by (target_exp - exp) digits, rounding the dropped
+        // part by the session's mode ([rounds_up]; HALF-UP by default)
         let pow = 10u128.checked_pow((target_exp - exp) as u32)?;
         let q = coeff / pow;
         let r = coeff % pow;
-        // round up when the dropped remainder is >= half; `r*2 >= pow`
-        // catches the exact-half up-round without a fractional half
-        if r.checked_mul(2).is_none_or(|d2| d2 >= pow) {
+        if rounds_up_rem(neg, q, r, pow) {
             q.checked_add(1)?
         } else {
             q
@@ -1043,7 +1116,7 @@ pub fn round_to_dec34(neg: bool, coeff: u128, exp: i32) -> Dec {
     let drop = digits.len() - 34;
     let mut c: u128 = digits[..34].parse().unwrap();
     let mut e = exp + drop as i32;
-    if digits.as_bytes()[34] >= b'5' {
+    if rounds_up_ascii(neg, &digits.as_bytes()[..34], &digits.as_bytes()[34..]) {
         c += 1;
         if c == 10u128.pow(34) {
             c /= 10;

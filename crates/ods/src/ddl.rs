@@ -13767,6 +13767,12 @@ pub struct ProcParamDef {
     pub precision: Option<i16>,
     /// a parameter DEFAULT: (value BLR verbatim, `= 7` source text)
     pub default: Option<(Vec<u8>, String)>,
+    /// a TEXT parameter's character set, `length` then counting its
+    /// CHARACTERS: the domain row carries the set, the byte length and the
+    /// character length, as the engine writes it (a UTF8 database's
+    /// VARCHAR(10) is 40 bytes of set 4). None is the legacy row - set 0,
+    /// `length` as given (a restore binds its own carried domain instead)
+    pub charset: Option<u8>,
 }
 
 /// `CREATE PROCEDURE` - the catalog rows the engine writes, measured
@@ -13937,9 +13943,12 @@ pub fn create_procedure_with_id(
             if matches!(p.field_type, 7 | 8 | 16 | 26) {
                 field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(p.precision.unwrap_or(0) as i64)));
             }
+            // a DECFLOAT parameter's precision is its digits (16 / 34)
+            if matches!(p.field_type, 24 | 25) {
+                field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(if p.field_type == 24 { 16 } else { 34 })));
+            }
             if matches!(p.field_type, 14 | 37) {
-                field_vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0)));
-                field_vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(p.length as i64)));
+                text_domain_vals(&mut field_vals, p.charset, p.length);
             }
             if !pre_existing {
                 let frel = crate::resolve_relation(file, page_size, "RDB$FIELDS")
@@ -13991,6 +14000,23 @@ pub fn create_procedure_with_id(
         store_privileges(file, page_size, &want, 5, &["X"])?;
     }
     advance_oldest_transactions(file, page_size)
+}
+
+/// A routine parameter's text domain facts: with its set, the BYTE length
+/// replaces the character count already in `vals`, and the set and the
+/// character length join it; without one, the legacy set 0 over `length`.
+fn text_domain_vals(vals: &mut Vec<(&str, SysVal<'_>)>, charset: Option<u8>, length: u16) {
+    let cs = charset.unwrap_or(0);
+    if charset.is_some() {
+        let bytes = length as i64 * crate::intl::bytes_per_char(cs).max(1) as i64;
+        for v in vals.iter_mut() {
+            if v.0 == "RDB$FIELD_LENGTH" {
+                v.1 = SysVal::I(bytes);
+            }
+        }
+    }
+    vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(cs as i64)));
+    vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(length as i64)));
 }
 
 /// Mint one carrier domain (`RDB$<n>`) with the given type facts and
@@ -14757,6 +14783,8 @@ pub struct FnArgDef {
     pub precision: Option<i64>,
     /// RDB$MECHANISM: 0 by value, 1 by reference (a legacy arg's)
     pub mech: i64,
+    /// a TEXT argument's character set ([ProcParamDef::charset])
+    pub charset: Option<u8>,
 }
 
 /// The EXTERNAL half of a carried function declaration: the code the
@@ -14960,9 +14988,11 @@ pub fn restore_carried_function(
         if matches!(a.field_type, 7 | 8 | 16 | 26) {
             field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(0)));
         }
+        if matches!(a.field_type, 24 | 25) {
+            field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(if a.field_type == 24 { 16 } else { 34 })));
+        }
         if matches!(a.field_type, 14 | 37) {
-            field_vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0)));
-            field_vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(a.length as i64)));
+            text_domain_vals(&mut field_vals, a.charset, a.length);
         }
         let fdrel = crate::resolve_relation(file, page_size, "RDB$FIELDS")
             .ok_or("no RDB$FIELDS relation")?;

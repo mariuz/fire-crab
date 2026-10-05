@@ -216,8 +216,10 @@ refuses "a width past the byte limit refuses (the engine's -204)" \
   "SELECT CAST('a' AS VARCHAR(9000) CHARACTER SET UTF8) FROM RDB\$DATABASE;"
 refuses "CHARACTER SET on a non-text target refuses" \
   "SELECT CAST('1' AS INTEGER CHARACTER SET UTF8) FROM RDB\$DATABASE;"
-refuses "a cast to a named set in a VIEW body refuses" \
-  "CREATE VIEW VC (ID, X) AS SELECT ID, CAST(S AS VARCHAR(9) CHARACTER SET OCTETS) FROM T;"
+# PROMOTED: the BLR compiler takes a named set now; the view's column is
+# that set's on its auto-domain (set 1, length 9 - the engine reads it so)
+both "a cast to a named set in a VIEW body (it refused)" \
+  "CREATE VIEW VC (ID, X) AS SELECT ID, CAST(S AS VARCHAR(9) CHARACTER SET OCTETS) FROM T; COMMIT; SELECT X FROM VC ORDER BY ID; SELECT F.RDB\$CHARACTER_SET_ID, F.RDB\$FIELD_LENGTH FROM RDB\$RELATION_FIELDS RF JOIN RDB\$FIELDS F ON F.RDB\$FIELD_NAME = RF.RDB\$FIELD_SOURCE WHERE RF.RDB\$RELATION_NAME = 'VC' AND RF.RDB\$FIELD_NAME = 'X';"
 refuses "a cast to a named set inside a PSQL body refuses" \
   "EXECUTE BLOCK RETURNS (R VARCHAR(4) CHARACTER SET OCTETS) AS BEGIN R = CAST('ab' AS VARCHAR(4) CHARACTER SET OCTETS); SUSPEND; END"
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)

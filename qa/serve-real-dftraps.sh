@@ -11,9 +11,10 @@
 # (Division_by_zero, Invalid_operation, Overflow).
 #
 # Answered: those three traps in any combination over DECFLOAT arithmetic,
-# and ROUND HALF_UP (the rounding every DECFLOAT operation here uses).
-# Recorded: an Inexact or Underflow trap and every other rounding mode
-# refuse. A stood-down trap reaches every site (6): EXP / POWER / LOG answer
+# and SET DECFLOAT ROUND <mode> for all eight modes (7): an operation's
+# result, a narrowing, a text or a wide literal converted in, QUANTIZE,
+# ROUND and a CAST out all round by it; TRUNC / CEILING / FLOOR keep their
+# own direction. Recorded: an Inexact or Underflow trap refuses. A stood-down trap reaches every site (6): EXP / POWER / LOG answer
 # the special of the TRUE sign, SUM / AVG / VAR carry it on, and a
 # conversion answers 0 at an exact target (Invalid) and the float's own
 # Infinity / NaN at DOUBLE and FLOAT - except a NaN into a SCALED BIGINT or
@@ -182,10 +183,26 @@ SELECT CAST(CAST('NaN' AS DECFLOAT(34)) AS NUMERIC(38,2)) G FROM RDB\$DATABASE;"
 echo "--- 4 RECORDED: shapes this server still refuses or answers differently"
 rec "4 RECORDED an Inexact trap" "SET DECFLOAT TRAPS TO Inexact, Overflow;
 SELECT $TR T FROM RDB\$DATABASE;" 'T|===============================================================================================================================================================================================================================================================|Inexact,Overflow|X|======|DONE|' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|T|===============================================================================================================================================================================================================================================================|Division_by_zero,Invalid_operation,Overflow|X|======|DONE|'
-rec "4 RECORDED a rounding mode other than HALF_UP" "SET DECFLOAT ROUND HALF_EVEN;
-SELECT ROUND(CAST(2.5 AS DECFLOAT(16)), 0) RW FROM RDB\$DATABASE;" ' RW|=======================| 2|X|======|DONE|' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error| RW|=======================| 3|X|======|DONE|'
 
 rec "4 RECORDED a NEGATED exact literal under a DECFLOAT item converts with its minus (the engine's preferred-desc fold)" "SELECT CAST(-0.0 AS DECFLOAT(16)) F1, CAST(-0 AS DECFLOAT(16)) F2, CAST(-0.00 AS DECFLOAT(34)) F4, CAST(-(0.0) AS DECFLOAT(16)) F6, COALESCE(CAST(-0 AS DECFLOAT(16)), 1) I, CAST(-0 AS DECFLOAT(16)) * 1 H FROM RDB\$DATABASE;" ' F1 F2 F4 F6 I H|======================= ======================= ========================================== ======================= ======================= ==========================================| -0.0 -0 -0.00 -0.0 -0 -0|X|======|DONE|' ' F1 F2 F4 F6 I H|======================= ======================= ========================================== ======================= ======================= ==========================================| 0.0 0 0.00 0.0 0 0|X|======|DONE|'
+
+echo "--- 7 SET DECFLOAT ROUND: every mode, every rounding the context makes"
+# each mode's statement TEXT differs (the mode name rides in it): the
+# engine's compiled-statement cache reuses a prepare-time fold made under
+# ANOTHER mode for the same text - `CAST(<20-digit literal> AS DECFLOAT(16))`
+# keeps the first mode's rounding (measured) - which is no law to copy
+RM=""
+for m in CEILING UP HALF_UP HALF_EVEN HALF_DOWN DOWN FLOOR REROUND; do
+    RM="$RM
+SET DECFLOAT ROUND $m;
+SELECT '$m' M, RDB\$GET_CONTEXT('SYSTEM', 'DECFLOAT_ROUND') R, CAST(2 AS DECFLOAT(34)) / 3 A, CAST(-2 AS DECFLOAT(34)) / 3 B, CAST(1 AS DECFLOAT(16)) / 3 D16, CAST(CAST('1.234567890123456789' AS DECFLOAT(34)) AS DECFLOAT(16)) C, CAST('2.5000000000000005' AS DECFLOAT(16)) E FROM RDB\$DATABASE;
+SELECT '$m' M, QUANTIZE(CAST(2.5 AS DECFLOAT(16)), CAST(1 AS DECFLOAT(16))) Q, QUANTIZE(CAST(-2.5 AS DECFLOAT(16)), CAST(1 AS DECFLOAT(16))) QN, ROUND(CAST(2.5 AS DECFLOAT(16)), 0) R0, ROUND(CAST(2.45 AS DECFLOAT(16)), 1) R1 FROM RDB\$DATABASE;
+SELECT '$m' M, CAST(CAST(2.5 AS DECFLOAT(16)) AS INT) CI, CAST(CAST(-2.5 AS DECFLOAT(16)) AS NUMERIC(9,0)) CN, CAST(CAST(2.25 AS DECFLOAT(16)) AS NUMERIC(9,1)) CN1, CAST(12345678901234567895 AS DECFLOAT(16)) BI, CAST(-12345678901234567895 AS DECFLOAT(16)) BN FROM RDB\$DATABASE;
+SELECT '$m' M, TRUNC(CAST(2.7 AS DECFLOAT(16))) T, CEILING(CAST(2.1 AS DECFLOAT(16))) CE, FLOOR(CAST(-2.1 AS DECFLOAT(16))) FL, X / 3 XD FROM T WHERE ID = 4;"
+done
+both "7 the eight modes: an operation, a narrowing, a text, QUANTIZE, ROUND, a CAST out, a wide literal; TRUNC / CEILING / FLOOR keep their own" "$RM"
+both "7 an unknown mode is the engine's bare 42000; a new attachment starts HALF_UP" "SET DECFLOAT ROUND NOSUCH;
+SELECT RDB\$GET_CONTEXT('SYSTEM', 'DECFLOAT_ROUND') R, CAST(2 AS DECFLOAT(34)) / 3 A FROM RDB\$DATABASE;"
 
 echo "--- panic check"
 ran=$((ran + 1))
@@ -193,5 +210,5 @@ if grep -aq 'panicked at' "/tmp/fc-serve-dft-$PORT.log"; then echo "FAIL the ser
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 35 ]; then echo "FAIL only $ran checks ran (floor 35) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 36 ]; then echo "FAIL only $ran checks ran (floor 36) - cells went missing"; fail=1; fi
 exit $fail
