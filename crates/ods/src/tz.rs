@@ -186,7 +186,8 @@ const TIME_ZONE_LIST: &[&str] = &[
     "US/Pacific-New", "US/Samoa", "UTC", "Universal",
     "VST", "W-SU", "WET", "Zulu",
     "America/Nuuk", "Asia/Qostanay", "Pacific/Kanton", "Europe/Kyiv",
-    "America/Ciudad_Juarez",];
+    "America/Ciudad_Juarez", "America/Coyhaique",
+];
 
 /// The displacement in minutes of a zone whose conversion rules are
 /// known without tzdata: offset zones, and GMT itself.
@@ -222,6 +223,12 @@ pub fn displacement(zone: u16) -> Option<i32> {
 /// minus its position in the list); None for a name not in the table.
 pub fn zone_id(name: &str) -> Option<u16> {
     TIME_ZONE_LIST.iter().position(|n| n.eq_ignore_ascii_case(name)).map(|i| (65535 - i) as u16)
+}
+
+/// Every NAMED zone, in the engine's list order (id 65535 first) - the
+/// rows of the virtual RDB$TIME_ZONES.
+pub fn zone_names() -> &'static [&'static str] {
+    TIME_ZONE_LIST
 }
 
 pub fn zone_text(zone: u16) -> String {

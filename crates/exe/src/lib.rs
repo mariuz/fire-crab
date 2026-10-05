@@ -2722,7 +2722,7 @@ impl<'a> Exec<'a> {
                 bitmap.insert(recno);
             }
         }
-        let formats = fire_crab_ods::relation_formats(self.file, self.page_size, rel);
+        let formats = relation_or_system_formats(self.file, self.page_size, rel, name);
         let (_, descs) = formats
             .iter()
             .max_by_key(|(n, _)| *n)
@@ -2849,7 +2849,7 @@ impl<'a> Exec<'a> {
     fn scan_relation(&mut self, name: &str) -> Result<Vec<Vec<Value>>, String> {
         let rel = resolve_relation(self.file, self.page_size, name)
             .ok_or_else(|| format!("relation {} not found", name))?;
-        let formats = fire_crab_ods::relation_formats(self.file, self.page_size, rel);
+        let formats = relation_or_system_formats(self.file, self.page_size, rel, name);
         let (_, descs) = formats
             .iter()
             .max_by_key(|(n, _)| *n)
@@ -3729,6 +3729,22 @@ thread_local! {
     /// a WHERE the unknown: a silently wrong answer each time. The run
     /// reads it and refuses instead ([bind_and_execute_mode])
     static INCOMPARABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A relation's formats: RDB$FORMATS' for a user relation, the built-in
+/// table for a SYSTEM one, whose formats are never stored (`SELECT .. FROM
+/// RDB$RELATIONS` answered "relation has no format" here).
+fn relation_or_system_formats(
+    file: &fire_crab_ods::Image,
+    page_size: usize,
+    rel: u16,
+    name: &str,
+) -> Vec<(u8, Vec<fire_crab_ods::Descriptor>)> {
+    let formats = fire_crab_ods::relation_formats(file, page_size, rel);
+    if !formats.is_empty() {
+        return formats;
+    }
+    fire_crab_ods::system_relation_formats(file, page_size, name.trim_end()).unwrap_or_default()
 }
 
 /// Every comparison of a FIELD with a TEXT LITERAL in the request, as

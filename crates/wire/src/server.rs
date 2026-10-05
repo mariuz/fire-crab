@@ -8955,7 +8955,7 @@ enum RowSource {
 /// record headers that a computed relation has none of.
 fn mon_computed_relation(db: &Database, rel: u16) -> bool {
     let image = db.bytes();
-    ["MON$DATABASE", "MON$ATTACHMENTS", "MON$TRANSACTIONS", "MON$STATEMENTS"]
+    ["MON$DATABASE", "MON$ATTACHMENTS", "MON$TRANSACTIONS", "MON$STATEMENTS", "RDB$TIME_ZONES", "RDB$KEYWORDS"]
         .iter()
         .any(|n| fire_crab_ods::resolve_relation(&image, db.page_size, n) == Some(rel))
 }
@@ -9258,6 +9258,46 @@ fn mon_rows(
     // COMPUTED BLOB (the machinery LIST() brought)
     if fire_crab_ods::resolve_relation(&image, db.page_size, "MON$STATEMENTS") == Some(rel) {
         return Some(mon_statement_rows(db, formats));
+    }
+    // RDB$TIME_ZONES and RDB$KEYWORDS are VIRTUAL too (RDB$RELATION_TYPE 3):
+    // the engine computes them from its zone list and its parser's keyword
+    // table, and a scan of their (empty) storage answered NO ROWS here -
+    // COUNT 0 where the engine counts 638 and 529
+    let named = |field: &str, fill: &mut dyn FnMut(&dyn Fn(&str) -> Option<usize>) -> Vec<Vec<Value>>| -> Option<Vec<Vec<Value>>> {
+        let _ = field;
+        let cols = relation_columns(&image, db.page_size, field);
+        let at = |c: &str| cols.iter().find(|x| x.name.eq_ignore_ascii_case(c)).map(|x| x.field_id as usize);
+        Some(fill(&at))
+    };
+    if fire_crab_ods::resolve_relation(&image, db.page_size, "RDB$TIME_ZONES") == Some(rel) {
+        let width = formats.iter().max_by_key(|(n, _)| *n)?.1.len();
+        return named("RDB$TIME_ZONES", &mut |at| {
+            fire_crab_ods::tz::zone_names()
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let mut row = vec![Value::Null; width];
+                    if let Some(f) = at("RDB$TIME_ZONE_ID") { row[f] = Value::Int(65535 - i as i64); }
+                    // a CHAR(63): blank-padded, as the engine delivers it
+                    if let Some(f) = at("RDB$TIME_ZONE_NAME") { row[f] = Value::Text(format!("{:<63}", name)); }
+                    row
+                })
+                .collect()
+        });
+    }
+    if fire_crab_ods::resolve_relation(&image, db.page_size, "RDB$KEYWORDS") == Some(rel) {
+        let width = formats.iter().max_by_key(|(n, _)| *n)?.1.len();
+        return named("RDB$KEYWORDS", &mut |at| {
+            fire_crab_ods::keywords::KEYWORDS
+                .iter()
+                .map(|(name, reserved)| {
+                    let mut row = vec![Value::Null; width];
+                    if let Some(f) = at("RDB$KEYWORD_NAME") { row[f] = Value::Text((*name).to_string()); }
+                    if let Some(f) = at("RDB$KEYWORD_RESERVED") { row[f] = Value::Bool(*reserved); }
+                    row
+                })
+                .collect()
+        });
     }
     if fire_crab_ods::resolve_relation(&image, db.page_size, "MON$DATABASE") != Some(rel) {
         return None;
@@ -114122,6 +114162,12 @@ fn eval_subquery_rel(
         return None;
     }
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
+    // a COMPUTED relation (MON$, RDB$TIME_ZONES, RDB$KEYWORDS) has no
+    // records to walk: the planned path reads it through [mon_rows]
+    // (`IN (SELECT RDB$TIME_ZONE_NAME FROM RDB$TIME_ZONES)` matched nothing)
+    if mon_computed_relation(db, rel) {
+        return None;
+    }
     let columns = db.columns(table);
     let formats = select_formats(db, table, rel);
     let descs = formats
@@ -130376,6 +130422,21 @@ fn exe_select(
     match fire_crab_ods::blr::decode(&compiled.blob) {
         Ok(decoded) if decoded.relations.iter().any(|n| is_view(db, n.trim_end())) => {
             return decline("a view");
+        }
+        // a VIRTUAL relation (RDB$RELATION_TYPE 3, read from the engine)
+        // has no records in the file - its rows are computed - and a
+        // GLOBAL TEMPORARY one keeps them per attachment, not on disk
+        Ok(decoded)
+            if decoded.relations.iter().any(|n| {
+                let n = n.trim_end();
+                n.starts_with("MON$")
+                    || n.starts_with("SEC$")
+                    || matches!(n, "RDB$CONFIG" | "RDB$KEYWORDS" | "RDB$TIME_ZONES")
+                    || fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, n)
+                        .is_some_and(|id| gtt_relations(db).iter().any(|(g, _)| *g == id))
+            }) =>
+        {
+            return decline("a virtual or temporary relation");
         }
         Ok(_) => {}
         Err(_) => return decline("an undecodable BLR"),

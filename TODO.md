@@ -41,6 +41,8 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       a plain decimal against an integer (exe::shape walks the request); (4) a lossy parameter move, a temporal
       parameter of another kind, a negated non-literal (exe's negate cannot know the overflow); and an output value
       not of its column's kind. selparam / view / viewjoin / textnumwhere / cmpparam green under the switch.
+      Slice 4: SYSTEM relations (exe read only RDB$FORMATS, which never holds a system relation's format - the
+      built-in table now), and a VIRTUAL or GLOBAL TEMPORARY relation declines (no records in the file).
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a
@@ -53,6 +55,9 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       it); and the engine STREAMS an outer row the gates turned away before the raise (row 1, then 22018), here the raise
       comes first. Unmeasured: `WHERE E.N = 'x' OR T.ID = 1` over a LEFT join raises on row 2 on the engine (fc: row 1).
 - [ ] **P2** The FLOAT/ROUND/DECFLOAT wrong answers first; then the rounds 6–8 items still refused (mixed multi-clause ALTER TABLE, `WHERE CURRENT OF` via `RDB$DB_KEY`) - the rest re-measured and agrees
+- [x] **P2** WRONG ANSWER: the virtual RDB$TIME_ZONES / RDB$KEYWORDS answered NO ROWS (the zone list lacked America/Coyhaique
+      too), and a subquery over any computed relation - MON$ included - walked its empty storage (`qa/serve-real-virtualrel.sh`).
+      RDB$CONFIG (this host's firebird.conf, 70 rows) still answers none - recorded.
 - [ ] **P2** DECFLOAT left: GROUP BY a DECFLOAT expression (NaN / cohort laws). (Done: CREATE PROCEDURE / FUNCTION with a DECFLOAT parameter; `SET DECFLOAT ROUND` - all eight modes, dftraps 7)
 - [x] **P2** DECFLOAT traps, specials, signed zero, the four DECFLOAT functions (`e07317d`); DECFLOAT in PSQL (`7fdb054`)
 - [ ] **P2** Optimizer gaps (merge join, RIGHT/FULL in a chain, HAVING plans, `SET PLAN`)
