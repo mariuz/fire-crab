@@ -19,6 +19,8 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** Redo the dropped rounds 6–8 SQL work; the FLOAT/ROUND/DECFLOAT wrong answers first
+- [ ] **P2** DECFLOAT left: ROUND modes beyond HALF_UP, GROUP BY a DECFLOAT expression (NaN / cohort laws), CREATE PROCEDURE with a DECFLOAT parameter
+- [x] **P2** DECFLOAT traps, specials, signed zero, the four DECFLOAT functions (`e07317d`); DECFLOAT in PSQL (`7fdb054`)
 - [ ] **P2** Optimizer gaps (merge join, RIGHT/FULL in a chain, HAVING plans, `SET PLAN`)
 - [ ] **P2** Refused DDL (USER, SHADOW, ALTER DATABASE, SCHEMA, PUBLICATION, LTT, ...)
 - [ ] **P2** Charsets/blobs (codepage holes on a UTF8 delivery, UTF8 default-collation padding, `isc_bpb`, filters, arrays), services actions, MON$ coverage, auth gaps

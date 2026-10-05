@@ -28,11 +28,15 @@ replacement of the C++ engine is below, in priority order. Full text:
 
 **Phase 2 — depth in existing subsystems** (wrong answers before refusals)
 7. SQL: FLOAT / ROUND / DECFLOAT-exponent / bind-error wrong answers; redo the
-   dropped rounds 6–8 (DECFLOAT built-ins, `SET DECFLOAT`, `WHERE CURRENT OF`,
+   dropped rounds 6–8 (`WHERE CURRENT OF`,
    multi-column `UNION`, CTE shapes, multi-clause `ALTER TABLE`, store
    conversions, text-to-DOUBLE); `OVERLAY`, `BIT_LENGTH`, `ASCII_CHAR`,
    `CAST AS BOOLEAN`; GROUP BY/windows with FIRST/SKIP; impure calls in DML;
    `NEXT VALUE FOR` in PSQL; `RDB$DEBUG_INFO`.
+   DECFLOAT left: ROUND modes beyond HALF_UP, GROUP BY a DECFLOAT expression
+   and its NaN/cohort laws, CREATE PROCEDURE with a DECFLOAT parameter (no
+   DECFLOAT dsc in `dsql`). Done: traps, specials, signed zero, the four
+   DECFLOAT functions (`e07317d`), DECFLOAT in PSQL (`7fdb054`).
 8. Optimizer: `cheaperThan`, merge join, RIGHT/FULL inside a chain without
    RAM, descending compound index scans, HAVING plans, `SET PLAN`.
 9. Refused DDL: USER (and `SEC$`, gsec), SHADOW, `ALTER DATABASE`, SCHEMA,

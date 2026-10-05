@@ -1,6 +1,6 @@
 # fire-crab: Full Conversion Plan
 
-*2026-10-05 · baseline `master` at `ea24856`, updated for `4a005dd` · shared copy:
+*2026-10-05 · baseline `master` at `ea24856`, updated for `7fdb054` · shared copy:
 [claude.ai doc](https://claude.ai/code/artifact/b21b5433-02ee-42ef-9918-c9d8177a2d5e)*
 
 Every Firebird subsystem has a first Rust version checked against the real
@@ -53,9 +53,18 @@ Wrong answers rank above refusals; a refusal is safe, a wrong answer is not.
 7. **SQL surface.**
     - Remaining wrong answers: FLOAT, ROUND, DECFLOAT exponent literals, bind
       errors.
-    - Redo the removed rounds 6–8 work: DECFLOAT built-ins, `SET DECFLOAT`,
-      `WHERE CURRENT OF`, multi-column `UNION`, CTE shapes, multi-clause
-      `ALTER TABLE`, store conversions, text-to-DOUBLE.
+    - Redo the removed rounds 6–8 work: `WHERE CURRENT OF`, multi-column
+      `UNION`, CTE shapes, multi-clause `ALTER TABLE`, store conversions,
+      text-to-DOUBLE.
+    - DECFLOAT still open: `SET DECFLOAT ROUND` modes other than HALF_UP;
+      GROUP BY a DECFLOAT expression, and GROUP BY's NaN and cohort laws;
+      CREATE PROCEDURE / FUNCTION with a DECFLOAT parameter (the `dsql` BLR
+      compiler has no DECFLOAT descriptor); a negated exact literal's sign
+      under the engine's preferred-desc fold.
+    - Done 2026-10-05: `SET DECFLOAT TRAPS`, the untrapped specials and the
+      signed zero; QUANTIZE, NORMALIZE_DECFLOAT, COMPARE_DECFLOAT, TOTALORDER
+      (`e07317d`); DECFLOAT in PSQL outputs, locals and engine-made routines
+      (`7fdb054`).
     - Scalar functions: `OVERLAY`, `BIT_LENGTH`, `ASCII_CHAR`,
       `CAST AS BOOLEAN`.
     - GROUP BY or windows together with FIRST/SKIP; impure calls in DML;
