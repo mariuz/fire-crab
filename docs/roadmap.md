@@ -11,8 +11,9 @@ replacement of the C++ engine is below, in priority order. Full text:
 [`docs/full-conversion-plan.md`](full-conversion-plan.md) ([shared doc](https://claude.ai/code/artifact/b21b5433-02ee-42ef-9918-c9d8177a2d5e)). Baseline: `master` at `ea24856`.
 
 **Phase 0 — stop depending on the C++ engine**
-1. Create databases natively: `create_database_file` still runs the C++
-   `isql` (`crates/wire/src/server.rs` ~6116, `$FC_ISQL`).
+1. ~~Create databases natively~~ done (`bd324f3`): `op_create` writes the
+   engine's empty database from `crates/ods/templates`, no `isql`. Next: write
+   the catalog itself (`INI_format`).
 2. Choose one reference engine build; re-measure the backlog (it is stale).
 
 **Phase 1 — architecture (largest risk; do first)**
@@ -20,6 +21,10 @@ replacement of the C++ engine is below, in priority order. Full text:
    Rust) and calls `dsql` 44×, `exe` 12×, `opt` 4×. Target: `dsql` compiles
    every statement to BLR, `opt` plans it, `exe` runs the record sources,
    `wire` is protocol only. One statement family at a time, gated both ways.
+   In progress behind `FC_EXEC_SELECT` (`qa/serve-real-exeselect.sh`): slice 1
+   (`953ec53`) parameterless SELECTs with numeric/temporal outputs, slice 2
+   (`a771c23`) text outputs. Next: parameters, attachment-set outputs,
+   DOUBLE / BOOLEAN / DECFLOAT in `dsql` and `exe`.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).
@@ -28,15 +33,15 @@ replacement of the C++ engine is below, in priority order. Full text:
 
 **Phase 2 — depth in existing subsystems** (wrong answers before refusals)
 7. SQL: FLOAT / ROUND / DECFLOAT-exponent / bind-error wrong answers; redo the
-   dropped rounds 6–8 (`WHERE CURRENT OF`,
-   multi-column `UNION`, CTE shapes, multi-clause `ALTER TABLE`, store
-   conversions, text-to-DOUBLE); `OVERLAY`, `BIT_LENGTH`, `ASCII_CHAR`,
+   still-refused rounds 6–8 items (mixed multi-clause `ALTER TABLE`,
+   `WHERE CURRENT OF` - needs `RDB$DB_KEY`, also refused); `OVERLAY`, `BIT_LENGTH`, `ASCII_CHAR`,
    `CAST AS BOOLEAN`; GROUP BY/windows with FIRST/SKIP; impure calls in DML;
    `NEXT VALUE FOR` in PSQL; `RDB$DEBUG_INFO`.
-   DECFLOAT left: ROUND modes beyond HALF_UP, GROUP BY a DECFLOAT expression
-   and its NaN/cohort laws, CREATE PROCEDURE with a DECFLOAT parameter (no
-   DECFLOAT dsc in `dsql`). Done: traps, specials, signed zero, the four
-   DECFLOAT functions (`e07317d`), DECFLOAT in PSQL (`7fdb054`).
+   DECFLOAT left: GROUP BY a DECFLOAT expression and its NaN/cohort laws.
+   Done: traps, specials, signed zero, the four DECFLOAT functions
+   (`e07317d`), DECFLOAT in PSQL (`7fdb054`), all eight ROUND modes and
+   DECFLOAT routine parameters (`a771c23`). Re-measured: multi-column UNION,
+   CTE shapes, text-to-DOUBLE and store conversions agree.
 8. Optimizer: `cheaperThan`, merge join, RIGHT/FULL inside a chain without
    RAM, descending compound index scans, HAVING plans, `SET PLAN`.
 9. Refused DDL: USER (and `SEC$`, gsec), SHADOW, `ALTER DATABASE`, SCHEMA,
@@ -45,7 +50,9 @@ replacement of the C++ engine is below, in priority order. Full text:
 10. Charsets/blobs: a codepage hole to U+0000 on a UTF8 delivery (the
     tables are bijective since `44c1c3f`), UTF8's default collation pads
     where this server trims, `isc_bpb` transliteration, blob filters,
-    arrays. (`UCS_BASIC` and COLLATE without a set: done, `4a005dd`.)
+    arrays. (`UCS_BASIC` and COLLATE without a set: done, `4a005dd`;
+    routine text parameters in the database's set and an explicit
+    CHARACTER SET: done, `a771c23`.)
 11. Services: REPAIR, VALIDATE, PROPERTIES, user actions, `GET_FB_LOG`,
     per-action SPB grammar, gstat data/index/record-version analysis.
 12. MON$: `MON$IO_STATS`, system attachments.

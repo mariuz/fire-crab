@@ -1,6 +1,6 @@
 # fire-crab: Full Conversion Plan
 
-*2026-10-05 · baseline `master` at `ea24856`, updated for `7fdb054` · shared copy:
+*2026-10-05 · baseline `master` at `ea24856`, updated for `a771c23` · shared copy:
 [claude.ai doc](https://claude.ai/code/artifact/b21b5433-02ee-42ef-9918-c9d8177a2d5e)*
 
 Every Firebird subsystem has a first Rust version checked against the real
@@ -10,10 +10,12 @@ execution out of the `wire` server.
 
 ## Phase 0: stop depending on the C++ engine
 
-1. **Create databases natively.** Creating a database still runs the C++
-   `isql` (`crates/wire/src/server.rs:6116`, `$FC_ISQL`). Port database
-   creation (DPB settings, catalog bootstrap, writing the system tables) so
-   the server runs without a Firebird install.
+1. **Create databases natively.** *Done 2026-10-05 (`bd324f3`,
+   `qa/serve-real-nativecreate.sh`):* `op_create` no longer runs the C++
+   `isql`. It writes the engine's own empty database (`crates/ods/templates`,
+   one per page size) with a fresh GUID and creation time, the engine's
+   page-size rounding and the DEFAULT CHARACTER SET. **Next:** write the
+   catalog itself (`INI_format`) instead of copying the engine's empty file.
 2. **Choose one reference engine build and re-measure.** Several test gates
    fail on the engine's side, and the roadmap's backlog is marked stale
    ("re-measure before planning"). Rebuild the backlog from a fresh hunt.
@@ -34,6 +36,20 @@ feature has to be built twice.
 
     Move one statement family at a time (SELECT, DML, PSQL, DDL), each
     checked against the engine before and after.
+
+    *In progress (`qa/serve-real-exeselect.sh`), off unless `FC_EXEC_SELECT`
+    is set:*
+    - Slice 1 (`953ec53`): a parameterless SELECT with exact-numeric or
+      temporal outputs is compiled by `dsql` as `FOR <select> INTO .. DO
+      SUSPEND` and served from `exe`'s record sources. Any decline falls back
+      to the interpreter, and `FC_EXEC_SELECT_TRACE` names where.
+    - Slice 2 (`a771c23`): text outputs in their own set; declined under a
+      collated or codepage relation.
+    - Found on the way and fixed: `exe` did not order temporal values, and
+      `dsql` refused an ORDER BY ordinal.
+    - Next slices: parameters, the attachment's set (`ATT_SUBTYPE` outputs),
+      DOUBLE / BOOLEAN / DECFLOAT in the BLR compiler and the executor; then a
+      sweep with the switch on, and making it the default.
 4. **Concurrency and sharing.** Writers are serialized per database, and only
    the transaction-lock series is used.
     - the typed lock series from `jrd/lck.cpp`, so writers conflict per row
@@ -53,18 +69,25 @@ Wrong answers rank above refusals; a refusal is safe, a wrong answer is not.
 7. **SQL surface.**
     - Remaining wrong answers: FLOAT, ROUND, DECFLOAT exponent literals, bind
       errors.
-    - Redo the removed rounds 6–8 work: `WHERE CURRENT OF`, multi-column
-      `UNION`, CTE shapes, multi-clause `ALTER TABLE`, store conversions,
-      text-to-DOUBLE.
-    - DECFLOAT still open: `SET DECFLOAT ROUND` modes other than HALF_UP;
-      GROUP BY a DECFLOAT expression, and GROUP BY's NaN and cohort laws;
-      CREATE PROCEDURE / FUNCTION with a DECFLOAT parameter (the `dsql` BLR
-      compiler has no DECFLOAT descriptor); a negated exact literal's sign
-      under the engine's preferred-desc fold.
+    - Rounds 6–8, re-measured 2026-10-05: multi-column `UNION`, CTE shapes
+      (recursive too), text-to-DOUBLE and store conversions agree. Still
+      refused: a mixed multi-clause `ALTER TABLE` (ADD with ALTER COLUMN or
+      DROP; the engine writes one new format), and `WHERE CURRENT OF` in an
+      EXECUTE BLOCK.
+    - `RDB$DB_KEY` is refused whole (8 bytes: relation id and record number,
+      little-endian). It is the foundation `WHERE CURRENT OF` needs; `dsql`
+      already compiles `FOR UPDATE [OF ..] [WITH LOCK]` byte for byte.
+    - A function over a selectable procedure's output column
+      (`SELECT CHAR_LENGTH(R) FROM <proc>(..)`) refuses; a BLR blob cast to
+      `VARCHAR .. CHARACTER SET OCTETS` reports *filter not found*.
+    - DECFLOAT still open: GROUP BY a DECFLOAT expression, and GROUP BY's NaN
+      and cohort laws; a negated exact literal's sign under the engine's
+      preferred-desc fold.
     - Done 2026-10-05: `SET DECFLOAT TRAPS`, the untrapped specials and the
       signed zero; QUANTIZE, NORMALIZE_DECFLOAT, COMPARE_DECFLOAT, TOTALORDER
       (`e07317d`); DECFLOAT in PSQL outputs, locals and engine-made routines
-      (`7fdb054`).
+      (`7fdb054`); `SET DECFLOAT ROUND`, all eight modes, and CREATE
+      PROCEDURE / FUNCTION with a DECFLOAT parameter (`a771c23`).
     - Scalar functions: `OVERLAY`, `BIT_LENGTH`, `ASCII_CHAR`,
       `CAST AS BOOLEAN`.
     - GROUP BY or windows together with FIRST/SKIP; impure calls in DML;
@@ -84,6 +107,14 @@ Wrong answers rank above refusals; a refusal is safe, a wrong answer is not.
     - UTF8's default collation pads with blanks (`'a<TAB>' < 'a'`) where this
       server trims.
     - `isc_bpb` charset transliteration, blob filters, arrays.
+    - A COLLATE after an explicit CHARACTER SET on a routine parameter
+      refuses; an explicit-set EXECUTE BLOCK output under a NONE attachment
+      refuses (the engine raises *Malformed string*).
+    - Done 2026-10-05 (`a771c23`, `qa/serve-real-utf8routines.sh`): a
+      routine's text parameter takes the database's default set, a literal in
+      a routine's BLR the attachment's set, and an explicit `CHARACTER SET`
+      on a parameter or CAST (52 sets, 119 aliases) - every routine's BLR is
+      the engine's byte for byte.
     - Done 2026-10-05: `UCS_BASIC`, and a COLLATE with no CHARACTER SET in
       DDL (`4a005dd`, `qa/serve-real-ucsbasic.sh`).
 11. **Services.** REPAIR, VALIDATE, PROPERTIES, the user actions,
