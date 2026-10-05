@@ -153,6 +153,42 @@ ran=$((ran + 1))
 if [ "$R3_crab" != 139 ]; then echo "OK   ... and the client did not SIGSEGV"
 else echo "DIFF gbak died with SIGSEGV (rc=139) against fire-crab"; fail=1; fi
 
+# ---- 4b. the connection outlives a refused attach; a quoted login -------------
+# node-firebird's attachOrCreate sends op_create on the SAME socket after
+# its op_attach to a fresh path fails; fire-crab hung up after the refusal
+# ("Connection to Firebird server was lost", samples/nodejs/metadata_cache.js).
+# isql's CREATE DATABASE parses its own `USER 'SYSDBA'` and sends the login
+# WITH the quotes; fire-crab dropped it after op_connect (08004 "connection
+# rejected by remote interface"). Both measured on 2196; fixed 2026-10-04.
+aoc() { # <port> <path>: attachOrCreate, then DDL and a read on the new file
+    FC_PORT="$1" FC_DB="$2" timeout 60 node -e '
+  process.on("uncaughtException",e=>{console.log("ERR "+e.message);process.exit(1);});
+  const F=require("node-firebird");
+  F.attachOrCreate({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,user:"SYSDBA",password:"masterkey"},(e,db)=>{
+    if(e){console.log("ERR "+e.message);process.exit(1);}
+    db.query("RECREATE TABLE T (A INTEGER)",[],(e1)=>{
+      if(e1){console.log("ERR "+e1.message);process.exit(1);}
+      db.query("SELECT RDB$RELATION_ID AS R FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = \x27T\x27",[],(e2,r)=>{
+        console.log(e2?("ERR "+e2.message):JSON.stringify(r));db.detach();process.exit(0);});
+    });
+  });' 2>&1; }
+if command -v node >/dev/null 2>&1 && node -e 'require("node-firebird")' 2>/dev/null; then
+    E4="$D/fc-att-aoc-engine-$PORT.fdb"; C4="$D/fc-att-aoc-crab-$PORT.fdb"
+    rm -f "$E4" "$C4"
+    e=$(aoc "$REAL" "$E4"); c=$(aoc "$PORT" "$C4")
+    check "4b attachOrCreate on a fresh path creates it, and DDL runs (engine: $e)" "$c" "$e"
+    e=$(aoc "$REAL" "$E4"); c=$(aoc "$PORT" "$C4")
+    check "4b ...and attaches to it the second time (RECREATE takes a new id)" "$c" "$e"
+else
+    echo "SKIP 4b attachOrCreate: node-firebird not resolvable (NODE_PATH=/home/ubuntu/work)"
+fi
+E5="$D/fc-att-q-engine-$PORT.fdb"; C5="$D/fc-att-q-crab-$PORT.fdb"
+rm -f "$E5" "$C5"
+qcreate() { printf "CREATE DATABASE '127.0.0.1/%s:%s' USER '%s' PASSWORD '%s';\nSELECT COUNT(*) AS N FROM RDB\$DATABASE;\n" "$1" "$2" "$U" "$P" \
+    | "$ISQL" -q 2>&1 | norm; }
+e=$(qcreate "$REAL" "$E5"); c=$(qcreate "$PORT" "$C5")
+check "4b isql CREATE DATABASE .. USER 'SYSDBA': the quoted login is accepted (engine: $e)" "$c" "$e"
+
 # ---- 5. the server survived all of it ----------------------------------------
 ran=$((ran + 1))
 if kill -0 $srv 2>/dev/null; then echo "OK   fcwire is still running at the end"
@@ -162,4 +198,6 @@ if ! grep -aq 'panicked at' "$LOG"; then echo "OK   no panic in the server log"
 else echo "DIFF panic in $LOG:"; grep -a -m2 'panicked at' "$LOG"; fail=1; fi
 
 echo "ran $ran checks"
+# the floor is the MEASURED count: 21 on the 2026-10-04 binary, 21 OK
+if [ "$ran" -lt 21 ]; then echo "FAIL only $ran checks ran (floor 21) - cells went missing"; fail=1; fi
 exit $fail

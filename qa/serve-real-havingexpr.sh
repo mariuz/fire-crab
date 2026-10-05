@@ -154,14 +154,28 @@ agree "SELECT u LIKE v (value world)" "select (u like v) as n from t order by id
 agree "SELECT CASE WHEN u CONTAINING sub" \
       "select (case when u containing sub then 1 else 0 end) as n from t order by id;"
 
+echo "-- 6. a CONSTANT tested side, decided per group (refused until 2026-10-04) --"
+agree "HAVING 1 = 1"                "select count(*) as n from t group by u having 1 = 1;"
+agree "HAVING 1 = 0 beside an aggregate's OR" \
+      "select count(*) as n from t group by u having count(*) > 0 or 1 = 0;"
+agree "HAVING 'a' = 'a' AND MAX(n) > 2" "select max(n) as n from t group by u having 'a' = 'a' and max(n) > 2;"
+agree "HAVING CURRENT_USER = 'SYSDBA', mirrored" \
+      "select count(*) as n from t group by u having 'SYSDBA' = current_user;"
+agree "HAVING 1 IN (1, 2) / BETWEEN"  "select count(*) as n from t group by u having 1 in (1, 2) and 1 between 0 and 2;"
+agree "HAVING 'abc' LIKE 'a%' / 'a ' = 'a'" "select count(*) as n from t group by u having 'abc' like 'a%' and 'a ' = 'a';"
+agree "HAVING 1 + 1 = 2 OR u = 'none'" "select count(*) as n from t group by u having 1 + 1 = 2 or u = 'none';"
+agree "ungrouped: HAVING 1 = 1 over no row is COUNT 0" \
+      "select count(*) as n from t where 1 = 0 having 1 = 1;"
+agree "HAVING NOT (1 = 0) / '1' = 1"  "select count(*) as n from t group by u having not (1 = 0) and '1' = 1;"
+
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$ENG" "$FC"
-# THE COUNTED FLOOR, derived from a measured run (28) and never typed from
+# THE COUNTED FLOOR, derived from a measured run (37; 28 before the constant-side section) and never typed from
 # the cell list. A helper defined below its first call, an `if` that eats a
 # block, an early `exit` in the fixture build - each silently REMOVES cells
 # while every remaining one still says OK. Only the count sees that.
-if [ "$ran" -lt 28 ]; then
-    echo "FAIL only $ran checks ran - the floor is 28; cells went MISSING"
+if [ "$ran" -lt 37 ]; then
+    echo "FAIL only $ran checks ran - the floor is 37; cells went MISSING"
     fail=1
 fi
 echo "ran $ran checks"

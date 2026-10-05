@@ -118,14 +118,35 @@ Short, actionable items. The long-form engineering backlog lives in
 - [ ] A `?` as RDB$GET_CONTEXT's variable name. (ENGINE_VERSION / NETWORK_PROTOCOL already answered; the session's
       keys, CURRENT_CONNECTION and the MON$ATTACHMENTS client columns answer since 2026-10-04 -
       `qa/serve-real-session.sh`.)
+- [x] samples/nodejs/windows.js runs identically: an op_create now honours the dpb's isc_dpb_set_db_charset (a node
+      `attachOrCreate` database was NONE where the engine's was UTF8); the hypothetical-set aggregates
+      (`qa/serve-real-hypoagg.sh`, with the engine's NULL-is-the-peer-of-zero law); a frame's EXCLUDE clause and a frame
+      on a ranking function (`qa/serve-real-frameexclude.sh`). Recorded there: a hypothetical value count that is not the
+      key count raises at EXECUTE on the engine (prepare here), a per-row value's -104 vector, a text value for a
+      numeric key, a collated or DECFLOAT key; a misplaced EXCLUDE's -104 and LIST-in-a-framed-window's 0A000.
+- [ ] A column declared `COLLATE UCS_BASIC` refuses everywhere (samples/nodejs/intl.js) - `keyable_ttype` takes collation
+      0 only, and UCS_BASIC is NOT that order: measured on 2196 it compares with trailing blanks TRIMMED and then by
+      code point ('a' = 'a ' < 'a<TAB>'), where UTF8's default pads with blanks ('a<TAB>' < 'a'), and COUNT(DISTINCT)
+      folds 'a' and 'a ' (4 of 5) where the default does not (5). Needs its own comparator in every route.
+- [ ] samples/nodejs/psql.js: an exception raised in a procedure lacks the engine's `At procedure "PUBLIC"."HIRE" line:
+      4, col: 29` context line.
+- [ ] serve-real-gbakverbose.sh went red in sweeps 65 and 66 on "the restore streams are byte-equal" and passes
+      alone (3/3) and under synthetic load (8/8, on this binary and d92cb5c's). Its DIFF prints only 400 bytes of each
+      stream, so the differing record is not visible - widen the printout before the next sweep that trips it.
+- [ ] samples/nodejs/types.js: a DECFLOAT column fetches through node here and does not on the engine (`-804 SQLDA
+      missing or incorrect version`) - a describe difference to measure.
 - [ ] CURRENT_TRANSACTION / TRANSACTION_ID: a transaction has no id here before its first write (the engine's has one
       from its start) - recorded in `qa/serve-real-session.sh`.
-- [ ] A HAVING over a literal-only condition refuses (`HAVING 1 = 1`, `HAVING COUNT(*) > 0 AND 'a' = 'a'`,
-      `HAVING CURRENT_USER = 'SYSDBA'`); CURRENT_DATE has its own path and answers.
+- [x] A HAVING over a literal-only condition (`HAVING 1 = 1`, `COUNT(*) > 0 OR 1 = 0`, `HAVING CURRENT_USER =
+      'SYSDBA'`) answers (`qa/serve-real-havingexpr.sh` section 6). Still refused: `HAVING 1 > ?` (the engine
+      prepares it).
 - [ ] MON$ATTACHMENTS lists only client attachments; the engine also lists its system ones (garbage collector, cache
       writer - NULL address).
 - [ ] CREATE / DROP SCHEMA; ALTER DATABASE .. PUBLICATION; CREATE / DROP SHADOW; ALTER EXTERNAL CONNECTIONS POOL.
-- [ ] A new table's RDB$RELATION_ID: 129 here where the engine reuses 128 (samples/metadata_cache.js).
+- [x] A new table's RDB$RELATION_ID was never the divergence: the ids agree (128, then 129 after a RECREATE). The
+      sample failed because node-firebird's attachOrCreate sends op_create on the same socket after a refused
+      op_attach, and this server hung up (`qa/serve-real-attach.sh` 4b). What still differs there is the
+      transaction number in `table 128 is used by transaction N` (ids are reserved lazily here).
 - [ ] The MON$ surface the samples read (MON$SERVER_PID, MON$IO_STATS, MON$PARALLEL_WORKERS, MON$WIRE_CRYPT_PLUGIN).
 - [ ] Engine quirk, NOT to emulate: a procedure created in the same attachment is selectable there although
       RDB$PROCEDURE_TYPE is 2; a fresh attachment gets "not selectable" (both measured on 2196).

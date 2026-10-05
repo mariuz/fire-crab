@@ -6120,12 +6120,17 @@ fn create_database_file(path: &str, want: CreateDpb) -> Result<(), String> {
     // page size (or its -p switch) in the create DPB, and a restore that
     // silently lands on 8192 is not the database that was backed up.
     let page_size = want.page_size.unwrap_or(8192);
+    let charset = match &want.db_charset {
+        Some(cs) => format!(" DEFAULT CHARACTER SET {}", cs),
+        None => String::new(),
+    };
     let sql = format!(
-        "CREATE DATABASE '{}' USER '{}' PASSWORD '{}' PAGE_SIZE {};\n",
+        "CREATE DATABASE '{}' USER '{}' PASSWORD '{}' PAGE_SIZE {}{};\n",
         p.replace('\'', "''"),
         user,
         pass,
-        page_size
+        page_size,
+        charset
     );
     let out = std::process::Command::new(&isql)
         .args(["-q", "-o", "/dev/null"])
@@ -12016,6 +12021,10 @@ enum AggSrc {
     /// a PERCENTILE fold: the fraction expression, the sort expression,
     /// and whether the sort is descending
     Percentile { frac: Expr, order: Expr, desc: bool },
+    /// a HYPOTHETICAL-SET fold ([AggFn::is_hypo]): the hypothetical row's
+    /// values, one per WITHIN GROUP key, and the keys with their DESC and
+    /// NULLS FIRST flags ([hypo_cmp])
+    Hypo { args: Vec<Expr>, order: Vec<(Expr, bool, bool)> },
     /// a LIST fold: the value expression (a blob column arrives as
     /// [Expr::BlobText] so its CONTENT joins the list, as the engine's
     /// MOV_make_string2 reads it), the separator (None = the default
@@ -12097,6 +12106,16 @@ enum AggFn {
     /// keeps its type. Both are nullable (NULL over an empty group).
     PercentileCont,
     PercentileDisc,
+    /// The HYPOTHETICAL-SET aggregates `RANK(v, ..) WITHIN GROUP (ORDER BY
+    /// k, ..)`, DENSE_RANK, PERCENT_RANK and CUME_DIST: where the row
+    /// `(v, ..)` would place among the group's rows in the keys' order
+    /// ([hypo_cmp]). RANK / DENSE_RANK are BIGINT, the other two DOUBLE,
+    /// all four NOT NULL (an empty group is 1 / 1 / 0 / 1), named
+    /// RANK_AGG .. CUME_DIST_AGG (SQLDA measured on 2196).
+    HypoRank,
+    HypoDenseRank,
+    HypoPercentRank,
+    HypoCumeDist,
     /// `LIST([DISTINCT] arg [, separator])` - the values rendered to text
     /// and joined into a TEXT BLOB the fold itself creates (the engine's
     /// ListAggNode: blb::create on the transaction, MOV_make_string2 per
@@ -12137,8 +12156,17 @@ impl AggFn {
             AggFn::RegrSxy => "REGR_SXY",
             AggFn::PercentileCont => "PERCENTILE_CONT",
             AggFn::PercentileDisc => "PERCENTILE_DISC",
+            AggFn::HypoRank => "RANK_AGG",
+            AggFn::HypoDenseRank => "DENSE_RANK_AGG",
+            AggFn::HypoPercentRank => "PERCENT_RANK_AGG",
+            AggFn::HypoCumeDist => "CUME_DIST_AGG",
             AggFn::List => "LIST",
         }
+    }
+
+    /// the four hypothetical-set aggregates
+    fn is_hypo(self) -> bool {
+        matches!(self, AggFn::HypoRank | AggFn::HypoDenseRank | AggFn::HypoPercentRank | AggFn::HypoCumeDist)
     }
 
     /// the two ordered-set percentile aggregates
@@ -12277,6 +12305,36 @@ struct Frame {
     /// 2147483648 PRECEDING AND CURRENT ROW` raises, over `WHERE 1 = 0`
     /// too; 2147483647 answers)
     too_big: bool,
+    /// the frame's `EXCLUDE` clause ([FrameExclude::keeps])
+    exclude: FrameExclude,
+}
+
+/// A frame's `EXCLUDE` clause, the SQL standard's, measured on 2196 over
+/// ROWS and RANGE frames, the folds and FIRST / LAST / NTH_VALUE: CURRENT
+/// ROW drops the row itself, GROUP the row and its ORDER BY peers, TIES
+/// the peers but not the row, NO OTHERS (the default) nothing. A frame
+/// the exclusion empties folds no rows (COUNT 0, AVG NULL). It is legal
+/// only after an explicit frame - `OVER (ORDER BY ID EXCLUDE CURRENT ROW)`
+/// is the engine's -104 at EXCLUDE.
+#[derive(Clone, Copy, PartialEq, Default)]
+enum FrameExclude {
+    #[default]
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
+impl FrameExclude {
+    /// does frame position `p` stay in the current row `pos`'s frame?
+    fn keeps(self, p: usize, pos: usize, peer: impl Fn(usize, usize) -> bool) -> bool {
+        match self {
+            FrameExclude::NoOthers => true,
+            FrameExclude::CurrentRow => p != pos,
+            FrameExclude::Group => p != pos && !peer(p, pos),
+            FrameExclude::Ties => p == pos || !peer(p, pos),
+        }
+    }
 }
 
 /// The function a window column computes. An [AggFn] fold over a partition
@@ -12325,6 +12383,12 @@ enum AggTarget {
         frac: RawExpr,
         order: RawExpr,
         desc: bool,
+    },
+    /// `RANK(v, ..) WITHIN GROUP (ORDER BY k [DESC] [NULLS ..], ..)` and
+    /// its three siblings - the hypothetical row, the keys
+    Hypo {
+        args: Vec<RawExpr>,
+        order: Vec<(RawExpr, bool, bool)>,
     },
     /// `LIST([DISTINCT] arg [, separator])` - the argument, the optional
     /// separator expression (default `,`), and the DISTINCT flag. The
@@ -38873,10 +38937,15 @@ impl ShutDpb {
 /// target came out the same: 8192-byte pages, and a full standard
 /// catalog including the PUBLIC schema. Both of those are wrong for a
 /// restore.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct CreateDpb {
     /// `isc_dpb_page_size` (4)
     page_size: Option<u32>,
+    /// `isc_dpb_set_db_charset` (68) - the new database's DEFAULT
+    /// CHARACTER SET. node-firebird's create sends its `encoding` here,
+    /// and a database made without it was NONE where the engine's was
+    /// UTF8 (samples/nodejs/windows.js through attachOrCreate)
+    db_charset: Option<String>,
     /// `isc_dpb_gbak_restore_has_schema` (107) - "do not create the
     /// PUBLIC schema, I am about to store it myself". The engine skips
     /// it at `ini.epp:819`, and skips the DDL grants and security
@@ -38913,6 +38982,14 @@ fn parse_create_dpb(dpb: &[u8]) -> CreateDpb {
         }
         match tag {
             4 => want.page_size = Some(v as u32),
+            68 => {
+                let name = String::from_utf8_lossy(&dpb[i + 2..end]).trim().to_string();
+                // a character set is a plain name; anything else is not
+                // spliced into the CREATE DATABASE text
+                if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                    want.db_charset = Some(name);
+                }
+            }
             59 => want.gbak_attach = len > 0,
             107 => want.restore_has_schema = true,
             _ => {}
@@ -67915,6 +67992,9 @@ fn plan_query_inner_at_body(
                         // never runs - a refusal beats a guess if it ever
                         // does
                         AggFn::List => return None,
+                        AggFn::HypoRank | AggFn::HypoDenseRank | AggFn::HypoPercentRank | AggFn::HypoCumeDist => {
+                            return None
+                        }
                         AggFn::Count => ScalarTy::count(),
                         AggFn::Min | AggFn::Max => match target {
                             AggTarget::Col(cn) => columns
@@ -68903,6 +68983,48 @@ fn resolve_agg_src(
 ) -> Option<(AggSrc, bool)> {
     let out = match target {
         AggTarget::Star => (AggSrc::Star, false), // COUNT(*) - parse guarantees Count
+        // the hypothetical row is CONSTANT (a per-row argument is the
+        // engine's isc_argmustbe_const_within_group - refused here); each
+        // key sorts by VALUE, so a key under a real collation, a DECFLOAT
+        // (no ExprType) or a zoned temporal refuses; and a value is of
+        // its key's own family or NULL (the engine converts `'2'` for an
+        // INTEGER key - unmodelled, refused)
+        AggTarget::Hypo { args, order } => {
+            let fam = |t: ExprType| match t {
+                ExprType::Int | ExprType::Numeric | ExprType::Approx => 0u8,
+                ExprType::Text => 1,
+                ExprType::Bool => 2,
+                ExprType::Temporal(TKind::Date) => 3,
+                ExprType::Temporal(TKind::Time) => 4,
+                ExprType::Temporal(TKind::Timestamp) => 5,
+                _ => 9,
+            };
+            let mut vals = Vec::with_capacity(args.len());
+            let mut keys = Vec::with_capacity(order.len());
+            for (a, (k, desc, nulls_first)) in args.iter().zip(order) {
+                if !raw_is_constant(a) {
+                    return None;
+                }
+                let ke = resolve_expr_sink(k, columns, descs, sink)?;
+                let kf = fam(ke.type_of(descs)?);
+                if kf == 9 {
+                    return None;
+                }
+                if kf == 1 {
+                    let tt = expr_key_coll(&ke, descs)?;
+                    if tt >> 8 != 0 || !matches!(tt & 0xFF, 0..=4) {
+                        return None;
+                    }
+                }
+                let ae = resolve_expr_sink(a, columns, descs, sink)?;
+                if !matches!(a, RawExpr::Null) && fam(ae.type_of(descs)?) != kf {
+                    return None;
+                }
+                vals.push(ae);
+                keys.push((ke, *desc, *nulls_first));
+            }
+            (AggSrc::Hypo { args: vals, order: keys }, false)
+        }
         AggTarget::Col(name) | AggTarget::Distinct(name) => {
             let rc = find_col(columns, name)?;
             let fid = rc.field_id as usize;
@@ -69297,6 +69419,8 @@ fn agg_result_desc(
             Descriptor { dtype: dtype::BLOB, scale: cs as i8, length: 8, sub_type: 1, flags: 0, offset: 1 }
         }
         AggFn::Count => int64(0),
+        AggFn::HypoRank | AggFn::HypoDenseRank => int64(0),
+        AggFn::HypoPercentRank | AggFn::HypoCumeDist => double_d(),
         AggFn::Min | AggFn::Max => match target {
             // MIN/MAX OVER A BLOB REFUSES rather than answering the wrong
             // row. The fold compares `Value::Blob(relation, recno)` - a
@@ -70302,6 +70426,10 @@ fn build_group_items(
                     // announces NOT NULLABLE - the even 580 survives
                     // below because nullable() skips it
                     AggFn::Count => (Wire::Int64, 580, 8, 0, 0),
+                    // the hypothetical-set folds: BIGINT ranks, DOUBLE
+                    // fractions, all four NOT nullable (measured)
+                    AggFn::HypoRank | AggFn::HypoDenseRank => (Wire::Int64, 580, 8, 0, 0),
+                    AggFn::HypoPercentRank | AggFn::HypoCumeDist => (Wire::Double, 480, 8, 0, 0),
                     // PERCENTILE_DISC picks an actual ordered value and keeps
                     // its EXACT type (its make() copies the ORDER BY
                     // descriptor) - over a column that is the column's own
@@ -70553,6 +70681,7 @@ fn build_group_items(
                             | AggFn::StddevPop
                             | AggFn::StddevSamp
                     ) || func.is_statistical2()
+                        || func.is_hypo()
                     {
                         // NOT nullable - the engine's own flag. The
                         // two-argument folds CAN be null at run time yet the
@@ -71485,7 +71614,7 @@ fn aggregate(
     // source's scale; the group machinery already does that. Aggregate
     // SUBQUERIES no longer come through here at all - they build a
     // one-item, no-key group, which is what a scalar aggregate is.
-    if matches!(func, AggFn::Avg | AggFn::List) || func.is_statistical() {
+    if matches!(func, AggFn::Avg | AggFn::List) || func.is_statistical() || func.is_hypo() {
         return None;
     }
     // SUM over a BIGINT (INT64) column widens to INT128: the engine
@@ -71522,6 +71651,9 @@ fn aggregate(
             (AggFn::Corr | AggFn::CovarPop | AggFn::CovarSamp | AggFn::RegrSlope | AggFn::RegrIntercept | AggFn::RegrCount | AggFn::RegrR2 | AggFn::RegrAvgx | AggFn::RegrAvgy | AggFn::RegrSxx | AggFn::RegrSyy | AggFn::RegrSxy, _) => unreachable!(),
             (AggFn::PercentileCont | AggFn::PercentileDisc, _) => unreachable!(),
             (AggFn::List, _) => unreachable!(), // declined above
+            (AggFn::HypoRank | AggFn::HypoDenseRank | AggFn::HypoPercentRank | AggFn::HypoCumeDist, _) => {
+                unreachable!() // declined above
+            }
         });
     });
     if hit != 0 {
@@ -74753,6 +74885,10 @@ fn compute_windows(
                                 FrameBound::UnboundedFollowing => len - 1,
                             }
                         };
+                        let peer = |a: usize, b: usize| {
+                            order_cmp(&ordrows[idxs[perm[a]]], &ordrows[idxs[perm[b]]], &okeys_peer)
+                                == std::cmp::Ordering::Equal
+                        };
                         for pos in 0..perm.len() {
                             let lo = at(&fr.start, pos as isize).max(0);
                             let hi = at(&fr.end, pos as isize).min(len - 1);
@@ -74763,9 +74899,9 @@ fn compute_windows(
                                     .next()
                                     .unwrap_or(Value::Null)
                             } else {
-                                let win: Vec<Vec<Value>> = perm[lo as usize..=hi as usize]
-                                    .iter()
-                                    .map(|&p| rows[idxs[p]].clone())
+                                let win: Vec<Vec<Value>> = (lo as usize..=hi as usize)
+                                    .filter(|&p| fr.exclude.keeps(p, pos, &peer))
+                                    .map(|p| rows[idxs[perm[p]]].clone())
                                     .collect();
                                 compute_group(&win, &gi)?.into_iter().next().unwrap_or(Value::Null)
                             };
@@ -74910,9 +75046,9 @@ fn compute_windows(
                                     .next()
                                     .unwrap_or(Value::Null)
                             } else {
-                                let win: Vec<Vec<Value>> = perm[lo..=hi]
-                                    .iter()
-                                    .map(|&p| rows[idxs[p]].clone())
+                                let win: Vec<Vec<Value>> = (lo..=hi)
+                                    .filter(|&p| fr.exclude.keeps(p, pos, same_peer))
+                                    .map(|p| rows[idxs[perm[p]]].clone())
                                     .collect();
                                 compute_group(&win, &gi)?
                                     .into_iter()
@@ -75166,27 +75302,39 @@ fn compute_windows(
                             ),
                             None => (0, peer_end[pos] as isize),
                         };
-                        vals[cur][wi] = if lo > hi {
-                            Value::Null // empty frame
+                        // the frame's positions after its EXCLUDE clause
+                        let exclude = frame.as_ref().map(|f| f.exclude).unwrap_or_default();
+                        let kept: Vec<usize> = if lo > hi {
+                            Vec::new()
                         } else {
-                            match func {
-                                ValFn::FirstValue => arg.eval(&rows[idxs[perm[lo as usize]]])?,
-                                ValFn::LastValue => arg.eval(&rows[idxs[perm[hi as usize]]])?,
+                            (lo as usize..=hi as usize)
+                                .filter(|&p| {
+                                    exclude.keeps(p, pos, |a, b| {
+                                        order_cmp(&ordrows[idxs[perm[a]]], &ordrows[idxs[perm[b]]], &okeys_peer)
+                                            == Equal
+                                    })
+                                })
+                                .collect()
+                        };
+                        let row_at = |p: usize| &rows[idxs[perm[p]]];
+                        vals[cur][wi] = match (kept.first(), kept.last()) {
+                            (Some(&first), Some(&last)) => match func {
+                                ValFn::FirstValue => arg.eval(row_at(first))?,
+                                ValFn::LastValue => arg.eval(row_at(last))?,
                                 // the Nth frame row (1-based from the frame
                                 // START), NULL past the frame end
                                 ValFn::NthValue => match n {
-                                    Some(k) if *k >= 1 && lo + (*k as isize - 1) <= hi => {
-                                        arg.eval(&rows[idxs[perm[(lo + *k as isize - 1) as usize]]])?
-                                    }
+                                    Some(k) if *k >= 1 && *k <= kept.len() => arg.eval(row_at(kept[*k - 1]))?,
                                     _ => Value::Null,
                                 },
                                 ValFn::NthValueLast => match n {
-                                    Some(k) if *k >= 1 && hi - (*k as isize - 1) >= lo => {
-                                        arg.eval(&rows[idxs[perm[(hi - (*k as isize - 1)) as usize]]])?
+                                    Some(k) if *k >= 1 && *k <= kept.len() => {
+                                        arg.eval(row_at(kept[kept.len() - *k]))?
                                     }
                                     _ => Value::Null,
                                 },
-                            }
+                            },
+                            _ => Value::Null, // empty frame
                         };
                     }
                 }
@@ -75551,6 +75699,11 @@ fn window_record(
                 AggSrc::Percentile { frac, order, .. } => {
                     expr_reads(frac, &base);
                     expr_reads(order, &base);
+                }
+                AggSrc::Hypo { args, order } => {
+                    for e in args.iter().chain(order.iter().map(|(k, ..)| k)) {
+                        expr_reads(e, &base);
+                    }
                 }
                 AggSrc::List { arg, sep, order, .. } => {
                     expr_reads(arg, &base);
@@ -76288,6 +76441,11 @@ fn group_rows(
                         AggSrc::Percentile { frac, order, .. } => {
                             expr_reads(frac, &mark);
                             expr_reads(order, &mark);
+                        }
+                        AggSrc::Hypo { args, order } => {
+                            for e in args.iter().chain(order.iter().map(|(k, ..)| k)) {
+                                expr_reads(e, &mark);
+                            }
                         }
                         AggSrc::List { arg, sep, order, .. } => {
                             expr_reads(arg, &mark);
@@ -77123,6 +77281,58 @@ fn percentile_result(func: AggFn, vals: &[Value], frac: f64) -> Result<Value, Ev
     Ok(Value::Double(out))
 }
 
+/// Is this the value a NULL's zeroed data reads as - 0 of any numeric
+/// type, an empty or all-blank text, FALSE, the zero DATE (1858-11-17),
+/// midnight, the zero TIMESTAMP? See [hypo_cmp].
+fn hypo_zero(v: &Value) -> bool {
+    match v {
+        Value::Int(i) | Value::Scaled(i, _) | Value::Rounded(i, _) => *i == 0,
+        Value::Int128(i, _) => *i == 0,
+        Value::Double(d) => *d == 0.0,
+        Value::Float(f) => *f == 0.0,
+        Value::Text(t) => t.trim_end_matches(' ').is_empty(),
+        Value::Bool(b) => !*b,
+        Value::Date(d) => *d == 0,
+        Value::Time(t) => *t == 0,
+        Value::Timestamp(d, t) => *d == 0 && *t == 0,
+        _ => false,
+    }
+}
+
+/// Where a key tuple `a` sorts relative to `b` under a hypothetical-set
+/// aggregate's WITHIN GROUP keys (`(desc, nulls_first)` each) - Less when
+/// `a` comes first. The values compare by value, DESC reversing. A NULL
+/// is the engine's own law, measured on 2196 over NUMERIC, VARCHAR, DATE,
+/// TIMESTAMP and BOOLEAN keys: under the direction's DEFAULT placement
+/// (ASC NULLS FIRST, DESC NULLS LAST, written or not) a NULL is a PEER of
+/// the zero value ([hypo_zero]) and otherwise sorts at its default end -
+/// `RANK(0)` over {300, NULL, 400} is 1 while `RANK(-5)` is 2, and
+/// DENSE_RANK counts a NULL and a 0 as one value; under the other
+/// placement (DESC NULLS FIRST, ASC NULLS LAST) a NULL sits at that end
+/// and is the peer of nothing but a NULL.
+fn hypo_cmp(a: &[Value], b: &[Value], flags: &[(bool, bool)]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for ((x, y), (desc, nulls_first)) in a.iter().zip(b).zip(flags) {
+        let default = *nulls_first != *desc;
+        let null_side = if *nulls_first { Ordering::Less } else { Ordering::Greater };
+        let o = match (matches!(x, Value::Null), matches!(y, Value::Null)) {
+            (true, true) => Ordering::Equal,
+            (true, false) if default && hypo_zero(y) => Ordering::Equal,
+            (false, true) if default && hypo_zero(x) => Ordering::Equal,
+            (true, false) => null_side,
+            (false, true) => null_side.reverse(),
+            (false, false) => {
+                let o = num_cmp(x, y).unwrap_or_else(|| value_cmp(x, y));
+                if *desc { o.reverse() } else { o }
+            }
+        };
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    Ordering::Equal
+}
+
 fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, EvalErr> {
     // an aggregate's per-row input: the field's value, or the
     // expression evaluated against the row (whose error - divide by
@@ -77149,6 +77359,8 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
             AggSrc::List { arg, .. } => arg.eval(r)?,
             // a percentile folds through its own arm, never here
             AggSrc::Percentile { order, .. } => order.eval(r)?,
+            // ...and a hypothetical-set fold
+            AggSrc::Hypo { .. } => Value::Null,
         })
     }
     // THE COMPARISON A FOLD MAKES. A collated source compares by its
@@ -77648,6 +77860,44 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                 // the ordered-set percentiles: collect the non-null ORDER BY
                 // values, sort them (DESC reverses), then interpolate
                 // (CONT) or pick (DISC) by the fractional rank
+                // the hypothetical-set folds: where the constant row would
+                // place among the group's rows in the keys' order
+                // ([hypo_cmp]) - RANK counts the rows BEFORE it, DENSE_RANK
+                // the distinct key tuples before it, CUME_DIST the rows
+                // before it or tied with it
+                GItem::Agg(func, AggSrc::Hypo { args, order }, _) if func.is_hypo() => {
+                    let hyp: Vec<Value> = args.iter().map(|a| a.eval(&[])).collect::<Result<_, _>>()?;
+                    let mut keyed: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+                    for r in rows {
+                        keyed.push(order.iter().map(|(k, ..)| k.eval(r)).collect::<Result<_, _>>()?);
+                    }
+                    let flags: Vec<(bool, bool)> = order.iter().map(|(_, d, n)| (*d, *n)).collect();
+                    let before: Vec<&Vec<Value>> =
+                        keyed.iter().filter(|k| hypo_cmp(k, &hyp, &flags) == std::cmp::Ordering::Less).collect();
+                    let n = keyed.len();
+                    match func {
+                        AggFn::HypoRank => Value::Int(before.len() as i64 + 1),
+                        AggFn::HypoDenseRank => {
+                            let mut distinct: Vec<&Vec<Value>> = Vec::new();
+                            for k in before {
+                                if !distinct.iter().any(|d| hypo_cmp(d, k, &flags) == std::cmp::Ordering::Equal) {
+                                    distinct.push(k);
+                                }
+                            }
+                            Value::Int(distinct.len() as i64 + 1)
+                        }
+                        AggFn::HypoPercentRank => {
+                            Value::Double(if n == 0 { 0.0 } else { before.len() as f64 / n as f64 })
+                        }
+                        _ => {
+                            let upto = keyed
+                                .iter()
+                                .filter(|k| hypo_cmp(k, &hyp, &flags) != std::cmp::Ordering::Greater)
+                                .count();
+                            Value::Double((upto + 1) as f64 / (n + 1) as f64)
+                        }
+                    }
+                }
                 GItem::Agg(func, AggSrc::Percentile { frac, order, desc }, _)
                     if func.is_percentile() =>
                 {
@@ -81904,6 +82154,9 @@ fn aggsrc_has_param(s: &AggSrc) -> bool {
         AggSrc::Expr(e) => expr_has_param(e),
         AggSrc::Pair(a, b) => expr_has_param(a) || expr_has_param(b),
         AggSrc::Percentile { frac, order, .. } => expr_has_param(frac) || expr_has_param(order),
+        AggSrc::Hypo { args, order } => {
+            args.iter().any(expr_has_param) || order.iter().any(|(k, ..)| expr_has_param(k))
+        }
         AggSrc::List { arg, sep, order, .. } => {
             expr_has_param(arg)
                 || sep.as_ref().is_some_and(expr_has_param)
@@ -87127,6 +87380,14 @@ fn renumber_agg_target_params(t: &mut AggTarget, next: &mut usize) {
             renumber_raw_params(y, next);
             renumber_raw_params(x, next);
         }
+        AggTarget::Hypo { args, order } => {
+            for a in args.iter_mut() {
+                renumber_raw_params(a, next);
+            }
+            for (k, ..) in order.iter_mut() {
+                renumber_raw_params(k, next);
+            }
+        }
         AggTarget::Percentile { frac, order, .. } => {
             renumber_raw_params(frac, next);
             renumber_raw_params(order, next);
@@ -88036,10 +88297,15 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                     ));
                 }
                 Some(RawExpr::Case(branches, default.map(Box::new), true))
-            } else if !quoted && agg_named(&word) && {
-                skip_ws(b, pos);
-                b.get(*pos) == Some(&'(')
-            } {
+            } else if !quoted
+                && (agg_named(&word)
+                    || (matches!(word.to_ascii_uppercase().as_str(), "RANK" | "DENSE_RANK" | "PERCENT_RANK" | "CUME_DIST")
+                        && hypo_call_chars(b, *pos)))
+                && {
+                    skip_ws(b, pos);
+                    b.get(*pos) == Some(&'(')
+                }
+            {
                 // an AGGREGATE as an expression leaf: hand the whole
                 // `SUM(...)` span to the aggregate parser, which already
                 // knows DISTINCT, `*` and expression arguments
@@ -112739,7 +113005,7 @@ fn eval_subquery_rel(
         // builds it, so a subquery accepts the same arguments a SELECT
         // list does - a column, `COUNT(DISTINCT col)`, or an expression
         let (src, distinct) = match &target {
-            AggTarget::Pair(..) | AggTarget::Percentile { .. } | AggTarget::List { .. } => {
+            AggTarget::Pair(..) | AggTarget::Percentile { .. } | AggTarget::List { .. } | AggTarget::Hypo { .. } => {
                 return None
             }
             AggTarget::Star => (AggSrc::Star, false),
@@ -113871,6 +114137,54 @@ fn split_query(
 /// Is this word one of the aggregate functions? (The expression parser
 /// asks before treating a `name(` as a call, since an aggregate is a
 /// LEAF there rather than a scalar function.)
+/// A HYPOTHETICAL-SET call at `at` (the word starts there, `upper` is it
+/// folded): RANK / DENSE_RANK / PERCENT_RANK / CUME_DIST, its `(...)`, and
+/// a `WITHIN GROUP` after it. Without the clause the word is the window
+/// function's, read elsewhere - so these names cannot simply join
+/// [agg_named]. One spelling for the byte lexer, one for the char parser.
+fn hypo_call_bytes(b: &[u8], after_word: usize, upper: &str) -> bool {
+    if !matches!(upper, "RANK" | "DENSE_RANK" | "PERCENT_RANK" | "CUME_DIST") {
+        return false;
+    }
+    let chars: Vec<char> = b.iter().map(|c| *c as char).collect();
+    hypo_call_chars(&chars, after_word)
+}
+
+fn hypo_call_chars(b: &[char], after_word: usize) -> bool {
+    let skip = |mut i: usize| {
+        while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+            i += 1;
+        }
+        i
+    };
+    let word_at = |at: usize, w: &str| -> bool {
+        w.chars().enumerate().all(|(k, wc)| b.get(at + k).is_some_and(|c| c.eq_ignore_ascii_case(&wc)))
+            && !b.get(at + w.len()).is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+    };
+    let open = skip(after_word);
+    if b.get(open) != Some(&'(') {
+        return false;
+    }
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, c) in b.iter().enumerate().skip(open) {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else { return false };
+    let w = skip(close + 1);
+    word_at(w, "WITHIN") && word_at(skip(w + 6), "GROUP")
+}
+
 fn agg_named(word: &str) -> bool {
     matches!(
         word.to_ascii_uppercase().as_str(),
@@ -114127,7 +114441,7 @@ fn parse_window_item(
         return None;
     }
     let spec = t[over_lp + 1..over_end].trim();
-    let (part, order, frame) = parse_over_spec(spec)?;
+    let (part, order, mut frame) = parse_over_spec(spec)?;
     // the engine refuses DISTINCT in a window with an ORDER BY or a
     // ROWS frame (WindowedStream.cpp: "DISTINCT is not supported in
     // windows with ORDER BY or frame by ROWS/GROUPS clauses"); this
@@ -114141,8 +114455,13 @@ fn parse_window_item(
     // explicit ROWS frame rides an AGGREGATE or a VALUE function (FIRST/
     // LAST/NTH_VALUE); a RANGE-offset frame rides an AGGREGATE only (a
     // value function under RANGE is a later slice). Ranking and navigation
-    // take no frame.
-    if let Some(fr) = &frame {
+    // IGNORE a frame and its EXCLUDE - ROW_NUMBER, RANK, DENSE_RANK,
+    // PERCENT_RANK, CUME_DIST, NTILE, LAG and LEAD answer the same under
+    // `ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING [EXCLUDE CURRENT ROW]` and
+    // `RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING` as with none
+    // (measured on 2196; this refused them). A negative or oversized
+    // offset there is unmeasured and still refuses.
+    if let Some(fr) = frame.clone() {
         if order.is_none() {
             return None;
         }
@@ -114151,7 +114470,10 @@ fn parse_window_item(
             FrameMode::Range => matches!(func, WinFunc::Agg(..)),
         };
         if !ok {
-            return None;
+            if matches!(func, WinFunc::Agg(..) | WinFunc::Val(..)) || fr.negative || fr.too_big {
+                return None;
+            }
+            frame = None;
         }
     }
     Some((func, part, order, frame))
@@ -114343,6 +114665,24 @@ fn parse_over_spec(spec: &str) -> Option<(Vec<RawExpr>, Option<String>, Option<F
 /// literal offset parses (its magnitude is kept) and marks the frame,
 /// which raises at EXECUTE ([EvalErr::WindowFrameNegative]).
 fn parse_frame_clause(s: &str) -> Option<Frame> {
+    // a trailing `EXCLUDE ..` ([FrameExclude])
+    let mut s = s.trim();
+    let mut exclude = FrameExclude::NoOthers;
+    let up_all = s.to_ascii_uppercase();
+    for (tail, ex) in [
+        (" EXCLUDE NO OTHERS", FrameExclude::NoOthers),
+        (" EXCLUDE CURRENT ROW", FrameExclude::CurrentRow),
+        (" EXCLUDE GROUP", FrameExclude::Group),
+        (" EXCLUDE TIES", FrameExclude::Ties),
+    ] {
+        let norm: String = up_all.split_whitespace().collect::<Vec<_>>().join(" ");
+        if norm.ends_with(tail) {
+            exclude = ex;
+            let at = find_word_depth0(&up_all, "EXCLUDE", 0)?;
+            s = s[..at].trim_end();
+            break;
+        }
+    }
     // the mode word, then the extent
     let (mode, kwlen) = if s.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("ROWS")) {
         (FrameMode::Rows, 4)
@@ -114363,11 +114703,11 @@ fn parse_frame_clause(s: &str) -> Option<Frame> {
         let and_at = find_word_depth0(&up, "AND", "BETWEEN ".len())?;
         let (start, n1, b1) = parse_frame_bound(body["BETWEEN ".len()..and_at].trim())?;
         let (end, n2, b2) = parse_frame_bound(body[and_at + "AND".len()..].trim())?;
-        Some(Frame { mode, start, end, negative: n1 || n2, too_big: rows && (b1 || b2) })
+        Some(Frame { mode, start, end, negative: n1 || n2, too_big: rows && (b1 || b2), exclude })
     } else {
         // shorthand: <mode> <start> == BETWEEN <start> AND CURRENT ROW
         let (start, negative, big) = parse_frame_bound(body)?;
-        Some(Frame { mode, start, end: FrameBound::CurrentRow, negative, too_big: rows && big })
+        Some(Frame { mode, start, end: FrameBound::CurrentRow, negative, too_big: rows && big, exclude })
     }
 }
 
@@ -114874,6 +115214,35 @@ fn parse_list_within_group(tail: &str) -> Option<Vec<(RawExpr, bool, bool)>> {
     (!keys.is_empty()).then_some(keys)
 }
 
+/// Parse `RANK(v, ..) WITHIN GROUP (ORDER BY k [ASC|DESC] [NULLS ..], ..)`
+/// (and DENSE_RANK / PERCENT_RANK / CUME_DIST). A count of values that is
+/// not the count of keys is the engine's isc_hypfun_args_non_equal_sort_item
+/// at prepare, under "Dynamic SQL Error" (measured on 2196).
+fn parse_hypo_item(func: AggFn, t: &str, open: usize) -> Option<(AggFn, AggTarget)> {
+    let close = matching_paren(t.as_bytes(), open)?;
+    let inner = t.get(open + 1..close)?.trim();
+    if inner.is_empty() {
+        return None;
+    }
+    let order = parse_list_within_group(t.get(close + 1..)?)?;
+    let mut args = Vec::new();
+    for a in split_top_level_commas(inner) {
+        args.push(parse_raw_expr_any(a.trim())?);
+    }
+    if args.len() != order.len() {
+        let name = func.name().trim_end_matches("_AGG").to_string();
+        PREPARE_REFUSAL.with(|r| {
+            *r.borrow_mut() = Some(EvalErr::Status(vec![
+                StatusItem::Gds(335544569), // isc_dsql_error
+                StatusItem::Gds(335545341), // isc_hypfun_args_non_equal_sort_item
+                StatusItem::Str(name),
+            ]))
+        });
+        return None;
+    }
+    Some((func, AggTarget::Hypo { args, order }))
+}
+
 /// Parse `PERCENTILE_x(frac) WITHIN GROUP (ORDER BY expr [ASC|DESC])` -
 /// `t` is the whole item, `open` the index of the `(` after the function
 /// name. Only ONE sort item is accepted (the engine rejects more).
@@ -115142,8 +115511,18 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
         "PERCENTILE_CONT" => AggFn::PercentileCont,
         "PERCENTILE_DISC" => AggFn::PercentileDisc,
         "LIST" => AggFn::List,
+        "RANK" => AggFn::HypoRank,
+        "DENSE_RANK" => AggFn::HypoDenseRank,
+        "PERCENT_RANK" => AggFn::HypoPercentRank,
+        "CUME_DIST" => AggFn::HypoCumeDist,
         _ => return None,
     };
+    // the hypothetical-set aggregates: `RANK(v, ..) WITHIN GROUP (ORDER BY
+    // ..)` - only with the clause (`RANK() OVER (..)` is the window
+    // function, read elsewhere)
+    if func.is_hypo() {
+        return parse_hypo_item(func, t, open);
+    }
     // the ordered-set percentiles have their OWN shape:
     // `PERCENTILE_x(frac) WITHIN GROUP (ORDER BY expr [ASC|DESC])` - the
     // WITHIN GROUP clause sits OUTSIDE the (frac) parens, so the generic
@@ -116372,7 +116751,7 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 // the WHOLE family ([agg_named]), so a HAVING over
                 // VAR_SAMP/CORR/PERCENTILE parses; a WHERE keeps
                 // refusing downstream, as it did for SUM
-                if agg_named(&upper) {
+                if agg_named(&upper) || hypo_call_bytes(b, i, &upper) {
                     let mut j = i;
                     while j < b.len() && b[j].is_ascii_whitespace() {
                         j += 1;
@@ -128122,6 +128501,7 @@ fn agg_src_exprs(s: &AggSrc) -> Vec<&Expr> {
         AggSrc::Expr(e) => vec![e],
         AggSrc::Pair(a, b) => vec![a, b],
         AggSrc::Percentile { frac, order, .. } => vec![frac, order],
+        AggSrc::Hypo { args, order } => args.iter().chain(order.iter().map(|(k, ..)| k)).collect(),
         AggSrc::List { arg, sep, order, .. } => {
             let mut v = vec![arg];
             v.extend(sep.iter());
@@ -135296,7 +135676,18 @@ fn resolve_having(
                 // ... or a stored call over a group key (`HAVING F2(C, 1)
                 // <> 'x'`), which runs over the folded row as one over an
                 // aggregate does
-                if raw_has_agg(raw_e) || rhs_e.is_some() || raw_has_param(raw_e) || null_test || raw_calls_user_fn(raw_e) {
+                // ... or a CONSTANT tested side - `HAVING 1 = 1`, `HAVING
+                // CURRENT_USER = 'SYSDBA'`, `COUNT(*) > 1 OR 1 = 0` - which
+                // refused at the `RawLhs::Expr` arm below, where the engine
+                // decides it per group (measured on 2196; `HAVING 1 / 0 =
+                // 1` raises 22012 at the fetch)
+                if raw_has_agg(raw_e)
+                    || rhs_e.is_some()
+                    || raw_has_param(raw_e)
+                    || null_test
+                    || raw_calls_user_fn(raw_e)
+                    || raw_is_constant(raw_e)
+                {
                     let mut aggs = collect_aggs(raw_e);
                     if let Some(r) = rhs_e {
                         for a in collect_aggs(r) {
@@ -135506,6 +135897,18 @@ fn resolve_having(
                             (None, None, Some(src), hk, false)
                         }
                         AggTarget::List { .. } => return None,
+                        // a hypothetical-set fold under HAVING: a BIGINT
+                        // rank, or a DOUBLE fraction
+                        AggTarget::Hypo { .. } => {
+                            agg_result_desc(*func, target, columns, descs)?;
+                            let (src, _) = resolve_agg_src(target, columns, descs, params)?;
+                            let hk = match family_kind {
+                                Some(k) => k,
+                                None if matches!(func, AggFn::HypoRank | AggFn::HypoDenseRank) => HKind::Int,
+                                None => HKind::Numeric,
+                            };
+                            (None, None, Some(src), hk, false)
+                        }
                         AggTarget::Star => (None, None, None, HKind::Int, false),
                         AggTarget::Col(name) | AggTarget::Distinct(name) => {
                             let rc =
@@ -135880,7 +136283,16 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!("[srv] login={} plugin={} list={} keylen={} compress={}", login, cu.plugin, cu.plugins, a_hex.len(), compress);
     }
-    if !login.eq_ignore_ascii_case(user) || a_hex.is_empty() {
+    // isql's CREATE DATABASE parses its own `USER 'SYSDBA'` on the client
+    // side and sends the login WITH its quotes - which the engine accepts
+    let bare = login
+        .strip_prefix('\'')
+        .and_then(|l| l.strip_suffix('\''))
+        .unwrap_or(&login);
+    if !bare.eq_ignore_ascii_case(user) || a_hex.is_empty() {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] login {:?} is not {:?} - connection dropped", login, user);
+        }
         return Ok(());
     }
     let offer = crypt_offer();
@@ -136159,7 +136571,16 @@ fn after_auth(
         why.write_items(&mut w, &db_path);
         w.int(0); // isc_arg_end
         w.send(&mut s, &mut enc)?;
-        return Ok(());
+        // THE CONNECTION OUTLIVES A REFUSED ATTACH, as on the engine:
+        // node-firebird's attachOrCreate sends op_create on the SAME
+        // socket after its op_attach fails, and hanging up here lost the
+        // connection (samples/nodejs/metadata_cache.js on a fresh path)
+        return match read_int(&mut s, &mut dec) {
+            Ok(next) if next == OP_ATTACH || next == OP_CREATE => {
+                after_auth(s, best, next, &mut enc, &mut dec, user, password)
+            }
+            _ => Ok(()),
+        };
     }
     // A SHUT-DOWN DATABASE REFUSES THE ATTACH ITSELF, before any of the
     // DPB's work - and the order of the two exemptions was MEASURED, not

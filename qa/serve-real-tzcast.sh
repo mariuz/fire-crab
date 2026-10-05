@@ -270,13 +270,14 @@ refused() { # <label> <script> <engine-output>
 }
 refused "12 a correlated EXISTS over a zoned key" "SELECT ID FROM CO WHERE EXISTS (SELECT 1 FROM CI WHERE CI.Y = CO.Y) ORDER BY ID;" "ID|1"
 refused "12 IN (<subquery>) over a zoned key" "SELECT ID FROM CO WHERE CO.X IN (SELECT X FROM CI) ORDER BY ID;" "ID|1|2"
-# CLIENT_OS_USER: the engine names the client's OS user; this server has
-# no faithful source for it and answers NULL, as for CLIENT_HOST - the key
-# is VALID, so it no longer raises
+# CLIENT_OS_USER: the client's OS user, from the connect block's CNCT_user
+# (promoted 2026-10-05 - it answered NULL here; qa/serve-real-session.sh
+# owns the law). The same isql, so the same user on both.
 ran=$((ran + 1))
+ev=$(sess "127.0.0.1/$REAL:$ENG" "SELECT RDB\$GET_CONTEXT('SYSTEM', 'CLIENT_OS_USER') $DUAL;")
 fv=$(sess "127.0.0.1/$PORT:$FC" "SELECT RDB\$GET_CONTEXT('SYSTEM', 'CLIENT_OS_USER') $DUAL;")
-if [ "$fv" = "RDB\$GET_CONTEXT|<null>" ]; then echo "OK   12 CLIENT_OS_USER is a valid key: NULL here, the OS user on the engine (recorded)"
-else echo "FAIL 12 CLIENT_OS_USER answered [$fv]"; fail=1; fi
+if [ -n "$ev" ] && [ "$fv" = "$ev" ]; then echo "OK   12 CLIENT_OS_USER is the client's OS user [$ev]"
+else echo "FAIL 12 CLIENT_OS_USER eng=[$ev] fc=[$fv]"; fail=1; fi
 err_differs "12 a TIMESTAMP string into TIME WITH TIME ZONE: the engine reads '-09-08 ...' as an OFFSET (22009), this server 22018" \
      "SELECT CAST('2026-09-08 10:00:00 Europe/Paris' AS TIME WITH TIME ZONE) $DUAL;"
 

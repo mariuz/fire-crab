@@ -144,12 +144,11 @@ else
     echo "SKIP section 4: node-firebird not resolvable (NODE_PATH=/home/ubuntu/work)"
 fi
 
-echo "--- 5 RECORDED: a transaction has no id here before its first write; a literal-only HAVING"
+echo "--- 5 RECORDED: a transaction has no id here before its first write"
 rec "5 RECORDED CURRENT_TRANSACTION" "SELECT CURRENT_TRANSACTION > 0 AS P FROM RDB\$DATABASE;" \
     ' P|=======|<true>|' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|'
-rec "5 RECORDED a HAVING over a literal-only condition (HAVING 1 = 1 alike)" \
-    "SELECT COUNT(*) AS N FROM T GROUP BY ID HAVING CURRENT_USER = 'SYSDBA';" \
-    ' N|=====================| 1|' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|'
+both "5 (promoted 2026-10-04) a HAVING over a session keyword" \
+    "SELECT COUNT(*) AS N FROM T GROUP BY ID HAVING CURRENT_USER = 'SYSDBA' AND CURRENT_CONNECTION > 0;"
 rec "5 RECORDED TRANSACTION_ID" "SELECT $(GC TRANSACTION_ID) IS NOT NULL AS P FROM RDB\$DATABASE;" \
     ' P|=======|<true>|' ' P|=======|<false>|'
 
