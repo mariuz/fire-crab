@@ -124,10 +124,11 @@ Short, actionable items. The long-form engineering backlog lives in
       on a ranking function (`qa/serve-real-frameexclude.sh`). Recorded there: a hypothetical value count that is not the
       key count raises at EXECUTE on the engine (prepare here), a per-row value's -104 vector, a text value for a
       numeric key, a collated or DECFLOAT key; a misplaced EXCLUDE's -104 and LIST-in-a-framed-window's 0A000.
-- [ ] A column declared `COLLATE UCS_BASIC` refuses everywhere (samples/nodejs/intl.js) - `keyable_ttype` takes collation
-      0 only, and UCS_BASIC is NOT that order: measured on 2196 it compares with trailing blanks TRIMMED and then by
-      code point ('a' = 'a ' < 'a<TAB>'), where UTF8's default pads with blanks ('a<TAB>' < 'a'), and COUNT(DISTINCT)
-      folds 'a' and 'a ' (4 of 5) where the default does not (5). Needs its own comparator in every route.
+- [x] UCS_BASIC (trailing blanks trimmed, then code points - this server's plain comparison) and a COLLATE with no
+      CHARACTER SET in column / domain / ALTER TABLE ADD DDL (`qa/serve-real-ucsbasic.sh`); samples/nodejs/intl.js runs
+      identically.
+- [ ] UTF8's DEFAULT collation PADS with blanks on the engine ('a<TAB>' < 'a'), where this server trims - a character
+      below the blank orders differently (recorded in ucsbasic section 3).
 - [ ] samples/nodejs/psql.js: an exception raised in a procedure lacks the engine's `At procedure "PUBLIC"."HIRE" line:
       4, col: 29` context line.
 - [x] A table carrying an EXPRESSION or PARTIAL index (engine-made) was read-only here; its writes now maintain both

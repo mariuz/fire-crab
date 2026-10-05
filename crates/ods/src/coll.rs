@@ -123,8 +123,13 @@ pub const TTYPE_PXW_INTL: u16 = 0x0135;
 /// the wrong order, or a row is missing from a filter - and this file's
 /// rule is that a refusal is better than a guess.
 pub fn keyable_ttype(ttype: u16) -> bool {
-    crate::intl::collation_id(ttype as i16) == 0 || ttype == TTYPE_PXW_INTL
+    crate::intl::collation_id(ttype as i16) == 0 || ttype == TTYPE_PXW_INTL || ttype == TTYPE_UCS_BASIC
 }
+
+/// UTF8's `UCS_BASIC` (collation 1): code-point order with trailing blanks
+/// TRIMMED - 'a' = 'a ' < 'a<TAB>' - which is the plain value comparison
+/// here, where UTF8's default pads with blanks instead (measured on 2196)
+pub const TTYPE_UCS_BASIC: u16 = 0x0104;
 
 fn expand_of(b: u8) -> (u8, u8) {
     for &(c, e1, e2) in PXW_INTL_EXPAND.iter() {

@@ -19179,6 +19179,11 @@ thread_local! {
     /// planner threads its database handle through 49 signatures already,
     /// and this is one connection-wide fact, not a per-call argument.
     static CURRENT_ATT_CS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// The DATABASE's default character set for the statement being
+    /// prepared - read only when its text names a COLLATE, which a column
+    /// or domain declaring no CHARACTER SET resolves against
+    /// ([parse_column_def])
+    static DDL_DB_CS: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
     /// set while [simple_case_mixed] resolves a CASE's branches: no
     /// distribution is attempted inside ([push_into_simple_case])
     static PUSH_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -24034,7 +24039,10 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
     // The COLLATE id (against the resolved charset); an unknown/user
     // collation refuses (a later slice), so the catalog never lies about it.
     let coll: u8 = match &coll_name {
-        Some(n) => collation_name_id(cs.unwrap_or(0), n)?,
+        // a COLLATE with no CHARACTER SET resolves against the DATABASE's
+        // default set ([DDL_DB_CS]); [apply_db_charset] then fills the low
+        // byte, keeping this high one
+        Some(n) => collation_name_id(cs.unwrap_or_else(|| DDL_DB_CS.with(|c| c.get()).unwrap_or(0)), n)?,
         None => 0,
     };
     // A CHAR/VARCHAR column with a real charset: the descriptor sub_type is
@@ -56042,6 +56050,17 @@ thread_local! {
 }
 
 fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
+    // a COLLATE with no CHARACTER SET names a collation of the DATABASE's
+    // default set (`B VARCHAR(10) COLLATE UCS_BASIC` in a UTF8 database);
+    // the column parser has no database, so it is handed over here
+    DDL_DB_CS.with(|c| {
+        c.set(match db {
+            Some(d) if sql.to_ascii_uppercase().contains("COLLATE") => {
+                Some(db_default_charset(&d.bytes(), d.page_size))
+            }
+            _ => None,
+        })
+    });
     // the OUTERMOST call records the statement; a nested one (a view, a
     // derived table re-planned from its own text) leaves it as it is
     let outermost = STMT_TEXT.with(|t| {
@@ -131808,6 +131827,10 @@ fn agg_needs_unkeyable_coll(gitems: &[GItem], descs: &[Descriptor]) -> bool {
         matches!(col_kind(d), Some(ColKind::Text))
             && d.sub_type >= 0
             && fire_crab_ods::intl::collation_id(d.sub_type) != 0
+            // UCS_BASIC IS the plain fold's comparison - trailing blanks
+            // trimmed, then code points: MIN / MAX and a DISTINCT that
+            // folds 'a' with 'a ' (measured on 2196: 6 of 7)
+            && d.sub_type as u16 != fire_crab_ods::coll::TTYPE_UCS_BASIC
     };
     gitems.iter().any(|g| match g {
         GItem::Agg(f, src, distinct) if matches!(f, AggFn::Min | AggFn::Max) || *distinct => {
@@ -138086,6 +138109,16 @@ fn after_auth(
                         // here, at prepare ([ddl_unknown_schema])
                         ddl_unknown_schema(&stmt_sql, &database).map(|e| (Plan::RefusedEval(e), Vec::new()))
                     };
+                    // a COLLATE with no CHARACTER SET resolves against the
+                    // database's default set ([DDL_DB_CS])
+                    DDL_DB_CS.with(|c| {
+                        c.set(match &database {
+                            Some(d) if stmt_sql.to_ascii_uppercase().contains("COLLATE") => {
+                                Some(db_default_charset(&d.bytes(), d.page_size))
+                            }
+                            _ => None,
+                        })
+                    });
                     let planned = planned
                         .or_else(|| plan_comment(&stmt_sql))
                         .or_else(|| plan_grant_procedure(&stmt_sql))
