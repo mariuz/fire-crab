@@ -2748,6 +2748,9 @@ pub fn field_type_to_dtype(ft: i16) -> Option<u8> {
         13 => dtype::SQL_TIME,
         35 => dtype::TIMESTAMP,
         23 => dtype::BOOLEAN,
+        // RDB$FIELD_TYPE 24 / 25 are DECFLOAT(16) / DECFLOAT(34)
+        24 => dtype::DEC64,
+        25 => dtype::DEC128,
         14 => dtype::TEXT,
         37 => dtype::VARYING,
         // blr_blob is 261 in the catalog (blr_blob = 261, blr.h), the

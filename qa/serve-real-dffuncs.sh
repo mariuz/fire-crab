@@ -136,9 +136,9 @@ both "6 PSQL: TOTALORDER / COMPARE_DECFLOAT into a SMALLINT" "SET TERM ^;
 EXECUTE BLOCK RETURNS (C SMALLINT, K SMALLINT) AS BEGIN C = TOTALORDER(CAST(1 AS DECFLOAT(16)), 2); K = COMPARE_DECFLOAT(CAST('NaN' AS DECFLOAT(16)), 1); SUSPEND; END^
 SET TERM ;^"
 rec "6 RECORDED GROUP BY a DECFLOAT-valued function (ABS too - every decfloat expression key)" "SELECT NORMALIZE_DECFLOAT(A) G, COUNT(*) FROM T WHERE ID IN (1,2,3) GROUP BY NORMALIZE_DECFLOAT(A) ORDER BY 1;" ' G COUNT|======================= =====================| 1 1| 1.2345 1| 1E+2 1|X|======|DONE|' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|X|======|DONE|'
-rec "6 RECORDED PSQL assigning a DECFLOAT-valued function (ABS too)" "SET TERM ^;
+both "6 PSQL assigning a DECFLOAT-valued function (promoted: dfpsql's DECFLOAT outputs)" "SET TERM ^;
 EXECUTE BLOCK RETURNS (R DECFLOAT(16)) AS BEGIN R = NORMALIZE_DECFLOAT(CAST(2.50 AS DECFLOAT(16))); SUSPEND; END^
-SET TERM ;^" ' R|=======================| 2.5|X|======|DONE|' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|X|======|DONE|'
+SET TERM ;^"
 
 echo "--- panic check"
 ran=$((ran + 1))

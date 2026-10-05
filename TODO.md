@@ -137,12 +137,18 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       to y's exponent, Invalid past the precision; the first operand's DECFLOAT(34) or else DECFLOAT(16); COMPARE by
       total order 0/1/2, 3 for a NaN; TOTALORDER IEEE -1/0/1. BOUNDARY: an sNaN / -NaN has no form here (refused).
 - [ ] GROUP BY a DECFLOAT-valued expression (ABS(A), NORMALIZE_DECFLOAT(A)) refuses (recorded in dffuncs 6).
-- [ ] PSQL has NO DECFLOAT slot: an EXECUTE BLOCK / procedure / function with a DECFLOAT parameter, output or
-      variable refuses whole (`RETURNS (R DECFLOAT(16)) .. R = 1` too; recorded in dffuncs 6). Engine answers: R = 1
-      is 1, `X + 1` over DECLARE X DECFLOAT(16) = 2 is 3, SELECT .. INTO R, a DECFLOAT(16) into a (34) output keeps
-      2.50, PD(X DECFLOAT(16)) RETURNS (R DECFLOAT(34)) R = X * 2 over 1.25 is 2.50 and over '3.5' 7.0. Admitting
-      the type in source_only_param alone is not enough - the block compile refuses elsewhere. Admitting the key is one line (parse_group_by's type_of guard) and
-      agrees for finite values, but it would carry the column path's NaN divergence (below) to a new router.
+      Admitting the key is one line (parse_group_by's type_of guard) and agrees for finite values, but it would carry
+      the column path's NaN divergence (below) to a new router.
+- [x] A DECFLOAT EXECUTE BLOCK output / local / INTO target (`qa/serve-real-dfpsql.sh`): the output reader takes
+      DECFLOAT, an output list is typed PER OUTPUT (a DOUBLE or DECFLOAT beside a VARCHAR refused), a DECFLOAT local
+      substitutes as CAST('<canonical>' AS DECFLOAT(n)), a DECFLOAT(16) NaN compares as SQL's (equal), and RDB$FIELD_TYPE
+      24/25 map to DEC64/DEC128. Recorded: `R = 2.5e0` (the engine reads the literal's text: 2.5; here 2.500000000000000).
+- [x] A stored PROCEDURE / FUNCTION with DECFLOAT parameters or result, made by the ENGINE, runs (source_only_param
+      takes DEC64/DEC128; a DECFLOAT user function is a decfloat leaf) - dfpsql 4.
+- [ ] CREATE PROCEDURE / FUNCTION with a DECFLOAT parameter refuses here: the BLR compiler (crates/dsql) has no
+      DECFLOAT dsc (blr_dec64 24 / blr_dec128 25). Recorded (dfpsql 5).
+- [ ] EXECUTE BLOCK: a duplicate output name is the engine's -637 *duplicate specification*, a bare refusal here; an
+      error location after a non-ASCII literal is 2 columns past the engine's (`C = 'é'; R = 1 / 0` col 63 vs 61).
 - [ ] GROUP BY a DECFLOAT column holding a NaN (pre-existing): the engine's group break is its COMPARE of the group
       head with the next sorted row - DECFLOAT(16) calls a NaN equal without raising, so Infinity and NaN merge
       (`NaN 2`) and under `GROUP BY -A` the negated NaN sorts first and swallows every row (`0.00 6`); DECFLOAT(34)

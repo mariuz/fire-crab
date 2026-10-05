@@ -99748,6 +99748,8 @@ fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
             Expr::Func(f, args) if is_dbldec_fn(f) => dbldec_decimal(args, descs),
             Expr::Func(SysFn::Abs, args) if args.len() == 1 => walk(&args[0], descs)?,
             Expr::Func(SysFn::Quantize | SysFn::NormalizeDecfloat, _) => true,
+            // a PSQL function declared RETURNS DECFLOAT(n)
+            Expr::UserFn { ret, .. } if is_decfloat_col(ret) => true,
             // FLOOR / CEILING over a decfloat answer DECFLOAT(34)
             // (makeCeilFloor's dec arm is makeDecimal128), ROUND / TRUNC
             // keep the operand's own width (makeRound / makeTrunc `*result
@@ -100316,6 +100318,12 @@ fn df_agg_engine_width(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
         Expr::Func(SysFn::Quantize | SysFn::NormalizeDecfloat, args) if !args.is_empty() => {
             Some(df_agg_engine_width(&args[0], descs) == Some(true))
         }
+        // a PSQL function's declared result
+        Expr::UserFn { ret, .. } => match ret.dtype {
+            dtype::DEC128 => Some(true),
+            dtype::DEC64 => Some(false),
+            _ => None,
+        },
         // FLOOR / CEILING widen a DECFLOAT(16) to (34) (`FLOOR(<DECFLOAT(16)>)`
         // describes DECFLOAT(34), measured); ROUND / TRUNC keep the width
         Expr::Func(SysFn::Ceil | SysFn::Ceiling | SysFn::Floor, args) if args.len() == 1 => {
@@ -121127,7 +121135,14 @@ fn var_check_predicate(src: &str, desc: &Descriptor) -> Option<Predicate> {
 fn source_only_param(d: &Descriptor) -> bool {
     matches!(
         d.dtype,
-        dtype::SQL_DATE | dtype::SQL_TIME | dtype::TIMESTAMP | dtype::DOUBLE | dtype::REAL | dtype::BOOLEAN
+        dtype::SQL_DATE
+            | dtype::SQL_TIME
+            | dtype::TIMESTAMP
+            | dtype::DOUBLE
+            | dtype::REAL
+            | dtype::BOOLEAN
+            | dtype::DEC64
+            | dtype::DEC128
     )
 }
 
@@ -121729,8 +121744,12 @@ fn psql_num_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
             }
         };
         let (x, y) = (dec(a)?, dec(b)?);
+        // a NaN compares as SQL's does ([dec_nan_cmp]): EQUAL with no
+        // DECFLOAT(34) side or with the Invalid trap stood down (`IF (R =
+        // R)` over a DECFLOAT(16) NaN takes THEN, measured on 2196); the
+        // 22000 the engine raises otherwise stays this refusal
         if matches!(x, Dec::Nan) || matches!(y, Dec::Nan) {
-            return None;
+            return dec_nan_cmp(a, b).ok();
         }
         return Some(dfl::cmp(&x, &y));
     }
@@ -124854,6 +124873,16 @@ fn psql_literal(v: &Value) -> Option<String> {
         // '' doubles inside a SQL string literal
         Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
         Value::Bool(b) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
+        // a DECFLOAT is the CAST of its canonical text, which reads back
+        // to the same value AND cohort (`2.50` stays 2.50, Infinity and the
+        // quiet NaN too) at its own width - a DECFLOAT local in `C =
+        // TOTALORDER(R, 2.50)` refused, having no literal at all
+        Value::DecFloat16(b) => {
+            format!("CAST('{}' AS DECFLOAT(16))", fire_crab_ods::decfloat::to_string(&fire_crab_ods::decfloat::decode_dec64(*b)))
+        }
+        Value::DecFloat34(b) => {
+            format!("CAST('{}' AS DECFLOAT(34))", fire_crab_ods::decfloat::to_string(&fire_crab_ods::decfloat::decode_dec128(*b)))
+        }
         // a temporal value re-renders as its TYPED literal - the exact
         // value survives the round trip (the render is the parse
         // grammar's ISO form), which is what carries temporal columns
@@ -131749,7 +131778,7 @@ fn parse_execute_block_select(
         // ...and a header the compiler has no type for - BOOLEAN, DOUBLE
         // PRECISION, FLOAT - is read by the column-type reader (outputs
         // only: inputs it cannot type refuse)
-        None if in_names.is_empty() => block_returns_scalar(returns_text)?,
+        None if in_names.is_empty() => block_output_descs(returns_text, &plain_funcs)?,
         // ...and an INPUT it has no type for (DOUBLE PRECISION, BOOLEAN)
         // is read by the same reader, from the declarations
         None => {
@@ -131770,7 +131799,7 @@ fn parse_execute_block_select(
                     }
                     (names, descs)
                 }
-                _ => block_returns_scalar(returns_text)?,
+                _ => block_output_descs(returns_text, &plain_funcs)?,
             }
         }
     };
@@ -131864,6 +131893,41 @@ fn block_input_descs(ins_decl: &str, plain_funcs: &[(String, usize, usize)]) -> 
     Some(out)
 }
 
+/// Each block OUTPUT's name and descriptor, typed ON ITS OWN as the
+/// inputs are ([block_input_descs]): the procedure compiler where it has
+/// the type, the column-type reader where it does not (DOUBLE PRECISION,
+/// BOOLEAN, DECFLOAT). Read whole, one output the compiler cannot type
+/// sent the list to the reader, which has no text type - so `RETURNS (R
+/// DECFLOAT(16), C VARCHAR(10))` and `(R DOUBLE PRECISION, C VARCHAR(10))`
+/// refused, each answering on the engine.
+fn block_output_descs(returns_text: &str, plain_funcs: &[(String, usize, usize)]) -> Option<(Vec<String>, Vec<Descriptor>)> {
+    let t = returns_text.trim();
+    let rest = t.get(.."RETURNS".len()).filter(|h| h.eq_ignore_ascii_case("RETURNS")).map(|_| &t["RETURNS".len()..])?;
+    let inner = rest.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let mut names: Vec<String> = Vec::new();
+    let mut descs = Vec::new();
+    for decl in split_top_level_commas(inner) {
+        let decl = decl.trim();
+        let head = format!("CREATE PROCEDURE FC$BLOCK RETURNS ({}) AS BEGIN SUSPEND; END", decl);
+        let (n, d) = match fire_crab_dsql::compile_procedure_full_with_funcs(&head, plain_funcs) {
+            Some(c) if c.outs.len() == 1 && c.ins.is_empty() => (c.outs[0].name.clone(), desc_from_proc_meta(&c.outs[0])?),
+            _ => {
+                let (n, d) = block_returns_scalar(&format!("RETURNS ({})", decl))?;
+                (n.into_iter().next()?, *d.first()?)
+            }
+        };
+        if names.contains(&n) {
+            return None;
+        }
+        names.push(n);
+        descs.push(d);
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some((names, descs))
+}
+
 /// The block's inputs as the [ProcParam]s its body binds.
 fn block_in_params(names: &[String], descs: &[Descriptor]) -> Vec<ProcParam> {
     names
@@ -131944,6 +132008,8 @@ fn block_returns_scalar(returns_text: &str) -> Option<(Vec<String>, Vec<Descript
                 | dtype::SQL_DATE
                 | dtype::SQL_TIME
                 | dtype::TIMESTAMP
+                | dtype::DEC64
+                | dtype::DEC128
         ) {
             return None;
         }
