@@ -1,6 +1,6 @@
 # fire-crab: Full Conversion Plan
 
-*2026-10-05 · baseline `master` at `ea24856` · shared copy:
+*2026-10-05 · baseline `master` at `ea24856`, updated for `4a005dd` · shared copy:
 [claude.ai doc](https://claude.ai/code/artifact/b21b5433-02ee-42ef-9918-c9d8177a2d5e)*
 
 Every Firebird subsystem has a first Rust version checked against the real
@@ -67,8 +67,16 @@ Wrong answers rank above refusals; a refusal is safe, a wrong answer is not.
 9. **DDL still refused.** USER management (also `SEC$` and gsec), SHADOW,
    `ALTER DATABASE` beyond BEGIN/END BACKUP, SCHEMA, PUBLICATION, EXTERNAL
    CONNECTIONS POOL, system privileges on roles, LOCAL TEMPORARY TABLE.
-10. **Character sets and blobs.** Undefined codepage bytes, the `UCS_BASIC`
-    comparator, `isc_bpb` charset transliteration, blob filters, arrays.
+10. **Character sets and blobs.**
+    - Codepage holes: every table is now a bijection on 256 bytes
+      (`44c1c3f`), but the engine transliterates a hole to U+0000 for a UTF8
+      delivery and refuses U+0081 into WIN1252. Fixing it means telling a
+      transliterating delivery from a byte one.
+    - UTF8's default collation pads with blanks (`'a<TAB>' < 'a'`) where this
+      server trims.
+    - `isc_bpb` charset transliteration, blob filters, arrays.
+    - Done 2026-10-05: `UCS_BASIC`, and a COLLATE with no CHARACTER SET in
+      DDL (`4a005dd`, `qa/serve-real-ucsbasic.sh`).
 11. **Services.** REPAIR, VALIDATE, PROPERTIES, the user actions,
     `GET_FB_LOG`; per-action SPB grammar; gstat's data, index and
     record-version analysis.

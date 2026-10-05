@@ -16,7 +16,8 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
 - [ ] **P2** Redo the dropped rounds 6–8 SQL work; the FLOAT/ROUND/DECFLOAT wrong answers first
 - [ ] **P2** Optimizer gaps (merge join, RIGHT/FULL in a chain, HAVING plans, `SET PLAN`)
 - [ ] **P2** Refused DDL (USER, SHADOW, ALTER DATABASE, SCHEMA, PUBLICATION, LTT, ...)
-- [ ] **P2** Charsets/blobs, services actions, MON$ coverage, auth gaps
+- [ ] **P2** Charsets/blobs (codepage holes on a UTF8 delivery, UTF8 default-collation padding, `isc_bpb`, filters, arrays), services actions, MON$ coverage, auth gaps
+- [x] **P2** `UCS_BASIC`; a COLLATE with no CHARACTER SET in DDL (`4a005dd`)
 - [ ] **P3** System packages, batch API, `ON EXTERNAL`, UDR/plugins, trace, encryption, replication, Windows/XNET, external tables
 - [ ] **P4** Rust fbclient (yvalve + remote client); standalone isql/gbak/gfix/gsec/nbackup; decide on gpre/qli
 

@@ -38,8 +38,10 @@ replacement of the C++ engine is below, in priority order. Full text:
 9. Refused DDL: USER (and `SEC$`, gsec), SHADOW, `ALTER DATABASE`, SCHEMA,
    PUBLICATION, EXTERNAL CONNECTIONS POOL, role system privileges, LOCAL
    TEMPORARY TABLE.
-10. Charsets/blobs: undefined codepage bytes, `UCS_BASIC`, `isc_bpb`
-    transliteration, blob filters, arrays.
+10. Charsets/blobs: a codepage hole to U+0000 on a UTF8 delivery (the
+    tables are bijective since `44c1c3f`), UTF8's default collation pads
+    where this server trims, `isc_bpb` transliteration, blob filters,
+    arrays. (`UCS_BASIC` and COLLATE without a set: done, `4a005dd`.)
 11. Services: REPAIR, VALIDATE, PROPERTIES, user actions, `GET_FB_LOG`,
     per-action SPB grammar, gstat data/index/record-version analysis.
 12. MON$: `MON$IO_STATS`, system attachments.
