@@ -136,7 +136,8 @@ Short, actionable items. The long-form engineering backlog lives in
 - [x] A text index's key type is the column's set (`qa/serve-real-textitype.sh`): UTF8 4, a tabled single-byte set
       IDX_OFFSET_INTL + ttype, NONE/ASCII 1 - this server stamped 1 for every set, and the ENGINE then misread its
       WIN1252 / ISO8859_1 indexes (wrong rows). An index on a set with no codepage table (DOS437 ..) is refused now.
-- [ ] Still differs: OCTETS (engine idx_byte_array 3) and UNICODE_FSS (engine 32834) keep idx_string here.
+- [x] OCTETS keys idx_byte_array (3) and UNICODE_FSS 32834, as the engine does; an engine-made index of either kind
+      takes this server's writes now (`qa/serve-real-textitype.sh` sections 4-5).
 - [ ] Non-ASCII text stored into a column of an untabled single-byte set (DOS437 ..) is written as UTF-8 bytes: the
       engine orders the rows differently (measured with 'ü').
 - [x] CREATE INDEX .. COMPUTED BY (..) and CREATE INDEX .. WHERE through this server (`qa/serve-real-exprindexddl.sh`;

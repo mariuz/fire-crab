@@ -45977,6 +45977,8 @@ fn resolve_index_ops_uncached(db: &Database, rel: u16, descs: &[Descriptor]) -> 
                     // while the engine took both. `btw::index_key` has
                     // encoded itype 4 all along.
                     | btw::IDX_METADATA
+                    | btw::IDX_BYTE_ARRAY
+                    | btw::IDX_UNICODE_FSS
                     | btw::IDX_NUMERIC
                     | btw::IDX_NUMERIC2
                     | btw::IDX_SQL_DATE

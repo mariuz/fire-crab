@@ -9240,18 +9240,19 @@ fn index_itype(d: &Descriptor) -> Option<u16> {
         // metadata set - is idx_metadata (4), a tabled single-byte set at
         // its default collation idx_offset_intl + ttype (WIN1252 32884,
         // ISO8859_1 32852, DOS437 32841), NONE and ASCII idx_string (1).
-        // OCTETS (idx_byte_array, 3) and UNICODE_FSS (32834) have no key
-        // builder here and keep idx_string - recorded (TODO).
+        // OCTETS idx_byte_array (3), UNICODE_FSS idx_offset_intl + 3.
         dtype::TEXT | dtype::VARYING => {
             let cs = crate::intl::charset_id(d.sub_type);
             if cs == crate::intl::CS_UTF8 {
                 btw::IDX_METADATA
             } else if crate::intl::tabled(cs) {
                 btw::IDX_OFFSET_INTL + cs as u16
-            } else if cs <= 3 {
-                // NONE, OCTETS, ASCII: carrier bytes; UNICODE_FSS: its
-                // bytes are UTF-8's
-                btw::IDX_STRING
+            } else if cs == 1 {
+                btw::IDX_BYTE_ARRAY // OCTETS
+            } else if cs == 3 {
+                btw::IDX_UNICODE_FSS
+            } else if cs <= 2 {
+                btw::IDX_STRING // NONE, ASCII: carrier bytes
             } else {
                 // A SET WITH NO CODEPAGE TABLE HERE (DOS437 and kin) has
                 // no key this writer can build: its text would key as

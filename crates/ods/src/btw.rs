@@ -77,6 +77,15 @@ pub fn intl_binary_charset(itype: u16) -> Option<u8> {
     }
 }
 pub const IDX_METADATA: u16 = 4;
+/// idx_byte_array - an OCTETS column's key: its raw bytes, trailing 0x00
+/// (the set's pad) stripped, an empty value keyed [00] (measured on 2196
+/// off an engine index: x'414200' and x'4142' both key 41 42, x'41422020'
+/// keeps its blanks, x'' keys 00)
+pub const IDX_BYTE_ARRAY: u16 = 3;
+/// UNICODE_FSS at its default collation - idx_offset_intl + ttype 3. Its
+/// bytes are UTF-8's, keyed exactly as [IDX_METADATA] keys them: 'ab' and
+/// 'ab  ' both 61 62, '' 00 (measured on 2196)
+pub const IDX_UNICODE_FSS: u16 = IDX_OFFSET_INTL + 3;
 pub const IDX_SQL_DATE: u16 = 5;
 pub const IDX_SQL_TIME: u16 = 6;
 pub const IDX_TIMESTAMP: u16 = 7;
@@ -269,7 +278,16 @@ pub fn index_key(itype: u16, value: &Value, scale: i8, charset: u8) -> Option<Ve
             let trimmed = bytes.trim_ascii_end_matches();
             Some(if trimmed.is_empty() { vec![b' '] } else { trimmed.to_vec() })
         }
-        IDX_METADATA => {
+        IDX_BYTE_ARRAY => {
+            let Value::Text(s) = value else { return None };
+            let bytes = crate::intl::carrier_encode(s)?;
+            let mut end = bytes.len();
+            while end > 0 && bytes[end - 1] == 0 {
+                end -= 1;
+            }
+            Some(if end == 0 { vec![0] } else { bytes[..end].to_vec() })
+        }
+        IDX_METADATA | IDX_UNICODE_FSS => {
             // INTL_string_to_key ttype_metadata (intl.cpp:949): plain
             // bytes, trailing spaces stripped (metadata text is UTF8
             // already); compress's empty-value pad for a non-idx_string
