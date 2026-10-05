@@ -80,15 +80,39 @@ rec() { # <label> <sql> <engine> <this server>
     elif [ "$c" != "$4" ]; then echo "FAIL $1 - this server answers [$c], not the recorded [$4]"; fail=1
     else echo "OK   $1 (recorded)"; fi
 }
-rec "2 RECORDED ORDER BY a DOS437 / KOI8R column (byte order)" "SELECT ID FROM T ORDER BY D437, ID; SELECT ID FROM T ORDER BY K8, ID;" \
-    ' ID|============| 3| 1| 2| 4| ID|============| 3| 4| 2| 1|X|======|DONE|' ' ID|============| 3| 4| 1| 2| ID|============| 3| 4| 1| 2|X|======|DONE|'
-rec "2 RECORDED a range over KOI8R (byte order)" "SELECT ID FROM T WHERE K8 > 'М' ORDER BY ID;" \
-    ' ID|============| 1|X|======|DONE|' ' ID|============| 1| 2|X|======|DONE|'
+# ORDER BY follows the set's CODEPAGE bytes, not the Unicode order of the
+# decoded text (promoted 2026-10-05: DOS866 'Ё' is F0, last; WIN1252 '€'
+# is 80, before every Latin-1 letter)
+both "2 ORDER BY each set's byte order" "SELECT ID FROM T ORDER BY D437, ID; SELECT ID FROM T ORDER BY K8, ID; SELECT ID FROM T ORDER BY W53, ID; SELECT ID FROM T ORDER BY TH, ID; SELECT ID FROM T ORDER BY D866 DESC, ID; SELECT ID FROM T ORDER BY I7, W55, ID;"
+both "2 ... through GROUP BY, DISTINCT and UNION" "SELECT K8, COUNT(*) FROM T GROUP BY K8 ORDER BY K8; SELECT DISTINCT D437 FROM T ORDER BY 1; SELECT K8 FROM T UNION SELECT D866 FROM T ORDER BY 1;"
+both "2 the older tabled sets where the orders part (WIN1252 €, WIN1250, WIN1251)" "CREATE TABLE OW (ID INT, W2 VARCHAR(4) CHARACTER SET WIN1252, W0 VARCHAR(4) CHARACTER SET WIN1250, W1 VARCHAR(4) CHARACTER SET WIN1251); COMMIT; INSERT INTO OW VALUES (1, '€', 'Š', 'Ё'); INSERT INTO OW VALUES (2, 'a', 'Ź', 'Я'); INSERT INTO OW VALUES (3, 'é', 'ą', 'а'); INSERT INTO OW VALUES (4, 'Ÿ', 'z', 'ђ'); SELECT ID FROM OW ORDER BY W2, ID; SELECT ID FROM OW ORDER BY W0, ID; SELECT ID FROM OW ORDER BY W1, ID; ROLLBACK;"
+# a RANGE compares the set's bytes too (promoted 2026-10-05: a KOI8R
+# column against 'М' - the column's set decides, a literal adopts it)
+both "2 ranges, BETWEEN, IN, MIN / MAX, CASE over a single-byte column" "SELECT ID FROM T WHERE K8 > 'М' ORDER BY ID; SELECT ID FROM T WHERE D866 BETWEEN 'А' AND 'я' ORDER BY ID; SELECT ID FROM T WHERE W53 IN ('Αβγ', 'abc') ORDER BY ID; SELECT MIN(D437), MAX(D437), MIN(K8), MAX(TH) FROM T; SELECT ID, CASE WHEN K8 < 'а' THEN 'lo' ELSE 'hi' END FROM T ORDER BY ID;"
+
+both "2 the other routers: a grouped MIN, a window, an ORDER BY expression, a LEFT JOIN key" "SELECT ID / 3, MIN(K8), MAX(D866) FROM T GROUP BY 1 ORDER BY 1; SELECT ID, ROW_NUMBER() OVER (ORDER BY K8, ID) FROM T ORDER BY ID; SELECT ID FROM T ORDER BY UPPER(D437), ID; SELECT ID FROM T ORDER BY K8 || '', ID; SELECT A.ID, B.ID FROM T A LEFT JOIN T B ON A.K8 < B.K8 AND B.ID = 2 ORDER BY 1, 2;"
+
+both "2 against a UTF8 side the COLUMN's bytes decide (a CAST, an _UTF8 literal, a UTF8 column)" "ALTER TABLE T ADD UU VARCHAR(8); COMMIT; UPDATE T SET UU = 'М'; SELECT ID FROM T WHERE K8 > UU ORDER BY ID; SELECT ID FROM T WHERE UU < K8 ORDER BY ID; SELECT ID FROM T WHERE K8 > CAST('М' AS VARCHAR(4) CHARACTER SET UTF8) ORDER BY ID; SELECT ID FROM T WHERE K8 > _UTF8 'М' ORDER BY ID; ROLLBACK;"
+# ...but a BOUND `?` compares in UNICODE order (measured: 'мИР' > 'М')
+if command -v node >/dev/null 2>&1 && node -e 'require("node-firebird")' 2>/dev/null; then
+    nq() { FC_PORT="$1" FC_DB="$2" timeout 30 node -e '
+      const F=require("node-firebird");
+      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,user:"SYSDBA",password:"masterkey",encoding:"UTF8"},(e,db)=>{
+        if(e){console.log("CONN_ERR");process.exit(1);}
+        db.query("SELECT ID FROM T WHERE K8 > ? ORDER BY ID",["М"],(e2,r)=>{console.log(e2?("ERR "+e2.message):JSON.stringify(r));db.detach();process.exit(0);});
+      });' 2>/dev/null; }
+    e=$(nq "$REAL" "$ENG"); c=$(nq "$PORT" "$FC")
+    if [ -z "$e" ] || [ "$e" = CONN_ERR ]; then ran=$((ran + 1)); echo "FAIL 2 the bound cell never ran"; fail=1
+    else check "2 a bound ? against a KOI8R column: Unicode order [$e]" "$e" "$c"; fi
+else
+    echo "SKIP 2 bound ?: node-firebird not resolvable"
+fi
 
 echo "--- 3 what the set cannot hold, and the other attachments"
 rec "3 RECORDED a character outside the set: the engine's 22018 at execute, a refusal at prepare here (every tabled set)" \
     "INSERT INTO T (ID, K8) VALUES (9, 'Ω'); ROLLBACK;" 'Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets|X|======|DONE|' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|X|======|DONE|'
 both "3 CAST into a set: the bytes, its case law, its 22018" "SELECT CAST('Çü' AS VARCHAR(3) CHARACTER SET DOS437) A, OCTET_LENGTH(CAST('Çü' AS VARCHAR(3) CHARACTER SET DOS437)) B, HEX_ENCODE(CAST(CAST('Жук' AS VARCHAR(3) CHARACTER SET KOI8R) AS VARCHAR(3) CHARACTER SET OCTETS)) C, UPPER(CAST('жук' AS VARCHAR(3) CHARACTER SET DOS866)) D FROM RDB\$DATABASE; SELECT CAST('Ω' AS VARCHAR(3) CHARACTER SET KOI8R) FROM RDB\$DATABASE;"
+both "3 a comparison against a character outside the set raises 22018 (=, >, IN, <>)" "SELECT COUNT(*) FROM T WHERE K8 = 'Ω'; SELECT COUNT(*) FROM T WHERE K8 > 'Ω'; SELECT COUNT(*) FROM T WHERE K8 IN ('Ω', 'Мир'); SELECT COUNT(*) FROM T WHERE K8 <> 'Ω';"
 both "3 the same rows under a WIN1251 attachment" "SELECT ID, D866, K8 FROM T ORDER BY ID;" WIN1251
 both "3 ... and under NONE (the stored bytes)" "SELECT ID, D437 FROM T WHERE ID = 3;" NONE
 
@@ -110,6 +134,6 @@ if grep -aq 'panicked at' "/tmp/fc-serve-cpg-$PORT.log"; then echo "FAIL the ser
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 16 on the 2026-10-05 binary, 16 OK
-if [ "$ran" -lt 16 ]; then echo "FAIL only $ran checks ran (floor 16) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 22 on the 2026-10-05 binary, 22 OK
+if [ "$ran" -lt 22 ]; then echo "FAIL only $ran checks ran (floor 22) - cells went missing"; fail=1; fi
 exit $fail

@@ -63862,11 +63862,35 @@ fn order_ttype_of(tt: u16) -> u16 {
         fire_crab_ods::coll::TTYPE_UTF8_UNICODE
     } else if coll_is_octets(tt) {
         fire_crab_ods::intl::CS_OCTETS as u16
+    } else if tt >> 8 == 0 && single_byte_order_cs(tt).is_some() {
+        // a TABLED single-byte set at its default collation orders by
+        // its CODEPAGE bytes, which part from the Unicode order of the
+        // decoded text (DOS866 'Ё' is F0, after 'а' E0; WIN1252 '€' is
+        // 80, before every Latin-1 letter) - measured on 2196
+        tt
     } else {
         // a charset's DEFAULT collation, and `UCS_BASIC` - both order
         // by the stored bytes, which is the plain value ordering
         0
     }
+}
+
+/// The tabled single-byte set an order key's ttype names, when its byte
+/// order is not already the Unicode order ([order_ttype_of]); ISO8859_1's
+/// is (its bytes ARE the first 256 code points).
+fn single_byte_order_cs(tt: u16) -> Option<u8> {
+    let cs = (tt & 0xFF) as u8;
+    (tt >> 8 == 0 && cs != fire_crab_ods::intl::CS_ISO8859_1 && fire_crab_ods::intl::tabled(cs)).then_some(cs)
+}
+
+/// Compare two text values by a single-byte set's CODEPAGE bytes, trailing
+/// blanks ignored as [value_cmp] ignores them; None when either does not
+/// encode (the caller keeps the plain order).
+fn single_byte_cmp(a: &Value, b: &Value, cs: u8) -> Option<std::cmp::Ordering> {
+    let (Value::Text(x), Value::Text(y)) = (a, b) else { return None };
+    let bx = fire_crab_ods::intl::encode_text(cs, x.trim_end_matches(' ')).ok().flatten()?;
+    let by = fire_crab_ods::intl::encode_text(cs, y.trim_end_matches(' ')).ok().flatten()?;
+    Some(bx.cmp(&by))
 }
 
 /// Stamp a GROUPED statement's ORDER BY keys with the collation of the
@@ -74539,6 +74563,9 @@ fn coll_value_cmp(a: &Value, b: &Value, ttype: u16) -> Option<std::cmp::Ordering
     if ttype == fire_crab_ods::coll::TTYPE_PXW_INTL {
         return collated_text_cmp(a, b);
     }
+    if let Some(cs) = single_byte_order_cs(ttype) {
+        return single_byte_cmp(a, b, cs);
+    }
     let st = fire_crab_ods::coll::icu_strength_of_ttype(ttype)?;
     icu_text_cmp(a, b, st)
 }
@@ -74588,6 +74615,8 @@ fn order_cmp(a: &[Value], b: &[Value], keys: &[OrderKey]) -> std::cmp::Ordering 
                 icu_text_cmp(va, vb, st).unwrap_or_else(|| value_cmp(va, vb))
             } else if coll_is_octets(key.coll) {
                 octets_value_cmp(va, vb)
+            } else if let Some(cs) = single_byte_order_cs(key.coll) {
+                single_byte_cmp(va, vb, cs).unwrap_or_else(|| value_cmp(va, vb))
             } else {
                 value_cmp(va, vb)
             };
@@ -105590,6 +105619,20 @@ impl Expr {
                         &fire_crab_ods::coll::icu_key(&s, st),
                     ))
                 }
+                // a tabled single-byte set at its default collation: the
+                // CODEPAGE bytes are the key ([single_byte_order_cs])
+                Value::Text(s) if single_byte_order_cs(*tt).is_some() => {
+                    let cs = single_byte_order_cs(*tt).unwrap_or(0);
+                    match fire_crab_ods::intl::encode_text(cs, &s) {
+                        Ok(Some(b)) => Value::Text(fire_crab_ods::intl::carrier_decode(&b)),
+                        // a value with no image in the set is moved INTO it
+                        // first by the engine, and raises there: 22018
+                        // (`D = <a UTF8 branch holding 'Ω'>` over a WIN1252
+                        // D - csfn 9b, measured)
+                        Err(_) => return Err(EvalErr::TransliterationFailed),
+                        Ok(None) => Value::Text(s),
+                    }
+                }
                 Value::Text(s) => {
                     match fire_crab_ods::intl::encode_text(
                         fire_crab_ods::intl::CS_WIN1252,
@@ -116518,6 +116561,13 @@ fn parse_order_by_expr(
                             .filter(|t| fire_crab_ods::coll::icu_strength_of_ttype(*t).is_some())
                             .unwrap_or(0),
                     };
+                } else if !expr_is_nontext(e, descs) {
+                    // a text RESULT in a tabled single-byte set sorts by
+                    // that set's bytes, as its column does (`ORDER BY
+                    // UPPER(D437)`, `ORDER BY K8 || ''` - measured)
+                    if let Some(tt) = expr_text_ttype(e, descs).filter(|t| single_byte_order_cs(*t).is_some()) {
+                        k.coll = tt;
+                    }
                 }
             }
         }
@@ -131618,7 +131668,9 @@ fn split_qualified_parts(s: &str, max: usize) -> Option<Vec<String>> {
 fn agg_field_src(fid: usize, descs: &[Descriptor]) -> AggSrc {
     let d = descs.get(fid);
     match d.and_then(coll_key_ttype) {
-        Some(tt) if fire_crab_ods::intl::collation_id(tt as i16) != 0 => {
+        // ...and a tabled single-byte set, whose MIN / MAX are its
+        // codepage-byte order ([single_byte_order_cs])
+        Some(tt) if fire_crab_ods::intl::collation_id(tt as i16) != 0 || single_byte_order_cs(tt).is_some() => {
             AggSrc::CollField(fid, tt)
         }
         // a UTF8 column under its default collation carries its ttype
@@ -131814,6 +131866,9 @@ fn coll_key_ttype(d: &Descriptor) -> Option<u16> {
     let tt = d.sub_type as u16;
     if tt == fire_crab_ods::coll::TTYPE_PXW_INTL
         || fire_crab_ods::coll::icu_strength_of_ttype(tt).is_some()
+        // a tabled single-byte set's comparisons run over its codepage
+        // bytes (`K8 > 'М'` is a KOI8R byte compare on the engine)
+        || single_byte_order_cs(tt).is_some()
     {
         Some(tt)
     } else {
@@ -135752,8 +135807,14 @@ fn param_or_typed_term(
             // collation like a literal does: the ExprParam's lhs is
             // already the CollKey wrap, and the BIND arm wraps the
             // arriving text value to match ([Term::ExprParam])
-            if let Some(tt) =
-                coll_key_ttype(d).filter(|_| matches!(kind, ColKind::Text))
+            // ...but NOT a tabled single-byte set's byte order: a bound
+            // `?` against a KOI8R column compares in UNICODE order on the
+            // engine (`K8 > ?` bound 'М' takes 'мИР' - measured on 2196),
+            // where the same text as a literal, an `_UTF8` literal, a CAST
+            // or a UTF8 column compares the column's bytes
+            if let Some(tt) = coll_key_ttype(d)
+                .filter(|_| matches!(kind, ColKind::Text))
+                .filter(|t| single_byte_order_cs(*t).is_none())
             {
                 return Some(Term::ExprParam(
                     Box::new(Expr::CollKey(Box::new(Expr::Col(idx)), tt)),

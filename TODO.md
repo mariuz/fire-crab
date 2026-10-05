@@ -142,9 +142,9 @@ Short, actionable items. The long-form engineering backlog lives in
       `qa/serve-real-codepages.sh`; a column of DOS437 / WIN1253 / KOI8R / TIS620 .. stored UTF-8 bytes before.
 - [ ] Engine-side nondeterminism seen once in sweep 72: cmpparam's `ID IN (SELECT b.ID .. b.ID IN (?, 3))` bound '0X2'
       answered 2;3 on the ENGINE (3 every other time, 3 alone and in a direct probe). Watch it.
-- [ ] ORDER BY and range comparisons over a single-byte set follow Unicode order here, the set's BYTE order on the
-      engine (DOS866 'Ё' is F0 - last there, first here). The same for every tabled set; WIN125x included wherever the
-      two orders part (recorded in codepages section 2). GROUP BY / DISTINCT / MIN / MAX / index bounds to check too.
+- [x] ORDER BY, ranges, BETWEEN, IN, MIN / MAX, CASE and expression keys over a single-byte set follow its BYTE order
+      (codepages section 2; WIN1252 '€' and the other older tabled sets included). A bound `?` against such a column
+      compares in UNICODE order on the engine - kept on the plain path (measured).
 - [ ] A byte the codepage leaves undefined decodes to U+0000 on the engine (measured for every set); the older
       WIN1250 / WIN1251 / WIN1252 tables here pass it through as its own code point.
 - [x] CREATE INDEX .. COMPUTED BY (..) and CREATE INDEX .. WHERE through this server (`qa/serve-real-exprindexddl.sh`;
