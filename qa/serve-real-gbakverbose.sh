@@ -82,7 +82,11 @@ kill -0 $srv 2>/dev/null || { echo "FAIL fcwire is not running - port $PORT in u
 check() { # <label> <got> <want>
     ran=$((ran + 1))
     if [ "$2" = "$3" ]; then echo "OK   $1"
-    else echo "DIFF $1"; echo "     want: $(printf '%s' "$3" | head -c 400)"; echo "     got:  $(printf '%s' "$2" | head -c 400)"; fail=1; fi
+    else echo "DIFF $1"
+        # the LINES that differ, not the first 400 bytes of each - two
+        # streams that agree for 400 bytes printed as identical
+        diff <(printf '%s\n' "$3") <(printf '%s\n' "$2") | head -20 | sed 's/^/     /'
+        fail=1; fi
 }
 EMGR="localhost:service_mgr"
 FMGR="127.0.0.1/$PORT:service_mgr"

@@ -131,8 +131,8 @@ Short, actionable items. The long-form engineering backlog lives in
 - [ ] samples/nodejs/psql.js: an exception raised in a procedure lacks the engine's `At procedure "PUBLIC"."HIRE" line:
       4, col: 29` context line.
 - [ ] serve-real-gbakverbose.sh went red in sweeps 65 and 66 on "the restore streams are byte-equal" and passes
-      alone (3/3) and under synthetic load (8/8, on this binary and d92cb5c's). Its DIFF prints only 400 bytes of each
-      stream, so the differing record is not visible - widen the printout before the next sweep that trips it.
+      alone (3/3) and under synthetic load (8/8, on this binary and d92cb5c's). Its DIFF now prints the differing lines
+      (it printed 400 bytes of each stream, which hid them) - read them the next time it trips.
 - [ ] samples/nodejs/types.js: a DECFLOAT column fetches through node here and does not on the engine (`-804 SQLDA
       missing or incorrect version`) - a describe difference to measure.
 - [ ] CURRENT_TRANSACTION / TRANSACTION_ID: a transaction has no id here before its first write (the engine's has one
