@@ -43,6 +43,11 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       not of its column's kind. selparam / view / viewjoin / textnumwhere / cmpparam green under the switch.
       Slice 4: SYSTEM relations (exe read only RDB$FORMATS, which never holds a system relation's format - the
       built-in table now), and a VIRTUAL or GLOBAL TEMPORARY relation declines (no records in the file).
+      Slice 5: DOUBLE / FLOAT (dsql's blr_double / blr_float descriptors, byte-identical procedure BLR; exe compares
+      them as doubles - a FLOAT beside a FLOAT or an exact value in SINGLE precision, the engine's rule - and SUM / AVG
+      fold them as doubles; a NaN, arithmetic and CAST over them still fail the run). Found: exe's SUM / AVG SKIPPED a
+      non-exact operand (`HAVING SUM(D) > 1` answered no rows under the switch) and the window SUM would skip a scaled
+      one - both now fail the run instead.
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a
@@ -57,6 +62,9 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
 - [x] **P2** WRONG ANSWER: the virtual RDB$TIME_ZONES / RDB$KEYWORDS answered NO ROWS (the zone list lacked America/Coyhaique
       too), and a subquery over any computed relation - MON$ included - walked its empty storage (`qa/serve-real-virtualrel.sh`).
       RDB$CONFIG (this host's firebird.conf, 70 rows) still answers none - recorded.
+- [x] **P2** An expression over a selectable procedure's outputs with no clause (`SELECT CHAR_LENGTH(R), K * 2 FROM P`)
+      was refused - the bare call's picker took only plain columns (`qa/serve-real-procexpr.sh`). A non-ASCII literal
+      in a procedure body made under a NONE attachment is still "PSQL this server does not interpret".
 - [ ] **P2** DECFLOAT left: GROUP BY a DECFLOAT expression (NaN / cohort laws). (Done: CREATE PROCEDURE / FUNCTION with a DECFLOAT parameter; `SET DECFLOAT ROUND` - all eight modes, dftraps 7)
 - [x] **P2** DECFLOAT traps, specials, signed zero, the four DECFLOAT functions (`e07317d`); DECFLOAT in PSQL (`7fdb054`)
 - [ ] **P2** Optimizer gaps (merge join, RIGHT/FULL in a chain, HAVING plans, `SET PLAN`)

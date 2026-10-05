@@ -155,6 +155,8 @@ mod blr {
     pub const DT_SQL_DATE: u8 = 12;
     pub const DT_SQL_TIME: u8 = 13;
     pub const DT_TIMESTAMP: u8 = 35;
+    pub const DT_DOUBLE: u8 = 27;
+    pub const DT_FLOAT: u8 = 10;
 }
 
 /// One slot of a message: its BLR dtype and, for text, the declared
@@ -537,6 +539,8 @@ impl<'a> P<'a> {
             blr::DT_SQL_DATE | blr::DT_SQL_TIME | blr::DT_TIMESTAMP => {
                 MsgSlot { dtype, length: 0, scale: 0, ttype: 0 }
             }
+            // ...and so do the approximate ones (slice 5)
+            blr::DT_DOUBLE | blr::DT_FLOAT => MsgSlot { dtype, length: 0, scale: 0, ttype: 0 },
             other => return Err(format!("message dtype {} unconverted", other)),
         })
     }
@@ -1388,6 +1392,7 @@ fn exe_numeric_bin(r1: i128, s1: i8, verb: u8, r2: i128, s2: i8) -> Result<(i128
 /// a single-byte width - multibyte CHAR padding in a nested call is a
 /// recorded boundary).
 fn coerce_arg(v: Value, slot: &MsgSlot) -> Result<Value, String> {
+    let v = coerce_approx(v, Some(slot))?;
     let v = coerce_num(v, Some(slot))?;
     if let Value::Text(t) = &v {
         let declared = slot.length as usize;
@@ -1472,6 +1477,39 @@ fn coerce_temporal(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
         Ok(v)
     } else {
         Err("temporal assignment outside this executor".into())
+    }
+}
+
+/// An assignment touching the APPROXIMATE kinds: into a DOUBLE / FLOAT
+/// slot an exact value moves as its correctly rounded double (one IEEE
+/// division of exactly-held operands - outside 53 bits or 22 digits it is
+/// unconverted) and a FLOAT / DOUBLE widens or narrows; an approximate
+/// value into an EXACT slot rounds by the engine's own rules, which this
+/// executor does not make - both of those, and text, fail the run so the
+/// source interpreter answers.
+fn coerce_approx(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
+    let Some(dt) = slot.map(|s| s.dtype) else { return Ok(v) };
+    let to_f64 = |v: &Value| -> Option<f64> {
+        match v {
+            Value::Double(d) => Some(*d),
+            Value::Float(x) => Some(*x as f64),
+            _ => {
+                let (r, s) = num_parts(v)?;
+                if r.unsigned_abs() >= 1u128 << 53 || s > 0 || s < -22 {
+                    return None;
+                }
+                Some(r as f64 / 10f64.powi(-(s as i32)))
+            }
+        }
+    };
+    match (dt, &v) {
+        (_, Value::Null) => Ok(v),
+        (blr::DT_DOUBLE, _) => to_f64(&v).map(Value::Double).ok_or_else(|| "assignment into a DOUBLE unconverted".into()),
+        (blr::DT_FLOAT, _) => to_f64(&v).map(|x| Value::Float(x as f32)).ok_or_else(|| "assignment into a FLOAT unconverted".into()),
+        (blr::DT_SHORT | blr::DT_LONG | blr::DT_INT64 | blr::DT_INT128, Value::Double(_) | Value::Float(_)) => {
+            Err("an approximate value into an exact slot unconverted".into())
+        }
+        _ => Ok(v),
     }
 }
 
@@ -1861,6 +1899,7 @@ impl<'a> Exec<'a> {
                         .and_then(|slots| slots.get(*i as usize))
                         .cloned(),
                 };
+                let v = coerce_approx(v, tslot.as_ref())?;
                 let v = coerce_num(v, tslot.as_ref())?;
                 let v = coerce_text(v, tslot.as_ref())?;
                 let v = coerce_temporal(v, tslot.as_ref())?;
@@ -2934,6 +2973,10 @@ impl<'a> Exec<'a> {
             // 2350000.00, and a fold that only took integers gave NULL)
             Sum(Option<(i128, i8)>),
             Avg(Option<(i128, i8, i64)>),
+            // an APPROXIMATE operand folds as a double: SUM and AVG of a
+            // FLOAT or DOUBLE are DOUBLE PRECISION, summed in scan order
+            SumD(f64),
+            AvgD(f64, i64),
             Min(Option<Value>),
             Max(Option<Value>),
             Pass(Value),
@@ -2990,10 +3033,32 @@ impl<'a> Exec<'a> {
                             *n += 1;
                         }
                     }
+                    // SUM / AVG take an exact operand at its scale and an
+                    // approximate one as a double; any OTHER non-NULL
+                    // operand fails the run - skipping it answered a NULL
+                    // SUM (`HAVING SUM(D) > 1` lost every group)
+                    (fold @ Fold::Sum(None), _, Some(Value::Double(d))) => *fold = Fold::SumD(d),
+                    (fold @ Fold::Sum(None), _, Some(Value::Float(x))) => *fold = Fold::SumD(x as f64),
+                    (fold @ Fold::Avg(None), _, Some(Value::Double(d))) => *fold = Fold::AvgD(d, 1),
+                    (fold @ Fold::Avg(None), _, Some(Value::Float(x))) => *fold = Fold::AvgD(x as f64, 1),
+                    (Fold::SumD(acc), _, Some(v)) => match v {
+                        Value::Null => {}
+                        Value::Double(d) => *acc += d,
+                        Value::Float(x) => *acc += x as f64,
+                        _ => return Err("SUM over mixed operands unconverted".into()),
+                    },
+                    (Fold::AvgD(acc, c), _, Some(v)) => match v {
+                        Value::Null => {}
+                        Value::Double(d) => { *acc += d; *c += 1 }
+                        Value::Float(x) => { *acc += x as f64; *c += 1 }
+                        _ => return Err("AVG over mixed operands unconverted".into()),
+                    },
                     (Fold::Sum(acc), _, Some(v)) => {
                         if let Some((raw, sc)) = num_parts(&v) {
                             let (a, s) = acc.unwrap_or((0, sc));
                             *acc = Some(exe_numeric_bin(a, s, blr::ADD, raw, sc)?);
+                        } else if !matches!(v, Value::Null) {
+                            return Err("SUM over a non-exact operand unconverted".into());
                         }
                     }
                     (Fold::Avg(acc), _, Some(v)) => {
@@ -3001,6 +3066,8 @@ impl<'a> Exec<'a> {
                             let (a, s, c) = acc.unwrap_or((0, sc, 0));
                             let (r, s2) = exe_numeric_bin(a, s, blr::ADD, raw, sc)?;
                             *acc = Some((r, s2, c + 1));
+                        } else if !matches!(v, Value::Null) {
+                            return Err("AVG over a non-exact operand unconverted".into());
                         }
                     }
                     (Fold::Min(acc), _, Some(v)) => {
@@ -3065,6 +3132,8 @@ impl<'a> Exec<'a> {
                     // of their negatives -1.01; AVG(budget) under head
                     // department 000 is 1166666.66)
                     Fold::Avg(v) => v.map(|(r, s, c)| mk_num(r / c as i128, s)).unwrap_or(Value::Null),
+                    Fold::SumD(x) => Value::Double(x),
+                    Fold::AvgD(x, c) => Value::Double(x / c as f64),
                     Fold::Min(v) | Fold::Max(v) => v.unwrap_or(Value::Null),
                     Fold::Pass(v) => v,
                 };
@@ -3621,6 +3690,10 @@ fn window_fold(verb: u8, ops: &[Option<Value>]) -> Result<Value, String> {
                     if let Some(x) = int_of(v) {
                         sum += x;
                         n += 1;
+                    } else if !matches!(v, Value::Null) {
+                        // a scaled or approximate operand: unconverted here,
+                        // never skipped (that answered a wrong total)
+                        return Err("window SUM / AVG over a non-integer unconverted".into());
                     }
                 }
             }
@@ -3901,6 +3974,44 @@ pub fn value_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Date(x), Date(y)) => Some(x.cmp(y)),
         (Time(x), Time(y)) => Some(x.cmp(y)),
         (Timestamp(xd, xt), Timestamp(yd, yt)) => Some((xd, xt).cmp(&(yd, yt))),
+        // AN APPROXIMATE OPERAND compares as a DOUBLE, an exact one
+        // converted to it (the engine's rule for a mixed comparison); a NaN
+        // has orders of its own (the primary-operand law, totalOrder in a
+        // sort) that this executor does not model - it fails the run
+        (Double(_) | Float(_), _) | (_, Double(_) | Float(_)) => {
+            // an exact value as its CORRECTLY ROUNDED double: one IEEE
+            // division of two exactly-held operands is, while the raw fits
+            // 53 bits and the scale 22 digits - outside that, unconverted
+            let f = |v: &Value| -> Option<f64> {
+                match v {
+                    Double(d) => Some(*d),
+                    Float(x) => Some(*x as f64),
+                    _ => {
+                        let (r, s) = num(v)?;
+                        if r.unsigned_abs() >= 1u128 << 53 || s > 0 || s < -22 {
+                            return None;
+                        }
+                        Some(r as f64 / 10f64.powi(-(s as i32)))
+                    }
+                }
+            };
+            // A FLOAT BESIDE A FLOAT OR AN EXACT VALUE compares in SINGLE
+            // precision, the exact side rounded through its double (the
+            // engine's, and the interpreter's single_cmp_f32: a FLOAT 0.1
+            // is NOT > 0.1); a DOUBLE on either side makes it double
+            let single = !matches!(a, Double(_)) && !matches!(b, Double(_));
+            let (fa, fb) = match (f(a), f(b)) {
+                (Some(x), Some(y)) if single => (Some(x as f32 as f64), Some(y as f32 as f64)),
+                other => other,
+            };
+            match (fa, fb) {
+                (Some(x), Some(y)) if !x.is_nan() && !y.is_nan() => x.partial_cmp(&y),
+                _ => {
+                    INCOMPARABLE.with(|f| f.set(true));
+                    None
+                }
+            }
+        }
         _ => {
             let (Some((ar, asc)), Some((br, bsc))) = (num(a), num(b)) else {
                 INCOMPARABLE.with(|f| f.set(true));

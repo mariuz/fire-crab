@@ -526,6 +526,9 @@ enum Dsc {
     Date,
     Time,
     Timestamp,
+    /// blr_double (27) / blr_float (10): the dtype byte alone
+    Double,
+    Float,
 }
 
 /// Every character set the engine carries: (name or alias, RDB$CHARACTER_SET_ID),
@@ -746,6 +749,8 @@ fn emit_dsc(out: &mut Vec<u8>, d: Dsc) {
         Dsc::Date => out.push(blr::DATE),
         Dsc::Time => out.push(blr::TIME),
         Dsc::Timestamp => out.push(blr::TIMESTAMP),
+        Dsc::Double => out.push(27),
+        Dsc::Float => out.push(10),
     }
 }
 
@@ -2910,6 +2915,20 @@ impl<'a> P<'a> {
             "DATE" => Dsc::Date,
             "TIME" => Dsc::Time,
             "TIMESTAMP" => Dsc::Timestamp,
+            "DOUBLE" => {
+                if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "PRECISION") {
+                    return None;
+                }
+                self.i += 1;
+                Dsc::Double
+            }
+            // a bare FLOAT / REAL is the 4-byte single; FLOAT(p) unprobed
+            "FLOAT" | "REAL" => {
+                if matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                    return None;
+                }
+                Dsc::Float
+            }
             // DECFLOAT(16) / DECFLOAT(34); a bare DECFLOAT is 34
             "DECFLOAT" => match paren_num(self) {
                 None => Dsc::Dec128,
@@ -10507,6 +10526,8 @@ impl TypeSpec {
             12 => Dsc::Date,
             13 => Dsc::Time,
             35 => Dsc::Timestamp,
+            27 => Dsc::Double,
+            10 => Dsc::Float,
             t => Dsc::Num(t, self.scale),
         }
     }
@@ -10930,6 +10951,8 @@ fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
         Dsc::Date => (12, 4, 0),
         Dsc::Time => (13, 4, 0),
         Dsc::Timestamp => (35, 8, 0),
+        Dsc::Double => (27, 8, 0),
+        Dsc::Float => (10, 4, 0),
     };
     ProcParamMeta {
         name: name.to_string(),
@@ -13697,7 +13720,6 @@ mod tests {
             // single-argument COALESCE is a syntax error IN THE ENGINE
             "SELECT ID FROM T WHERE COALESCE(A) = 5",
             // unprobed cast targets and unprobed unifications
-            "SELECT ID FROM T WHERE CAST(A AS FLOAT) = 1",
             "SELECT ID FROM T WHERE CAST(A AS NUMERIC(30)) = 1",
             "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN NULL ELSE NULL END IS NULL",
             "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN 'x' ELSE 0 END = 'x'",
@@ -13729,6 +13751,13 @@ mod tests {
         ] {
             assert!(compile_view_select(sql).is_none(), "{sql} was compiled");
         }
+        // a CAST to the approximate kinds is the dtype byte alone -
+        // blr_float 10, blr_double 27 (measured: a view over CAST(A AS
+        // FLOAT) / REAL / DOUBLE PRECISION stores the engine's bytes)
+        let f = compile_view_select("SELECT ID FROM T WHERE CAST(A AS FLOAT) = 1").expect("FLOAT cast");
+        assert!(f.windows(2).any(|w| w == [blr::CAST, 10]), "{f:02X?}");
+        let d = compile_view_select("SELECT ID FROM T WHERE CAST(A AS DOUBLE PRECISION) = 1").expect("DOUBLE cast");
+        assert!(d.windows(2).any(|w| w == [blr::CAST, 27]), "{d:02X?}");
         // double negation cancels
         assert_eq!(
             compile_view_select("SELECT ID FROM T WHERE NOT (NOT (A > 5))"),

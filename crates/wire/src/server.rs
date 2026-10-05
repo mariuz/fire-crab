@@ -68223,9 +68223,14 @@ fn plan_query_inner_at_body(
                     // picker below, which refuses a `SelItem::Agg` -
                     // measured, the engine answers 5, and the GROUPED
                     // form was already agreeing because it has a clause.
+                    // ...and so is ANY item that is not a plain output
+                    // column: the picker below takes only columns, and it
+                    // refused `SELECT CHAR_LENGTH(R), K * 2 FROM P` while
+                    // the same projection under a WHERE - routed here -
+                    // answered (measured: the engine answers both)
                     let proj_agg = matches!(
                         parse_projection(split_query(sql)?.0),
-                        Some(Proj::Items(v)) if v.iter().any(|i| matches!(i, SelItem::Agg(..)))
+                        Some(Proj::Items(v)) if v.iter().any(|i| !matches!(i, SelItem::Col(..)))
                     );
                     if w_s.is_some() || g_s.is_some() || h_s.is_some() || o_s.is_some() || proj_agg
                     {
@@ -130370,6 +130375,11 @@ fn exe_select(
             570 => "DATE".to_string(),
             560 => "TIME".to_string(),
             510 => "TIMESTAMP".to_string(),
+            // the approximate kinds (slice 5): the executor compares and
+            // folds them as doubles; its arithmetic and CAST over them
+            // still fail the run
+            480 => "DOUBLE PRECISION".to_string(),
+            482 => "FLOAT".to_string(),
             // A TEXT OUTPUT IN ITS OWN SET: a plain column's ttype (the
             // length in bytes), or an expression's real-set sentinel (the
             // length in characters); the attachment's set ([ATT_SUBTYPE])
@@ -130559,6 +130569,7 @@ fn exe_select(
             (_, Value::Null) => true,
             (500 | 496 | 580, Value::Int(_) | Value::Scaled(..)) => true,
             (570, Value::Date(_)) | (560, Value::Time(_)) | (510, Value::Timestamp(..)) => true,
+            (480, Value::Double(_)) | (482, Value::Float(_)) => true,
             (448 | 452, Value::Text(_)) => true,
             _ => false,
         }
