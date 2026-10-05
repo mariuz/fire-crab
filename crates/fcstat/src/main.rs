@@ -469,6 +469,19 @@ fn indexes(data: &[u8], relation: u16) {
                 "  index {}: root page {}, {} key(s), state {}, flags {:#x}",
                 e.id, e.root_page, e.key_count, e.state, e.flags
             );
+            // each segment's field and KEY TYPE (itype) - what the engine
+            // derives a key's encoding from, so two files that differ here
+            // key the same values differently
+            if let Some((segs, _)) = fire_crab_ods::btw::index_segments(
+                &image,
+                h.page_size as usize,
+                relation,
+                e.id,
+                e.key_count.max(1) as usize,
+            ) {
+                let shown: Vec<String> = segs.iter().map(|(f, t)| format!("field {} itype {}", f, t)).collect();
+                println!("    segments: {}", shown.join(", "));
+            }
         }
     }
 }

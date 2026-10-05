@@ -9235,7 +9235,32 @@ fn index_itype(d: &Descriptor) -> Option<u16> {
         // and an FK child 'KEY' finds its parent 'Key'; the byte index
         // here stored both and refused the child. Refused, not guessed.
         dtype::TEXT | dtype::VARYING if crate::intl::collation_id(d.sub_type) != 0 => return None,
-        dtype::TEXT | dtype::VARYING => btw::IDX_STRING,
+        // the TEXT key type is the column's SET (DFW_assign_index_type,
+        // measured on 2196 off the engine's own index roots): UTF8 - the
+        // metadata set - is idx_metadata (4), a tabled single-byte set at
+        // its default collation idx_offset_intl + ttype (WIN1252 32884,
+        // ISO8859_1 32852, DOS437 32841), NONE and ASCII idx_string (1).
+        // OCTETS (idx_byte_array, 3) and UNICODE_FSS (32834) have no key
+        // builder here and keep idx_string - recorded (TODO).
+        dtype::TEXT | dtype::VARYING => {
+            let cs = crate::intl::charset_id(d.sub_type);
+            if cs == crate::intl::CS_UTF8 {
+                btw::IDX_METADATA
+            } else if crate::intl::tabled(cs) {
+                btw::IDX_OFFSET_INTL + cs as u16
+            } else if cs <= 3 {
+                // NONE, OCTETS, ASCII: carrier bytes; UNICODE_FSS: its
+                // bytes are UTF-8's
+                btw::IDX_STRING
+            } else {
+                // A SET WITH NO CODEPAGE TABLE HERE (DOS437 and kin) has
+                // no key this writer can build: its text would key as
+                // UTF-8 bytes, and the ENGINE reading the tree then
+                // misorders and misses rows (measured: 'ü' under DOS437).
+                // Refused, not guessed.
+                return None;
+            }
+        }
         dtype::SQL_DATE => 5,  // idx_sql_date
         dtype::SQL_TIME => 6,  // idx_sql_time
         dtype::TIMESTAMP => 7, // idx_timestamp

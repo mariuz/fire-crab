@@ -133,9 +133,12 @@ Short, actionable items. The long-form engineering backlog lives in
 - [x] A table carrying an EXPRESSION or PARTIAL index (engine-made) was read-only here; its writes now maintain both
       from the catalog sources, and the engine reads this server's file through them identically with gfix clean
       (`qa/serve-real-exprindex.sh`). Still refused: a UNIQUE expression index; an expression over a collated column.
-- [ ] A plain CREATE INDEX on a text column stamps itype 1 (IDX_STRING) for every set; the engine stamps 4 for UTF8,
-      IDX_OFFSET_INTL + ttype for a tabled set (WIN1252: 32884) and 3 for OCTETS (ASCII and NONE agree at 1). Measured
-      on 2196 by reading both files' index roots. Each side keys consistently with its own stamp, but the files differ.
+- [x] A text index's key type is the column's set (`qa/serve-real-textitype.sh`): UTF8 4, a tabled single-byte set
+      IDX_OFFSET_INTL + ttype, NONE/ASCII 1 - this server stamped 1 for every set, and the ENGINE then misread its
+      WIN1252 / ISO8859_1 indexes (wrong rows). An index on a set with no codepage table (DOS437 ..) is refused now.
+- [ ] Still differs: OCTETS (engine idx_byte_array 3) and UNICODE_FSS (engine 32834) keep idx_string here.
+- [ ] Non-ASCII text stored into a column of an untabled single-byte set (DOS437 ..) is written as UTF-8 bytes: the
+      engine orders the rows differently (measured with 'ü').
 - [x] CREATE INDEX .. COMPUTED BY (..) and CREATE INDEX .. WHERE through this server (`qa/serve-real-exprindexddl.sh`;
       expression and condition BLR byte-identical, the engine reads the file through them, gfix clean). dsql compiles
       EXTRACT now. samples/nodejs/indexes.js runs; only its PLAN text differs (the plan request is unanswered).
