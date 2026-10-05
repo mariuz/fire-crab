@@ -4,6 +4,67 @@
 `docs/roadmap-history.md` (frozen 2026-08-20) and in the commit and gate
 named beside it.*
 
+## HIGH PRIORITY — the plan to a full conversion (2026-10-05)
+
+Every subsystem has a first slice; what stands between fire-crab and a full
+replacement of the C++ engine is below, in priority order. Full text:
+[`docs/full-conversion-plan.md`](full-conversion-plan.md) ([shared doc](https://claude.ai/code/artifact/b21b5433-02ee-42ef-9918-c9d8177a2d5e)). Baseline: `master` at `ea24856`.
+
+**Phase 0 — stop depending on the C++ engine**
+1. Create databases natively: `create_database_file` still runs the C++
+   `isql` (`crates/wire/src/server.rs` ~6116, `$FC_ISQL`).
+2. Choose one reference engine build; re-measure the backlog (it is stale).
+
+**Phase 1 — architecture (largest risk; do first)**
+3. Move SQL execution out of `wire`: `server.rs` is 163k lines (67% of the
+   Rust) and calls `dsql` 44×, `exe` 12×, `opt` 4×. Target: `dsql` compiles
+   every statement to BLR, `opt` plans it, `exe` runs the record sources,
+   `wire` is protocol only. One statement family at a time, gated both ways.
+4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
+   conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
+   shared across processes (Classic/SuperClassic).
+5. Page cache eviction under memory pressure.
+6. Background and cooperative GC (today only `gfix -sweep`).
+
+**Phase 2 — depth in existing subsystems** (wrong answers before refusals)
+7. SQL: FLOAT / ROUND / DECFLOAT-exponent / bind-error wrong answers; redo the
+   dropped rounds 6–8 (DECFLOAT built-ins, `SET DECFLOAT`, `WHERE CURRENT OF`,
+   multi-column `UNION`, CTE shapes, multi-clause `ALTER TABLE`, store
+   conversions, text-to-DOUBLE); `OVERLAY`, `BIT_LENGTH`, `ASCII_CHAR`,
+   `CAST AS BOOLEAN`; GROUP BY/windows with FIRST/SKIP; impure calls in DML;
+   `NEXT VALUE FOR` in PSQL; `RDB$DEBUG_INFO`.
+8. Optimizer: `cheaperThan`, merge join, RIGHT/FULL inside a chain without
+   RAM, descending compound index scans, HAVING plans, `SET PLAN`.
+9. Refused DDL: USER (and `SEC$`, gsec), SHADOW, `ALTER DATABASE`, SCHEMA,
+   PUBLICATION, EXTERNAL CONNECTIONS POOL, role system privileges, LOCAL
+   TEMPORARY TABLE.
+10. Charsets/blobs: undefined codepage bytes, `UCS_BASIC`, `isc_bpb`
+    transliteration, blob filters, arrays.
+11. Services: REPAIR, VALIDATE, PROPERTIES, user actions, `GET_FB_LOG`,
+    per-action SPB grammar, gstat data/index/record-version analysis.
+12. MON$: `MON$IO_STATS`, system attachments.
+13. Auth: identity mapping, `op_cont_auth`, `Legacy_UserManager`, Legacy_Auth?
+
+**Phase 3 — subsystems that don't exist yet**
+14. System packages (`RDB$BLOB_UTIL`, `RDB$TIME_ZONE_UTIL`, `RDB$PROFILER`)
+15. Batch / bulk insert API
+16. `EXECUTE STATEMENT ON EXTERNAL` (`jrd/extds`)
+17. UDR, external engines, plugin loading
+18. Trace and audit (`jrd/trace`, ntrace)
+19. Database encryption (CryptoManager)
+20. Replication (`jrd/replication`)
+21. Platform: `winnt.cpp`, XNET, raw devices, O_DIRECT
+22. External tables
+
+**Phase 4 — client side and tools**
+23. A Rust fbclient (`yvalve` + `remote/client`): ISC and OO APIs, C ABI,
+    provider dispatcher.
+24. Standalone isql, gbak, gfix, gsec, nbackup.
+25. gpre and qli: decide explicitly whether they are out of scope.
+
+**Order:** 0 → 3 → 4 → 7–9 (plus the parts of 10–13 applications hit) →
+14–16 → 23–24 → 17–22.
+
 fire-crab, 2026-08-20: a Rust conversion of the Firebird 6 engine —
 123k lines across 14 crates (`ods` 22.7k, `dsql` 12k, `burp` 5.1k,
 `exe`, `opt`, `lck`, `svc`, `auth`, `cch`, `pio`, `blb`, `evt`,

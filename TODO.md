@@ -3,6 +3,23 @@
 Short, actionable items. The long-form engineering backlog lives in
 [`docs/roadmap.md`](docs/roadmap.md).
 
+## HIGH PRIORITY: full conversion (2026-10-05)
+
+The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
+[`docs/full-conversion-plan.md`](docs/full-conversion-plan.md) ([shared doc](https://claude.ai/code/artifact/b21b5433-02ee-42ef-9918-c9d8177a2d5e)).
+
+- [ ] **P0** Create databases natively; stop calling the C++ `isql` (`server.rs` ~6116)
+- [ ] **P0** Pick the reference engine build; re-measure the stale backlog
+- [ ] **P1** Move SQL execution out of `wire::server` into `dsql` → `opt` → `exe`, one statement family at a time
+- [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
+- [ ] **P1** Page cache eviction; background/cooperative GC
+- [ ] **P2** Redo the dropped rounds 6–8 SQL work; the FLOAT/ROUND/DECFLOAT wrong answers first
+- [ ] **P2** Optimizer gaps (merge join, RIGHT/FULL in a chain, HAVING plans, `SET PLAN`)
+- [ ] **P2** Refused DDL (USER, SHADOW, ALTER DATABASE, SCHEMA, PUBLICATION, LTT, ...)
+- [ ] **P2** Charsets/blobs, services actions, MON$ coverage, auth gaps
+- [ ] **P3** System packages, batch API, `ON EXTERNAL`, UDR/plugins, trace, encryption, replication, Windows/XNET, external tables
+- [ ] **P4** Rust fbclient (yvalve + remote client); standalone isql/gbak/gfix/gsec/nbackup; decide on gpre/qli
+
 ## Upstream reports to file
 
 - [x] **Report to Firebird: semi-join `IN` / `EXISTS` loses a `0` match behind a `NULL`** (found 2026-10-03). **REPORTED 2026-10-03** on the existing issue [#9158](https://github.com/FirebirdSQL/firebird/issues/9158) (same SEMI-join defect, there via UUID hash collisions) rather than as a duplicate: <https://github.com/FirebirdSQL/firebird/issues/9158#issuecomment-5965771034>
