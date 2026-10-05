@@ -20,8 +20,9 @@
 #
 # RECORDED, not fixed: the engine STREAMS an outer row the gates turned
 # away before the raise (row 1, then 22018) where this server raises
-# first; and a SUBQUERY's inner key (EXISTS / IN / a scalar subselect over
-# the indexed E) - the subquery fold has no error channel yet.
+# first. A SUBQUERY's inner key (EXISTS / IN / ANY / a scalar subselect)
+# answered from the rows here too: the relation reading now declines and
+# the per-row route, which plans the body with its keys, raises.
 #
 #   qa/serve-real-joinkeyraise.sh [port]
 set -u
@@ -132,12 +133,21 @@ both "5 an UNINDEXED inner answers (LEFT)" "SELECT T.ID FROM T LEFT JOIN E2 ON E
 both "5 ...(INNER)" "SELECT T.ID FROM T JOIN E2 ON E2.N = 'x';" "$NONE"
 both "5 inside an EXISTS body's join" "SELECT T.ID FROM T WHERE T.ID = 1 AND EXISTS (SELECT 1 FROM T T2 LEFT JOIN E ON E.N = 'x');" "$RAISE"
 
-echo "--- 6 RECORDED: a SUBQUERY's inner key (the fold has no error channel)"
-rec "6 RECORDED uncorrelated EXISTS" "SELECT T.ID FROM T WHERE EXISTS (SELECT 1 FROM E WHERE E.N = 'x');" "$RAISE" "$NONE"
-rec "6 RECORDED IN (SELECT ..)" "SELECT T.ID FROM T WHERE T.ID IN (SELECT E.ID FROM E WHERE E.N = 'x');" "$RAISE" "$NONE"
-rec "6 RECORDED a scalar subselect" "SELECT (SELECT COUNT(*) FROM E WHERE E.N = 'x') FROM T;" "COUNT|=====================|${R}X|======|DONE|" "COUNT|=====================|0|0|X|======|DONE|"
-rec "6 RECORDED an uncorrelated EXISTS is an INVARIANT: it raises over an empty outer" "SELECT Z.ID FROM Z WHERE EXISTS (SELECT 1 FROM E WHERE E.N = 'x');" "$RAISE" "$NONE"
-rec "6 RECORDED correlated EXISTS" "SELECT T.ID FROM T WHERE EXISTS (SELECT 1 FROM E WHERE E.ID = T.ID AND E.N = 'x');" "$RAISE" "$NONE"
+echo "--- 6 a SUBQUERY's inner key: the relation reading declines, the per-row route raises"
+both "6 uncorrelated EXISTS" "SELECT T.ID FROM T WHERE EXISTS (SELECT 1 FROM E WHERE E.N = 'x');" "$RAISE"
+both "6 NOT EXISTS" "SELECT T.ID FROM T WHERE NOT EXISTS (SELECT 1 FROM E WHERE E.N = 'x');" "$RAISE"
+both "6 IN (SELECT ..)" "SELECT T.ID FROM T WHERE T.ID IN (SELECT E.ID FROM E WHERE E.N = 'x');" "$RAISE"
+both "6 NOT IN (SELECT ..)" "SELECT T.ID FROM T WHERE T.ID NOT IN (SELECT E.ID FROM E WHERE E.N = 'x');" "$RAISE"
+both "6 = ANY (SELECT ..)" "SELECT T.ID FROM T WHERE T.ID = ANY (SELECT E.ID FROM E WHERE E.N = 'x');" "$RAISE"
+both "6 a scalar subselect" "SELECT (SELECT COUNT(*) FROM E WHERE E.N = 'x') FROM T;" "COUNT|=====================|${R}X|======|DONE|"
+both "6 an uncorrelated EXISTS is an INVARIANT: it raises over an empty outer" "SELECT Z.ID FROM Z WHERE EXISTS (SELECT 1 FROM E WHERE E.N = 'x');" "$RAISE"
+both "6 ...and beside an outer conjunct turning every row away" "SELECT T.ID FROM T WHERE T.ID = 5 AND EXISTS (SELECT 1 FROM E WHERE E.N = 'x');" "$RAISE"
+both "6 IN over an EMPTY outer never opens the inner" "SELECT Z.ID FROM Z WHERE Z.ID IN (SELECT E.ID FROM E WHERE E.N = 'x');" "$NONE"
+both "6 ...nor over an outer filtered to nothing" "SELECT T.ID FROM T WHERE T.ID = 5 AND T.ID IN (SELECT E.ID FROM E WHERE E.N = 'x');" "$NONE"
+both "6 correlated EXISTS" "SELECT T.ID FROM T WHERE EXISTS (SELECT 1 FROM E WHERE E.ID = T.ID AND E.N = 'x');" "$RAISE"
+both "6 ...over an empty outer" "SELECT Z.ID FROM Z WHERE EXISTS (SELECT 1 FROM E WHERE E.ID = Z.ID AND E.N = 'x');" "$NONE"
+both "6 the last writer: E.N = 5 AND E.N = 'x' raises" "SELECT T.ID FROM T WHERE EXISTS (SELECT 1 FROM E WHERE E.N = 5 AND E.N = 'x');" "$RAISE"
+both "6 control: <> keys nothing" "SELECT T.ID FROM T WHERE EXISTS (SELECT 1 FROM E WHERE E.N <> 'x');" "$NONE"
 both "6 control: a scalar subselect over an empty outer is never evaluated" "SELECT (SELECT COUNT(*) FROM E WHERE E.N = 'x') FROM Z;" "$NONE"
 both "6 control: an unindexed EXISTS body answers" "SELECT T.ID FROM T WHERE EXISTS (SELECT 1 FROM E2 WHERE E2.N = 'x');" "$NONE"
 
@@ -147,5 +157,5 @@ if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 51 ]; then echo "FAIL only $ran checks ran (floor 51) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 60 ]; then echo "FAIL only $ran checks ran (floor 60) - cells went missing"; fail=1; fi
 exit $fail

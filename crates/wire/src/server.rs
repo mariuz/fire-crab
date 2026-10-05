@@ -114296,6 +114296,17 @@ fn eval_subquery_rel(
             Some(resolve_predicate(raw, &columns, &descs, &mut sink)?.bind(&[]).ok()?)
         }
     };
+    // AN INDEX KEY THIS FILTER CANNOT BUILD raises when the inner OPENS,
+    // before any row ([Predicate::key_conversion], [join_open_raise]): this
+    // reading would answer from the rows (none, over an empty E), so it
+    // declines and the per-row route - which plans the body with its keys
+    // - raises it (`EXISTS (SELECT 1 FROM E WHERE E.N = 'x')` over an empty
+    // indexed E answered no rows where the engine raises)
+    if let Some(f) = &filter {
+        if key_raise(f, &index_key_fids(db, rel, &descs)).is_some() {
+            return None;
+        }
+    }
 
     // The inner retrieval's access path, chosen the way every other
     // single-relation retrieval chooses one. The statement handed to the

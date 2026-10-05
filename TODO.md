@@ -49,11 +49,10 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       text literal that cannot convert raises 22018 on the engine before any row. JOINS DONE (`qa/serve-real-joinkeyraise.sh`):
       a join inner's key is built when the inner OPENS, per outer row passing the outer-only conjuncts of the WHERE and
       the ON; a WHERE comparison on the inner keys it (the LEFT runs as an INNER); RIGHT / FULL open the left relation
-      per preserved row; a COUNT(*) over the join raises at execute (it was counted at prepare and refused). LEFT: the
-      SUBQUERY's inner key - uncorrelated EXISTS (an INVARIANT: raises over an empty outer), IN (SELECT ..), a scalar
-      subselect, correlated EXISTS all answer here (the subquery fold has no error channel: a raise in the body declines
-      it); and the engine STREAMS an outer row the gates turned away before the raise (row 1, then 22018), here the raise
-      comes first. Unmeasured: `WHERE E.N = 'x' OR T.ID = 1` over a LEFT join raises on row 2 on the engine (fc: row 1).
+      per preserved row; a COUNT(*) over the join raises at execute (it was counted at prepare and refused). SUBQUERIES DONE
+      too (EXISTS / NOT EXISTS / IN / ANY / a scalar subselect, correlated or not; an uncorrelated EXISTS is an invariant
+      and raises over an empty outer). LEFT: the engine STREAMS an outer row the gates turned away before the raise (row
+      1, then 22018), here the raise comes first. Unmeasured: `WHERE E.N = 'x' OR T.ID = 1` over a LEFT join raises on row 2 on the engine (fc: row 1).
 - [ ] **P2** The FLOAT/ROUND/DECFLOAT wrong answers first; then the rounds 6–8 items still refused (mixed multi-clause ALTER TABLE, `WHERE CURRENT OF` via `RDB$DB_KEY`) - the rest re-measured and agrees
 - [x] **P2** WRONG ANSWER: the virtual RDB$TIME_ZONES / RDB$KEYWORDS answered NO ROWS (the zone list lacked America/Coyhaique
       too), and a subquery over any computed relation - MON$ included - walked its empty storage (`qa/serve-real-virtualrel.sh`).
