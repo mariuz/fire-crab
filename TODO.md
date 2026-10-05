@@ -145,8 +145,9 @@ Short, actionable items. The long-form engineering backlog lives in
 - [x] ORDER BY, ranges, BETWEEN, IN, MIN / MAX, CASE and expression keys over a single-byte set follow its BYTE order
       (codepages section 2; WIN1252 '€' and the other older tabled sets included). A bound `?` against such a column
       compares in UNICODE order on the engine - kept on the plain path (measured).
-- [ ] A byte the codepage leaves undefined decodes to U+0000 on the engine (measured for every set); the older
-      WIN1250 / WIN1251 / WIN1252 tables here pass it through as its own code point.
+- [ ] A codepage HOLE (WIN1252 0x81 ..) transliterates to U+0000 on the engine, which also refuses U+0081 into WIN1252;
+      every table here keeps the hole at its C1 point instead, so a byte-carrier (NONE) delivery reproduces the stored
+      bytes (cscast measured that law). Fixing it means telling a transliterating delivery from a byte one.
 - [x] CREATE INDEX .. COMPUTED BY (..) and CREATE INDEX .. WHERE through this server (`qa/serve-real-exprindexddl.sh`;
       expression and condition BLR byte-identical, the engine reads the file through them, gfix clean). dsql compiles
       EXTRACT now. samples/nodejs/indexes.js runs; only its PLAN text differs (the plan request is unanswered).

@@ -9,6 +9,8 @@
 # the codepage leaves undefined decodes to U+0000, the engine's own answer,
 # and decoding never raises - and UPPER / LOWER of each byte read back in
 # the set, a case mapping that leaves the set being the engine's 22018.
+# A codepage HOLE keeps its C1 point in every table (the engine's U+0000 is
+# recorded in section 3).
 #
 # The extraction, kept here so the tables can be regenerated: an EXECUTE
 # BLOCK over RDB$CHARACTER_SETS (RDB$BYTES_PER_CHARACTER = 1), each byte as
@@ -113,6 +115,9 @@ rec "3 RECORDED a character outside the set: the engine's 22018 at execute, a re
     "INSERT INTO T (ID, K8) VALUES (9, 'Ω'); ROLLBACK;" 'Statement failed, SQLSTATE = 22018|arithmetic exception, numeric overflow, or string truncation|-Cannot transliterate character between character sets|X|======|DONE|' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|X|======|DONE|'
 both "3 CAST into a set: the bytes, its case law, its 22018" "SELECT CAST('Çü' AS VARCHAR(3) CHARACTER SET DOS437) A, OCTET_LENGTH(CAST('Çü' AS VARCHAR(3) CHARACTER SET DOS437)) B, HEX_ENCODE(CAST(CAST('Жук' AS VARCHAR(3) CHARACTER SET KOI8R) AS VARCHAR(3) CHARACTER SET OCTETS)) C, UPPER(CAST('жук' AS VARCHAR(3) CHARACTER SET DOS866)) D FROM RDB\$DATABASE; SELECT CAST('Ω' AS VARCHAR(3) CHARACTER SET KOI8R) FROM RDB\$DATABASE;"
 both "3 a comparison against a character outside the set raises 22018 (=, >, IN, <>)" "SELECT COUNT(*) FROM T WHERE K8 = 'Ω'; SELECT COUNT(*) FROM T WHERE K8 > 'Ω'; SELECT COUNT(*) FROM T WHERE K8 IN ('Ω', 'Мир'); SELECT COUNT(*) FROM T WHERE K8 <> 'Ω';"
+rec "3 RECORDED a codepage HOLE: the engine transliterates it to U+0000 and refuses U+0081, this server keeps it at its C1 point (the tables stay bijections for byte-carrier delivery)" \
+    "SELECT HEX_ENCODE(CAST(CAST(CAST(ASCII_CHAR(129) AS VARCHAR(1) CHARACTER SET OCTETS) AS VARCHAR(1) CHARACTER SET WIN1252) AS VARCHAR(2) CHARACTER SET UTF8)) A FROM RDB\$DATABASE;" \
+    'A|================|00|X|======|DONE|' 'A|================|C281|X|======|DONE|'
 both "3 the same rows under a WIN1251 attachment" "SELECT ID, D866, K8 FROM T ORDER BY ID;" WIN1251
 both "3 ... and under NONE (the stored bytes)" "SELECT ID, D437 FROM T WHERE ID = 3;" NONE
 
@@ -134,6 +139,6 @@ if grep -aq 'panicked at' "/tmp/fc-serve-cpg-$PORT.log"; then echo "FAIL the ser
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 22 on the 2026-10-05 binary, 22 OK
-if [ "$ran" -lt 22 ]; then echo "FAIL only $ran checks ran (floor 22) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 23 on the 2026-10-05 binary, 23 OK
+if [ "$ran" -lt 23 ]; then echo "FAIL only $ran checks ran (floor 23) - cells went missing"; fail=1; fi
 exit $fail
