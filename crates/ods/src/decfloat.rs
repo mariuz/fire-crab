@@ -526,6 +526,17 @@ pub(crate) fn parts(d: &Dec) -> (bool, Vec<u8>, i64) {
 ///   cannot carry round away HALF-UP and the exponent clamps to -6176
 ///   (`1E-6000 / 1E+200` is `0E-6176`, `5E-6176 * 0.1` is `1E-6176`), where
 ///   the out-of-range exponent answered garbage (`8.0E-2071`).
+/// [finite] for a PRODUCT or a QUOTIENT, whose zero keeps the operands'
+/// combined sign (decNumber, IEEE 754): `0 / -2.5` is -0E+1 and `0 * -3`
+/// -0 on the engine (measured on 2196). A SUM's exact zero is +0, which
+/// is why [finite] itself normalises.
+pub(crate) fn finite_signed(neg: bool, digits: Vec<u8>, exp: i64) -> Dec {
+    match finite(neg, digits, exp) {
+        Dec::Finite { coeff: 0, exp, .. } => Dec::Finite { neg, coeff: 0, exp },
+        other => other,
+    }
+}
+
 pub(crate) fn finite(neg: bool, digits: Vec<u8>, exp: i64) -> Dec {
     let mut d = strip0(digits);
     let mut exp = exp;
@@ -612,8 +623,10 @@ pub fn div(a: &Dec, b: &Dec) -> Dec {
         (Dec::Infinity { neg: x }, Dec::Finite { neg: f, .. }) => {
             return Dec::Infinity { neg: x != f };
         }
-        (Dec::Finite { .. }, Dec::Infinity { .. }) => {
-            return Dec::Finite { neg: false, coeff: 0, exp: 0 };
+        // the zero lands at the format's least exponent: `5 / -Infinity`
+        // is -0E-6176 on the engine (-0E-398 once fitted to DECFLOAT(16))
+        (Dec::Finite { neg: f, .. }, Dec::Infinity { neg: x }) => {
+            return Dec::Finite { neg: f != x, coeff: 0, exp: -6176 };
         }
         _ => {}
     }
@@ -634,7 +647,7 @@ pub fn div(a: &Dec, b: &Dec) -> Dec {
         exp -= 1;
     }
     let (kept, drop) = round34(&strip0(q));
-    finite(na != nb, kept, exp + drop)
+    finite_signed(na != nb, kept, exp + drop)
 }
 
 /// Encode a computed [Dec] back to its decimal128 bits.
@@ -646,10 +659,11 @@ pub fn dec_to_bits(d: &Dec) -> u128 {
     }
 }
 
-/// Negate: flips the sign of a finite value or an Infinity (NaN stays NaN).
+/// Negate: flips the sign of a finite value - a ZERO too, `-CAST(0 AS
+/// DECFLOAT(16))` is -0 on the engine - or an Infinity (NaN stays NaN).
 pub fn negate(d: &Dec) -> Dec {
     match d {
-        Dec::Finite { neg, coeff, exp } => Dec::Finite { neg: *coeff != 0 && !*neg, coeff: *coeff, exp: *exp },
+        Dec::Finite { neg, coeff, exp } => Dec::Finite { neg: !*neg, coeff: *coeff, exp: *exp },
         Dec::Infinity { neg } => Dec::Infinity { neg: !*neg },
         Dec::Nan => Dec::Nan,
     }
@@ -690,8 +704,10 @@ pub fn add(a: &Dec, b: &Dec) -> Dec {
             std::cmp::Ordering::Equal => (false, vec![b'0']),
         }
     };
+    // two zeros of ONE sign sum to that sign (`-0 + -0` and `-0 - 0` are -0,
+    // IEEE 754); opposite signs cancel to +0 above
     let (kept, drop) = round34(&mag);
-    finite(sign, kept, e + drop)
+    finite_signed(sign, kept, e + drop)
 }
 
 /// `a - b`.
@@ -718,7 +734,7 @@ pub fn mul(a: &Dec, b: &Dec) -> Dec {
     let (na, ca, ea) = parts(a);
     let (nb, cb, eb) = parts(b);
     let (kept, drop) = round34(&umul(&ca, &cb));
-    finite(na != nb, kept, ea + eb + drop)
+    finite_signed(na != nb, kept, ea + eb + drop)
 }
 
 /// `a * b + c` ROUNDED ONCE, to 34 significant digits HALF-UP - the
@@ -752,8 +768,10 @@ pub fn fma(a: &Dec, b: &Dec, c: &Dec) -> Dec {
             std::cmp::Ordering::Equal => (false, vec![b'0']),
         }
     };
+    // two zeros of ONE sign sum to that sign (`-0 + -0` and `-0 - 0` are -0,
+    // IEEE 754); opposite signs cancel to +0 above
     let (kept, drop) = round34(&mag);
-    finite(sign, kept, e + drop)
+    finite_signed(sign, kept, e + drop)
 }
 
 /// The integer square root (floor) of MSD-first digits, digit pair by
@@ -1180,6 +1198,13 @@ mod tests {
         assert_eq!(s(&negate(&d(false, 15, -1))), "-1.5");
         // opposite-sign add that cancels to zero
         assert_eq!(s(&add(&d(false, 5, 0), &d(true, 5, 0))), "0");
+        // the signed zero (measured on 2196): minus flips it, one sign sums
+        // to that sign, opposite signs to +0, x / -Inf at the least exponent
+        assert_eq!(s(&negate(&d(false, 0, 0))), "-0");
+        assert_eq!(s(&add(&d(true, 0, 0), &d(true, 0, -1))), "-0.0");
+        assert_eq!(s(&sub(&d(true, 0, 0), &d(false, 0, 0))), "-0");
+        assert_eq!(s(&add(&d(true, 0, 0), &d(false, 0, 0))), "0");
+        assert_eq!(s(&div(&d(false, 5, 0), &Dec::Infinity { neg: true })), "-0E-6176");
         // HALF-UP at the 34-sig boundary: 34 twos + 0.5 -> ...2223 (probed)
         let twos: u128 = "2222222222222222222222222222222222".parse().unwrap();
         assert_eq!(s(&add(&d(false, twos, 0), &d(false, 5, -1))), "2222222222222222222222222222222223");

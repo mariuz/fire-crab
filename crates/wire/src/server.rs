@@ -10170,8 +10170,9 @@ impl ProjCol {
                     v = match fire_crab_ods::decfloat::round_to_dec16_of(*bits) {
                         Some(d64) => Value::DecFloat16(d64),
                         // the engine's vector here is *Decimal float
-                        // overflow*, not the numeric out-of-range one
-                        None => return Err(EvalErr::DecfloatOverflow),
+                        // overflow*, not the numeric out-of-range one -
+                        // a trap SET DECFLOAT TRAPS can stand down
+                        None => dec16_narrow_special(*bits)?,
                     };
                 }
                 Ok(v)
@@ -10211,8 +10212,9 @@ impl ProjCol {
                     v = match fire_crab_ods::decfloat::round_to_dec16_of(*bits) {
                         Some(d64) => Value::DecFloat16(d64),
                         // the engine's vector here is *Decimal float
-                        // overflow*, not the numeric out-of-range one
-                        None => return Err(EvalErr::DecfloatOverflow),
+                        // overflow*, not the numeric out-of-range one -
+                        // a trap SET DECFLOAT TRAPS can stand down
+                        None => dec16_narrow_special(*bits)?,
                     };
                 }
                 Ok(v)
@@ -11294,6 +11296,13 @@ AlterDomainRename {
     /// than fall through to the unknown-statement path (which the
     /// execute-immediate route acknowledges as success)
     SetTimeZoneRefused(EvalErr),
+    /// `SET DECFLOAT TRAPS TO [..]` - the session's trap mask
+    /// ([DECFLOAT_TRAPS]); `None` is `SET DECFLOAT ROUND HALF_UP`, the
+    /// rounding every DECFLOAT operation here already uses. Reported, like
+    /// every session statement, as isc_info_sql_stmt_ddl.
+    SetDecfloat {
+        traps: Option<u8>,
+    },
 }
 
 /// One SUSPENDED transaction's whole state - everything in [Database]
@@ -21530,7 +21539,7 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
             ExtractPart::Second | ExtractPart::Millisecond => long,
             _ => short,
         }),
-        SysFn::Sign => Some(short),
+        SysFn::Sign | SysFn::CompareDecfloat | SysFn::TotalOrder => Some(short),
         SysFn::AsciiVal | SysFn::AsciiValCs(_) => Some(short), // SMALLINT (probed)
         // BIGINT (probed); `USING CRC32` is an INTEGER (makeHash: makeLong
         // for the 4-byte algorithm, measured `496 LONG len 4`)
@@ -34897,6 +34906,232 @@ fn unquote_ident(t: &str) -> Option<String> {
 
 /// Parse `SET GENERATOR <name> TO <n>` - set a generator to an absolute
 /// value. The value may be signed. None for any other statement.
+const DF_TRAP_DIV: u8 = 1;
+const DF_TRAP_INVALID: u8 = 2;
+const DF_TRAP_OVERFLOW: u8 = 4;
+
+/// IEEE 754 totalOrder of two decoded DECFLOATs (decQuadCompareTotal):
+/// numeric order first; among equal values a -0 before a +0, then the
+/// cohorts - the smaller exponent first for a positive value, the larger
+/// for a negative one (`1.00 < 1.0 < 1`, `-1 < -1.0`); a NaN beyond
+/// +Infinity (the only NaN a decoded value carries is the quiet,
+/// unsigned one).
+fn dec_total_cmp(a: &fire_crab_ods::decfloat::Dec, b: &fire_crab_ods::decfloat::Dec) -> std::cmp::Ordering {
+    use fire_crab_ods::decfloat::{cmp, Dec};
+    use std::cmp::Ordering::*;
+    match (a, b) {
+        (Dec::Nan, Dec::Nan) => return Equal,
+        (Dec::Nan, _) => return Greater,
+        (_, Dec::Nan) => return Less,
+        _ => {}
+    }
+    match cmp(a, b) {
+        Equal => {}
+        o => return o,
+    }
+    match (a, b) {
+        (Dec::Finite { neg: na, exp: ea, .. }, Dec::Finite { neg: nb, exp: eb, .. }) => {
+            if na != nb {
+                return if *na { Less } else { Greater };
+            }
+            if *na { eb.cmp(ea) } else { ea.cmp(eb) }
+        }
+        _ => Equal,
+    }
+}
+
+/// QUANTIZE / NORMALIZE_DECFLOAT / COMPARE_DECFLOAT / TOTALORDER over
+/// their (non-NULL) operands. Each operand converts to a decimal first -
+/// an exact numeric at its own cohort, a double at 17 significant digits
+/// (16 into a DECFLOAT(16) result), a text by decNumber's grammar. The
+/// result width is makeDecFloatResult's: DECFLOAT(34) only when the FIRST
+/// operand is one. Measured on 2196: `QUANTIZE(1.2355, 0.001)` 1.236
+/// (HALF-UP), `QUANTIZE(1, 1E-34)` past 34 digits the 22000 invalid
+/// operation (NaN with the trap stood down), `NORMALIZE_DECFLOAT(-0.00)`
+/// -0, `COMPARE_DECFLOAT(1.0, 1)` 1, `TOTALORDER(-0, 0)` -1.
+fn dec_fn_eval(f: &SysFn, vs: &[Value]) -> Result<Value, EvalErr> {
+    use fire_crab_ods::decfloat::{dec_to_bits, dec_to_dec64_bits, fit_dec64, round_to_dec16, round_to_exp, Dec};
+    let wide = matches!(vs.first(), Some(Value::DecFloat34(_)));
+    let arg = |v: &Value, wide: bool| -> Result<Dec, EvalErr> {
+        match v {
+            Value::Text(s) => text_to_dec128_clamped(s)
+                .map(fire_crab_ods::decfloat::decode_dec128)
+                .map_err(|over| if over { EvalErr::DecfloatOverflow } else { EvalErr::DecfloatConvError(s.clone()) }),
+            v => match approx_of(v) {
+                Some(x) if !x.is_finite() => Ok(if x.is_nan() { Dec::Nan } else { Dec::Infinity { neg: x < 0.0 } }),
+                Some(x) => f64_to_dec(x, if wide { 17 } else { 16 }).ok_or(EvalErr::ConversionError(None)),
+                None => value_as_dec(v).ok_or_else(|| nonnumeric_conv(v)),
+            },
+        }
+    };
+    // a value at the result's width: DECFLOAT(16) rounds to 16 digits
+    let at_width = |d: Dec, wide: bool| -> Dec {
+        match d {
+            Dec::Finite { neg, coeff, exp } if !wide => round_to_dec16(neg, coeff, exp),
+            d => d,
+        }
+    };
+    let out = |d: Dec, wide: bool| -> Result<Value, EvalErr> {
+        Ok(if wide {
+            Value::DecFloat34(dec_to_bits(&d))
+        } else {
+            match d {
+                Dec::Finite { neg, coeff, exp } => {
+                    Value::DecFloat16(fit_dec64(neg, coeff, exp).ok_or(EvalErr::DecfloatOverflow)?)
+                }
+                d => Value::DecFloat16(dec_to_dec64_bits(&d)),
+            }
+        })
+    };
+    let invalid = |wide: bool| -> Result<Value, EvalErr> {
+        if decfloat_trapped(DF_TRAP_INVALID) {
+            Err(EvalErr::DecfloatInvalidOperation)
+        } else {
+            out(Dec::Nan, wide)
+        }
+    };
+    match f {
+        SysFn::NormalizeDecfloat => match at_width(arg(&vs[0], wide)?, wide) {
+            Dec::Finite { neg, coeff: 0, .. } => out(Dec::Finite { neg, coeff: 0, exp: 0 }, wide),
+            Dec::Finite { neg, mut coeff, mut exp } => {
+                while coeff % 10 == 0 {
+                    coeff /= 10;
+                    exp += 1;
+                }
+                out(Dec::Finite { neg, coeff, exp }, wide)
+            }
+            d => out(d, wide),
+        },
+        SysFn::Quantize => {
+            let (x, y) = (at_width(arg(&vs[0], wide)?, wide), at_width(arg(&vs[1], wide)?, wide));
+            match (&x, &y) {
+                (Dec::Nan, _) | (_, Dec::Nan) => out(Dec::Nan, wide),
+                (Dec::Infinity { .. }, Dec::Infinity { .. }) => out(x, wide),
+                (Dec::Infinity { .. }, _) | (_, Dec::Infinity { .. }) => invalid(wide),
+                (Dec::Finite { neg, exp: ex, .. }, Dec::Finite { exp: ey, .. }) => {
+                    let (prec, lo, hi) = if wide { (34u32, -6176, 6111) } else { (16u32, -398, 369) };
+                    if *ey < lo || *ey > hi {
+                        return invalid(wide);
+                    }
+                    // a coefficient of at most 34 digits dropped by 39 or
+                    // more places rounds to zero
+                    let c = if *ey - *ex > 38 { Some(0) } else { round_to_exp(&x, *ey) };
+                    match c {
+                        Some(c) if c.unsigned_abs() < 10u128.pow(prec) => {
+                            out(Dec::Finite { neg: *neg, coeff: c.unsigned_abs(), exp: *ey }, wide)
+                        }
+                        _ => invalid(wide),
+                    }
+                }
+            }
+        }
+        _ => {
+            let (x, y) = (arg(&vs[0], true)?, arg(&vs[1], true)?);
+            let o = dec_total_cmp(&x, &y);
+            Ok(Value::Int(match f {
+                SysFn::CompareDecfloat if matches!(x, Dec::Nan) || matches!(y, Dec::Nan) => 3,
+                SysFn::CompareDecfloat => match o {
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Less => 1,
+                    std::cmp::Ordering::Greater => 2,
+                },
+                _ => o as i64,
+            }))
+        }
+    }
+}
+
+/// A DECFLOAT into an exact target that has no form there - non-finite,
+/// past 34 digits, past the backing integer - is decNumber's Invalid
+/// operation (and toInt64's *Floating-point invalid operand*, raised from
+/// the same context); with that trap stood down (SET DECFLOAT TRAPS) the
+/// conversion answers 0 at the target's scale (measured on 2196: 'Inf' AS
+/// INT, 'NaN' AS BIGINT, '1E30' AS BIGINT, '1E37' AS INT128, '1E40' AS
+/// NUMERIC(9,2)). A 22003 range failure is no decimal trap and stays.
+fn dec_cvt_untrapped(r: Result<i128, EvalErr>) -> Result<i128, EvalErr> {
+    match r {
+        Err(EvalErr::DecfloatInvalidOperation | EvalErr::FloatInvalidOperand)
+            if !decfloat_trapped(DF_TRAP_INVALID) =>
+        {
+            Ok(0)
+        }
+        r => r,
+    }
+}
+
+/// A decimal128 intermediate that has no decimal64 form at a DECFLOAT(16)
+/// slot: a special narrows as itself, a finite value is the overflow -
+/// raised, or the signed Infinity when the session stood that trap down.
+fn dec16_narrow_special(bits: u128) -> Result<Value, EvalErr> {
+    use fire_crab_ods::decfloat::{decode_dec128, dec_to_dec64_bits, Dec};
+    match decode_dec128(bits) {
+        Dec::Finite { neg, .. } if !decfloat_trapped(DF_TRAP_OVERFLOW) => {
+            Ok(Value::DecFloat16(dec_to_dec64_bits(&Dec::Infinity { neg })))
+        }
+        Dec::Finite { .. } => Err(EvalErr::DecfloatOverflow),
+        d => Ok(Value::DecFloat16(dec_to_dec64_bits(&d))),
+    }
+}
+
+fn decfloat_trapped(bit: u8) -> bool {
+    DECFLOAT_TRAPS.with(|c| c.get()) & bit != 0
+}
+
+/// `SET DECFLOAT TRAPS TO [name, ..]` and `SET DECFLOAT ROUND <mode>`
+/// (StmtNodes.cpp SetDecFloatTrapsNode / SetDecFloatRoundNode). A name the
+/// engine does not know is its bare 42000 *Invalid decfloat trap state
+/// @1* / *rounding mode @1* (upper-cased). Answered here: the three traps
+/// this server's DECFLOAT operations know how to stand down (Division_by_
+/// zero, Invalid_operation, Overflow) and ROUND HALF_UP, the rounding
+/// they already use. Inexact and Underflow - which need the inexact flag
+/// of every operation - and every other rounding mode refuse.
+fn plan_set_decfloat(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let up = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
+    let mut it = up.split_whitespace();
+    if it.next() != Some("SET") || it.next() != Some("DECFLOAT") {
+        return None;
+    }
+    let refuse = |e: EvalErr| Some((Plan::SetTimeZoneRefused(e), Vec::new()));
+    match it.next() {
+        Some("ROUND") => {
+            let mode = it.next().unwrap_or("").to_string();
+            if it.next().is_some() {
+                return None;
+            }
+            match mode.as_str() {
+                "HALF_UP" => Some((Plan::SetDecfloat { traps: None }, Vec::new())),
+                "CEILING" | "UP" | "HALF_EVEN" | "HALF_DOWN" | "DOWN" | "FLOOR" | "REROUND" => {
+                    refuse(EvalErr::Unsupported)
+                }
+                _ => refuse(EvalErr::Status(vec![StatusItem::Gds(335545155), StatusItem::Str(mode)])),
+            }
+        }
+        Some("TRAPS") => {
+            if it.next() != Some("TO") {
+                return None;
+            }
+            let rest: String = it.collect::<Vec<_>>().join(" ");
+            let mut mask = 0u8;
+            for name in rest.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                mask |= match name {
+                    "DIVISION_BY_ZERO" => DF_TRAP_DIV,
+                    "INVALID_OPERATION" => DF_TRAP_INVALID,
+                    "OVERFLOW" => DF_TRAP_OVERFLOW,
+                    "INEXACT" | "UNDERFLOW" => return refuse(EvalErr::Unsupported),
+                    other => {
+                        return refuse(EvalErr::Status(vec![
+                            StatusItem::Gds(335545154),
+                            StatusItem::Str(other.to_string()),
+                        ]))
+                    }
+                };
+            }
+            Some((Plan::SetDecfloat { traps: Some(mask) }, Vec::new()))
+        }
+        _ => None,
+    }
+}
+
 /// `SET TIME ZONE {'<zone>' | LOCAL}` - the session zone
 /// (StmtNodes.cpp:10980). An unresolvable zone answers the engine's own
 /// 22009 through the ordinary refusal channel.
@@ -41910,6 +42145,12 @@ fn execute_dml(
     }
     if let Plan::SetTimeZoneRefused(e) = plan {
         return Err(ExecErr::Eval(e.clone()));
+    }
+    if let Plan::SetDecfloat { traps } = plan {
+        if let Some(m) = traps {
+            DECFLOAT_TRAPS.with(|c| c.set(*m));
+        }
+        return Ok((0, 0, 0));
     }
     reserve_dml_relation(plan, database)?;
     with_conflict_wait(database, |db| execute_dml_collecting(plan, db, args, ctx, None))
@@ -77161,10 +77402,10 @@ fn stat2_dec_result(
     use fire_crab_ods::decfloat::{self as dfl, Dec};
     let fin = |d: &Dec| matches!(d, Dec::Finite { .. });
     let trap = |before: &[&Dec], after: Dec| -> Result<Dec, EvalErr> {
-        if matches!(after, Dec::Infinity { .. }) && before.iter().all(|d| fin(d)) {
+        if matches!(after, Dec::Infinity { .. }) && before.iter().all(|d| fin(d)) && decfloat_trapped(DF_TRAP_OVERFLOW) {
             return Err(EvalErr::DecfloatOverflow);
         }
-        if matches!(after, Dec::Nan) && !before.iter().any(|d| matches!(d, Dec::Nan)) {
+        if matches!(after, Dec::Nan) && !before.iter().any(|d| matches!(d, Dec::Nan)) && decfloat_trapped(DF_TRAP_INVALID) {
             return Err(EvalErr::DecfloatInvalidOperation);
         }
         Ok(after)
@@ -77228,7 +77469,7 @@ fn stat2_dec_result(
             // execute, which tests the divisor first (above).
             let safe_dv = |a: &Dec, b: &Dec| -> Result<Dec, EvalErr> {
                 let q = dfl::div(a, b);
-                if matches!(q, Dec::Nan) && !matches!(a, Dec::Nan) && !matches!(b, Dec::Nan) {
+                if matches!(q, Dec::Nan) && !matches!(a, Dec::Nan) && !matches!(b, Dec::Nan) && decfloat_trapped(DF_TRAP_INVALID) {
                     return Err(EvalErr::DecfloatInvalidOperation);
                 }
                 Ok(q)
@@ -77655,7 +77896,7 @@ fn percentile_result(func: AggFn, vals: &[Value], frac: f64) -> Result<Value, Ev
             let acc = Dec::Finite { neg: false, coeff: 0, exp: 0 };
             let acc = dfl::add(&acc, &dfl::mul(&at(frn)?, &w1));
             let acc = dfl::add(&acc, &dfl::mul(&at(crn)?, &w2));
-            if matches!(acc, Dec::Infinity { .. }) {
+            if matches!(acc, Dec::Infinity { .. }) && decfloat_trapped(DF_TRAP_OVERFLOW) {
                 return Err(EvalErr::DecfloatOverflow);
             }
             acc
@@ -77937,8 +78178,11 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                                 };
                                 // a finite running sum plus a finite value can
                                 // only reach Infinity by OVERFLOW: the engine
-                                // raises it (SUM and AVG alike, measured)
-                                if matches!(next, fire_crab_ods::decfloat::Dec::Infinity { .. })
+                                // raises it (SUM and AVG alike, measured) -
+                                // unless SET DECFLOAT TRAPS stood it down, and
+                                // the sum carries on as the Infinity
+                                if decfloat_trapped(DF_TRAP_OVERFLOW)
+                                    && matches!(next, fire_crab_ods::decfloat::Dec::Infinity { .. })
                                     && matches!(d, fire_crab_ods::decfloat::Dec::Finite { .. })
                                     && acc0.as_ref().map_or(true, |a| {
                                         matches!(a, fire_crab_ods::decfloat::Dec::Finite { .. })
@@ -77950,7 +78194,8 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                                 // is the invalid operation the engine traps
                                 // (SUM / AVG, grouped and windowed, measured);
                                 // a NaN INPUT still propagates as NaN
-                                if matches!(next, fire_crab_ods::decfloat::Dec::Nan)
+                                if decfloat_trapped(DF_TRAP_INVALID)
+                                    && matches!(next, fire_crab_ods::decfloat::Dec::Nan)
                                     && !matches!(d, fire_crab_ods::decfloat::Dec::Nan)
                                     && !matches!(acc0, Some(fire_crab_ods::decfloat::Dec::Nan))
                                 {
@@ -78098,10 +78343,10 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         // a finite step reaching Infinity is the overflow
                         // trap, a non-NaN step reaching NaN the invalid one
                         let trap = |before: &[&Dec], after: &Dec| -> Result<(), EvalErr> {
-                            if matches!(after, Dec::Infinity { .. }) && before.iter().all(|d| fin(d)) {
+                            if matches!(after, Dec::Infinity { .. }) && before.iter().all(|d| fin(d)) && decfloat_trapped(DF_TRAP_OVERFLOW) {
                                 return Err(EvalErr::DecfloatOverflow);
                             }
-                            if matches!(after, Dec::Nan) && !before.iter().any(|d| matches!(d, Dec::Nan)) {
+                            if matches!(after, Dec::Nan) && !before.iter().any(|d| matches!(d, Dec::Nan)) && decfloat_trapped(DF_TRAP_INVALID) {
                                 return Err(EvalErr::DecfloatInvalidOperation);
                             }
                             Ok(())
@@ -78227,10 +78472,10 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         };
                         let fin = |d: &Dec| matches!(d, Dec::Finite { .. });
                         let trap = |before: &[&Dec], after: Dec| -> Result<Dec, EvalErr> {
-                            if matches!(after, Dec::Infinity { .. }) && before.iter().all(|d| fin(d)) {
+                            if matches!(after, Dec::Infinity { .. }) && before.iter().all(|d| fin(d)) && decfloat_trapped(DF_TRAP_OVERFLOW) {
                                 return Err(EvalErr::DecfloatOverflow);
                             }
-                            if matches!(after, Dec::Nan) && !before.iter().any(|d| matches!(d, Dec::Nan)) {
+                            if matches!(after, Dec::Nan) && !before.iter().any(|d| matches!(d, Dec::Nan)) && decfloat_trapped(DF_TRAP_INVALID) {
                                 return Err(EvalErr::DecfloatInvalidOperation);
                             }
                             Ok(after)
@@ -78442,6 +78687,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         Plan::TxControl { .. }
         | Plan::Savepoint { .. }
         | Plan::SetTimeZone { .. }
+        | Plan::SetDecfloat { .. }
         | Plan::SetTimeZoneRefused(_) => build_describe(&[], params, att),
     }
 }
@@ -78469,7 +78715,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::TxControl { rollback, .. } => if *rollback { 11 } else { 10 },
         // isc_info_sql_stmt_ddl: what the engine reports for EVERY
         // session-management statement (dsql.cpp:887)
-        Plan::SetTimeZone { .. } | Plan::SetTimeZoneRefused(_) => 5,
+        Plan::SetTimeZone { .. } | Plan::SetDecfloat { .. } | Plan::SetTimeZoneRefused(_) => 5,
         Plan::Savepoint { .. } => 14,
         Plan::Union { .. }
         | Plan::ProcSelect { .. }
@@ -78575,7 +78821,7 @@ fn stmt_flags_of(plan: &Plan) -> i32 {
     const FLAG_REPEAT_EXECUTE: i32 = 2;
     let ty = stmt_type_of(plan);
     // session management reports the DDL type but is not DDL
-    let session_mgmt = matches!(plan, Plan::SetTimeZone { .. } | Plan::SetTimeZoneRefused(_));
+    let session_mgmt = matches!(plan, Plan::SetTimeZone { .. } | Plan::SetDecfloat { .. } | Plan::SetTimeZoneRefused(_));
     if ty == 5 && !session_mgmt {
         return 0;
     }
@@ -82709,6 +82955,7 @@ fn emit_rows_inner(
         | Plan::ExecBlock { .. }
         | Plan::Savepoint { .. }
         | Plan::SetTimeZone { .. }
+        | Plan::SetDecfloat { .. }
         | Plan::SetTimeZoneRefused(_)
         | Plan::InsertSelect { .. }
         | Plan::Insert { .. } | Plan::InsertRefused(_) | Plan::UpdateOrInsert { .. } | Plan::Merge { .. }
@@ -84621,6 +84868,11 @@ thread_local! {
     /// connection (`att_current_timezone`); `None` = the attachment's
     /// original, which is what `SET TIME ZONE LOCAL` restores.
     static SESSION_ZONE: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+    /// The session's DECFLOAT trap mask (`SET DECFLOAT TRAPS TO ..`):
+    /// [DF_TRAP_DIV] | [DF_TRAP_INVALID] | [DF_TRAP_OVERFLOW], all three by
+    /// default. An untrapped condition answers its special value - x / 0
+    /// a signed Infinity, 0 / 0 NaN, an overflow Infinity (measured)
+    static DECFLOAT_TRAPS: std::cell::Cell<u8> = const { std::cell::Cell::new(7) };
     /// THIS CONNECTION'S OWN FACTS, for `CURRENT_CONNECTION` and the
     /// SYSTEM context keys bound to the session. A connection is one
     /// thread ([handle]), so the connect block's client identity, the
@@ -86492,6 +86744,17 @@ enum RawExpr {
 /// live engine before it was written down - see qa/serve-real-functions.sh.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SysFn {
+    /// QUANTIZE(x, y): x rounded HALF-UP to y's exponent, DECFLOAT(34)
+    /// when x is one and DECFLOAT(16) for every other x (makeDecFloatResult)
+    Quantize,
+    /// NORMALIZE_DECFLOAT(x): x with its trailing zeros stripped, typed as
+    /// QUANTIZE is
+    NormalizeDecfloat,
+    /// COMPARE_DECFLOAT(x, y): SMALLINT 0 / 1 / 2 by TOTAL order (equal,
+    /// less, greater - `1.0` is less than `1`), 3 when either is a NaN
+    CompareDecfloat,
+    /// TOTALORDER(x, y): SMALLINT -1 / 0 / 1 by IEEE 754 totalOrder
+    TotalOrder,
     /// BLOB_APPEND(a, b, ..): the arguments' text, NULLs SKIPPED, NULL only
     /// when every argument is - resolved under a CAST to the BLOB the first
     /// argument decides ([lower_blob_append])
@@ -86935,6 +87198,10 @@ impl SysFn {
             SysFn::Reverse => "REVERSE",
             SysFn::BlobAppend => "BLOB_APPEND",
             SysFn::Abs => "ABS",
+            SysFn::Quantize => "QUANTIZE",
+            SysFn::NormalizeDecfloat => "NORMALIZE_DECFLOAT",
+            SysFn::CompareDecfloat => "COMPARE_DECFLOAT",
+            SysFn::TotalOrder => "TOTALORDER",
             SysFn::Mod => "MOD",
             SysFn::Sign => "SIGN",
             SysFn::BinAnd => "BIN_AND",
@@ -89026,6 +89293,10 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
         "REVERSE" => SysFn::Reverse,
         "BLOB_APPEND" => SysFn::BlobAppend,
         "ABS" => SysFn::Abs,
+        "QUANTIZE" => SysFn::Quantize,
+        "NORMALIZE_DECFLOAT" => SysFn::NormalizeDecfloat,
+        "COMPARE_DECFLOAT" => SysFn::CompareDecfloat,
+        "TOTALORDER" => SysFn::TotalOrder,
         "MOD" => SysFn::Mod,
         "SIGN" => SysFn::Sign,
         "BIN_AND" => SysFn::BinAnd,
@@ -89594,7 +89865,9 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::BlobOctetLength
         | SysFn::Reverse
         | SysFn::Abs
+        | SysFn::NormalizeDecfloat
         | SysFn::Sign => (1, 1),
+        SysFn::Quantize | SysFn::CompareDecfloat | SysFn::TotalOrder => (2, 2),
         SysFn::Left | SysFn::Right | SysFn::Mod | SysFn::BinShl | SysFn::BinShr => (2, 2),
         SysFn::BinNot | SysFn::AsciiVal | SysFn::AsciiValCs(_) | SysFn::Hash(_) | SysFn::HashCs(..) | SysFn::BitLength | SysFn::Sqrt | SysFn::Ln | SysFn::Log10 | SysFn::Exp
         | SysFn::Sin | SysFn::Cos | SysFn::Tan | SysFn::Cot | SysFn::Asin | SysFn::Acos | SysFn::Atan
@@ -99474,6 +99747,7 @@ fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
             // it is transparent here (ABS(<decfloat>) is that decfloat)
             Expr::Func(f, args) if is_dbldec_fn(f) => dbldec_decimal(args, descs),
             Expr::Func(SysFn::Abs, args) if args.len() == 1 => walk(&args[0], descs)?,
+            Expr::Func(SysFn::Quantize | SysFn::NormalizeDecfloat, _) => true,
             // FLOOR / CEILING over a decfloat answer DECFLOAT(34)
             // (makeCeilFloor's dec arm is makeDecimal128), ROUND / TRUNC
             // keep the operand's own width (makeRound / makeTrunc `*result
@@ -100035,6 +100309,13 @@ fn df_agg_engine_width(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
         // ABS keeps the operand's own width (makeAbs `*result = *value`)
         Expr::Func(f, args) if is_dbldec_fn(f) && dbldec_decimal(args, descs) => Some(true),
         Expr::Func(SysFn::Abs, args) if args.len() == 1 => df_agg_engine_width(&args[0], descs),
+        // makeDecFloatResult: DECFLOAT(34) only when the FIRST operand is
+        // one, DECFLOAT(16) for every other operand - an exact, a double,
+        // a text (measured: `NORMALIZE_DECFLOAT(100)` and `QUANTIZE(1.2345,
+        // <DECFLOAT(34)>)` describe DECFLOAT(16))
+        Expr::Func(SysFn::Quantize | SysFn::NormalizeDecfloat, args) if !args.is_empty() => {
+            Some(df_agg_engine_width(&args[0], descs) == Some(true))
+        }
         // FLOOR / CEILING widen a DECFLOAT(16) to (34) (`FLOOR(<DECFLOAT(16)>)`
         // describes DECFLOAT(34), measured); ROUND / TRUNC keep the width
         Expr::Func(SysFn::Ceil | SysFn::Ceiling | SysFn::Floor, args) if args.len() == 1 => {
@@ -103909,7 +104190,12 @@ fn cvt_dec_to_int64(d: &fire_crab_ods::decfloat::Dec, scale: i32) -> Result<i64,
 /// `A < 5` / `A <> 5` none), and against a DECFLOAT(34) column or cast
 /// 22000. `Err` for the raise, else the (always Equal) order.
 fn dec_nan_cmp(x: &Value, y: &Value) -> Result<std::cmp::Ordering, EvalErr> {
-    if matches!(x, Value::DecFloat34(_)) || matches!(y, Value::DecFloat34(_)) {
+    // ...a TRAPPED Invalid: a session that stood it down (`SET DECFLOAT
+    // TRAPS TO ..`) compares the NaN EQUAL in DECFLOAT(34) too - measured
+    // on 2196: `X / Y = X / Y` takes the 0 / 0 row, `X / Y > 0` does not
+    if (matches!(x, Value::DecFloat34(_)) || matches!(y, Value::DecFloat34(_)))
+        && decfloat_trapped(DF_TRAP_INVALID)
+    {
         return Err(EvalErr::DecfloatInvalidOperation);
     }
     Ok(std::cmp::Ordering::Equal)
@@ -104466,6 +104752,15 @@ impl Expr {
                 if matches!(f, SysFn::Sign) && args.len() == 1 && is_decfloat_arith(&args[0], descs) {
                     return Some(ExprType::Int);
                 }
+                // the DECFLOAT functions: QUANTIZE / NORMALIZE_DECFLOAT are
+                // decfloat leaves whatever their operands ([df_agg_engine_width]),
+                // COMPARE_DECFLOAT / TOTALORDER the SHORT their answer is
+                if matches!(f, SysFn::Quantize | SysFn::NormalizeDecfloat) {
+                    return None;
+                }
+                if matches!(f, SysFn::CompareDecfloat | SysFn::TotalOrder) {
+                    return Some(ExprType::Int);
+                }
                 // MOD over a DECFLOAT reads each operand through
                 // MOV_get_int64 (half up) and answers the FIRST operand's
                 // integer type, INT64 for anything else (makeMod -
@@ -104577,6 +104872,8 @@ impl Expr {
                     })
                     .collect::<Option<Vec<_>>>()?;
                 match f {
+                    // typed above, before the operands are read
+                    SysFn::Quantize | SysFn::NormalizeDecfloat | SysFn::CompareDecfloat | SysFn::TotalOrder => None,
                     // OVERLAY: its two text operands convert to text (a
                     // number too - `OVERLAY(12345 PLACING 9 FROM 2)` is
                     // '19345', measured), the start and length are
@@ -105997,26 +106294,43 @@ impl Expr {
                         ArithOp::Sub => df::sub(&da, &db),
                         ArithOp::Mul => df::mul(&da, &db),
                         ArithOp::Div => {
-                            // x / 0 traps 22012, 0 / 0 traps 22000 (probed)
-                            if df::is_zero(&db) {
-                                return Err(if df::is_zero(&da) {
-                                    EvalErr::DecfloatInvalidOperation
+                            // x / 0 traps 22012, 0 / 0 traps 22000 (probed);
+                            // UNTRAPPED (`SET DECFLOAT TRAPS TO ..`) they
+                            // answer a signed Infinity and NaN (measured:
+                            // 1/0 Infinity, -1/0 -Infinity, 0/0 NaN)
+                            if df::is_zero(&db) && matches!(da, df::Dec::Finite { .. }) {
+                                if df::is_zero(&da) {
+                                    if decfloat_trapped(DF_TRAP_INVALID) {
+                                        return Err(EvalErr::DecfloatInvalidOperation);
+                                    }
+                                    df::Dec::Nan
                                 } else {
-                                    EvalErr::DecfloatDivideByZero
-                                });
+                                    if decfloat_trapped(DF_TRAP_DIV) {
+                                        return Err(EvalErr::DecfloatDivideByZero);
+                                    }
+                                    let neg_a = matches!(da, df::Dec::Finite { neg: true, .. });
+                                    let neg_b = matches!(db, df::Dec::Finite { neg: true, .. });
+                                    df::Dec::Infinity { neg: neg_a != neg_b }
+                                }
+                            } else if df::is_zero(&db) {
+                                return Err(EvalErr::DecfloatInvalidOperation);
+                            } else {
+                                df::div(&da, &db)
                             }
-                            df::div(&da, &db)
                         }
                     };
-                    if matches!(r, df::Dec::Nan) {
+                    if matches!(r, df::Dec::Nan) && decfloat_trapped(DF_TRAP_INVALID) {
                         return Err(EvalErr::DecfloatInvalidOperation);
                     }
                     // a FINITE pair can only reach Infinity by OVERFLOW - the
                     // decimal module signals the adjusted exponent passing
-                    // 6144 that way ([decfloat::finite]); the engine raises
+                    // 6144 that way ([decfloat::finite]); the engine raises,
+                    // unless the session stood that trap down
                     if matches!(r, df::Dec::Infinity { .. })
                         && matches!(da, df::Dec::Finite { .. })
                         && matches!(db, df::Dec::Finite { .. })
+                        && !(df::is_zero(&db) && matches!(op, ArithOp::Div))
+                        && decfloat_trapped(DF_TRAP_OVERFLOW)
                     {
                         return Err(EvalErr::DecfloatOverflow);
                     }
@@ -106415,6 +106729,14 @@ impl Expr {
                             // decNumber does (measured)
                             match text_to_dec128_clamped(s) {
                                 Ok(bits) => fire_crab_ods::decfloat::decode_dec128(bits),
+                                // ..unless Overflow is untrapped (SET DECFLOAT
+                                // TRAPS): then it is the signed Infinity
+                                // (`CAST('1E9999' AS DECFLOAT(16))`, measured)
+                                Err(true) if !decfloat_trapped(DF_TRAP_OVERFLOW) => {
+                                    fire_crab_ods::decfloat::Dec::Infinity {
+                                        neg: s.trim_start_matches(' ').starts_with('-'),
+                                    }
+                                }
                                 Err(true) => return Err(EvalErr::DecfloatOverflow),
                                 // decNumber's own refusal: *Decimal float
                                 // invalid operation* AND THEN the conversion
@@ -106489,8 +106811,13 @@ impl Expr {
                             // garbled the exponent field
                             let bits = match &dec {
                                 fire_crab_ods::decfloat::Dec::Finite { neg, coeff, exp } => {
-                                    fire_crab_ods::decfloat::fit_dec64(*neg, *coeff, *exp)
-                                        .ok_or(EvalErr::DecfloatOverflow)?
+                                    match fire_crab_ods::decfloat::fit_dec64(*neg, *coeff, *exp) {
+                                        Some(b) => b,
+                                        None if !decfloat_trapped(DF_TRAP_OVERFLOW) => {
+                                            fire_crab_ods::decfloat::encode_dec64_special(*neg, false)
+                                        }
+                                        None => return Err(EvalErr::DecfloatOverflow),
+                                    }
                                 }
                                 _ => fire_crab_ods::decfloat::dec_to_dec64_bits(&dec),
                             };
@@ -106678,20 +107005,18 @@ impl Expr {
                             v @ (Value::DecFloat16(_) | Value::DecFloat34(_)) => {
                                 let dec =
                                     value_as_dec(&v).ok_or(EvalErr::DecfloatInvalidOperation)?;
-                                if *bytes >= 8 {
+                                let x = if *bytes >= 8 {
                                     // BIGINT is Decimal128::toInt64
                                     // ([cvt_dec_to_int64]): the range
                                     // failure is *Floating-point invalid
                                     // operand* (measured: `'1e30' AS BIGINT`)
-                                    fit(cvt_dec_to_int64(&dec, 0)? as i128)?
+                                    cvt_dec_to_int64(&dec, 0).map(|n| n as i128)
                                 } else {
-                                    let x = fire_crab_ods::decfloat::round_to_exp(&dec, 0)
-                                        .ok_or(EvalErr::DecfloatInvalidOperation)?;
-                                    if x < i32::MIN as i128 || x > i32::MAX as i128 {
-                                        return Err(EvalErr::DecfloatInvalidOperation);
-                                    }
-                                    fit(x)?
-                                }
+                                    fire_crab_ods::decfloat::round_to_exp(&dec, 0)
+                                        .filter(|x| *x >= i32::MIN as i128 && *x <= i32::MAX as i128)
+                                        .ok_or(EvalErr::DecfloatInvalidOperation)
+                                };
+                                fit(dec_cvt_untrapped(x)?)?
                             }
                             _ => return Err(nonnumeric_conv(&v)),
                         }
@@ -107129,14 +107454,30 @@ impl Expr {
                             v @ (Value::DecFloat16(_) | Value::DecFloat34(_)) => {
                                 let dec =
                                     value_as_dec(v).ok_or(EvalErr::DecfloatInvalidOperation)?;
+                                // a NaN into a SCALED BIGINT or any INT128 target
+                                // with the Invalid trap stood down answers the
+                                // engine's uninitialised garbage (NUMERIC(18,2)
+                                // 78863920565143470.08, NUMERIC(38,2) 10^27 -
+                                // measured on 2196): refused, not imitated
+                                if matches!(dec, fire_crab_ods::decfloat::Dec::Nan)
+                                    && !decfloat_trapped(DF_TRAP_INVALID)
+                                    && (*bytes == 16 && *scale != 0 || *bytes == 8 && *scale != 0)
+                                {
+                                    return Err(EvalErr::Unsupported);
+                                }
                                 if *bytes == 16 {
                                     // an INT128-backed target is the
                                     // engine's CVT_get_int128 dec arm:
                                     // range first (22003), then the
                                     // 34-digit quantize (22000)
-                                    (cvt_dec_to_int128(&dec, *scale as i32)?, *scale)
+                                    (dec_cvt_untrapped(cvt_dec_to_int128(&dec, *scale as i32))?, *scale)
                                 } else if *bytes == 8 {
-                                    (cvt_dec_to_int64(&dec, *scale as i32)? as i128, *scale)
+                                    (dec_cvt_untrapped(cvt_dec_to_int64(&dec, *scale as i32).map(|n| n as i128))?, *scale)
+                                } else if !decfloat_trapped(DF_TRAP_INVALID)
+                                    && fire_crab_ods::decfloat::round_to_exp(&dec, *scale as i32)
+                                        .is_none_or(|raw| raw < i32::MIN as i128 || raw > i32::MAX as i128)
+                                {
+                                    (0, *scale)
                                 } else {
                                     let raw = fire_crab_ods::decfloat::round_to_exp(&dec, *scale as i32)
                                         .ok_or(EvalErr::DecfloatInvalidOperation)?;
@@ -107268,6 +107609,15 @@ impl Expr {
                                 let dec =
                                     value_as_dec(dfv).ok_or(EvalErr::ConversionError(None))?;
                                 match dec {
+                                    // ..each its own trap, which SET DECFLOAT
+                                    // TRAPS stands down: then the float's own
+                                    // Infinity / NaN (measured on 2196)
+                                    fire_crab_ods::decfloat::Dec::Infinity { neg } if !decfloat_trapped(DF_TRAP_OVERFLOW) => {
+                                        return Ok(Value::Float(if neg { f32::NEG_INFINITY } else { f32::INFINITY }))
+                                    }
+                                    fire_crab_ods::decfloat::Dec::Nan if !decfloat_trapped(DF_TRAP_INVALID) => {
+                                        return Ok(Value::Float(f32::NAN))
+                                    }
                                     fire_crab_ods::decfloat::Dec::Infinity { .. } => {
                                         return Err(EvalErr::FloatOverflowBare)
                                     }
@@ -107302,6 +107652,15 @@ impl Expr {
                         dfv @ (Value::DecFloat16(_) | Value::DecFloat34(_)) => {
                             let dec = value_as_dec(dfv).ok_or(EvalErr::ConversionError(None))?;
                             match dec {
+                                // ..each its own trap, which SET DECFLOAT
+                                // TRAPS stands down: then the double's own
+                                // Infinity / NaN (measured on 2196)
+                                fire_crab_ods::decfloat::Dec::Infinity { neg } if !decfloat_trapped(DF_TRAP_OVERFLOW) => {
+                                    return Ok(Value::Double(if neg { f64::NEG_INFINITY } else { f64::INFINITY }))
+                                }
+                                fire_crab_ods::decfloat::Dec::Nan if !decfloat_trapped(DF_TRAP_INVALID) => {
+                                    return Ok(Value::Double(f64::NAN))
+                                }
                                 fire_crab_ods::decfloat::Dec::Infinity { .. } => {
                                     return Err(EvalErr::FloatOverflowBare)
                                 }
@@ -107316,8 +107675,9 @@ impl Expr {
                             // a finite value past the double's range is the
                             // same bare float overflow (measured on 2182:
                             // `CAST(CAST('1e400' AS DECFLOAT(34)) AS DOUBLE
-                            // PRECISION)`; '1e-400' is 0)
-                            if f.is_infinite() {
+                            // PRECISION)`; '1e-400' is 0) - the Overflow
+                            // trap, so untrapped it is the Infinity
+                            if f.is_infinite() && decfloat_trapped(DF_TRAP_OVERFLOW) {
                                 return Err(EvalErr::FloatOverflowBare);
                             }
                             Value::Double(f)
@@ -107534,6 +107894,9 @@ impl Expr {
                     vs.push(v);
                 }
                 match f {
+                    SysFn::Quantize | SysFn::NormalizeDecfloat | SysFn::CompareDecfloat | SysFn::TotalOrder => {
+                        dec_fn_eval(f, &vs)?
+                    }
                     // a marker over the lowered `||` ([blob_append_target])
                     SysFn::BlobAppend => {
                         if vs.is_empty() {
@@ -107888,8 +108251,20 @@ impl Expr {
                                     }
                                 }
                                 "DECFLOAT_ROUND" => Value::Text("HALF_UP".into()),
+                                // the session's mask, in the engine's order;
+                                // an empty one is `None` (measured)
                                 "DECFLOAT_TRAPS" => {
-                                    Value::Text("Division_by_zero,Invalid_operation,Overflow".into())
+                                    let m = DECFLOAT_TRAPS.with(|c| c.get());
+                                    let names: Vec<&str> = [
+                                        (DF_TRAP_DIV, "Division_by_zero"),
+                                        (DF_TRAP_INVALID, "Invalid_operation"),
+                                        (DF_TRAP_OVERFLOW, "Overflow"),
+                                    ]
+                                    .iter()
+                                    .filter(|(b, _)| m & b != 0)
+                                    .map(|(_, n)| *n)
+                                    .collect();
+                                    Value::Text(if names.is_empty() { "None".into() } else { names.join(",") })
                                 }
                                 "EXT_CONN_POOL_SIZE"
                                 | "EXT_CONN_POOL_IDLE_COUNT"
@@ -108608,8 +108983,38 @@ impl Expr {
                                 }
                             }
                         };
+                        // a trap the session stood down (SET DECFLOAT TRAPS)
+                        // answers the special value instead, each trap on
+                        // its own: Invalid is NaN, an overflow or a zero
+                        // divisor the Infinity of the TRUE result's sign -
+                        // `POWER(-10, 7001)` -Infinity, `LOG(1, 0.5)` (ln 0.5
+                        // over ln 1) -Infinity, `POWER(-8, 0.5)` NaN, `EXP(1E5)`
+                        // Infinity (measured on 2196)
+                        let below_one = |d: &Dec| cmp(d, &Dec::Finite { neg: false, coeff: 1, exp: 0 }) == std::cmp::Ordering::Less;
+                        let odd_int = |d: &Dec| match *d {
+                            Dec::Finite { coeff, exp: 0, .. } => coeff % 2 == 1,
+                            Dec::Finite { coeff, exp, .. } if exp < 0 && exp > -39 => {
+                                let p = 10u128.pow((-exp) as u32);
+                                coeff % p == 0 && (coeff / p) % 2 == 1
+                            }
+                            _ => false,
+                        };
+                        let neg = || match f {
+                            SysFn::Power => matches!(ds[0], Dec::Finite { neg: true, .. } | Dec::Infinity { neg: true }) && odd_int(&ds[1]),
+                            SysFn::Log => below_one(&ds[1]) != below_one(&ds[0]),
+                            _ => false,
+                        };
                         match r {
                             Ok(d) => Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&d)),
+                            Err(dm::MathErr::Invalid) if !decfloat_trapped(DF_TRAP_INVALID) => {
+                                Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&Dec::Nan))
+                            }
+                            Err(dm::MathErr::DivByZero) if !decfloat_trapped(DF_TRAP_DIV) => {
+                                Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&Dec::Infinity { neg: neg() }))
+                            }
+                            Err(dm::MathErr::Overflow) if !decfloat_trapped(DF_TRAP_OVERFLOW) => {
+                                Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&Dec::Infinity { neg: neg() }))
+                            }
                             Err(dm::MathErr::Invalid) => return Err(EvalErr::DecfloatInvalidOperation),
                             Err(dm::MathErr::DivByZero) => return Err(EvalErr::DecfloatDivideByZero),
                             Err(dm::MathErr::Overflow) => return Err(EvalErr::DecfloatOverflow),
@@ -121667,6 +122072,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
     // ALTER form also begins with a DDL verb.
     plan_set_generator(text)
         .or_else(|| plan_set_time_zone(text))
+        .or_else(|| plan_set_decfloat(text))
         .or_else(|| plan_set_statistics(text))
         .or_else(|| {
             if ddl_kw {
@@ -134912,6 +135318,8 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
             }
             match f {
                 SysFn::GetContext | SysFn::SetContext | SysFn::TzName => false,
+                // an operand's conversion, QUANTIZE's invalid operation
+                SysFn::Quantize | SysFn::NormalizeDecfloat | SysFn::CompareDecfloat | SysFn::TotalOrder => false,
                 // a start below 1, a negative length, a DATE past 9999
                 SysFn::Overlay | SysFn::FirstLastDay(..) => false,
                 SysFn::Upper
@@ -138077,6 +138485,7 @@ fn after_auth(
                     .find(|k| find_word(&up, k, 0) == Some(0));
                 if let Some((p, ps)) = plan_set_generator(&stmt_sql)
                     .or_else(|| plan_set_time_zone(&stmt_sql))
+                    .or_else(|| plan_set_decfloat(&stmt_sql))
                     .or_else(|| plan_set_statistics(&stmt_sql))
                     .map(|(p, ps)| (std::rc::Rc::new(p), std::rc::Rc::new(ps)))
                 {
@@ -138803,6 +139212,7 @@ fn after_auth(
                         | Plan::AlterColumnIdentity { .. }
                         | Plan::SetGenerator { .. }
                         | Plan::SetTimeZone { .. }
+                        | Plan::SetDecfloat { .. }
                         | Plan::SetTimeZoneRefused(_)
                 ) {
                     // DML and DDL execute here (not at fetch): write the

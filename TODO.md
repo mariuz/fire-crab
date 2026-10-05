@@ -122,8 +122,34 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       interpret").
 - [ ] A trigger compiled that way stores an empty RDB$DEBUG_INFO, as a procedure does; and a procedure this server
       created raises without the `At procedure .. line: L, col: C` item (no debug map to place it).
-- [ ] `SET DECFLOAT TRAPS TO [..]` / `SET DECFLOAT ROUND <mode>` refuse (session state; measured: untrapped 1/0 is
-      Infinity, 0/0 NaN, the context variable reads `None`, CEILING rounds at the 16th digit).
+- [x] `SET DECFLOAT TRAPS TO [..]` and the untrapped specials: x/0 +-Infinity, 0/0 NaN, overflow Infinity, an
+      untrapped NaN compares equal, a zero quotient/product keeps the XOR sign, the context variable renders the mask
+      (`qa/serve-real-dftraps.sh`). `SET DECFLOAT ROUND HALF_UP` is a no-op; recorded: every other mode refuses.
+- [x] The signed DECFLOAT zero (IEEE 754): unary minus flips it, `-0 + -0` is -0, `x / -Inf` is -0E-398 / -0E-6176;
+      an untrapped CAST overflow is Infinity (`serve-real-dftraps.sh` 5).
+- [ ] A NEGATED exact literal converts to DECFLOAT with its minus only under the engine's preferred-desc fold: `CAST(-0.0
+      AS DECFLOAT(16))` is -0.0 as a DECFLOAT item (and under COALESCE / `* 1` there), '0.0' cast on to VARCHAR, +0
+      under `|| ''` or in a WHERE; inside TOTALORDER `-0.00` keeps it and `-0` does not. Recorded (dftraps 4); +0 here.
+- [x] A stood-down DECFLOAT trap at a function (EXP/POWER/LOG, true sign), an aggregate (SUM/AVG/VAR/window) and a
+      conversion (0 at an exact target, the float's Infinity/NaN) - `serve-real-dftraps.sh` 6. BOUNDARY: a NaN into a
+      scaled BIGINT / INT128 untrapped is engine garbage (78863920565143470.08); refused here.
+- [x] QUANTIZE / NORMALIZE_DECFLOAT / COMPARE_DECFLOAT / TOTALORDER (`qa/serve-real-dffuncs.sh`): QUANTIZE HALF_UP
+      to y's exponent, Invalid past the precision; the first operand's DECFLOAT(34) or else DECFLOAT(16); COMPARE by
+      total order 0/1/2, 3 for a NaN; TOTALORDER IEEE -1/0/1. BOUNDARY: an sNaN / -NaN has no form here (refused).
+- [ ] GROUP BY a DECFLOAT-valued expression (ABS(A), NORMALIZE_DECFLOAT(A)) refuses (recorded in dffuncs 6).
+- [ ] PSQL has NO DECFLOAT slot: an EXECUTE BLOCK / procedure / function with a DECFLOAT parameter, output or
+      variable refuses whole (`RETURNS (R DECFLOAT(16)) .. R = 1` too; recorded in dffuncs 6). Engine answers: R = 1
+      is 1, `X + 1` over DECLARE X DECFLOAT(16) = 2 is 3, SELECT .. INTO R, a DECFLOAT(16) into a (34) output keeps
+      2.50, PD(X DECFLOAT(16)) RETURNS (R DECFLOAT(34)) R = X * 2 over 1.25 is 2.50 and over '3.5' 7.0. Admitting
+      the type in source_only_param alone is not enough - the block compile refuses elsewhere. Admitting the key is one line (parse_group_by's type_of guard) and
+      agrees for finite values, but it would carry the column path's NaN divergence (below) to a new router.
+- [ ] GROUP BY a DECFLOAT column holding a NaN (pre-existing): the engine's group break is its COMPARE of the group
+      head with the next sorted row - DECFLOAT(16) calls a NaN equal without raising, so Infinity and NaN merge
+      (`NaN 2`) and under `GROUP BY -A` the negated NaN sorts first and swallows every row (`0.00 6`); DECFLOAT(34)
+      raises 22000 there. Here every value is its own group.
+- [ ] GROUP BY / DISTINCT of equal DECFLOATs of different cohorts picks another representative (`1.0, 1, 1.00` groups
+      as 1.00 on the engine, 1.0 here; `2.00, 2.0` as 2.00, here 2.0; zeros alike). Not totalOrder - ORDER BY keeps
+      insertion order for the same rows - it is the engine sort's tie handling; MIN/MAX likewise row-order-dependent.
 - [x] `BLOB_APPEND(..)` (`qa/serve-real-blobappend.sh`); recorded: it describes Nullable where the engine says
       NOT NULL (and still delivers NULL).
 - [ ] Non-ASCII text CAST into a NONE text blob counts double (`OCTET_LENGTH(CAST('abcéé' AS BLOB SUB_TYPE TEXT
