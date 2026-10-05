@@ -47,7 +47,17 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       them as doubles - a FLOAT beside a FLOAT or an exact value in SINGLE precision, the engine's rule - and SUM / AVG
       fold them as doubles; a NaN, arithmetic and CAST over them still fail the run). Found: exe's SUM / AVG SKIPPED a
       non-exact operand (`HAVING SUM(D) > 1` answered no rows under the switch) and the window SUM would skip a scaled
-      one - both now fail the run instead.
+      one - both now fail the run instead; a double SUM / AVG declines too (its value depends on the summation ORDER and
+      it overflows to a raise - aggfold).
+      THE SWITCH-ON SWEEP AFTER SLICE 5 (2026-10-05, 4152 s): declines - compile 9852, the attachment's set text
+      output 3185, execute 1540, a lossy bound move 1008, own writes 763, BOOLEAN / DECFLOAT / INT128 / zoned outputs
+      (32764 274, 32762 660, 32752 567, 32760 181, 32754 156), BLOB 392, DOUBLE arithmetic. WRONG where it served, the
+      next closes: CHAR padding and LIKE / STARTING over CHAR conditionals and carriers (inselcond, condpattern,
+      carriermix); OCTETS / codepage text (litcs, octets, cscast, xlit, codepages: the 0x00 pad, NONE bytes); ICU and
+      key collations under joins and windows (icucoll, collkey FIRST_VALUE ties); a LIMBO record read without raising
+      (limbo); an EXECUTE BLOCK's own writes (readconsistency); the window offset raise over an empty table (aggplan);
+      a lazy COUNT overflow (ovlazy); a NULL-only outer's key raise (textcolcmp); SUBSTRING's BIGINT range (fnargs);
+      index-deferral trace cells (index, idxcost - artifacts).
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a

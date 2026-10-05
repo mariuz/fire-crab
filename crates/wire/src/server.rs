@@ -130487,6 +130487,19 @@ fn exe_select(
     if idents.iter().any(|n| !n.is_empty() && is_view(db, n)) {
         return decline("a view");
     }
+    // ...and a VIRTUAL or TEMPORARY relation the same way: joined to a user
+    // table, RDB$TIME_ZONES is not in the BLR's relation list either (the
+    // join answered no rows under the switch)
+    let image = db.bytes();
+    if idents.iter().any(|n| {
+        n.starts_with("MON$")
+            || n.starts_with("SEC$")
+            || matches!(n.as_str(), "RDB$CONFIG" | "RDB$KEYWORDS" | "RDB$TIME_ZONES")
+            || fire_crab_ods::resolve_relation(&image, db.page_size, n)
+                .is_some_and(|id| gtt_relations(db).iter().any(|(g, _)| *g == id))
+    }) {
+        return decline("a virtual or temporary relation");
+    }
     if blr_reads_codepage_relation(db, &compiled.blob) {
         return decline("a codepage relation");
     }

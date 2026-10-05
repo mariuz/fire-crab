@@ -162,9 +162,9 @@ route "4 a CAST to TIMESTAMP (the executor has no such cast)" declined "SELECT C
 route "4 a DOUBLE output" declined "SELECT CAST(N AS DOUBLE PRECISION) FROM T ORDER BY ID"
 echo "--- 10 the approximate kinds (slice 5): compared and folded as doubles, FLOAT beside FLOAT or exact in SINGLE precision"
 route "10 DOUBLE and FLOAT outputs" served "SELECT ID, R, D FROM A ORDER BY ID"
-route "10 SUM / AVG of FLOAT and DOUBLE are DOUBLE, MIN / MAX keep the kind" served "SELECT SUM(R), AVG(R), SUM(D), AVG(D), MIN(R), MAX(D) FROM A"
-route "10 HAVING SUM(D) - the fold skipped a double and answered NULL (no rows)" served "SELECT COUNT(*) FROM A HAVING SUM(D) > 1"
-route "10 ...AVG(R)" served "SELECT COUNT(*) FROM A HAVING AVG(R) > 0"
+route "10 SUM / AVG over the approximate kinds decline (the sum depends on its order and overflows to a raise: aggfold)" declined "SELECT SUM(R), AVG(R), SUM(D), AVG(D), MIN(R), MAX(D) FROM A"
+route "10 HAVING SUM(D) - the fold SKIPPED a double and answered no rows; it declines now" declined "SELECT COUNT(*) FROM A HAVING SUM(D) > 1"
+route "10 ...AVG(R)" declined "SELECT COUNT(*) FROM A HAVING AVG(R) > 0"
 route "10 a FLOAT 0.1 is NOT > 0.1: single precision" served "SELECT ID FROM A WHERE R > 0.1 ORDER BY ID"
 route "10 ...and = 0.1" served "SELECT ID FROM A WHERE R = 0.1 ORDER BY ID"
 route "10 a FLOAT beside a DOUBLE compares in double" served "SELECT ID FROM A WHERE R < D ORDER BY ID"
@@ -173,6 +173,7 @@ route "10 sorted DESC, NULLs" served "SELECT ID, R FROM A ORDER BY R DESC"
 route "10 GROUP BY / DISTINCT a FLOAT" served "SELECT R, COUNT(*) FROM A GROUP BY R ORDER BY 1"
 route "10 IN over a FLOAT (dsql: an IN list beside a non-exact operand is unprobed)" declined "SELECT ID FROM A WHERE R IN (0.1, 1.5) ORDER BY ID"
 route "10 BETWEEN over a DOUBLE" served "SELECT ID, D FROM A WHERE D BETWEEN 0 AND 3 ORDER BY D"
+route "10 MIN / MAX keep the kind" served "SELECT MIN(R), MAX(D), MAX(R) FROM A"
 route "10 arithmetic over a double still declines" declined "SELECT D * 2 FROM A ORDER BY ID"
 echo "--- 9 system relations: their formats are built in, never stored (slice 4)"
 route "9 a SYSTEM relation, numeric outputs" served "SELECT RDB\$RELATION_ID, RDB\$SYSTEM_FLAG FROM RDB\$RELATIONS WHERE RDB\$RELATION_ID < 12 ORDER BY 1"
@@ -209,5 +210,5 @@ if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 61 ]; then echo "FAIL only $ran checks ran (floor 61) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 62 ]; then echo "FAIL only $ran checks ran (floor 62) - cells went missing"; fail=1; fi
 exit $fail

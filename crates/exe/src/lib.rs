@@ -3037,10 +3037,14 @@ impl<'a> Exec<'a> {
                     // approximate one as a double; any OTHER non-NULL
                     // operand fails the run - skipping it answered a NULL
                     // SUM (`HAVING SUM(D) > 1` lost every group)
-                    (fold @ Fold::Sum(None), _, Some(Value::Double(d))) => *fold = Fold::SumD(d),
-                    (fold @ Fold::Sum(None), _, Some(Value::Float(x))) => *fold = Fold::SumD(x as f64),
-                    (fold @ Fold::Avg(None), _, Some(Value::Double(d))) => *fold = Fold::AvgD(d, 1),
-                    (fold @ Fold::Avg(None), _, Some(Value::Float(x))) => *fold = Fold::AvgD(x as f64, 1),
+                    // ...but NOT summed here: a double sum depends on its
+                    // ORDER (1, 1E155, -1E155 is 0 in the engine's order and
+                    // 1 in another) and overflows to a raise, neither of
+                    // which this fold reproduces (aggfold under the switch) -
+                    // an approximate operand fails the run
+                    (Fold::Sum(None) | Fold::Avg(None), _, Some(Value::Double(_) | Value::Float(_))) => {
+                        return Err("SUM / AVG over an approximate operand unconverted".into());
+                    }
                     (Fold::SumD(acc), _, Some(v)) => match v {
                         Value::Null => {}
                         Value::Double(d) => *acc += d,
