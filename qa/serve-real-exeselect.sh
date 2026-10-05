@@ -48,6 +48,9 @@ INSERT INTO W VALUES (3, NULL, NULL);
 INSERT INTO W VALUES (4, 'abc', 'ab');
 CREATE TABLE X (ID INT, P VARCHAR(5) CHARACTER SET WIN1252);
 INSERT INTO X VALUES (1, 'x');
+CREATE VIEW VT AS SELECT ID, N FROM T WHERE ID < 3;
+CREATE TABLE E (ID INT, N INT);
+CREATE INDEX E_N ON E (N);
 COMMIT;\n" "$REAL" "$ENG" "$U" "$P" | "$ISQL" -q -b > /tmp/exs-build.log 2>&1
 [ -s "$ENG" ] || { echo "FAIL fixture not created"; sed 's/^/   /' /tmp/exs-build.log; exit 1; }
 cp "$ENG" "$FC"; chmod 666 "$FC"
@@ -105,11 +108,54 @@ CS=UTF8 route "6 ...GROUP BY a CHAR" served "SELECT K, COUNT(*) FROM W GROUP BY 
 CS=UTF8 route "6 ...LIKE / STARTING WITH" served "SELECT ID, V FROM W WHERE V STARTING WITH 'c' OR V LIKE 'Z%' ORDER BY 1"
 route "6 UTF8 outputs under a NONE attachment" served "SELECT ID, V FROM W ORDER BY ID"
 
+echo "--- 7 bound parameters (slice 3): each ? an input of the procedure, typed as the prepare described it"
+if command -v node >/dev/null 2>&1 && node -e 'require("node-firebird")' 2>/dev/null; then
+qmsg() { FC_DB="$2" FC_PORT="$1" FC_Q="$3" FC_P="$4" timeout 25 node -e '
+  process.on("uncaughtException",()=>{console.log("CONN_ERR");process.exit(1);});
+  const F=require("node-firebird");
+  const fmt=r=>(!r||!r.length)?"(none)":r.map(x=>Object.values(x).join()).join(";");
+  F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,user:"SYSDBA",password:"masterkey",encoding:"UTF8"},(e,db)=>{
+    if(e){console.log("CONN_ERR");process.exit(1);}
+    db.query(process.env.FC_Q,JSON.parse(process.env.FC_P),(e2,r)=>{
+      console.log(e2?("ERR "+e2.message.replace(/\s+/g," ").trim()):("rows "+fmt(r)));
+      db.detach();process.exit(0);
+    });
+  });' 2>/dev/null; }
+proute() { # <label> <served|declined> <sql> <json params>
+    ran=$((ran + 1))
+    local e c before after pat
+    pat="exe_select served [0-9]* rows: \"$(printf '%s' "$3" | sed 's/[][\.*^$/]/\\&/g')\""
+    e=$(qmsg "$REAL" "$ENG" "$3" "$4"); before=$(grep -ac "$pat" "$LOG")
+    c=$(qmsg "$PORT" "$FC" "$3" "$4"); after=$(grep -ac "$pat" "$LOG")
+    local by; [ "$after" -gt "$before" ] && by=served || by=declined
+    case "$e$c" in *CONN_ERR*) echo "FAIL $1 - a connection died [$e] [$c]"; fail=1; return;; esac
+    if [ "$e" != "$c" ]; then echo "DIFF $1 (the BLR path $by it)"; echo "     eng=[$e]"; echo "     fc =[$c]"; fail=1
+    elif [ "$by" != "$2" ]; then echo "FAIL $1 - the BLR path $by it, the cell says $2"; fail=1
+    else echo "OK   $1 ($by) [$e]"; fi
+}
+proute "7 an INTEGER parameter in a range" served "SELECT ID FROM T WHERE ID > ? ORDER BY ID" '[1]'
+proute "7 two parameters, BETWEEN, an aggregate" served "SELECT COUNT(*), SUM(N) FROM T WHERE ID BETWEEN ? AND ?" '[2, 4]'
+proute "7 a text parameter against a UTF8 column" served "SELECT ID, V FROM W WHERE V = ? ORDER BY ID" '["café"]'
+proute "7 LIKE a parameter" served "SELECT ID FROM W WHERE V LIKE ? ORDER BY ID" '["%e%"]'
+proute "7 a CHAR column's padding against a parameter" served "SELECT ID, K FROM W WHERE K = ? ORDER BY ID" '["ab"]'
+proute "7 FIRST with a parameterised filter" served "SELECT FIRST 1 ID FROM T WHERE ID >= ? ORDER BY ID DESC" '[1]'
+proute "7 a NULL bound" served "SELECT COUNT(*) FROM T WHERE N = ?" '[null]'
+proute "7 a DATE parameter" served "SELECT ID FROM T WHERE D < ? ORDER BY ID" '["2024-02-01"]'
+echo "--- 8 DECLINED bound values: the engine compares what the move would change"
+proute "8 a fractional bound against an INTEGER slot - no row equals 2.4, the move made it 2" declined "SELECT ID FROM T WHERE ID = ? ORDER BY ID" '["2.4"]'
+proute "8 ...COALESCE of 1.25 described INTEGER - the executor kept the double and encoded 0" declined "SELECT COALESCE(?, 0) FROM T WHERE ID = 1" '[1.25]'
+proute "8 a TIMESTAMP message into a TIME slot - the engine promotes the TIME to TODAY" declined "SELECT ID FROM T WHERE IIF(TM = ?, 1, 0) = 1 ORDER BY ID" '["2024-01-10 10:00:00"]'
+proute "8 a negated parameter - the executor's negate cannot know the overflow" declined "SELECT ID FROM T WHERE -CAST(? AS INTEGER) = -2" '[2]'
+proute "8 control: a whole number bound is served" served "SELECT ID FROM T WHERE ID = ? ORDER BY ID" '[2]'
+else echo "SKIP 7 node-firebird not resolvable"; fi
+
 echo "--- 4 DECLINED: the interpreter answers, right"
 route "4 a codepage relation (the executor orders by code point, WIN1252 by byte)" declined "SELECT ID FROM X ORDER BY ID"
 route "4 a DATE literal in the predicate (the BLR compiler takes none)" declined "SELECT ID FROM T WHERE D > DATE '2024-02-01' ORDER BY ID"
 route "4 a CAST to TIMESTAMP (the executor has no such cast)" declined "SELECT CAST(D AS TIMESTAMP) FROM T ORDER BY ID"
 route "4 a DOUBLE output" declined "SELECT CAST(N AS DOUBLE PRECISION) FROM T ORDER BY ID"
+route "4 a view joined to a table (the BLR's relation list names only the base: COUNT 0)" declined "SELECT COUNT(*) FROM VT JOIN U ON U.T_ID = VT.ID"
+route "4 a text literal against an INTEGER over an EMPTY indexed table (the engine raises at compile)" declined "SELECT ID FROM E WHERE N = 'x'"
 
 echo "--- 5 the BLR compiler: an ORDER BY ordinal is the item it names"
 both() { ran=$((ran + 1)); local e c; e=$(run "127.0.0.1/$REAL:$ENG" "$2"); c=$(run "127.0.0.1/$PORT:$FC" "$2")
@@ -137,5 +183,5 @@ if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 28 ]; then echo "FAIL only $ran checks ran (floor 28) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 43 ]; then echo "FAIL only $ran checks ran (floor 43) - cells went missing"; fail=1; fi
 exit $fail

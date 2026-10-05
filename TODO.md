@@ -23,10 +23,38 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       kinds order now, and a pair of non-NULL values exe cannot order FAILS the run instead of answering; dsql
       refused an ORDER BY ordinal (CREATE PROCEDURE .. ORDER BY 1 was refused) - it compiles byte-for-byte now.
       Slice 2: text outputs in their own set (a plain column's, an expression's real set) - declined under a COLLATED
-      relation and a CODEPAGE relation (the executor orders by code point). Next slices: parameters, the attachment's
-      set (ATT_SUBTYPE outputs), DOUBLE / BOOLEAN / DECFLOAT in the BLR compiler and the executor.
+      relation and a CODEPAGE relation (the executor orders by code point). Slice 3: bound parameters (each `?` an
+      input of the procedure, typed as the prepare described it, and every value MOVED into its slot - declined where
+      the move would change it, since the engine COMPARES a bound 2.4 against an INTEGER slot unrounded; a temporal
+      served only in its slot's own kind, a midnight TIMESTAMP into a DATE slot being its date). Next slices: the attachment's set (ATT_SUBTYPE
+      outputs), DOUBLE / BOOLEAN / DECFLOAT in the BLR compiler and the executor.
+      THE SWITCH-ON SWEEP (2026-10-05, all 523 gates with FC_EXEC_SELECT=1; the route stays OFF until these close):
+      served ~2200 statements, declined ~10000 - compile 4485 (dsql), execute 2370 (exe: an unorderable comparison 939
+      - DOUBLE / cross-type; "relation has no format" 539 - system relations; LIKE / STARTING over a non-text 493;
+      arithmetic over a non-numeric 256), the attachment's-set text output 653, a parameter type 426. WRONG where it
+      served, to close or decline FIRST: (1) exe reads the COMMITTED image, not the attachment's own uncommitted writes
+      (viewdml, stalefmt, fnwhere: a SELECT after an UPDATE in one transaction shows the old rows); (2) a VIEW reads as
+      EMPTY (view, viewjoin, viewrename); (3) a join predicate's conversion error raises on the engine and answers rows
+      here (textnumwhere); (4) cmpparam's 204 cells. And speed: idxcost / leftjoinindex take minutes (no index use).
+      CLOSED BY DECLINING (slice 3): (1) any transaction with writes; (2) any identifier of the text naming a view (the
+      BLR's relation list names a joined view's BASE only); (3) a text literal compared with a non-text column unless
+      a plain decimal against an integer (exe::shape walks the request); (4) a lossy parameter move, a temporal
+      parameter of another kind, a negated non-literal (exe's negate cannot know the overflow); and an output value
+      not of its column's kind. selparam / view / viewjoin / textnumwhere / cmpparam green under the switch.
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
+- [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a
+      text literal that cannot convert raises 22018 on the engine before any row - fire-crab has this law for a single
+      table's WHERE only (`Predicate::key_conversion`). Over an EMPTY indexed `E(N INT)` with `T` holding 2 rows the
+      engine RAISES and fire-crab answers rows for: `T LEFT JOIN E ON E.ID = T.ID AND E.N = 'x'` (fc: 1, 2), `T LEFT
+      JOIN E ON E.N = 'x'`, `T LEFT JOIN E ON E.N > 'x'`, `T JOIN E ON E.N = 'x'` (fc: none), `T LEFT JOIN E ON ..
+      WHERE E.N = 'x'`, `EXISTS (SELECT 1 FROM E WHERE E.N = 'x')`, `T.ID IN (SELECT E.ID FROM E WHERE E.N = 'x')`,
+      `(SELECT COUNT(*) FROM E WHERE E.N = 'x')` in the projection (fc: 0, 0). Unindexed `E2`: both agree (LEFT 1, 2;
+      INNER none). TIMING, measured: the inner's key is built when the inner OPENS - per surviving outer row - so an
+      EMPTY outer (`Z LEFT JOIN E ON E.N = 'x'`, `Z JOIN ..`) answers none, as does an outer filtered to nothing first
+      (`.. JOIN E ON E.ID = T.ID AND E.N = 'x' WHERE T.ID = 5`, LEFT too, `WHERE 1 = 0`) and a scalar subselect over an
+      empty Z; but an UNCORRELATED EXISTS is an invariant evaluated at open - it raises over an empty Z and beside
+      `T.ID = 5 AND ..`; `E RIGHT JOIN T ON E.N = 'x'` raises (T is the outer).
 - [ ] **P2** The FLOAT/ROUND/DECFLOAT wrong answers first; then the rounds 6–8 items still refused (mixed multi-clause ALTER TABLE, `WHERE CURRENT OF` via `RDB$DB_KEY`) - the rest re-measured and agrees
 - [ ] **P2** DECFLOAT left: GROUP BY a DECFLOAT expression (NaN / cohort laws). (Done: CREATE PROCEDURE / FUNCTION with a DECFLOAT parameter; `SET DECFLOAT ROUND` - all eight modes, dftraps 7)
 - [x] **P2** DECFLOAT traps, specials, signed zero, the four DECFLOAT functions (`e07317d`); DECFLOAT in PSQL (`7fdb054`)

@@ -130014,8 +130014,14 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
 /// descriptor). Every step that declines - the compile, the parse, a
 /// generator, a runtime error, a message of another shape - leaves the
 /// statement to the interpreter, which answers it as it always has.
-fn exe_select(plan: &Plan, sql: &str, database: &Option<Database>, args: &[WireParam]) -> Option<Plan> {
-    if std::env::var("FC_EXEC_SELECT").is_err() || !args.is_empty() {
+fn exe_select(
+    plan: &Plan,
+    sql: &str,
+    database: &Option<Database>,
+    args: &[WireParam],
+    params: &[Descriptor],
+) -> Option<Plan> {
+    if std::env::var("FC_EXEC_SELECT").is_err() || args.len() != params.len() {
         return None;
     }
     let db = database.as_ref()?;
@@ -130034,6 +130040,71 @@ fn exe_select(plan: &Plan, sql: &str, database: &Option<Database>, args: &[WireP
     let cols = output_cols_of(plan);
     if cols.is_empty() {
         return decline("no output columns");
+    }
+    // SLICE 3, THE PARAMETERS: each `?` (outside a literal) becomes the
+    // procedure's input `:FC$P<i>`, typed as the prepare described the
+    // slot, and the bound values are its input message
+    let masked = mask_literals(text);
+    let marks: Vec<usize> = masked.char_indices().filter(|(_, c)| *c == '?').map(|(i, _)| i).collect();
+    if marks.len() != params.len() {
+        return decline("parameter marks");
+    }
+    let mut body = String::with_capacity(text.len() + 8 * marks.len());
+    let mut from = 0;
+    for (i, at) in marks.iter().enumerate() {
+        body.push_str(&text[from..*at]);
+        body.push_str(&format!(":FC$P{}", i));
+        from = at + 1;
+    }
+    body.push_str(&text[from..]);
+    let mut in_decls = Vec::with_capacity(params.len());
+    for (i, d) in params.iter().enumerate() {
+        if !matches!(
+            d.dtype,
+            dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::TEXT | dtype::VARYING | dtype::SQL_DATE | dtype::SQL_TIME | dtype::TIMESTAMP
+        ) {
+            return decline("a parameter type");
+        }
+        in_decls.push(format!("FC$P{} {}", i, desc_type_sql_cs(d)));
+    }
+    let mut in_vals = Vec::with_capacity(args.len());
+    for (a, d) in args.iter().zip(params) {
+        // a TEMPORAL value is served only in its slot's OWN kind: the engine
+        // does NOT move a TIMESTAMP message into a TIME slot before it
+        // compares (`TM = ?` bound '2024-01-10 12:30:00' promotes the TIME to
+        // TODAY's timestamp and matches nothing; the move matched the row),
+        // and a text message into a temporal slot has laws of its own
+        // (cmpparam's X2 under the switch) - any other pairing declines
+        let v = match (a, d.dtype) {
+            // (a MIDNIGHT timestamp - a driver's date text - compares as
+            // its date: the promoted column and the value agree)
+            (WireParam::Date(x), dtype::SQL_DATE) | (WireParam::Timestamp(x, 0), dtype::SQL_DATE) => Value::Date(*x),
+            (WireParam::Time(t), dtype::SQL_TIME) => Value::Time(*t),
+            (WireParam::Timestamp(x, t), dtype::TIMESTAMP) => Value::Timestamp(*x, *t),
+            (_, dtype::SQL_DATE | dtype::SQL_TIME | dtype::TIMESTAMP) => return decline("a temporal parameter of another kind"),
+            _ => match wireparam_arg_value(a) {
+                Some(v) => v,
+                None => return decline("a bound value"),
+            },
+        };
+        // ...and every value is MOVED into its slot's type the way this
+        // server's own CAST moves it (a JS 1.25 bound where the prepare
+        // described an INTEGER is 1; the executor kept the double, and the
+        // INTEGER output encoded it as 0 - selparam under the switch); a
+        // conversion that raises is the interpreter's to answer
+        let v = match (&v, slot_cast_target(d)) {
+            (Value::Null, _) => v,
+            (_, Some(t)) => match Expr::Cast(Box::new(Expr::Col(0)), t, fire_crab_ods::intl::CS_UTF8).eval(std::slice::from_ref(&v)) {
+                // ...but only where the move LOSES nothing: the engine
+                // COMPARES a bound 2.4 against an INTEGER slot exactly (no
+                // row equals it) while the move rounds it to 2 (cmpparam)
+                Ok(c) if matches!(fire_crab_exe::value_cmp(&v, &c), Some(std::cmp::Ordering::Equal)) => c,
+                Ok(_) => return decline("a bound value the slot rounds"),
+                Err(_) => return decline("a bound value's conversion"),
+            },
+            (_, None) => return decline("a parameter type"),
+        };
+        in_vals.push(v);
     }
     let mut decls = Vec::with_capacity(cols.len());
     let mut slots = Vec::with_capacity(cols.len());
@@ -130078,10 +130149,12 @@ fn exe_select(plan: &Plan, sql: &str, database: &Option<Database>, args: &[WireP
         decls.push(format!("FC$O{} {}", i, ty));
         slots.push(format!(":FC$O{}", i));
     }
+    let ins = if in_decls.is_empty() { String::new() } else { format!("({}) ", in_decls.join(", ")) };
     let synth = format!(
-        "CREATE PROCEDURE FC$SELECT RETURNS ({}) AS BEGIN FOR {} INTO {} DO SUSPEND; END",
+        "CREATE PROCEDURE FC$SELECT {}RETURNS ({}) AS BEGIN FOR {} INTO {} DO SUSPEND; END",
+        ins,
         decls.join(", "),
-        text,
+        body,
         slots.join(", ")
     );
     let funcs = plain_function_arities(database);
@@ -130089,7 +130162,7 @@ fn exe_select(plan: &Plan, sql: &str, database: &Option<Database>, args: &[WireP
     let compiled = fire_crab_dsql::compile_procedure_full_with_funcs(&synth, &funcs);
     fire_crab_dsql::set_catalog(Vec::new());
     let Some(compiled) = compiled else { return decline("compile") };
-    if compiled.calls_user_fn || compiled.outs.len() != cols.len() {
+    if compiled.calls_user_fn || compiled.outs.len() != cols.len() || compiled.ins.len() != params.len() {
         return decline("compile shape");
     }
     // THE EXECUTOR COMPARES TEXT BY CODE POINT, blank-trimmed: right for
@@ -130098,6 +130171,46 @@ fn exe_select(plan: &Plan, sql: &str, database: &Option<Database>, args: &[WireP
     // set, which orders by its BYTES (WIN1252's 0xE9 against 'z')
     if blr_reads_collated_relation(db, &compiled.blob) {
         return decline("a collated relation");
+    }
+    // THE EXECUTOR READS THE COMMITTED IMAGE: a transaction that has
+    // written sees its own rows here and not there (a SELECT after an UPDATE
+    // in one transaction answered the old rows - the switch-on sweep's
+    // viewdml / stalefmt / fnwhere) - and a VIEW has no data pages to scan
+    // (it answered EMPTY: view, viewjoin)
+    if db.tx.is_some() || !db.nested_tx.is_empty() {
+        return decline("the transaction's own writes");
+    }
+    match fire_crab_ods::blr::decode(&compiled.blob) {
+        Ok(decoded) if decoded.relations.iter().any(|n| is_view(db, n.trim_end())) => {
+            return decline("a view");
+        }
+        Ok(_) => {}
+        Err(_) => return decline("an undecodable BLR"),
+    }
+    // ...and the BLR's relation list does not name a view joined to a table
+    // (viewjoin answered COUNT 0 under the switch): every identifier the
+    // TEXT spells is asked instead, a superset of the names it reads
+    // (a string literal is skipped; a quoted name is kept as spelled)
+    let mut idents = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut in_str = false;
+    for ch in text.chars() {
+        if in_str || (!quoted && ch == '\'') {
+            if ch == '\'' { in_str = !in_str; }
+            if !cur.is_empty() { idents.push(std::mem::take(&mut cur)); }
+        } else if ch == '"' {
+            if quoted { idents.push(std::mem::take(&mut cur)); }
+            quoted = !quoted;
+        } else if quoted || ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+            cur.push(if quoted { ch } else { ch.to_ascii_uppercase() });
+        } else if !cur.is_empty() {
+            idents.push(std::mem::take(&mut cur));
+        }
+    }
+    idents.push(cur);
+    if idents.iter().any(|n| !n.is_empty() && is_view(db, n)) {
+        return decline("a view");
     }
     if blr_reads_codepage_relation(db, &compiled.blob) {
         return decline("a codepage relation");
@@ -130109,7 +130222,44 @@ fn exe_select(plan: &Plan, sql: &str, database: &Option<Database>, args: &[WireP
     if req.uses_generators {
         return decline("generators");
     }
-    let sends = match fire_crab_exe::bind_and_execute_mode(&db.bytes(), db.page_size, &req, &[], false) {
+    // A TEXT LITERAL AGAINST A NON-TEXT COLUMN is converted when the engine
+    // compiles the request: `N = 'x'` raises 22018 over an EMPTY indexed
+    // table and beside an empty join inner, where the executor compares
+    // nothing and answers no rows (textnumwhere under the switch). Only a
+    // plain decimal against a numeric column is served here
+    {
+        let image = db.bytes();
+        let ps = db.page_size;
+        let plain_decimal = |t: &str| {
+            let t = t.trim().trim_start_matches(['+', '-']);
+            let (a, b) = t.split_once('.').unwrap_or((t, ""));
+            !(a.is_empty() && b.is_empty())
+                && a.bytes().all(|c| c.is_ascii_digit())
+                && b.bytes().all(|c| c.is_ascii_digit())
+        };
+        let shape = fire_crab_exe::shape(&req);
+        if shape.negates {
+            return decline("a negated value");
+        }
+        for (rel, field, lit) in shape.text_cmps {
+            let Some(id) = fire_crab_ods::catalog::resolve_relation(&image, ps, &rel) else {
+                return decline("a text literal against an unresolved field");
+            };
+            let cols = fire_crab_ods::catalog::relation_columns(&image, ps, &rel);
+            let fid = cols.iter().find(|c| c.name.trim_end() == field.trim_end()).map(|c| c.field_id as usize);
+            let formats = fire_crab_ods::format::relation_formats(&image, ps, id);
+            let desc = fid.and_then(|f| formats.iter().max_by_key(|(n, _)| *n).and_then(|(_, d)| d.get(f).cloned()));
+            let Some(d) = desc else {
+                return decline("a text literal against an unresolved field");
+            };
+            match col_kind(&d) {
+                Some(ColKind::Text) => {}
+                Some(ColKind::Int) if plain_decimal(&lit) => {}
+                _ => return decline("a text literal against a non-text column"),
+            }
+        }
+    }
+    let sends = match fire_crab_exe::bind_and_execute_mode(&db.bytes(), db.page_size, &req, &in_vals, false) {
         Ok(s) => s,
         Err(e) => return decline(&format!("execute ({})", e)),
     };
@@ -130135,6 +130285,21 @@ fn exe_select(plan: &Plan, sql: &str, database: &Option<Database>, args: &[WireP
                 })
                 .collect(),
         );
+    }
+    // THE VALUES MUST BE OF THEIR COLUMNS' KINDS: an executor value the
+    // column's wire form does not encode (a double in an INTEGER slot) would
+    // go out as garbage - decline instead
+    let kind_ok = |c: &ProjCol, v: &Value| -> bool {
+        match (c.sql_type & !1, v) {
+            (_, Value::Null) => true,
+            (500 | 496 | 580, Value::Int(_) | Value::Scaled(..)) => true,
+            (570, Value::Date(_)) | (560, Value::Time(_)) | (510, Value::Timestamp(..)) => true,
+            (448 | 452, Value::Text(_)) => true,
+            _ => false,
+        }
+    };
+    if rows.iter().any(|r: &Vec<Value>| r.iter().zip(&cols).any(|(v, c)| !kind_ok(c, v))) {
+        return decline("an output value's kind");
     }
     if std::env::var("FC_SRV_TRACE").is_ok() || std::env::var("FC_EXEC_SELECT_TRACE").is_ok() {
         eprintln!("[srv] exe_select served {} rows: {:?}", rows.len(), text);
@@ -140398,7 +140563,7 @@ fn after_auth(
                     }
                     continue;
                 } else if let Some(p) = (!plan_has_procselect(&plan))
-                    .then(|| exe_select(&plan, &stmt_sql, &database, &bound_args))
+                    .then(|| exe_select(&plan, &stmt_sql, &database, &bound_args, &stmt_params))
                     .flatten()
                 {
                     // THE BLR PATH SERVES IT ([exe_select], FC_EXEC_SELECT)

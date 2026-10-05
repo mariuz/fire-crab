@@ -3731,6 +3731,139 @@ thread_local! {
     static INCOMPARABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Every comparison of a FIELD with a TEXT LITERAL in the request, as
+/// (relation, field, literal) - the operands the engine CONVERTS when it
+/// compiles the request, before any row is read: `N = 'x'` against an
+/// INTEGER raises 22018 on the engine even over an EMPTY indexed table
+/// (an index key is built from it) and beside an empty join inner, where
+/// this executor compares nothing and answers no rows. A caller that
+/// cannot prove every such literal converts declines the request.
+/// `negates` says a NON-LITERAL value is negated somewhere: this executor's
+/// negate does not know its operand's type, so `-CAST(? AS INTEGER)` over
+/// -2147483648 answers where the engine raises an integer overflow.
+pub struct Shape {
+    pub text_cmps: Vec<(String, String, String)>,
+    pub negates: bool,
+}
+
+pub fn shape(req: &Request) -> Shape {
+    #[derive(Default)]
+    struct W {
+        ctx: std::collections::HashMap<u8, String>,
+        cmps: Vec<(u8, String, String)>,
+        negates: bool,
+    }
+    impl W {
+        fn pair(&mut self, a: &Expr, b: &Expr) {
+            match (a, b) {
+                (Expr::Field(c, f), Expr::Literal(Value::Text(t)))
+                | (Expr::Literal(Value::Text(t)), Expr::Field(c, f)) => {
+                    self.cmps.push((*c, f.clone(), t.clone()))
+                }
+                _ => {}
+            }
+            self.expr(a);
+            self.expr(b);
+        }
+        fn expr(&mut self, e: &Expr) {
+            match e {
+                Expr::Arith(_, a, b) => { self.expr(a); self.expr(b) }
+                Expr::Negate(a) if !matches!(**a, Expr::Literal(_)) => { self.negates = true; self.expr(a) }
+                Expr::Negate(a) | Expr::CaseMap(_, a) | Expr::StrLen(_, a) | Expr::Trim(_, a) | Expr::Cast(_, a) => self.expr(a),
+                Expr::GenId(_, Some(a)) => self.expr(a),
+                Expr::Substr(a, b, c) => { self.expr(a); self.expr(b); self.expr(c) }
+                Expr::Coalesce(v) | Expr::Function(_, _, v) => v.iter().for_each(|x| self.expr(x)),
+                Expr::Decode(a, c, r) => {
+                    self.expr(a);
+                    for x in c { self.pair(a, x) }
+                    r.iter().for_each(|x| self.expr(x))
+                }
+                Expr::ValueIf(c, a, b) => { self.boolean(c); self.expr(a); self.expr(b) }
+                Expr::Via(r, a, b) => { self.rse(r); self.expr(a); self.expr(b) }
+                _ => {}
+            }
+        }
+        fn boolean(&mut self, b: &Bool) {
+            match b {
+                Bool::Cmp(_, x, y) | Bool::Like(x, y) | Bool::Starting(x, y) => self.pair(x, y),
+                Bool::And(x, y) | Bool::Or(x, y) => { self.boolean(x); self.boolean(y) }
+                Bool::Not(x) => self.boolean(x),
+                Bool::Missing(x) => self.expr(x),
+                Bool::InList(x, v) => v.iter().for_each(|y| self.pair(x, y)),
+                Bool::Between(x, lo, hi) => { self.pair(x, lo); self.pair(x, hi) }
+                Bool::Any(r) | Bool::UniqueRse(r) => self.rse(r),
+                Bool::Quantified { rse, .. } => self.rse(rse),
+            }
+        }
+        fn rse(&mut self, r: &Rse) {
+            self.stream(&r.stream);
+            if let Some(b) = &r.boolean { self.boolean(b) }
+            r.sort.iter().for_each(|k| self.expr(&k.expr));
+            r.project.iter().for_each(|x| self.expr(x));
+            for x in r.first.iter().chain(r.skip.iter()) { self.expr(x) }
+        }
+        fn stream(&mut self, s: &Stream) {
+            match s {
+                Stream::Relation { name, context } => { self.ctx.insert(*context, name.clone()); }
+                Stream::Aggregate(a) => {
+                    self.rse(&a.source);
+                    a.group_by.iter().for_each(|x| self.expr(x));
+                    for (_, m) in &a.map {
+                        match m { MapItem::Agg(_, Some(x)) | MapItem::Value(x) => self.expr(x), _ => {} }
+                    }
+                }
+                Stream::Join { streams, on, .. } => {
+                    for j in streams {
+                        match j {
+                            JoinSource::Rel(js) => { self.ctx.insert(js.context, js.name.clone()); }
+                            JoinSource::Nested(n) => self.stream(n),
+                        }
+                    }
+                    if let Some(b) = on { self.boolean(b) }
+                }
+                Stream::Derived(r) => self.rse(r),
+                Stream::Union { branches, .. } => for (r, m) in branches {
+                    self.rse(r);
+                    m.iter().for_each(|(_, x)| self.expr(x))
+                },
+                Stream::Recurse { anchor, anchor_map, rec_boolean, rec_map, .. } => {
+                    self.rse(anchor);
+                    anchor_map.iter().chain(rec_map.iter()).for_each(|(_, x)| self.expr(x));
+                    if let Some(b) = rec_boolean { self.boolean(b) }
+                }
+                Stream::Window { source, windows } => {
+                    self.rse(source);
+                    for w in windows {
+                        w.partition.iter().for_each(|x| self.expr(x));
+                        w.order.iter().for_each(|k| self.expr(&k.expr));
+                    }
+                }
+            }
+        }
+        fn stmt(&mut self, s: &Stmt) {
+            match s {
+                Stmt::Begin(v) => v.iter().for_each(|x| self.stmt(x)),
+                Stmt::Label(_, x) | Stmt::Send(_, x) | Stmt::Loop(_, x) => self.stmt(x),
+                Stmt::For(_, r, x) => { self.rse(r); self.stmt(x) }
+                Stmt::Assign(e, _) => self.expr(e),
+                Stmt::If(b, t, e) => {
+                    self.boolean(b);
+                    self.stmt(t);
+                    if let Some(e) = e { self.stmt(e) }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut w = W::default();
+    w.stmt(&req.body);
+    let W { ctx, cmps, negates } = w;
+    Shape {
+        text_cmps: cmps.into_iter().map(|(c, f, t)| (ctx.get(&c).cloned().unwrap_or_default(), f, t)).collect(),
+        negates,
+    }
+}
+
 pub fn value_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     use Value::*;
     let num = |v: &Value| -> Option<(i128, i8)> {
