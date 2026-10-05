@@ -1,6 +1,6 @@
 # fire-crab: Full Conversion Plan
 
-*2026-10-05 · baseline `master` at `ea24856`, updated for `a771c23` · shared copy:
+*2026-10-05 · baseline `master` at `ea24856`, updated for `768bc86` · shared copy:
 [claude.ai doc](https://claude.ai/code/artifact/b21b5433-02ee-42ef-9918-c9d8177a2d5e)*
 
 Every Firebird subsystem has a first Rust version checked against the real
@@ -45,11 +45,26 @@ feature has to be built twice.
       to the interpreter, and `FC_EXEC_SELECT_TRACE` names where.
     - Slice 2 (`a771c23`): text outputs in their own set; declined under a
       collated or codepage relation.
-    - Found on the way and fixed: `exe` did not order temporal values, and
-      `dsql` refused an ORDER BY ordinal.
-    - Next slices: parameters, the attachment's set (`ATT_SUBTYPE` outputs),
-      DOUBLE / BOOLEAN / DECFLOAT in the BLR compiler and the executor; then a
-      sweep with the switch on, and making it the default.
+    - Slice 3 (`fee1e98`): bound parameters, each `?` an input of the
+      procedure, declined where moving the value into its slot would change it.
+    - Slice 4 (`529313c`): system relations (the built-in formats); a virtual
+      or global temporary relation declines.
+    - Slice 5 (`768bc86`): DOUBLE / FLOAT, compared and summed as the engine
+      does.
+    - Found on the way and fixed: `exe` did not order temporal values,
+      `dsql` refused an ORDER BY ordinal, and `exe`'s SUM / AVG skipped a
+      non-exact operand.
+    - **Switch-on sweep (2026-10-05, all 523 gates):** about 2,200 statements
+      served and 10,000 declined (compile 4,485; execute 2,370; text output in
+      the attachment's set 653; parameter types 426). Every wrong answer it
+      found is now declined instead: a transaction with its own writes (`exe`
+      reads the committed image), views (read as empty), a text literal against
+      a non-text column, lossy parameter moves. The route stays off until
+      these are served correctly.
+    - Next: the attachment's set (`ATT_SUBTYPE` outputs); BOOLEAN and DECFLOAT;
+      NaN, arithmetic and CAST over doubles; reading the transaction's own
+      writes; views; index use in `exe` (`idxcost` and `leftjoinindex` take
+      minutes under the switch); then making the route the default.
 4. **Concurrency and sharing.** Writers are serialized per database, and only
    the transaction-lock series is used.
     - the typed lock series from `jrd/lck.cpp`, so writers conflict per row
@@ -77,9 +92,18 @@ Wrong answers rank above refusals; a refusal is safe, a wrong answer is not.
     - `RDB$DB_KEY` is refused whole (8 bytes: relation id and record number,
       little-endian). It is the foundation `WHERE CURRENT OF` needs; `dsql`
       already compiles `FOR UPDATE [OF ..] [WITH LOCK]` byte for byte.
-    - A function over a selectable procedure's output column
-      (`SELECT CHAR_LENGTH(R) FROM <proc>(..)`) refuses; a BLR blob cast to
-      `VARCHAR .. CHARACTER SET OCTETS` reports *filter not found*.
+    - A BLR blob cast to `VARCHAR .. CHARACTER SET OCTETS` reports *filter not
+      found*; a non-ASCII literal in a procedure body made under a NONE
+      attachment is not interpreted.
+    - Wrong answer, mostly closed: an index key built from a text literal that
+      cannot convert raises 22018 on the engine before any row. Joins
+      (`92ea9c4`) and subqueries (`cb8ea7f`) now raise too. Left: under a LEFT
+      join the engine streams a row before the raise, where this server raises
+      first.
+    - `RDB$CONFIG` answers no rows.
+    - Done 2026-10-05/06: an expression over a selectable procedure's outputs
+      (`768bc86`); the virtual `RDB$TIME_ZONES` / `RDB$KEYWORDS` and subqueries
+      over computed relations, MON$ included (`529313c`).
     - DECFLOAT still open: GROUP BY a DECFLOAT expression, and GROUP BY's NaN
       and cohort laws; a negated exact literal's sign under the engine's
       preferred-desc fold.

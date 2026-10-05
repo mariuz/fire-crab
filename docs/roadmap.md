@@ -23,8 +23,12 @@ replacement of the C++ engine is below, in priority order. Full text:
    `wire` is protocol only. One statement family at a time, gated both ways.
    In progress behind `FC_EXEC_SELECT` (`qa/serve-real-exeselect.sh`): slice 1
    (`953ec53`) parameterless SELECTs with numeric/temporal outputs, slice 2
-   (`a771c23`) text outputs. Next: parameters, attachment-set outputs,
-   DOUBLE / BOOLEAN / DECFLOAT in `dsql` and `exe`.
+   (`a771c23`) text outputs, slice 3 (`fee1e98`) bound parameters, slice 4
+   (`529313c`) system relations, slice 5 (`768bc86`) DOUBLE / FLOAT. The
+   switch-on sweep served ~2,200 statements and declined ~10,000; its wrong
+   answers (own uncommitted writes, views, ...) now decline. Next:
+   attachment-set outputs, BOOLEAN / DECFLOAT, own writes, views, index use
+   in `exe`; then the switch on by default.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).
@@ -37,6 +41,10 @@ replacement of the C++ engine is below, in priority order. Full text:
    `WHERE CURRENT OF` - needs `RDB$DB_KEY`, also refused); `OVERLAY`, `BIT_LENGTH`, `ASCII_CHAR`,
    `CAST AS BOOLEAN`; GROUP BY/windows with FIRST/SKIP; impure calls in DML;
    `NEXT VALUE FOR` in PSQL; `RDB$DEBUG_INFO`.
+   Index keys from an unconvertible literal raise in joins and subqueries
+   (`92ea9c4`, `cb8ea7f`; LEFT-join row order left); expressions over a
+   procedure's outputs and virtual RDB$TIME_ZONES / RDB$KEYWORDS: done
+   (`768bc86`, `529313c`); RDB$CONFIG answers no rows.
    DECFLOAT left: GROUP BY a DECFLOAT expression and its NaN/cohort laws.
    Done: traps, specials, signed zero, the four DECFLOAT functions
    (`e07317d`), DECFLOAT in PSQL (`7fdb054`), all eight ROUND modes and
