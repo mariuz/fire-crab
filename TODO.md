@@ -133,8 +133,12 @@ Short, actionable items. The long-form engineering backlog lives in
 - [x] A table carrying an EXPRESSION or PARTIAL index (engine-made) was read-only here; its writes now maintain both
       from the catalog sources, and the engine reads this server's file through them identically with gfix clean
       (`qa/serve-real-exprindex.sh`). Still refused: a UNIQUE expression index; an expression over a collated column.
-- [ ] CREATE INDEX .. COMPUTED BY (..) and CREATE INDEX .. WHERE through this server (samples/nodejs/indexes.js):
-      the expression / condition BLR must be generated as the engine writes it.
+- [ ] A plain CREATE INDEX on a text column stamps itype 1 (IDX_STRING) for every set; the engine stamps 4 for UTF8,
+      IDX_OFFSET_INTL + ttype for a tabled set (WIN1252: 32884) and 3 for OCTETS (ASCII and NONE agree at 1). Measured
+      on 2196 by reading both files' index roots. Each side keys consistently with its own stamp, but the files differ.
+- [x] CREATE INDEX .. COMPUTED BY (..) and CREATE INDEX .. WHERE through this server (`qa/serve-real-exprindexddl.sh`;
+      expression and condition BLR byte-identical, the engine reads the file through them, gfix clean). dsql compiles
+      EXTRACT now. samples/nodejs/indexes.js runs; only its PLAN text differs (the plan request is unanswered).
 - [x] INSERT .. SELECT of non-ASCII UTF8 text under a NONE attachment refused (`qa/serve-real-inselutf8.sh`).
 - [ ] serve-real-gbakverbose.sh went red in sweeps 65 and 66 on "the restore streams are byte-equal" and passes
       alone (3/3) and under synthetic load (8/8, on this binary and d92cb5c's). With the wider DIFF it showed the ENGINE's

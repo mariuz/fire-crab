@@ -429,6 +429,11 @@ enum Val {
     /// a literal past blr_long's 32 bits: blr_int64
     Int64(i64),
     Upper(Box<Val>),
+    /// `EXTRACT(<part> FROM <value>)`: blr_extract, the part code
+    /// (blr_extract_year 0 .. blr_extract_week 9), the value - measured
+    /// on 2196: an index COMPUTED BY (EXTRACT(YEAR FROM DT)) stores
+    /// 05 9F 00 17 00 02 'DT' 4C
+    Extract(u8, Box<Val>),
     Lower(Box<Val>),
     /// blr_strlen with its length-type byte (1=CHAR, 2=OCTET)
     StrLen(u8, Box<Val>),
@@ -791,7 +796,7 @@ fn stamp_val(v: &mut Val, cn: &str) {
             stamp_val(a, cn);
             stamp_val(b, cn);
         }
-        Val::Neg(a) | Val::Upper(a) | Val::Lower(a) => stamp_val(a, cn),
+        Val::Neg(a) | Val::Upper(a) | Val::Lower(a) | Val::Extract(_, a) => stamp_val(a, cn),
         _ => {}
     }
 }
@@ -2355,6 +2360,29 @@ impl<'a> P<'a> {
         self.i += 1; // (
         let v = match name {
             "UPPER" => Val::Upper(Box::new(self.val()?)),
+            "EXTRACT" => {
+                let part = match self.t.get(self.i)? {
+                    Tok::Ident(w) => match w.to_ascii_uppercase().as_str() {
+                        "YEAR" => 0,
+                        "MONTH" => 1,
+                        "DAY" => 2,
+                        "HOUR" => 3,
+                        "MINUTE" => 4,
+                        "SECOND" => 5,
+                        "WEEKDAY" => 6,
+                        "YEARDAY" => 7,
+                        "MILLISECOND" => 8,
+                        "WEEK" => 9,
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                self.i += 1;
+                if !self.kw("FROM") {
+                    return None;
+                }
+                Val::Extract(part, Box::new(self.val()?))
+            }
             "LOWER" => Val::Lower(Box::new(self.val()?)),
             // blr_strlen's length-type byte: CHAR_LENGTH=1,
             // OCTET_LENGTH=2 (probed)
@@ -3011,6 +3039,11 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
         }
         Val::Upper(a) => {
             out.push(blr::UPCASE);
+            emit_val(out, a);
+        }
+        Val::Extract(part, a) => {
+            out.push(159); // blr_extract
+            out.push(*part);
             emit_val(out, a);
         }
         Val::Lower(a) => {
@@ -9979,6 +10012,71 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
     }
     let mut out = vec![blr::VERSION5];
     emit_val(&mut out, &v);
+    out.push(blr::EOC);
+    Some(out)
+}
+
+/// Compile a PARTIAL index's condition - `WHERE <boolean>` - to the BLR
+/// the engine stores in `RDB$INDICES.RDB$CONDITION_BLR`: blr_version5,
+/// the boolean as written (not negated, unlike a CHECK's trigger),
+/// blr_eoc, with the table's columns as bare fields at CONTEXT 0 - the
+/// shape [compile_computed] gives an expression index (measured on 2196:
+/// `WHERE S = 'active'` stores 05 2F 17 00 01 'S' 15 0F 00 00 06 00
+/// 'active' 4C).
+pub fn compile_index_condition(sql: &str) -> Option<Vec<u8>> {
+    let toks = lex(sql.trim().trim_end_matches(';'))?;
+    let mut p = P {
+        t: &toks,
+        i: 0,
+        // one anonymous stream: the table itself, context 0 - bare
+        // names bind to it, qualified names refuse
+        streams: vec![Stream {
+            name: String::new(),
+            alias: None,
+            derived: None,
+            sub: false,
+            cur: None,
+            proc_args: None,
+        }],
+        base: 0,
+        outer: Some(1),
+        sub: None,
+        agg_map: Vec::new(),
+        agg_mode: false,
+        in_params: Vec::new(),
+        local_vars: Vec::new(),
+        next_label: 1,
+            loop_labels: Vec::new(),
+            package: None,
+            pkg_members: Vec::new(),
+            plain_funcs: Vec::new(),
+            saw_user_fn: false,
+            pending_loop_label: None,
+        proc: None,
+        agg_fid_ctx: 1,
+        domain_value: false,
+        cursors: Vec::new(),
+        cursor_decls: Vec::new(),
+        for_cursors: Vec::new(),
+        merge_scope: None,
+        in_func: false,
+        in_sub: false,
+        saw_suspend: false,
+        host: None,
+        ctes: Vec::new(),
+        sub_decls: Vec::new(),
+        sub_procs: Vec::new(),
+        sub_funcs: Vec::new(),
+    };
+    if !p.kw("WHERE") {
+        return None;
+    }
+    let cond = p.bool_or()?;
+    if p.i != p.t.len() {
+        return None;
+    }
+    let mut out = vec![blr::VERSION5];
+    emit_bool(&mut out, &cond);
     out.push(blr::EOC);
     Some(out)
 }

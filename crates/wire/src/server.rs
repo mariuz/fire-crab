@@ -10528,6 +10528,13 @@ enum Plan {
         cols: Vec<String>,
         unique: bool,
         descending: bool,
+        /// `COMPUTED [BY] (<expr>)`: the parenthesised expression as
+        /// written - what RDB$EXPRESSION_SOURCE stores - and `cols` is
+        /// empty
+        expr: Option<String>,
+        /// `WHERE <condition>`: a PARTIAL index - the clause as written,
+        /// what RDB$CONDITION_SOURCE stores
+        cond: Option<String>,
     },
     /// `DROP TABLE <name>`: catalog rows stubbed, RDB$PAGES rows wiped,
     /// every owned page released
@@ -30813,12 +30820,48 @@ fn plan_create_index(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // every name CANONICAL ([canon_ident]): a bare `dept` is DEPT, a
     // quoted `"a"` is a - and the ods matcher compares exactly
     let name = canon_ident(&s[index_kw + "INDEX".len()..on_kw])?;
-    let open = masked[on_kw..].find('(')? + on_kw;
-    if !s.ends_with(')') {
-        return None;
+    // `ON <table> COMPUTED [BY] (<expr>)` - an EXPRESSION index
+    if let Some(c) = find_word(&masked, "COMPUTED", on_kw + "ON".len()) {
+        let table = canon_ident(&s[on_kw + "ON".len()..c])?;
+        let mut rest = s[c + "COMPUTED".len()..].trim_start();
+        if rest.get(..2).is_some_and(|w| w.eq_ignore_ascii_case("BY")) {
+            rest = rest[2..].trim_start();
+        }
+        if !rest.starts_with('(') {
+            return None;
+        }
+        let close = matching_paren(rest.as_bytes(), 0)?;
+        if !rest[close + 1..].trim().is_empty() {
+            return None;
+        }
+        return Some((
+            Plan::CreateIndex {
+                table,
+                name,
+                cols: Vec::new(),
+                unique,
+                descending,
+                expr: Some(rest[..=close].to_string()),
+                cond: None,
+            },
+            Vec::new(),
+        ));
     }
+    let open = masked[on_kw..].find('(')? + on_kw;
+    let close = matching_paren(s.as_bytes(), open)?;
+    // `... (<cols>) WHERE <condition>` - a PARTIAL index
+    let tail = s[close + 1..].trim();
+    let cond = if tail.is_empty() {
+        None
+    } else if tail.get(..5).is_some_and(|w| w.eq_ignore_ascii_case("WHERE"))
+        && tail[5..].starts_with(char::is_whitespace)
+    {
+        Some(tail.to_string())
+    } else {
+        return None;
+    };
     let table = canon_ident(&s[on_kw + "ON".len()..open])?;
-    let cols = split_ident_list(&s[open + 1..s.len() - 1])?;
+    let cols = split_ident_list(&s[open + 1..close])?;
     Some((
         Plan::CreateIndex {
             table,
@@ -30826,9 +30869,106 @@ fn plan_create_index(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             cols,
             unique,
             descending,
+            expr: None,
+            cond,
         },
         Vec::new(),
     ))
+}
+
+/// `CREATE [UNIQUE] INDEX .. (<cols>) WHERE <condition>`: the condition's
+/// BLR as the engine stores it ([fire_crab_dsql::compile_index_condition],
+/// byte-identical on 2196), its source as written, and a backfill over
+/// the rows the condition takes - TRUE, not NULL - read by the statement
+/// resolver's own predicate over the relation.
+#[allow(clippy::too_many_arguments)]
+fn create_partial_index_ddl(
+    work: &mut fire_crab_ods::Image,
+    page_size: usize,
+    table: &str,
+    name: &str,
+    cols: &[String],
+    unique: bool,
+    descending: bool,
+    src: &str,
+) -> Result<(), ExecErr> {
+    let refuse = || ExecErr::from("an index condition this server cannot evaluate");
+    let blr = fire_crab_dsql::compile_index_condition(src).ok_or_else(refuse)?;
+    let rel = fire_crab_ods::resolve_relation(work, page_size, table).ok_or_else(refuse)?;
+    let formats = fire_crab_ods::relation_formats(work, page_size, rel);
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).cloned().ok_or_else(refuse)?;
+    let columns = relation_columns(work, page_size, table);
+    let body = src.trim()[5..].trim();
+    let toks = tokenize(body).ok_or_else(refuse)?;
+    let mut np = 0usize;
+    let raw = parse_predicate(&toks, &mut np).ok_or_else(refuse)?;
+    let mut params = Vec::new();
+    let p = resolve_predicate(raw, &columns, &descs, &mut params).ok_or_else(refuse)?;
+    if !params.is_empty() {
+        return Err(refuse());
+    }
+    let mut filter = |values: &[Value]| -> Result<bool, String> { p.matches(values).map_err(|e| format!("{:?}", e)) };
+    fire_crab_ods::ddl::create_partial_index(
+        work, page_size, table, name, cols, unique, descending, &blr, src, &mut filter,
+    )
+    .map_err(ExecErr::from)
+}
+
+/// `CREATE INDEX .. COMPUTED BY (<expr>)`: the expression's BLR as the
+/// engine stores it - byte-identical to a COMPUTED BY column's
+/// ([fire_crab_dsql::compile_computed], measured on 2196) - its source as
+/// written, the key itype the engine stamps for the expression's type
+/// (UPPER(T) over UTF8 4, `N * 2` over INTEGER 8, measured off the index
+/// roots), and every committed row keyed on the evaluated expression.
+/// A type whose key the write path does not build refuses.
+fn create_expression_index_ddl(
+    work: &mut fire_crab_ods::Image,
+    page_size: usize,
+    table: &str,
+    name: &str,
+    unique: bool,
+    descending: bool,
+    src: &str,
+) -> Result<(), ExecErr> {
+    use fire_crab_ods::btw;
+    let refuse = || ExecErr::from("an index expression this server cannot key");
+    let blr = fire_crab_dsql::compile_computed(&format!("COMPUTED BY {}", src)).ok_or_else(refuse)?;
+    let rel = fire_crab_ods::resolve_relation(work, page_size, table).ok_or_else(refuse)?;
+    let formats = fire_crab_ods::relation_formats(work, page_size, rel);
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).cloned().ok_or_else(refuse)?;
+    let columns = relation_columns(work, page_size, table);
+    let raw = parse_raw_expr_any(src.trim()).ok_or_else(refuse)?;
+    let e = resolve_expr(&raw, &columns, &descs).ok_or_else(refuse)?;
+    let itype = match e.type_of(&descs).ok_or_else(refuse)? {
+        ExprType::Text => {
+            if expr_key_coll(&e, &descs).ok_or_else(refuse)? >> 8 != 0 {
+                return Err(refuse());
+            }
+            match (expr_text_ttype(&e, &descs).ok_or_else(refuse)? & 0xFF) as u8 {
+                fire_crab_ods::intl::CS_UTF8 => btw::IDX_METADATA,
+                0 | 2 => btw::IDX_STRING, // NONE, ASCII
+                _ => return Err(refuse()),
+            }
+        }
+        ExprType::Int | ExprType::Numeric => match e.rank_of(&descs) {
+            Some(NumRank::Long) => btw::IDX_NUMERIC,
+            Some(NumRank::I64) => btw::IDX_NUMERIC2,
+            _ => return Err(refuse()),
+        },
+        ExprType::Approx => btw::IDX_NUMERIC,
+        ExprType::Temporal(TKind::Date) => btw::IDX_SQL_DATE,
+        ExprType::Temporal(TKind::Time) => btw::IDX_SQL_TIME,
+        ExprType::Temporal(TKind::Timestamp) => btw::IDX_TIMESTAMP,
+        ExprType::Bool => btw::IDX_BOOLEAN,
+        _ => return Err(refuse()),
+    };
+    let mut eval = |values: &[Value]| -> Result<Value, String> {
+        e.eval(values).map_err(|err| format!("{:?}", err))
+    };
+    fire_crab_ods::ddl::create_expression_index(
+        work, page_size, table, name, unique, descending, itype, &blr, src, &mut eval,
+    )
+    .map_err(ExecErr::from)
 }
 
 /// Parse `DROP TABLE <name>`.
@@ -42398,7 +42538,23 @@ fn execute_dml_collecting_inner(
             )?;
             (0, 0, 0)
         }
-        Plan::CreateIndex { table, name, cols, unique, descending } => {
+        Plan::CreateIndex { table, name, unique, descending, expr: Some(src), .. } => {
+            create_expression_index_ddl(&mut work, db.page_size, table, name, *unique, *descending, src)?;
+            (0, 0, 0)
+        }
+        Plan::CreateIndex { table, name, cols, unique, descending, expr: None, cond: Some(src) } => {
+            if let Err(e) = create_partial_index_ddl(&mut work, db.page_size, table, name, cols, *unique, *descending, src) {
+                // a UNIQUE partial index over duplicate rows the condition
+                // takes: the same isc_no_dup inside "CREATE INDEX @1 failed"
+                // a plain index answers (measured on 2196)
+                let ExecErr::Text(m) = &e else { return Err(e) };
+                let obj = format!("\"PUBLIC\".\"{}\"", name.trim().trim_matches('"'));
+                return Err(dup_key_build_err(&work, db.page_size, table, cols, m, 336397316, obj, Some(name))
+                    .unwrap_or(e));
+            }
+            (0, 0, 0)
+        }
+        Plan::CreateIndex { table, name, cols, unique, descending, expr: None, cond: None } => {
             if let Err(e) = fire_crab_ods::ddl::create_index(
                 &mut work, db.page_size, table, name, cols, *unique, *descending, false, None,
             ) {

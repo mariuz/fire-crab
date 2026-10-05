@@ -9316,6 +9316,67 @@ pub fn create_index_for(
     foreign_key: Option<&str>,
     constraint: bool,
 ) -> Result<(), String> {
+    create_index_impl(
+        file, page_size, table, index_name, col_names, unique, descending, primary, foreign_key, constraint, None,
+    )
+}
+
+/// A row filter: does this record belong in a PARTIAL index?
+pub type IndexFilter<'a> = &'a mut dyn FnMut(&[Value]) -> Result<bool, String>;
+
+/// `CREATE [UNIQUE] INDEX .. (<cols>) WHERE <condition>`: a column index
+/// whose irt repeat carries IRT_CONDITION, whose RDB$INDICES row keeps
+/// the condition's BLR and source verbatim, and whose backfill and
+/// selectivity see only the rows `filter` takes - the CALLER evaluates
+/// the condition, as [create_expression_index]'s caller evaluates its
+/// expression.
+#[allow(clippy::too_many_arguments)]
+pub fn create_partial_index(
+    file: &mut crate::Image,
+    page_size: usize,
+    table: &str,
+    index_name: &str,
+    col_names: &[String],
+    unique: bool,
+    descending: bool,
+    cond_blr: &[u8],
+    cond_source: &str,
+    filter: IndexFilter<'_>,
+) -> Result<(), String> {
+    create_index_impl(
+        file,
+        page_size,
+        table,
+        index_name,
+        col_names,
+        unique,
+        descending,
+        false,
+        None,
+        false,
+        Some((cond_blr, cond_source, filter)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_index_impl(
+    file: &mut crate::Image,
+    page_size: usize,
+    table: &str,
+    index_name: &str,
+    col_names: &[String],
+    unique: bool,
+    descending: bool,
+    primary: bool,
+    foreign_key: Option<&str>,
+    constraint: bool,
+    cond: Option<(&[u8], &str, IndexFilter<'_>)>,
+) -> Result<(), String> {
+    let mut keep_all = |_: &[Value]| -> Result<bool, String> { Ok(true) };
+    let (cond_meta, filter): (Option<(&[u8], &str)>, IndexFilter<'_>) = match cond {
+        Some((b, src, f)) => (Some((b, src)), f),
+        None => (None, &mut keep_all),
+    };
     let rel = crate::resolve_relation(file, page_size, table)
         .ok_or_else(|| format!("table {} not found", table))?;
     if rel < 128 {
@@ -9368,6 +9429,9 @@ pub fn create_index_for(
     if foreign_key.is_some() {
         iflags |= btw::IRT_FOREIGN; // ods.h:461
     }
+    if cond_meta.is_some() {
+        iflags |= btw::IRT_CONDITION;
+    }
     let slot = allocate_index_slot(file, page_size, rel, &segs, iflags)?;
 
     // catalog rows. NOTE: the bucket page is NOT registered in
@@ -9404,6 +9468,20 @@ pub fn create_index_for(
         ivals.push(("RDB$FOREIGN_KEY", SysVal::S(partner)));
         ivals.push(("RDB$FOREIGN_KEY_SCHEMA_NAME", SysVal::S("PUBLIC")));
     }
+    // a PARTIAL index's condition, BLR and source, as the engine keeps them
+    let cond_blobs = match &cond_meta {
+        Some((blr, src)) => {
+            let irel = crate::resolve_relation(file, page_size, "RDB$INDICES").ok_or("no RDB$INDICES relation")?;
+            let b = dml::insert_blob(file, page_size, irel, &[blr.to_vec()], 2)?;
+            let t = dml::insert_blob_cs(file, page_size, irel, &[src.as_bytes().to_vec()], 1, 4)?;
+            Some((blob_id_bytes(irel, b), blob_id_bytes(irel, t)))
+        }
+        None => None,
+    };
+    if let Some((b, t)) = &cond_blobs {
+        ivals.push(("RDB$CONDITION_BLR", SysVal::B(b.clone())));
+        ivals.push(("RDB$CONDITION_SOURCE", SysVal::B(t.clone())));
+    }
     sys_row_by_name(file, page_size, "RDB$INDICES", &ivals)?;
     for (pos, n) in col_names.iter().enumerate() {
         // the segment names the column's EXACT catalog spelling
@@ -9415,12 +9493,10 @@ pub fn create_index_for(
         ])?;
     }
 
-    backfill_index(
-        file, page_size, rel, slot, &segs, descs, unique, descending, primary,
-    )?;
+    backfill_index_inner(file, page_size, rel, slot, &segs, descs, unique, descending, primary, &mut *filter)?;
     // the selectivity the engine computes at build time and keeps in
     // three places
-    let sel = index_selectivity(file, page_size, rel, &segs, descending)?;
+    let sel = index_selectivity_filtered(file, page_size, rel, &segs, descending, filter)?;
     write_index_statistics(file, page_size, rel, slot, index_name, &sel, true)
 }
 
@@ -9633,7 +9709,7 @@ fn backfill_index(
     descending: bool,
     primary: bool,
 ) -> Result<(), String> {
-    backfill_index_inner(file, page_size, rel, slot, segs, descs, unique, descending, primary)
+    backfill_index_inner(file, page_size, rel, slot, segs, descs, unique, descending, primary, &mut |_| Ok(true))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9647,6 +9723,7 @@ fn backfill_index_inner(
     unique: bool,
     descending: bool,
     primary: bool,
+    filter: &mut dyn FnMut(&[Value]) -> Result<bool, String>,
 ) -> Result<(), String> {
     let recs = max_recs_per_dp(page_size);
     let tips = crate::tra::TipChain::read(file, page_size);
@@ -9678,6 +9755,9 @@ fn backfill_index_inner(
             })
             .collect();
         for (line, values) in rows {
+            if !filter(&values)? {
+                continue; // outside a PARTIAL index's condition
+            }
             let recno = seq * recs + line as u64;
             let null = Value::Null;
             let key_segs: Vec<btw::KeySeg<'_>> = segs
@@ -11147,6 +11227,17 @@ fn index_selectivity(
     segs: &[(u16, u16, i8)],
     descending: bool,
 ) -> Result<Vec<f32>, String> {
+    index_selectivity_filtered(file, page_size, rel, segs, descending, &mut |_| Ok(true))
+}
+
+fn index_selectivity_filtered(
+    file: &crate::Image,
+    page_size: usize,
+    rel: u16,
+    segs: &[(u16, u16, i8)],
+    descending: bool,
+    filter: &mut dyn FnMut(&[Value]) -> Result<bool, String>,
+) -> Result<Vec<f32>, String> {
     let formats = crate::relation_formats(file, page_size, rel);
     let (_, descs) = formats
         .iter()
@@ -11163,6 +11254,9 @@ fn index_selectivity(
         for r in dp.records() {
             let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else { continue };
             let values = decode_record(&image, descs);
+            if !filter(&values)? {
+                continue;
+            }
             rows += 1;
             let null = Value::Null;
             for prefix in 0..segs.len() {
