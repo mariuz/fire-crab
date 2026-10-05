@@ -191,8 +191,9 @@ refuses() { # <label> <sql>
         *) echo "DIFF boundary MOVED: $1"; echo "     fc: $r"; fail=1 ;;
     esac
 }
-refuses "a character set with no table here refuses (DOS437)" \
-  "SELECT CAST('a' AS VARCHAR(2) CHARACTER SET DOS437) FROM RDB\$DATABASE;"
+# (promoted 2026-10-05: DOS437 is tabled - qa/serve-real-codepages.sh)
+both "a DOS437 target, now tabled" \
+  "SELECT CAST('a' AS VARCHAR(2) CHARACTER SET DOS437), OCTET_LENGTH(CAST('é' AS VARCHAR(2) CHARACTER SET DOS437)) FROM RDB\$DATABASE;"
 refuses "... and UNICODE_FSS with it" \
   "SELECT CAST('a' AS VARCHAR(2) CHARACTER SET UNICODE_FSS) FROM RDB\$DATABASE;"
 refuses "a COLLATE with no CHARACTER SET refuses" \

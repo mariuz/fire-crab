@@ -9,9 +9,9 @@
 # compare equal (fcstat), the ENGINE reads this server's file through every
 # index exactly as its own, and gfix finds it clean.
 #
-# Refused now: an index on a set with no codepage table here (DOS437 and
-# kin) - its text keyed as UTF-8 bytes and the engine misordered and missed
-# rows. OCTETS keys idx_byte_array (3: raw bytes, trailing 0x00 stripped)
+# An index on DOS437 and kin keyed its text as UTF-8 bytes and the engine
+# misordered and missed rows; refused, then built right once every
+# single-byte set was tabled (section 4). OCTETS keys idx_byte_array (3: raw bytes, trailing 0x00 stripped)
 # and UNICODE_FSS 32834 (idx_metadata's shape), read off the engine's trees.
 #
 #   qa/serve-real-textitype.sh [port]
@@ -130,12 +130,17 @@ ran=$((ran + 1))
 if "$GFIX" -v -full -user "$U" -pas "$P" "127.0.0.1/$REAL:$VFY" > /tmp/txit-gfix.log 2>&1 && [ ! -s /tmp/txit-gfix.log ]; then
     echo "OK   4 gfix -v -full finds it clean"
 else echo "DIFF 4 gfix -v -full:"; sed 's/^/     /' /tmp/txit-gfix.log | head; fail=1; fi
-ran=$((ran + 1))
-c=$(run "127.0.0.1/$PORT:$FC" "CREATE INDEX R_P ON R (P); COMMIT; SELECT COUNT(*) AS N FROM RDB\$INDICES WHERE RDB\$INDEX_NAME = 'R_P';" | sed 's/  */ /g; s/ *$//' | tr '\n' '|')
-case "$c" in
-    *"Statement failed"*"N|"*"| 0|") echo "OK   4 a DOS437 index is refused here (the engine builds it)" ;;
-    *) echo "FAIL 4 a DOS437 index: [$c]"; fail=1 ;;
-esac
+# a DOS437 index: refused while the set had no table, BUILT since the 34
+# engine-read tables landed (promoted 2026-10-05) - its root and reads
+# must be the engine's
+PX="INSERT INTO R (ID, P) VALUES (20, 'Çü'); INSERT INTO R (ID, P) VALUES (21, 'abc'); INSERT INTO R (ID, P) VALUES (22, '½'); COMMIT;
+CREATE INDEX R_P ON R (P); COMMIT;"
+check "4 a DOS437 index: built on both" "$(run "127.0.0.1/$REAL:$ENG" "$PX")" "$(run "127.0.0.1/$PORT:$FC" "$PX")"
+cp "$FC" "$VFY"; chmod 666 "$VFY"
+sudo -n cat "$ENG" > "$EC" 2>/dev/null || cat "$ENG" > "$EC"
+check "4 ... its root (32841)" "$(roots "$EC" 129)" "$(roots "$VFY" 129)"
+Q="SET PLAN ON; SELECT ID FROM R WHERE P = 'Çü'; SELECT ID FROM R WHERE P >= 'a' ORDER BY P, ID;"
+check "4 ... and the ENGINE reads it" "$(run "127.0.0.1/$REAL:$ENG" "$Q")" "$(run "127.0.0.1/$REAL:$VFY" "$Q")"
 
 echo "--- 5 the ENGINE's own OCTETS / UNICODE_FSS indexes take this server's writes (they refused)"
 W="INSERT INTO S VALUES (1, x'41', 'ab');
@@ -164,6 +169,6 @@ if grep -aq 'panicked at' "/tmp/fc-serve-txit-$PORT.log"; then echo "FAIL the se
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-# the floor is the MEASURED count: 17 on the 2026-10-05 binary, 17 OK (11 before OCTETS / UNICODE_FSS)
-if [ "$ran" -lt 17 ]; then echo "FAIL only $ran checks ran (floor 17) - cells went missing"; fail=1; fi
+# the floor is the MEASURED count: 19 on the 2026-10-05 binary, 19 OK (11 before OCTETS / UNICODE_FSS)
+if [ "$ran" -lt 19 ]; then echo "FAIL only $ran checks ran (floor 19) - cells went missing"; fail=1; fi
 exit $fail

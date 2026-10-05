@@ -138,8 +138,15 @@ Short, actionable items. The long-form engineering backlog lives in
       WIN1252 / ISO8859_1 indexes (wrong rows). An index on a set with no codepage table (DOS437 ..) is refused now.
 - [x] OCTETS keys idx_byte_array (3) and UNICODE_FSS 32834, as the engine does; an engine-made index of either kind
       takes this server's writes now (`qa/serve-real-textitype.sh` sections 4-5).
-- [ ] Non-ASCII text stored into a column of an untabled single-byte set (DOS437 ..) is written as UTF-8 bytes: the
-      engine orders the rows differently (measured with 'ü').
+- [x] Every single-byte set the engine carries is tabled now - 34 tables READ OFF THE LIVE ENGINE (decode, UPPER, LOWER),
+      `qa/serve-real-codepages.sh`; a column of DOS437 / WIN1253 / KOI8R / TIS620 .. stored UTF-8 bytes before.
+- [ ] Engine-side nondeterminism seen once in sweep 72: cmpparam's `ID IN (SELECT b.ID .. b.ID IN (?, 3))` bound '0X2'
+      answered 2;3 on the ENGINE (3 every other time, 3 alone and in a direct probe). Watch it.
+- [ ] ORDER BY and range comparisons over a single-byte set follow Unicode order here, the set's BYTE order on the
+      engine (DOS866 'Ё' is F0 - last there, first here). The same for every tabled set; WIN125x included wherever the
+      two orders part (recorded in codepages section 2). GROUP BY / DISTINCT / MIN / MAX / index bounds to check too.
+- [ ] A byte the codepage leaves undefined decodes to U+0000 on the engine (measured for every set); the older
+      WIN1250 / WIN1251 / WIN1252 tables here pass it through as its own code point.
 - [x] CREATE INDEX .. COMPUTED BY (..) and CREATE INDEX .. WHERE through this server (`qa/serve-real-exprindexddl.sh`;
       expression and condition BLR byte-identical, the engine reads the file through them, gfix clean). dsql compiles
       EXTRACT now. samples/nodejs/indexes.js runs; only its PLAN text differs (the plan request is unanswered).

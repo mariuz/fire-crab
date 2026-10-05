@@ -23700,7 +23700,9 @@ fn charset_name_id(name: &str) -> Option<u8> {
         "WIN1250" => 51,
         "WIN1251" => 52,
         "WIN1252" => 53,
-        _ => return None,
+        // every other single-byte set the engine carries, once ods::intl
+        // tables it (DOS437, WIN1253, KOI8R, ...)
+        other => return engine_charset_id(other).filter(|id| fire_crab_ods::intl::tabled_name(*id).is_some()),
     })
 }
 
@@ -23721,7 +23723,7 @@ fn charset_id_name(id: u8) -> Option<&'static str> {
         51 => "WIN1250",
         52 => "WIN1251",
         53 => "WIN1252",
-        _ => return None,
+        other => return fire_crab_ods::intl::tabled_name(other),
     })
 }
 
@@ -60201,10 +60203,11 @@ fn charset_sql_name(id: u8) -> Option<&'static str> {
         3 => "UNICODE_FSS",
         4 => "UTF8",
         21 => "ISO8859_1",
+        22 => "ISO8859_2",
         51 => "WIN1250",
         52 => "WIN1251",
         53 => "WIN1252",
-        _ => return None,
+        other => return fire_crab_ods::intl::tabled_name(other),
     })
 }
 
@@ -153169,7 +153172,7 @@ mod tests {
         // a collation other than the set's own, a set with no table
         // here, and the width bounds all REFUSE
         assert!(target("VARCHAR(3) CHARACTER SET UTF8 COLLATE UNICODE_CI").is_none());
-        assert!(target("VARCHAR(3) CHARACTER SET DOS437").is_none());
+        assert!(target("VARCHAR(3) CHARACTER SET SJIS_0208").is_none());
         assert!(target("VARCHAR(0) CHARACTER SET UTF8").is_none());
         assert!(target("VARCHAR(8192) CHARACTER SET UTF8").is_none());
         assert!(target("CHAR(32767) CHARACTER SET NONE").is_some());

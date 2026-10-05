@@ -9254,11 +9254,12 @@ fn index_itype(d: &Descriptor) -> Option<u16> {
             } else if cs <= 2 {
                 btw::IDX_STRING // NONE, ASCII: carrier bytes
             } else {
-                // A SET WITH NO CODEPAGE TABLE HERE (DOS437 and kin) has
-                // no key this writer can build: its text would key as
-                // UTF-8 bytes, and the ENGINE reading the tree then
-                // misorders and misses rows (measured: 'ü' under DOS437).
-                // Refused, not guessed.
+                // A SET WITH NO CODEPAGE TABLE HERE (the multi-byte ones
+                // beyond UTF8 / UNICODE_FSS) has no key this writer can
+                // build: its text would key as UTF-8 bytes, and the ENGINE
+                // reading the tree then misorders and misses rows
+                // (measured with DOS437 'ü' before every single-byte set
+                // was tabled). Refused, not guessed.
                 return None;
             }
         }
