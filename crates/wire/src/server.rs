@@ -9593,6 +9593,10 @@ impl RowSource {
                     && part.probe.as_ref().map_or(true, |p| p.index.is_none()) =>
             {
                 let rrows = right.rows(db)?;
+                let law = OpenLaw::of(part, *left_width, above);
+                if let Some(law) = &law {
+                    law.preserved(part, *left_width, rrows.iter().map(|r| r.as_slice()))?;
+                }
                 let rhash = index_hash(&rrows, &part.keys);
                 let mut cand: Vec<usize> = Vec::new();
                 let mut right_matched = vec![false; rrows.len()];
@@ -9609,6 +9613,9 @@ impl RowSource {
                 // join_step produces
                 let mut stopped = false;
                 let flow = left.for_each(db, &mut |l| {
+                    if let Some(law) = &law {
+                        law.outer(part, *left_width, &l)?;
+                    }
                     let mut matched = false;
                     for &ri in mirror_candidates(rhash.as_ref(), &part.keys, &l, rrows.len(), &mut cand) {
                         let r = &rrows[ri];
@@ -11506,6 +11513,20 @@ struct JoinPart {
     /// only its own rows, so a materialised side is hashed O(N + M)
     /// where it used to be scanned once per driver row.
     keys: Vec<ProbeKey>,
+    /// the literal an INDEX KEY of this side cannot be built from: the
+    /// engine builds the inner's retrieval bounds when the inner OPENS -
+    /// once per outer row that reaches it - so a literal the keyed column
+    /// cannot take raises 22018 there, over an EMPTY inner, where no ON
+    /// is ever evaluated ([Predicate::key_conversion]'s law, one table's
+    /// WHERE, carried to a join's inner). See [join_open_raise].
+    open_raise: Option<String>,
+    /// the inner's keyed columns (offset into the combined row), for the
+    /// WHERE conjuncts a null-rejecting filter pushes into its retrieval
+    open_keys: Vec<usize>,
+    /// [JoinPart::open_raise] for the LEFT side, when this is the FIRST
+    /// step over a base relation: a RIGHT or FULL join's preserved side
+    /// drives and the left one is the inner that opens
+    open_raise_left: Option<String>,
 }
 
 /// What a plain-relation join side would need to be probed by record
@@ -14196,6 +14217,45 @@ fn index_key_fids(db: &Database, rel: u16, descs: &[Descriptor]) -> Vec<usize> {
         .filter(|op| op.retrievable)
         .filter_map(|op| op.segs.first().map(|(fid, _, _, _)| *fid))
         .collect()
+}
+
+/// The literal a join INNER's index key cannot be built from, if any. The
+/// side must be a base relation (a derived or view side materialises and
+/// keys nothing); its index segments are offset into the combined row the
+/// ON names, and [Predicate::key_conversion] decides - the same matching,
+/// last-writer and upper-first laws one table's WHERE obeys. Measured on
+/// 2196 over an EMPTY indexed `E(N INT)`: `T LEFT JOIN E ON E.N = 'x'`,
+/// `.. ON E.ID = T.ID AND E.N = 'x'`, `.. ON E.N > 'x'` and the INNER
+/// form RAISE where this server answered T's rows (or none); an unindexed
+/// E answers.
+fn join_open_raise(
+    db: &Database,
+    on: &Predicate,
+    src: &RowSource,
+    descs: &[Descriptor],
+    offset: usize,
+) -> (Option<String>, Vec<usize>) {
+    let rel = match src {
+        RowSource::TableScan { rel, .. } | RowSource::IndexScan { rel, .. } => *rel,
+        _ => return (None, Vec::new()),
+    };
+    let keys: Vec<usize> = index_key_fids(db, rel, descs).into_iter().map(|f| f + offset).collect();
+    (key_raise(on, &keys), keys)
+}
+
+/// The literal [Predicate::key_conversion] raises on when `keys` are the
+/// keyed columns, if any.
+fn key_raise(p: &Predicate, keys: &[usize]) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+    let mut p = p.clone();
+    p.keys = keys.to_vec();
+    p.keys_known = true;
+    match p.key_conversion() {
+        Err(ExecErr::Eval(EvalErr::ConversionError(Some(s)))) => Some(s),
+        _ => None,
+    }
 }
 
 /// The columns of `rel` that NO live index leads with, read straight
@@ -49824,6 +49884,12 @@ fn plan_join_bound(
                 (true, _) => eprintln!("[srv] join natural: side={}", sides[k + 1].key),
             }
         }
+        let (open_raise, open_keys) = join_open_raise(db, &on, &sides[k + 1].src, &sides[k + 1].descs, sides[k + 1].offset);
+        let open_raise_left = if k == 0 && matches!(kind, JoinKind::Right | JoinKind::Full) {
+            join_open_raise(db, &on, &sides[0].src, &sides[0].descs, sides[0].offset).0
+        } else {
+            None
+        };
         parts.push(JoinPart {
             kind: *kind,
             src: sides[k + 1].src.clone(),
@@ -49831,6 +49897,9 @@ fn plan_join_bound(
             on,
             probe: access.probe,
             keys: access.keys,
+            open_raise,
+            open_keys,
+            open_raise_left,
         });
     }
     // The merged names are hidden on the side that was joined IN: they
@@ -68491,17 +68560,21 @@ fn plan_query_inner_at_body(
                     if !params.is_empty() {
                         return None;
                     }
-                    let n = join_rows(db, &base, base_width, &parts, &filter)
-                    .ok()?
-                    .len();
-                    return Some(Plan::Scalar(
-                        ScalarVal::Fixed(Some(n as i64)),
-                        "COUNT".to_string(),
-                        None,
-                        ScalarTy::count(),
-                    ));
+                    // ...and a join that RAISES (an inner's index key built
+                    // from a literal it cannot take) raises at EXECUTE, after
+                    // the describe: the general join plan below does that,
+                    // where a prepare-time failure here refused the statement
+                    if let Ok(rows) = join_rows(db, &base, base_width, &parts, &filter) {
+                        return Some(Plan::Scalar(
+                            ScalarVal::Fixed(Some(rows.len() as i64)),
+                            "COUNT".to_string(),
+                            None,
+                            ScalarTy::count(),
+                        ));
+                    }
+                } else {
+                    return from_names_view.then_some(Plan::Refused);
                 }
-                return from_names_view.then_some(Plan::Refused);
             }
         }
         return match plan_join(
@@ -73775,8 +73848,16 @@ impl JoinCursor {
         let pd = parts.last().expect("a mirror cursor has a last part");
         let part = &pd.part;
         let side = mirror_side.as_ref().expect("a mirror cursor stores its last side");
+        let law = OpenLaw::of(part, *mirror_left_width, above);
+        if let Some(law) = &law {
+            let rows = (0..side.len()).map(|i| side.get(i)).collect::<Result<Vec<_>, _>>()?;
+            law.preserved(part, *mirror_left_width, rows.iter().map(|r| r.as_slice()))?;
+        }
         let mut out = Vec::new();
         for acc_row in acc {
+            if let Some(law) = &law {
+                law.outer(part, *mirror_left_width, &acc_row)?;
+            }
             let mut matched = false;
             for &ri in mirror_candidates(mirror_hash.as_ref(), &part.keys, &acc_row, side.len(), mirror_cand) {
                 let r = side.get(ri)?;
@@ -73834,6 +73915,12 @@ impl JoinCursor {
         let pd = parts.last().expect("a mirror cursor has a last part");
         let part = &pd.part;
         let side = mirror_side.as_ref().expect("a mirror cursor stores its last side");
+        if *mi == 0 {
+            if let Some(law) = OpenLaw::of(part, *mirror_left_width, above) {
+                let rows = (0..side.len()).map(|i| side.get(i)).collect::<Result<Vec<_>, _>>()?;
+                law.preserved(part, *mirror_left_width, rows.iter().map(|r| r.as_slice()))?;
+            }
+        }
         while *mi < side.len() {
             let ri = *mi;
             *mi += 1;
@@ -74367,6 +74454,106 @@ fn join_rowsource(
     RowSource::Filter { input: Box::new(src), pred: filter.clone() }
 }
 
+/// A join's OPEN law, shared by every walker of a join ([join_step], the
+/// streaming FULL arm of [RowSource::for_each], [JoinCursor]'s mirror):
+/// THE INNER OPENS PER OUTER ROW, and its index bounds are built then,
+/// before any ON ([JoinPart::open_raise]). What reaches the open is an
+/// outer row passing the outer-only conjuncts of the WHERE AND of the ON
+/// (measured: `T JOIN E ON T.ID = 5 AND E.N = 'x'` and its LEFT twin
+/// answer, `.. ON T.ID + 0 = 1 AND ..` raises on row 1). A WHERE comparison
+/// naming only the inner keys it too - it rejects the NULL padding, so the
+/// engine runs the outer join as an inner one (`T LEFT JOIN E ON E.ID =
+/// T.ID WHERE E.N = 'x'` raises; under `E.N IS NULL OR E.N = 'x'` it
+/// answers, and over an unindexed E it answers none). A RIGHT or FULL
+/// join's preserved right side drives the mirror: the left relation opens
+/// once per right row (`E RIGHT JOIN T ON E.N = 'x'` and `E FULL JOIN T ..`
+/// raise; `.. AND T.ID = 5` answers). The raise comes before any row: an
+/// outer row the gates turn away first is NOT emitted ahead of it here,
+/// where the engine streams it (`T LEFT JOIN E ON T.ID = 2 AND E.N = 'x'`
+/// shows row 1, then raises - a recorded boundary).
+struct OpenLaw {
+    inner: Option<String>,
+    left: Option<String>,
+    lgate: Option<Predicate>,
+    rgate: Option<Predicate>,
+    on_lgate: Option<Predicate>,
+    on_rgate: Option<Predicate>,
+}
+
+impl OpenLaw {
+    fn of(part: &JoinPart, acc_width: usize, above: &Option<Predicate>) -> Option<OpenLaw> {
+        if part.open_raise.is_none() && part.open_raise_left.is_none() && part.open_keys.is_empty() {
+            return None;
+        }
+        let lgate = side_filter(above, 0..acc_width);
+        let rgate = side_filter(above, acc_width..acc_width + part.width);
+        let where_raise = match &rgate {
+            Some(g)
+                if matches!(part.kind, JoinKind::Inner)
+                    || (matches!(part.kind, JoinKind::Left)
+                        && !g.groups.iter().flatten().any(|t| matches!(t, Term::IsNull(_)))) =>
+            {
+                key_raise(g, &part.open_keys)
+            }
+            _ => None,
+        };
+        let inner = part.open_raise.clone().or(where_raise);
+        if inner.is_none() && part.open_raise_left.is_none() {
+            return None;
+        }
+        let on = Some(part.on.clone());
+        Some(OpenLaw {
+            inner,
+            left: part.open_raise_left.clone(),
+            lgate,
+            rgate,
+            on_lgate: side_filter(&on, 0..acc_width),
+            on_rgate: side_filter(&on, acc_width..acc_width + part.width),
+        })
+    }
+
+    fn gate(g: &Option<Predicate>, row: &[Value]) -> Result<bool, EvalErr> {
+        match g {
+            None => Ok(true),
+            Some(p) => p.matches(row),
+        }
+    }
+
+    /// an accumulated (outer) row reaching the inner's open
+    fn outer(&self, part: &JoinPart, acc_width: usize, l: &[Value]) -> Result<(), EvalErr> {
+        if let Some(s) = &self.inner {
+            if !matches!(part.kind, JoinKind::Right) {
+                let mut row = l.to_vec();
+                row.resize(acc_width + part.width, Value::Null);
+                if Self::gate(&self.lgate, &row)? && Self::gate(&self.on_lgate, &row)? {
+                    return Err(EvalErr::ConversionError(Some(s.clone())));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// the preserved right side's rows, each opening the left relation
+    fn preserved<'a>(
+        &self,
+        part: &JoinPart,
+        acc_width: usize,
+        rrows: impl Iterator<Item = &'a [Value]>,
+    ) -> Result<(), EvalErr> {
+        let _ = part;
+        if let Some(s) = &self.left {
+            for r in rrows {
+                let mut row = vec![Value::Null; acc_width];
+                row.extend(r.iter().cloned());
+                if Self::gate(&self.rgate, &row)? && Self::gate(&self.on_rgate, &row)? {
+                    return Err(EvalErr::ConversionError(Some(s.clone())));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One step of the fold: join the rows accumulated so far with the next
 /// side's, on that step's condition. The step's KIND applies to the
 /// accumulated side as a whole - `A JOIN B ON ... LEFT JOIN C ON ...`
@@ -74431,6 +74618,12 @@ fn join_step(
         None
     };
     let mut cand: Vec<usize> = Vec::new();
+    if let Some(law) = OpenLaw::of(part, acc_width, above) {
+        law.preserved(part, acc_width, rrows.iter().map(|r| r.as_slice()))?;
+        for l in &acc {
+            law.outer(part, acc_width, l)?;
+        }
+    }
     for l in &acc {
         let mut matched = false;
         let ix: &[usize] = if rhash.is_some() {
@@ -147658,6 +147851,9 @@ mod tests {
                 probe: None,
                 keys: Vec::new(),
                 on: Predicate::dnf(vec![vec![Term::Const(on)]]),
+                open_raise: None,
+            open_keys: Vec::new(),
+            open_raise_left: None,
             })
         };
         let l = RowSource::Rows(vec![row(1, 10), row(2, 20)]);
@@ -150833,6 +151029,9 @@ mod tests {
                 Cmp::Eq,
                 Box::new(Expr::Col(2)),
             )))]]),
+            open_raise: None,
+            open_keys: Vec::new(),
+            open_raise_left: None,
         };
         let acc = vec![
             vec![Value::Int(1), Value::Int(10)],
@@ -150955,6 +151154,9 @@ mod tests {
                 Cmp::Eq,
                 Box::new(Expr::Col(2)),
             )))]]),
+            open_raise: None,
+            open_keys: Vec::new(),
+            open_raise_left: None,
         };
         let acc = vec![
             vec![Value::Int(1), Value::Int(10)],
@@ -151001,6 +151203,9 @@ mod tests {
                 ))),
                 Term::CmpConvErr(0, Cmp::Eq, "x".into(), None),
             ]]),
+            open_raise: None,
+            open_keys: Vec::new(),
+            open_raise_left: None,
         };
         let acc = vec![vec![Value::Int(1), Value::Int(10)]];
         let none: Vec<Vec<Value>> = Vec::new();
@@ -151037,6 +151242,9 @@ mod tests {
                 ))),
                 Term::CmpConvErr(0, Cmp::Eq, "x".into(), None),
             ]]),
+            open_raise: None,
+            open_keys: Vec::new(),
+            open_raise_left: None,
         };
         let out = join_step(acc, 2, &none, &sc_part, &None).unwrap();
         assert_eq!(out, vec![vec![Value::Int(1), Value::Int(10), Value::Null]]);
@@ -151049,6 +151257,9 @@ mod tests {
             probe: None,
             keys: Vec::new(),
             on: Predicate::dnf(vec![vec![Term::CmpConvErr(2, Cmp::Eq, "x".into(), None)]]),
+            open_raise: None,
+            open_keys: Vec::new(),
+            open_raise_left: None,
         };
         let rrows = vec![vec![Value::Int(7)]];
         assert!(join_step(Vec::new(), 2, &rrows, &rt_raiser, &None).is_err());
@@ -151077,6 +151288,9 @@ mod tests {
                 ))),
                 Term::CmpConvErr(0, Cmp::Eq, "x".into(), None),
             ]]),
+            open_raise: None,
+            open_keys: Vec::new(),
+            open_raise_left: None,
         };
         let acc = vec![vec![Value::Int(1), Value::Int(10)]];
         // the inner stream HAS a row, and it is not this one's partner
@@ -151212,6 +151426,9 @@ mod tests {
                 Cmp::Eq,
                 Box::new(Expr::Col(2)),
             )))]]),
+            open_raise: None,
+            open_keys: Vec::new(),
+            open_raise_left: None,
         };
         let h = build_join_key_hash_from_rows(&rows, &part.keys)
             .expect("a probe-less side hashes by its own key");

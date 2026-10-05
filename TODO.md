@@ -44,17 +44,14 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a
-      text literal that cannot convert raises 22018 on the engine before any row - fire-crab has this law for a single
-      table's WHERE only (`Predicate::key_conversion`). Over an EMPTY indexed `E(N INT)` with `T` holding 2 rows the
-      engine RAISES and fire-crab answers rows for: `T LEFT JOIN E ON E.ID = T.ID AND E.N = 'x'` (fc: 1, 2), `T LEFT
-      JOIN E ON E.N = 'x'`, `T LEFT JOIN E ON E.N > 'x'`, `T JOIN E ON E.N = 'x'` (fc: none), `T LEFT JOIN E ON ..
-      WHERE E.N = 'x'`, `EXISTS (SELECT 1 FROM E WHERE E.N = 'x')`, `T.ID IN (SELECT E.ID FROM E WHERE E.N = 'x')`,
-      `(SELECT COUNT(*) FROM E WHERE E.N = 'x')` in the projection (fc: 0, 0). Unindexed `E2`: both agree (LEFT 1, 2;
-      INNER none). TIMING, measured: the inner's key is built when the inner OPENS - per surviving outer row - so an
-      EMPTY outer (`Z LEFT JOIN E ON E.N = 'x'`, `Z JOIN ..`) answers none, as does an outer filtered to nothing first
-      (`.. JOIN E ON E.ID = T.ID AND E.N = 'x' WHERE T.ID = 5`, LEFT too, `WHERE 1 = 0`) and a scalar subselect over an
-      empty Z; but an UNCORRELATED EXISTS is an invariant evaluated at open - it raises over an empty Z and beside
-      `T.ID = 5 AND ..`; `E RIGHT JOIN T ON E.N = 'x'` raises (T is the outer).
+      text literal that cannot convert raises 22018 on the engine before any row. JOINS DONE (`qa/serve-real-joinkeyraise.sh`):
+      a join inner's key is built when the inner OPENS, per outer row passing the outer-only conjuncts of the WHERE and
+      the ON; a WHERE comparison on the inner keys it (the LEFT runs as an INNER); RIGHT / FULL open the left relation
+      per preserved row; a COUNT(*) over the join raises at execute (it was counted at prepare and refused). LEFT: the
+      SUBQUERY's inner key - uncorrelated EXISTS (an INVARIANT: raises over an empty outer), IN (SELECT ..), a scalar
+      subselect, correlated EXISTS all answer here (the subquery fold has no error channel: a raise in the body declines
+      it); and the engine STREAMS an outer row the gates turned away before the raise (row 1, then 22018), here the raise
+      comes first. Unmeasured: `WHERE E.N = 'x' OR T.ID = 1` over a LEFT join raises on row 2 on the engine (fc: row 1).
 - [ ] **P2** The FLOAT/ROUND/DECFLOAT wrong answers first; then the rounds 6–8 items still refused (mixed multi-clause ALTER TABLE, `WHERE CURRENT OF` via `RDB$DB_KEY`) - the rest re-measured and agrees
 - [ ] **P2** DECFLOAT left: GROUP BY a DECFLOAT expression (NaN / cohort laws). (Done: CREATE PROCEDURE / FUNCTION with a DECFLOAT parameter; `SET DECFLOAT ROUND` - all eight modes, dftraps 7)
 - [x] **P2** DECFLOAT traps, specials, signed zero, the four DECFLOAT functions (`e07317d`); DECFLOAT in PSQL (`7fdb054`)
