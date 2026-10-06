@@ -130375,6 +130375,9 @@ fn exe_select(
             496 => "INTEGER".to_string(),
             580 if sc > 0 => format!("NUMERIC(18,{})", sc),
             580 => "BIGINT".to_string(),
+            // INT128 (slice 8)
+            32752 if sc > 0 => format!("NUMERIC(38,{})", sc),
+            32752 => "INT128".to_string(),
             570 => "DATE".to_string(),
             560 => "TIME".to_string(),
             510 => "TIMESTAMP".to_string(),
@@ -130684,6 +130687,7 @@ fn exe_select(
             (570, Value::Date(_)) | (560, Value::Time(_)) | (510, Value::Timestamp(..)) => true,
             (480, Value::Double(_)) | (482, Value::Float(_)) => true,
             (32764, Value::Bool(_)) => true,
+            (32752, Value::Int(_) | Value::Scaled(..) | Value::Int128(..)) => true,
             (448 | 452, Value::Text(_)) => true,
             _ => false,
         }

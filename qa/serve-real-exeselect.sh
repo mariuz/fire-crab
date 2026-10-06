@@ -59,6 +59,10 @@ CREATE TABLE BO (ID INT, B BOOLEAN);
 INSERT INTO BO VALUES (1, TRUE);
 INSERT INTO BO VALUES (2, FALSE);
 INSERT INTO BO VALUES (3, NULL);
+CREATE TABLE WI (ID INT, I INT128, N NUMERIC(38,2));
+INSERT INTO WI VALUES (1, 170141183460469231731687303715884105727, 1.25);
+INSERT INTO WI VALUES (2, -5, -0.5);
+INSERT INTO WI VALUES (3, NULL, 123456789012345678901234567890.12);
 CREATE TABLE E (ID INT, N INT);
 CREATE INDEX E_N ON E (N);
 COMMIT;\n" "$REAL" "$ENG" "$U" "$P" | "$ISQL" -q -b > /tmp/exs-build.log 2>&1
@@ -190,6 +194,11 @@ route "11 = TRUE" served "SELECT ID FROM BO WHERE B = TRUE"
 route "11 = FALSE OR IS NULL" served "SELECT ID FROM BO WHERE B = FALSE OR B IS NULL ORDER BY ID"
 route "11 GROUP BY, sorted" served "SELECT B, COUNT(*) FROM BO GROUP BY B ORDER BY 1"
 route "11 MAX / MIN" served "SELECT MAX(B), MIN(B) FROM BO"
+echo "--- 12 INT128 / NUMERIC(38) (slice 8)"
+route "12 INT128 and NUMERIC(38,2) outputs at their extremes" served "SELECT ID, I, N FROM WI ORDER BY ID"
+route "12 compared and sorted" served "SELECT ID, I FROM WI WHERE I > -10 ORDER BY I DESC"
+route "12 SUM / MAX / MIN" served "SELECT SUM(N), MAX(I), MIN(N), COUNT(I) FROM WI"
+route "12 arithmetic in the exact scale rules" served "SELECT I + 1, N * 2 FROM WI WHERE ID = 2"
 echo "--- 9 system relations: their formats are built in, never stored (slice 4)"
 route "9 a SYSTEM relation, numeric outputs" served "SELECT RDB\$RELATION_ID, RDB\$SYSTEM_FLAG FROM RDB\$RELATIONS WHERE RDB\$RELATION_ID < 12 ORDER BY 1"
 route "9 ...an aggregate over one" served "SELECT COUNT(*), MAX(RDB\$FIELD_POSITION) FROM RDB\$RELATION_FIELDS WHERE RDB\$SYSTEM_FLAG = 0"
@@ -225,5 +234,5 @@ if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 72 ]; then echo "FAIL only $ran checks ran (floor 72) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 76 ]; then echo "FAIL only $ran checks ran (floor 76) - cells went missing"; fail=1; fi
 exit $fail

@@ -2894,6 +2894,7 @@ impl<'a> P<'a> {
             "SMALLINT" => Dsc::Num(blr::SHORT, 0),
             "INTEGER" | "INT" => Dsc::Num(blr::LONG, 0),
             "BIGINT" => Dsc::Num(blr::INT64, 0),
+            "INT128" => Dsc::Num(26, 0),
             // NUMERIC(p<=4) is short; DECIMAL(p<=9) is ALWAYS long -
             // DECIMAL(4,1) probed as blr_long (SQL's "at least p")
             "NUMERIC" | "DECIMAL" => match paren_num(self) {
@@ -2905,8 +2906,12 @@ impl<'a> P<'a> {
                         blr::LONG
                     } else if p <= 18 {
                         blr::INT64
+                    } else if p <= 38 {
+                        // blr_int128 (26) with its scale byte (measured: a
+                        // NUMERIC(38,2) parameter's slot is `1A FE`)
+                        26
                     } else {
-                        return None; // INT128 territory: unprobed
+                        return None;
                     };
                     Dsc::Num(dt, -sc)
                 }
@@ -10980,6 +10985,7 @@ fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
     let (field_type, length, scale) = match d {
         Dsc::Num(7, sc) => (7, 2, *sc as i16),
         Dsc::Num(8, sc) => (8, 4, *sc as i16),
+        Dsc::Num(26, sc) => (26, 16, *sc as i16),
         Dsc::Num(_, sc) => (16, 8, *sc as i16),
         Dsc::Text(l) | Dsc::TextCs(l, _) => (14, *l, 0),
         Dsc::Varying(l) | Dsc::VaryingCs(l, _) => (37, *l, 0),
@@ -11005,6 +11011,9 @@ fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
         precision: match d {
             Dsc::Dec64 => Some(16),
             Dsc::Dec128 => Some(34),
+            // a bare INT128's RDB$FIELD_PRECISION is 0 (measured); a declared
+            // NUMERIC(p, s) overrides it ([apply_decl])
+            Dsc::Num(26, _) => Some(0),
             _ => None,
         },
         default: None,
@@ -13758,7 +13767,6 @@ mod tests {
             // single-argument COALESCE is a syntax error IN THE ENGINE
             "SELECT ID FROM T WHERE COALESCE(A) = 5",
             // unprobed cast targets and unprobed unifications
-            "SELECT ID FROM T WHERE CAST(A AS NUMERIC(30)) = 1",
             "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN NULL ELSE NULL END IS NULL",
             "SELECT ID FROM T WHERE CASE WHEN A > 5 THEN 'x' ELSE 0 END = 'x'",
             // a subquery inside an ON clause would interleave the
@@ -13795,6 +13803,12 @@ mod tests {
         let f = compile_view_select("SELECT ID FROM T WHERE CAST(A AS FLOAT) = 1").expect("FLOAT cast");
         assert!(f.windows(2).any(|w| w == [blr::CAST, 10]), "{f:02X?}");
         let d = compile_view_select("SELECT ID FROM T WHERE CAST(A AS DOUBLE PRECISION) = 1").expect("DOUBLE cast");
+        // ...and INT128 its scale byte (measured: NUMERIC(30) and INT128 are
+        // `83 1A 00`, DECIMAL(25,3) `83 1A FD`)
+        let n = compile_view_select("SELECT ID FROM T WHERE CAST(A AS NUMERIC(30)) = 1").expect("NUMERIC(30) cast");
+        assert!(n.windows(3).any(|w| w == [blr::CAST, 26, 0]), "{n:02X?}");
+        let n = compile_view_select("SELECT ID FROM T WHERE CAST(A AS DECIMAL(25,3)) = 1").expect("DECIMAL(25,3) cast");
+        assert!(n.windows(3).any(|w| w == [blr::CAST, 26, 0xFD]), "{n:02X?}");
         assert!(d.windows(2).any(|w| w == [blr::CAST, 27]), "{d:02X?}");
         // double negation cancels
         assert_eq!(
