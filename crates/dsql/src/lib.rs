@@ -501,6 +501,8 @@ enum Val {
     /// `S = CURRENT_USER` stores `2F 17 01 01 'S' 2C`)
     UserName,
     CurrentRole,
+    /// TRUE / FALSE - blr_literal blr_bool 1 / 0 (measured: `15 17 01`)
+    Bool(bool),
     /// GEN_ID(sequence, increment)
     GenId(String, Box<Val>),
     /// NEXT VALUE FOR sequence - blr_gen_id2, the name alone
@@ -534,6 +536,9 @@ enum Dsc {
     /// blr_double (27) / blr_float (10): the dtype byte alone
     Double,
     Float,
+    /// blr_bool (23): the dtype byte alone (measured: a BOOLEAN output's
+    /// message slot is `17`)
+    Boolean,
 }
 
 /// Every character set the engine carries: (name or alias, RDB$CHARACTER_SET_ID),
@@ -756,6 +761,7 @@ fn emit_dsc(out: &mut Vec<u8>, d: Dsc) {
         Dsc::Timestamp => out.push(blr::TIMESTAMP),
         Dsc::Double => out.push(27),
         Dsc::Float => out.push(10),
+        Dsc::Boolean => out.push(23),
     }
 }
 
@@ -1207,7 +1213,7 @@ fn lex(sql: &str) -> Option<Vec<Tok>> {
                     "CURRENT_USER" | "USER" | "CURRENT_ROLE" | "CURRENT_DATE" | "CURRENT_TIME"
                         | "CURRENT_TIMESTAMP" | "CURRENT_CONNECTION" | "CURRENT_TRANSACTION"
                         | "LOCALTIME" | "LOCALTIMESTAMP" | "ROW_COUNT" | "SQLCODE" | "GDSCODE"
-                        | "SQLSTATE"
+                        | "SQLSTATE" | "TRUE" | "FALSE" | "UNKNOWN"
                 ) {
                     return None;
                 }
@@ -2375,6 +2381,8 @@ impl<'a> P<'a> {
             // every row, and `S = CURRENT_USER` failed at use
             Tok::Ident(x) if x == "CURRENT_USER" || x == "USER" => Val::UserName,
             Tok::Ident(x) if x == "CURRENT_ROLE" => Val::CurrentRole,
+            Tok::Ident(x) if x == "TRUE" => Val::Bool(true),
+            Tok::Ident(x) if x == "FALSE" => Val::Bool(false),
             Tok::Ident(x) if x == "NEXT" => {
                 self.i += 1;
                 if !(self.kw("VALUE") && self.kw("FOR")) {
@@ -2947,6 +2955,7 @@ impl<'a> P<'a> {
                 Dsc::Double
             }
             // a bare FLOAT / REAL is the 4-byte single; FLOAT(p) unprobed
+            "BOOLEAN" => Dsc::Boolean,
             "FLOAT" | "REAL" => {
                 if matches!(self.t.get(self.i), Some(Tok::LParen)) {
                     return None;
@@ -3450,6 +3459,7 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             emit_val(out, &Val::Int(2));
         }
         Val::UserName => out.push(0x2C),
+        Val::Bool(b) => out.extend_from_slice(&[blr::LITERAL, 23, *b as u8]),
         Val::CurrentRole => out.push(0xAE),
         Val::GenId(name, inc) => {
             out.push(blr::GEN_ID);
@@ -10554,6 +10564,7 @@ impl TypeSpec {
             35 => Dsc::Timestamp,
             27 => Dsc::Double,
             10 => Dsc::Float,
+            23 => Dsc::Boolean,
             t => Dsc::Num(t, self.scale),
         }
     }
@@ -10979,6 +10990,7 @@ fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
         Dsc::Timestamp => (35, 8, 0),
         Dsc::Double => (27, 8, 0),
         Dsc::Float => (10, 4, 0),
+        Dsc::Boolean => (23, 1, 0),
     };
     ProcParamMeta {
         name: name.to_string(),

@@ -130383,6 +130383,8 @@ fn exe_select(
             // still fail the run
             480 => "DOUBLE PRECISION".to_string(),
             482 => "FLOAT".to_string(),
+            // BOOLEAN (slice 7)
+            32764 => "BOOLEAN".to_string(),
             // A TEXT OUTPUT IN ITS OWN SET: a plain column's ttype (the
             // length in bytes), or an expression's real-set sentinel (the
             // length in characters); the attachment's set ([ATT_SUBTYPE])
@@ -130681,6 +130683,7 @@ fn exe_select(
             (500 | 496 | 580, Value::Int(_) | Value::Scaled(..)) => true,
             (570, Value::Date(_)) | (560, Value::Time(_)) | (510, Value::Timestamp(..)) => true,
             (480, Value::Double(_)) | (482, Value::Float(_)) => true,
+            (32764, Value::Bool(_)) => true,
             (448 | 452, Value::Text(_)) => true,
             _ => false,
         }

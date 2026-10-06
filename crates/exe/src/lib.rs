@@ -156,6 +156,7 @@ mod blr {
     pub const DT_SQL_TIME: u8 = 13;
     pub const DT_TIMESTAMP: u8 = 35;
     pub const DT_DOUBLE: u8 = 27;
+    pub const DT_BOOL: u8 = 23;
     pub const DT_FLOAT: u8 = 10;
 }
 
@@ -540,7 +541,7 @@ impl<'a> P<'a> {
                 MsgSlot { dtype, length: 0, scale: 0, ttype: 0 }
             }
             // ...and so do the approximate ones (slice 5)
-            blr::DT_DOUBLE | blr::DT_FLOAT => MsgSlot { dtype, length: 0, scale: 0, ttype: 0 },
+            blr::DT_DOUBLE | blr::DT_FLOAT | blr::DT_BOOL => MsgSlot { dtype, length: 0, scale: 0, ttype: 0 },
             other => return Err(format!("message dtype {} unconverted", other)),
         })
     }
@@ -791,6 +792,7 @@ impl<'a> P<'a> {
                                 .map_err(|_| "literal not utf8")?,
                         )
                     }
+                    blr::DT_BOOL => Value::Bool(self.u8()? != 0),
                     other => return Err(format!("literal dtype {} unconverted", other)),
                 }))
             }
@@ -1392,6 +1394,7 @@ fn exe_numeric_bin(r1: i128, s1: i8, verb: u8, r2: i128, s2: i8) -> Result<(i128
 /// a single-byte width - multibyte CHAR padding in a nested call is a
 /// recorded boundary).
 fn coerce_arg(v: Value, slot: &MsgSlot) -> Result<Value, String> {
+    let v = coerce_bool(v, Some(slot))?;
     let v = coerce_approx(v, Some(slot))?;
     let v = coerce_num(v, Some(slot))?;
     if let Value::Text(t) = &v {
@@ -1477,6 +1480,20 @@ fn coerce_temporal(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
         Ok(v)
     } else {
         Err("temporal assignment outside this executor".into())
+    }
+}
+
+/// An assignment touching a BOOLEAN: one into a BOOLEAN slot must be a
+/// BOOLEAN (the engine's text / number conversions into it are not made
+/// here), and a BOOLEAN into another kind of slot (rendered 'TRUE' into a
+/// text) is unconverted too - both fail the run.
+fn coerce_bool(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
+    let Some(dt) = slot.map(|s| s.dtype) else { return Ok(v) };
+    match (dt == blr::DT_BOOL, &v) {
+        (_, Value::Null) => Ok(v),
+        (true, Value::Bool(_)) => Ok(v),
+        (false, Value::Bool(_)) | (true, _) => Err("a BOOLEAN assignment unconverted".into()),
+        _ => Ok(v),
     }
 }
 
@@ -1899,6 +1916,7 @@ impl<'a> Exec<'a> {
                         .and_then(|slots| slots.get(*i as usize))
                         .cloned(),
                 };
+                let v = coerce_bool(v, tslot.as_ref())?;
                 let v = coerce_approx(v, tslot.as_ref())?;
                 let v = coerce_num(v, tslot.as_ref())?;
                 let v = coerce_text(v, tslot.as_ref())?;

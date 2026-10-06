@@ -80,6 +80,9 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       non-text column 706, execute 629, own writes 545, BOOLEAN / INT128 / DECFLOAT / zoned / BLOB outputs. Turning
       the route ON by default would need those trace gates to pin the interpreter (FC_EXEC_SELECT unset) - a decision
       for the plan, not taken here.
+      Slice 7: BOOLEAN (dsql's blr_bool descriptor and TRUE / FALSE literals - `15 17 01` - byte-identical in fc-made
+      procedures and functions; exe's BOOLEAN slots and literals; a non-BOOLEAN into a BOOLEAN slot, or the reverse,
+      fails the run).
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a
