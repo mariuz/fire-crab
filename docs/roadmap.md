@@ -26,12 +26,12 @@ replacement of the C++ engine is below, in priority order. Full text:
    (`a771c23`) text outputs, slice 3 (`fee1e98`) bound parameters, slice 4
    (`529313c`) system relations, slice 5 (`768bc86`) DOUBLE / FLOAT, slice 6
    (`69d712e`) attachment-set text under UTF8, slice 7 (`983cd3c`) BOOLEAN,
-   slice 8 (`ee344b8`) INT128, slice 9 (`c975df7`) the transaction's own view;
+   slice 8 (`ee344b8`) INT128, slice 9 (`c975df7`) the transaction's own view, slice 10 (`644ef69`) arithmetic over DOUBLE / FLOAT, slice 11 (`204f43a`) DECFLOAT read-only;
    INNER-join equalities hash (`3828117`). Switch-on sweep: no served-wrong
    cell left after slice 6, ~4,180 statements served after slice 9. Decision
    before default-on: pin the 11 interpreter index-trace gates or trace `exe`.
    Next: the compile / attachment-set / lossy-move / text-literal decline
-   classes, DECFLOAT / zoned / BLOB outputs, views, index use in `exe`.
+   classes, DECFLOAT arithmetic / grouping, zoned / BLOB outputs, views, index use in `exe`.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

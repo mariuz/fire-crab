@@ -1,6 +1,6 @@
 # fire-crab: Full Conversion Plan
 
-*2026-10-05 · baseline `master` at `ea24856`, updated for `c975df7` · shared copy:
+*2026-10-05 · baseline `master` at `ea24856`, updated for `204f43a` · shared copy:
 [claude.ai doc](https://claude.ai/code/artifact/b21b5433-02ee-42ef-9918-c9d8177a2d5e)*
 
 Every Firebird subsystem has a first Rust version checked against the real
@@ -58,6 +58,14 @@ feature has to be built twice.
     - Slice 9 (`c975df7`): **the transaction's own view** - `exe` reads its
       own uncommitted rows and a concurrency transaction's snapshot, where it
       read the committed image and declined both.
+    - Slice 10 (`644ef69`): arithmetic over DOUBLE / FLOAT, IEEE as the
+      engine's C++ doubles are; an integer operand joins exactly under 2^53.
+      A scaled operand, a division by zero and a non-finite result still fail
+      the run. It also reaches the stored routines `exe` runs by default.
+    - Slice 11 (`204f43a`): DECFLOAT, read-only - outputs, comparison by
+      value beside a DECFLOAT or an exact value (1.0 = 1.00 = 1), MIN / MAX.
+      A NaN, arithmetic, SUM, CAST, DISTINCT / GROUP BY (the cohort laws) and
+      MIN / MAX over equal values of different cohorts fail the run.
     - Speed (`3828117`): an equality across an INNER join step is a hash
       join; a 600 x 600 self join went from over a minute to 1.1 s.
     - Found on the way and fixed: `exe` did not order temporal values,
@@ -77,8 +85,9 @@ feature has to be built twice.
       equivalent trace.
     - Next: the biggest decline classes - compile (`dsql`, about 7,600), the
       attachment's set under non-UTF8 attachments, lossy bound moves, a text
-      literal against a non-text column; DECFLOAT, zoned and BLOB outputs;
-      NaN, arithmetic and CAST over doubles; views; index use in `exe`.
+      literal against a non-text column; DECFLOAT arithmetic and grouping,
+      zoned and BLOB outputs;
+      NaN, CAST and scaled operands over doubles; views; index use in `exe`.
 4. **Concurrency and sharing.** Writers are serialized per database, and only
    the transaction-lock series is used.
     - the typed lock series from `jrd/lck.cpp`, so writers conflict per row
