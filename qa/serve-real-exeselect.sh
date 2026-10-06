@@ -63,6 +63,11 @@ CREATE TABLE WI (ID INT, I INT128, N NUMERIC(38,2));
 INSERT INTO WI VALUES (1, 170141183460469231731687303715884105727, 1.25);
 INSERT INTO WI VALUES (2, -5, -0.5);
 INSERT INTO WI VALUES (3, NULL, 123456789012345678901234567890.12);
+CREATE TABLE DF (ID INT, A DECFLOAT(16), B DECFLOAT(34), N NUMERIC(9,2));
+INSERT INTO DF VALUES (1, 1.0, 1.00, 1.00);
+INSERT INTO DF VALUES (2, 2.5, -3E+100, 2.50);
+INSERT INTO DF VALUES (3, 1.00, 1E-6000, -1);
+INSERT INTO DF VALUES (4, NULL, NULL, NULL);
 CREATE TABLE E (ID INT, N INT);
 CREATE INDEX E_N ON E (N);
 COMMIT;\n" "$REAL" "$ENG" "$U" "$P" | "$ISQL" -q -b > /tmp/exs-build.log 2>&1
@@ -202,6 +207,13 @@ route "12 compared and sorted" served "SELECT ID, I FROM WI WHERE I > -10 ORDER 
 route "12 MAX / MIN / COUNT" served "SELECT MAX(I), MIN(N), COUNT(I) FROM WI"
 route "12 SUM over INT128 declines (where it overflows is the engine's summation order: aggfold)" declined "SELECT SUM(N) FROM WI"
 route "12 arithmetic in the exact scale rules" served "SELECT I + 1, N * 2 FROM WI WHERE ID = 2"
+echo "--- 13 DECFLOAT read-only (slice 11): outputs, compared by VALUE, MIN / MAX"
+route "13 DECFLOAT(16) / (34) outputs, their cohorts kept" served "SELECT ID, A, B FROM DF ORDER BY ID"
+route "13 = an exact literal: 1.0 and 1.00 are 1" served "SELECT ID FROM DF WHERE A = 1 ORDER BY ID"
+route "13 beside an exact column" served "SELECT ID FROM DF WHERE A > N ORDER BY ID"
+route "13 MAX / MIN at the exponent extremes" served "SELECT MAX(B), MIN(B) FROM DF"
+route "13 GROUP BY a DECFLOAT declines (the cohort law)" declined "SELECT A, COUNT(*) FROM DF GROUP BY A"
+route "13 arithmetic declines" declined "SELECT A * 2 FROM DF WHERE ID = 2"
 echo "--- 9 system relations: their formats are built in, never stored (slice 4)"
 route "9 a SYSTEM relation, numeric outputs" served "SELECT RDB\$RELATION_ID, RDB\$SYSTEM_FLAG FROM RDB\$RELATIONS WHERE RDB\$RELATION_ID < 12 ORDER BY 1"
 route "9 ...an aggregate over one" served "SELECT COUNT(*), MAX(RDB\$FIELD_POSITION) FROM RDB\$RELATION_FIELDS WHERE RDB\$SYSTEM_FLAG = 0"
@@ -237,5 +249,5 @@ if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 79 ]; then echo "FAIL only $ran checks ran (floor 79) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 85 ]; then echo "FAIL only $ran checks ran (floor 85) - cells went missing"; fail=1; fi
 exit $fail

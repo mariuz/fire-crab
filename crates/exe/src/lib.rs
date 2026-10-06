@@ -157,6 +157,8 @@ mod blr {
     pub const DT_TIMESTAMP: u8 = 35;
     pub const DT_DOUBLE: u8 = 27;
     pub const DT_BOOL: u8 = 23;
+    pub const DT_DEC64: u8 = 24;
+    pub const DT_DEC128: u8 = 25;
     pub const DT_FLOAT: u8 = 10;
 }
 
@@ -541,7 +543,9 @@ impl<'a> P<'a> {
                 MsgSlot { dtype, length: 0, scale: 0, ttype: 0 }
             }
             // ...and so do the approximate ones (slice 5)
-            blr::DT_DOUBLE | blr::DT_FLOAT | blr::DT_BOOL => MsgSlot { dtype, length: 0, scale: 0, ttype: 0 },
+            blr::DT_DOUBLE | blr::DT_FLOAT | blr::DT_BOOL | blr::DT_DEC64 | blr::DT_DEC128 => {
+                MsgSlot { dtype, length: 0, scale: 0, ttype: 0 }
+            }
             other => return Err(format!("message dtype {} unconverted", other)),
         })
     }
@@ -1489,6 +1493,17 @@ fn coerce_temporal(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
 /// text) is unconverted too - both fail the run.
 fn coerce_bool(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
     let Some(dt) = slot.map(|s| s.dtype) else { return Ok(v) };
+    // ...and a DECFLOAT the same way: a value into a DECFLOAT slot must be
+    // one of that width, and a DECFLOAT into another kind is unconverted
+    // (the engine's conversions, traps and rounding modes are not made here)
+    match (dt, &v) {
+        (_, Value::Null) => {}
+        (blr::DT_DEC64, Value::DecFloat16(_)) | (blr::DT_DEC128, Value::DecFloat34(_)) => return Ok(v),
+        (blr::DT_DEC64 | blr::DT_DEC128, _) | (_, Value::DecFloat16(_) | Value::DecFloat34(_)) => {
+            return Err("a DECFLOAT assignment unconverted".into())
+        }
+        _ => {}
+    }
     match (dt == blr::DT_BOOL, &v) {
         (_, Value::Null) => Ok(v),
         (true, Value::Bool(_)) => Ok(v),
@@ -2359,6 +2374,11 @@ impl<'a> Exec<'a> {
                 let keys = self.with_binding(&binding, |ex| {
                     rse.project.iter().map(|e| ex.eval(e)).collect::<Result<Vec<_>, _>>()
                 })?;
+                // which of two equal DECFLOATs (1.0, 1.00) DISTINCT keeps is
+                // the engine's cohort law - unconverted here
+                if keys.iter().any(|k| matches!(k, Value::DecFloat16(_) | Value::DecFloat34(_))) {
+                    return Err("DISTINCT over a DECFLOAT unconverted".into());
+                }
                 keyed.push((keys, binding));
             }
             keyed.sort_by(|(a, _), (b, _)| {
@@ -3158,6 +3178,11 @@ impl<'a> Exec<'a> {
             for k in &agg.group_by {
                 keys.push(self.eval(k)?);
             }
+            // GROUP BY a DECFLOAT: the group's representative and NaN's
+            // grouping are the engine's cohort laws - unconverted here
+            if keys.iter().any(|k| matches!(k, Value::DecFloat16(_) | Value::DecFloat34(_))) {
+                return Err("GROUP BY a DECFLOAT unconverted".into());
+            }
             let gi = match groups.iter().position(|g| {
                 g.keys.len() == keys.len()
                     && g.keys.iter().zip(&keys).all(|(a, b)| group_eq(a, b))
@@ -3229,6 +3254,16 @@ impl<'a> Exec<'a> {
                         } else if !matches!(v, Value::Null) {
                             return Err("AVG over a non-exact operand unconverted".into());
                         }
+                    }
+                    (Fold::Min(acc) | Fold::Max(acc), _, Some(v))
+                        if matches!(v, Value::DecFloat16(_) | Value::DecFloat34(_))
+                            && acc.as_ref().is_some_and(|cur| {
+                                value_cmp(&v, cur) == Some(std::cmp::Ordering::Equal) && *cur != v
+                            }) =>
+                    {
+                        // two EQUAL DECFLOATs of different cohorts: which one
+                        // MIN / MAX answers is the engine's law - unconverted
+                        return Err("MIN / MAX over equal DECFLOAT cohorts unconverted".into());
                     }
                     (Fold::Min(acc), _, Some(v)) => {
                         if !matches!(v, Value::Null) {
@@ -4313,6 +4348,34 @@ pub fn value_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         // converted to it (the engine's rule for a mixed comparison); a NaN
         // has orders of its own (the primary-operand law, totalOrder in a
         // sort) that this executor does not model - it fails the run
+        // A DECFLOAT beside a DECFLOAT or an exact value compares by VALUE
+        // (ods::decfloat::cmp - 1.0 equals 1.00); a NaN is unorderable here
+        // (its laws are the engine's own) and a double beside it is
+        // unconverted - both fail the run
+        (DecFloat16(_) | DecFloat34(_), _) | (_, DecFloat16(_) | DecFloat34(_))
+            if !matches!(a, Double(_) | Float(_)) && !matches!(b, Double(_) | Float(_)) =>
+        {
+            use fire_crab_ods::decfloat as dfl;
+            let d = |v: &Value| -> Option<dfl::Dec> {
+                match v {
+                    DecFloat16(x) => Some(dfl::decode_dec64(*x)),
+                    DecFloat34(x) => Some(dfl::decode_dec128(*x)),
+                    _ => {
+                        let (r, s) = num(v)?;
+                        Some(dfl::Dec::Finite { neg: r < 0, coeff: r.unsigned_abs(), exp: s as i32 })
+                    }
+                }
+            };
+            match (d(a), d(b)) {
+                (Some(x), Some(y)) if !matches!(x, dfl::Dec::Nan) && !matches!(y, dfl::Dec::Nan) => {
+                    Some(dfl::cmp(&x, &y))
+                }
+                _ => {
+                    INCOMPARABLE.with(|f| f.set(true));
+                    None
+                }
+            }
+        }
         (Double(_) | Float(_), _) | (_, Double(_) | Float(_)) => {
             // an exact value as its CORRECTLY ROUNDED double: one IEEE
             // division of two exactly-held operands is, while the raw fits

@@ -130388,6 +130388,9 @@ fn exe_select(
             482 => "FLOAT".to_string(),
             // BOOLEAN (slice 7)
             32764 => "BOOLEAN".to_string(),
+            // DECFLOAT (slice 11)
+            32760 => "DECFLOAT(16)".to_string(),
+            32762 => "DECFLOAT(34)".to_string(),
             // A TEXT OUTPUT IN ITS OWN SET: a plain column's ttype (the
             // length in bytes), or an expression's real-set sentinel (the
             // length in characters); the attachment's set ([ATT_SUBTYPE])
@@ -130673,6 +130676,7 @@ fn exe_select(
             (570, Value::Date(_)) | (560, Value::Time(_)) | (510, Value::Timestamp(..)) => true,
             (480, Value::Double(_)) | (482, Value::Float(_)) => true,
             (32764, Value::Bool(_)) => true,
+            (32760, Value::DecFloat16(_)) | (32762, Value::DecFloat34(_)) => true,
             (32752, Value::Int(_) | Value::Scaled(..) | Value::Int128(..)) => true,
             (448 | 452, Value::Text(_)) => true,
             _ => false,
