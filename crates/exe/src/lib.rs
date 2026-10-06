@@ -3677,11 +3677,14 @@ impl<'a> Exec<'a> {
             // a NON-ASCII text maps by the charset's own case tables (the
             // Turkish dotted İ is not 'i' + U+0307 under the engine's
             // LOWER - utf8case) - unconverted here, the ASCII map only
-            Expr::CaseMap(_, inner) if matches!(self.eval(inner)?, Value::Text(ref t) if !t.is_ascii()) => {
-                return Err("case mapping over non-ASCII text unconverted".into());
-            }
+            // (the operand is evaluated ONCE: a guard arm that evaluated it
+            // and fell through to this one doubled the work per level - 390
+            // nested UPPERs never finished: deepexpr)
             Expr::CaseMap(up, inner) => match self.eval(inner)? {
                 Value::Null => Value::Null,
+                Value::Text(t) if !t.is_ascii() => {
+                    return Err("case mapping over non-ASCII text unconverted".into());
+                }
                 Value::Text(t) => Value::Text(if *up {
                     t.to_uppercase()
                 } else {
