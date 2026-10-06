@@ -1,6 +1,6 @@
 # fire-crab: Full Conversion Plan
 
-*2026-10-05 · baseline `master` at `ea24856`, updated for `768bc86` · shared copy:
+*2026-10-05 · baseline `master` at `ea24856`, updated for `c975df7` · shared copy:
 [claude.ai doc](https://claude.ai/code/artifact/b21b5433-02ee-42ef-9918-c9d8177a2d5e)*
 
 Every Firebird subsystem has a first Rust version checked against the real
@@ -49,22 +49,36 @@ feature has to be built twice.
       procedure, declined where moving the value into its slot would change it.
     - Slice 4 (`529313c`): system relations (the built-in formats); a virtual
       or global temporary relation declines.
-    - Slice 5 (`768bc86`): DOUBLE / FLOAT, compared and summed as the engine
-      does.
+    - Slice 5 (`768bc86`): DOUBLE / FLOAT, compared as the engine does (a
+      double SUM / AVG declines: its value depends on the summation order).
+    - Slice 6 (`69d712e`): text output in the attachment's set under UTF8.
+      Slice 7 (`983cd3c`): BOOLEAN. Slice 8 (`ee344b8`): INT128 /
+      NUMERIC(19..38). Each type's BLR descriptor is byte-identical to the
+      engine's.
+    - Slice 9 (`c975df7`): **the transaction's own view** - `exe` reads its
+      own uncommitted rows and a concurrency transaction's snapshot, where it
+      read the committed image and declined both.
+    - Speed (`3828117`): an equality across an INNER join step is a hash
+      join; a 600 x 600 self join went from over a minute to 1.1 s.
     - Found on the way and fixed: `exe` did not order temporal values,
       `dsql` refused an ORDER BY ordinal, and `exe`'s SUM / AVG skipped a
       non-exact operand.
-    - **Switch-on sweep (2026-10-05, all 523 gates):** about 2,200 statements
-      served and 10,000 declined (compile 4,485; execute 2,370; text output in
-      the attachment's set 653; parameter types 426). Every wrong answer it
-      found is now declined instead: a transaction with its own writes (`exe`
-      reads the committed image), views (read as empty), a text literal against
-      a non-text column, lossy parameter moves. The route stays off until
-      these are served correctly.
-    - Next: the attachment's set (`ATT_SUBTYPE` outputs); BOOLEAN and DECFLOAT;
-      NaN, arithmetic and CAST over doubles; reading the transaction's own
-      writes; views; index use in `exe` (`idxcost` and `leftjoinindex` take
-      minutes under the switch); then making the route the default.
+    - **Switch-on sweeps:** the first (2026-10-05) served about 2,200
+      statements; every class of wrong answer it found now declines or fails
+      the run (`37fc50f`, `f91d03a`). One root cause: the BLR decoder listed
+      only `blr_relation`, so aliased streams - joined views, joined codepage
+      or collated relations - escaped the guards. After slice 6 (2026-10-06)
+      **no served-wrong cell is left**; after slice 9 the route serves about
+      4,180 statements. The remaining failures are the known engine-side reds
+      and 11 index / join-order cells that count the interpreter's own index
+      trace, which the route bypasses.
+    - **Decision needed before the route goes on by default:** pin those trace
+      gates to the interpreter (`FC_EXEC_SELECT` unset), or give `exe` an
+      equivalent trace.
+    - Next: the biggest decline classes - compile (`dsql`, about 7,600), the
+      attachment's set under non-UTF8 attachments, lossy bound moves, a text
+      literal against a non-text column; DECFLOAT, zoned and BLOB outputs;
+      NaN, arithmetic and CAST over doubles; views; index use in `exe`.
 4. **Concurrency and sharing.** Writers are serialized per database, and only
    the transaction-lock series is used.
     - the typed lock series from `jrd/lck.cpp`, so writers conflict per row
@@ -101,6 +115,9 @@ Wrong answers rank above refusals; a refusal is safe, a wrong answer is not.
       join the engine streams a row before the raise, where this server raises
       first.
     - `RDB$CONFIG` answers no rows.
+    - Wrong answer fixed (`a88ecfd`, `qa/serve-real-ctxwords.sh`): a bare
+      CURRENT_USER / USER / CURRENT_ROLE in a view, CHECK or routine this
+      server compiled was stored as a column reference.
     - Done 2026-10-05/06: an expression over a selectable procedure's outputs
       (`768bc86`); the virtual `RDB$TIME_ZONES` / `RDB$KEYWORDS` and subqueries
       over computed relations, MON$ included (`529313c`).

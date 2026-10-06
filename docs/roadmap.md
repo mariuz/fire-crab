@@ -24,11 +24,14 @@ replacement of the C++ engine is below, in priority order. Full text:
    In progress behind `FC_EXEC_SELECT` (`qa/serve-real-exeselect.sh`): slice 1
    (`953ec53`) parameterless SELECTs with numeric/temporal outputs, slice 2
    (`a771c23`) text outputs, slice 3 (`fee1e98`) bound parameters, slice 4
-   (`529313c`) system relations, slice 5 (`768bc86`) DOUBLE / FLOAT. The
-   switch-on sweep served ~2,200 statements and declined ~10,000; its wrong
-   answers (own uncommitted writes, views, ...) now decline. Next:
-   attachment-set outputs, BOOLEAN / DECFLOAT, own writes, views, index use
-   in `exe`; then the switch on by default.
+   (`529313c`) system relations, slice 5 (`768bc86`) DOUBLE / FLOAT, slice 6
+   (`69d712e`) attachment-set text under UTF8, slice 7 (`983cd3c`) BOOLEAN,
+   slice 8 (`ee344b8`) INT128, slice 9 (`c975df7`) the transaction's own view;
+   INNER-join equalities hash (`3828117`). Switch-on sweep: no served-wrong
+   cell left after slice 6, ~4,180 statements served after slice 9. Decision
+   before default-on: pin the 11 interpreter index-trace gates or trace `exe`.
+   Next: the compile / attachment-set / lossy-move / text-literal decline
+   classes, DECFLOAT / zoned / BLOB outputs, views, index use in `exe`.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).
@@ -41,6 +44,8 @@ replacement of the C++ engine is below, in priority order. Full text:
    `WHERE CURRENT OF` - needs `RDB$DB_KEY`, also refused); `OVERLAY`, `BIT_LENGTH`, `ASCII_CHAR`,
    `CAST AS BOOLEAN`; GROUP BY/windows with FIRST/SKIP; impure calls in DML;
    `NEXT VALUE FOR` in PSQL; `RDB$DEBUG_INFO`.
+   Context words in compiled views / CHECKs / routines are session values,
+   not columns (`a88ecfd`).
    Index keys from an unconvertible literal raise in joins and subqueries
    (`92ea9c4`, `cb8ea7f`; LEFT-join row order left); expressions over a
    procedure's outputs and virtual RDB$TIME_ZONES / RDB$KEYWORDS: done
