@@ -2050,12 +2050,75 @@ impl<'a> Exec<'a> {
                         let mut acc: Vec<Vec<StreamFrame>> = vec![Vec::new()];
                         for src in streams {
                             let side = self.open_source(src)?;
+                            // AN EQUALITY CONJUNCT ACROSS THE STEP hashes the
+                            // new side by its key and probes it per
+                            // accumulated binding - only CANDIDATE pairs are
+                            // built, and the full ON still decides each one
+                            // below (the cross product of two 600-row sides
+                            // took over a minute: fetchdup under the switch)
+                            let acc_ctx: Vec<u8> = acc.first().map(|b| b.iter().map(|f| f.context).collect()).unwrap_or_default();
+                            let side_ctx: Vec<u8> = side.first().map(|b| b.iter().map(|f| f.context).collect()).unwrap_or_default();
+                            let probe = on.as_ref().and_then(|b| equi_key(b, &acc_ctx, &side_ctx));
                             let mut next = Vec::new();
-                            for b in &acc {
-                                for sb in &side {
-                                    let mut nb = b.clone();
-                                    nb.extend(sb.iter().cloned());
-                                    next.push(nb);
+                            match probe {
+                                Some((left_key, right_key)) if !acc_ctx.is_empty() => {
+                                    let mut table: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+                                    let mut hashable = true;
+                                    for (i, sb) in side.iter().enumerate() {
+                                        let v = self.with_binding(sb, |ex| ex.eval(&right_key))?;
+                                        match hash_key(&v) {
+                                            Some(Some(k)) => table.entry(k).or_default().push(i),
+                                            Some(None) => {} // NULL: never equal
+                                            None => { hashable = false; break }
+                                        }
+                                    }
+                                    // the KINDS the new side's keys hold: a key of
+                                    // another kind is no equality but an
+                                    // unorderable pair, which the nested loop
+                                    // turns into a failed run - so it falls back
+                                    let kinds: std::collections::HashSet<char> =
+                                        table.keys().filter_map(|k| k.chars().next()).collect();
+                                    if hashable {
+                                        for b in &acc {
+                                            let v = self.with_binding(b, |ex| ex.eval(&left_key))?;
+                                            match hash_key(&v) {
+                                                Some(Some(k)) if !kinds.is_empty() && !kinds.contains(&k.chars().next().unwrap_or(' ')) => {
+                                                    hashable = false;
+                                                    break;
+                                                }
+                                                Some(Some(k)) => {
+                                                    if let Some(ix) = table.get(&k) {
+                                                        for &i in ix {
+                                                            let mut nb = b.clone();
+                                                            nb.extend(side[i].iter().cloned());
+                                                            next.push(nb);
+                                                        }
+                                                    }
+                                                }
+                                                Some(None) => {}
+                                                None => { hashable = false; break }
+                                            }
+                                        }
+                                    }
+                                    if !hashable {
+                                        next.clear();
+                                        for b in &acc {
+                                            for sb in &side {
+                                                let mut nb = b.clone();
+                                                nb.extend(sb.iter().cloned());
+                                                next.push(nb);
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    for b in &acc {
+                                        for sb in &side {
+                                            let mut nb = b.clone();
+                                            nb.extend(sb.iter().cloned());
+                                            next.push(nb);
+                                        }
+                                    }
                                 }
                             }
                             acc = next;
@@ -3847,6 +3910,75 @@ thread_local! {
     /// a WHERE the unknown: a silently wrong answer each time. The run
     /// reads it and refuses instead ([bind_and_execute_mode])
     static INCOMPARABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The contexts an expression reads (blr_field / blr_fid), or None when
+/// it reads something a join step cannot place (a variable, a subquery).
+fn expr_contexts(e: &Expr, out: &mut Vec<u8>) -> Option<()> {
+    match e {
+        Expr::Field(c, _) | Expr::Fid(c, _) => out.push(*c),
+        Expr::Literal(_) | Expr::Null | Expr::Parameter(..) => {}
+        Expr::Arith(_, a, b) => { expr_contexts(a, out)?; expr_contexts(b, out)? }
+        Expr::Negate(a) | Expr::CaseMap(_, a) | Expr::StrLen(_, a) | Expr::Trim(_, a) | Expr::Cast(_, a) => expr_contexts(a, out)?,
+        _ => return None,
+    }
+    Some(())
+}
+
+/// An equality conjunct of `on` whose one operand reads only `left`
+/// contexts and the other only `right` ones: (left key, right key).
+fn equi_key(on: &Bool, left: &[u8], right: &[u8]) -> Option<(Expr, Expr)> {
+    match on {
+        Bool::And(a, b) => equi_key(a, left, right).or_else(|| equi_key(b, left, right)),
+        Bool::Cmp(op, x, y) if *op == blr::EQL => {
+            let side = |e: &Expr| -> Option<u8> {
+                let mut cs = Vec::new();
+                expr_contexts(e, &mut cs)?;
+                if cs.is_empty() {
+                    None
+                } else if cs.iter().all(|c| left.contains(c)) {
+                    Some(0)
+                } else if cs.iter().all(|c| right.contains(c)) {
+                    Some(1)
+                } else {
+                    None
+                }
+            };
+            match (side(x)?, side(y)?) {
+                (0, 1) => Some((x.clone(), y.clone())),
+                (1, 0) => Some((y.clone(), x.clone())),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A join key's hash text under [value_cmp]'s equality: Some(None) for
+/// NULL (equal to nothing), None for a kind this hash does not canonicalise
+/// (the step then falls back to the nested loop). Exact numerics reduce to
+/// their shortest (raw, scale) so 2 and 2.00 meet; text drops its trailing
+/// blanks, as the comparison does.
+fn hash_key(v: &Value) -> Option<Option<String>> {
+    Some(Some(match v {
+        Value::Null => return Some(None),
+        Value::Int(_) | Value::Scaled(..) | Value::Int128(..) => {
+            let (mut r, mut s) = num_parts(v)?;
+            while s < 0 && r % 10 == 0 {
+                r /= 10;
+                s += 1;
+            }
+            if r == 0 {
+                s = 0;
+            }
+            format!("n{}e{}", r, s)
+        }
+        Value::Text(t) => format!("t{}", t.trim_end_matches(' ')),
+        Value::Date(d) => format!("d{}", d),
+        Value::Time(t) => format!("m{}", t),
+        Value::Timestamp(d, t) => format!("s{}:{}", d, t),
+        _ => return None,
+    }))
 }
 
 /// A relation's formats: RDB$FORMATS' for a user relation, the built-in

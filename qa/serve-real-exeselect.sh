@@ -103,6 +103,9 @@ echo "--- 3 aggregates, grouping, joins"
 route "3 COUNT / SUM / MAX over the table" served "SELECT COUNT(*), SUM(N), MAX(B), MIN(G) FROM T"
 route "3 GROUP BY a SMALLINT, HAVING" served "SELECT G, COUNT(*), SUM(N) FROM T GROUP BY G HAVING COUNT(*) > 1 ORDER BY G"
 route "3 an inner join, a NUMERIC(18,4) output" served "SELECT T.ID, U.V FROM T JOIN U ON U.T_ID = T.ID ORDER BY U.ID"
+route "3 a HASH join on exact keys of different scales (1.00 meets 1)" served "SELECT T.ID, U.ID FROM T JOIN U ON U.T_ID * 1.00 = T.ID ORDER BY 2"
+route "3 ...a self join, the key on both sides" served "SELECT A.ID, B.ID FROM T A JOIN T B ON B.G = A.G ORDER BY 1, 2"
+route "3 ...a NULL key meets nothing" served "SELECT A.ID FROM T A JOIN T B ON B.N = A.N ORDER BY 1"
 route "3 EXISTS" served "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U WHERE U.T_ID = T.ID) ORDER BY ID"
 
 echo "--- 6 text outputs in their own set (slice 2)"
@@ -210,5 +213,5 @@ if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 62 ]; then echo "FAIL only $ran checks ran (floor 62) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 65 ]; then echo "FAIL only $ran checks ran (floor 65) - cells went missing"; fail=1; fi
 exit $fail

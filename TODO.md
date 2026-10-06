@@ -67,6 +67,11 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       utf8routines). ROOT CAUSE of two classes: the BLR decoder listed only blr_relation, so every ALIASED stream - a
       joined view, a joined codepage or collated relation - was invisible to the guards (icucoll, codepages); it lists
       blr_relation2 / blr_relation3 too now, which also tightens the stored-procedure collation guard.
+      SPEED: exe's INNER join built the whole cross product before filtering (a 600 x 600 self join took over a
+      minute - fetchdup's isql timed out under the switch). An equality conjunct across a join step now hashes the
+      new side by its key (exact numerics at their shortest scale, text without trailing blanks, the temporal kinds)
+      and probes per accumulated binding; the full ON still decides each candidate, and a key of another kind or an
+      unhashable one falls back to the nested loop. 1.1 s now.
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a
