@@ -2212,7 +2212,38 @@ impl<'a> Exec<'a> {
                     // outer joins: preserved-side bindings with no ON
                     // match emit once, the other side's frames EMPTY
                     // rows - every field of them reads NULL
-                    JoinKind::Left | JoinKind::Right | JoinKind::Full => {
+                    // A RIGHT join is driven by its PRESERVED side: right rows
+                    // in their storage order, each one's matches in the left
+                    // side's order, an unmatched one padded IN ITS POSITION
+                    // (jointypes: the left-driven emission put RID 10 first)
+                    JoinKind::Right => {
+                        let side_a = self.open_source(&streams[0])?;
+                        let side_b = self.open_source(&streams[1])?;
+                        let pad_a = padding_frames(&streams[0]);
+                        let mut out = Vec::new();
+                        for bb in &side_b {
+                            let mut hit = false;
+                            for ba in &side_a {
+                                let mut binding = ba.clone();
+                                binding.extend(bb.iter().cloned());
+                                let keep = match on {
+                                    None => Some(true),
+                                    Some(cond) => self.with_binding(&binding, |ex| ex.bool_eval(cond))?,
+                                };
+                                if keep == Some(true) {
+                                    hit = true;
+                                    out.push(binding);
+                                }
+                            }
+                            if !hit {
+                                let mut binding = pad_a.clone();
+                                binding.extend(bb.iter().cloned());
+                                out.push(binding);
+                            }
+                        }
+                        out
+                    }
+                    JoinKind::Left | JoinKind::Full => {
                         let side_a = self.open_source(&streams[0])?;
                         let side_b = self.open_source(&streams[1])?;
                         let pad_a = padding_frames(&streams[0]);
@@ -3370,6 +3401,12 @@ impl<'a> Exec<'a> {
                 self.gen_overlay.insert(id, new);
                 Value::Int(new)
             }
+            // a NON-ASCII text maps by the charset's own case tables (the
+            // Turkish dotted İ is not 'i' + U+0307 under the engine's
+            // LOWER - utf8case) - unconverted here, the ASCII map only
+            Expr::CaseMap(_, inner) if matches!(self.eval(inner)?, Value::Text(ref t) if !t.is_ascii()) => {
+                return Err("case mapping over non-ASCII text unconverted".into());
+            }
             Expr::CaseMap(up, inner) => match self.eval(inner)? {
                 Value::Null => Value::Null,
                 Value::Text(t) => Value::Text(if *up {
@@ -3467,8 +3504,18 @@ impl<'a> Exec<'a> {
                         // text parses (the engine's string-to-number
                         // conversion; a bad string is its 22018)
                         let n = match &v {
+                            // the engine converts through a BUFFER sized by the
+                            // target (22 bytes for SMALLINT, 52 for INTEGER /
+                            // BIGINT - a longer padded string raises "string
+                            // right truncation"): past the smallest, unconverted
+                            Value::Text(t) if t.len() > 22 => {
+                                return Err("a long text to integer conversion unconverted".into())
+                            }
+                            // only BLANKS are trimmed: a tab or a newline is
+                            // part of the string and fails the conversion
+                            // (textcolcmp: '\t2' raises on the engine)
                             Value::Text(t) => t
-                                .trim()
+                                .trim_matches(' ')
                                 .parse::<i64>()
                                 // the PARSE trims leading/trailing spaces, but
                                 // the 22018 message carries the RAW value -

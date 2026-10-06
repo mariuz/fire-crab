@@ -1237,6 +1237,13 @@ fn lex(sql: &str) -> Option<Vec<Tok>> {
                     let n: i64 = b[start..i].iter().collect::<String>().parse().ok()?;
                     out.push(Tok::Int(n));
                 }
+                // a number RUN INTO a letter is an exponent literal
+                // (`1e308`, `1.5E-3`) this lexicon does not read - never a
+                // number followed by an alias named `E308` (which answered
+                // 1.0 for `SELECT 1e308` once aliases were accepted)
+                if b.get(i).is_some_and(|c| c.is_alphabetic() || *c == '_' || *c == '$') {
+                    return None;
+                }
             }
             a if a.is_alphabetic() || a == '_' || a == '$' => {
                 let start = i;
@@ -6700,6 +6707,7 @@ impl<'a> P<'a> {
             self.merge_scope = Some((sidx, sidx + 1 + joins.len()));
         }
         let mut items: Vec<Item> = Vec::new();
+        let mut aliases: Vec<String> = Vec::new();
         loop {
             match self.t.get(self.i)? {
                 Tok::Ident(w)
@@ -6812,6 +6820,20 @@ impl<'a> P<'a> {
                     });
                 }
             }
+            // an item's ALIAS - `AS name` or a bare name - names the
+            // column for the client and never reaches the BLR (measured:
+            // a FOR SELECT with and without them compiles alike); an ORDER
+            // BY that names one is refused below
+            if self.kw("AS") {
+                let Some(Tok::Ident(a)) = self.t.get(self.i) else { return None };
+                aliases.push(a.clone());
+                self.i += 1;
+            } else if let Some(Tok::Ident(a)) = self.t.get(self.i) {
+                if self.i != list_end && !is_keyword(a) {
+                    aliases.push(a.clone());
+                    self.i += 1;
+                }
+            }
             if self.i == list_end {
                 break;
             }
@@ -6821,6 +6843,25 @@ impl<'a> P<'a> {
             self.i += 1;
         }
         self.i = after_from;
+        // an ORDER BY / GROUP BY naming an alias resolves by the engine's
+        // own rules (an alias beside a column of the same name): refused
+        if !aliases.is_empty() {
+            let mut j = after_from;
+            let mut depth = 0i32;
+            let mut in_order = false;
+            while let Some(t) = self.t.get(j) {
+                match t {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => depth -= 1,
+                    Tok::Semi => break,
+                    Tok::Ident(w) if depth == 0 && (w == "INTO" || w == "DO") => break,
+                    Tok::Ident(w) if depth == 0 && (w == "ORDER" || w == "GROUP" || w == "HAVING") => in_order = true,
+                    Tok::Ident(w) if in_order && aliases.iter().any(|a| a == w) => return None,
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
         let cols_n = items.len();
         if cols_n == 0 {
             return None;

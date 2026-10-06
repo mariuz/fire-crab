@@ -96,6 +96,12 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       Slice 11: DECFLOAT read-only - outputs, comparison by VALUE beside a DECFLOAT or an exact value (1.0 = 1.00 = 1),
       MIN / MAX; a NaN, a double beside it, arithmetic, SUM, CAST, an assignment of another kind, DISTINCT and GROUP BY
       (the cohort laws) and MIN / MAX over equal values of different cohorts fail the run.
+      Slice 12: SELECT-LIST ALIASES (`COUNT(*) AS K`, `DEPT_ID D`) - dsql refused every one; an alias never reaches the
+      BLR (a fc-made FOR SELECT with them is byte-identical), and an ORDER / GROUP BY / HAVING naming one refuses. Served
+      5862 under the switch (4180 before). What the newly served statements exposed, each closed: dsql's lexer read
+      `1e308` as 1 with an ALIAS E308 (a number run into a letter refuses now); exe's text-to-integer CAST trimmed tabs
+      and ignored the engine's conversion buffer (22 / 52 bytes); a RIGHT join was emitted left-driven (the preserved
+      side drives now); LOWER / UPPER over non-ASCII text fail the run (the Turkish dotted I).
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a
