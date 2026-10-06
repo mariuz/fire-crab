@@ -214,6 +214,11 @@ route "13 beside an exact column" served "SELECT ID FROM DF WHERE A > N ORDER BY
 route "13 MAX / MIN at the exponent extremes" served "SELECT MAX(B), MIN(B) FROM DF"
 route "13 GROUP BY a DECFLOAT declines (the cohort law)" declined "SELECT A, COUNT(*) FROM DF GROUP BY A"
 route "13 arithmetic declines" declined "SELECT A * 2 FROM DF WHERE ID = 2"
+echo "--- 14 INDEX retrieval (slice 13): an equality or a range on an indexed exact column"
+route "14 the PRIMARY KEY by equality" served "SELECT ID, N FROM T WHERE ID = 2"
+route "14 ...by a parameter-free range, both bounds" served "SELECT ID FROM T WHERE ID BETWEEN 2 AND 3 ORDER BY ID"
+route "14 ...an open range, mirrored" served "SELECT ID FROM T WHERE 2 < ID ORDER BY ID"
+route "14 ...a value the column cannot hold matches nothing" served "SELECT ID FROM T WHERE ID = 2.5"
 echo "--- 9 system relations: their formats are built in, never stored (slice 4)"
 route "9 a SYSTEM relation, numeric outputs" served "SELECT RDB\$RELATION_ID, RDB\$SYSTEM_FLAG FROM RDB\$RELATIONS WHERE RDB\$RELATION_ID < 12 ORDER BY 1"
 route "9 ...an aggregate over one" served "SELECT COUNT(*), MAX(RDB\$FIELD_POSITION) FROM RDB\$RELATION_FIELDS WHERE RDB\$SYSTEM_FLAG = 0"
@@ -249,5 +254,5 @@ if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 85 ]; then echo "FAIL only $ran checks ran (floor 85) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 89 ]; then echo "FAIL only $ran checks ran (floor 89) - cells went missing"; fail=1; fi
 exit $fail

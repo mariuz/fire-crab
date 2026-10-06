@@ -3119,7 +3119,7 @@ impl<'a> Exec<'a> {
         let cols = relation_columns(self.file, self.page_size, name);
         let Some(irt) = fire_crab_ods::btr::find_index_root(self.file, self.page_size, rel) else { return Ok(None) };
         let tips = TipChain::read(self.file, self.page_size).ok_or("cannot read transaction inventory")?;
-        for c in cs {
+        for c in &cs {
             let Bool::Cmp(op, x, y) = c else { continue };
             if *op != blr::EQL {
                 continue;
@@ -3170,6 +3170,111 @@ impl<'a> Exec<'a> {
                 let seg = btw::KeySeg { itype: segs[0].1, value: &key_value, scale: d.scale, charset: 0 };
                 let Some((key, _)) = btw::build_index_key(&[seg], desc) else { continue };
                 let Some(hits) = fire_crab_ods::btr::lookup_key(self.file, self.page_size, rel, e.id, &key, desc) else { continue };
+                return Ok(Some(self.fetch_by_recno(rel, &formats, hits.into_iter().map(|(_, n)| n).collect())?));
+            }
+        }
+        // NO EQUALITY: a RANGE over one column - `<`, `<=`, `>`, `>=` (BETWEEN
+        // compiles to two of them) - through an ASCENDING plain index, whose
+        // keys are order-preserving: one band [lo, hi]. A bound the column
+        // cannot hold exactly, a descending index (its complemented keys
+        // swap the band) and a mix of columns keep the scan.
+        let mut bounds: std::collections::HashMap<usize, (Option<(Value, bool)>, Option<(Value, bool)>)> =
+            std::collections::HashMap::new();
+        for c in &cs {
+            let Bool::Cmp(op, x, y) = c else { continue };
+            let (field, val, op) = match (x, y) {
+                (Expr::Field(cx, f), v @ (Expr::Literal(_) | Expr::Parameter(..))) if *cx == context => (f, v, *op),
+                (v @ (Expr::Literal(_) | Expr::Parameter(..)), Expr::Field(cx, f)) if *cx == context => {
+                    // mirrored: `5 < K` is `K > 5`
+                    let m = match *op {
+                        blr::LSS => blr::GTR,
+                        blr::LEQ => blr::GEQ,
+                        blr::GTR => blr::LSS,
+                        blr::GEQ => blr::LEQ,
+                        o => o,
+                    };
+                    (f, v, m)
+                }
+                _ => continue,
+            };
+            if !matches!(op, blr::LSS | blr::LEQ | blr::GTR | blr::GEQ) {
+                continue;
+            }
+            let Some(fid) = cols.iter().find(|c| c.name.trim_end() == field.trim_end()).map(|c| c.field_id as usize) else { continue };
+            let Some(d) = descs.get(fid) else { continue };
+            if !matches!(d.dtype, fire_crab_ods::format::dtype::SHORT | fire_crab_ods::format::dtype::LONG | fire_crab_ods::format::dtype::INT64) {
+                continue;
+            }
+            let v = self.eval(val)?;
+            let Some((raw, sc)) = num_parts(&v) else { continue };
+            let Some(r) = exe_rescale(raw, sc, d.scale) else { continue };
+            if exe_rescale(r, d.scale, sc) != Some(raw) {
+                continue;
+            }
+            let kv = mk_num(r, d.scale);
+            let e = bounds.entry(fid).or_insert((None, None));
+            // the TIGHTER bound wins; a tie keeps the exclusive one
+            let tighter = |cur: &Option<(Value, bool)>, new: &Value, incl: bool, lower: bool| -> bool {
+                match cur {
+                    None => true,
+                    Some((cv, ci)) => match value_cmp(new, cv) {
+                        Some(std::cmp::Ordering::Greater) => lower,
+                        Some(std::cmp::Ordering::Less) => !lower,
+                        Some(std::cmp::Ordering::Equal) => *ci && !incl,
+                        None => false,
+                    },
+                }
+            };
+            match op {
+                blr::GTR | blr::GEQ => {
+                    let incl = op == blr::GEQ;
+                    if tighter(&e.0, &kv, incl, true) {
+                        e.0 = Some((kv, incl));
+                    }
+                }
+                _ => {
+                    let incl = op == blr::LEQ;
+                    if tighter(&e.1, &kv, incl, false) {
+                        e.1 = Some((kv, incl));
+                    }
+                }
+            }
+        }
+        for (fid, (lo, hi)) in bounds {
+            let Some(d) = descs.get(fid) else { continue };
+            for e in irt.live_entries() {
+                if e.key_count != 1 || e.is_dropping(Some(&tips)) {
+                    continue;
+                }
+                let Some((segs, flags)) = btw::index_segments(self.file, self.page_size, rel, e.id, 1) else { continue };
+                if flags & (btw::IRT_EXPRESSION | btw::IRT_CONDITION | btw::IRT_DESCENDING) != 0
+                    || segs.first().map(|s| s.0 as usize) != Some(fid)
+                {
+                    continue;
+                }
+                let key = |v: &Value| -> Option<Vec<u8>> {
+                    let seg = btw::KeySeg { itype: segs[0].1, value: v, scale: d.scale, charset: 0 };
+                    btw::build_index_key(&[seg], false).map(|(k, _)| k)
+                };
+                let lo_k = match &lo {
+                    Some((v, i)) => match key(v) { Some(k) => Some((k, *i)), None => continue },
+                    None => None,
+                };
+                let hi_k = match &hi {
+                    Some((v, i)) => match key(v) { Some(k) => Some((k, *i)), None => continue },
+                    None => None,
+                };
+                let Some(hits) = fire_crab_ods::btr::lookup_range(
+                    self.file,
+                    self.page_size,
+                    rel,
+                    e.id,
+                    lo_k.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+                    hi_k.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+                    false,
+                ) else {
+                    continue;
+                };
                 return Ok(Some(self.fetch_by_recno(rel, &formats, hits.into_iter().map(|(_, n)| n).collect())?));
             }
         }

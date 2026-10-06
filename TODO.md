@@ -107,7 +107,8 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       conjunct `<column> = <literal | ?>` over an exact-numeric column with a live plain single-segment index retrieves
       through it (btw::build_index_key, btr::lookup_key, a fetch by record number under the read view; the full WHERE
       still decides every candidate): a point lookup in 20,000 rows 70 ms. A value the column cannot hold answers no
-      rows at once, as the engine's retrieval does. Ranges and compound / text / descending-range keys still scan.
+      rows at once, as the engine's retrieval does. RANGES too (`<` `<=` `>` `>=`, BETWEEN; the tightest bound wins)
+      through an ascending index; compound / text keys and descending-index ranges still scan.
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a
