@@ -496,6 +496,11 @@ enum Val {
     /// blr_internal_info(1) / (2) (probed)
     CurrentConnection,
     CurrentTransaction,
+    /// CURRENT_USER / USER - blr_user_name (0x2C); CURRENT_ROLE -
+    /// blr_current_role (0xAE) (measured: an engine view over
+    /// `S = CURRENT_USER` stores `2F 17 01 01 'S' 2C`)
+    UserName,
+    CurrentRole,
     /// GEN_ID(sequence, increment)
     GenId(String, Box<Val>),
     /// NEXT VALUE FOR sequence - blr_gen_id2, the name alone
@@ -1191,6 +1196,19 @@ fn lex(sql: &str) -> Option<Vec<Tok>> {
                     }
                 }
                 if v.is_empty() {
+                    return None;
+                }
+                // a DELIMITED name that spells a context word ("USER",
+                // "CURRENT_DATE", ..) is a COLUMN, which this token stream
+                // cannot tell from the bare keyword - refused, never read
+                // as the session value (or the bare word as the column)
+                if matches!(
+                    v.as_str(),
+                    "CURRENT_USER" | "USER" | "CURRENT_ROLE" | "CURRENT_DATE" | "CURRENT_TIME"
+                        | "CURRENT_TIMESTAMP" | "CURRENT_CONNECTION" | "CURRENT_TRANSACTION"
+                        | "LOCALTIME" | "LOCALTIMESTAMP" | "ROW_COUNT" | "SQLCODE" | "GDSCODE"
+                        | "SQLSTATE"
+                ) {
                     return None;
                 }
                 out.push(Tok::Ident(v));
@@ -2351,6 +2369,12 @@ impl<'a> P<'a> {
             Tok::Ident(x) if x == "ROW_COUNT" => Val::RowCount,
             Tok::Ident(x) if x == "CURRENT_CONNECTION" => Val::CurrentConnection,
             Tok::Ident(x) if x == "CURRENT_TRANSACTION" => Val::CurrentTransaction,
+            // a session context word, NOT a column: compiled as a field it
+            // stored `blr_field 'CURRENT_ROLE'` - a view over `"CURRENT_ROLE"
+            // = CURRENT_ROLE` compared the column with itself and answered
+            // every row, and `S = CURRENT_USER` failed at use
+            Tok::Ident(x) if x == "CURRENT_USER" || x == "USER" => Val::UserName,
+            Tok::Ident(x) if x == "CURRENT_ROLE" => Val::CurrentRole,
             Tok::Ident(x) if x == "NEXT" => {
                 self.i += 1;
                 if !(self.kw("VALUE") && self.kw("FOR")) {
@@ -3425,6 +3449,8 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.push(blr::INTERNAL_INFO);
             emit_val(out, &Val::Int(2));
         }
+        Val::UserName => out.push(0x2C),
+        Val::CurrentRole => out.push(0xAE),
         Val::GenId(name, inc) => {
             out.push(blr::GEN_ID);
             out.push(name.len() as u8);
