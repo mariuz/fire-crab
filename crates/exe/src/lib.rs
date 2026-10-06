@@ -3611,6 +3611,37 @@ impl<'a> Exec<'a> {
                     };
                     return Ok(Value::Text(format!("{}{}", text(&lv)?, text(&rv)?)));
                 }
+                // AN APPROXIMATE OPERAND makes it double arithmetic: IEEE,
+                // as the engine's C++ doubles are. An integer operand joins
+                // exactly while under 2^53; a scaled one (whose conversion
+                // to double the engine makes its own way) and a result that
+                // is not finite or divides by zero (the engine raises) fail
+                // the run
+                if matches!(lv, Value::Double(_) | Value::Float(_)) || matches!(rv, Value::Double(_) | Value::Float(_)) {
+                    let f = |v: &Value| -> Option<f64> {
+                        match v {
+                            Value::Double(d) => Some(*d),
+                            Value::Float(x) => Some(*x as f64),
+                            Value::Int(n) if n.unsigned_abs() < 1u64 << 53 => Some(*n as f64),
+                            _ => None,
+                        }
+                    };
+                    let (Some(a), Some(b)) = (f(&lv), f(&rv)) else {
+                        return Err("double arithmetic over this operand unconverted".into());
+                    };
+                    let r = match *verb {
+                        blr::ADD => a + b,
+                        blr::SUBTRACT => a - b,
+                        blr::MULTIPLY => a * b,
+                        blr::DIVIDE if b == 0.0 => return Err("double divide by zero unconverted".into()),
+                        blr::DIVIDE => a / b,
+                        _ => unreachable!("parse admitted the verb"),
+                    };
+                    if !r.is_finite() {
+                        return Err("a non-finite double result unconverted".into());
+                    }
+                    return Ok(Value::Double(r));
+                }
                 // PURE INTEGER stays on the i64 path (byte-identical to
                 // before): INTEGER arithmetic is INTEGER, and an i64
                 // overflow is the engine's error, not a silent widen.

@@ -187,7 +187,9 @@ route "10 GROUP BY / DISTINCT a FLOAT" served "SELECT R, COUNT(*) FROM A GROUP B
 route "10 IN over a FLOAT (dsql: an IN list beside a non-exact operand is unprobed)" declined "SELECT ID FROM A WHERE R IN (0.1, 1.5) ORDER BY ID"
 route "10 BETWEEN over a DOUBLE" served "SELECT ID, D FROM A WHERE D BETWEEN 0 AND 3 ORDER BY D"
 route "10 MIN / MAX keep the kind" served "SELECT MIN(R), MAX(D), MAX(R) FROM A"
-route "10 arithmetic over a double still declines" declined "SELECT D * 2 FROM A ORDER BY ID"
+route "10 arithmetic over a double: IEEE, an integer operand exact under 2^53 (slice 10)" served "SELECT D * 2, R * 3, D + R, R / 3 FROM A ORDER BY ID"
+route "10 ...a scaled operand still declines" declined "SELECT N * D FROM A ORDER BY ID"
+route "10 ...and a division by zero (the engine raises)" declined "SELECT D / 0 FROM A WHERE ID = 1"
 echo "--- 11 BOOLEAN (slice 7): outputs, TRUE / FALSE literals, ordered FALSE before TRUE"
 route "11 a BOOLEAN output" served "SELECT ID, B FROM BO ORDER BY ID"
 route "11 = TRUE" served "SELECT ID FROM BO WHERE B = TRUE"
@@ -235,5 +237,5 @@ if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 77 ]; then echo "FAIL only $ran checks ran (floor 77) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 79 ]; then echo "FAIL only $ran checks ran (floor 79) - cells went missing"; fail=1; fi
 exit $fail

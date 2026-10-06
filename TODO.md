@@ -90,6 +90,9 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       image and declined both. 4180 statements served under the switch (3543 before). Its sweep found two classes,
       both closed: a SUM / AVG over INT128 (where it overflows is the engine's summation order) fails the run, and an
       OCTET_LENGTH beside NONE / OCTETS columns declines (the engine counts stored bytes - merge).
+      Slice 10: arithmetic over DOUBLE / FLOAT in exe (IEEE; an integer operand exact under 2^53; a scaled operand, a
+      division by zero and a non-finite result fail the run). This also reaches stored routines exe runs in the default
+      mode.
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a
