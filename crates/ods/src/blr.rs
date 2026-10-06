@@ -847,7 +847,16 @@ fn walk_verb(r: &mut Reader, out: &mut BlrDecode, level: usize) -> Result<(), Bl
                     *out.lines.last_mut().unwrap() += &format!(" '{}'", text);
                     if verb == 23 {
                         out.fields.push((bytes.first().copied().unwrap_or(0), text.clone()));
-                    } else if verb == 74 {
+                    } else if verb == 74
+                        // blr_relation2 (146): the NAME, then the alias; and
+                        // blr_relation3 (148): schema, package, NAME, alias.
+                        // Listing blr_relation alone missed every ALIASED
+                        // stream - a joined view or relation - so a guard
+                        // asking "does this read X" answered no (a view in a
+                        // join read as EMPTY on the exe route)
+                        || (verb == 146 && strings.is_empty())
+                        || (verb == 148 && strings.len() == 2)
+                    {
                         out.relations.push(text.clone());
                     }
                     strings.push(text);

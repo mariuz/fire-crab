@@ -128165,9 +128165,12 @@ fn blr_reads_codepage_relation(db: &Database, blr: &[u8]) -> bool {
             .filter(|(id, _)| {
                 fire_crab_ods::format::relation_formats(&image, ps, *id).iter().any(|(_, descs)| {
                     descs.iter().any(|d| {
+                        // (OCTETS, set 1, pads CHAR with 0x00 and orders
+                        // by byte: the executor's blank-padded text is wrong
+                        // for it - octets / cscast under the switch)
                         matches!(col_kind(d), Some(ColKind::Text))
                             && d.sub_type >= 0
-                            && !matches!(fire_crab_ods::intl::charset_id(d.sub_type), 0..=4)
+                            && !matches!(fire_crab_ods::intl::charset_id(d.sub_type), 0 | 2..=4)
                     })
                 })
             })
@@ -130398,7 +130401,7 @@ fn exe_select(
                 } else {
                     return decline("a text output in the attachment's set");
                 };
-                let Some(name) = charset_sql_name(cs).filter(|_| matches!(cs, 0..=4)) else {
+                let Some(name) = charset_sql_name(cs).filter(|_| matches!(cs, 0 | 2..=4)) else {
                     return decline("a text output in a codepage set");
                 };
                 let kw = if c.sql_type & !1 == 448 { "VARCHAR" } else { "CHAR" };
@@ -130439,6 +130442,34 @@ fn exe_select(
     // (it answered EMPTY: view, viewjoin)
     if db.tx.is_some() || !db.nested_tx.is_empty() {
         return decline("the transaction's own writes");
+    }
+    // A LIMBO transaction's record raises on the engine ("record from
+    // transaction N is stuck in limbo") where the executor's visibility
+    // walk reads past it (limbo under the switch)
+    // A SNAPSHOT transaction (or one beside an autonomous one) reads
+    // through its own snapshot; the executor reads the latest committed
+    // image (readconsistency under the switch: a SNAPSHOT saw a row another
+    // transaction committed after it started). The two agree until a
+    // transaction the snapshot cannot see has COMMITTED - one it held as
+    // active, or one started since - and only then does the route decline
+    if let Some(snap) = db.view_snapshot() {
+        let image = db.bytes();
+        let now = fire_crab_ods::tra::Snapshot::capture(&image, db.page_size);
+        let diverged = match fire_crab_ods::tra::TipChain::read(&image, db.page_size) {
+            None => true,
+            Some(tips) => snap
+                .active
+                .iter()
+                .copied()
+                .chain(snap.limit..now.limit.max(snap.limit))
+                .any(|id| !snap.sees(id) && matches!(tips.state(id), Some(fire_crab_ods::tip::TxState::Committed))),
+        };
+        if diverged {
+            return decline("a snapshot another transaction has committed past");
+        }
+    }
+    if !fire_crab_ods::tra::limbo_ids(&db.bytes(), db.page_size).is_empty() {
+        return decline("a limbo transaction");
     }
     match fire_crab_ods::blr::decode(&compiled.blob) {
         Ok(decoded) if decoded.relations.iter().any(|n| is_view(db, n.trim_end())) => {
@@ -130503,6 +130534,39 @@ fn exe_select(
     if blr_reads_codepage_relation(db, &compiled.blob) {
         return decline("a codepage relation");
     }
+    // A NON-ASCII LITERAL under a non-UTF8 attachment is bytes of the
+    // ATTACHMENT's set (NONE / WIN1252: 'é' is one byte), where dsql spells
+    // the text as UTF-8 (litcs / xlit under the switch: OCTET_LENGTH 6 for 4)
+    if !text.is_ascii() && CURRENT_ATT_CS.with(|c| c.get()) != fire_crab_ods::intl::CS_UTF8 {
+        return decline("a non-ASCII text under a non-UTF8 attachment");
+    }
+    // ...and beside NONE / OCTETS text a non-ASCII literal compares by its
+    // BYTES on the engine, where the executor compares decoded characters
+    // (xlit: a NONE column's 'caf\xE9' row matched a UTF-8 'café';
+    // utf8routines: a NONE routine parameter). The database default set
+    // decides a routine's parameters; the relations read decide columns.
+    if !text.is_ascii() {
+        let image = db.bytes();
+        let ps = db.page_size;
+        let byteish = |cs: u8| matches!(cs, 0 | 1);
+        let rel_byteish = match fire_crab_ods::blr::decode(&compiled.blob) {
+            Err(_) => true,
+            Ok(decoded) => decoded.relations.iter().any(|n| {
+                fire_crab_ods::catalog::resolve_relation(&image, ps, n.trim_end()).is_none_or(|id| {
+                    fire_crab_ods::format::relation_formats(&image, ps, id).iter().any(|(_, descs)| {
+                        descs.iter().any(|d| {
+                            matches!(col_kind(d), Some(ColKind::Text))
+                                && d.sub_type >= 0
+                                && byteish(fire_crab_ods::intl::charset_id(d.sub_type))
+                        })
+                    })
+                })
+            }),
+        };
+        if rel_byteish || byteish(db_default_cs(db) as u8) {
+            return decline("a non-ASCII text beside NONE / OCTETS bytes");
+        }
+    }
     let req = match fire_crab_exe::parse(&compiled.blob) {
         Ok(r) => r,
         Err(e) => return decline(&format!("parse ({})", e)),
@@ -130529,15 +130593,41 @@ fn exe_select(
         if shape.negates {
             return decline("a negated value");
         }
-        for (rel, field, lit) in shape.text_cmps {
-            let Some(id) = fire_crab_ods::catalog::resolve_relation(&image, ps, &rel) else {
-                return decline("a text literal against an unresolved field");
+        if shape.row_reading_window {
+            return decline("a window");
+        }
+        if shape.non_literal_pattern {
+            return decline("a non-literal pattern");
+        }
+        if shape.text_coalesce {
+            return decline("a COALESCE over text");
+        }
+        // a field's declared descriptor, the newest format's
+        let field_desc = |rel: &str, field: &str| -> Option<Descriptor> {
+            let id = fire_crab_ods::catalog::resolve_relation(&image, ps, rel)?;
+            let cols = fire_crab_ods::catalog::relation_columns(&image, ps, rel);
+            let fid = cols.iter().find(|c| c.name.trim_end() == field.trim_end()).map(|c| c.field_id as usize)?;
+            let mut formats = fire_crab_ods::format::relation_formats(&image, ps, id);
+            if formats.is_empty() {
+                // a SYSTEM relation's formats are built in, never stored
+                formats = fire_crab_ods::system_relation_formats(&image, ps, rel.trim_end()).unwrap_or_default();
+            }
+            formats.iter().max_by_key(|(n, _)| *n).and_then(|(_, d)| d.get(fid).cloned())
+        };
+        // A TEXT FIELD AGAINST A NON-TEXT ONE: the engine converts the text
+        // side where it builds a hash - over a NULL-only outer too
+        // (textcolcmp under the switch) - so the route declines
+        for ((r1, f1), (r2, f2)) in &shape.field_cmps {
+            let (Some(a), Some(b)) = (field_desc(r1, f1), field_desc(r2, f2)) else {
+                return decline("a field comparison over an unresolved field");
             };
-            let cols = fire_crab_ods::catalog::relation_columns(&image, ps, &rel);
-            let fid = cols.iter().find(|c| c.name.trim_end() == field.trim_end()).map(|c| c.field_id as usize);
-            let formats = fire_crab_ods::format::relation_formats(&image, ps, id);
-            let desc = fid.and_then(|f| formats.iter().max_by_key(|(n, _)| *n).and_then(|(_, d)| d.get(f).cloned()));
-            let Some(d) = desc else {
+            let text = |d: &Descriptor| matches!(col_kind(d), Some(ColKind::Text));
+            if text(&a) != text(&b) {
+                return decline("a text field against a non-text one");
+            }
+        }
+        for (rel, field, lit) in shape.text_cmps {
+            let Some(d) = field_desc(&rel, &field) else {
                 return decline("a text literal against an unresolved field");
             };
             match col_kind(&d) {

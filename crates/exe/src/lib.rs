@@ -2308,6 +2308,24 @@ impl<'a> Exec<'a> {
             binding: Vec<StreamFrame>,
             extra: Vec<StreamFrame>,
         }
+        // A CONSTANT frame offset is checked when the window OPENS: a
+        // negative (or non-integer) one raises on the engine over an EMPTY
+        // source too, where the per-row bound below never runs (aggplan
+        // under the switch) - unconverted here, so the run fails
+        for w in windows {
+            let Some(f) = &w.frame else { continue };
+            for b in [&f.start, &f.end] {
+                let ok = match &b.value {
+                    None => true,
+                    Some(Expr::Literal(Value::Int(n))) => *n >= 0 && *n <= i32::MAX as i64,
+                    Some(Expr::Literal(_)) | Some(Expr::Negate(_)) => false,
+                    Some(_) => true,
+                };
+                if !ok {
+                    return Err("a constant window frame offset unconverted".into());
+                }
+            }
+        }
         let mut rows: Vec<WRow> = self
             .open_rse(source)?
             .into_iter()
@@ -2773,13 +2791,18 @@ impl<'a> Exec<'a> {
         // index-driven read of an old row must re-scale and default-fill
         // it too
         let newest_defaults = self.newest_defaults(rel);
-        Ok(visible_rows(self.file, self.page_size, rel, &descs, &tips)
+        let rows: Vec<Vec<Value>> = visible_rows(self.file, self.page_size, rel, &descs, &tips)
             .into_iter()
             .filter(|vr| bitmap.contains(&vr.recno))
             .map(|vr| {
                 fire_crab_ods::format::present_record(&vr.image, vr.format, &formats, &newest_defaults)
             })
-            .collect())
+            .collect();
+        // the lazy 22003 the scan above explains
+        if rows.iter().any(|r| r.iter().any(|v| matches!(v, Value::OutOfRange))) {
+            return Err("an out-of-range presentation unconverted".into());
+        }
+        Ok(rows)
     }
 
     /// RDB$INDICES: the named index's 0-based slot in the relation's
@@ -2906,12 +2929,20 @@ impl<'a> Exec<'a> {
         // wrong numbers where a client SELECT over the same file read
         // right ones.
         let newest_defaults = self.newest_defaults(rel);
-        Ok(visible_rows(self.file, self.page_size, rel, &descs, &tips)
+        let rows: Vec<Vec<Value>> = visible_rows(self.file, self.page_size, rel, &descs, &tips)
             .into_iter()
             .map(|vr| {
                 fire_crab_ods::format::present_record(&vr.image, vr.format, &formats, &newest_defaults)
             })
-            .collect())
+            .collect();
+        // an old row whose value the newest format cannot PRESENT rides as
+        // OutOfRange; the engine raises 22003 LAZILY, only where that value
+        // is used - which this executor does not track (`COUNT(N)` counted
+        // it, ovlazy under the switch) - so it fails the run
+        if rows.iter().any(|r| r.iter().any(|v| matches!(v, Value::OutOfRange))) {
+            return Err("an out-of-range presentation unconverted".into());
+        }
+        Ok(rows)
     }
 
     /// The newest RDB$FORMATS default section of a relation - the values
@@ -3214,6 +3245,12 @@ impl<'a> Exec<'a> {
                         if st < 0 {
                             return Err("negative substring start".into());
                         }
+                        // the engine moves both into an INTEGER: past its
+                        // range is 22003, not an empty answer (fnargs under
+                        // the switch) - unconverted here
+                        if st > i32::MAX as i64 || ln > i32::MAX as i64 {
+                            return Err("substring bounds past INTEGER unconverted".into());
+                        }
                         let chars: Vec<char> = t.chars().collect();
                         let st = (st as usize).min(chars.len());
                         let end = (st + ln as usize).min(chars.len());
@@ -3307,7 +3344,11 @@ impl<'a> Exec<'a> {
                             // the engine's 22001, never a silent cut
                             return Err("string right truncation".into());
                         }
-                        Value::Text(t)
+                        // ...and a CHAR target PADS: the unifying cast of
+                        // `IIF(.., 'big', 's')` is CHAR(3), so its 's' is
+                        // 's  ' - CHAR_LENGTH 3, `|| '|'` is 's  |'
+                        // (inselcond / condpattern under the switch)
+                        coerce_text(Value::Text(t), Some(slot))?
                     }
                     other => {
                         return Err(format!("cast target dtype {} unconverted", other))
@@ -3837,6 +3878,27 @@ fn relation_or_system_formats(
 pub struct Shape {
     pub text_cmps: Vec<(String, String, String)>,
     pub negates: bool,
+    /// every comparison of a FIELD with a FIELD, as ((relation, field),
+    /// (relation, field)): a text column against a numeric one converts the
+    /// text side when the engine BUILDS a semi-join's hash - over a NULL
+    /// outer value too, where this executor compares nothing
+    pub field_cmps: Vec<((String, String), (String, String))>,
+    /// a WINDOW stream anywhere: its rows come out in the window's sort and
+    /// its ties - ROW_NUMBER's numbering, FIRST_VALUE's pick - follow the
+    /// record fields the engine's sort carries, not modelled here (collkey
+    /// under the switch)
+    pub row_reading_window: bool,
+    /// a LIKE / STARTING WITH whose pattern is not a literal: a column (or
+    /// expression) pattern meets the operand across CHARACTER SETS, where
+    /// the engine converts one side's bytes (carriermix: a NONE operand
+    /// against a UTF8 pattern) - not modelled here
+    pub non_literal_pattern: bool,
+    /// a COALESCE over TEXT (a text literal or a cast to text among its
+    /// operands): the engine types it as the WIDEST CHAR of its operands
+    /// and pads every value to it - `COALESCE(IIF(.., NULL, 'ab'), 'zzzz')`
+    /// is 'ab  ' - where this executor passes the operand through
+    /// (inselcond under the switch)
+    pub text_coalesce: bool,
 }
 
 pub fn shape(req: &Request) -> Shape {
@@ -3845,6 +3907,10 @@ pub fn shape(req: &Request) -> Shape {
         ctx: std::collections::HashMap<u8, String>,
         cmps: Vec<(u8, String, String)>,
         negates: bool,
+        fields: Vec<((u8, String), (u8, String))>,
+        row_window: bool,
+        pattern: bool,
+        text_coalesce: bool,
     }
     impl W {
         fn pair(&mut self, a: &Expr, b: &Expr) {
@@ -3852,6 +3918,9 @@ pub fn shape(req: &Request) -> Shape {
                 (Expr::Field(c, f), Expr::Literal(Value::Text(t)))
                 | (Expr::Literal(Value::Text(t)), Expr::Field(c, f)) => {
                     self.cmps.push((*c, f.clone(), t.clone()))
+                }
+                (Expr::Field(c1, f1), Expr::Field(c2, f2)) => {
+                    self.fields.push(((*c1, f1.clone()), (*c2, f2.clone())))
                 }
                 _ => {}
             }
@@ -3865,7 +3934,20 @@ pub fn shape(req: &Request) -> Shape {
                 Expr::Negate(a) | Expr::CaseMap(_, a) | Expr::StrLen(_, a) | Expr::Trim(_, a) | Expr::Cast(_, a) => self.expr(a),
                 Expr::GenId(_, Some(a)) => self.expr(a),
                 Expr::Substr(a, b, c) => { self.expr(a); self.expr(b); self.expr(c) }
-                Expr::Coalesce(v) | Expr::Function(_, _, v) => v.iter().for_each(|x| self.expr(x)),
+                Expr::Coalesce(v) => {
+                    if v.iter().any(|x| match x {
+                        Expr::Literal(Value::Text(_)) => true,
+                        Expr::Cast(slot, _) => matches!(
+                            slot.dtype,
+                            blr::DT_TEXT | blr::DT_TEXT2 | blr::DT_VARYING | blr::DT_VARYING2
+                        ),
+                        _ => false,
+                    }) {
+                        self.text_coalesce = true;
+                    }
+                    v.iter().for_each(|x| self.expr(x))
+                }
+                Expr::Function(_, _, v) => v.iter().for_each(|x| self.expr(x)),
                 Expr::Decode(a, c, r) => {
                     self.expr(a);
                     for x in c { self.pair(a, x) }
@@ -3878,7 +3960,14 @@ pub fn shape(req: &Request) -> Shape {
         }
         fn boolean(&mut self, b: &Bool) {
             match b {
-                Bool::Cmp(_, x, y) | Bool::Like(x, y) | Bool::Starting(x, y) => self.pair(x, y),
+                Bool::Like(x, y) | Bool::Starting(x, y) => {
+                    // (a bound `?` is the attachment's text, as a literal is)
+                    if !matches!(y, Expr::Literal(_) | Expr::Parameter(..)) {
+                        self.pattern = true;
+                    }
+                    self.pair(x, y)
+                }
+                Bool::Cmp(_, x, y) => self.pair(x, y),
                 Bool::And(x, y) | Bool::Or(x, y) => { self.boolean(x); self.boolean(y) }
                 Bool::Not(x) => self.boolean(x),
                 Bool::Missing(x) => self.expr(x),
@@ -3926,6 +4015,11 @@ pub fn shape(req: &Request) -> Shape {
                 }
                 Stream::Window { source, windows } => {
                     self.rse(source);
+                    // ANY window: its rows come out in the window's sort, and
+                    // ties there follow the record fields the engine's sort
+                    // carries (collkey: ROW_NUMBER with no outer ORDER BY,
+                    // FIRST_VALUE over tied keys) - not modelled here
+                    self.row_window = true;
                     for w in windows {
                         w.partition.iter().for_each(|x| self.expr(x));
                         w.order.iter().for_each(|k| self.expr(&k.expr));
@@ -3950,10 +4044,15 @@ pub fn shape(req: &Request) -> Shape {
     }
     let mut w = W::default();
     w.stmt(&req.body);
-    let W { ctx, cmps, negates } = w;
+    let W { ctx, cmps, negates, fields, row_window, pattern, text_coalesce } = w;
+    let rel = |c: u8| ctx.get(&c).cloned().unwrap_or_default();
     Shape {
-        text_cmps: cmps.into_iter().map(|(c, f, t)| (ctx.get(&c).cloned().unwrap_or_default(), f, t)).collect(),
+        text_cmps: cmps.into_iter().map(|(c, f, t)| (rel(c), f, t)).collect(),
         negates,
+        field_cmps: fields.into_iter().map(|((c1, f1), (c2, f2))| ((rel(c1), f1), (rel(c2), f2))).collect(),
+        row_reading_window: row_window,
+        non_literal_pattern: pattern,
+        text_coalesce,
     }
 }
 

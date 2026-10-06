@@ -58,6 +58,15 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       (limbo); an EXECUTE BLOCK's own writes (readconsistency); the window offset raise over an empty table (aggplan);
       a lazy COUNT overflow (ovlazy); a NULL-only outer's key raise (textcolcmp); SUBSTRING's BIGINT range (fnargs);
       index-deferral trace cells (index, idxcost - artifacts).
+      CLOSED (2026-10-06, all by declining or failing the run): limbo (a limbo transaction in the TIP), readconsistency /
+      snapshot (a snapshot some transaction it cannot see has committed past), textcolcmp (a text field against a
+      non-text one), fnargs (SUBSTRING bounds past INTEGER), ovlazy (an out-of-range presentation), aggplan (a constant
+      frame offset negative or past INTEGER), collkey (any window), carriermix (a non-literal, non-parameter pattern),
+      inselcond / condpattern (a CHAR cast now PADS; a COALESCE over text declines), OCTETS (set 1) relations and
+      outputs, a non-ASCII text beside NONE / OCTETS bytes or under a non-UTF8 attachment (litcs, xlit, codepages,
+      utf8routines). ROOT CAUSE of two classes: the BLR decoder listed only blr_relation, so every ALIASED stream - a
+      joined view, a joined codepage or collated relation - was invisible to the guards (icucoll, codepages); it lists
+      blr_relation2 / blr_relation3 too now, which also tightens the stored-procedure collation guard.
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a
@@ -75,6 +84,10 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
 - [x] **P2** An expression over a selectable procedure's outputs with no clause (`SELECT CHAR_LENGTH(R), K * 2 FROM P`)
       was refused - the bare call's picker took only plain columns (`qa/serve-real-procexpr.sh`). A non-ASCII literal
       in a procedure body made under a NONE attachment is still "PSQL this server does not interpret".
+- [x] **P2** WRONG ANSWER: a bare CURRENT_USER / USER / CURRENT_ROLE in a view, CHECK or routine this server compiled
+      was stored as a COLUMN reference (`blr_field 'CURRENT_ROLE'`): `"CURRENT_ROLE" = CURRENT_ROLE` answered every row, `S =
+      CURRENT_USER` failed at use. dsql emits blr_user_name / blr_current_role now; a delimited name spelling a context
+      word refuses (`qa/serve-real-ctxwords.sh`).
 - [ ] **P2** DECFLOAT left: GROUP BY a DECFLOAT expression (NaN / cohort laws). (Done: CREATE PROCEDURE / FUNCTION with a DECFLOAT parameter; `SET DECFLOAT ROUND` - all eight modes, dftraps 7)
 - [x] **P2** DECFLOAT traps, specials, signed zero, the four DECFLOAT functions (`e07317d`); DECFLOAT in PSQL (`7fdb054`)
 - [ ] **P2** Optimizer gaps (merge join, RIGHT/FULL in a chain, HAVING plans, `SET PLAN`)
