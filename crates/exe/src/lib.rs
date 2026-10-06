@@ -1762,6 +1762,10 @@ struct Exec<'a> {
     /// column, None for a stored column; Err when the stored expression
     /// is outside this executor's surface
     computed: std::collections::HashMap<(String, String), Option<Result<std::rc::Rc<Expr>, String>>>,
+    /// (relation, field name) -> field id: a blr_field resolves through
+    /// RDB$RELATION_FIELDS, which was walked on EVERY evaluation (a 20,000
+    /// row scan with one comparison took 6 s on the route)
+    field_ids: std::collections::HashMap<(String, String), usize>,
     /// EXECUTE PROCEDURE mode: the first blr_stall ends the request
     halt_at_stall: bool,
 }
@@ -1897,6 +1901,7 @@ fn bind_and_execute_mode_inner(
         leaving: None,
         continuing: None,
         computed: std::collections::HashMap::new(),
+        field_ids: std::collections::HashMap::new(),
         halt_at_stall,
     };
     ex.stmt(&request.body)?;
@@ -2085,7 +2090,10 @@ impl<'a> Exec<'a> {
         let mut bindings: Vec<Vec<StreamFrame>> = match &rse.stream {
             Stream::Relation { name, context } => {
                 let rows = if rse.plan_indices.is_empty() {
-                    self.scan_relation(name)?
+                    match self.keyed_scan(name, *context, rse.boolean.as_ref())? {
+                        Some(rows) => rows,
+                        None => self.scan_relation(name)?,
+                    }
                 } else {
                     // PLAN (T INDEX (...)): the BitmapTableScan -
                     // the B-tree walk yields record numbers, the
@@ -3076,6 +3084,152 @@ impl<'a> Exec<'a> {
         Err(format!("generator {} not found", name))
     }
 
+    /// AN INDEXED EQUALITY: a conjunct `<column> = <literal or ?>` of the
+    /// stream's own WHERE, over an exact-numeric column with a live,
+    /// plain, single-segment index, retrieves through that index - the
+    /// key is built as the engine's (btw::build_index_key), the B-tree
+    /// yields record numbers, each record is fetched by number and judged
+    /// visible on itself. The full WHERE still decides every candidate
+    /// (an index entry outlives the row version it described), so the
+    /// candidates only have to be a SUPERSET. None when no conjunct
+    /// qualifies - the caller scans.
+    fn keyed_scan(
+        &mut self,
+        name: &str,
+        context: u8,
+        boolean: Option<&Bool>,
+    ) -> Result<Option<Vec<Vec<Value>>>, String> {
+        use fire_crab_ods::btw;
+        fn conjuncts<'b>(b: &'b Bool, out: &mut Vec<&'b Bool>) {
+            match b {
+                Bool::And(x, y) => {
+                    conjuncts(x, out);
+                    conjuncts(y, out);
+                }
+                other => out.push(other),
+            }
+        }
+        let Some(b) = boolean else { return Ok(None) };
+        let mut cs = Vec::new();
+        conjuncts(b, &mut cs);
+        let Some(rel) = resolve_relation(self.file, self.page_size, name) else { return Ok(None) };
+        let formats = relation_or_system_formats(self.file, self.page_size, rel, name);
+        let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else { return Ok(None) };
+        let descs = descs.clone();
+        let cols = relation_columns(self.file, self.page_size, name);
+        let Some(irt) = fire_crab_ods::btr::find_index_root(self.file, self.page_size, rel) else { return Ok(None) };
+        let tips = TipChain::read(self.file, self.page_size).ok_or("cannot read transaction inventory")?;
+        for c in cs {
+            let Bool::Cmp(op, x, y) = c else { continue };
+            if *op != blr::EQL {
+                continue;
+            }
+            let (field, val) = match (x, y) {
+                (Expr::Field(cx, f), v @ (Expr::Literal(_) | Expr::Parameter(..))) if *cx == context => (f, v),
+                (v @ (Expr::Literal(_) | Expr::Parameter(..)), Expr::Field(cx, f)) if *cx == context => (f, v),
+                _ => continue,
+            };
+            let Some(fid) = cols.iter().find(|c| c.name.trim_end() == field.trim_end()).map(|c| c.field_id as usize) else { continue };
+            let Some(d) = descs.get(fid) else { continue };
+            if !matches!(d.dtype, fire_crab_ods::format::dtype::SHORT | fire_crab_ods::format::dtype::LONG | fire_crab_ods::format::dtype::INT64) {
+                continue;
+            }
+            // the value AT THE COLUMN'S SCALE, exactly - one the column
+            // cannot hold matches no row, and the scan answers that
+            let v = self.eval(val)?;
+            let Some((raw, sc)) = num_parts(&v) else { continue };
+            let Some(r) = exe_rescale(raw, sc, d.scale) else { continue };
+            if exe_rescale(r, d.scale, sc) != Some(raw) {
+                // a value the column cannot hold equals no row: with an
+                // index on the column the engine's retrieval finds nothing
+                // and no other conjunct is evaluated - answer that, rather
+                // than scan the whole relation to learn it
+                let indexed = irt.live_entries().any(|e| {
+                    e.key_count == 1
+                        && !e.is_dropping(Some(&tips))
+                        && btw::index_segments(self.file, self.page_size, rel, e.id, 1).is_some_and(|(segs, flags)| {
+                            flags & (btw::IRT_EXPRESSION | btw::IRT_CONDITION) == 0
+                                && segs.first().map(|s| s.0 as usize) == Some(fid)
+                        })
+                });
+                if indexed {
+                    return Ok(Some(Vec::new()));
+                }
+                continue;
+            }
+            let key_value = mk_num(r, d.scale);
+            for e in irt.live_entries() {
+                if e.key_count != 1 || e.is_dropping(Some(&tips)) {
+                    continue;
+                }
+                let Some((segs, flags)) = btw::index_segments(self.file, self.page_size, rel, e.id, 1) else { continue };
+                if flags & (btw::IRT_EXPRESSION | btw::IRT_CONDITION) != 0 || segs.first().map(|s| s.0 as usize) != Some(fid) {
+                    continue;
+                }
+                let desc = flags & btw::IRT_DESCENDING != 0;
+                let seg = btw::KeySeg { itype: segs[0].1, value: &key_value, scale: d.scale, charset: 0 };
+                let Some((key, _)) = btw::build_index_key(&[seg], desc) else { continue };
+                let Some(hits) = fire_crab_ods::btr::lookup_key(self.file, self.page_size, rel, e.id, &key, desc) else { continue };
+                return Ok(Some(self.fetch_by_recno(rel, &formats, hits.into_iter().map(|(_, n)| n).collect())?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The records at `recnos` (ascending, deduplicated) that the current
+    /// read view sees, presented through the newest format - the per-record
+    /// fetch an index retrieval needs, in record-number order.
+    fn fetch_by_recno(
+        &mut self,
+        rel: u16,
+        formats: &[(u8, Vec<fire_crab_ods::Descriptor>)],
+        mut recnos: Vec<u64>,
+    ) -> Result<Vec<Vec<Value>>, String> {
+        recnos.sort_unstable();
+        recnos.dedup();
+        let tips = TipChain::read(self.file, self.page_size).ok_or("cannot read transaction inventory")?;
+        let per_dp = fire_crab_ods::format::max_recs_per_dp(self.page_size);
+        let pages: std::collections::HashMap<u32, u32> = fire_crab_ods::relation_data_pages(self.file, self.page_size, rel)
+            .into_iter()
+            .filter_map(|no| {
+                let dp = fire_crab_ods::page_at(self.file, self.page_size, no).and_then(DataPage::decode)?;
+                Some((dp.sequence, no))
+            })
+            .collect();
+        let newest_defaults = self.newest_defaults(rel);
+        let (own, snap) = READ_AS.with(|r| match &*r.borrow() {
+            Some((o, s)) => (o.clone(), s.clone()),
+            None => (fire_crab_ods::tra::OwnTx::none(), None),
+        });
+        let mut out = Vec::new();
+        for recno in recnos {
+            let Some(&page_no) = pages.get(&((recno / per_dp) as u32)) else { continue };
+            let Some(dp) = fire_crab_ods::page_at(self.file, self.page_size, page_no).and_then(DataPage::decode) else { continue };
+            let Some(r) = dp.record((recno % per_dp) as u16) else { continue };
+            // the SCAN's filter exactly (ods::tra::visible_rows_as): a chain
+            // head only - NOT `is_primary_record`, which also turns away a
+            // DELETE STUB whose back version is the row a savepoint undo
+            // restored (savepointtx: the indexed count answered 0 for it)
+            {
+                use fire_crab_ods::data::flags;
+                if r.flags & (flags::CHAIN | flags::BLOB | flags::FRAGMENT) != 0 {
+                    continue;
+                }
+            }
+            let v = match fire_crab_ods::tra::visible_version_2pc(self.file, self.page_size, &r, &tips, &own, false, snap.as_ref()) {
+                Ok(Some(v)) => v,
+                Ok(None) => continue,
+                Err(_) => return Err("a limbo record unconverted".into()),
+            };
+            let row = fire_crab_ods::format::present_record(&v.image, v.format, formats, &newest_defaults);
+            if row.iter().any(|x| matches!(x, Value::OutOfRange)) {
+                return Err("an out-of-range presentation unconverted".into());
+            }
+            out.push(row);
+        }
+        Ok(out)
+    }
+
     /// The committed-visibility scan of one relation.
     fn scan_relation(&mut self, name: &str) -> Result<Vec<Vec<Value>>, String> {
         let rel = resolve_relation(self.file, self.page_size, name)
@@ -3775,31 +3929,34 @@ impl<'a> Exec<'a> {
                 frame.row.get(*slot as usize).cloned().unwrap_or(Value::Null)
             }
             Expr::Field(ctx, name) => {
-                let (rel_name, row) = {
-                    let frame = self
-                        .frames
-                        .iter()
-                        .rev()
-                        .find(|f| f.context == *ctx)
-                        .ok_or_else(|| format!("context {} not bound", ctx))?;
-                    // resolve the NAME through the catalog to the field id
-                    // - decoded rows index by field id
-                    let rel_name = frame
-                        .relation
-                        .clone()
-                        .ok_or("bare field over an aggregate frame")?;
-                    (rel_name, frame.row.clone())
-                };
-                let cols =
-                    relation_columns(self.file, self.page_size, &rel_name);
-                // EXACT: a BLR field name is the catalog's own spelling
-                // (`"a"` beside A are two fields - a case-blind first
-                // match read A for "a", review-caught)
-                let col = cols
+                let fi = self
+                    .frames
                     .iter()
-                    .find(|c| c.name == *name)
-                    .ok_or_else(|| format!("field {} unknown", name))?;
-                let fid = col.field_id as usize;
+                    .rposition(|f| f.context == *ctx)
+                    .ok_or_else(|| format!("context {} not bound", ctx))?;
+                // resolve the NAME through the catalog to the field id -
+                // decoded rows index by field id; cached per (relation, name)
+                let rel_name = self.frames[fi]
+                    .relation
+                    .clone()
+                    .ok_or("bare field over an aggregate frame")?;
+                let key = (rel_name.clone(), name.clone());
+                let fid = match self.field_ids.get(&key) {
+                    Some(f) => *f,
+                    None => {
+                        let cols = relation_columns(self.file, self.page_size, &rel_name);
+                        // EXACT: a BLR field name is the catalog's own spelling
+                        // (`"a"` beside A are two fields - a case-blind first
+                        // match read A for "a", review-caught)
+                        let col = cols
+                            .iter()
+                            .find(|c| c.name == *name)
+                            .ok_or_else(|| format!("field {} unknown", name))?;
+                        let f = col.field_id as usize;
+                        self.field_ids.insert(key.clone(), f);
+                        f
+                    }
+                };
                 // A COMPUTED BY column has NO record bytes: its stored
                 // expression is evaluated over THIS row, with context 0
                 // bound to the relation - the engine's own numbering in
@@ -3807,7 +3964,6 @@ impl<'a> Exec<'a> {
                 // EMPLOYEE.FULL_NAME is `last_name || ', ' || first_name`
                 // as `blr_field 0`, and a slot read answered NULL for
                 // every manager in ORG_CHART)
-                let key = (rel_name.clone(), name.clone());
                 let stored = match self.computed.get(&key) {
                     Some(c) => c.clone(),
                     None => {
@@ -3818,9 +3974,10 @@ impl<'a> Exec<'a> {
                     }
                 };
                 match stored {
-                    None => row.get(fid).cloned().unwrap_or(Value::Null),
+                    None => self.frames[fi].row.get(fid).cloned().unwrap_or(Value::Null),
                     Some(Err(e)) => return Err(format!("computed field {}: {}", name, e)),
                     Some(Ok(expr)) => {
+                        let row = self.frames[fi].row.clone();
                         self.frames.push(StreamFrame { context: 0, relation: Some(rel_name), row });
                         let v = self.eval(&expr);
                         self.frames.pop();

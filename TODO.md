@@ -102,6 +102,12 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       `1e308` as 1 with an ALIAS E308 (a number run into a letter refuses now); exe's text-to-integer CAST trimmed tabs
       and ignored the engine's conversion buffer (22 / 52 bytes); a RIGHT join was emitted left-driven (the preserved
       side drives now); LOWER / UPPER over non-ASCII text fail the run (the Turkish dotted I).
+      Slice 13: SPEED. exe resolved every blr_field through RDB$RELATION_FIELDS on EVERY evaluation and cloned the row
+      (a 20,000-row scan with one comparison: 6 s) - the field id is cached per statement now (80 ms). And an equality
+      conjunct `<column> = <literal | ?>` over an exact-numeric column with a live plain single-segment index retrieves
+      through it (btw::build_index_key, btr::lookup_key, a fetch by record number under the read view; the full WHERE
+      still decides every candidate): a point lookup in 20,000 rows 70 ms. A value the column cannot hold answers no
+      rows at once, as the engine's retrieval does. Ranges and compound / text / descending-range keys still scan.
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a
