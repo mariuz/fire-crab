@@ -130453,34 +130453,15 @@ fn exe_select(
     // in one transaction answered the old rows - the switch-on sweep's
     // viewdml / stalefmt / fnwhere) - and a VIEW has no data pages to scan
     // (it answered EMPTY: view, viewjoin)
-    if db.tx.is_some() || !db.nested_tx.is_empty() {
-        return decline("the transaction's own writes");
-    }
+    // THE EXECUTOR READS AS THIS ATTACHMENT: its own uncommitted rows and,
+    // for a concurrency transaction, its isolation snapshot - the view the
+    // interpreter reads with ([Database::own_tx], [Database::view_snapshot]).
+    // It used to read the committed image and declined both cases (a SELECT
+    // after an UPDATE in one transaction showed the old rows: viewdml,
+    // stalefmt, fnwhere, readconsistency under the switch)
     // A LIMBO transaction's record raises on the engine ("record from
     // transaction N is stuck in limbo") where the executor's visibility
     // walk reads past it (limbo under the switch)
-    // A SNAPSHOT transaction (or one beside an autonomous one) reads
-    // through its own snapshot; the executor reads the latest committed
-    // image (readconsistency under the switch: a SNAPSHOT saw a row another
-    // transaction committed after it started). The two agree until a
-    // transaction the snapshot cannot see has COMMITTED - one it held as
-    // active, or one started since - and only then does the route decline
-    if let Some(snap) = db.view_snapshot() {
-        let image = db.bytes();
-        let now = fire_crab_ods::tra::Snapshot::capture(&image, db.page_size);
-        let diverged = match fire_crab_ods::tra::TipChain::read(&image, db.page_size) {
-            None => true,
-            Some(tips) => snap
-                .active
-                .iter()
-                .copied()
-                .chain(snap.limit..now.limit.max(snap.limit))
-                .any(|id| !snap.sees(id) && matches!(tips.state(id), Some(fire_crab_ods::tip::TxState::Committed))),
-        };
-        if diverged {
-            return decline("a snapshot another transaction has committed past");
-        }
-    }
     if !fire_crab_ods::tra::limbo_ids(&db.bytes(), db.page_size).is_empty() {
         return decline("a limbo transaction");
     }
@@ -130558,7 +130539,8 @@ fn exe_select(
     // (xlit: a NONE column's 'caf\xE9' row matched a UTF-8 'café';
     // utf8routines: a NONE routine parameter). The database default set
     // decides a routine's parameters; the relations read decide columns.
-    if !text.is_ascii() {
+    let octet_length = fire_crab_exe::parse(&compiled.blob).map(|r| fire_crab_exe::shape(&r).octet_length).unwrap_or(true);
+    if !text.is_ascii() || octet_length {
         let image = db.bytes();
         let ps = db.page_size;
         let byteish = |cs: u8| matches!(cs, 0 | 1);
@@ -130576,8 +130558,10 @@ fn exe_select(
                 })
             }),
         };
-        if rel_byteish || byteish(db_default_cs(db) as u8) {
-            return decline("a non-ASCII text beside NONE / OCTETS bytes");
+        // (an OCTET_LENGTH beside such bytes counts them on the engine,
+        // the decoded characters' UTF-8 here - the same decline)
+        if rel_byteish || (!text.is_ascii() && byteish(db_default_cs(db) as u8)) {
+            return decline("a non-ASCII text or OCTET_LENGTH beside NONE / OCTETS bytes");
         }
     }
     let req = match fire_crab_exe::parse(&compiled.blob) {
@@ -130650,7 +130634,9 @@ fn exe_select(
             }
         }
     }
-    let sends = match fire_crab_exe::bind_and_execute_mode(&db.bytes(), db.page_size, &req, &in_vals, false) {
+    let sends = match fire_crab_exe::with_read_view(db.own_tx(), db.view_snapshot(), || {
+        fire_crab_exe::bind_and_execute_mode(&db.bytes(), db.page_size, &req, &in_vals, false)
+    }) {
         Ok(s) => s,
         Err(e) => return decline(&format!("execute ({})", e)),
     };

@@ -1569,6 +1569,43 @@ fn coerce_num(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
 /// begin, messages, an inner begin holding declares + NULL-inits +
 /// stall + the labeled body, the trailing EOF send.
 thread_local! {
+    /// THE READER'S VIEW the executor scans with: the attachment's own
+    /// transaction ids (its uncommitted rows are visible to it) and, for a
+    /// concurrency transaction, its isolation snapshot. None (a tool, a
+    /// caller that sets nothing) is the committed-only reader.
+    static READ_AS: std::cell::RefCell<Option<(fire_crab_ods::tra::OwnTx, Option<fire_crab_ods::tra::Snapshot>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the executor's scans reading as `own` / `snap` (see
+/// [READ_AS]); the previous view is restored after.
+pub fn with_read_view<T>(
+    own: fire_crab_ods::tra::OwnTx,
+    snap: Option<fire_crab_ods::tra::Snapshot>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let prev = READ_AS.with(|r| r.replace(Some((own, snap))));
+    let out = f();
+    READ_AS.with(|r| *r.borrow_mut() = prev);
+    out
+}
+
+/// [visible_rows] under the current [READ_AS] view.
+fn visible_rows_now(
+    file: &fire_crab_ods::Image,
+    page_size: usize,
+    rel: u16,
+    descs: &[fire_crab_ods::Descriptor],
+    tips: &TipChain,
+) -> Vec<fire_crab_ods::tra::VisibleRow> {
+    READ_AS.with(|r| match &*r.borrow() {
+        None => visible_rows(file, page_size, rel, descs, tips),
+        Some((own, snap)) => fire_crab_ods::tra::visible_rows_as(file, page_size, rel, descs, tips, own, snap.as_ref(), false)
+            .unwrap_or_default(),
+    })
+}
+
+thread_local! {
     /// nested blr_function2 call depth, to bound recursion (each nested
     /// call builds a FRESH Exec, so the guard cannot live on the struct)
     static FN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -2872,7 +2909,7 @@ impl<'a> Exec<'a> {
         // index-driven read of an old row must re-scale and default-fill
         // it too
         let newest_defaults = self.newest_defaults(rel);
-        let rows: Vec<Vec<Value>> = visible_rows(self.file, self.page_size, rel, &descs, &tips)
+        let rows: Vec<Vec<Value>> = visible_rows_now(self.file, self.page_size, rel, &descs, &tips)
             .into_iter()
             .filter(|vr| bitmap.contains(&vr.recno))
             .map(|vr| {
@@ -3010,7 +3047,7 @@ impl<'a> Exec<'a> {
         // wrong numbers where a client SELECT over the same file read
         // right ones.
         let newest_defaults = self.newest_defaults(rel);
-        let rows: Vec<Vec<Value>> = visible_rows(self.file, self.page_size, rel, &descs, &tips)
+        let rows: Vec<Vec<Value>> = visible_rows_now(self.file, self.page_size, rel, &descs, &tips)
             .into_iter()
             .map(|vr| {
                 fire_crab_ods::format::present_record(&vr.image, vr.format, &formats, &newest_defaults)
@@ -3156,6 +3193,13 @@ impl<'a> Exec<'a> {
                     // an approximate operand fails the run
                     (Fold::Sum(None) | Fold::Avg(None), _, Some(Value::Double(_) | Value::Float(_))) => {
                         return Err("SUM / AVG over an approximate operand unconverted".into());
+                    }
+                    // ...nor an INT128 one: its sum can pass the INT128 range,
+                    // and WHERE it raises depends on the engine's summation
+                    // order over the sorted input (aggfold: -max, max, ..
+                    // raises on the engine, folds to 0 here)
+                    (Fold::Sum(_) | Fold::Avg(_), _, Some(Value::Int128(..))) => {
+                        return Err("SUM / AVG over an INT128 operand unconverted".into());
                     }
                     (Fold::SumD(acc), _, Some(v)) => match v {
                         Value::Null => {}
@@ -4049,6 +4093,10 @@ pub struct Shape {
     /// is 'ab  ' - where this executor passes the operand through
     /// (inselcond under the switch)
     pub text_coalesce: bool,
+    /// an OCTET_LENGTH anywhere: over a NONE / OCTETS column the engine
+    /// counts the stored BYTES, where this executor's text is decoded
+    /// (merge under the switch: 8 for 4)
+    pub octet_length: bool,
 }
 
 pub fn shape(req: &Request) -> Shape {
@@ -4061,6 +4109,7 @@ pub fn shape(req: &Request) -> Shape {
         row_window: bool,
         pattern: bool,
         text_coalesce: bool,
+        octets: bool,
     }
     impl W {
         fn pair(&mut self, a: &Expr, b: &Expr) {
@@ -4081,6 +4130,7 @@ pub fn shape(req: &Request) -> Shape {
             match e {
                 Expr::Arith(_, a, b) => { self.expr(a); self.expr(b) }
                 Expr::Negate(a) if !matches!(**a, Expr::Literal(_)) => { self.negates = true; self.expr(a) }
+                Expr::StrLen(2, a) => { self.octets = true; self.expr(a) }
                 Expr::Negate(a) | Expr::CaseMap(_, a) | Expr::StrLen(_, a) | Expr::Trim(_, a) | Expr::Cast(_, a) => self.expr(a),
                 Expr::GenId(_, Some(a)) => self.expr(a),
                 Expr::Substr(a, b, c) => { self.expr(a); self.expr(b); self.expr(c) }
@@ -4194,7 +4244,7 @@ pub fn shape(req: &Request) -> Shape {
     }
     let mut w = W::default();
     w.stmt(&req.body);
-    let W { ctx, cmps, negates, fields, row_window, pattern, text_coalesce } = w;
+    let W { ctx, cmps, negates, fields, row_window, pattern, text_coalesce, octets } = w;
     let rel = |c: u8| ctx.get(&c).cloned().unwrap_or_default();
     Shape {
         text_cmps: cmps.into_iter().map(|(c, f, t)| (rel(c), f, t)).collect(),
@@ -4203,6 +4253,7 @@ pub fn shape(req: &Request) -> Shape {
         row_reading_window: row_window,
         non_literal_pattern: pattern,
         text_coalesce,
+        octet_length: octets,
     }
 }
 

@@ -574,6 +574,25 @@ pub fn visible_rows_2pc(
     tips: &TipChain,
     strict: bool,
 ) -> Result<Vec<VisibleRow>, u64> {
+    visible_rows_as(file, page_size, relation, descs, tips, &OwnTx::none(), None, strict)
+}
+
+/// [visible_rows] as a READER WITH A TRANSACTION sees them: its OWN
+/// uncommitted versions (`own`) and, for a concurrency transaction, its
+/// isolation snapshot (`snap`) instead of the latest committed state - the
+/// view the executor needs to serve a statement inside a transaction that
+/// has written, or a SNAPSHOT one others have committed past.
+#[allow(clippy::too_many_arguments)]
+pub fn visible_rows_as(
+    file: &crate::Image,
+    page_size: usize,
+    relation: u16,
+    descs: &[Descriptor],
+    tips: &TipChain,
+    own: &OwnTx,
+    snap: Option<&Snapshot>,
+    strict: bool,
+) -> Result<Vec<VisibleRow>, u64> {
     let recs_per_dp = crate::format::max_recs_per_dp(page_size);
     let mut out = Vec::new();
 
@@ -593,9 +612,10 @@ pub fn visible_rows_2pc(
                 continue;
             }
             let recno = dp.sequence as u64 * recs_per_dp + r.slot as u64;
-            // committed-only: a reader with no transaction of its own
+            // committed-only for a reader with no transaction of its own
+            // (`own` empty, no snapshot)
             let Some(v) =
-                visible_version_2pc(file, page_size, &r, tips, &OwnTx::none(), strict, None)?
+                visible_version_2pc(file, page_size, &r, tips, own, strict, snap)?
             else {
                 continue;
             };

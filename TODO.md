@@ -85,6 +85,11 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       fails the run).
       Slice 8: INT128 / NUMERIC(19..38) (dsql's blr_int128 descriptor with its scale byte - `1A FE` - byte-identical in
       procedure parameters and view CASTs, catalog precision 0 for a bare INT128; the route serves INT128 outputs).
+      Slice 9: THE TRANSACTION'S OWN VIEW. exe reads as the attachment - its own uncommitted rows and a concurrency
+      transaction's isolation snapshot (ods::tra::visible_rows_as, exe::with_read_view) - where it read the committed
+      image and declined both. 4180 statements served under the switch (3543 before). Its sweep found two classes,
+      both closed: a SUM / AVG over INT128 (where it overflows is the engine's summation order) fails the run, and an
+      OCTET_LENGTH beside NONE / OCTETS columns declines (the engine counts stored bytes - merge).
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a
