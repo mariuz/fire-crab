@@ -116,6 +116,8 @@ CS=UTF8 route "6 ...a range over text" served "SELECT ID FROM W WHERE V > 'c' OR
 CS=UTF8 route "6 ...GROUP BY a CHAR" served "SELECT K, COUNT(*) FROM W GROUP BY K ORDER BY K"
 CS=UTF8 route "6 ...LIKE / STARTING WITH" served "SELECT ID, V FROM W WHERE V STARTING WITH 'c' OR V LIKE 'Z%' ORDER BY 1"
 route "6 UTF8 outputs under a NONE attachment" served "SELECT ID, V FROM W ORDER BY ID"
+CS=UTF8 route "6 a text in the ATTACHMENT's set under a UTF8 attachment: a literal, a CAST, a concatenation (slice 6)" served "SELECT ID, 'x' || V, CAST(ID AS VARCHAR(5)), 'lit' FROM W ORDER BY ID"
+route "6 ...under a NONE attachment it still declines" declined "SELECT ID, 'x' || S FROM T ORDER BY ID"
 
 echo "--- 7 bound parameters (slice 3): each ? an input of the procedure, typed as the prepare described it"
 if command -v node >/dev/null 2>&1 && node -e 'require("node-firebird")' 2>/dev/null; then
@@ -213,5 +215,5 @@ if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 65 ]; then echo "FAIL only $ran checks ran (floor 65) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 67 ]; then echo "FAIL only $ran checks ran (floor 67) - cells went missing"; fail=1; fi
 exit $fail

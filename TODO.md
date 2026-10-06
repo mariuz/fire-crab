@@ -72,6 +72,14 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       new side by its key (exact numerics at their shortest scale, text without trailing blanks, the temporal kinds)
       and probes per accumulated binding; the full ON still decides each candidate, and a key of another kind or an
       unhashable one falls back to the nested loop. 1.1 s now.
+      Slice 6: a text output in the ATTACHMENT's set under a UTF8 attachment (the sentinel's length is characters).
+      THE SWITCH-ON SWEEP AFTER SLICE 6 (2026-10-06, 3970 s): ~3540 statements served and NO served-wrong cell left -
+      the 95 failures are the 83 known-red, 11 index / joinorder / idxcost cells that count the INTERPRETER's index
+      trace (the route bypasses it), and one condpattern refusal cell the route now answers correctly. Declines: compile
+      7588, the attachment's set under other attachments 1000, a lossy bound move 984, a text literal against a
+      non-text column 706, execute 629, own writes 545, BOOLEAN / INT128 / DECFLOAT / zoned / BLOB outputs. Turning
+      the route ON by default would need those trace gates to pin the interpreter (FC_EXEC_SELECT unset) - a decision
+      for the plan, not taken here.
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a

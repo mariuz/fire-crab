@@ -130398,6 +130398,14 @@ fn exe_select(
                     (cs, c.length / bpc)
                 } else if c.sub_type <= -2 {
                     ((-2 - c.sub_type) as u8, c.length)
+                } else if c.sub_type == ATT_SUBTYPE
+                    && CURRENT_ATT_CS.with(|a| a.get()) == fire_crab_ods::intl::CS_UTF8
+                {
+                    // THE ATTACHMENT'S SET, when it is UTF8 (every driver the
+                    // gates run): the sentinel's length is CHARACTERS, the
+                    // describe already resolved - other attachments still
+                    // decline (slice 6)
+                    (fire_crab_ods::intl::CS_UTF8, c.length)
                 } else {
                     return decline("a text output in the attachment's set");
                 };
