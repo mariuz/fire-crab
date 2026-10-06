@@ -175,7 +175,9 @@ else echo "SKIP 7 node-firebird not resolvable"; fi
 
 echo "--- 4 DECLINED: the interpreter answers, right"
 route "4 a codepage relation (the executor orders by code point, WIN1252 by byte)" declined "SELECT ID FROM X ORDER BY ID"
-route "4 a DATE literal in the predicate (the BLR compiler takes none)" declined "SELECT ID FROM T WHERE D > DATE '2024-02-01' ORDER BY ID"
+route "4 a DATE literal in the predicate (slice 14: the BLR compiler takes the ISO spelling)" served "SELECT ID FROM T WHERE D > DATE '2024-02-01' ORDER BY ID"
+route "4 ...a TIMESTAMP and a TIME literal" served "SELECT ID FROM T WHERE TS < TIMESTAMP '2024-01-02 10:00:00' OR TM = TIME '23:00:00' ORDER BY ID"
+route "4 ...a spelling outside the ISO subset declines" declined "SELECT ID FROM T WHERE D = DATE '2024-2-1'"
 route "4 a CAST to TIMESTAMP (the executor has no such cast)" declined "SELECT CAST(D AS TIMESTAMP) FROM T ORDER BY ID"
 route "4 a DOUBLE output" declined "SELECT CAST(N AS DOUBLE PRECISION) FROM T ORDER BY ID"
 echo "--- 10 the approximate kinds (slice 5): compared and folded as doubles, FLOAT beside FLOAT or exact in SINGLE precision"
@@ -254,5 +256,5 @@ if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 89 ]; then echo "FAIL only $ran checks ran (floor 89) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 91 ]; then echo "FAIL only $ran checks ran (floor 91) - cells went missing"; fail=1; fi
 exit $fail

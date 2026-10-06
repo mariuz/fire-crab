@@ -503,6 +503,10 @@ enum Val {
     CurrentRole,
     /// TRUE / FALSE - blr_literal blr_bool 1 / 0 (measured: `15 17 01`)
     Bool(bool),
+    /// DATE / TIME / TIMESTAMP '<iso>' - blr_literal with the dtype and its
+    /// value bytes (measured: DATE '2024-02-01' is `15 0C B5 EB 00 00`, the
+    /// MJD day; TIME is 1/10000 s ticks; TIMESTAMP is both)
+    TemporalLit(Vec<u8>),
     /// GEN_ID(sequence, increment)
     GenId(String, Box<Val>),
     /// NEXT VALUE FOR sequence - blr_gen_id2, the name alone
@@ -728,6 +732,81 @@ fn charset_by_name(name: &str) -> Option<(u16, u16)> {
     let id = CHARSET_NAMES.iter().find(|(n, _)| *n == name).map(|(_, i)| *i)?;
     let bpc = CHARSET_BPC.iter().find(|(i, _)| *i == id).map(|(_, b)| *b)?;
     Some((id, bpc))
+}
+
+/// A typed temporal literal's blr_literal tail - the dtype byte and the
+/// value - for the STRICT ISO spelling only: `YYYY-MM-DD` for a DATE,
+/// `HH:MM[:SS[.ffff]]` for a TIME, both (one blank between) for a
+/// TIMESTAMP. The engine reads many more spellings (month names, other
+/// separators, TODAY / NOW); every one of them refuses here.
+fn temporal_literal_bytes(kind: &str, text: &str) -> Option<Vec<u8>> {
+    let date = |t: &str| -> Option<i32> {
+        let b = t.as_bytes();
+        if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+            return None;
+        }
+        let y: i64 = t.get(0..4)?.parse().ok()?;
+        let m: i64 = t.get(5..7)?.parse().ok()?;
+        let d: i64 = t.get(8..10)?.parse().ok()?;
+        if !(1..=12).contains(&m) || d < 1 {
+            return None;
+        }
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(m - 1) as usize];
+        if d > mdays || !(1..=9999).contains(&y) {
+            return None;
+        }
+        // days from the civil date (Howard Hinnant's algorithm), then to MJD
+        let (y2, m2) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+        let era = y2.div_euclid(400);
+        let yoe = y2 - era * 400;
+        let doy = (153 * m2 + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let unix_days = era * 146097 + doe - 719468;
+        i32::try_from(unix_days + 40587).ok()
+    };
+    let time = |t: &str| -> Option<u32> {
+        let (hms, frac) = match t.split_once('.') {
+            Some((a, f)) => (a, Some(f)),
+            None => (t, None),
+        };
+        let parts: Vec<&str> = hms.split(':').collect();
+        if parts.len() < 2 || parts.len() > 3 || parts.iter().any(|p| p.len() != 2 || !p.bytes().all(|c| c.is_ascii_digit())) {
+            return None;
+        }
+        let h: u32 = parts[0].parse().ok()?;
+        let mi: u32 = parts[1].parse().ok()?;
+        let se: u32 = parts.get(2).map_or(Some(0), |p| p.parse().ok())?;
+        if h > 23 || mi > 59 || se > 59 || (frac.is_some() && parts.len() != 3) {
+            return None;
+        }
+        let f: u32 = match frac {
+            None => 0,
+            Some(f) if (1..=4).contains(&f.len()) && f.bytes().all(|c| c.is_ascii_digit()) => {
+                f.parse::<u32>().ok()? * 10u32.pow(4 - f.len() as u32)
+            }
+            Some(_) => return None,
+        };
+        Some(((h * 60 + mi) * 60 + se) * 10000 + f)
+    };
+    let mut out = Vec::new();
+    match kind {
+        "DATE" => {
+            out.push(blr::DATE);
+            out.extend_from_slice(&date(text)?.to_le_bytes());
+        }
+        "TIME" => {
+            out.push(blr::TIME);
+            out.extend_from_slice(&time(text)?.to_le_bytes());
+        }
+        _ => {
+            let (d, t) = text.split_once(' ')?;
+            out.push(blr::TIMESTAMP);
+            out.extend_from_slice(&date(d)?.to_le_bytes());
+            out.extend_from_slice(&time(t)?.to_le_bytes());
+        }
+    }
+    Some(out)
 }
 
 fn emit_dsc(out: &mut Vec<u8>, d: Dsc) {
@@ -2388,6 +2467,15 @@ impl<'a> P<'a> {
             // every row, and `S = CURRENT_USER` failed at use
             Tok::Ident(x) if x == "CURRENT_USER" || x == "USER" => Val::UserName,
             Tok::Ident(x) if x == "CURRENT_ROLE" => Val::CurrentRole,
+            Tok::Ident(x)
+                if matches!(x.as_str(), "DATE" | "TIME" | "TIMESTAMP")
+                    && matches!(self.t.get(self.i + 1), Some(Tok::Str(_))) =>
+            {
+                let Some(Tok::Str(text)) = self.t.get(self.i + 1) else { return None };
+                let bytes = temporal_literal_bytes(x, text)?;
+                self.i += 2;
+                return Some(Val::TemporalLit(bytes));
+            }
             Tok::Ident(x) if x == "TRUE" => Val::Bool(true),
             Tok::Ident(x) if x == "FALSE" => Val::Bool(false),
             Tok::Ident(x) if x == "NEXT" => {
@@ -3472,6 +3560,10 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
         }
         Val::UserName => out.push(0x2C),
         Val::Bool(b) => out.extend_from_slice(&[blr::LITERAL, 23, *b as u8]),
+        Val::TemporalLit(b) => {
+            out.push(blr::LITERAL);
+            out.extend_from_slice(b);
+        }
         Val::CurrentRole => out.push(0xAE),
         Val::GenId(name, inc) => {
             out.push(blr::GEN_ID);

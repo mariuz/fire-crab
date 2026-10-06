@@ -109,6 +109,10 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       still decides every candidate): a point lookup in 20,000 rows 70 ms. A value the column cannot hold answers no
       rows at once, as the engine's retrieval does. RANGES too (`<` `<=` `>` `>=`, BETWEEN; the tightest bound wins)
       through an ascending index; compound / text keys and descending-index ranges still scan.
+      Slice 14: typed TEMPORAL LITERALS (`DATE '2024-02-01'`, TIME, TIMESTAMP; dsql's blr_literal with the dtype -
+      `15 0C <MJD day>` - byte-identical in fc-made views; the strict ISO spelling only, others refuse). The engine also
+      FOLDS a text literal against a DATE column into a DATE literal at compile (`D = '2024-02-01'` stores `15 0C ..`) -
+      not done (the route declines a text literal against a non-text column).
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a

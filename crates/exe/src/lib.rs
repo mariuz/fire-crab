@@ -797,6 +797,20 @@ impl<'a> P<'a> {
                         )
                     }
                     blr::DT_BOOL => Value::Bool(self.u8()? != 0),
+                    // the temporal literals: the MJD day, 1/10000 s ticks
+                    blr::DT_SQL_DATE => {
+                        let b = [self.u8()?, self.u8()?, self.u8()?, self.u8()?];
+                        Value::Date(i32::from_le_bytes(b))
+                    }
+                    blr::DT_SQL_TIME => {
+                        let b = [self.u8()?, self.u8()?, self.u8()?, self.u8()?];
+                        Value::Time(u32::from_le_bytes(b))
+                    }
+                    blr::DT_TIMESTAMP => {
+                        let d = [self.u8()?, self.u8()?, self.u8()?, self.u8()?];
+                        let t = [self.u8()?, self.u8()?, self.u8()?, self.u8()?];
+                        Value::Timestamp(i32::from_le_bytes(d), u32::from_le_bytes(t))
+                    }
                     other => return Err(format!("literal dtype {} unconverted", other)),
                 }))
             }
