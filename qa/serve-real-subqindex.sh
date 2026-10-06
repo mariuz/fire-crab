@@ -74,7 +74,7 @@ EOF
 make_db "$A" || { echo "FAIL scratch A"; exit 1; }
 make_db "$B" || { echo "FAIL scratch B"; exit 1; }
 
-FC_SRV_TRACE=1 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >"$LOG" 2>&1 &
+FC_EXEC_SELECT=0 FC_SRV_TRACE=1 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >"$LOG" 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null' EXIT
 i=0; while [ $i -lt 20 ]; do
@@ -286,7 +286,7 @@ subq_indexed "the OLD key finds nothing (the stale entry is filtered)" \
 # log must hold NO "subq index:" line at all.
 P2=$((PORT + 1))
 LOG2="/tmp/fc-serve-subqidx-noidx-$PORT.log"
-FC_NO_INDEX=1 FC_SRV_TRACE=1 "$FCWIRE" serve "127.0.0.1:$P2" "$U" "$P" >"$LOG2" 2>&1 &
+FC_EXEC_SELECT=0 FC_NO_INDEX=1 FC_SRV_TRACE=1 "$FCWIRE" serve "127.0.0.1:$P2" "$U" "$P" >"$LOG2" 2>&1 &
 srv2=$!
 trap 'kill $srv $srv2 2>/dev/null' EXIT
 i=0; while [ $i -lt 20 ]; do

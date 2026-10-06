@@ -50,7 +50,7 @@ SET TERM ;^
 COMMIT;
 EOF
 chmod 666 "$DBE"; cp "$DBE" "$DBF"; chmod 666 "$DBF"
-FC_SRV_TRACE=1 FC_SORT_MEMORY=2000000 FC_TEMP_DIR="$TMP" "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >"$LOG" 2>&1 &
+FC_EXEC_SELECT=0 FC_SRV_TRACE=1 FC_SORT_MEMORY=2000000 FC_TEMP_DIR="$TMP" "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >"$LOG" 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null; rm -rf "$DBE" "$DBF" "$TMP"' EXIT
 i=0; while [ $i -lt 20 ]; do

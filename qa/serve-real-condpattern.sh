@@ -426,7 +426,7 @@ done
 # predicate world's arms refuse a text expression - its collation), a
 # TEMPORAL conditional under a literal pattern (the engine's prepare-time
 # 22018, this server's refusal) and K1's numeric mix
-eng_only "9 <text expr> STARTING WITH ? - the text-expression arm" "$W $X STARTING WITH ? ORDER BY ID" '[1,"s"]'
+both "9 <text expr> STARTING WITH ? - the text-expression arm (promoted: the exe route answers it)" "$W $X STARTING WITH ? ORDER BY ID" '[1,"s"]'
 eng_only "9 <text expr> CONTAINING ?"                               "$W $X CONTAINING ? ORDER BY ID" '[1,"IG"]'
 eng_only "9 .. LIKE 'b%' AND ID > ? - K1's numeric mix"              "$W $X LIKE 'b%' AND ID > ? ORDER BY ID" '[1,2]'
 # (a LITERAL condition: isql cannot bind, and this server already raises

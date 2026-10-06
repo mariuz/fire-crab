@@ -130258,9 +130258,10 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
 /// A SELECT SERVED BY THE BLR PATH - SQL -> fire-crab-dsql's BLR ->
 /// fire-crab-exe's record sources -> rows - instead of this crate's
 /// interpreter: item 3 of docs/full-conversion-plan.md, moving SQL
-/// execution out of `wire`, one statement family at a time. EXPERIMENTAL
-/// and OFF unless FC_EXEC_SELECT is set, so a sweep run with it ON measures
-/// the BLR path against every gate the interpreter already passes.
+/// execution out of `wire`, one statement family at a time. ON BY DEFAULT
+/// since its switch-on sweeps left no served-wrong cell (slices 1-14);
+/// FC_EXEC_SELECT=0 turns it off - the gates that count the INTERPRETER's
+/// own index, sort and coverage traces pin that.
 ///
 /// The statement is compiled as the selectable procedure the engine's own
 /// DSQL would make of it - `FOR <select> INTO :o.. DO SUSPEND`, its RETURNS
@@ -130279,7 +130280,7 @@ fn exe_select(
     args: &[WireParam],
     params: &[Descriptor],
 ) -> Option<Plan> {
-    if std::env::var("FC_EXEC_SELECT").is_err() || args.len() != params.len() {
+    if std::env::var("FC_EXEC_SELECT").is_ok_and(|v| v == "0") || args.len() != params.len() {
         return None;
     }
     let db = database.as_ref()?;

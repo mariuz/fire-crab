@@ -95,9 +95,9 @@ if [ "${n:-0}" -lt 100000 ]; then
     exit 1
 fi
 
-"$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-idxcost.log 2>&1 &
+FC_EXEC_SELECT=0 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-idxcost.log 2>&1 &
 srv=$!
-FC_NO_INDEX=1 "$FCWIRE" serve "127.0.0.1:$PORT2" "$U" "$P" >>/tmp/fc-serve-idxcost.log 2>&1 &
+FC_EXEC_SELECT=0 FC_NO_INDEX=1 "$FCWIRE" serve "127.0.0.1:$PORT2" "$U" "$P" >>/tmp/fc-serve-idxcost.log 2>&1 &
 srv2=$!
 i=0; while [ $i -lt 30 ]; do
     command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null \

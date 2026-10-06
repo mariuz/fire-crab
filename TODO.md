@@ -113,6 +113,9 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       `15 0C <MJD day>` - byte-identical in fc-made views; the strict ISO spelling only, others refuse). The engine also
       FOLDS a text literal against a DATE column into a DATE literal at compile (`D = '2024-02-01'` stores `15 0C ..`) -
       not done (the route declines a text literal against a non-text column).
+      THE ROUTE IS ON BY DEFAULT (2026-10-06): its switch-on sweeps left no served-wrong cell; FC_EXEC_SELECT=0 turns it
+      off, and the six gates that count the interpreter's own index / sort / coverage traces (index, joinorder,
+      idxcost, leftjoinindex, subqindex, bigsort) pin that. The interpreter still answers every statement it declines.
 - [ ] **P1** Typed lock series, `-w` cycles, `PIO_open` locking, multi-process lock table
 - [ ] **P1** Page cache eviction; background/cooperative GC
 - [ ] **P2** WRONG ANSWER (found 2026-10-05 under the exe switch, in the INTERPRETER): an index KEY built from a

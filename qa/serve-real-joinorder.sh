@@ -41,7 +41,7 @@ COMMIT;
 SQL
 }
 rm -f "$DBE" "$DBF"; build "$DBE"; build "$DBF"; chmod 666 "$DBE" "$DBF"
-FC_SRV_TRACE=1 FC_SORT_MEMORY=65536 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >"$LOG" 2>&1 &
+FC_EXEC_SELECT=0 FC_SRV_TRACE=1 FC_SORT_MEMORY=65536 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >"$LOG" 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null; rm -f "$DBE" "$DBF"' EXIT
 i=0; while [ $i -lt 20 ]; do
