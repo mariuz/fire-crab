@@ -1464,6 +1464,20 @@ fn sf_int_rounded(v: &Value) -> Result<i128, String> {
     }
 }
 
+/// an exact numeric as the engine renders it to text: the sign, the
+/// integer digits, a point and the stored decimals (0.05 at scale -2 is
+/// "0.05")
+fn sf_exact_text(raw: i128, scale: i8) -> String {
+    if scale >= 0 {
+        return raw.to_string();
+    }
+    let d = (-(scale as i32)) as usize;
+    let digits = raw.unsigned_abs().to_string();
+    let digits = if digits.len() <= d { format!("{}{}", "0".repeat(d + 1 - digits.len()), digits) } else { digits };
+    let (int_part, frac) = digits.split_at(digits.len() - d);
+    format!("{}{}.{}", if raw < 0 { "-" } else { "" }, int_part, frac)
+}
+
 fn sf_text(v: &Value) -> Result<&str, String> {
     match v {
         Value::Text(t) => Ok(t.as_str()),
@@ -1993,6 +2007,34 @@ fn sys_fn(name: &str, args: &[Value]) -> Result<Value, String> {
                 }
             }
             best.clone()
+        }
+        // HASH without an algorithm: the engine's WeakHashContext (Hash.cpp) -
+        // a 64-bit ELF hash over the value's TEXT bytes (a number rendered as
+        // text first: HASH(-7) hashes "-7" = 775; HASH('hello') = 7258927,
+        // measured). Text here must be ASCII (its bytes are its characters in
+        // every set); a two-argument HASH .. USING is unconverted.
+        "HASH" => {
+            if args.len() != 1 {
+                return Err("HASH USING an algorithm unconverted".into());
+            }
+            let text: String = match arg(0)? {
+                Value::Text(t) if t.is_ascii() => t.clone(),
+                Value::Text(_) => return Err("HASH of non-ASCII text unconverted".into()),
+                Value::Int(n) => n.to_string(),
+                Value::Scaled(raw, sc) => sf_exact_text(*raw as i128, *sc),
+                Value::Int128(raw, sc) => sf_exact_text(*raw, *sc),
+                _ => return Err("HASH over this kind unconverted".into()),
+            };
+            let mut h: i64 = 0;
+            for b in text.bytes() {
+                h = (h << 4).wrapping_add(b as i64);
+                let n = h & (0xF000_0000_0000_0000u64 as i64);
+                if n != 0 {
+                    h ^= n >> 56;
+                }
+                h &= !n;
+            }
+            Value::Int(h)
         }
         "DATEADD" => {
             let part = sf_part(arg(1)?)?;

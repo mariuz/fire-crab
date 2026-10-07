@@ -141,7 +141,7 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       ROUND(1e300) raises) - unconverted; DATEADD(1.5 DAY) adds 2 (rounded); DATEDIFF(MILLISECOND) is INT64 scale -1;
       MAXVALUE(D, TS) is HY004; LEFT(S, -1) 22011; POSITION('', S) = 1; LPAD truncates to the length. The route's
       ATT_SUBTYPE rule still declines text-function outputs under a NONE attachment (cells run with CS=UTF8). Still
-      unconverted: HASH (the engine's own algorithm), CRYPT_HASH, GEN_UUID/RAND/UUID functions, RDB$GET/SET_CONTEXT,
+      unconverted: HASH USING (CRYPT_HASH's libtomcrypt digests; plain HASH is WeakHashContext's 64-bit ELF hash over MOV_make_string2's bytes - done), CRYPT_HASH, GEN_UUID/RAND/UUID functions, RDB$GET/SET_CONTEXT,
       QUANTIZE/NORMALIZE_DECFLOAT/COMPARE_DECFLOAT/TOTALORDER, HEX_DECODE/BASE64_DECODE (binary), WEEK in DATEDIFF
       and FIRST_DAY, DATEADD past midnight on a TIME, ASCII_VAL/ASCII_CHAR outside ASCII.
       Slice 13: SPEED. exe resolved every blr_field through RDB$RELATION_FIELDS on EVERY evaluation and cloned the row

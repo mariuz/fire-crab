@@ -133,7 +133,9 @@ feature has to be built twice.
       HEX_ENCODE, BASE64_ENCODE), the BIN_ functions, MAXVALUE / MINVALUE,
       DATEADD (calendar months with the day clamped, ticks otherwise, a
       fraction rounded), DATEDIFF (by field; MILLISECOND as NUMERIC(18,1)),
-      FIRST_DAY / LAST_DAY. Unconverted and declined: HASH, the UUID and
+      FIRST_DAY / LAST_DAY, and HASH without an algorithm (the engine's
+      64-bit ELF hash over the value's text bytes, read from Hash.cpp).
+      Unconverted and declined: HASH USING an algorithm, the UUID and
       random functions, the context functions, the DECFLOAT functions, the
       binary decoders. 16 new route cells.
     - Next: the remaining compile classes - COLLATE expressions (which the
