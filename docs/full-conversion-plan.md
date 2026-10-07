@@ -1,6 +1,6 @@
 # fire-crab: Full Conversion Plan
 
-*2026-10-05 · baseline `master` at `ea24856`, updated for `204f43a` · shared copy:
+*2026-10-05 · baseline `master` at `ea24856`, updated for slice 15 (2026-10-07) · shared copy:
 [claude.ai doc](https://claude.ai/code/artifact/b21b5433-02ee-42ef-9918-c9d8177a2d5e)*
 
 Every Firebird subsystem has a first Rust version checked against the real
@@ -83,7 +83,33 @@ feature has to be built twice.
     - **Decision needed before the route goes on by default:** pin those trace
       gates to the interpreter (`FC_EXEC_SELECT` unset), or give `exe` an
       equivalent trace.
-    - Next: the biggest decline classes - compile (`dsql`, about 7,600), the
+    - Slice 15 (2026-10-07): **the compile census.** A sweep with the trace
+      exported counted 5,430 `compile` declines - the largest class - and a
+      probe harness measured 190 of those shapes against the engine's own
+      `RDB$PROCEDURE_BLR`. `dsql` now compiles, byte for byte: every system
+      function (`blr_sys_function`, with the DATEADD / DATEDIFF /
+      FIRST_DAY / POSITION / OVERLAY / CRYPT_HASH spellings rewritten to
+      the engine's argument order); CONTAINING, SIMILAR TO [ESCAPE] and
+      LIKE .. ESCAPE; exponent literals (a `blr_double` literal carrying the
+      source text) and hex literals; aggregate FILTER (sugar for the
+      aggregate over `CASE WHEN c THEN arg END`); HAVING without GROUP BY,
+      GROUP BY without an aggregate item, FIRST / SKIP and ROWS n over an
+      aggregate, ORDER BY an aggregate; one-item IN lists (an equality) and
+      IN lists typed among their items. **A typed catalog** (`set_catalog_typed`,
+      each column's type from the relation's current format) lets CASE /
+      IIF / NULLIF / FILTER over a column carry the engine's unified cast:
+      the widest exact dtype with the smallest scale, where a decimal
+      literal is an INT64 inside DSQL - which also fixed a pre-existing
+      wrong BLR (`CASE WHEN c THEN 1.5 ELSE 2.5 END` compiled as LONG).
+      `qa/dsql-proc-blr.sh` pins 365 byte-identical cells (78 new); five old
+      refusal pins promoted after measuring. Still refused: NULLS FIRST /
+      LAST, LIST, derived tables (the engine dissolves a one-table derived
+      table into an aliased relation), COLLATE expressions, text beside a
+      number in a CASE.
+    - Next: the remaining compile classes - COLLATE expressions (which the
+      executor could not serve anyway), windows beside GROUP BY, derived
+      tables and CTEs, UNION in a derived table, NULLS FIRST / LAST, LIST;
+      then the other decline classes - the
       attachment's set under non-UTF8 attachments, lossy bound moves, a text
       literal against a non-text column; DECFLOAT arithmetic and grouping,
       zoned and BLOB outputs;

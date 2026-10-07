@@ -28603,7 +28603,7 @@ fn plan_create_trigger_dsql(sql: &str, db: &Option<Database>) -> Option<(Plan, V
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
     let body_text = expand_listless_inserts(&s[as_kw..], dbr)?;
     let synth = format!("CREATE TRIGGER X FOR {} BEFORE INSERT {}", quoted, body_text);
-    fire_crab_dsql::set_catalog(dsql_catalog_for(db, &synth));
+    fire_crab_dsql::set_catalog_typed(dsql_catalog_for(db, &synth));
     let cs = db_default_charset(&dbr.bytes(), dbr.page_size);
     fire_crab_dsql::set_default_charset(cs as u16, fire_crab_ods::intl::bytes_per_char(cs) as u16);
     let blr = fire_crab_dsql::compile_trigger(&synth);
@@ -30604,6 +30604,7 @@ fn plan_create_table(sql: &str, db: Option<&Database>) -> Option<(Plan, Vec<Desc
                                 blr_type: c.field_type as u8,
                                 length: c.length,
                                 scale: c.scale,
+                                charset: None,
                             },
                         )
                     })
@@ -31702,25 +31703,77 @@ fn proc_default_of(src: &str) -> Option<(Vec<u8>, String)> {
 /// The (table or procedure, its columns or outputs) pairs a body may
 /// name: every identifier of the statement that resolves as a user
 /// relation or a procedure in the catalog.
-fn dsql_catalog_for(db: &Option<Database>, sql: &str) -> Vec<(String, Vec<String>)> {
+/// The tables (and selectable procedures) a statement names, with each
+/// table column's TYPE from the relation's current format, so the dsql
+/// compiler unifies a CASE / NULLIF / IIF / FILTER over a column and
+/// types an IN list beside one the way the engine does
+/// (`fire_crab_dsql::set_catalog_typed`). A procedure's outputs and a
+/// column whose descriptor the compiler has no cast dsc for (BLOB, zoned
+/// temporals, a collated text) carry None and leave those shapes refused.
+fn dsql_catalog_for(
+    db: &Option<Database>,
+    sql: &str,
+) -> Vec<(String, Vec<(String, Option<fire_crab_dsql::TypeSpec>)>)> {
     let Some(db) = db.as_ref() else { return Vec::new() };
     let masked = mask_literals(&sql.to_ascii_uppercase());
-    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut out: Vec<(String, Vec<(String, Option<fire_crab_dsql::TypeSpec>)>)> = Vec::new();
     for word in masked.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')) {
         if word.is_empty() || out.iter().any(|(n, _)| n == word) {
             continue;
         }
         if fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, word).is_some() {
-            let cols: Vec<String> = relation_columns(&db.bytes(), db.page_size, word)
-                .into_iter()
-                .map(|c| c.name)
-                .collect();
+            // the current format's descriptors are indexed by FIELD ID
+            let descs: Vec<Descriptor> = db
+                .relation_meta(word)
+                .and_then(|m| m.formats.last().map(|f| f.1.clone()))
+                .unwrap_or_default();
+            let cols: Vec<(String, Option<fire_crab_dsql::TypeSpec>)> =
+                relation_columns(&db.bytes(), db.page_size, word)
+                    .into_iter()
+                    .map(|c| {
+                        let t = descs.get(c.field_id as usize).and_then(dsql_type_spec_of_desc);
+                        (c.name, t)
+                    })
+                    .collect();
             out.push((word.to_string(), cols));
         } else if let Some(meta) = load_procedure(db, word) {
-            out.push((word.to_string(), meta.outs.iter().map(|p| p.name.clone()).collect()));
+            out.push((word.to_string(), meta.outs.iter().map(|p| (p.name.clone(), None)).collect()));
         }
     }
     out
+}
+
+/// A stored column's descriptor as the dsql compiler's [TypeSpec]: the
+/// ODS dtype mapped to its BLR type code, a text's set from its ttype
+/// (a COLLATED column's unified cast is unmeasured: None), BLOB / array
+/// / zoned kinds None.
+fn dsql_type_spec_of_desc(d: &Descriptor) -> Option<fire_crab_dsql::TypeSpec> {
+    use fire_crab_ods::format::dtype;
+    let text_cs = || -> Option<u16> {
+        let ttype = d.sub_type as u16;
+        if ttype >> 8 != 0 {
+            return None;
+        }
+        Some(ttype & 0xFF)
+    };
+    let (blr_type, charset) = match d.dtype {
+        dtype::TEXT => (14u8, Some(text_cs()?)),
+        dtype::VARYING => (37, Some(text_cs()?)),
+        dtype::SHORT => (7, None),
+        dtype::LONG => (8, None),
+        dtype::INT64 => (16, None),
+        dtype::INT128 => (26, None),
+        dtype::REAL => (10, None),
+        dtype::DOUBLE => (27, None),
+        dtype::SQL_DATE => (12, None),
+        dtype::SQL_TIME => (13, None),
+        dtype::TIMESTAMP => (35, None),
+        dtype::BOOLEAN => (23, None),
+        dtype::DEC64 => (24, None),
+        dtype::DEC128 => (25, None),
+        _ => return None,
+    };
+    Some(fire_crab_dsql::TypeSpec { blr_type, length: d.length, scale: d.scale, charset })
 }
 
 /// WHAT THE ENGINE'S COMPILER REFUSES IN A ROUTINE BODY that the DSQL
@@ -31767,7 +31820,7 @@ fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<
     let plain_funcs = plain_function_arities(db);
     // the compiler resolves a bare column across streams through the
     // catalog of the tables and procedures the body names
-    fire_crab_dsql::set_catalog(dsql_catalog_for(db, sql));
+    fire_crab_dsql::set_catalog_typed(dsql_catalog_for(db, sql));
     let c = with_routine_default_cs(|| fire_crab_dsql::compile_procedure_full_with_funcs(sql, &plain_funcs));
     fire_crab_dsql::set_catalog(Vec::new());
     let mut c = c?;
@@ -33964,6 +34017,7 @@ fn plan_create_domain(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
                         blr_type: col.field_type as u8,
                         length: col.length,
                         scale: col.scale,
+                        charset: None,
                     },
                 )?,
             };
@@ -66734,7 +66788,7 @@ fn plan_query_inner_at_body(
         // compiler first, and [block_prepare_verdict] where it declines
         let ins_clause = if in_names.is_empty() { String::new() } else { format!("({}) ", ins_decl) };
         let synth = format!("CREATE PROCEDURE FC$BLOCK {}AS {}", ins_clause, source);
-        fire_crab_dsql::set_catalog(dsql_catalog_for(db, &synth));
+        fire_crab_dsql::set_catalog_typed(dsql_catalog_for(db, &synth));
         let c = fire_crab_dsql::compile_procedure_full_with_funcs(&synth, &plain_function_arities(db));
         fire_crab_dsql::set_catalog(Vec::new());
         let compiled = c.is_some();
@@ -130438,7 +130492,7 @@ fn exe_select(
         slots.join(", ")
     );
     let funcs = plain_function_arities(database);
-    fire_crab_dsql::set_catalog(dsql_catalog_for(database, &synth));
+    fire_crab_dsql::set_catalog_typed(dsql_catalog_for(database, &synth));
     let compiled = fire_crab_dsql::compile_procedure_full_with_funcs(&synth, &funcs);
     fire_crab_dsql::set_catalog(Vec::new());
     let Some(compiled) = compiled else { return decline("compile") };
@@ -130543,7 +130597,20 @@ fn exe_select(
     // (xlit: a NONE column's 'caf\xE9' row matched a UTF-8 'café';
     // utf8routines: a NONE routine parameter). The database default set
     // decides a routine's parameters; the relations read decide columns.
-    let octet_length = fire_crab_exe::parse(&compiled.blob).map(|r| fire_crab_exe::shape(&r).octet_length).unwrap_or(true);
+    let (octet_length, codepage_cast) = fire_crab_exe::parse(&compiled.blob)
+        .map(|r| {
+            let sh = fire_crab_exe::shape(&r);
+            (sh.octet_length, sh.codepage_cast)
+        })
+        // (an unparsable BLR keeps its own decline below)
+        .unwrap_or((true, false));
+    // a CAST to a text type in a CODEPAGE set (the rewrite of an introducer
+    // `_win1252 'é'` is one): the engine transliterates into the set's
+    // bytes, this executor concatenates decoded characters (concatcs:
+    // OCTET_LENGTH 5 for the engine's 6 under UTF8 and 4 under NONE)
+    if codepage_cast {
+        return decline("a cast to a codepage set");
+    }
     if !text.is_ascii() || octet_length {
         let image = db.bytes();
         let ps = db.page_size;
@@ -132753,7 +132820,7 @@ fn parse_execute_block_select(
     // catalog, `R = FN('ab')` was an unknown name and the block refused
     // where the engine answers 'fab' (measured)
     let plain_funcs = plain_function_arities(db);
-    fire_crab_dsql::set_catalog(dsql_catalog_for(db, &synth));
+    fire_crab_dsql::set_catalog_typed(dsql_catalog_for(db, &synth));
     let c = fire_crab_dsql::compile_procedure_full_with_funcs(&synth, &plain_funcs);
     fire_crab_dsql::set_catalog(Vec::new());
     // A BODY THE BLR COMPILER CANNOT HOLD IS NOT A BLOCK THE ENGINE

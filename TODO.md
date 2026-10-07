@@ -102,6 +102,23 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       `1e308` as 1 with an ALIAS E308 (a number run into a letter refuses now); exe's text-to-integer CAST trimmed tabs
       and ignored the engine's conversion buffer (22 / 52 bytes); a RIGHT join was emitted left-driven (the preserved
       side drives now); LOWER / UPPER over non-ASCII text fail the run (the Turkish dotted I).
+      Slice 15 (2026-10-07): THE COMPILE CENSUS. The sweep's trace counted compile 5430 as the largest decline class;
+      190 shapes measured on the engine (scratch blrprobe.sh: a CREATE PROCEDURE per shape, RDB$PROCEDURE_BLR read
+      back, the expression bytes isolated against a plain-column control). dsql now emits: blr_sys_function for every
+      system function (special spellings rewritten to the stored argument order; CRYPT_HASH's algorithm is a text2
+      literal in ASCII); CONTAINING / SIMILAR TO [ESCAPE] / LIKE ESCAPE (blr_ansi_like); exponent literals (blr_double
+      carrying the SOURCE TEXT) and X'..' (text2 in OCTETS); FILTER (the aggregate over CAST(CASE WHEN c THEN arg END));
+      HAVING alone, GROUP BY without aggregates (empty map), FIRST/SKIP/ROWS n after an aggregate's map, ORDER BY an
+      aggregate (a map slot); IN (one item) = blr_eql, numeric IN items cast to the ITEMS' common type, text / non-text
+      items cast to a text operand's type, temporal literal items raw. The TYPED CATALOG (set_catalog_typed; TypeSpec
+      gained charset: Option<u16>; the server reads each column's descriptor from the relation's current format by
+      field id) gives CASE / IIF / NULLIF / FILTER over columns the engine's unified cast - widest exact dtype, smallest
+      scale, a DECIMAL LITERAL BEING INT64 inside DSQL (so `1.5 vs 2.5` is int64: a pre-existing wrong BLR fixed),
+      DOUBLE wins, FLOAT beside short/long stays FLOAT, texts VARYING-if-any / longest chars / the one non-NONE set.
+      FCDSQL_CATALOG feeds fcdsql the same catalog; qa/dsql-proc-blr.sh exports it and pins 365 cells (78 new, five
+      old refusals promoted after measuring). Still refused: NULLS FIRST/LAST (7 sort-tuple sites), LIST, derived
+      tables / CTEs (the engine DISSOLVES a one-table derived table into blr_relation2 with alias `"D" "PUBLIC"."T"`),
+      COLLATE expressions, text beside a number in a CASE, FLOAT beside INT64, a window's FILTER.
       Slice 13: SPEED. exe resolved every blr_field through RDB$RELATION_FIELDS on EVERY evaluation and cloned the row
       (a 20,000-row scan with one comparison: 6 s) - the field id is cached per statement now (80 ms). And an equality
       conjunct `<column> = <literal | ?>` over an exact-numeric column with a live plain single-segment index retrieves

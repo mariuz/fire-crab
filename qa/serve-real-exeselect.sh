@@ -191,7 +191,7 @@ route "10 a FLOAT beside a DOUBLE compares in double" served "SELECT ID FROM A W
 route "10 an exact column beside a DOUBLE" served "SELECT ID FROM A WHERE N = D ORDER BY ID"
 route "10 sorted DESC, NULLs" served "SELECT ID, R FROM A ORDER BY R DESC"
 route "10 GROUP BY / DISTINCT a FLOAT" served "SELECT R, COUNT(*) FROM A GROUP BY R ORDER BY 1"
-route "10 IN over a FLOAT (dsql: an IN list beside a non-exact operand is unprobed)" declined "SELECT ID FROM A WHERE R IN (0.1, 1.5) ORDER BY ID"
+route "10 IN over a FLOAT (slice 15: the items are typed among THEMSELVES - int64 scale -1 here - and the FLOAT operand never shapes them, measured; promoted from declined)" served "SELECT ID FROM A WHERE R IN (0.1, 1.5) ORDER BY ID"
 route "10 BETWEEN over a DOUBLE" served "SELECT ID, D FROM A WHERE D BETWEEN 0 AND 3 ORDER BY D"
 route "10 MIN / MAX keep the kind" served "SELECT MIN(R), MAX(D), MAX(R) FROM A"
 route "10 arithmetic over a double: IEEE, an integer operand exact under 2^53 (slice 10)" served "SELECT D * 2, R * 3, D + R, R / 3 FROM A ORDER BY ID"

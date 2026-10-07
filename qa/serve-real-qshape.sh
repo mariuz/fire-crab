@@ -464,7 +464,8 @@ refused "12 an unbounded recursive CTE under FIRST" "with recursive r (n) as (se
 refused "12 FIRST (expr)" "select first (1+1) id from t1 order by id;"
 refused "12 ROWS 1.5" "select id from t1 order by id rows 1.5;"
 refused "12 a number INTEGER CONTAINING" "select id from t1 where b containing 0 order by 1;"
-differs "12 a column item beside a text in an IN list: the engine answers, this server raises 22018 per row" "select id from t1 where v in (a, 'apple') order by 1;" "ID|1" "ID|Statement failed, SQLSTATE = 22018|conversion error from string \"apple\""
+# (promoted 2026-10-07: the BLR path types the text item to the column's type and the column item to it too - slice 15)
+pin "12 a column item beside a text in an IN list: the engine answers, and so does this server now" "select id from t1 where v in (a, 'apple') order by 1;" "ID|1"
 refused "12 a text UNION a number" "select id from t1 union select 'x' from rdb\$database order by 1;"
 refused "12 a derived table's WITH declaring an UNUSED CTE (the engine warns; its end-of-query pass is not folded)" "select * from (with c as (select 1 x from rdb\$database), d as (select 2 y from rdb\$database) select * from c);"
 refused "12 a parenthesised column" "select id, (a) r from t1 order by 1;"

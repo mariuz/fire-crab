@@ -4489,6 +4489,12 @@ pub struct Shape {
     /// counts the stored BYTES, where this executor's text is decoded
     /// (merge under the switch: 8 for 4)
     pub octet_length: bool,
+    /// a CAST to a text type in a CODEPAGE set (not NONE / ASCII /
+    /// UNICODE_FSS / UTF8): this executor concatenates and measures decoded
+    /// characters, where the engine transliterates into the set's BYTES
+    /// (`'ab' || _win1252 'é'` is 6 octets under UTF8 and 4 under NONE -
+    /// concatcs; the server rewrites an introducer into such a CAST)
+    pub codepage_cast: bool,
 }
 
 pub fn shape(req: &Request) -> Shape {
@@ -4502,6 +4508,7 @@ pub fn shape(req: &Request) -> Shape {
         pattern: bool,
         text_coalesce: bool,
         octets: bool,
+        codepage_cast: bool,
     }
     impl W {
         fn pair(&mut self, a: &Expr, b: &Expr) {
@@ -4523,6 +4530,13 @@ pub fn shape(req: &Request) -> Shape {
                 Expr::Arith(_, a, b) => { self.expr(a); self.expr(b) }
                 Expr::Negate(a) if !matches!(**a, Expr::Literal(_)) => { self.negates = true; self.expr(a) }
                 Expr::StrLen(2, a) => { self.octets = true; self.expr(a) }
+                Expr::Cast(slot, a)
+                    if matches!(slot.dtype, blr::DT_TEXT | blr::DT_TEXT2 | blr::DT_VARYING | blr::DT_VARYING2)
+                        && !matches!(slot.ttype & 0xFF, 0 | 2 | 3 | 4) =>
+                {
+                    self.codepage_cast = true;
+                    self.expr(a)
+                }
                 Expr::Negate(a) | Expr::CaseMap(_, a) | Expr::StrLen(_, a) | Expr::Trim(_, a) | Expr::Cast(_, a) => self.expr(a),
                 Expr::GenId(_, Some(a)) => self.expr(a),
                 Expr::Substr(a, b, c) => { self.expr(a); self.expr(b); self.expr(c) }
@@ -4636,7 +4650,7 @@ pub fn shape(req: &Request) -> Shape {
     }
     let mut w = W::default();
     w.stmt(&req.body);
-    let W { ctx, cmps, negates, fields, row_window, pattern, text_coalesce, octets } = w;
+    let W { ctx, cmps, negates, fields, row_window, pattern, text_coalesce, octets, codepage_cast } = w;
     let rel = |c: u8| ctx.get(&c).cloned().unwrap_or_default();
     Shape {
         text_cmps: cmps.into_iter().map(|(c, f, t)| (rel(c), f, t)).collect(),
@@ -4646,6 +4660,7 @@ pub fn shape(req: &Request) -> Shape {
         non_literal_pattern: pattern,
         text_coalesce,
         octet_length: octets,
+        codepage_cast,
     }
 }
 

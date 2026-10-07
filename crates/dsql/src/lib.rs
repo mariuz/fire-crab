@@ -513,6 +513,19 @@ enum Val {
     GenId2(String),
     /// blr_coalesce
     Coalesce(Vec<Val>),
+    /// a SYSTEM function - blr_sys_function, the name counted, then the
+    /// counted arguments ([SYS_FUNCTIONS]; the special spellings of
+    /// DATEADD / DATEDIFF / FIRST_DAY / LAST_DAY / POSITION / OVERLAY /
+    /// CRYPT_HASH are rewritten to the argument order the engine stores)
+    SysFn(String, Vec<Val>),
+    /// an exponent literal, the source text the engine's blr_double
+    /// literal carries
+    DoubleLit(String),
+    /// a hex literal's bytes - text2 in OCTETS
+    Bytes(Vec<u8>),
+    /// a text literal stamped with an EXPLICIT set (CRYPT_HASH's algorithm
+    /// name is text2 in ASCII, charset 2 - measured)
+    StrCs(String, u16),
 }
 
 /// A cast target descriptor, exactly the dsc bytes blr_cast carries
@@ -844,94 +857,43 @@ fn emit_dsc(out: &mut Vec<u8>, d: Dsc) {
     }
 }
 
-/// A branch's contribution to the unified descriptor of a value_if
-/// chain. Only literals and explicit CASTs contribute - a FIELD
-/// branch's descriptor lives in the catalog, so it REFUSES (same
-/// principle as bare multi-stream fields: never guess a descriptor).
+/// What a CASE / IIF / NULLIF / IN-list operand contributes to the
+/// unified descriptor - the engine's DataTypeUtil::makeFromList, as
+/// measured on 2196 through RDB$PROCEDURE_BLR (see [P::unify_branches]).
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum BranchDsc {
-    /// exact-numeric: (integer digits, scale<=0)
-    Num(i32, i8),
-    Text(u16),
-    /// NULL - ignored by unification (probed: the missing-ELSE null
-    /// leaves the dsc to the real branches)
+    /// an exact numeric: its blr dtype (SHORT / LONG / INT64 / INT128)
+    /// and scale
+    Exact(u8, i8),
+    /// FLOAT (false) or DOUBLE PRECISION (true)
+    Approx(bool),
+    /// a text: VARYING or not, its length in CHARACTERS, its set
+    Text { varying: bool, chars: u16, cs: u16 },
+    Date,
+    Time,
+    Timestamp,
+    Boolean,
+    /// NULL - shapes nothing
     Skip,
 }
 
-fn branch_dsc(v: &Val) -> Option<BranchDsc> {
-    Some(match v {
-        Val::Int(_) => BranchDsc::Num(9, 0),
-        Val::Int64(_) => BranchDsc::Num(18, 0),
-        // a decimal literal is blr_long at its written scale (the
-        // stored scale is ALREADY negative: 1.5 is (15, -1)): 9
-        // digits of precision, |scale| of them fractional
-        Val::Dec(_, sc) => BranchDsc::Num(9 + *sc as i32, *sc),
-        Val::Str(t) => BranchDsc::Text(u16::try_from(t.len()).ok()?),
-        Val::Null => BranchDsc::Skip,
-        Val::Cast(d, _) => match d {
-            Dsc::Num(dt, sc) => {
-                let prec = match *dt {
-                    blr::SHORT => 4,
-                    blr::LONG => 9,
-                    blr::INT64 => 18,
-                    _ => return None,
-                };
-                BranchDsc::Num(prec + *sc as i32, *sc)
-            }
-            Dsc::Text(l) => BranchDsc::Text(*l),
-            // varying / temporal branches: unification not yet probed
-            _ => return None,
-        },
-        _ => return None,
-    })
-}
-
-/// The UNIFIED descriptor the engine's DSQL computes for a value_if
-/// chain, probed law by law: NULL branches are ignored; all-text
-/// branches unify to blr_text2 at the MAXIMUM length ('yes'/'no' ->
-/// CHAR(3)); exact numerics take the MAXIMUM integer-digit count and
-/// the MINIMUM scale, then the dtype that FITS the total digit count
-/// (<=4 short, <=9 long, else int64) - which is why long(scale 0)
-/// united with long(scale -1) WIDENS to int64: 9 + 1 = 10 digits
-fn unify_branches(branches: &[&Val]) -> Option<Dsc> {
-    let mut num: Option<(i32, i8)> = None;
-    let mut text: Option<u16> = None;
-    let mut seen = false;
-    for b in branches {
-        match branch_dsc(b)? {
-            BranchDsc::Skip => continue,
-            BranchDsc::Num(ints, sc) => {
-                if text.is_some() {
-                    return None; // text/numeric mixtures: unprobed
-                }
-                let (i0, s0) = num.unwrap_or((ints, sc));
-                num = Some((i0.max(ints), s0.min(sc)));
-                seen = true;
-            }
-            BranchDsc::Text(l) => {
-                if num.is_some() {
-                    return None;
-                }
-                text = Some(text.unwrap_or(0).max(l));
-                seen = true;
-            }
+fn dsc_to_branch(d: Dsc) -> Option<BranchDsc> {
+    Some(match d {
+        Dsc::Num(dt, sc) if matches!(dt, blr::SHORT | blr::LONG | blr::INT64 | 26) => {
+            BranchDsc::Exact(dt, sc)
         }
-    }
-    if !seen {
-        return None; // all-NULL: the engine's choice is unprobed
-    }
-    if let Some(l) = text {
-        return Some(Dsc::Text(l));
-    }
-    let (ints, sc) = num?;
-    let needed = ints - sc as i32;
-    let dt = if needed <= 4 {
-        blr::SHORT
-    } else if needed <= 9 {
-        blr::LONG
-    } else {
-        blr::INT64
-    };
-    Some(Dsc::Num(dt, sc))
+        Dsc::Num(..) | Dsc::Dec64 | Dsc::Dec128 => return None,
+        Dsc::Text(l) => BranchDsc::Text { varying: false, chars: l, cs: DEFAULT_CS.with(|c| c.get()).0 },
+        Dsc::Varying(l) => BranchDsc::Text { varying: true, chars: l, cs: DEFAULT_CS.with(|c| c.get()).0 },
+        Dsc::TextCs(l, cs) => BranchDsc::Text { varying: false, chars: l, cs },
+        Dsc::VaryingCs(l, cs) => BranchDsc::Text { varying: true, chars: l, cs },
+        Dsc::Date => BranchDsc::Date,
+        Dsc::Time => BranchDsc::Time,
+        Dsc::Timestamp => BranchDsc::Timestamp,
+        Dsc::Double => BranchDsc::Approx(true),
+        Dsc::Float => BranchDsc::Approx(false),
+        Dsc::Boolean => BranchDsc::Boolean,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -999,6 +961,13 @@ enum Bool {
     /// own shape (parse.y distinct_predicate), which NotBoolNode keeps
     /// because blr_equiv has no inverse verb
     Equiv(Val, Val),
+    /// CONTAINING - blr_containing; NOT keeps a real blr_not (measured)
+    Containing(Val, Val),
+    /// SIMILAR TO [ESCAPE] - blr_similar: value, pattern, then a count
+    /// byte (0 or 1) and the escape (measured)
+    Similar(Val, Val, Option<Val>),
+    /// LIKE .. ESCAPE - blr_ansi_like: value, pattern, escape (measured)
+    AnsiLike(Val, Val, Val),
     AnsiAny(CmpOp, Val, SubQ),
     /// `<left> <cmp> ALL (SELECT ...)` and NOT IN - blr_ansi_all
     AnsiAll(CmpOp, Val, SubQ),
@@ -1046,9 +1015,15 @@ fn stamp_bool(b: &mut Bool, cn: &str) {
             stamp_bool(r, cn);
         }
         Bool::Not(x) => stamp_bool(x, cn),
-        Bool::Cmp(_, a, c) | Bool::Like(a, c) | Bool::Starting(a, c) | Bool::Equiv(a, c) => {
+        Bool::Cmp(_, a, c) | Bool::Like(a, c) | Bool::Starting(a, c) | Bool::Equiv(a, c)
+        | Bool::Containing(a, c) | Bool::Similar(a, c, None) => {
             stamp_val(a, cn);
             stamp_val(c, cn);
+        }
+        Bool::Similar(a, c, Some(e)) | Bool::AnsiLike(a, c, e) => {
+            stamp_val(a, cn);
+            stamp_val(c, cn);
+            stamp_val(e, cn);
         }
         Bool::Missing(v) => stamp_val(v, cn),
         Bool::Between(v, lo, hi) => {
@@ -1116,7 +1091,8 @@ fn negate(b: Bool) -> Bool {
             Box::new(Bool::Cmp(CmpOp::Gtr, v, hi)),
         ),
         keep @ (Bool::Missing(_) | Bool::Like(..) | Bool::Starting(..)
-        | Bool::InList(..) | Bool::Equiv(..)) => {
+        | Bool::InList(..) | Bool::Equiv(..) | Bool::Containing(..)
+        | Bool::Similar(..) | Bool::AnsiLike(..)) => {
             Bool::Not(Box::new(keep))
         }
         // the quantifier FLIPS and the comparison INVERTS (probed:
@@ -1136,6 +1112,13 @@ enum Tok {
     Ident(String),
     Int(i64),
     Dec(i64, i8),
+    /// an EXPONENT literal (`1e0`, `1.5E-3`): the engine stores it as a
+    /// blr_double literal carrying the SOURCE TEXT (measured: `151B 0300
+    /// "1e0"`), so the spelling is kept as written
+    Double(String),
+    /// a HEX literal `X'0A0B'`: blr_literal text2 in OCTETS (charset 1)
+    /// over the decoded bytes (measured)
+    Hex(Vec<u8>),
     Str(String),
     LParen,
     RParen,
@@ -1316,13 +1299,62 @@ fn lex(sql: &str) -> Option<Vec<Tok>> {
                     let n: i64 = b[start..i].iter().collect::<String>().parse().ok()?;
                     out.push(Tok::Int(n));
                 }
-                // a number RUN INTO a letter is an exponent literal
-                // (`1e308`, `1.5E-3`) this lexicon does not read - never a
-                // number followed by an alias named `E308` (which answered
-                // 1.0 for `SELECT 1e308` once aliases were accepted)
-                if b.get(i).is_some_and(|c| c.is_alphabetic() || *c == '_' || *c == '$') {
+                // an EXPONENT literal (`1e308`, `1.5E-3`): the mantissa
+                // just lexed plus e/E, an optional sign and digits - kept
+                // as its source text (the engine's double literal carries
+                // the spelling). Any other letter RUN INTO a number is
+                // refused - never a number followed by an alias named
+                // `E308` (which answered 1.0 for `SELECT 1e308` once
+                // aliases were accepted)
+                if matches!(b.get(i), Some('e' | 'E')) {
+                    let mut j = i + 1;
+                    if matches!(b.get(j), Some('+' | '-')) {
+                        j += 1;
+                    }
+                    if !b.get(j).is_some_and(|c| c.is_ascii_digit()) {
+                        return None;
+                    }
+                    while j < b.len() && b[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if b.get(j).is_some_and(|c| c.is_alphanumeric() || *c == '_' || *c == '$' || *c == '.') {
+                        return None;
+                    }
+                    out.pop();
+                    out.push(Tok::Double(b[start..j].iter().collect()));
+                    i = j;
+                } else if b.get(i).is_some_and(|c| c.is_alphabetic() || *c == '_' || *c == '$') {
                     return None;
                 }
+            }
+            // a HEX literal `X'0A0B'` / `x'..'`: pairs of hex digits (an odd
+            // count is a syntax error in the engine) - the bytes of a text2
+            // literal in OCTETS (measured: `150F 0100 0200 0A0B`)
+            'x' | 'X' if b.get(i + 1) == Some(&'\'') => {
+                i += 2;
+                let mut digits = String::new();
+                loop {
+                    match b.get(i) {
+                        None => return None,
+                        Some('\'') => {
+                            i += 1;
+                            break;
+                        }
+                        Some(ch) if ch.is_ascii_hexdigit() => {
+                            digits.push(*ch);
+                            i += 1;
+                        }
+                        Some(_) => return None,
+                    }
+                }
+                if digits.len() % 2 != 0 {
+                    return None;
+                }
+                let bytes = (0..digits.len())
+                    .step_by(2)
+                    .map(|k| u8::from_str_radix(&digits[k..k + 2], 16).ok())
+                    .collect::<Option<Vec<u8>>>()?;
+                out.push(Tok::Hex(bytes));
             }
             a if a.is_alphabetic() || a == '_' || a == '$' => {
                 let start = i;
@@ -2511,6 +2543,16 @@ impl<'a> P<'a> {
                 self.i += 1;
                 return Some(Val::LocalVar(vi as u16));
             }
+            // the system functions spelled with a reserved word: a call
+            // is the word followed by its paren (a LEFT JOIN never is)
+            Tok::Ident(x)
+                if matches!(x.as_str(), "LEFT" | "RIGHT" | "POSITION")
+                    && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) =>
+            {
+                let first = x.clone();
+                self.i += 1;
+                return self.func(&first);
+            }
             Tok::Ident(x) if !is_keyword(x) => {
                 let first = x.clone();
                 self.i += 1;
@@ -2581,6 +2623,8 @@ impl<'a> P<'a> {
                 Err(_) => Val::Int64(*n),
             },
             Tok::Dec(r, s) => Val::Dec(i32::try_from(*r).ok()?, *s),
+            Tok::Double(text) => Val::DoubleLit(text.clone()),
+            Tok::Hex(bytes) => Val::Bytes(bytes.clone()),
             Tok::Str(s) => Val::Str(s.clone()),
             Tok::LParen => {
                 // a scalar subselect as a value: blr_via(singular)
@@ -2855,7 +2899,7 @@ impl<'a> P<'a> {
                 }
                 self.i += 1;
                 let b = self.val()?;
-                let dsc = unify_branches(&[&Val::Null, &a])?;
+                let dsc = self.unify_branches(&[&Val::Null, &a])?;
                 Val::Cast(
                     dsc,
                     Box::new(Val::ValueIf(
@@ -2865,6 +2909,10 @@ impl<'a> P<'a> {
                     )),
                 )
             }
+            // a SYSTEM function: blr_sys_function over the counted
+            // arguments ([SYS_FUNCTIONS]), the special spellings rewritten
+            // to the argument order the engine stores
+            n if sys_function_arity(n).is_some() => self.sys_function(n)?,
             "IIF" => {
                 // IIF is pure sugar: byte-identical to the searched
                 // CASE WHEN c THEN a ELSE b END (probed)
@@ -2879,7 +2927,7 @@ impl<'a> P<'a> {
                 }
                 self.i += 1;
                 let b = self.val()?;
-                let dsc = unify_branches(&[&a, &b])?;
+                let dsc = self.unify_branches(&[&a, &b])?;
                 Val::Cast(
                     dsc,
                     Box::new(Val::ValueIf(Box::new(c), Box::new(a), Box::new(b))),
@@ -2892,6 +2940,277 @@ impl<'a> P<'a> {
         }
         self.i += 1;
         Some(v)
+    }
+
+    /// The catalog type of a column the statement reads: the stream the
+    /// context numbers, then [catalog_type] of its relation. A derived
+    /// table, a cursor or a procedure stream has no catalog type.
+    fn field_dsc(&self, ctx: u8, name: &str) -> Option<Dsc> {
+        let idx = ctx.checked_sub(self.base)? as usize;
+        let st = self.streams.get(idx)?;
+        if st.derived.is_some() || st.proc_args.is_some() || st.cur.is_some() {
+            return None;
+        }
+        catalog_type(&st.name, name)
+    }
+
+    fn branch_dsc(&self, v: &Val) -> Option<BranchDsc> {
+        Some(match v {
+            // an integer literal is a LONG inside the engine's DSQL (an
+            // INT64 once it no longer fits); a DECIMAL literal is an INT64
+            // however few its digits, emitted narrow when it fits - which
+            // is why CASE WHEN c THEN 1.5 ELSE 2.5 END casts to int64
+            // scale -1 and `N IN (2.5, 1)` casts the 1 and not the 2.5
+            // (measured)
+            Val::Int(_) => BranchDsc::Exact(blr::LONG, 0),
+            Val::Int64(_) => BranchDsc::Exact(blr::INT64, 0),
+            Val::Dec(_, sc) => BranchDsc::Exact(blr::INT64, *sc),
+            Val::DoubleLit(_) => BranchDsc::Approx(true),
+            Val::Str(t) => {
+                let cs = LIT_CS.with(|c| c.get());
+                let cs = if t.is_ascii() || matches!(cs, 0 | 2..=4) { cs } else { 0 };
+                BranchDsc::Text {
+                    varying: false,
+                    chars: u16::try_from(t.chars().count()).ok()?,
+                    cs,
+                }
+            }
+            Val::Null => BranchDsc::Skip,
+            Val::Cast(d, _) => dsc_to_branch(*d)?,
+            Val::Field(ctx, name) => {
+                let d = typing_of(v).or_else(|| self.field_dsc(*ctx, name))?;
+                dsc_to_branch(d)?
+            }
+            _ => return None,
+        })
+    }
+
+    /// The descriptor a CASE / IIF / NULLIF casts its branches to, and
+    /// an IN list's common item type. Measured on 2196:
+    /// - exact numerics: the WIDEST dtype (short < long < int64 < int128)
+    ///   with the SMALLEST scale - N INTEGER beside R NUMERIC(9,2) is long
+    ///   scale -2, beside a BIGINT int64, beside 2.5 int64 scale -1 (the
+    ///   decimal literal being an int64 inside DSQL), I128 beside 1.5
+    ///   int128 scale -1;
+    /// - DOUBLE beside anything numeric is DOUBLE; FLOAT beside a short,
+    ///   long or FLOAT stays FLOAT (wider exacts beside a FLOAT: unmeasured,
+    ///   refused);
+    /// - texts: VARYING if any is, the length the LONGEST in characters,
+    ///   the set the one non-NONE set among them (CH CHAR(5) NONE beside U
+    ///   VARCHAR(10) UTF8 is varying 10 chars UTF8); two different real
+    ///   sets refuse;
+    /// - a temporal or BOOLEAN only beside its own kind (DATE beside
+    ///   TIMESTAMP is the engine's -804); text beside a number: refused.
+    fn unify_branches(&self, branches: &[&Val]) -> Option<Dsc> {
+        let mut kinds: Vec<BranchDsc> = Vec::new();
+        for b in branches {
+            match self.branch_dsc(b)? {
+                BranchDsc::Skip => {}
+                k => kinds.push(k),
+            }
+        }
+        if kinds.is_empty() {
+            return None; // all-NULL: the engine's choice is unprobed
+        }
+        if kinds.iter().all(|k| matches!(k, BranchDsc::Exact(..) | BranchDsc::Approx(_))) {
+            if kinds.iter().any(|k| matches!(k, BranchDsc::Approx(true))) {
+                return Some(Dsc::Double);
+            }
+            if kinds.iter().any(|k| matches!(k, BranchDsc::Approx(false))) {
+                return if kinds
+                    .iter()
+                    .all(|k| matches!(k, BranchDsc::Approx(false) | BranchDsc::Exact(blr::SHORT | blr::LONG, _)))
+                {
+                    Some(Dsc::Float)
+                } else {
+                    None
+                };
+            }
+            let rank = |dt: u8| match dt {
+                blr::SHORT => 0,
+                blr::LONG => 1,
+                blr::INT64 => 2,
+                _ => 3,
+            };
+            let mut dt = blr::SHORT;
+            let mut sc = 0i8;
+            for k in &kinds {
+                if let BranchDsc::Exact(d, s) = k {
+                    if rank(*d) > rank(dt) {
+                        dt = *d;
+                    }
+                    sc = sc.min(*s);
+                }
+            }
+            return Some(Dsc::Num(dt, sc));
+        }
+        if kinds.iter().all(|k| matches!(k, BranchDsc::Text { .. })) {
+            let mut varying = false;
+            let mut chars = 0u16;
+            let mut sets: Vec<u16> = Vec::new();
+            for k in &kinds {
+                if let BranchDsc::Text { varying: v, chars: c, cs } = k {
+                    varying |= *v;
+                    chars = chars.max(*c);
+                    if *cs != 0 && !sets.contains(cs) {
+                        sets.push(*cs);
+                    }
+                }
+            }
+            let cs = match sets.as_slice() {
+                [] => 0,
+                [one] => *one,
+                _ => return None,
+            };
+            return Some(if varying { Dsc::VaryingCs(chars, cs) } else { Dsc::TextCs(chars, cs) });
+        }
+        let first = kinds[0];
+        if kinds.iter().all(|k| *k == first) {
+            return match first {
+                BranchDsc::Date => Some(Dsc::Date),
+                BranchDsc::Time => Some(Dsc::Time),
+                BranchDsc::Timestamp => Some(Dsc::Timestamp),
+                BranchDsc::Boolean => Some(Dsc::Boolean),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// A system function call, self.i past the opening paren; leaves
+    /// self.i ON the closing paren like every arm of [P::func]. The
+    /// engine stores every spelling in ONE argument order (measured on
+    /// 2196 through RDB$PROCEDURE_BLR):
+    ///   DATEADD(<part>, v, d) == DATEADD(v <part> TO d)  -> [v, part, d]
+    ///   DATEDIFF(<part>, a, b) == DATEDIFF(<part> FROM a TO b) -> [part, a, b]
+    ///   FIRST_DAY / LAST_DAY (OF <part> FROM d)         -> [part, d]
+    ///   POSITION(a IN b) == POSITION(a, b)              -> [a, b]
+    ///   OVERLAY(a PLACING b FROM c [FOR d])             -> [a, b, c, (d)]
+    ///   CRYPT_HASH(a USING alg)                         -> [a, 'alg' in ASCII]
+    /// where <part> is a blr_long literal of the blr_extract code (DAY 2,
+    /// WEEK 9, MILLISECOND 8 ..).
+    fn sys_function(&mut self, name: &str) -> Option<Val> {
+        let (min, max) = sys_function_arity(name)?;
+        let part_code = |p: &mut Self| -> Option<Val> {
+            let Some(Tok::Ident(w)) = p.t.get(p.i) else { return None };
+            let code = extract_part_code(w)?;
+            p.i += 1;
+            Some(Val::Int(code as i32))
+        };
+        let args: Vec<Val> = match name {
+            "DATEADD" => {
+                // `<part>, v, d` when a part name is followed by a comma
+                if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if extract_part_code(w).is_some())
+                    && matches!(self.t.get(self.i + 1), Some(Tok::Comma))
+                {
+                    let part = part_code(self)?;
+                    self.i += 1; // ,
+                    let v = self.val()?;
+                    if !matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        return None;
+                    }
+                    self.i += 1;
+                    let d = self.val()?;
+                    vec![v, part, d]
+                } else {
+                    let v = self.val()?;
+                    let part = part_code(self)?;
+                    if !self.kw("TO") {
+                        return None;
+                    }
+                    let d = self.val()?;
+                    vec![v, part, d]
+                }
+            }
+            "DATEDIFF" => {
+                let part = part_code(self)?;
+                if self.kw("FROM") {
+                    let a = self.val()?;
+                    if !self.kw("TO") {
+                        return None;
+                    }
+                    let b = self.val()?;
+                    vec![part, a, b]
+                } else {
+                    if !matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        return None;
+                    }
+                    self.i += 1;
+                    let a = self.val()?;
+                    if !matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        return None;
+                    }
+                    self.i += 1;
+                    let b = self.val()?;
+                    vec![part, a, b]
+                }
+            }
+            "FIRST_DAY" | "LAST_DAY" => {
+                if !self.kw("OF") {
+                    return None;
+                }
+                let part = part_code(self)?;
+                if !self.kw("FROM") {
+                    return None;
+                }
+                let d = self.val()?;
+                vec![part, d]
+            }
+            "POSITION" => {
+                let a = self.val()?;
+                if self.kw("IN") {
+                    vec![a, self.val()?]
+                } else {
+                    let mut args = vec![a];
+                    while matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        self.i += 1;
+                        args.push(self.val()?);
+                    }
+                    args
+                }
+            }
+            "OVERLAY" => {
+                let a = self.val()?;
+                if !self.kw("PLACING") {
+                    return None;
+                }
+                let b = self.val()?;
+                if !self.kw("FROM") {
+                    return None;
+                }
+                let c = self.val()?;
+                let mut args = vec![a, b, c];
+                if self.kw("FOR") {
+                    args.push(self.val()?);
+                }
+                args
+            }
+            "CRYPT_HASH" => {
+                let a = self.val()?;
+                if !self.kw("USING") {
+                    return None;
+                }
+                let Some(Tok::Ident(alg)) = self.t.get(self.i) else { return None };
+                let alg = alg.clone();
+                self.i += 1;
+                vec![a, Val::StrCs(alg, 2)]
+            }
+            _ => {
+                let mut args = Vec::new();
+                if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                    args.push(self.val()?);
+                    while matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        self.i += 1;
+                        args.push(self.val()?);
+                    }
+                }
+                args
+            }
+        };
+        if args.len() < min || args.len() > max {
+            return None;
+        }
+        Some(Val::SysFn(name.to_string(), args))
     }
 
     /// CASE ... END, self.i past the CASE keyword. The searched form
@@ -2920,7 +3239,7 @@ impl<'a> P<'a> {
             }
             let mut branches: Vec<&Val> = arms.iter().map(|(_, v)| v).collect();
             branches.push(&els);
-            let dsc = unify_branches(&branches)?;
+            let dsc = self.unify_branches(&branches)?;
             let mut tree = els;
             for (c, v) in arms.into_iter().rev() {
                 tree = Val::ValueIf(Box::new(c), Box::new(v), Box::new(tree));
@@ -3100,6 +3419,43 @@ impl<'a> P<'a> {
             return None;
         }
         self.i += 1;
+        // FILTER (WHERE c) is DSQL sugar (measured): the aggregate over
+        // CAST(CASE WHEN c THEN <arg> END AS <arg's type>) - COUNT(*)
+        // becoming blr_agg_count2 over CAST(CASE WHEN c THEN 1 END AS
+        // INTEGER). A window's FILTER is unmeasured and refuses.
+        let out = if self.kw("FILTER") {
+            if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                return None;
+            }
+            self.i += 1;
+            if !self.kw("WHERE") {
+                return None;
+            }
+            let cond = self.bool_or()?;
+            if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                return None;
+            }
+            self.i += 1;
+            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "OVER") {
+                return None;
+            }
+            match out {
+                (verb, None) if verb == blr::AGG_COUNT => (
+                    blr::AGG_COUNT2,
+                    Some(Val::Cast(
+                        Dsc::Num(blr::LONG, 0),
+                        Box::new(Val::ValueIf(Box::new(cond), Box::new(Val::Int(1)), Box::new(Val::Null))),
+                    )),
+                ),
+                (verb, Some(arg)) => {
+                    let d = self.unify_branches(&[&arg, &Val::Null])?;
+                    (verb, Some(Val::Cast(d, Box::new(Val::ValueIf(Box::new(cond), Box::new(arg), Box::new(Val::Null))))))
+                }
+                _ => return None,
+            }
+        } else {
+            out
+        };
         Some(out)
     }
 
@@ -3199,7 +3555,34 @@ impl<'a> P<'a> {
         }
         if self.kw("LIKE") {
             let pat = self.val()?;
-            let body = Bool::Like(left, pat);
+            // LIKE .. ESCAPE is a different verb (blr_ansi_like)
+            let body = if self.kw("ESCAPE") {
+                Bool::AnsiLike(left, pat, self.val()?)
+            } else {
+                Bool::Like(left, pat)
+            };
+            return Some(if negated {
+                Bool::Not(Box::new(body))
+            } else {
+                body
+            });
+        }
+        if self.kw("CONTAINING") {
+            let pat = self.val()?;
+            let body = Bool::Containing(left, pat);
+            return Some(if negated {
+                Bool::Not(Box::new(body))
+            } else {
+                body
+            });
+        }
+        if self.kw("SIMILAR") {
+            if !self.kw("TO") {
+                return None;
+            }
+            let pat = self.val()?;
+            let esc = if self.kw("ESCAPE") { Some(self.val()?) } else { None };
+            let body = Bool::Similar(left, pat, esc);
             return Some(if negated {
                 Bool::Not(Box::new(body))
             } else {
@@ -3237,31 +3620,81 @@ impl<'a> P<'a> {
                 return None;
             }
             self.i += 1;
-            // the engine CASTS non-integer IN-list items to the
-            // LEFT SIDE's catalog type (probed: S IN ('a','b') stores
-            // each item under blr_cast varying2(10) - the column's
-            // declared type, in views and CHECKs alike). Integer
-            // literals and input parameters are the probed UNCAST
-            // cases; anything else needs the catalog and refuses.
-            // a TEXT member is stored cast to the tested operand's
-            // declared type (measured on the engine's RDB$VALIDATION_BLR
-            // and CHECK trigger BLR); without that type the shape is
-            // unknown and refuses
-            let items: Vec<Val> = match typing_of(&left) {
+            // ONE item is a plain equality (measured: `IN (1 + 1)` is
+            // blr_eql and NOT IN a blr_not over it; a lone text item is
+            // not cast)
+            if items.len() == 1 {
+                let body = Bool::Cmp(CmpOp::Eql, left, items.pop()?);
+                return Some(if negated { Bool::Not(Box::new(body)) } else { body });
+            }
+            let left_dsc = typing_of(&left).or_else(|| match &left {
+                Val::Field(c, n) => self.field_dsc(*c, n),
+                _ => None,
+            });
+            // a TEXT item is cast to the LEFT's own type (measured: `S IN
+            // ('a', 'b')` casts each to varying(20) NONE, `U IN (..)` to
+            // its UTF8 type - in views and CHECKs alike); without that
+            // type the shape is unknown and refuses below
+            // (`S IN ('a', N)` casts the INTEGER column too - every
+            // non-text item takes the text operand's type; a text column
+            // item is unmeasured and refuses)
+            let items: Vec<Val> = match left_dsc {
                 Some(d @ (Dsc::Text(_) | Dsc::Varying(_) | Dsc::TextCs(..) | Dsc::VaryingCs(..))) => items
                     .into_iter()
                     .map(|it| match it {
-                        Val::Str(_) => Val::Cast(d, Box::new(it)),
-                        other => other,
+                        Val::Str(_) => Some(Val::Cast(d, Box::new(it))),
+                        Val::Field(..) => match self.branch_dsc(&it) {
+                            Some(BranchDsc::Exact(..) | BranchDsc::Approx(_)) => Some(Val::Cast(d, Box::new(it))),
+                            _ => None,
+                        },
+                        other => Some(other),
                     })
-                    .collect(),
+                    .collect::<Option<Vec<Val>>>()?,
                 _ => items,
             };
-            if items.iter().any(|it| {
-                !matches!(it, Val::Int(_) | Val::Int64(_) | Val::InParam(_) | Val::Cast(..))
-            }) {
-                return None;
+            // temporal LITERAL items beside a temporal operand stay raw
+            // (measured: `D IN (DATE '..', DATE '..')` lists two date
+            // literals uncast)
+            if items.iter().all(|it| matches!(it, Val::TemporalLit(_))) {
+                let body = Bool::InList(left, items);
+                return Some(if negated { Bool::Not(Box::new(body)) } else { body });
             }
+            let items: Vec<Val> = if items.iter().any(|it| matches!(it, Val::InParam(_) | Val::Cast(..))) {
+                // a `?` has no type to unify with; the probed shape keeps
+                // the items raw beside integer literals and casts
+                if items.iter().any(|it| {
+                    !matches!(it, Val::Int(_) | Val::Int64(_) | Val::InParam(_) | Val::Cast(..))
+                }) {
+                    return None;
+                }
+                items
+            } else {
+                // NUMERIC items are cast to the ITEMS' common type where
+                // their own differs (measured: `N IN (1, SM)` casts SM to
+                // long, `N IN (1, B)` casts the 1 to int64, `R IN (1.5, 2)`
+                // casts the 2 to int64 scale -1 and leaves the 1.5 - the
+                // left operand never shapes it: `B IN (1, N)` casts nothing)
+                // ...and an approximate item widens the common type the
+                // same way (measured: `N IN (1, DB)` casts the 1 to DOUBLE,
+                // `N IN (1, F)` to FLOAT, the column itself staying raw)
+                let kinds: Vec<BranchDsc> =
+                    items.iter().map(|it| self.branch_dsc(it)).collect::<Option<_>>()?;
+                if !kinds.iter().all(|k| matches!(k, BranchDsc::Exact(..) | BranchDsc::Approx(_))) {
+                    return None;
+                }
+                let common = self.unify_branches(&items.iter().collect::<Vec<_>>())?;
+                let own = |k: &BranchDsc| match k {
+                    BranchDsc::Exact(dt, sc) => Some(Dsc::Num(*dt, *sc)),
+                    BranchDsc::Approx(true) => Some(Dsc::Double),
+                    BranchDsc::Approx(false) => Some(Dsc::Float),
+                    _ => None,
+                };
+                items
+                    .into_iter()
+                    .zip(kinds)
+                    .map(|(it, k)| if own(&k) == Some(common) { it } else { Val::Cast(common, Box::new(it)) })
+                    .collect()
+            };
             let body = Bool::InList(left, items);
             return Some(if negated {
                 Bool::Not(Box::new(body))
@@ -3290,6 +3723,55 @@ impl<'a> P<'a> {
     }
 }
 
+/// The engine's system functions this compiler emits as blr_sys_function
+/// (SysFunction.cpp's table, minus the ones whose SQL spelling carries
+/// more than a value list: ENCRYPT / DECRYPT, RSA_*, RDB$SYSTEM_PRIVILEGE
+/// - and HASH .. USING, which 2196 refuses). Each with its (min, max)
+/// argument count; the special spellings are rewritten in
+/// [P::sys_function].
+const SYS_FUNCTIONS: &[(&str, usize, usize)] = &[
+    ("ABS", 1, 1), ("ACOS", 1, 1), ("ACOSH", 1, 1), ("ASCII_CHAR", 1, 1), ("ASCII_VAL", 1, 1),
+    ("ASIN", 1, 1), ("ASINH", 1, 1), ("ATAN", 1, 1), ("ATAN2", 2, 2), ("ATANH", 1, 1),
+    ("BASE64_DECODE", 1, 1), ("BASE64_ENCODE", 1, 1), ("BIN_AND", 2, 255), ("BIN_NOT", 1, 1),
+    ("BIN_OR", 2, 255), ("BIN_SHL", 2, 2), ("BIN_SHL_ROT", 2, 2), ("BIN_SHR", 2, 2),
+    ("BIN_SHR_ROT", 2, 2), ("BIN_XOR", 2, 255), ("BLOB_APPEND", 2, 255), ("CEIL", 1, 1),
+    ("CEILING", 1, 1), ("CHAR_TO_UUID", 1, 1), ("COMPARE_DECFLOAT", 2, 2), ("COS", 1, 1),
+    ("COSH", 1, 1), ("COT", 1, 1), ("CRYPT_HASH", 2, 2), ("DATEADD", 3, 3), ("DATEDIFF", 3, 3),
+    ("EXP", 1, 1), ("FIRST_DAY", 2, 2), ("FLOOR", 1, 1), ("GEN_UUID", 0, 0), ("HASH", 1, 1),
+    ("HEX_DECODE", 1, 1), ("HEX_ENCODE", 1, 1), ("LAST_DAY", 2, 2), ("LEFT", 2, 2), ("LN", 1, 1),
+    ("LOG", 2, 2), ("LOG10", 1, 1), ("LPAD", 2, 3), ("MAKE_DBKEY", 2, 4), ("MAXVALUE", 1, 255),
+    ("MINVALUE", 1, 255), ("MOD", 2, 2), ("NORMALIZE_DECFLOAT", 1, 1), ("OVERLAY", 3, 4),
+    ("PI", 0, 0), ("POSITION", 2, 3), ("POWER", 2, 2), ("QUANTIZE", 2, 2), ("RAND", 0, 0),
+    ("RDB$GET_CONTEXT", 2, 2), ("RDB$GET_TRANSACTION_CN", 1, 1), ("RDB$ROLE_IN_USE", 1, 1),
+    ("RDB$SET_CONTEXT", 3, 3), ("REPLACE", 3, 3), ("REVERSE", 1, 1), ("RIGHT", 2, 2),
+    ("ROUND", 1, 2), ("RPAD", 2, 3), ("SIGN", 1, 1), ("SIN", 1, 1), ("SINH", 1, 1),
+    ("SQRT", 1, 1), ("TAN", 1, 1), ("TANH", 1, 1), ("TOTALORDER", 2, 2), ("TRUNC", 1, 2),
+    ("UNICODE_CHAR", 1, 1), ("UNICODE_VAL", 1, 1), ("UUID_TO_CHAR", 1, 1),
+];
+
+fn sys_function_arity(name: &str) -> Option<(usize, usize)> {
+    SYS_FUNCTIONS.iter().find(|(n, ..)| *n == name).map(|(_, lo, hi)| (*lo, *hi))
+}
+
+/// blr_extract's part codes, which DATEADD / DATEDIFF / FIRST_DAY /
+/// LAST_DAY carry as a blr_long literal (measured: DAY 2, MONTH 1, WEEK
+/// 9, MILLISECOND 8, YEAR 0, HOUR 3)
+fn extract_part_code(w: &str) -> Option<u8> {
+    Some(match w.to_ascii_uppercase().as_str() {
+        "YEAR" => 0,
+        "MONTH" => 1,
+        "DAY" => 2,
+        "HOUR" => 3,
+        "MINUTE" => 4,
+        "SECOND" => 5,
+        "WEEKDAY" => 6,
+        "YEARDAY" => 7,
+        "MILLISECOND" => 8,
+        "WEEK" => 9,
+        _ => return None,
+    })
+}
+
 fn is_keyword(w: &str) -> bool {
     matches!(
         w,
@@ -3301,6 +3783,11 @@ fn is_keyword(w: &str) -> bool {
             | "BETWEEN"
             | "LIKE"
             | "STARTING"
+            | "CONTAINING"
+            | "SIMILAR"
+            | "ESCAPE"
+            | "FILTER"
+            | "PLACING"
             | "IN"
             | "WHERE"
             | "FROM"
@@ -3644,6 +4131,35 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.extend_from_slice(&(s.len() as u16).to_le_bytes());
             out.extend_from_slice(s.as_bytes());
         }
+        Val::SysFn(name, args) => {
+            out.push(186); // blr_sys_function
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+            out.push(args.len() as u8);
+            for a in args {
+                emit_val(out, a);
+            }
+        }
+        Val::DoubleLit(text) => {
+            out.push(blr::LITERAL);
+            out.push(27); // blr_double: a counted string, the spelling
+            out.extend_from_slice(&(text.len() as u16).to_le_bytes());
+            out.extend_from_slice(text.as_bytes());
+        }
+        Val::Bytes(bytes) => {
+            out.push(blr::LITERAL);
+            out.push(blr::TEXT2);
+            out.extend_from_slice(&1u16.to_le_bytes()); // OCTETS
+            out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        Val::StrCs(text, cs) => {
+            out.push(blr::LITERAL);
+            out.push(blr::TEXT2);
+            out.extend_from_slice(&cs.to_le_bytes());
+            out.extend_from_slice(&(text.len() as u16).to_le_bytes());
+            out.extend_from_slice(text.as_bytes());
+        }
         Val::Fn(name, args) => {
             out.push(blr::FUNCTION);
             out.push(name.len() as u8);
@@ -3727,6 +4243,29 @@ fn emit_bool(out: &mut Vec<u8>, b: &Bool) {
             out.push(0x37); // blr_starting
             emit_val(out, v);
             emit_val(out, p);
+        }
+        Bool::Containing(v, p) => {
+            out.push(0x35); // blr_containing
+            emit_val(out, v);
+            emit_val(out, p);
+        }
+        Bool::Similar(v, p, esc) => {
+            out.push(0xBC); // blr_similar
+            emit_val(out, v);
+            emit_val(out, p);
+            match esc {
+                Some(e) => {
+                    out.push(1);
+                    emit_val(out, e);
+                }
+                None => out.push(0),
+            }
+        }
+        Bool::AnsiLike(v, p, e) => {
+            out.push(0x6C); // blr_ansi_like
+            emit_val(out, v);
+            emit_val(out, p);
+            emit_val(out, e);
         }
         Bool::InList(v, items) => {
             out.push(blr::IN_LIST);
@@ -6318,6 +6857,14 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.push(blr::MAP);
                 out.extend_from_slice(&(f.map.len() as u16).to_le_bytes());
                 emit_map_entries(out, &f.map);
+                if let Some(v) = &f.first {
+                    out.push(blr::FIRST);
+                    emit_val(out, v);
+                }
+                if let Some(v) = &f.skip {
+                    out.push(blr::SKIP);
+                    emit_val(out, v);
+                }
                 if let Some(h) = &f.having {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, h);
@@ -7141,7 +7688,12 @@ impl<'a> P<'a> {
                 }
             }
         }
-        let aggregate = has_aggs || grouped;
+        // a HAVING with neither aggregate item nor GROUP BY is still an
+        // aggregate (measured: `SELECT 1 FROM T HAVING COUNT(*) > 1` maps
+        // the count alone)
+        let aggregate = has_aggs
+            || grouped
+            || matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "HAVING");
         let mut agg_vals: Option<Vec<Val>> = None;
         if union_.is_some()
             && (grouped || first.is_some() || skip.is_some())
@@ -7179,12 +7731,10 @@ impl<'a> P<'a> {
             return None;
         }
         if aggregate {
-            if !has_aggs {
-                return None; // grouped-without-aggs: unprobed
-            }
-            if first.is_some() || skip.is_some() {
-                return None;
-            }
+            // grouped without an aggregate item (`SELECT 1 FROM T GROUP BY
+            // ID`): an EMPTY map, measured; FIRST / SKIP ride the outer
+            // rse after the map (measured: `FIRST 1 COUNT(*)` is `.. map
+            // blr_first 1 end`)
             // the aggregate node takes the NEXT context - after the
             // stream AND any join streams (probed: a joined COUNT
             // put the aggregate at 2 over streams 0 and 1); claim
@@ -7255,7 +7805,17 @@ impl<'a> P<'a> {
                 return None;
             }
             loop {
-                let key = self.val()?;
+                // under an aggregate a key may be an aggregate itself,
+                // selected or not: it takes (or adds) its map slot (measured:
+                // `SELECT COUNT(*) .. ORDER BY SUM(N)` sorts on fid 1)
+                let key = if aggregate {
+                    self.agg_mode = true;
+                    let k = self.val();
+                    self.agg_mode = false;
+                    k?
+                } else {
+                    self.val()?
+                };
                 // over an aggregate the key REBUILDS against the
                 // map; elsewhere the raw expression IS the sort key
                 // (both probed) - and a bare integer is a POSITION in
@@ -7478,8 +8038,7 @@ impl<'a> P<'a> {
             self.i += 1;
             // FIRST/SKIP refuse beside the structures they always
             // have - re-check now that they may have just appeared
-            if aggregate
-                || has_wins
+            if has_wins
                 || union_.is_some()
                 || !joins.is_empty()
                 || stream.derived.is_some()
@@ -7498,29 +8057,29 @@ impl<'a> P<'a> {
             };
             let m = i32::try_from(*m).ok()?;
             self.i += 1;
-            if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "TO")
-            {
-                return None;
-            }
-            self.i += 1;
-            let Some(Tok::Int(n)) = self.t.get(self.i) else {
-                return None;
-            };
-            let n = i32::try_from(*n).ok()?;
-            self.i += 1;
-            first = Some(Val::Add(
-                Box::new(Val::Sub(
-                    Box::new(Val::Int(n)),
+            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "TO") {
+                self.i += 1;
+                let Some(Tok::Int(n)) = self.t.get(self.i) else {
+                    return None;
+                };
+                let n = i32::try_from(*n).ok()?;
+                self.i += 1;
+                first = Some(Val::Add(
+                    Box::new(Val::Sub(
+                        Box::new(Val::Int(n)),
+                        Box::new(Val::Int(m)),
+                    )),
+                    Box::new(Val::Int(1)),
+                ));
+                skip = Some(Val::Sub(
                     Box::new(Val::Int(m)),
-                )),
-                Box::new(Val::Int(1)),
-            ));
-            skip = Some(Val::Sub(
-                Box::new(Val::Int(m)),
-                Box::new(Val::Int(1)),
-            ));
-            if aggregate
-                || has_wins
+                    Box::new(Val::Int(1)),
+                ));
+            } else {
+                // ROWS n alone is blr_first n (measured)
+                first = Some(Val::Int(m));
+            }
+            if has_wins
                 || union_.is_some()
                 || !joins.is_empty()
                 || stream.derived.is_some()
@@ -10690,22 +11249,65 @@ pub struct TypeSpec {
     pub blr_type: u8,
     pub length: u16,
     pub scale: i8,
+    /// a text column's set when the caller knows it (a catalog column:
+    /// the length is then its BYTES); None keeps the database default a
+    /// bare declaration takes
+    pub charset: Option<u16>,
 }
 
 impl TypeSpec {
     fn dsc(&self) -> Dsc {
-        match self.blr_type {
-            14 => Dsc::Text(self.length),
-            37 => Dsc::Varying(self.length),
-            12 => Dsc::Date,
-            13 => Dsc::Time,
-            35 => Dsc::Timestamp,
-            27 => Dsc::Double,
-            10 => Dsc::Float,
-            23 => Dsc::Boolean,
-            t => Dsc::Num(t, self.scale),
+        match (self.blr_type, self.charset) {
+            (14, Some(cs)) => Dsc::TextCs(self.length / charset_bpc(cs), cs),
+            (37, Some(cs)) => Dsc::VaryingCs(self.length / charset_bpc(cs), cs),
+            (14, None) => Dsc::Text(self.length),
+            (37, None) => Dsc::Varying(self.length),
+            (26, _) => Dsc::Num(26, self.scale),
+            (24, _) => Dsc::Dec64,
+            (25, _) => Dsc::Dec128,
+            (12, _) => Dsc::Date,
+            (13, _) => Dsc::Time,
+            (35, _) => Dsc::Timestamp,
+            (27, _) => Dsc::Double,
+            (10, _) => Dsc::Float,
+            (23, _) => Dsc::Boolean,
+            (t, _) => Dsc::Num(t, self.scale),
         }
     }
+}
+
+fn charset_bpc(cs: u16) -> u16 {
+    CHARSET_BPC.iter().find(|(i, _)| *i == cs).map_or(1, |(_, b)| (*b).max(1))
+}
+
+/// A column type written as SQL (`NUMERIC(9,2)`, `VARCHAR(20) CHARACTER
+/// SET UTF8`, `DOUBLE PRECISION`) as the [TypeSpec] a typed catalog entry
+/// carries ([set_catalog_typed]); a bare text type takes the database
+/// default set ([set_default_charset]). None for a spelling the cast
+/// grammar does not read.
+pub fn type_spec_of(sql: &str) -> Option<TypeSpec> {
+    let toks = lex(sql.trim())?;
+    let mut p = P::fresh(&toks);
+    let d = p.cast_target()?;
+    if p.i != toks.len() {
+        return None;
+    }
+    let (def_cs, def_bpc) = DEFAULT_CS.with(|c| c.get());
+    Some(match d {
+        Dsc::Num(dt, sc) => TypeSpec { blr_type: dt, length: 0, scale: sc, charset: None },
+        Dsc::Text(l) => TypeSpec { blr_type: 14, length: l.saturating_mul(def_bpc), scale: 0, charset: Some(def_cs) },
+        Dsc::Varying(l) => TypeSpec { blr_type: 37, length: l.saturating_mul(def_bpc), scale: 0, charset: Some(def_cs) },
+        Dsc::TextCs(l, cs) => TypeSpec { blr_type: 14, length: l.saturating_mul(charset_bpc(cs)), scale: 0, charset: Some(cs) },
+        Dsc::VaryingCs(l, cs) => TypeSpec { blr_type: 37, length: l.saturating_mul(charset_bpc(cs)), scale: 0, charset: Some(cs) },
+        Dsc::Date => TypeSpec { blr_type: 12, length: 4, scale: 0, charset: None },
+        Dsc::Time => TypeSpec { blr_type: 13, length: 4, scale: 0, charset: None },
+        Dsc::Timestamp => TypeSpec { blr_type: 35, length: 8, scale: 0, charset: None },
+        Dsc::Double => TypeSpec { blr_type: 27, length: 8, scale: 0, charset: None },
+        Dsc::Float => TypeSpec { blr_type: 10, length: 4, scale: 0, charset: None },
+        Dsc::Boolean => TypeSpec { blr_type: 23, length: 1, scale: 0, charset: None },
+        Dsc::Dec64 => TypeSpec { blr_type: 24, length: 8, scale: 0, charset: None },
+        Dsc::Dec128 => TypeSpec { blr_type: 25, length: 16, scale: 0, charset: None },
+    })
 }
 
 /// What the compiler knows about the types around it while compiling a
@@ -10732,7 +11334,7 @@ thread_local! {
     static TYPING: std::cell::RefCell<Typing> = std::cell::RefCell::new(Typing::default());
     /// (relation or procedure name, its column or output names): what a
     /// bare column name across several streams resolves through
-    static CATALOG: std::cell::RefCell<Vec<(String, Vec<String>)>> = std::cell::RefCell::new(Vec::new());
+    static CATALOG: std::cell::RefCell<Vec<(String, Vec<(String, Option<TypeSpec>)>)>> = std::cell::RefCell::new(Vec::new());
 }
 
 /// The database's default character set, for the text types a body
@@ -10752,6 +11354,19 @@ pub fn set_default_charset(charset: u16, bytes_per_char: u16) {
 /// procedures) a body may read, so a bare name across two streams binds
 /// the way the engine's resolves it. Cleared with an empty list.
 pub fn set_catalog(entries: Vec<(String, Vec<String>)>) {
+    set_catalog_typed(
+        entries
+            .into_iter()
+            .map(|(r, cols)| (r, cols.into_iter().map(|c| (c, None)).collect()))
+            .collect(),
+    );
+}
+
+/// [set_catalog] with each column's type where the caller knows it, so
+/// a CASE / IIF / NULLIF / FILTER over a column, and an IN list beside
+/// one, carry the cast descriptor the engine unifies to
+/// ([P::unify_branches]); a None type leaves those shapes refused.
+pub fn set_catalog_typed(entries: Vec<(String, Vec<(String, Option<TypeSpec>)>)>) {
     CATALOG.with(|c| *c.borrow_mut() = entries);
 }
 
@@ -10759,7 +11374,16 @@ fn catalog_has(rel: &str, col: &str) -> bool {
     CATALOG.with(|c| {
         c.borrow()
             .iter()
-            .any(|(r, cols)| r == rel && cols.iter().any(|x| x == col))
+            .any(|(r, cols)| r == rel && cols.iter().any(|(x, _)| x == col))
+    })
+}
+
+fn catalog_type(rel: &str, col: &str) -> Option<Dsc> {
+    CATALOG.with(|c| {
+        let c = c.borrow();
+        let (_, cols) = c.iter().find(|(r, _)| r == rel)?;
+        let (_, t) = cols.iter().find(|(x, _)| x == col)?;
+        t.map(|t| t.dsc())
     })
 }
 
@@ -13529,7 +14153,6 @@ mod tests {
     fn slice_forty_two_refusals() {
         for sql in [
             // ROWS n alone (no TO): unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE ORDER BY EMP_NO ROWS 3 INTO :R1 DO SUSPEND; END",
             // ROWS with parameter bounds: unprobed
             "CREATE PROCEDURE X (P1 INTEGER, P2 INTEGER) RETURNS (R1 INTEGER) AS BEGIN FOR SELECT EMP_NO FROM EMPLOYEE ORDER BY EMP_NO ROWS :P1 TO :P2 INTO :R1 DO SUSPEND; END",
             // ROWS after OFFSET/FETCH: contradictory limits
@@ -13745,7 +14368,6 @@ mod tests {
             // FIRST/SKIP in the singular form and over aggregates:
             // unprobed placements
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN SELECT FIRST 1 ID FROM T INTO :R1; END",
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT FIRST 2 COUNT(*) FROM T INTO :R1 DO SUSPEND; END",
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }
@@ -13805,7 +14427,6 @@ mod tests {
             // a plain column beside an aggregate NEEDS a GROUP BY
             "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT A, COUNT(*) FROM T INTO :R1, :R2 DO SUSPEND; END",
             // GROUP BY without aggregates: unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT A FROM T GROUP BY A INTO :R1 DO SUSPEND; END",
             // a select column missing from GROUP BY
             "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT S, COUNT(*) FROM T GROUP BY A INTO :R1, :R2 DO SUSPEND; END",
             // a non-grouped column in HAVING
@@ -13854,7 +14475,14 @@ mod tests {
         // PO3 bytes, checked through fcdsql); the AGGREGATE written out as
         // the key (`ORDER BY COUNT(*)`) is not taken by this compiler yet
         assert!(compile_procedure(&grp("ORDER BY 2 DESC")).is_some());
-        assert!(compile_procedure(&grp("ORDER BY COUNT(*) DESC")).is_none());
+        // slice 28: an aggregate as a sort key takes its map slot - the
+        // same bytes as the ordinal that names it (measured: `ORDER BY
+        // SUM(N)` sorts on fid 1)
+        assert_eq!(
+            compile_procedure(&grp("ORDER BY COUNT(*) DESC")),
+            compile_procedure(&grp("ORDER BY 2 DESC"))
+        );
+        assert!(compile_procedure(&grp("ORDER BY COUNT(*) DESC")).is_some());
     }
 
     #[test]
@@ -13912,7 +14540,6 @@ mod tests {
             // left side's CATALOG type (probed: S IN ('a','b') stores
             // blr_cast varying2(10) per item) - catalog-free refuses
             "SELECT ID FROM T WHERE S IN ('a', 'b')",
-            "SELECT ID FROM T WHERE N IN (1.5, 2.5)",
             // mixed UNION / UNION ALL chains bind by their own
             // precedence rules: unprobed
             "SELECT A FROM T UNION SELECT UA FROM U2 UNION ALL SELECT VID FROM V3T",

@@ -322,7 +322,8 @@ pin  "8b EXTRACT(YEAR) in a PSQL assignment" "$(eb "execute block returns (r int
 
 echo "--- 8. RECORDED: the engine answers, this server refuses"
 refused "8 a VIEW whose select item is IS NOT DISTINCT (the compiler has no boolean item)" "create view vd4 as select id, val is not distinct from 20 b from w; commit; select count(*) from rdb\$relations where rdb\$relation_name = 'VD4';" "COUNT|1"
-refused "8 a VIEW over OVERLAY (the compiler knows no OVERLAY)" "create view vd5 as select overlay(s placing 'x' from 1) o from d; commit; select count(*) from rdb\$relations where rdb\$relation_name = 'VD5';" "COUNT|1"
+# (promoted 2026-10-07: OVERLAY is a system function dsql emits now - slice 15)
+pin "8 a VIEW over OVERLAY (the compiler emits blr_sys_function OVERLAY now)" "create view vd5 as select overlay(s placing 'x' from 1) o from d; commit; select count(*) from rdb\$relations where rdb\$relation_name = 'VD5';" "COUNT|1"
 # PROMOTED 2026-10-03: a CAST over a LIST answers (serve-real-listexpr.sh)
 pin  "8 LIST cast" "select cast(list(v) as varchar(50)) from t;" "CAST|b,a"
 # PROMOTED 2026-10-03: every expression over a LIST answers; the blob-out
