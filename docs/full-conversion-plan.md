@@ -138,6 +138,14 @@ feature has to be built twice.
       Unconverted and declined: HASH USING an algorithm, the UUID and
       random functions, the context functions, the DECFLOAT functions, the
       binary decoders. 16 new route cells.
+    - Slice 18 (2026-10-07): **windows over an aggregate** (436 compile
+      declines in the census): `blr_window` over an rse whose stream is the
+      aggregate node, its map holding, in order of appearance, the group
+      fields and inner aggregates the list and the windows reference, the
+      HAVING after it; each window's keys and arguments read that map by
+      fid, and a plain item rides an empty window as a key entry exactly as
+      beside ordinary windows. 15 new byte-checked cells; one stale pin
+      promoted. A statement ORDER BY beside windows stays refused.
     - Next: the remaining compile classes - COLLATE expressions (which the
       executor could not serve anyway), windows beside GROUP BY, derived
       tables and CTEs, UNION in a derived table, NULLS FIRST / LAST, LIST;

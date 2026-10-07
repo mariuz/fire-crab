@@ -5179,6 +5179,20 @@ fn rebuild_over_keys(
     fid_ctx: u8,
 ) -> Option<Val> {
     match v {
+        // an aggregate's fid reaching a WINDOW layer rides the window's map
+        // as a key entry (measured: `DEPT_ID + 1, COUNT(*) OVER () .. GROUP
+        // BY DEPT_ID` adds `fid(1,0)` to the window map and rebuilds over it)
+        Val::Fid(..) => {
+            let entry = MapEntry::Key(v.clone());
+            let slot = match map.iter().position(|e| *e == entry) {
+                Some(i) => i,
+                None => {
+                    map.push(entry);
+                    map.len() - 1
+                }
+            };
+            Some(Val::Fid(fid_ctx, slot as u16))
+        }
         Val::Field(..) => {
             if !gfields.contains(v) {
                 return None;
@@ -5222,6 +5236,28 @@ fn rebuild_over_keys(
 
 /// Stamp a context into every Fid of a rebuilt expression - the
 /// window contexts are assigned after the maps are built.
+/// [rebuild_over_keys] for the AGGREGATE layer under windows: a group field
+/// takes its key slot, an aggregate's own fid passes through (it already
+/// names a map slot), an expression rebuilds over both.
+fn lift_over_agg(map: &mut Vec<MapEntry>, v: &Val, gfields: &[Val], fid_ctx: u8) -> Option<Val> {
+    match v {
+        Val::Fid(..) | Val::Int(_) | Val::Int64(_) | Val::Dec(..) | Val::Str(_) | Val::Null | Val::InParam(_) | Val::LocalVar(_) => Some(v.clone()),
+        Val::Field(..) => rebuild_over_keys(map, v, gfields, fid_ctx),
+        Val::Add(a, b) | Val::Sub(a, b) | Val::Mul(a, b) | Val::Div(a, b) | Val::Concat(a, b) => {
+            let (a, b) = (lift_over_agg(map, a, gfields, fid_ctx)?, lift_over_agg(map, b, gfields, fid_ctx)?);
+            Some(match v {
+                Val::Add(..) => Val::Add(Box::new(a), Box::new(b)),
+                Val::Sub(..) => Val::Sub(Box::new(a), Box::new(b)),
+                Val::Mul(..) => Val::Mul(Box::new(a), Box::new(b)),
+                Val::Div(..) => Val::Div(Box::new(a), Box::new(b)),
+                _ => Val::Concat(Box::new(a), Box::new(b)),
+            })
+        }
+        Val::Neg(a) => Some(Val::Neg(Box::new(lift_over_agg(map, a, gfields, fid_ctx)?))),
+        _ => None,
+    }
+}
+
 fn patch_fid_ctx(v: &Val, ctx: u8) -> Val {
     match v {
         Val::Fid(_, slot) => Val::Fid(ctx, *slot),
@@ -7014,7 +7050,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     emit_val(out, item);
                 }
                 out.push(blr::END); // the wrapper rse's end
-            } else if f.aggregate {
+            } else if f.aggregate && f.windows.is_empty() {
                 out.push(blr::AGGREGATE);
                 out.push(f.ctx + 1 + f.joins.len() as u8);
                 out.push(blr::RSE);
@@ -7091,10 +7127,37 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.push(blr::WINDOW);
                 out.push(blr::RSE);
                 out.push(1);
-                emit_stream(out, &f.stream, f.ctx);
-                if let Some(b) = &f.boolean {
-                    out.push(blr::BOOLEAN);
-                    emit_bool(out, b);
+                if f.aggregate {
+                    // the aggregate node stands as the window's stream, its
+                    // HAVING after its map (measured)
+                    out.push(blr::AGGREGATE);
+                    out.push(f.ctx + 1 + f.joins.len() as u8);
+                    out.push(blr::RSE);
+                    out.push(rse_stream_count(&f.joins));
+                    emit_join_chain(out, &f.stream, f.ctx, &f.joins);
+                    if let Some(b) = &f.boolean {
+                        out.push(blr::BOOLEAN);
+                        emit_bool(out, b);
+                    }
+                    out.push(blr::END);
+                    out.push(blr::GROUP_BY);
+                    out.push(f.group_keys.len() as u8);
+                    for k in &f.group_keys {
+                        emit_val(out, k);
+                    }
+                    out.push(blr::MAP);
+                    out.extend_from_slice(&(f.map.len() as u16).to_le_bytes());
+                    emit_map_entries(out, &f.map);
+                    if let Some(h) = &f.having {
+                        out.push(blr::BOOLEAN);
+                        emit_bool(out, h);
+                    }
+                } else {
+                    emit_stream(out, &f.stream, f.ctx);
+                    if let Some(b) = &f.boolean {
+                        out.push(blr::BOOLEAN);
+                        emit_bool(out, b);
+                    }
                 }
                 out.push(blr::END);
                 out.push(f.windows.len() as u8);
@@ -7502,9 +7565,42 @@ impl<'a> P<'a> {
         if !joins.is_empty() {
             self.merge_scope = Some((sidx, sidx + 1 + joins.len()));
         }
+        // A GROUP BY ahead (depth 0, before INTO / DO / UNION): a WINDOW in
+        // this list then sits OVER THE AGGREGATE (measured: blr_window's rse
+        // holds the aggregate node, whose map carries, in order of
+        // APPEARANCE, the group fields and inner aggregates the list and the
+        // windows reference; each window reads them by fid). The aggregate's
+        // context is claimed now so those references resolve while parsing.
+        let grouped_ahead = {
+            let mut j = after_from;
+            let mut depth = 0i32;
+            let mut found = false;
+            while let Some(t) = self.t.get(j) {
+                match t {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => depth -= 1,
+                    Tok::Ident(w) if depth == 0 && (w == "INTO" || w == "DO" || w == "UNION") => break,
+                    Tok::Ident(w) if depth == 0 && w == "GROUP" => {
+                        found = true;
+                        break;
+                    }
+                    Tok::Semi => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+            found
+        };
+        if grouped_ahead {
+            self.agg_fid_ctx = ctx + 1 + joins.len() as u8;
+            self.agg_map = Vec::new();
+        }
         let mut items: Vec<Item> = Vec::new();
         let mut aliases: Vec<String> = Vec::new();
         loop {
+            // under a GROUP BY the plain fields an item or a window's keys name
+            // take their map slots in order of appearance
+            let mut keys_seen: Vec<Val> = Vec::new();
             match self.t.get(self.i)? {
                 Tok::Ident(w)
                     if matches!(
@@ -7514,9 +7610,19 @@ impl<'a> P<'a> {
                 {
                     let w = w.clone();
                     self.i += 1;
-                    let (verb, arg) = self.parse_agg(&w)?;
+                    let saved_mode = self.agg_mode;
+                    self.agg_mode = grouped_ahead;
+                    let parsed = self.parse_agg(&w);
+                    self.agg_mode = saved_mode;
+                    let (verb, arg) = parsed?;
                     if self.kw("OVER") {
-                        let (part, ord, frame) = self.over_clause(ctx)?;
+                        self.agg_mode = grouped_ahead;
+                        let over = self.over_clause(ctx);
+                        self.agg_mode = saved_mode;
+                        let (part, ord, frame) = over?;
+                        for k in part.iter().chain(ord.iter().map(|(_, k)| k)) {
+                            collect_fields(k, &mut keys_seen);
+                        }
                         items.push(Item::Win(
                             MapEntry::Agg(verb, arg),
                             part,
@@ -7547,16 +7653,27 @@ impl<'a> P<'a> {
                     let w = w.clone();
                     self.i += 2;
                     let mut args = Vec::new();
+                    let saved_mode = self.agg_mode;
+                    self.agg_mode = grouped_ahead;
                     if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
                         loop {
-                            args.push(self.val()?);
+                            let a = self.val();
+                            let Some(a) = a else {
+                                self.agg_mode = saved_mode;
+                                return None;
+                            };
+                            args.push(a);
                             match self.t.get(self.i)? {
                                 Tok::Comma => self.i += 1,
                                 Tok::RParen => break,
-                                _ => return None,
+                                _ => {
+                                    self.agg_mode = saved_mode;
+                                    return None;
+                                }
                             }
                         }
                     }
+                    self.agg_mode = saved_mode;
                     if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
                         return None;
                     }
@@ -7596,7 +7713,14 @@ impl<'a> P<'a> {
                     if !self.kw("OVER") {
                         return None;
                     }
-                    let (part, ord, frame) = self.over_clause(ctx)?;
+                    let saved_mode = self.agg_mode;
+                    self.agg_mode = grouped_ahead;
+                    let over = self.over_clause(ctx);
+                    self.agg_mode = saved_mode;
+                    let (part, ord, frame) = over?;
+                    for k in part.iter().chain(ord.iter().map(|(_, k)| k)) {
+                        collect_fields(k, &mut keys_seen);
+                    }
                     items.push(Item::Win(
                         MapEntry::Fn(w, args),
                         part,
@@ -7610,10 +7734,19 @@ impl<'a> P<'a> {
                     // stream scope is set); a plain column keeps its
                     // Col shape for the aggregate/cursor paths
                     let v = self.val()?;
+                    collect_fields(&v, &mut keys_seen);
                     items.push(match v {
                         Val::Field(..) => Item::Col(v),
                         other => Item::Expr(other),
                     });
+                }
+            }
+            if grouped_ahead {
+                for k in keys_seen {
+                    let e = MapEntry::Key(k);
+                    if !self.agg_map.contains(&e) {
+                        self.agg_map.push(e);
+                    }
                 }
             }
             // an item's ALIAS - `AS name` or a bare name - names the
@@ -7874,20 +8007,99 @@ impl<'a> P<'a> {
         }
         // windows beside aggregates, joins, FIRST/SKIP or in the
         // singular form: unprobed
-        if has_wins
-            && (aggregate
-                || !joins.is_empty()
-                || first.is_some()
-                || skip.is_some()
-                || !is_for)
-        {
+        if has_wins && (!joins.is_empty() || first.is_some() || skip.is_some() || !is_for) {
+            return None;
+        }
+        // windows over an aggregate: only the GROUP BY form is measured
+        if has_wins && aggregate && !grouped {
             return None;
         }
         // joins beside FIRST/SKIP: unprobed
         if !joins.is_empty() && (first.is_some() || skip.is_some()) {
             return None;
         }
-        if aggregate {
+        if aggregate && has_wins {
+            // WINDOWS OVER THE AGGREGATE (measured): the aggregate takes the
+            // next context and the windows the ones after it; every item and
+            // every window key or argument is LIFTED to the aggregate's map
+            // - a group field to its key slot, an aggregate to its verb's
+            // slot, an expression rebuilt over them - and the window layer
+            // below then runs over those fids exactly as over plain columns
+            // (a plain item rides an empty window as a key entry there too)
+            if stream.derived.is_some() {
+                return None;
+            }
+            let fid_ctx = self.agg_fid_ctx;
+            self.streams.push(Stream {
+                name: String::new(),
+                alias: None,
+                derived: None,
+                sub: self.in_sub,
+                cur: None,
+                proc_args: None,
+            });
+            let mut gfields: Vec<Val> = Vec::new();
+            for k in &group_keys {
+                collect_fields(k, &mut gfields);
+            }
+            let mut lifted: Vec<Item> = Vec::with_capacity(items.len());
+            for it in items.drain(..) {
+                let lift = |p: &mut Self, v: &Val| -> Option<Val> {
+                    match v {
+                        Val::Fid(..) | Val::Int(_) | Val::Int64(_) | Val::Dec(..) | Val::Str(_) | Val::Null | Val::InParam(_) | Val::LocalVar(_) => Some(v.clone()),
+                        Val::Field(..) => {
+                            if !gfields.contains(v) {
+                                return None;
+                            }
+                            let e = MapEntry::Key(v.clone());
+                            let slot = match p.agg_map.iter().position(|x| *x == e) {
+                                Some(i) => i,
+                                None => {
+                                    p.agg_map.push(e);
+                                    p.agg_map.len() - 1
+                                }
+                            };
+                            Some(Val::Fid(fid_ctx, slot as u16))
+                        }
+                        other => lift_over_agg(&mut p.agg_map, other, &gfields, fid_ctx),
+                    }
+                };
+                lifted.push(match it {
+                    Item::Col(v) | Item::Expr(v) => {
+                        let r = lift(self, &v)?;
+                        if matches!(r, Val::Fid(..)) { Item::Col(r) } else { Item::Expr(r) }
+                    }
+                    Item::Agg(verb, arg) => {
+                        let slot = self.agg_slot(verb, arg);
+                        Item::Col(Val::Fid(fid_ctx, slot))
+                    }
+                    Item::Win(e, part, ord, frame) => {
+                        let e = match e {
+                            MapEntry::Agg(verb, Some(arg)) => MapEntry::Agg(verb, Some(lift(self, &arg)?)),
+                            MapEntry::Fn(n, args) => {
+                                let mut out = Vec::with_capacity(args.len());
+                                for a in &args {
+                                    out.push(lift(self, a)?);
+                                }
+                                MapEntry::Fn(n, out)
+                            }
+                            other => other,
+                        };
+                        let mut p2 = Vec::with_capacity(part.len());
+                        for k in &part {
+                            p2.push(lift(self, k)?);
+                        }
+                        let mut o2 = Vec::with_capacity(ord.len());
+                        for (d, k) in &ord {
+                            o2.push((*d, lift(self, k)?));
+                        }
+                        Item::Win(e, p2, o2, frame)
+                    }
+                });
+            }
+            items = lifted;
+        }
+        if aggregate && !has_wins {
             // grouped without an aggregate item (`SELECT 1 FROM T GROUP BY
             // ID`): an EMPTY map, measured; FIRST / SKIP ride the outer
             // rse after the map (measured: `FIRST 1 COUNT(*)` is `.. map
@@ -8115,8 +8327,9 @@ impl<'a> P<'a> {
                     }
                 }
             }
+            let win_base = if aggregate { self.agg_fid_ctx } else { ctx };
             for (i, w) in windows.iter_mut().enumerate() {
-                w.ctx = ctx + 1 + i as u8;
+                w.ctx = win_base + 1 + i as u8;
             }
             for _ in &windows {
                 self.streams.push(Stream {
@@ -9199,6 +9412,15 @@ impl<'a> P<'a> {
             let Some(Tok::Ident(a)) = p.t.get(p.i) else {
                 return None;
             };
+            // over an AGGREGATE a key may be an aggregate itself (`RANK() OVER
+            // (ORDER BY SUM(SALARY))`): it takes its slot in the aggregate's
+            // map (measured) - the agg_mode interception in func()
+            if p.agg_mode
+                && matches!(a.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+                && matches!(p.t.get(p.i + 1), Some(Tok::LParen))
+            {
+                return p.val();
+            }
             if is_keyword(a) {
                 return None;
             }

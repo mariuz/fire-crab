@@ -144,6 +144,16 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       unconverted: HASH USING (CRYPT_HASH's libtomcrypt digests; plain HASH is WeakHashContext's 64-bit ELF hash over MOV_make_string2's bytes - done), CRYPT_HASH, GEN_UUID/RAND/UUID functions, RDB$GET/SET_CONTEXT,
       QUANTIZE/NORMALIZE_DECFLOAT/COMPARE_DECFLOAT/TOTALORDER, HEX_DECODE/BASE64_DECODE (binary), WEEK in DATEDIFF
       and FIRST_DAY, DATEADD past midnight on a TIME, ASCII_VAL/ASCII_CHAR outside ASCII.
+      Slice 18 (2026-10-07): WINDOWS OVER AN AGGREGATE. Measured (scratch cases10/11): `C3 43 01 [4F <agg ctx> 43 01 <stream>
+      [WHERE] FF 4E <keys> 4D <map> [HAVING]] FF <n> <windows..>`; the aggregate's map holds the group fields and inner
+      aggregates in ORDER OF APPEARANCE across the select list and the OVER clauses; window keys / arguments are fids of
+      it; plain items (a group field, a bare aggregate, an expression) ride an EMPTY window as key entries over those
+      fids, like plain columns beside ordinary windows; the windows number from the aggregate's context. dsql: a
+      GROUP BY lookahead claims the aggregate context before the items, parses window internals in agg_mode (an
+      aggregate inside OVER / an argument becomes its map fid at parse time), registers plain fields as key entries
+      in appearance order, then LIFTS every item and window key to the aggregate's fids and hands them to the existing
+      window layer; the emitter nests the aggregate as the window rse's stream. Still refused: ORDER BY beside
+      windows, windows over a HAVING-only aggregate, over joins, FIRST/SKIP with windows.
       Slice 13: SPEED. exe resolved every blr_field through RDB$RELATION_FIELDS on EVERY evaluation and cloned the row
       (a 20,000-row scan with one comparison: 6 s) - the field id is cached per statement now (80 ms). And an equality
       conjunct `<column> = <literal | ?>` over an exact-numeric column with a live plain single-segment index retrieves
