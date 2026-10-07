@@ -240,6 +240,10 @@ pub enum Expr {
     /// (empty for a plain function), function name, argument expressions).
     /// Run by fetching the callee's BLR and executing it recursively.
     Function(String, String, Vec<Expr>),
+    /// blr_sys_function: the engine's built-in scalar functions by NAME
+    /// over their arguments ([sys_fn]); a name outside the converted set
+    /// fails the run
+    SysFn(String, Vec<Expr>),
     /// blr_null
     Null,
 }
@@ -839,6 +843,16 @@ impl<'a> P<'a> {
                 }
                 Ok(Expr::Function(pkg, name, args))
             }
+            186 => {
+                // blr_sys_function: counted name, counted arguments
+                let name = self.counted_name()?;
+                let n = self.u8()? as usize;
+                let mut args = Vec::with_capacity(n);
+                for _ in 0..n {
+                    args.push(self.expr()?);
+                }
+                Ok(Expr::SysFn(name, args))
+            }
             other => Err(format!("value verb {} unconverted", other)),
         }
     }
@@ -1333,6 +1347,667 @@ fn scaled(raw: i64, scale: i8) -> Value {
 }
 
 /// An exact-numeric value as (raw, scale) in i128 - Int/Scaled/Int128.
+// ---------------------------------------------------------------- sys functions
+//
+// The engine's built-in scalar functions, each with the result type and
+// the edge laws measured on 2196 (2026-10-07, scratchpad sysfnprobe):
+//   ROUND / TRUNC over an exact: with a scale the STORAGE scale is kept and
+//     the value rounded (half away from zero) / truncated at that many
+//     decimals - a scale beyond the stored decimals leaves it unchanged, a
+//     negative one rounds the integer part; without a scale the result has
+//     scale 0 (ROUND(2.675) = 3, TRUNC(2.675) = 2, ROUND(7, -1) = 10). Over a
+//     double: UNCONVERTED - the engine goes through an integer path (2.675
+//     at scale 2 gave 2.68, not the naive multiply; ROUND(-0.125) is +0 where
+//     C's round gives -0; 1e300 raises 22003).
+//   FLOOR / CEILING over an exact -> scale 0 (BIGINT on the engine); over a
+//     double or FLOAT -> DOUBLE.
+//   SIGN -> SMALLINT -1 / 0 / 1.  ABS keeps the kind (the engine widens exacts
+//     to BIGINT; a value is a value).
+//   MOD ROUNDS BOTH OPERANDS TO INTEGERS first (MOD(2.675, 2) = 1, MOD(1.235,
+//     7) = 1, MOD(-7, 3) = -1 - C's %); a zero divisor is the engine's 22012.
+//   POWER / SQRT / EXP / LN / LOG / LOG10 / trigonometry -> DOUBLE through the
+//     C library; a domain error or a non-finite result is the engine's
+//     raise, so the run fails.
+//   LEFT / RIGHT / LPAD / RPAD / REVERSE / REPLACE / POSITION / OVERLAY work in
+//     CHARACTERS; a negative count is the engine's 22011; POSITION('', s) = 1;
+//     RPAD / LPAD TRUNCATE to the length; OVERLAY's default FOR is the
+//     placing string's length.
+//   ASCII_VAL -> SMALLINT of the first character (ASCII only here);
+//     ASCII_CHAR(0..127) -> CHAR(1) (a high byte is NONE bytes this model
+//     cannot hold); UNICODE_VAL / UNICODE_CHAR by code point.
+//   HEX_ENCODE / BASE64_ENCODE over the BYTES (ASCII text only here, whose
+//     bytes are its characters).  BIN_AND / OR / XOR / NOT / SHL / SHR over
+//     integers (SHR arithmetic: BIN_SHR(-7, 1) = -4).
+//   MAXVALUE / MINVALUE: the largest / smallest under the comparison; NULL if
+//     any is NULL; incomparable kinds are the engine's HY004.
+//   DATEADD: YEAR / MONTH by calendar with the day clamped (2024-01-31 + 1
+//     MONTH = 2024-02-29), the others by elapsed ticks; a fractional count is
+//     ROUNDED (1.5 DAY = 2 days); a DATE takes YEAR / MONTH / DAY / WEEK, a
+//     TIME the sub-day units (a result past midnight: unconverted).
+//   DATEDIFF: YEAR = y2 - y1, MONTH = 12 * years + months, DAY = days (a
+//     TIMESTAMP's time ignored), HOUR / MINUTE / SECOND on the truncated
+//     values, MILLISECOND as NUMERIC(18,1) (the engine's INT64 scale -1).
+//   FIRST_DAY / LAST_DAY OF YEAR / MONTH keep a TIMESTAMP's time.
+// Unconverted (the run fails, the route declines): HASH / CRYPT_HASH, the
+// UUID and GEN_UUID / RAND functions, RDB$GET_CONTEXT / RDB$SET_CONTEXT, the
+// DECFLOAT functions, HEX_DECODE / BASE64_DECODE (binary results), BLOB_APPEND,
+// MAKE_DBKEY, WEEK in DATEDIFF / FIRST_DAY.
+
+/// days from 1970-01-01 of a proleptic Gregorian date (Howard Hinnant)
+fn sf_days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = (m as u64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+/// (year, month, day) of a day count from 1970-01-01
+fn sf_civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// the ODS date (days from 1858-11-17) <-> civil
+const SF_MJD_UNIX: i64 = 40587;
+fn sf_ods_to_ymd(d: i32) -> (i64, u32, u32) {
+    sf_civil_from_days(d as i64 - SF_MJD_UNIX)
+}
+fn sf_ymd_to_ods(y: i64, m: u32, d: u32) -> Result<i32, String> {
+    i32::try_from(sf_days_from_civil(y, m, d) + SF_MJD_UNIX).map_err(|_| "date out of range".to_string())
+}
+fn sf_days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+    }
+}
+const SF_TICKS_PER_DAY: i64 = 86_400 * 10_000;
+
+/// an exact or approximate value as f64 (an integer exact under 2^53)
+fn sf_f64(v: &Value) -> Result<f64, String> {
+    match v {
+        Value::Double(d) => Ok(*d),
+        Value::Float(f) => Ok(*f as f64),
+        Value::Int(n) if n.unsigned_abs() < 1u64 << 53 => Ok(*n as f64),
+        Value::Scaled(raw, s) if raw.unsigned_abs() < 1u64 << 53 => Ok(*raw as f64 / 10f64.powi(-(*s as i32))),
+        _ => Err("a double function over this operand unconverted".into()),
+    }
+}
+
+/// a numeric value ROUNDED to an integer (half away from zero)
+fn sf_int_rounded(v: &Value) -> Result<i128, String> {
+    match v {
+        Value::Int(n) => Ok(*n as i128),
+        Value::Scaled(raw, s) => exe_rescale(*raw as i128, *s, 0).ok_or_else(|| "integer overflow".to_string()),
+        Value::Int128(raw, s) => exe_rescale(*raw, *s, 0).ok_or_else(|| "integer overflow".to_string()),
+        Value::Double(d) if d.is_finite() && d.abs() < 1e30 => Ok(d.round() as i128),
+        Value::Float(f) if f.is_finite() => Ok((*f as f64).round() as i128),
+        _ => Err("an integer operand of another kind unconverted".into()),
+    }
+}
+
+fn sf_text(v: &Value) -> Result<&str, String> {
+    match v {
+        Value::Text(t) => Ok(t.as_str()),
+        _ => Err("a text function over a non-text value unconverted".into()),
+    }
+}
+
+fn sf_count(v: &Value) -> Result<i64, String> {
+    match v {
+        Value::Int(n) if i32::try_from(*n).is_ok() => Ok(*n),
+        Value::Int(_) => Err("a count past INTEGER: the engine's 22003".into()),
+        _ => Err("a count of another kind unconverted".into()),
+    }
+}
+
+/// ROUND / TRUNC of an exact at `decimals` (None: to an integer, scale 0)
+fn sf_round_exact(raw: i128, scale: i8, decimals: Option<i64>, truncate: bool) -> Result<Value, String> {
+    let stored = -(scale as i64); // decimals held
+    let (unit_pow, out_scale) = match decimals {
+        None => (stored, 0i8),
+        Some(n) if n >= stored => return Ok(mk_num(raw, scale)),
+        Some(n) => (stored - n, scale),
+    };
+    let unit = 10i128.checked_pow(u32::try_from(unit_pow).map_err(|_| "scale out of range")?).ok_or("integer overflow")?;
+    let q = raw / unit;
+    let r = raw % unit;
+    let q = if !truncate && 2 * r.unsigned_abs() >= unit as u128 { q + raw.signum() } else { q };
+    if decimals.is_none() {
+        return Ok(mk_num(q, out_scale));
+    }
+    Ok(mk_num(q.checked_mul(unit).ok_or("integer overflow")?, out_scale))
+}
+
+fn sf_base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { A[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// DATEADD's / DATEDIFF's part literal (blr_extract's codes)
+fn sf_part(v: &Value) -> Result<u8, String> {
+    match v {
+        Value::Int(n) if (0..=9).contains(n) => Ok(*n as u8),
+        _ => Err("a date part of another kind unconverted".into()),
+    }
+}
+
+/// DATEADD MONTH / YEAR exactly as SysFunction.cpp's evlDateAdd computes it
+/// (read from the engine's source, 2026-10-07; fnargs measured 2024-02-29 +
+/// 13 MONTH = 2025-03-31 and + 1 MONTH = 2024-03-29): the quantity splits
+/// into years and months by C division; the source day's distance to its
+/// month's end is taken from the NON-leap table; after the move the table
+/// is leap-adjusted for the TARGET year, and when the quantity is
+/// non-negative and the source day no longer fits its own month there, the
+/// day becomes the target month's length minus that distance; then a clamp
+/// into 1..=length.
+fn sf_add_months(days: i32, months: i64) -> Result<i32, String> {
+    if months.abs() > 9999 * 12 {
+        return Err("DATEADD month count out of range: the engine's 22003".into());
+    }
+    let (y0, m0, d0) = sf_ods_to_ymd(days);
+    let mut md = [31i64, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let yq = months / 12; // C division: toward zero
+    let mq = months % 12;
+    let lm = (m0 - 1) as usize;
+    let ld = md[lm] - d0 as i64;
+    let mut year = y0 + yq;
+    let mut mon = lm as i64 + mq;
+    if mon > 11 {
+        year += 1;
+        mon -= 12;
+    } else if mon < 0 {
+        year -= 1;
+        mon += 12;
+    }
+    if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+        md[1] += 1;
+    }
+    let mut day = d0 as i64;
+    if yq >= 0 && mq >= 0 && day > md[lm] {
+        day = md[mon as usize] - ld;
+    }
+    if day > md[mon as usize] {
+        day = md[mon as usize];
+    } else if day < 1 {
+        day = 1;
+    }
+    sf_ymd_to_ods(year, mon as u32 + 1, day as u32)
+}
+
+/// the engine's valid date range in ODS days: 0001-01-01 .. 9999-12-31
+const SF_DATE_MIN: i64 = -678_575;
+const SF_DATE_MAX: i64 = 2_973_483;
+fn sf_date_in_range(d: i64) -> Result<i32, String> {
+    if !(SF_DATE_MIN..=SF_DATE_MAX).contains(&d) {
+        return Err("DATEADD past the valid dates: the engine's 22008".into());
+    }
+    Ok(d as i32)
+}
+
+/// a DATEADD count scaled to a unit's ticks and ROUNDED there (half away
+/// from zero): 0.5 MILLISECOND is 5 ticks, 1.26 is 13 (measured, fnargs)
+fn sf_ticks_of(v: &Value, per: i64) -> Result<i128, String> {
+    // the engine converts the count to INT64 at scale 0 - a WHOLE number of
+    // the unit, rounded (0.5 SECOND is one second) - except MILLISECOND,
+    // which it takes at scale -1: tenths of a millisecond, the time tick
+    if per == 10 {
+        let tenths = match v {
+            Value::Int(n) => (*n as i128).checked_mul(10).ok_or_else(|| "DATEADD overflow".to_string())?,
+            Value::Scaled(raw, s) => exe_rescale(*raw as i128, *s, -1).ok_or_else(|| "DATEADD overflow".to_string())?,
+            Value::Double(d) if d.is_finite() && d.abs() < 1e17 => (d * 10.0).round() as i128,
+            _ => return Err("a DATEADD count of this kind unconverted".into()),
+        };
+        return Ok(tenths);
+    }
+    sf_int_rounded(v)?.checked_mul(per as i128).ok_or_else(|| "DATEADD overflow".to_string())
+}
+
+fn sf_dateadd(count: i128, part: u8, target: &Value, raw_count: &Value) -> Result<Value, String> {
+    let count_i64 = i64::try_from(count).map_err(|_| "DATEADD count out of range")?;
+    let ticks_per = |part: u8| -> Option<i64> {
+        Some(match part {
+            2 => SF_TICKS_PER_DAY,
+            9 => 7 * SF_TICKS_PER_DAY,
+            3 => 3_600 * 10_000,
+            4 => 60 * 10_000,
+            5 => 10_000,
+            8 => 10,
+            _ => return None,
+        })
+    };
+    match target {
+        Value::Date(d) => match part {
+            0 => sf_add_months(*d, count_i64.checked_mul(12).ok_or("DATEADD overflow")?).and_then(|nd| sf_date_in_range(nd as i64)).map(Value::Date),
+            1 => sf_add_months(*d, count_i64).and_then(|nd| sf_date_in_range(nd as i64)).map(Value::Date),
+            2 | 9 => {
+                let days = if part == 9 { count_i64.checked_mul(7).ok_or("DATEADD overflow")? } else { count_i64 };
+                sf_date_in_range(*d as i64 + days).map(Value::Date)
+            }
+            _ => Err("DATEADD of a sub-day unit to a DATE unconverted".into()),
+        },
+        Value::Time(t) => {
+            let per = ticks_per(part).filter(|_| part >= 3).ok_or("DATEADD of a day unit to a TIME unconverted")?;
+            let ticks = *t as i128 + sf_ticks_of(raw_count, per)?;
+            if !(0..SF_TICKS_PER_DAY as i128).contains(&ticks) {
+                return Err("DATEADD past midnight on a TIME unconverted".into());
+            }
+            Ok(Value::Time(ticks as u32))
+        }
+        Value::Timestamp(d, t) => match part {
+            0 => sf_add_months(*d, count_i64.checked_mul(12).ok_or("DATEADD overflow")?).and_then(|nd| sf_date_in_range(nd as i64)).map(|nd| Value::Timestamp(nd, *t)),
+            1 => sf_add_months(*d, count_i64).and_then(|nd| sf_date_in_range(nd as i64)).map(|nd| Value::Timestamp(nd, *t)),
+            _ => {
+                let per = ticks_per(part).ok_or("DATEADD part unconverted")?;
+                let total = (*d as i128) * SF_TICKS_PER_DAY as i128 + *t as i128 + sf_ticks_of(raw_count, per)?;
+                let days = total.div_euclid(SF_TICKS_PER_DAY as i128);
+                let ticks = total.rem_euclid(SF_TICKS_PER_DAY as i128);
+                Ok(Value::Timestamp(sf_date_in_range(i64::try_from(days).map_err(|_| "date out of range")?)?, ticks as u32))
+            }
+        },
+        _ => Err("DATEADD over a non-temporal value unconverted".into()),
+    }
+}
+
+/// a temporal as (days, ticks, is-a-TIME) - a DATE at midnight, a TIME on day 0
+fn sf_stamp(v: &Value) -> Result<(i64, i64, bool), String> {
+    match v {
+        Value::Date(d) => Ok((*d as i64, 0, false)),
+        Value::Timestamp(d, t) => Ok((*d as i64, *t as i64, false)),
+        Value::Time(t) => Ok((0, *t as i64, true)),
+        _ => Err("DATEDIFF over a non-temporal value unconverted".into()),
+    }
+}
+
+fn sf_datediff(part: u8, a: &Value, b: &Value) -> Result<Value, String> {
+    let (d1, t1, time1) = sf_stamp(a)?;
+    let (d2, t2, time2) = sf_stamp(b)?;
+    if time1 != time2 {
+        return Err("DATEDIFF between a TIME and a date unconverted".into());
+    }
+    Ok(match part {
+        0 | 1 if !time1 => {
+            let (y1, m1, _) = sf_ods_to_ymd(d1 as i32);
+            let (y2, m2, _) = sf_ods_to_ymd(d2 as i32);
+            Value::Int(if part == 0 { y2 - y1 } else { (y2 - y1) * 12 + (m2 as i64 - m1 as i64) })
+        }
+        2 if !time1 => Value::Int(d2 - d1),
+        3 | 4 | 5 => {
+            let per = match part {
+                3 => 3_600 * 10_000,
+                4 => 60 * 10_000,
+                _ => 10_000,
+            };
+            let a = d1 * SF_TICKS_PER_DAY + t1;
+            let b = d2 * SF_TICKS_PER_DAY + t2;
+            Value::Int(b.div_euclid(per) - a.div_euclid(per))
+        }
+        8 => {
+            let a = d1 * SF_TICKS_PER_DAY + t1;
+            let b = d2 * SF_TICKS_PER_DAY + t2;
+            Value::Scaled(b - a, -1)
+        }
+        _ => return Err("DATEDIFF part unconverted".into()),
+    })
+}
+
+fn sf_first_last_day(part: u8, v: &Value, last: bool) -> Result<Value, String> {
+    let (d, t) = match v {
+        Value::Date(d) => (*d, None),
+        Value::Timestamp(d, t) => (*d, Some(*t)),
+        _ => return Err("FIRST_DAY / LAST_DAY over a non-date unconverted".into()),
+    };
+    let (y, m, _) = sf_ods_to_ymd(d);
+    let nd = match (part, last) {
+        (0, false) => sf_ymd_to_ods(y, 1, 1)?,
+        (0, true) => sf_ymd_to_ods(y, 12, 31)?,
+        (1, false) => sf_ymd_to_ods(y, m, 1)?,
+        (1, true) => sf_ymd_to_ods(y, m, sf_days_in_month(y, m))?,
+        _ => return Err("FIRST_DAY / LAST_DAY OF WEEK unconverted".into()),
+    };
+    Ok(match t {
+        None => Value::Date(nd),
+        Some(t) => Value::Timestamp(nd, t),
+    })
+}
+
+/// A system function over its evaluated arguments; NULL in, NULL out.
+fn sys_fn(name: &str, args: &[Value]) -> Result<Value, String> {
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let arg = |i: usize| -> Result<&Value, String> { args.get(i).ok_or_else(|| format!("{} needs argument {}", name, i + 1)) };
+    let dbl = |f: &dyn Fn(f64) -> Result<f64, String>| -> Result<Value, String> {
+        let r = f(sf_f64(arg(0)?)?)?;
+        if !r.is_finite() {
+            return Err(format!("{}: a non-finite result", name));
+        }
+        Ok(Value::Double(r))
+    };
+    Ok(match name {
+        "ABS" => match arg(0)? {
+            Value::Int(n) => Value::Int(n.checked_abs().ok_or("integer overflow")?),
+            Value::Scaled(r, s) => Value::Scaled(r.checked_abs().ok_or("integer overflow")?, *s),
+            Value::Int128(r, s) => Value::Int128(r.checked_abs().ok_or("integer overflow")?, *s),
+            Value::Double(d) => Value::Double(d.abs()),
+            _ => return Err("ABS over this kind unconverted".into()),
+        },
+        "SIGN" => Value::Int(match arg(0)? {
+            Value::Int(n) => n.signum(),
+            Value::Scaled(r, _) => r.signum(),
+            Value::Int128(r, _) => r.signum() as i64,
+            Value::Double(d) if d.is_nan() => return Err("SIGN of NaN unconverted".into()),
+            Value::Double(d) => (*d > 0.0) as i64 - (*d < 0.0) as i64,
+            Value::Float(f) => (*f > 0.0) as i64 - (*f < 0.0) as i64,
+            _ => return Err("SIGN over this kind unconverted".into()),
+        }),
+        "FLOOR" | "CEIL" | "CEILING" => {
+            let ceil = name != "FLOOR";
+            match arg(0)? {
+                Value::Double(_) | Value::Float(_) => {
+                    let d = sf_f64(arg(0)?)?;
+                    Value::Double(if ceil { d.ceil() } else { d.floor() })
+                }
+                v => {
+                    let (raw, s) = num_parts(v).ok_or("FLOOR over this kind unconverted")?;
+                    let unit = 10i128.checked_pow(u32::try_from(-(s as i64)).map_err(|_| "scale out of range")?).ok_or("integer overflow")?;
+                    let q = if ceil { -((-raw).div_euclid(unit)) } else { raw.div_euclid(unit) };
+                    mk_num(q, 0)
+                }
+            }
+        }
+        "ROUND" | "TRUNC" => {
+            let truncate = name == "TRUNC";
+            let decimals = match args.get(1) {
+                None => None,
+                // the engine's scale argument is a SCHAR: outside -128..127 it
+                // raises (fnargs: "The numeric scale must be between -128 and 127")
+                Some(v) => match sf_count(v)? {
+                    n if (-128..=127).contains(&n) => Some(n),
+                    _ => return Err(format!("{} scale outside -128..127: the engine raises", name)),
+                },
+            };
+            match arg(0)? {
+                // the engine rounds a double through an INTEGER path:
+                // ROUND(-0.125) is +0 where C's round gives -0, and 1e300
+                // raises 22003 - unconverted (measured, exeselect 16)
+                Value::Double(_) | Value::Float(_) => {
+                    return Err(format!("{} of a double unconverted", name));
+                }
+                v => {
+                    let (raw, s) = num_parts(v).ok_or("ROUND over this kind unconverted")?;
+                    sf_round_exact(raw, s, decimals, truncate)?
+                }
+            }
+        }
+        "MOD" => {
+            let a = sf_int_rounded(arg(0)?)?;
+            let b = sf_int_rounded(arg(1)?)?;
+            if b == 0 {
+                return Err("MOD by zero: the engine's 22012".into());
+            }
+            mk_num(a % b, 0)
+        }
+        "SQRT" => dbl(&|x| if x < 0.0 { Err("SQRT of a negative".into()) } else { Ok(x.sqrt()) })?,
+        "EXP" => dbl(&|x| Ok(x.exp()))?,
+        "LN" => dbl(&|x| if x <= 0.0 { Err("LN of a non-positive".into()) } else { Ok(x.ln()) })?,
+        "LOG10" => dbl(&|x| if x <= 0.0 { Err("LOG10 of a non-positive".into()) } else { Ok(x.log10()) })?,
+        "LOG" => {
+            let base = sf_f64(arg(0)?)?;
+            let x = sf_f64(arg(1)?)?;
+            if base <= 0.0 || x <= 0.0 || base == 1.0 {
+                return Err("LOG domain".into());
+            }
+            let r = x.ln() / base.ln();
+            if !r.is_finite() {
+                return Err("LOG: a non-finite result".into());
+            }
+            Value::Double(r)
+        }
+        "POWER" => {
+            let b = sf_f64(arg(0)?)?;
+            let e = sf_f64(arg(1)?)?;
+            if b < 0.0 && e.fract() != 0.0 {
+                return Err("POWER of a negative base to a fraction".into());
+            }
+            if b == 0.0 && e < 0.0 {
+                return Err("POWER of zero to a negative".into());
+            }
+            let r = b.powf(e);
+            if !r.is_finite() {
+                return Err("POWER: a non-finite result".into());
+            }
+            Value::Double(r)
+        }
+        "PI" => Value::Double(std::f64::consts::PI),
+        "SIN" => dbl(&|x| Ok(x.sin()))?,
+        "COS" => dbl(&|x| Ok(x.cos()))?,
+        "TAN" => dbl(&|x| Ok(x.tan()))?,
+        "COT" => dbl(&|x| {
+            let t = x.tan();
+            if t == 0.0 { Err("COT of a zero tangent".into()) } else { Ok(1.0 / t) }
+        })?,
+        "ASIN" => dbl(&|x| if !(-1.0..=1.0).contains(&x) { Err("ASIN domain".into()) } else { Ok(x.asin()) })?,
+        "ACOS" => dbl(&|x| if !(-1.0..=1.0).contains(&x) { Err("ACOS domain".into()) } else { Ok(x.acos()) })?,
+        "ATAN" => dbl(&|x| Ok(x.atan()))?,
+        "ATAN2" => {
+            let y = sf_f64(arg(0)?)?;
+            let x = sf_f64(arg(1)?)?;
+            if y == 0.0 && x == 0.0 {
+                return Err("ATAN2(0, 0): the engine raises".into());
+            }
+            Value::Double(y.atan2(x))
+        }
+        "SINH" => dbl(&|x| Ok(x.sinh()))?,
+        "COSH" => dbl(&|x| Ok(x.cosh()))?,
+        "TANH" => dbl(&|x| Ok(x.tanh()))?,
+        // the inverse hyperbolics by the engine's LOG FORMULAS (SysFunction.cpp),
+        // which differ from libm's in the last digit (builtins: ASINH(1) is
+        // ...429 there, ...430 from asinh())
+        "ASINH" => dbl(&|x| Ok((x + (x * x + 1.0).sqrt()).ln()))?,
+        "ACOSH" => dbl(&|x| if x < 1.0 { Err("ACOSH domain".into()) } else { Ok((x + (x * x - 1.0).sqrt()).ln()) })?,
+        "ATANH" => dbl(&|x| if x <= -1.0 || x >= 1.0 { Err("ATANH domain".into()) } else { Ok(0.5 * ((1.0 + x) / (1.0 - x)).ln()) })?,
+        "ASCII_VAL" => {
+            let t = sf_text(arg(0)?)?;
+            let c = t.chars().next().ok_or("ASCII_VAL of an empty string unconverted")?;
+            if !c.is_ascii() {
+                return Err("ASCII_VAL of a non-ASCII character unconverted".into());
+            }
+            Value::Int(c as i64)
+        }
+        "ASCII_CHAR" => {
+            let n = sf_count(arg(0)?)?;
+            if !(0..=127).contains(&n) {
+                return Err("ASCII_CHAR outside ASCII unconverted".into());
+            }
+            Value::Text((n as u8 as char).to_string())
+        }
+        "UNICODE_VAL" => {
+            let t = sf_text(arg(0)?)?;
+            let c = t.chars().next().ok_or("UNICODE_VAL of an empty string unconverted")?;
+            Value::Int(c as i64)
+        }
+        "UNICODE_CHAR" => {
+            let n = sf_count(arg(0)?)?;
+            let c = u32::try_from(n).ok().and_then(char::from_u32).ok_or("UNICODE_CHAR: not a code point")?;
+            Value::Text(c.to_string())
+        }
+        "LEFT" | "RIGHT" => {
+            let t: Vec<char> = sf_text(arg(0)?)?.chars().collect();
+            let n = sf_count(arg(1)?)?;
+            if n < 0 {
+                return Err("a negative LEFT / RIGHT count: the engine's 22011".into());
+            }
+            let n = (n as usize).min(t.len());
+            Value::Text(if name == "LEFT" { t[..n].iter().collect() } else { t[t.len() - n..].iter().collect() })
+        }
+        "LPAD" | "RPAD" => {
+            let t: Vec<char> = sf_text(arg(0)?)?.chars().collect();
+            let n = sf_count(arg(1)?)?;
+            if n < 0 {
+                return Err("a negative pad length: the engine's 22011".into());
+            }
+            let pad: Vec<char> = match args.get(2) {
+                None => vec![' '],
+                Some(p) => sf_text(p)?.chars().collect(),
+            };
+            if n > 16383 {
+                return Err("a pad past 16383 characters: the engine raises under UTF8, unconverted".into());
+            }
+            let n = n as usize;
+            if n <= t.len() {
+                Value::Text(t[..n].iter().collect())
+            } else if pad.is_empty() {
+                Value::Text(t.iter().collect())
+            } else {
+                let fill: String = pad.iter().cycle().take(n - t.len()).collect();
+                let body: String = t.iter().collect();
+                Value::Text(if name == "LPAD" { fill + &body } else { body + &fill })
+            }
+        }
+        "REVERSE" => Value::Text(sf_text(arg(0)?)?.chars().rev().collect()),
+        "REPLACE" => {
+            let t = sf_text(arg(0)?)?;
+            let from = sf_text(arg(1)?)?;
+            let to = sf_text(arg(2)?)?;
+            Value::Text(if from.is_empty() { t.to_string() } else { t.replace(from, to) })
+        }
+        "POSITION" => {
+            let sub: Vec<char> = sf_text(arg(0)?)?.chars().collect();
+            let t: Vec<char> = sf_text(arg(1)?)?.chars().collect();
+            let start = match args.get(2) {
+                None => 1,
+                Some(v) => sf_count(v)?,
+            };
+            if start < 1 {
+                return Err("POSITION start below 1 unconverted".into());
+            }
+            if sub.is_empty() {
+                if args.len() > 2 {
+                    return Err("POSITION of an empty string from a start unconverted".into());
+                }
+                Value::Int(1)
+            } else {
+                let from = (start - 1) as usize;
+                let mut hit = 0i64;
+                if from < t.len() {
+                    for i in from..t.len() {
+                        if t[i..].starts_with(&sub) {
+                            hit = i as i64 + 1;
+                            break;
+                        }
+                    }
+                }
+                Value::Int(hit)
+            }
+        }
+        "OVERLAY" => {
+            let t: Vec<char> = sf_text(arg(0)?)?.chars().collect();
+            let r: Vec<char> = sf_text(arg(1)?)?.chars().collect();
+            let from = sf_count(arg(2)?)?;
+            let len = match args.get(3) {
+                None => r.len() as i64,
+                Some(v) => sf_count(v)?,
+            };
+            if from < 1 || len < 0 {
+                return Err("OVERLAY bounds unconverted".into());
+            }
+            let from = ((from - 1) as usize).min(t.len());
+            let end = (from + len as usize).min(t.len());
+            let mut out: Vec<char> = t[..from].to_vec();
+            out.extend_from_slice(&r);
+            out.extend_from_slice(&t[end..]);
+            Value::Text(out.into_iter().collect())
+        }
+        "HEX_ENCODE" | "BASE64_ENCODE" => {
+            let t = sf_text(arg(0)?)?;
+            if !t.is_ascii() {
+                return Err(format!("{} of non-ASCII text unconverted", name));
+            }
+            Value::Text(if name == "HEX_ENCODE" {
+                t.bytes().map(|b| format!("{:02X}", b)).collect()
+            } else {
+                sf_base64(t.as_bytes())
+            })
+        }
+        "BIN_AND" | "BIN_OR" | "BIN_XOR" => {
+            let mut acc = sf_count(arg(0)?)?;
+            for v in &args[1..] {
+                let n = sf_count(v)?;
+                acc = match name {
+                    "BIN_AND" => acc & n,
+                    "BIN_OR" => acc | n,
+                    _ => acc ^ n,
+                };
+            }
+            Value::Int(acc)
+        }
+        "BIN_NOT" => Value::Int(!sf_count(arg(0)?)?),
+        "BIN_SHL" | "BIN_SHR" => {
+            let a = sf_count(arg(0)?)?;
+            let n = sf_count(arg(1)?)?;
+            if !(0..63).contains(&n) {
+                return Err("a shift count outside 0..62 unconverted".into());
+            }
+            Value::Int(if name == "BIN_SHL" {
+                a.checked_mul(1i64 << n).ok_or("BIN_SHL overflow unconverted")?
+            } else {
+                a >> n
+            })
+        }
+        "MAXVALUE" | "MINVALUE" => {
+            let mut best = arg(0)?;
+            for v in &args[1..] {
+                let o = value_cmp(v, best).ok_or("MAXVALUE / MINVALUE over incomparable kinds")?;
+                if (name == "MAXVALUE" && o == std::cmp::Ordering::Greater)
+                    || (name == "MINVALUE" && o == std::cmp::Ordering::Less)
+                {
+                    best = v;
+                }
+            }
+            best.clone()
+        }
+        "DATEADD" => {
+            let part = sf_part(arg(1)?)?;
+            // a DATE's units are whole (1.5 DAY rounds to 2); a sub-day unit on
+            // a TIMESTAMP / TIME scales the count to ticks first
+            let count = if part <= 2 || part == 9 { sf_int_rounded(arg(0)?)? } else { 0 };
+            sf_dateadd(count, part, arg(2)?, arg(0)?)?
+        }
+        "DATEDIFF" => sf_datediff(sf_part(arg(0)?)?, arg(1)?, arg(2)?)?,
+        "FIRST_DAY" => sf_first_last_day(sf_part(arg(0)?)?, arg(1)?, false)?,
+        "LAST_DAY" => sf_first_last_day(sf_part(arg(0)?)?, arg(1)?, true)?,
+        _ => return Err(format!("system function {} unconverted", name)),
+    })
+}
+
 fn num_parts(v: &Value) -> Option<(i128, i8)> {
     match v {
         Value::Int(n) => Some((*n as i128, 0)),
@@ -4034,6 +4709,10 @@ impl<'a> Exec<'a> {
                     mk_num(raw, sc)
                 }
             }
+            Expr::SysFn(name, args) => {
+                let vals = args.iter().map(|a| self.eval(a)).collect::<Result<Vec<_>, _>>()?;
+                sys_fn(name, &vals)?
+            }
             Expr::Variable(n) => self
                 .variables
                 .get(*n as usize)
@@ -4378,6 +5057,11 @@ fn expr_contexts(e: &Expr, out: &mut Vec<u8>) -> Option<()> {
         Expr::Literal(_) | Expr::Null | Expr::Parameter(..) => {}
         Expr::Arith(_, a, b) => { expr_contexts(a, out)?; expr_contexts(b, out)? }
         Expr::Negate(a) | Expr::CaseMap(_, a) | Expr::StrLen(_, a) | Expr::Trim(_, a) | Expr::Cast(_, a) => expr_contexts(a, out)?,
+        Expr::SysFn(_, v) => {
+            for a in v {
+                expr_contexts(a, out)?;
+            }
+        }
         _ => return None,
     }
     Some(())
@@ -4557,7 +5241,7 @@ pub fn shape(req: &Request) -> Shape {
                     }
                     v.iter().for_each(|x| self.expr(x))
                 }
-                Expr::Function(_, _, v) => v.iter().for_each(|x| self.expr(x)),
+                Expr::Function(_, _, v) | Expr::SysFn(_, v) => v.iter().for_each(|x| self.expr(x)),
                 Expr::Decode(a, c, r) => {
                     self.expr(a);
                     for x in c { self.pair(a, x) }

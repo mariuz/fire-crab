@@ -131,6 +131,19 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       (the engine's -206). Unmeasured and refused: an aggregate / UNION / join INSIDE a derived table, DISTINCT over
       an expression item, GROUP BY over one, ORDER BY an ordinal inside, a derived table in a subroutine or a view
       without alias. Gates: dsql-proc-blr 397, dsql-view-blr 133 (five new derived cells).
+      Slice 17 (2026-10-07): exe runs blr_sys_function (Expr::SysFn, `sys_fn` in crates/exe). Laws measured on 2196
+      (scratchpad sysfnprobe, 150 cells): ROUND/TRUNC over an exact keep the STORAGE scale when a scale is given
+      (ROUND(2.675, 1) = 2.70 as NUMERIC(9,2); a scale beyond the stored decimals leaves the value; a negative scale
+      rounds the integer part), scale 0 without one; FLOOR/CEILING of an exact -> INT64 (LONG for a SMALLINT), of a
+      double -> DOUBLE; SIGN -> SMALLINT; ABS widens exacts to INT64; MOD ROUNDS BOTH OPERANDS TO INTEGERS (MOD(2.675, 2)
+      = 1, MOD(1.235, 7) = 1) then C's %; the double functions raise on domain errors (SQRT(-1), LN(0), LOG(2, 0)) and
+      on a non-finite result (EXP(1000) 22003); ROUND/TRUNC of a DOUBLE go through an INTEGER path (ROUND(-0.125) = +0,
+      ROUND(1e300) raises) - unconverted; DATEADD(1.5 DAY) adds 2 (rounded); DATEDIFF(MILLISECOND) is INT64 scale -1;
+      MAXVALUE(D, TS) is HY004; LEFT(S, -1) 22011; POSITION('', S) = 1; LPAD truncates to the length. The route's
+      ATT_SUBTYPE rule still declines text-function outputs under a NONE attachment (cells run with CS=UTF8). Still
+      unconverted: HASH (the engine's own algorithm), CRYPT_HASH, GEN_UUID/RAND/UUID functions, RDB$GET/SET_CONTEXT,
+      QUANTIZE/NORMALIZE_DECFLOAT/COMPARE_DECFLOAT/TOTALORDER, HEX_DECODE/BASE64_DECODE (binary), WEEK in DATEDIFF
+      and FIRST_DAY, DATEADD past midnight on a TIME, ASCII_VAL/ASCII_CHAR outside ASCII.
       Slice 13: SPEED. exe resolved every blr_field through RDB$RELATION_FIELDS on EVERY evaluation and cloned the row
       (a 20,000-row scan with one comparison: 6 s) - the field id is cached per statement now (80 ms). And an equality
       conjunct `<column> = <literal | ?>` over an exact-numeric column with a live plain single-segment index retrieves

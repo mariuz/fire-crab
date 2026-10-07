@@ -120,6 +120,22 @@ feature has to be built twice.
       rather than guessing. 34 new byte-checked cells across the two BLR
       gates; three stale pins promoted. Still refused: an aggregate, a UNION
       or a join inside a derived table, LIST, COLLATE expressions.
+    - Slice 17 (2026-10-07): **the executor runs `blr_sys_function`** - the
+      566 statements dsql now compiled but `exe` could not parse. ABS,
+      SIGN, FLOOR / CEILING, ROUND / TRUNC (an exact keeps its storage scale
+      at a given scale; a double is unconverted, the engine rounding it
+      through an integer path), MOD (both operands ROUNDED to integers
+      first, the engine's quirk), the double functions (SQRT, EXP, LN, LOG,
+      LOG10, POWER, PI, the trigonometric and hyperbolic set; a domain error
+      or a non-finite result fails the run as the engine raises), the text
+      functions in characters (LEFT, RIGHT, LPAD, RPAD, REVERSE, REPLACE,
+      POSITION, OVERLAY, ASCII_VAL / ASCII_CHAR, UNICODE_VAL / UNICODE_CHAR,
+      HEX_ENCODE, BASE64_ENCODE), the BIN_ functions, MAXVALUE / MINVALUE,
+      DATEADD (calendar months with the day clamped, ticks otherwise, a
+      fraction rounded), DATEDIFF (by field; MILLISECOND as NUMERIC(18,1)),
+      FIRST_DAY / LAST_DAY. Unconverted and declined: HASH, the UUID and
+      random functions, the context functions, the DECFLOAT functions, the
+      binary decoders. 16 new route cells.
     - Next: the remaining compile classes - COLLATE expressions (which the
       executor could not serve anyway), windows beside GROUP BY, derived
       tables and CTEs, UNION in a derived table, NULLS FIRST / LAST, LIST;
