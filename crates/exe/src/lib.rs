@@ -2420,10 +2420,14 @@ impl<'a> Exec<'a> {
             bindings = kept;
         }
         // the DISTINCT project: sort-based unique on the projected
-        // values, NULL grouping with NULL (set semantics)
+        // values, NULL grouping with NULL (set semantics). Of equal keys
+        // the engine keeps the LAST row in record order (collkey: PAD
+        // SPACE-equal 'abc' and 'abc ' survive as the one fed last) - the
+        // rows go in reversed so the stable sort puts the last first and
+        // the dedup, which keeps the first of a run, keeps it
         if !rse.project.is_empty() {
             let mut keyed: Vec<(Vec<Value>, Vec<StreamFrame>)> = Vec::new();
-            for binding in bindings {
+            for binding in bindings.into_iter().rev() {
                 let keys = self.with_binding(&binding, |ex| {
                     rse.project.iter().map(|e| ex.eval(e)).collect::<Result<Vec<_>, _>>()
                 })?;

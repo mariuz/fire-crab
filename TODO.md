@@ -119,6 +119,18 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       old refusals promoted after measuring). Still refused: NULLS FIRST/LAST (7 sort-tuple sites), LIST, derived
       tables / CTEs (the engine DISSOLVES a one-table derived table into blr_relation2 with alias `"D" "PUBLIC"."T"`),
       COLLATE expressions, text beside a number in a CASE, FLOAT beside INT64, a window's FILTER.
+      Slice 16 (2026-10-07): NULLS FIRST / LAST (Val::NullsPlaced wraps the sort key; emit_sort_key writes B2 / B4
+      before the direction byte at all four sort emit sites; exe declines the bytes - "sort direction 180 unconverted");
+      an UNSELECTED group field as a sort key takes a new map slot after the items (measured); DERIVED TABLES: the
+      inner select is ONE nested blr_rse in the stream slot - FIRST, SKIP, WHERE, ORDER BY, DISTINCT's blr_project in
+      that order inside it; relation2 alias `"D" "PUBLIC"."T"` / `"D" "A"` over an inner alias / plain blr_relation
+      when alias-less; an expression item is NOT stored in the rse but wrapped as blr_derived_expr(ctx) at every
+      outer reference (select, WHERE, an aggregate's argument); an aggregate over a derived table nests it as the
+      aggregate's stream; joins of derived tables are blr_join of nested rses; CTEs reuse the same body. field()
+      now translates derived columns inside a JOIN scope too and an alias-less derived table answers to no qualifier
+      (the engine's -206). Unmeasured and refused: an aggregate / UNION / join INSIDE a derived table, DISTINCT over
+      an expression item, GROUP BY over one, ORDER BY an ordinal inside, a derived table in a subroutine or a view
+      without alias. Gates: dsql-proc-blr 397, dsql-view-blr 133 (five new derived cells).
       Slice 13: SPEED. exe resolved every blr_field through RDB$RELATION_FIELDS on EVERY evaluation and cloned the row
       (a 20,000-row scan with one comparison: 6 s) - the field id is cached per statement now (80 ms). And an equality
       conjunct `<column> = <literal | ?>` over an exact-numeric column with a live plain single-segment index retrieves

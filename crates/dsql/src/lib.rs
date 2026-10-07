@@ -526,6 +526,24 @@ enum Val {
     /// a text literal stamped with an EXPLICIT set (CRYPT_HASH's algorithm
     /// name is text2 in ASCII, charset 2 - measured)
     StrCs(String, u16),
+    /// a SORT KEY written with NULLS FIRST (blr_nullsfirst 0xB2) or NULLS
+    /// LAST (0xB4): the byte goes BEFORE the key's direction byte, in a
+    /// statement's ORDER BY, an aggregate's and a window's alike (measured);
+    /// only [emit_sort_key] reads it - it never stands as a value
+    NullsPlaced(u8, Box<Val>),
+}
+
+/// One sort key: `[nulls byte] <ascending|descending> <value>`.
+fn emit_sort_key(out: &mut Vec<u8>, descending: bool, key: &Val) {
+    let key = match key {
+        Val::NullsPlaced(nulls, inner) => {
+            out.push(*nulls);
+            inner.as_ref()
+        }
+        other => other,
+    };
+    out.push(if descending { blr::DESCENDING } else { blr::ASCENDING });
+    emit_val(out, key);
 }
 
 /// A cast target descriptor, exactly the dsc bytes blr_cast carries
@@ -1071,7 +1089,7 @@ fn stamp_val(v: &mut Val, cn: &str) {
             stamp_val(a, cn);
             stamp_val(b, cn);
         }
-        Val::Neg(a) | Val::Upper(a) | Val::Lower(a) | Val::Extract(_, a) => stamp_val(a, cn),
+        Val::Neg(a) | Val::Upper(a) | Val::Lower(a) | Val::Extract(_, a) | Val::NullsPlaced(_, a) => stamp_val(a, cn),
         _ => {}
     }
 }
@@ -1413,11 +1431,30 @@ struct Stream {
 #[derive(Clone, Debug, PartialEq)]
 struct Derived {
     wher: Option<Bool>,
-    /// the derived column list as (outer name, inner name) pairs -
-    /// pass-through columns map to themselves, `col AS alias` maps
-    /// the ALIAS to the inner column; outer references translate to
-    /// the INNER name at the shared context (probed)
-    cols: Vec<(String, String)>,
+    /// the derived column list as (outer name, inner value): a pass-through
+    /// column maps to itself, `col [AS] alias` maps the ALIAS to the inner
+    /// column, an expression item to the expression - which every outer
+    /// reference wraps in blr_derived_expr over the shared context
+    /// (measured: `SELECT X + 1 FROM (SELECT N + 1 X FROM T) D` is
+    /// `add(derived_expr(ctx, add(N, 1)), 1)`); outer references translate
+    /// at the SAME context, the derived table having none of its own
+    cols: Vec<(String, DCol)>,
+    /// the inner relation's own alias: the nested relation2's alias text
+    /// is then `"D" "A"` instead of `"D" "PUBLIC"."T"` (measured)
+    inner_alias: Option<String>,
+    /// the inner select's FIRST / SKIP, WHERE (`wher`), ORDER BY and
+    /// DISTINCT (blr_project over the items) - inside the nested rse in
+    /// that order (measured)
+    first: Option<Val>,
+    skip: Option<Val>,
+    sort: Vec<(bool, Val)>,
+    project: Option<Vec<Val>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum DCol {
+    Col(String),
+    Expr(Val),
 }
 
 /// One slot of an aggregate's blr_map: a group-key value or an
@@ -1616,79 +1653,73 @@ impl<'a> P<'a> {
     /// through the catalog, which this catalog-free compiler refuses
     /// rather than guessing.
     fn field(&self, qualifier: Option<&str>, name: &str) -> Option<Val> {
-        // inside a MERGE's ON/SET/VALUES only the source and target
-        // streams are visible, and bare names refuse (catalog-free -
-        // the engine resolves them through column lists)
-        if let Some((start, end)) = self.merge_scope {
-            let Some(q) = qualifier else {
-                // a BARE name over several streams: the catalog says which
-                // one owns the column - exactly one (the employee sample's
-                // SHIP_ORDER reads `po_number` across `sales s, customer c`)
-                let hits: Vec<usize> = (start..end)
-                    .filter(|&i| {
-                        self.streams[i].derived.is_none() && catalog_has(&self.streams[i].name, name)
-                    })
-                    .collect();
-                if hits.len() != 1 {
-                    return None;
-                }
-                return Some(Val::Field(hits[0] as u8 + self.base, name.to_string()));
-            };
-            let hit = |st: &Stream| {
-                st.alias.as_deref().map_or(st.name == q, |a| a == q)
-            };
-            let idx = (start..end).find(|&i| hit(&self.streams[i]))?;
-            return Some(Val::Field(idx as u8 + self.base, name.to_string()));
-        }
-        let n_outer = self.outer.unwrap_or(self.streams.len());
-        let ctx = match qualifier {
-            Some(q) => {
-                let hit = |st: &Stream| {
-                    st.alias.as_deref().map_or(st.name == q, |a| a == q)
-                };
-                let idx = self
-                    .streams
-                    .iter()
-                    .take(n_outer)
-                    .position(hit)
-                    .or_else(|| {
-                        self.host.filter(|&hi| hit(&self.streams[hi]))
-                    })
-                    .or_else(|| {
-                        self.sub
-                            .filter(|&si| hit(&self.streams[si]))
-                    })?;
-                idx as u8 + self.base
-            }
-            None => match self.sub {
-                Some(si) => si as u8 + self.base,
-                None => {
-                    if n_outer != 1 {
-                        // several streams: the catalog says which one
-                        // owns the column - exactly one, or the name
-                        // is ambiguous / unknown and refuses
-                        let hits: Vec<usize> = (0..n_outer)
-                            .filter(|&i| {
-                                self.streams[i].derived.is_none()
-                                    && catalog_has(&self.streams[i].name, name)
-                            })
-                            .collect();
-                        if hits.len() != 1 {
-                            return None;
-                        }
-                        return Some(Val::Field(hits[0] as u8 + self.base, name.to_string()));
-                    }
-                    self.base
-                }
-            },
+        // Which stream a reference names (then the tail translates a
+        // DERIVED stream's outer name). A stream answers to its alias, else
+        // to its relation's name - but an ALIAS-LESS DERIVED table answers to
+        // no qualifier at all (the engine's -206 for `SELECT X.ID FROM
+        // (SELECT ID FROM T)`); a bare name belongs to the one stream whose
+        // relation has the column, or whose DERIVED list names it. Inside a
+        // MERGE / JOIN scope only the scope's streams are asked; a subquery
+        // asks its own stream first, then the host's.
+        let hits_q = |st: &Stream, q: &str| {
+            st.alias.as_deref().map_or(st.derived.is_none() && st.name == q, |a| a == q)
         };
-        // a DERIVED stream translates outer names to the inner
-        // column through its recorded list (probed: D.X emitted the
-        // underlying UID)
+        let has_col = |st: &Stream| match &st.derived {
+            None => catalog_has(&st.name, name),
+            Some(d) => d.cols.iter().any(|(o, _)| o == name),
+        };
+        let n_outer = self.outer.unwrap_or(self.streams.len());
+        let ctx = if let Some((start, end)) = self.merge_scope {
+            match qualifier {
+                None => {
+                    let hits: Vec<usize> = (start..end).filter(|&i| has_col(&self.streams[i])).collect();
+                    if hits.len() != 1 {
+                        return None;
+                    }
+                    hits[0] as u8 + self.base
+                }
+                Some(q) => {
+                    let idx = (start..end).find(|&i| hits_q(&self.streams[i], q))?;
+                    idx as u8 + self.base
+                }
+            }
+        } else {
+            match qualifier {
+                Some(q) => {
+                    let hit = |st: &Stream| hits_q(st, q);
+                    let idx = self
+                        .streams
+                        .iter()
+                        .take(n_outer)
+                        .position(hit)
+                        .or_else(|| self.host.filter(|&hi| hit(&self.streams[hi])))
+                        .or_else(|| self.sub.filter(|&si| hit(&self.streams[si])))?;
+                    idx as u8 + self.base
+                }
+                None => match self.sub {
+                    Some(si) => si as u8 + self.base,
+                    None => {
+                        if n_outer != 1 {
+                            let hits: Vec<usize> =
+                                (0..n_outer).filter(|&i| has_col(&self.streams[i])).collect();
+                            if hits.len() != 1 {
+                                return None;
+                            }
+                            hits[0] as u8 + self.base
+                        } else {
+                            self.base
+                        }
+                    }
+                },
+            }
+        };
         let idx = (ctx - self.base) as usize;
         if let Some(d) = &self.streams[idx].derived {
             let (_, inner) = d.cols.iter().find(|(o, _)| o == name)?;
-            return Some(Val::Field(ctx, inner.clone()));
+            return Some(match inner {
+                DCol::Col(n) => Val::Field(ctx, n.clone()),
+                DCol::Expr(e) => Val::DerivedWrap(ctx, Box::new(e.clone())),
+            });
         }
         Some(Val::Field(ctx, name.to_string()))
     }
@@ -1775,23 +1806,31 @@ impl<'a> P<'a> {
             return None;
         }
         self.i += 1;
-        let Some(Tok::Ident(alias)) = self.t.get(self.i) else {
-            return None; // an alias-less derived table: unprobed
+        // an alias-less derived table nests a plain blr_relation (measured)
+        let alias = match self.t.get(self.i) {
+            Some(Tok::Ident(a)) if !is_keyword(a) => {
+                let a = a.clone();
+                self.i += 1;
+                Some(a)
+            }
+            _ => None,
         };
-        if is_keyword(alias) {
-            return None;
-        }
-        let alias = alias.clone();
-        self.i += 1;
-        Some(Stream {
-            alias: Some(alias),
-            ..st
-        })
+        Some(Stream { alias, ..st })
     }
 
     /// The body of a derived table or a WITH cte: `SELECT cols FROM
     /// tbl [WHERE ...]` - the resulting stream carries the given
     /// alias and the recorded column pairs.
+    /// The inner select of a derived table (or a CTE body), self.i on its
+    /// SELECT. Measured on 2196: the whole of it nests as ONE blr_rse
+    /// standing as a stream - FIRST, SKIP, the WHERE, the ORDER BY and a
+    /// DISTINCT's blr_project in that order inside it; the inner relation
+    /// takes the derived table's context, aliased `"D" "PUBLIC"."T"` (or
+    /// `"D" "A"` over an inner alias); an item's expression is NOT stored
+    /// here but at every outer reference ([DCol]). Parsed in two phases
+    /// like a statement's select list: the FROM first, so the items see
+    /// their stream. Still refused: `*`, an aggregate or a UNION or a join
+    /// inside, a derived table in a subroutine, ORDER BY an ordinal.
     fn derived_body(&mut self, alias: String) -> Option<Stream> {
         if self.in_sub {
             return None; // derived tables in subroutines: unprobed
@@ -1799,19 +1838,72 @@ impl<'a> P<'a> {
         if !self.kw("SELECT") {
             return None;
         }
-        // the column list: bare columns (traceless pass-through) or
-        // `col AS alias` - outer references translate to the INNER
-        // name through the recorded pairs (probed)
-        let mut cols: Vec<(String, String)> = Vec::new();
-        loop {
-            let Some(Tok::Ident(n)) = self.t.get(self.i) else {
-                return None; // *, expressions, quals: unprobed
-            };
-            if is_keyword(n) {
-                return None;
+        let mut first = None;
+        let mut skip = None;
+        if self.kw("FIRST") {
+            first = Some(self.limit_operand()?);
+        }
+        if self.kw("SKIP") {
+            skip = Some(self.limit_operand()?);
+        }
+        let distinct = self.kw("DISTINCT");
+        let list_start = self.i;
+        let mut depth = 0i32;
+        let list_end = loop {
+            match self.t.get(self.i)? {
+                Tok::LParen => {
+                    depth += 1;
+                    self.i += 1;
+                }
+                Tok::RParen => {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                    self.i += 1;
+                }
+                Tok::Ident(w) if w == "FROM" && depth == 0 => break self.i,
+                _ => self.i += 1,
             }
-            let n = n.clone();
-            self.i += 1;
+        };
+        self.i = list_end + 1;
+        let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+            return None;
+        };
+        if is_keyword(name) {
+            return None;
+        }
+        let name = name.clone();
+        self.i += 1;
+        let inner_alias = match self.t.get(self.i) {
+            Some(Tok::Ident(a)) if !is_keyword(a) => {
+                let a = a.clone();
+                self.i += 1;
+                Some(a)
+            }
+            _ => None,
+        };
+        let after_from = self.i;
+        self.streams.push(Stream {
+            name: name.clone(),
+            alias: inner_alias.clone(),
+            derived: None,
+            sub: self.in_sub,
+            cur: None,
+            proc_args: None,
+        });
+        let si = self.streams.len() - 1;
+        let saved = self.sub.replace(si);
+        // the items, against the inner stream
+        self.i = list_start;
+        let mut cols: Vec<(String, DCol)> = Vec::new();
+        let mut project: Vec<Val> = Vec::new();
+        let mut any_expr = false;
+        loop {
+            if matches!(self.t.get(self.i), Some(Tok::Star)) {
+                return None; // `*`: unprobed
+            }
+            let v = self.val()?;
             let outer = if self.kw("AS") {
                 let Some(Tok::Ident(a)) = self.t.get(self.i) else {
                     return None;
@@ -1822,48 +1914,82 @@ impl<'a> P<'a> {
                 let a = a.clone();
                 self.i += 1;
                 a
+            } else if let Some(Tok::Ident(a)) = self.t.get(self.i).filter(|t| matches!(t, Tok::Ident(a) if !is_keyword(a))) {
+                let a = a.clone();
+                self.i += 1;
+                a
             } else {
-                n.clone()
+                match &v {
+                    Val::Field(_, inner) => inner.clone(),
+                    _ => return None, // an expression needs its name
+                }
             };
-            cols.push((outer, n));
+            let dcol = match &v {
+                Val::Field(_, inner) => DCol::Col(inner.clone()),
+                other => {
+                    any_expr = true;
+                    DCol::Expr(other.clone())
+                }
+            };
+            project.push(v);
+            cols.push((outer, dcol));
             match self.t.get(self.i)? {
                 Tok::Comma => self.i += 1,
-                Tok::Ident(w) if w == "FROM" => {
-                    self.i += 1;
-                    break;
-                }
+                Tok::Ident(w) if w == "FROM" => break,
                 _ => return None,
             }
         }
-        let Some(Tok::Ident(name)) = self.t.get(self.i) else {
-            return None;
-        };
-        if is_keyword(name) {
+        if self.i != list_end {
             return None;
         }
-        let name = name.clone();
-        self.i += 1;
-        self.streams.push(Stream {
-            name: name.clone(),
-            alias: None,
-            derived: None,
-            sub: self.in_sub,
-            cur: None,
-            proc_args: None,
-        });
-        let si = self.streams.len() - 1;
-        let saved = self.sub.replace(si);
+        self.i = after_from;
         let wher = if self.kw("WHERE") {
             Some(self.bool_or()?)
         } else {
             None
         };
+        let mut sort: Vec<(bool, Val)> = Vec::new();
+        if self.kw("ORDER") {
+            if !self.kw("BY") {
+                return None;
+            }
+            loop {
+                let key = self.val()?;
+                if matches!(key, Val::Int(_) | Val::Int64(_) | Val::Dec(..)) {
+                    return None; // an ordinal inside a derived table: unprobed
+                }
+                let descending = if self.kw("DESC") {
+                    true
+                } else {
+                    let _ = self.kw("ASC");
+                    false
+                };
+                let key = self.nulls_placement(key)?;
+                sort.push((descending, key));
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
         self.sub = saved;
         self.streams.pop();
+        if distinct && any_expr {
+            return None; // a projection over an expression item: unprobed
+        }
         Some(Stream {
             name,
             alias: if alias.is_empty() { None } else { Some(alias) },
-            derived: Some(Box::new(Derived { wher, cols })),
+            derived: Some(Box::new(Derived {
+                wher,
+                cols,
+                inner_alias,
+                first,
+                skip,
+                sort,
+                project: if distinct { Some(project) } else { None },
+            })),
             sub: self.in_sub,
             cur: None,
             proc_args: None,
@@ -2942,6 +3068,23 @@ impl<'a> P<'a> {
         Some(v)
     }
 
+    /// `NULLS FIRST` / `NULLS LAST` after a sort key's direction: wraps the
+    /// key for [emit_sort_key] (measured: `B2` / `B4` before the direction
+    /// byte, emitted whenever written - the default placement too)
+    fn nulls_placement(&mut self, key: Val) -> Option<Val> {
+        if !self.kw("NULLS") {
+            return Some(key);
+        }
+        let b = if self.kw("FIRST") {
+            0xB2
+        } else if self.kw("LAST") {
+            0xB4
+        } else {
+            return None;
+        };
+        Some(Val::NullsPlaced(b, Box::new(key)))
+    }
+
     /// The catalog type of a column the statement reads: the stream the
     /// context numbers, then [catalog_type] of its relation. A derived
     /// table, a cursor or a procedure stream has no catalog type.
@@ -3788,6 +3931,7 @@ fn is_keyword(w: &str) -> bool {
             | "ESCAPE"
             | "FILTER"
             | "PLACING"
+            | "NULLS"
             | "IN"
             | "WHERE"
             | "FROM"
@@ -4160,6 +4304,9 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.extend_from_slice(&(text.len() as u16).to_le_bytes());
             out.extend_from_slice(text.as_bytes());
         }
+        // a placement reaching a value position would be a parser slip:
+        // emit the key it wraps (emit_sort_key is the one reader)
+        Val::NullsPlaced(_, inner) => emit_val(out, inner),
         Val::Fn(name, args) => {
             out.push(blr::FUNCTION);
             out.push(name.len() as u8);
@@ -4409,24 +4556,53 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
         return;
     }
     if let Some(d) = &st.derived {
-        // a derived table is an rse in the stream slot; its relation2
-        // alias text carries the alias AND the schema-qualified
-        // underlying table (probed: `(SELECT ID FROM T) X` stores
-        // `"X" "PUBLIC"."T"`); inner and outer references share the
-        // ONE context
         out.push(blr::RSE);
         out.push(1);
-        out.push(blr::RELATION2);
-        out.push(st.name.len() as u8);
-        out.extend_from_slice(st.name.as_bytes());
-        let alias = st.alias.as_deref().unwrap_or("");
-        let text = format!("\"{}\" \"PUBLIC\".\"{}\"", alias, st.name);
-        out.push(text.len() as u8);
-        out.extend_from_slice(text.as_bytes());
+        match &st.alias {
+            // alias-less: a plain blr_relation inside (measured)
+            None => {
+                out.push(0x4A); // blr_relation
+                out.push(st.name.len() as u8);
+                out.extend_from_slice(st.name.as_bytes());
+            }
+            Some(alias) => {
+                out.push(blr::RELATION2);
+                out.push(st.name.len() as u8);
+                out.extend_from_slice(st.name.as_bytes());
+                let text = match &d.inner_alias {
+                    Some(ia) => format!("\"{}\" \"{}\"", alias, ia),
+                    None => format!("\"{}\" \"PUBLIC\".\"{}\"", alias, st.name),
+                };
+                out.push(text.len() as u8);
+                out.extend_from_slice(text.as_bytes());
+            }
+        }
         out.push(ctx);
+        if let Some(v) = &d.first {
+            out.push(blr::FIRST);
+            emit_val(out, v);
+        }
+        if let Some(v) = &d.skip {
+            out.push(blr::SKIP);
+            emit_val(out, v);
+        }
         if let Some(w) = &d.wher {
             out.push(blr::BOOLEAN);
             emit_bool(out, w);
+        }
+        if !d.sort.is_empty() {
+            out.push(blr::SORT);
+            out.push(d.sort.len() as u8);
+            for (desc, k) in &d.sort {
+                emit_sort_key(out, *desc, k);
+            }
+        }
+        if let Some(pr) = &d.project {
+            out.push(0x45); // blr_project
+            out.push(pr.len() as u8);
+            for v in pr {
+                emit_val(out, v);
+            }
         }
         out.push(blr::END);
         return;
@@ -4583,6 +4759,9 @@ pub fn compile_view_columns(sql: &str) -> Option<Vec<Option<Vec<u8>>>> {
     }
     // the streams, exactly as the view's RSE numbers them
     let first = p.stream_item()?;
+    if first.derived.is_some() && first.alias.is_none() {
+        return None; // an alias-less derived table in a VIEW: unmeasured
+    }
     p.streams.push(first);
     if matches!(p.t.get(p.i), Some(Tok::Comma)) {
         while matches!(p.t.get(p.i), Some(Tok::Comma)) {
@@ -4732,6 +4911,9 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
     // join to its LEFT, so the chain nests left (probed: the second
     // join's node contains the first as its first stream slot)
     let first = p.stream_item()?;
+    if first.derived.is_some() && first.alias.is_none() {
+        return None; // an alias-less derived table in a VIEW: unmeasured
+    }
     p.streams.push(first);
     // each chained join: (join-type byte - 0 for INNER, which emits NO
     // blr_join_type sub-clause; 1/2/3 for LEFT/RIGHT/FULL - and its ON)
@@ -5102,6 +5284,7 @@ fn map_val_to_fid(map: &[MapEntry], v: &Val, fid_ctx: u8) -> Option<Val> {
             })
         }
         Val::Neg(a) => Some(Val::Neg(Box::new(map_val_to_fid(map, a, fid_ctx)?))),
+        Val::NullsPlaced(n, a) => Some(Val::NullsPlaced(*n, Box::new(map_val_to_fid(map, a, fid_ctx)?))),
         // anything richer over an aggregate's output: unprobed
         _ => None,
     }
@@ -5227,12 +5410,7 @@ fn emit_cursor_decl(out: &mut Vec<u8>, d: &CursorDecl) {
         out.push(blr::SORT);
         out.push(d.sort.len() as u8);
         for (desc, key) in &d.sort {
-            out.push(if *desc {
-                blr::DESCENDING
-            } else {
-                blr::ASCENDING
-            });
-            emit_val(out, key);
+            emit_sort_key(out, *desc, key);
         }
     }
     out.push(blr::END);
@@ -6947,12 +7125,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                             out.push(2); // win_order
                             out.push(w.ord.len() as u8);
                             for (desc, k) in &w.ord {
-                                out.push(if *desc {
-                                    blr::DESCENDING
-                                } else {
-                                    blr::ASCENDING
-                                });
-                                emit_val(out, k);
+                                emit_sort_key(out, *desc, k);
                             }
                         }
                         out.push(3); // win_map
@@ -6990,12 +7163,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     out.push(blr::SORT);
                     out.push(w.ord.len() as u8);
                     for (desc, k) in &w.ord {
-                        out.push(if *desc {
-                            blr::DESCENDING
-                        } else {
-                            blr::ASCENDING
-                        });
-                        emit_val(out, k);
+                        emit_sort_key(out, *desc, k);
                     }
                     out.push(blr::MAP);
                     out.extend_from_slice(
@@ -7064,12 +7232,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.push(blr::SORT);
                 out.push(f.sort.len() as u8);
                 for (desc, key) in &f.sort {
-                    out.push(if *desc {
-                        blr::DESCENDING
-                    } else {
-                        blr::ASCENDING
-                    });
-                    emit_val(out, key);
+                    emit_sort_key(out, *desc, key);
                 }
             }
             if f.distinct {
@@ -7291,9 +7454,6 @@ impl<'a> P<'a> {
                 break;
             };
             let st2 = self.stream_item()?;
-            if st2.derived.is_some() {
-                return None;
-            }
             self.streams.push(st2.clone());
             let ctx2 = (self.streams.len() - 1) as u8 + self.base;
             if !self.kw("ON") {
@@ -7316,9 +7476,6 @@ impl<'a> P<'a> {
             }
             self.i += 1;
             let st2 = self.stream_item()?;
-            if st2.derived.is_some() {
-                return None;
-            }
             self.streams.push(st2.clone());
             let ctx2 = (self.streams.len() - 1) as u8 + self.base;
             joins.push((JOIN_COMMA, st2, ctx2, Bool::Missing(Val::Null)));
@@ -7704,14 +7861,14 @@ impl<'a> P<'a> {
         if union_.is_some() && has_wins {
             return None;
         }
-        // a DERIVED stream (probed pass-through at body numbering)
-        // beside aggregates, windows, joins, FIRST/SKIP: unprobed
-        if stream.derived.is_some()
-            && (aggregate
-                || has_wins
-                || !joins.is_empty()
-                || first.is_some()
-                || skip.is_some())
+        // a DERIVED stream beside a window: unprobed; a GROUP BY over an
+        // EXPRESSION item of one: unprobed (the aggregate, FIRST / SKIP and
+        // join shapes are measured - the nested rse stands as the stream)
+        if stream.derived.is_some() && has_wins {
+            return None;
+        }
+        if grouped
+            && stream.derived.as_ref().is_some_and(|d| d.cols.iter().any(|(_, c)| matches!(c, DCol::Expr(_))))
         {
             return None;
         }
@@ -7845,6 +8002,20 @@ impl<'a> P<'a> {
                         }
                     }
                 } else if aggregate {
+                    // an UNSELECTED group field as a sort key takes a new
+                    // map slot after the items (measured: `SELECT COUNT(*) ..
+                    // GROUP BY DEPT_ID ORDER BY DEPT_ID` maps the count, then
+                    // the key, and sorts on fid 1)
+                    if let Val::Field(..) = &key {
+                        let mut gf = Vec::new();
+                        for k in &group_keys {
+                            collect_fields(k, &mut gf);
+                        }
+                        let entry = MapEntry::Key(key.clone());
+                        if gf.contains(&key) && !self.agg_map.contains(&entry) {
+                            self.agg_map.push(entry);
+                        }
+                    }
                     map_val_to_fid(&self.agg_map, &key, self.agg_fid_ctx)?
                 } else {
                     key
@@ -7855,6 +8026,7 @@ impl<'a> P<'a> {
                     let _ = self.kw("ASC");
                     false
                 };
+                let key = self.nulls_placement(key)?;
                 sort.push((descending, key));
                 if matches!(self.t.get(self.i), Some(Tok::Comma)) {
                     self.i += 1;
@@ -8038,11 +8210,7 @@ impl<'a> P<'a> {
             self.i += 1;
             // FIRST/SKIP refuse beside the structures they always
             // have - re-check now that they may have just appeared
-            if has_wins
-                || union_.is_some()
-                || !joins.is_empty()
-                || stream.derived.is_some()
-            {
+            if has_wins || union_.is_some() || !joins.is_empty() {
                 return None;
             }
         }
@@ -8079,11 +8247,7 @@ impl<'a> P<'a> {
                 // ROWS n alone is blr_first n (measured)
                 first = Some(Val::Int(m));
             }
-            if has_wins
-                || union_.is_some()
-                || !joins.is_empty()
-                || stream.derived.is_some()
-            {
+            if has_wins || union_.is_some() || !joins.is_empty() {
                 return None;
             }
         }
@@ -8880,6 +9044,7 @@ impl<'a> P<'a> {
                     let _ = self.kw("ASC");
                     false
                 };
+                let key = self.nulls_placement(key)?;
                 sort.push((descending, key));
                 if matches!(self.t.get(self.i), Some(Tok::Comma)) {
                     self.i += 1;
@@ -9078,6 +9243,7 @@ impl<'a> P<'a> {
                     let _ = self.kw("ASC");
                     false
                 };
+                let k = self.nulls_placement(k)?;
                 ord.push((descending, k));
                 if matches!(self.t.get(self.i), Some(Tok::Comma)) {
                     self.i += 1;

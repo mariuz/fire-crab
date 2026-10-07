@@ -106,6 +106,20 @@ feature has to be built twice.
       LAST, LIST, derived tables (the engine dissolves a one-table derived
       table into an aliased relation), COLLATE expressions, text beside a
       number in a CASE.
+    - Slice 16 (2026-10-07): **NULLS FIRST / LAST** on every sort key (the
+      placement byte before the direction byte, in a statement's, an
+      aggregate's and a window's ORDER BY alike), an unselected GROUP BY
+      field as a sort key (a fresh map slot), and **derived tables**: the
+      inner select nests as one `blr_rse` standing as the stream - FIRST,
+      SKIP, WHERE, ORDER BY and a DISTINCT's projection inside it, the base
+      relation aliased `"D" "PUBLIC"."T"` (or `"D" "A"` over an inner
+      alias, a plain relation when the derived table has no alias), an
+      expression item wrapped in `blr_derived_expr` at every outer
+      reference; aggregates, FIRST / SKIP and joins over a derived table,
+      and CTEs, follow. The executor declines the two placement bytes
+      rather than guessing. 34 new byte-checked cells across the two BLR
+      gates; three stale pins promoted. Still refused: an aggregate, a UNION
+      or a join inside a derived table, LIST, COLLATE expressions.
     - Next: the remaining compile classes - COLLATE expressions (which the
       executor could not serve anyway), windows beside GROUP BY, derived
       tables and CTEs, UNION in a derived table, NULLS FIRST / LAST, LIST;
