@@ -1449,12 +1449,26 @@ struct Derived {
     skip: Option<Val>,
     sort: Vec<(bool, Val)>,
     project: Option<Vec<Val>>,
+    /// an AGGREGATE inside: the nested rse's stream is then the aggregate
+    /// node over the relation (measured) - it takes the context AFTER the
+    /// derived table's, so such a stream occupies TWO context slots; the
+    /// outer columns read its map by fid
+    agg: Option<DerivedAgg>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DerivedAgg {
+    group_keys: Vec<Val>,
+    map: Vec<MapEntry>,
+    having: Option<Bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum DCol {
     Col(String),
     Expr(Val),
+    /// a map fid of the derived table's aggregate, read as is
+    Fid(Val),
 }
 
 /// One slot of an aggregate's blr_map: a group-key value or an
@@ -1716,9 +1730,13 @@ impl<'a> P<'a> {
         let idx = (ctx - self.base) as usize;
         if let Some(d) = &self.streams[idx].derived {
             let (_, inner) = d.cols.iter().find(|(o, _)| o == name)?;
+            // an expression item wraps over the context its fields live in:
+            // the relation's, or the inner aggregate's (ctx + 1)
+            let expr_ctx = if d.agg.is_some() { ctx + 1 } else { ctx };
             return Some(match inner {
                 DCol::Col(n) => Val::Field(ctx, n.clone()),
-                DCol::Expr(e) => Val::DerivedWrap(ctx, Box::new(e.clone())),
+                DCol::Expr(e) => Val::DerivedWrap(expr_ctx, Box::new(e.clone())),
+                DCol::Fid(v) => v.clone(),
             });
         }
         Some(Val::Field(ctx, name.to_string()))
@@ -1894,16 +1912,78 @@ impl<'a> P<'a> {
         });
         let si = self.streams.len() - 1;
         let saved = self.sub.replace(si);
+        let inner_ctx = si as u8 + self.base;
+        // an AGGREGATE inside (an aggregate item, or a GROUP BY after the
+        // FROM): the items parse in aggregate mode against a map of their
+        // own, the aggregate taking the context after the relation's
+        let agg_inner = {
+            let mut found = (list_start..list_end).any(|k| {
+                matches!(self.t.get(k), Some(Tok::Ident(w)) if matches!(w.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"))
+                    && matches!(self.t.get(k + 1), Some(Tok::LParen))
+            });
+            let mut j = after_from;
+            let mut depth = 0i32;
+            while let Some(t) = self.t.get(j) {
+                match t {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    Tok::Ident(w) if depth == 0 && w == "GROUP" => {
+                        found = true;
+                        break;
+                    }
+                    Tok::Semi => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+            found
+        };
+        if agg_inner && (first.is_some() || skip.is_some() || distinct) {
+            return None; // FIRST / SKIP / DISTINCT over an inner aggregate: unprobed
+        }
+        let saved_agg = (std::mem::take(&mut self.agg_map), self.agg_fid_ctx, self.agg_mode);
+        let agg_ctx = inner_ctx + 1;
+        if agg_inner {
+            self.agg_fid_ctx = agg_ctx;
+            self.agg_mode = true;
+        }
+        let restore_agg = |p: &mut Self, saved: (Vec<MapEntry>, u8, bool)| {
+            p.agg_map = saved.0;
+            p.agg_fid_ctx = saved.1;
+            p.agg_mode = saved.2;
+        };
         // the items, against the inner stream
         self.i = list_start;
         let mut cols: Vec<(String, DCol)> = Vec::new();
+        let mut raw_items: Vec<(String, Val)> = Vec::new();
         let mut project: Vec<Val> = Vec::new();
         let mut any_expr = false;
         loop {
             if matches!(self.t.get(self.i), Some(Tok::Star)) {
+                restore_agg(self, saved_agg);
                 return None; // `*`: unprobed
             }
-            let v = self.val()?;
+            let Some(v) = self.val() else {
+                restore_agg(self, saved_agg);
+                return None;
+            };
+            if agg_inner {
+                // the plain fields an item names take their key slots in
+                // order of appearance
+                let mut ks = Vec::new();
+                collect_fields(&v, &mut ks);
+                for k in ks {
+                    let e = MapEntry::Key(k);
+                    if !self.agg_map.contains(&e) {
+                        self.agg_map.push(e);
+                    }
+                }
+            }
             let outer = if self.kw("AS") {
                 let Some(Tok::Ident(a)) = self.t.get(self.i) else {
                     return None;
@@ -1924,30 +2004,112 @@ impl<'a> P<'a> {
                     _ => return None, // an expression needs its name
                 }
             };
-            let dcol = match &v {
-                Val::Field(_, inner) => DCol::Col(inner.clone()),
-                other => {
-                    any_expr = true;
-                    DCol::Expr(other.clone())
+            if agg_inner {
+                raw_items.push((outer, v));
+            } else {
+                let dcol = match &v {
+                    Val::Field(_, inner) => DCol::Col(inner.clone()),
+                    other => {
+                        any_expr = true;
+                        DCol::Expr(other.clone())
+                    }
+                };
+                project.push(v);
+                cols.push((outer, dcol));
+            }
+            match self.t.get(self.i) {
+                Some(Tok::Comma) => self.i += 1,
+                Some(Tok::Ident(w)) if w == "FROM" => break,
+                _ => {
+                    restore_agg(self, saved_agg);
+                    return None;
                 }
-            };
-            project.push(v);
-            cols.push((outer, dcol));
-            match self.t.get(self.i)? {
-                Tok::Comma => self.i += 1,
-                Tok::Ident(w) if w == "FROM" => break,
-                _ => return None,
             }
         }
         if self.i != list_end {
+            restore_agg(self, saved_agg);
             return None;
         }
         self.i = after_from;
+        // the WHERE reads the relation's columns, never the map
+        let saved_mode_w = self.agg_mode;
+        self.agg_mode = false;
         let wher = if self.kw("WHERE") {
-            Some(self.bool_or()?)
+            match self.bool_or() {
+                Some(b) => Some(b),
+                None => {
+                    restore_agg(self, saved_agg);
+                    return None;
+                }
+            }
         } else {
             None
         };
+        self.agg_mode = saved_mode_w;
+        let mut agg = None;
+        if agg_inner {
+            let mut group_keys: Vec<Val> = Vec::new();
+            if self.kw("GROUP") {
+                if !self.kw("BY") {
+                    restore_agg(self, saved_agg);
+                    return None;
+                }
+                self.agg_mode = false;
+                loop {
+                    match self.val() {
+                        Some(k) => group_keys.push(k),
+                        None => {
+                            restore_agg(self, saved_agg);
+                            return None;
+                        }
+                    }
+                    if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        self.i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                self.agg_mode = true;
+            }
+            let mut gfields: Vec<Val> = Vec::new();
+            for k in &group_keys {
+                collect_fields(k, &mut gfields);
+            }
+            // every item lifts to the aggregate's map
+            for (outer, v) in raw_items.drain(..) {
+                let dcol = match &v {
+                    Val::Fid(..) => DCol::Fid(v.clone()),
+                    Val::Field(..) => match rebuild_over_keys(&mut self.agg_map, &v, &gfields, agg_ctx) {
+                        Some(f) => DCol::Fid(f),
+                        None => {
+                            restore_agg(self, saved_agg);
+                            return None;
+                        }
+                    },
+                    other => match lift_over_agg(&mut self.agg_map, other, &gfields, agg_ctx) {
+                        Some(e) => DCol::Expr(e),
+                        None => {
+                            restore_agg(self, saved_agg);
+                            return None;
+                        }
+                    },
+                };
+                cols.push((outer, dcol));
+            }
+            let having = if self.kw("HAVING") {
+                let b = self.bool_or().and_then(|b| map_bool_to_fids(&self.agg_map, b, agg_ctx));
+                match b {
+                    Some(b) => Some(b),
+                    None => {
+                        restore_agg(self, saved_agg);
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
+            agg = Some(DerivedAgg { group_keys, map: std::mem::take(&mut self.agg_map), having });
+        }
         let mut sort: Vec<(bool, Val)> = Vec::new();
         if self.kw("ORDER") {
             if !self.kw("BY") {
@@ -1975,8 +2137,20 @@ impl<'a> P<'a> {
         }
         self.sub = saved;
         self.streams.pop();
+        restore_agg(self, saved_agg);
+        if agg.is_some() && !sort.is_empty() {
+            return None; // an ORDER BY beside an inner aggregate: unprobed
+        }
         if distinct && any_expr {
             return None; // a projection over an expression item: unprobed
+        }
+        // two columns under one name: the engine refuses the statement
+        // at prepare (isc_dsql_derived_field_dup_name, -104) - a CREATE
+        // PROCEDURE over `(SELECT ID, ID FROM T)` must not be stored
+        for (i, (n, _)) in cols.iter().enumerate() {
+            if cols[..i].iter().any(|(m, _)| m == n) {
+                return None;
+            }
         }
         Some(Stream {
             name,
@@ -1989,6 +2163,7 @@ impl<'a> P<'a> {
                 skip,
                 sort,
                 project: if distinct { Some(project) } else { None },
+                agg,
             })),
             sub: self.in_sub,
             cur: None,
@@ -3066,6 +3241,22 @@ impl<'a> P<'a> {
         }
         self.i += 1;
         Some(v)
+    }
+
+    /// A derived table with an aggregate inside occupies the context after
+    /// its own too (the aggregate node's); claim it so later streams number
+    /// past it (measured: a join to such a table takes context 2)
+    fn claim_derived_agg_slot(&mut self, st: &Stream) {
+        if st.derived.as_ref().is_some_and(|d| d.agg.is_some()) {
+            self.streams.push(Stream {
+                name: String::new(),
+                alias: None,
+                derived: None,
+                sub: self.in_sub,
+                cur: None,
+                proc_args: None,
+            });
+        }
     }
 
     /// `NULLS FIRST` / `NULLS LAST` after a sort key's direction: wraps the
@@ -4558,6 +4749,12 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
     if let Some(d) = &st.derived {
         out.push(blr::RSE);
         out.push(1);
+        if d.agg.is_some() {
+            out.push(blr::AGGREGATE);
+            out.push(ctx + 1);
+            out.push(blr::RSE);
+            out.push(1);
+        }
         match &st.alias {
             // alias-less: a plain blr_relation inside (measured)
             None => {
@@ -4578,6 +4775,29 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
             }
         }
         out.push(ctx);
+        if let Some(agg) = &d.agg {
+            // the aggregate's own rse holds the WHERE; its map follows, then
+            // the HAVING as the nested rse's boolean (measured)
+            if let Some(w) = &d.wher {
+                out.push(blr::BOOLEAN);
+                emit_bool(out, w);
+            }
+            out.push(blr::END);
+            out.push(blr::GROUP_BY);
+            out.push(agg.group_keys.len() as u8);
+            for k in &agg.group_keys {
+                emit_val(out, k);
+            }
+            out.push(blr::MAP);
+            out.extend_from_slice(&(agg.map.len() as u16).to_le_bytes());
+            emit_map_entries(out, &agg.map);
+            if let Some(h) = &agg.having {
+                out.push(blr::BOOLEAN);
+                emit_bool(out, h);
+            }
+            out.push(blr::END);
+            return;
+        }
         if let Some(v) = &d.first {
             out.push(blr::FIRST);
             emit_val(out, v);
@@ -6211,6 +6431,9 @@ struct ForSel {
     /// (probed at body numbering)
     union_: Option<BodyUnion>,
     aggregate: bool,
+    /// the aggregate node's context (the next free one after the FROM
+    /// streams - a derived table with an aggregate inside takes two)
+    agg_ctx: u8,
     map: Vec<MapEntry>,
     group_keys: Vec<Val>,
     boolean: Option<Bool>,
@@ -7052,7 +7275,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.push(blr::END); // the wrapper rse's end
             } else if f.aggregate && f.windows.is_empty() {
                 out.push(blr::AGGREGATE);
-                out.push(f.ctx + 1 + f.joins.len() as u8);
+                out.push(f.agg_ctx);
                 out.push(blr::RSE);
                 out.push(rse_stream_count(&f.joins));
                 // the inner rse holds the JOIN chain when one exists,
@@ -7131,7 +7354,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     // the aggregate node stands as the window's stream, its
                     // HAVING after its map (measured)
                     out.push(blr::AGGREGATE);
-                    out.push(f.ctx + 1 + f.joins.len() as u8);
+                    out.push(f.agg_ctx);
                     out.push(blr::RSE);
                     out.push(rse_stream_count(&f.joins));
                     emit_join_chain(out, &f.stream, f.ctx, &f.joins);
@@ -7484,6 +7707,7 @@ impl<'a> P<'a> {
         self.streams.push(stream.clone());
         let sidx = self.streams.len() - 1;
         let ctx = sidx as u8 + self.base;
+        self.claim_derived_agg_slot(&stream);
         // JOIN chain - the view laws at body numbering (probed):
         // each ON resolves across the accumulated statement streams
         let mut joins: Vec<(u8, Stream, u8, Bool)> = Vec::new();
@@ -7519,6 +7743,7 @@ impl<'a> P<'a> {
             let st2 = self.stream_item()?;
             self.streams.push(st2.clone());
             let ctx2 = (self.streams.len() - 1) as u8 + self.base;
+            self.claim_derived_agg_slot(&st2);
             if !self.kw("ON") {
                 return None;
             }
@@ -7541,6 +7766,7 @@ impl<'a> P<'a> {
             let st2 = self.stream_item()?;
             self.streams.push(st2.clone());
             let ctx2 = (self.streams.len() - 1) as u8 + self.base;
+            self.claim_derived_agg_slot(&st2);
             joins.push((JOIN_COMMA, st2, ctx2, Bool::Missing(Val::Null)));
         }
         let after_from = self.i;
@@ -7563,7 +7789,8 @@ impl<'a> P<'a> {
         // statement's streams replaces the single-stream scope
         let saved_scope = self.merge_scope;
         if !joins.is_empty() {
-            self.merge_scope = Some((sidx, sidx + 1 + joins.len()));
+            // every FROM stream - a derived aggregate's placeholder slot included
+            self.merge_scope = Some((sidx, self.streams.len()));
         }
         // A GROUP BY ahead (depth 0, before INTO / DO / UNION): a WINDOW in
         // this list then sits OVER THE AGGREGATE (measured: blr_window's rse
@@ -7592,7 +7819,7 @@ impl<'a> P<'a> {
             found
         };
         if grouped_ahead {
-            self.agg_fid_ctx = ctx + 1 + joins.len() as u8;
+            self.agg_fid_ctx = self.streams.len() as u8 + self.base;
             self.agg_map = Vec::new();
         }
         let mut items: Vec<Item> = Vec::new();
@@ -8108,7 +8335,7 @@ impl<'a> P<'a> {
             // stream AND any join streams (probed: a joined COUNT
             // put the aggregate at 2 over streams 0 and 1); claim
             // its slot so later statements keep counting correctly
-            self.agg_fid_ctx = ctx + 1 + joins.len() as u8;
+            self.agg_fid_ctx = self.streams.len() as u8 + self.base;
             self.streams.push(Stream {
                 name: String::new(),
                 alias: None,
@@ -8327,7 +8554,7 @@ impl<'a> P<'a> {
                     }
                 }
             }
-            let win_base = if aggregate { self.agg_fid_ctx } else { ctx };
+            let win_base = self.streams.len() as u8 + self.base - 1;
             for (i, w) in windows.iter_mut().enumerate() {
                 w.ctx = win_base + 1 + i as u8;
             }
@@ -8622,6 +8849,7 @@ impl<'a> P<'a> {
             plan,
             union_,
             aggregate,
+            agg_ctx: self.agg_fid_ctx,
             map,
             group_keys,
             boolean,
@@ -9215,7 +9443,8 @@ impl<'a> P<'a> {
         let saved = self.sub.replace(sidx);
         let saved_scope = self.merge_scope;
         if !joins.is_empty() {
-            self.merge_scope = Some((sidx, sidx + 1 + joins.len()));
+            // every FROM stream - a derived aggregate's placeholder slot included
+            self.merge_scope = Some((sidx, self.streams.len()));
         }
         let mut boolean = if self.kw("WHERE") {
             Some(self.bool_or()?)
@@ -9743,6 +9972,7 @@ impl<'a> P<'a> {
             plan: None,
             union_: None,
             aggregate: false,
+            agg_ctx: self.agg_fid_ctx,
             map: Vec::new(),
             group_keys: Vec::new(),
             boolean: None,

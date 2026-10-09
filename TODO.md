@@ -154,6 +154,14 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       in appearance order, then LIFTS every item and window key to the aggregate's fids and hands them to the existing
       window layer; the emitter nests the aggregate as the window rse's stream. Still refused: ORDER BY beside
       windows, windows over a HAVING-only aggregate, over joins, FIRST/SKIP with windows.
+      Slice 19 (2026-10-07): an AGGREGATE INSIDE A DERIVED TABLE (scratch cases12): `43 01 [4F <ctx+1> 43 01 <relation ctx>
+      [WHERE] FF 4E <keys> 4D <map> [HAVING]] FF` - the aggregate takes the context after the derived table's, so the
+      stream occupies TWO slots (claim_derived_agg_slot pushes a placeholder; the aggregate / window contexts and the
+      items' JOIN scope now come from streams.len(), never ctx + 1 + joins); outer columns read the map by fid
+      (DCol::Fid), an expression item is blr_derived_expr over the AGGREGATE's context. derived_body saves / restores
+      the statement's aggregate state around its own, parses items in agg_mode with plain fields registered as keys
+      in appearance order, lifts items after GROUP BY, maps HAVING over the map. Refused: FIRST / SKIP / DISTINCT /
+      ORDER BY with an inner aggregate, a UNION or a join inside a derived table.
       Slice 13: SPEED. exe resolved every blr_field through RDB$RELATION_FIELDS on EVERY evaluation and cloned the row
       (a 20,000-row scan with one comparison: 6 s) - the field id is cached per statement now (80 ms). And an equality
       conjunct `<column> = <literal | ?>` over an exact-numeric column with a live plain single-segment index retrieves

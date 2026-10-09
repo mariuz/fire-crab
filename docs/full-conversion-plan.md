@@ -146,6 +146,16 @@ feature has to be built twice.
       fid, and a plain item rides an empty window as a key entry exactly as
       beside ordinary windows. 15 new byte-checked cells; one stale pin
       promoted. A statement ORDER BY beside windows stays refused.
+    - Slice 19 (2026-10-07): **an aggregate inside a derived table**: the
+      nested rse's stream is the aggregate node over the relation, which
+      takes the context after the derived table's (such a stream occupies
+      two slots, and every later stream numbers past both); the inner WHERE
+      sits in the aggregate's own rse and the HAVING after its map; outer
+      references read the map by fid, an expression item wrapped in
+      `blr_derived_expr` over the aggregate's context. Joins to it, outer
+      WHERE / ORDER BY / aggregates over it follow. 13 new byte-checked
+      cells. FIRST / SKIP / DISTINCT / ORDER BY inside such a derived table
+      stay refused.
     - Next: the remaining compile classes - COLLATE expressions (which the
       executor could not serve anyway), windows beside GROUP BY, derived
       tables and CTEs, UNION in a derived table, NULLS FIRST / LAST, LIST;
