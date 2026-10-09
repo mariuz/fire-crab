@@ -5494,6 +5494,25 @@ fn collect_fields(v: &Val, out: &mut Vec<Val>) {
     }
 }
 
+/// [collect_fields] through every PURE node [map_children] walks (a
+/// function's operands too) - what a window's passthrough expression
+/// reads. Kept apart: the GROUP BY key sets stay on the arithmetic walk.
+fn collect_fields_deep(v: &Val, out: &mut Vec<Val>) {
+    match v {
+        Val::Field(..) => {
+            if !out.contains(v) {
+                out.push(v.clone());
+            }
+        }
+        _ => {
+            let _ = map_children(v, &mut |c| {
+                collect_fields_deep(c, out);
+                Some(c.clone())
+            });
+        }
+    }
+}
+
 /// An ORDER BY key at `j` that is ONE bare name standing alone - after BY
 /// or a comma, before a comma, a direction, NULLS or the clause's end.
 fn whole_sort_key(t: &[Tok], j: usize) -> bool {
@@ -5513,6 +5532,73 @@ fn whole_sort_key(t: &[Tok], j: usize) -> bool {
             _ => true,
         }
         && after_ok
+}
+
+/// A value with NO child values: a literal, a parameter, a variable, a
+/// context function. Every map/rebuild below passes these through.
+fn is_leaf_val(v: &Val) -> bool {
+    matches!(
+        v,
+        Val::Int(_)
+            | Val::Int64(_)
+            | Val::Dec(..)
+            | Val::Str(_)
+            | Val::StrCs(..)
+            | Val::Null
+            | Val::InParam(_)
+            | Val::LocalVar(_)
+            | Val::DoubleLit(_)
+            | Val::Bytes(_)
+            | Val::Bool(_)
+            | Val::TemporalLit(_)
+            | Val::CurrentDate
+            | Val::CurrentTime
+            | Val::CurrentTimestamp
+            | Val::UserName
+            | Val::CurrentRole
+            | Val::CurrentConnection
+            | Val::CurrentTransaction
+    )
+}
+
+/// Rebuild a PURE value node with every child value passed through `f` -
+/// arithmetic, the string / cast / extract functions, COALESCE, DECODE,
+/// the system functions, a NULLS placement. A node carrying anything
+/// else (a boolean, a subquery, a stored function, a generator) is None:
+/// what a map over it means is unprobed.
+fn map_children(v: &Val, f: &mut dyn FnMut(&Val) -> Option<Val>) -> Option<Val> {
+    let b = |x: Val| Box::new(x);
+    Some(match v {
+        Val::Add(x, y) => Val::Add(b(f(x)?), b(f(y)?)),
+        Val::Sub(x, y) => Val::Sub(b(f(x)?), b(f(y)?)),
+        Val::Mul(x, y) => Val::Mul(b(f(x)?), b(f(y)?)),
+        Val::Div(x, y) => Val::Div(b(f(x)?), b(f(y)?)),
+        Val::Concat(x, y) => Val::Concat(b(f(x)?), b(f(y)?)),
+        Val::Neg(x) => Val::Neg(b(f(x)?)),
+        Val::Upper(x) => Val::Upper(b(f(x)?)),
+        Val::Lower(x) => Val::Lower(b(f(x)?)),
+        Val::Extract(k, x) => Val::Extract(*k, b(f(x)?)),
+        Val::StrLen(k, x) => Val::StrLen(*k, b(f(x)?)),
+        Val::Substring(x, y, z) => Val::Substring(b(f(x)?), b(f(y)?), b(f(z)?)),
+        Val::Trim(k, what, x) => {
+            let what = match what {
+                Some(w) => Some(b(f(w)?)),
+                None => None,
+            };
+            Val::Trim(*k, what, b(f(x)?))
+        }
+        Val::Cast(d, x) => Val::Cast(d.clone(), b(f(x)?)),
+        Val::CastInt64(x) => Val::CastInt64(b(f(x)?)),
+        Val::NullsPlaced(k, x) => Val::NullsPlaced(*k, b(f(x)?)),
+        Val::Coalesce(vs) => Val::Coalesce(vs.iter().map(|x| f(x)).collect::<Option<Vec<_>>>()?),
+        Val::SysFn(n, vs) => Val::SysFn(n.clone(), vs.iter().map(|x| f(x)).collect::<Option<Vec<_>>>()?),
+        Val::Decode(sel, cs, rs) => Val::Decode(
+            b(f(sel)?),
+            cs.iter().map(|x| f(x)).collect::<Option<Vec<_>>>()?,
+            rs.iter().map(|x| f(x)).collect::<Option<Vec<_>>>()?,
+        ),
+        _ => return None,
+    })
 }
 
 /// Rebuild a select item over an aggregate map being built: every
@@ -5553,30 +5639,11 @@ fn rebuild_over_keys(
             };
             Some(Val::Fid(fid_ctx, slot as u16))
         }
-        Val::Int(_) | Val::Int64(_) | Val::Dec(..) | Val::Str(_) => {
-            Some(v.clone())
-        }
-        Val::Add(a, b)
-        | Val::Sub(a, b)
-        | Val::Mul(a, b)
-        | Val::Div(a, b)
-        | Val::Concat(a, b) => {
-            let (a, b) = (
-                rebuild_over_keys(map, a, gfields, fid_ctx)?,
-                rebuild_over_keys(map, b, gfields, fid_ctx)?,
-            );
-            Some(match v {
-                Val::Add(..) => Val::Add(Box::new(a), Box::new(b)),
-                Val::Sub(..) => Val::Sub(Box::new(a), Box::new(b)),
-                Val::Mul(..) => Val::Mul(Box::new(a), Box::new(b)),
-                Val::Div(..) => Val::Div(Box::new(a), Box::new(b)),
-                _ => Val::Concat(Box::new(a), Box::new(b)),
-            })
-        }
-        Val::Neg(a) => Some(Val::Neg(Box::new(rebuild_over_keys(
-            map, a, gfields, fid_ctx,
-        )?))),
-        _ => None,
+        v if is_leaf_val(v) => Some(v.clone()),
+        // a function over the keys rebuilds over their slots like any
+        // operator (measured: `UPPER(S), COUNT(*) OVER ()`, `ORDER BY
+        // ABS(G)` beside a window, `UPPER(S) .. GROUP BY S`)
+        _ => map_children(v, &mut |c| rebuild_over_keys(map, c, gfields, fid_ctx)),
     }
 }
 
@@ -5589,46 +5656,15 @@ fn lift_over_agg(map: &mut Vec<MapEntry>, v: &Val, gfields: &[Val], fid_ctx: u8)
     match v {
         Val::Fid(..) | Val::Int(_) | Val::Int64(_) | Val::Dec(..) | Val::Str(_) | Val::Null | Val::InParam(_) | Val::LocalVar(_) => Some(v.clone()),
         Val::Field(..) => rebuild_over_keys(map, v, gfields, fid_ctx),
-        Val::Add(a, b) | Val::Sub(a, b) | Val::Mul(a, b) | Val::Div(a, b) | Val::Concat(a, b) => {
-            let (a, b) = (lift_over_agg(map, a, gfields, fid_ctx)?, lift_over_agg(map, b, gfields, fid_ctx)?);
-            Some(match v {
-                Val::Add(..) => Val::Add(Box::new(a), Box::new(b)),
-                Val::Sub(..) => Val::Sub(Box::new(a), Box::new(b)),
-                Val::Mul(..) => Val::Mul(Box::new(a), Box::new(b)),
-                Val::Div(..) => Val::Div(Box::new(a), Box::new(b)),
-                _ => Val::Concat(Box::new(a), Box::new(b)),
-            })
-        }
-        Val::Neg(a) => Some(Val::Neg(Box::new(lift_over_agg(map, a, gfields, fid_ctx)?))),
-        _ => None,
+        v if is_leaf_val(v) => Some(v.clone()),
+        _ => map_children(v, &mut |c| lift_over_agg(map, c, gfields, fid_ctx)),
     }
 }
 
 fn patch_fid_ctx(v: &Val, ctx: u8) -> Val {
     match v {
         Val::Fid(_, slot) => Val::Fid(ctx, *slot),
-        Val::Add(a, b) => Val::Add(
-            Box::new(patch_fid_ctx(a, ctx)),
-            Box::new(patch_fid_ctx(b, ctx)),
-        ),
-        Val::Sub(a, b) => Val::Sub(
-            Box::new(patch_fid_ctx(a, ctx)),
-            Box::new(patch_fid_ctx(b, ctx)),
-        ),
-        Val::Mul(a, b) => Val::Mul(
-            Box::new(patch_fid_ctx(a, ctx)),
-            Box::new(patch_fid_ctx(b, ctx)),
-        ),
-        Val::Div(a, b) => Val::Div(
-            Box::new(patch_fid_ctx(a, ctx)),
-            Box::new(patch_fid_ctx(b, ctx)),
-        ),
-        Val::Concat(a, b) => Val::Concat(
-            Box::new(patch_fid_ctx(a, ctx)),
-            Box::new(patch_fid_ctx(b, ctx)),
-        ),
-        Val::Neg(a) => Val::Neg(Box::new(patch_fid_ctx(a, ctx))),
-        other => other.clone(),
+        other => map_children(other, &mut |c| Some(patch_fid_ctx(c, ctx))).unwrap_or_else(|| other.clone()),
     }
 }
 
@@ -5651,24 +5687,10 @@ fn map_val_to_fid(map: &[MapEntry], v: &Val, fid_ctx: u8) -> Option<Val> {
         | Val::Null
         | Val::InParam(_)
         | Val::LocalVar(_) => Some(v.clone()),
-        Val::Add(a, b) | Val::Sub(a, b) | Val::Mul(a, b) | Val::Div(a, b)
-        | Val::Concat(a, b) => {
-            let (a, b) = (
-                map_val_to_fid(map, a, fid_ctx)?,
-                map_val_to_fid(map, b, fid_ctx)?,
-            );
-            Some(match v {
-                Val::Add(..) => Val::Add(Box::new(a), Box::new(b)),
-                Val::Sub(..) => Val::Sub(Box::new(a), Box::new(b)),
-                Val::Mul(..) => Val::Mul(Box::new(a), Box::new(b)),
-                Val::Div(..) => Val::Div(Box::new(a), Box::new(b)),
-                _ => Val::Concat(Box::new(a), Box::new(b)),
-            })
-        }
-        Val::Neg(a) => Some(Val::Neg(Box::new(map_val_to_fid(map, a, fid_ctx)?))),
-        Val::NullsPlaced(n, a) => Some(Val::NullsPlaced(*n, Box::new(map_val_to_fid(map, a, fid_ctx)?))),
-        // anything richer over an aggregate's output: unprobed
-        _ => None,
+        v if is_leaf_val(v) => Some(v.clone()),
+        // a pure function over the aggregate's output maps its operands
+        // (measured: `.. GROUP BY G HAVING ABS(G) > 1`, `ORDER BY ABS(G)`)
+        _ => map_children(v, &mut |c| map_val_to_fid(map, c, fid_ctx)),
     }
 }
 
@@ -7989,7 +8011,7 @@ impl<'a> P<'a> {
                         self.agg_mode = saved_mode;
                         let (part, ord, frame) = over?;
                         for k in part.iter().chain(ord.iter().map(|(_, k)| k)) {
-                            collect_fields(k, &mut keys_seen);
+                            collect_fields_deep(k, &mut keys_seen);
                         }
                         items.push(Item::Win(
                             MapEntry::Agg(verb, arg),
@@ -8087,7 +8109,7 @@ impl<'a> P<'a> {
                     self.agg_mode = saved_mode;
                     let (part, ord, frame) = over?;
                     for k in part.iter().chain(ord.iter().map(|(_, k)| k)) {
-                        collect_fields(k, &mut keys_seen);
+                        collect_fields_deep(k, &mut keys_seen);
                     }
                     items.push(Item::Win(
                         MapEntry::Fn(w, args),
@@ -8114,7 +8136,7 @@ impl<'a> P<'a> {
                         }
                         names.extend(self.star_names(idx)?);
                         for v in self.star_fields(idx)? {
-                            collect_fields(&v, &mut keys_seen);
+                            collect_fields_deep(&v, &mut keys_seen);
                             items.push(match v {
                                 Val::Field(..) => Item::Col(v),
                                 other => Item::Expr(other),
@@ -8140,7 +8162,7 @@ impl<'a> P<'a> {
                     }
                     star_names = Some(self.star_names(hits[0])?);
                     for v in self.star_fields(hits[0])? {
-                        collect_fields(&v, &mut keys_seen);
+                        collect_fields_deep(&v, &mut keys_seen);
                         items.push(match v {
                             Val::Field(..) => Item::Col(v),
                             other => Item::Expr(other),
@@ -8153,7 +8175,7 @@ impl<'a> P<'a> {
                     // stream scope is set); a plain column keeps its
                     // Col shape for the aggregate/cursor paths
                     let v = self.val()?;
-                    collect_fields(&v, &mut keys_seen);
+                    collect_fields_deep(&v, &mut keys_seen);
                     items.push(match v {
                         Val::Field(..) => Item::Col(v),
                         other => Item::Expr(other),
@@ -8850,7 +8872,7 @@ impl<'a> P<'a> {
                         // no key constraint: passthrough fields all
                         // land in the window's map
                         let mut gf = Vec::new();
-                        collect_fields(&v, &mut gf);
+                        collect_fields_deep(&v, &mut gf);
                         // ctx filled below; rebuild against slot ids
                         // with a placeholder ctx, fixed after
                         let rebuilt = rebuild_over_keys(
@@ -8887,7 +8909,7 @@ impl<'a> P<'a> {
                     }
                 };
                 let mut gf = Vec::new();
-                collect_fields(v, &mut gf);
+                collect_fields_deep(v, &mut gf);
                 let rebuilt = rebuild_over_keys(&mut windows[wi].map, v, &gf, 0)?;
                 sort_rebuilt.push((k, wi, rebuilt));
             }
