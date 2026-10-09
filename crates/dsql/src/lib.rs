@@ -130,6 +130,10 @@ mod blr {
     /// a SELECTABLE PROCEDURE as a stream: blr_procedure <counted name>
     /// <ctx> <u16 input count> <inputs>
     pub const PROCEDURE: u8 = 0x7C;
+    /// the same WITH AN ALIAS: blr_procedure2 <counted name> <counted
+    /// quoted alias> <ctx> <u16 input count> <inputs> (measured: `FROM
+    /// PS(1) P` is `85 02 "PS" 03 "\"P\"" 00 01 00 ..`)
+    pub const PROCEDURE2: u8 = 0x85;
     /// join-type sub-clause inside blr_join: absent for INNER,
     /// 1=LEFT, 2=RIGHT, 3=FULL (probed)
     pub const JOIN_TYPE: u8 = 0x50;
@@ -1964,9 +1968,40 @@ impl<'a> P<'a> {
         let mut project: Vec<Val> = Vec::new();
         let mut any_expr = false;
         loop {
-            if matches!(self.t.get(self.i), Some(Tok::Star)) {
-                restore_agg(self, saved_agg);
-                return None; // `*`: unprobed
+            // `*` alone, or `<inner stream>.*`: the relation's columns in
+            // field-position order, as the hand-written list (measured)
+            let star = match (self.t.get(self.i), self.t.get(self.i + 1), self.t.get(self.i + 2)) {
+                (Some(Tok::Star), _, _) => Some((None, 1usize)),
+                (Some(Tok::Ident(q)), Some(Tok::Dot), Some(Tok::Star)) => Some((Some(q.clone()), 3)),
+                _ => None,
+            };
+            if let Some((q, width)) = star {
+                let bare_alone = q.is_none() && self.i == list_start && self.i + 1 == list_end;
+                let names_it = match &q {
+                    None => true,
+                    Some(q) => inner_alias.as_deref().map_or(*q == name, |a| a == q),
+                };
+                let ok = !agg_inner && (q.is_some() || bare_alone) && names_it;
+                let Some(expanded) = catalog_columns(&name).filter(|_| ok) else {
+                    restore_agg(self, saved_agg);
+                    return None;
+                };
+                for n in expanded {
+                    project.push(Val::Field(inner_ctx, n.clone()));
+                    cols.push((n.clone(), DCol::Col(n)));
+                }
+                self.i += width;
+                match self.t.get(self.i) {
+                    Some(Tok::Comma) => {
+                        self.i += 1;
+                        continue;
+                    }
+                    Some(Tok::Ident(w)) if w == "FROM" => break,
+                    _ => {
+                        restore_agg(self, saved_agg);
+                        return None;
+                    }
+                }
             }
             let Some(v) = self.val() else {
                 restore_agg(self, saved_agg);
@@ -3241,6 +3276,30 @@ impl<'a> P<'a> {
         }
         self.i += 1;
         Some(v)
+    }
+
+    /// The values a `*` over stream `idx` stands for: a relation's or a
+    /// selectable procedure's catalogued columns as fields of that
+    /// context, a derived table's outer columns through the same mapping
+    /// a qualified reference takes ([Self::field]). None when the
+    /// catalog does not know the relation.
+    fn star_fields(&self, idx: usize) -> Option<Vec<Val>> {
+        let st = &self.streams[idx];
+        let ctx = idx as u8 + self.base;
+        Some(match &st.derived {
+            None => catalog_columns(&st.name)?.into_iter().map(|n| Val::Field(ctx, n)).collect(),
+            Some(d) => {
+                let expr_ctx = if d.agg.is_some() { ctx + 1 } else { ctx };
+                d.cols
+                    .iter()
+                    .map(|(_, inner)| match inner {
+                        DCol::Col(n) => Val::Field(ctx, n.clone()),
+                        DCol::Expr(e) => Val::DerivedWrap(expr_ctx, Box::new(e.clone())),
+                        DCol::Fid(v) => v.clone(),
+                    })
+                    .collect()
+            }
+        })
     }
 
     /// A derived table with an aggregate inside occupies the context after
@@ -4736,9 +4795,21 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
     // a selectable procedure source (measured, ALL_LANGS): blr_procedure,
     // the counted name, the context, a u16 input count, the inputs
     if let Some(args) = &st.proc_args {
-        out.push(blr::PROCEDURE);
-        out.push(st.name.len() as u8);
-        out.extend_from_slice(st.name.as_bytes());
+        match &st.alias {
+            None => {
+                out.push(blr::PROCEDURE);
+                out.push(st.name.len() as u8);
+                out.extend_from_slice(st.name.as_bytes());
+            }
+            Some(a) => {
+                out.push(blr::PROCEDURE2);
+                out.push(st.name.len() as u8);
+                out.extend_from_slice(st.name.as_bytes());
+                let quoted = format!("\"{}\"", a);
+                out.push(quoted.len() as u8);
+                out.extend_from_slice(quoted.as_bytes());
+            }
+        }
         out.push(ctx);
         out.extend_from_slice(&(args.len() as u16).to_le_bytes());
         for a in args {
@@ -7955,6 +8026,53 @@ impl<'a> P<'a> {
                         frame,
                     ));
                 }
+                // `*` - alone in the list - or `<stream>.*`: the stream's
+                // columns in field-position order, exactly as if written out
+                // (measured: the engine's BLR for the star and for the
+                // hand-written list are byte-identical over a relation, a
+                // view, a selectable procedure, a derived table, a join and a
+                // comma list; `*, 1` is refused by the engine, `T.*, 1` is not)
+                Tok::Star => {
+                    if self.i != list_start || self.i + 1 != list_end {
+                        return None;
+                    }
+                    self.i += 1;
+                    for idx in sidx..self.streams.len() {
+                        if self.streams[idx].name.is_empty() && self.streams[idx].derived.is_none() {
+                            continue; // a derived aggregate's placeholder slot
+                        }
+                        for v in self.star_fields(idx)? {
+                            collect_fields(&v, &mut keys_seen);
+                            items.push(match v {
+                                Val::Field(..) => Item::Col(v),
+                                other => Item::Expr(other),
+                            });
+                        }
+                    }
+                }
+                Tok::Ident(q)
+                    if matches!(self.t.get(self.i + 1), Some(Tok::Dot))
+                        && matches!(self.t.get(self.i + 2), Some(Tok::Star)) =>
+                {
+                    let q = q.clone();
+                    self.i += 3;
+                    let hits: Vec<usize> = (sidx..self.streams.len())
+                        .filter(|&k| {
+                            let st = &self.streams[k];
+                            st.alias.as_deref().map_or(st.derived.is_none() && st.name == q, |a| a == q)
+                        })
+                        .collect();
+                    if hits.len() != 1 {
+                        return None; // no such stream, or two of them: unprobed
+                    }
+                    for v in self.star_fields(hits[0])? {
+                        collect_fields(&v, &mut keys_seen);
+                        items.push(match v {
+                            Val::Field(..) => Item::Col(v),
+                            other => Item::Expr(other),
+                        });
+                    }
+                }
                 _ => {
                     // a full value expression at the stream context
                     // (bare names resolve as COLUMNS here - the
@@ -8122,39 +8240,57 @@ impl<'a> P<'a> {
                 if !self.kw("SELECT") {
                     return None;
                 }
-                // the branch select list, positionally
-                let mut raw: Vec<(Option<String>, String)> = Vec::new();
+                // the branch select list, positionally: plain columns, or
+                // a `*` / `<stream>.*` standing for the branch stream's
+                // columns (resolved once the stream is parsed)
+                enum BrItem {
+                    Col(Option<String>, String),
+                    Star(Option<String>),
+                }
+                let mut raw: Vec<BrItem> = Vec::new();
                 loop {
-                    let Some(Tok::Ident(a)) = self.t.get(self.i) else {
-                        return None;
-                    };
-                    if is_keyword(a) {
-                        return None;
-                    }
-                    let a = a.clone();
-                    self.i += 1;
-                    if matches!(self.t.get(self.i), Some(Tok::Dot)) {
-                        self.i += 1;
-                        let Some(Tok::Ident(b)) = self.t.get(self.i)
-                        else {
-                            return None;
-                        };
-                        raw.push((Some(a), b.clone()));
-                        self.i += 1;
-                    } else {
-                        raw.push((None, a));
+                    match (self.t.get(self.i), self.t.get(self.i + 1), self.t.get(self.i + 2)) {
+                        (Some(Tok::Star), _, _) => {
+                            if !raw.is_empty() {
+                                return None; // `*` stands alone
+                            }
+                            self.i += 1;
+                            raw.push(BrItem::Star(None));
+                        }
+                        (Some(Tok::Ident(q)), Some(Tok::Dot), Some(Tok::Star)) => {
+                            raw.push(BrItem::Star(Some(q.clone())));
+                            self.i += 3;
+                        }
+                        _ => {
+                            let Some(Tok::Ident(a)) = self.t.get(self.i) else {
+                                return None;
+                            };
+                            if is_keyword(a) {
+                                return None;
+                            }
+                            let a = a.clone();
+                            self.i += 1;
+                            if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                                self.i += 1;
+                                let Some(Tok::Ident(b)) = self.t.get(self.i)
+                                else {
+                                    return None;
+                                };
+                                raw.push(BrItem::Col(Some(a), b.clone()));
+                                self.i += 1;
+                            } else {
+                                raw.push(BrItem::Col(None, a));
+                            }
+                        }
                     }
                     match self.t.get(self.i)? {
-                        Tok::Comma => self.i += 1,
+                        Tok::Comma if !matches!(raw.first(), Some(BrItem::Star(None))) => self.i += 1,
                         Tok::Ident(w) if w == "FROM" => {
                             self.i += 1;
                             break;
                         }
                         _ => return None,
                     }
-                }
-                if raw.len() != first_cols.len() {
-                    return None;
                 }
                 let bst = self.stream_item()?;
                 if bst.derived.is_some() {
@@ -8165,8 +8301,22 @@ impl<'a> P<'a> {
                 let bctx = bidx as u8 + self.base;
                 let saved_b = self.sub.replace(bidx);
                 let mut cols = Vec::with_capacity(raw.len());
-                for (q, n) in &raw {
-                    cols.push(self.field(q.as_deref(), n)?);
+                for it in &raw {
+                    match it {
+                        BrItem::Col(q, n) => cols.push(self.field(q.as_deref(), n)?),
+                        BrItem::Star(q) => {
+                            if let Some(q) = q {
+                                let answers = bst.alias.as_deref().map_or(bst.name == *q, |a| a == q);
+                                if !answers {
+                                    return None;
+                                }
+                            }
+                            cols.extend(self.star_fields(bidx)?);
+                        }
+                    }
+                }
+                if cols.len() != first_cols.len() {
+                    return None;
                 }
                 let bwher = if self.kw("WHERE") {
                     Some(self.bool_or()?)
@@ -11986,6 +12136,19 @@ pub fn set_catalog(entries: Vec<(String, Vec<String>)>) {
 /// ([P::unify_branches]); a None type leaves those shapes refused.
 pub fn set_catalog_typed(entries: Vec<(String, Vec<(String, Option<TypeSpec>)>)>) {
     CATALOG.with(|c| *c.borrow_mut() = entries);
+}
+
+/// Every column of a catalogued relation (or a selectable procedure's
+/// outputs) in RDB$FIELD_POSITION order - what a `*` stands for; None
+/// when the catalog does not know the name, so a star compiles nothing
+/// it cannot see.
+fn catalog_columns(rel: &str) -> Option<Vec<String>> {
+    CATALOG.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(r, _)| r == rel)
+            .map(|(_, cols)| cols.iter().map(|(n, _)| n.clone()).collect())
+    })
 }
 
 fn catalog_has(rel: &str, col: &str) -> bool {

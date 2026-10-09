@@ -156,6 +156,14 @@ feature has to be built twice.
       WHERE / ORDER BY / aggregates over it follow. 13 new byte-checked
       cells. FIRST / SKIP / DISTINCT / ORDER BY inside such a derived table
       stay refused.
+    - Slice 20 (2026-10-09): **`*` and `<stream>.*`**: a star is the
+      stream's columns in field-position order, byte-identical to the
+      hand-written list (measured over a relation, a view, a selectable
+      procedure, a derived table, a CTE, a join, a comma list and a UNION
+      branch); a bare `*` stands alone. The compiler expands through the
+      catalog the server hands it. An aliased selectable procedure stream
+      is blr_procedure2 with the quoted alias (fc had dropped the alias).
+      27 new byte-checked cells.
     - Next: the remaining compile classes - COLLATE expressions (which the
       executor could not serve anyway), windows beside GROUP BY, derived
       tables and CTEs, UNION in a derived table, NULLS FIRST / LAST, LIST;

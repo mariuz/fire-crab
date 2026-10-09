@@ -162,6 +162,16 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       the statement's aggregate state around its own, parses items in agg_mode with plain fields registered as keys
       in appearance order, lifts items after GROUP BY, maps HAVING over the map. Refused: FIRST / SKIP / DISTINCT /
       ORDER BY with an inner aggregate, a UNION or a join inside a derived table.
+      Slice 20 (2026-10-09): `*` AND `<stream>.*` (scratch starcases): the stream's columns in RDB$FIELD_POSITION
+      order, exactly as the hand-written list - the engine's BLR for the star and for the expansion are byte-identical
+      over a relation, a view, a selectable procedure, a derived table (its outer columns through the same DCol
+      mapping a qualified reference takes), a CTE, a join, a comma list, a UNION branch, under GROUP BY / DISTINCT /
+      FIRST and beside a window; a bare `*` must stand alone (`*, 1` is the engine's -104; `T.*, 1` is fine). The
+      compiler reads the catalog the server hands it (catalog_columns), so a relation it was not given refuses. Found
+      on the way: an ALIASED selectable procedure stream is blr_procedure2 (name, quoted alias, ctx, inputs) - fc
+      emitted blr_procedure and dropped the alias (a silent wrong answer in every `FROM P(..) X` compile). Refused:
+      a schema-qualified star (`PUBLIC.T.*`), a star over USING / NATURAL joins (the coalesced key), a star inside
+      a subquery's own list, two streams answering one qualifier.
       Slice 13: SPEED. exe resolved every blr_field through RDB$RELATION_FIELDS on EVERY evaluation and cloned the row
       (a 20,000-row scan with one comparison: 6 s) - the field id is cached per statement now (80 ms). And an equality
       conjunct `<column> = <literal | ?>` over an exact-numeric column with a live plain single-segment index retrieves
