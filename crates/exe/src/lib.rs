@@ -1043,22 +1043,10 @@ impl<'a> P<'a> {
                         }
                     }
                 }
-                if self.u8()? != blr::END {
-                    return Err("window does not close with blr_end".into());
-                }
-                // the window consumed the rse-clause END itself: the
-                // stream returns directly (no outer clauses follow a
-                // window in this wrapper)
-                return Ok(Rse {
-                    stream: Stream::Window { source, windows },
-                    boolean: None,
-                    sort: Vec::new(),
-                    first: None,
-                    skip: None,
-                    project: Vec::new(),
-                    plan_indices: Vec::new(),
-                    singular: false,
-                });
+                // the outer rse's own clauses follow the window list -
+                // FIRST / SKIP, the statement's sort, a DISTINCT project -
+                // and its END closes it (dsql: measured on 2196)
+                Stream::Window { source, windows }
             }
             blr::RECURSE => {
                 let context = self.u8()?;
@@ -3025,9 +3013,7 @@ impl<'a> Exec<'a> {
                 }
             }
             Stream::Derived(inner) => self.open_rse(inner)?,
-            Stream::Window { source, windows } => {
-                return self.open_window(source, windows);
-            }
+            Stream::Window { source, windows } => self.open_window(source, windows)?,
             Stream::Recurse {
                 context,
                 anchor,

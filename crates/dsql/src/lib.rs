@@ -3283,6 +3283,40 @@ impl<'a> P<'a> {
     /// context, a derived table's outer columns through the same mapping
     /// a qualified reference takes ([Self::field]). None when the
     /// catalog does not know the relation.
+    /// Lift a value onto the aggregate's map for the window layer above it:
+    /// a group field takes (or adds) its key slot, an aggregate's fid
+    /// passes, an expression rebuilds over both ([lift_over_agg]).
+    fn lift_to_agg(&mut self, v: &Val, gfields: &[Val], fid_ctx: u8) -> Option<Val> {
+        match v {
+            Val::Fid(..) | Val::Int(_) | Val::Int64(_) | Val::Dec(..) | Val::Str(_) | Val::Null | Val::InParam(_) | Val::LocalVar(_) => Some(v.clone()),
+            Val::Field(..) => {
+                if !gfields.contains(v) {
+                    return None;
+                }
+                let e = MapEntry::Key(v.clone());
+                let slot = match self.agg_map.iter().position(|x| *x == e) {
+                    Some(i) => i,
+                    None => {
+                        self.agg_map.push(e);
+                        self.agg_map.len() - 1
+                    }
+                };
+                Some(Val::Fid(fid_ctx, slot as u16))
+            }
+            other => lift_over_agg(&mut self.agg_map, other, gfields, fid_ctx),
+        }
+    }
+
+    /// The NAMES of [star_fields]' columns, in the same order: a
+    /// relation's columns, a derived table's outer column names.
+    fn star_names(&self, idx: usize) -> Option<Vec<String>> {
+        let st = &self.streams[idx];
+        Some(match &st.derived {
+            None => catalog_columns(&st.name)?,
+            Some(d) => d.cols.iter().map(|(n, _)| n.clone()).collect(),
+        })
+    }
+
     fn star_fields(&self, idx: usize) -> Option<Vec<Val>> {
         let st = &self.streams[idx];
         let ctx = idx as u8 + self.base;
@@ -5460,6 +5494,27 @@ fn collect_fields(v: &Val, out: &mut Vec<Val>) {
     }
 }
 
+/// An ORDER BY key at `j` that is ONE bare name standing alone - after BY
+/// or a comma, before a comma, a direction, NULLS or the clause's end.
+fn whole_sort_key(t: &[Tok], j: usize) -> bool {
+    let before = j.checked_sub(1).and_then(|k| t.get(k));
+    let after_ok = match t.get(j + 1) {
+        None | Some(Tok::Comma) | Some(Tok::Semi) => true,
+        Some(Tok::Ident(w)) => matches!(
+            w.as_str(),
+            "ASC" | "ASCENDING" | "DESC" | "DESCENDING" | "NULLS" | "INTO" | "ROWS" | "OFFSET" | "FETCH" | "PLAN" | "FOR" | "WITH" | "DO"
+        ),
+        _ => false,
+    };
+    matches!(t.get(j), Some(Tok::Ident(_)))
+        && matches!(before, Some(Tok::Comma) | Some(Tok::Ident(_)))
+        && match before {
+            Some(Tok::Ident(b)) => b == "BY",
+            _ => true,
+        }
+        && after_ok
+}
+
 /// Rebuild a select item over an aggregate map being built: every
 /// FIELD must appear in some group key and lands a (deduped) Key
 /// slot; the rest recurses (probed on expression group keys).
@@ -7528,6 +7583,16 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     );
                     emit_map_entries(out, &w.map);
                 }
+                // FIRST / SKIP ride the outer rse after the window list,
+                // before the sort (measured)
+                if let Some(v) = &f.first {
+                    out.push(blr::FIRST);
+                    emit_val(out, v);
+                }
+                if let Some(v) = &f.skip {
+                    out.push(blr::SKIP);
+                    emit_val(out, v);
+                }
             } else if let Some(cn) = &f.cursor {
                 // AS CURSOR: the name rides the relation2 alias
                 // exactly like a DECLAREd cursor's - relation3 with
@@ -7895,10 +7960,15 @@ impl<'a> P<'a> {
         }
         let mut items: Vec<Item> = Vec::new();
         let mut aliases: Vec<String> = Vec::new();
+        // each item's NAME as an ORDER BY key sees it: its alias, else the
+        // column a bare (or qualified) column reference names, else none
+        let mut item_names: Vec<Option<String>> = Vec::new();
         loop {
             // under a GROUP BY the plain fields an item or a window's keys name
             // take their map slots in order of appearance
             let mut keys_seen: Vec<Val> = Vec::new();
+            let item_start = self.i;
+            let mut star_names: Option<Vec<String>> = None;
             match self.t.get(self.i)? {
                 Tok::Ident(w)
                     if matches!(
@@ -8037,10 +8107,12 @@ impl<'a> P<'a> {
                         return None;
                     }
                     self.i += 1;
+                    let mut names = Vec::new();
                     for idx in sidx..self.streams.len() {
                         if self.streams[idx].name.is_empty() && self.streams[idx].derived.is_none() {
                             continue; // a derived aggregate's placeholder slot
                         }
+                        names.extend(self.star_names(idx)?);
                         for v in self.star_fields(idx)? {
                             collect_fields(&v, &mut keys_seen);
                             items.push(match v {
@@ -8049,6 +8121,7 @@ impl<'a> P<'a> {
                             });
                         }
                     }
+                    star_names = Some(names);
                 }
                 Tok::Ident(q)
                     if matches!(self.t.get(self.i + 1), Some(Tok::Dot))
@@ -8065,6 +8138,7 @@ impl<'a> P<'a> {
                     if hits.len() != 1 {
                         return None; // no such stream, or two of them: unprobed
                     }
+                    star_names = Some(self.star_names(hits[0])?);
                     for v in self.star_fields(hits[0])? {
                         collect_fields(&v, &mut keys_seen);
                         items.push(match v {
@@ -8097,16 +8171,35 @@ impl<'a> P<'a> {
             // an item's ALIAS - `AS name` or a bare name - names the
             // column for the client and never reaches the BLR (measured:
             // a FOR SELECT with and without them compiles alike); an ORDER
-            // BY that names one is refused below
+            // BY key that IS one sorts on the item (resolved below)
+            let expr_end = self.i;
+            let mut alias: Option<String> = None;
             if self.kw("AS") {
                 let Some(Tok::Ident(a)) = self.t.get(self.i) else { return None };
-                aliases.push(a.clone());
+                alias = Some(a.clone());
                 self.i += 1;
             } else if let Some(Tok::Ident(a)) = self.t.get(self.i) {
                 if self.i != list_end && !is_keyword(a) {
-                    aliases.push(a.clone());
+                    alias = Some(a.clone());
                     self.i += 1;
                 }
+            }
+            if let Some(names) = star_names {
+                if names.len() != items.len() - item_names.len() {
+                    return None;
+                }
+                item_names.extend(names.into_iter().map(Some));
+            } else {
+                let bare = match &self.t[item_start..expr_end] {
+                    [Tok::Ident(n)] => Some(n.clone()),
+                    [Tok::Ident(_), Tok::Dot, Tok::Ident(n)] => Some(n.clone()),
+                    _ => None,
+                };
+                let bare = bare.filter(|_| matches!(items.last(), Some(Item::Col(_))));
+                item_names.push(alias.clone().or(bare));
+            }
+            if let Some(a) = alias {
+                aliases.push(a);
             }
             if self.i == list_end {
                 break;
@@ -8117,20 +8210,31 @@ impl<'a> P<'a> {
             self.i += 1;
         }
         self.i = after_from;
-        // an ORDER BY / GROUP BY naming an alias resolves by the engine's
-        // own rules (an alias beside a column of the same name): refused
+        // a GROUP BY / HAVING naming an alias resolves by the engine's own
+        // rules (an alias beside a column of the same name): refused; so is
+        // an alias INSIDE an ORDER BY expression (the engine does not see it
+        // there - `ORDER BY X + 1` is column unknown). A WHOLE ORDER BY key
+        // naming one is resolved against the item names in the sort loop
         if !aliases.is_empty() {
             let mut j = after_from;
             let mut depth = 0i32;
-            let mut in_order = false;
+            let mut clause = 0u8; // 1 ORDER BY, 2 GROUP BY / HAVING
             while let Some(t) = self.t.get(j) {
                 match t {
                     Tok::LParen => depth += 1,
                     Tok::RParen => depth -= 1,
                     Tok::Semi => break,
                     Tok::Ident(w) if depth == 0 && (w == "INTO" || w == "DO") => break,
-                    Tok::Ident(w) if depth == 0 && (w == "ORDER" || w == "GROUP" || w == "HAVING") => in_order = true,
-                    Tok::Ident(w) if in_order && aliases.iter().any(|a| a == w) => return None,
+                    Tok::Ident(w) if depth == 0 && w == "ORDER" => clause = 1,
+                    Tok::Ident(w) if depth == 0 && (w == "GROUP" || w == "HAVING") => clause = 2,
+                    Tok::Ident(w)
+                        if clause != 0
+                            && aliases.iter().any(|a| a == w)
+                            && !matches!(self.t.get(j.wrapping_sub(1)), Some(Tok::Dot))
+                            && !(clause == 1 && depth == 0 && whole_sort_key(&self.t, j)) =>
+                    {
+                        return None
+                    }
                     _ => {}
                 }
                 j += 1;
@@ -8384,7 +8488,7 @@ impl<'a> P<'a> {
         }
         // windows beside aggregates, joins, FIRST/SKIP or in the
         // singular form: unprobed
-        if has_wins && (!joins.is_empty() || first.is_some() || skip.is_some() || !is_for) {
+        if has_wins && (!joins.is_empty() || !is_for) {
             return None;
         }
         // windows over an aggregate: only the GROUP BY form is measured
@@ -8421,26 +8525,7 @@ impl<'a> P<'a> {
             }
             let mut lifted: Vec<Item> = Vec::with_capacity(items.len());
             for it in items.drain(..) {
-                let lift = |p: &mut Self, v: &Val| -> Option<Val> {
-                    match v {
-                        Val::Fid(..) | Val::Int(_) | Val::Int64(_) | Val::Dec(..) | Val::Str(_) | Val::Null | Val::InParam(_) | Val::LocalVar(_) => Some(v.clone()),
-                        Val::Field(..) => {
-                            if !gfields.contains(v) {
-                                return None;
-                            }
-                            let e = MapEntry::Key(v.clone());
-                            let slot = match p.agg_map.iter().position(|x| *x == e) {
-                                Some(i) => i,
-                                None => {
-                                    p.agg_map.push(e);
-                                    p.agg_map.len() - 1
-                                }
-                            };
-                            Some(Val::Fid(fid_ctx, slot as u16))
-                        }
-                        other => lift_over_agg(&mut p.agg_map, other, &gfields, fid_ctx),
-                    }
-                };
+                let lift = |p: &mut Self, v: &Val| -> Option<Val> { p.lift_to_agg(v, &gfields, fid_ctx) };
                 lifted.push(match it {
                     Item::Col(v) | Item::Expr(v) => {
                         let r = lift(self, &v)?;
@@ -8546,15 +8631,42 @@ impl<'a> P<'a> {
             None
         };
         let mut sort: Vec<(bool, Val)> = Vec::new();
+        // the statement ORDER BY over windows: (descending, nulls byte,
+        // the item's position or the key to compile over the windows)
+        let mut win_sort: Vec<(bool, Option<u8>, Result<Val, usize>)> = Vec::new();
         if self.kw("ORDER") {
             if !self.kw("BY") {
                 return None;
             }
             loop {
+                // a WHOLE key that is a bare name looks at the select list
+                // first: an item's alias, or the column a bare column item
+                // names - one hit sorts on that item exactly as its position
+                // would, two are the engine's 42702 (alias/alias, alias/field
+                // and field/field alike), none falls through to the columns
+                // (all measured on 2196)
+                let named = match self.t.get(self.i) {
+                    Some(Tok::Ident(w)) if whole_sort_key(&self.t, self.i) => {
+                        let hits: Vec<usize> = item_names
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, n)| n.as_deref() == Some(w.as_str()))
+                            .map(|(k, _)| k)
+                            .collect();
+                        if hits.len() > 1 {
+                            return None;
+                        }
+                        hits.first().copied()
+                    }
+                    _ => None,
+                };
                 // under an aggregate a key may be an aggregate itself,
                 // selected or not: it takes (or adds) its map slot (measured:
                 // `SELECT COUNT(*) .. ORDER BY SUM(N)` sorts on fid 1)
-                let key = if aggregate {
+                let key = if let Some(k) = named {
+                    self.i += 1;
+                    Val::Int(i32::try_from(k + 1).ok()?)
+                } else if aggregate {
                     self.agg_mode = true;
                     let k = self.val();
                     self.agg_mode = false;
@@ -8579,6 +8691,44 @@ impl<'a> P<'a> {
                 };
                 if matches!(key, Val::Dec(..)) {
                     return None;
+                }
+                if has_wins {
+                    // OVER WINDOWS a key is compiled once the windows are
+                    // built: a position (or a name) sorts on the item's own
+                    // value, anything else reads the window streams like an
+                    // item would - lifted through the aggregate first when
+                    // there is one (all measured)
+                    let src = if let Some(n) = position {
+                        let i = usize::try_from(n).ok()?.checked_sub(1)?;
+                        if i >= items.len() {
+                            return None;
+                        }
+                        Err(i)
+                    } else if aggregate {
+                        let mut gf = Vec::new();
+                        for k in &group_keys {
+                            collect_fields(k, &mut gf);
+                        }
+                        Ok(self.lift_to_agg(&key, &gf, self.agg_fid_ctx)?)
+                    } else {
+                        Ok(key)
+                    };
+                    let descending = if self.kw("DESC") {
+                        true
+                    } else {
+                        let _ = self.kw("ASC");
+                        false
+                    };
+                    let nulls = match self.nulls_placement(Val::Null)? {
+                        Val::NullsPlaced(b, _) => Some(b),
+                        _ => None,
+                    };
+                    win_sort.push((descending, nulls, src));
+                    if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        self.i += 1;
+                        continue;
+                    }
+                    break;
                 }
                 let key = if let Some(n) = position {
                     let i = usize::try_from(n).ok()?.checked_sub(1)?;
@@ -8633,6 +8783,7 @@ impl<'a> P<'a> {
         // contexts claim the slots after the stream (all probed)
         let mut windows: Vec<Win> = Vec::new();
         let mut rebuilt_exprs: Vec<(usize, usize, Val)> = Vec::new();
+        let mut sort_rebuilt: Vec<(usize, usize, Val)> = Vec::new();
         let win_slots: Vec<(usize, u16)> = if has_wins {
             let mut slots = Vec::new();
             for it in &items {
@@ -8682,8 +8833,17 @@ impl<'a> P<'a> {
                 };
                 match entry {
                     WSlot::Direct(e) => {
-                        let slot = windows[wi].map.len() as u16;
-                        windows[wi].map.push(e);
+                        // a window's map holds each entry ONCE: a repeated
+                        // column or window function reads the same slot
+                        // (measured: `ID, ID, COUNT(*) OVER ()` and two
+                        // `COUNT(*) OVER ()` items map two entries)
+                        let slot = match windows[wi].map.iter().position(|x| *x == e) {
+                            Some(k) => k as u16,
+                            None => {
+                                windows[wi].map.push(e);
+                                (windows[wi].map.len() - 1) as u16
+                            }
+                        };
                         slots.push((wi, slot));
                     }
                     WSlot::Rebuild(v) => {
@@ -8703,6 +8863,33 @@ impl<'a> P<'a> {
                         rebuilt_exprs.push((slots.len() - 1, wi, rebuilt));
                     }
                 }
+            }
+            // the statement ORDER BY's own keys read the DEFAULT window -
+            // created after the others when no item made it (measured:
+            // `ROW_NUMBER() OVER (ORDER BY N) .. ORDER BY ID` is the
+            // ROW_NUMBER window, then an empty one mapping ID); a column
+            // already mapped there reuses its slot, a new one is appended
+            for (k, (_, _, src)) in win_sort.iter().enumerate() {
+                let Ok(v) = src else { continue };
+                let wi = match windows.iter().position(|w| {
+                    w.part.is_empty() && w.ord.is_empty() && w.frame.is_none()
+                }) {
+                    Some(i) => i,
+                    None => {
+                        windows.push(Win {
+                            ctx: 0,
+                            part: Vec::new(),
+                            ord: Vec::new(),
+                            frame: None,
+                            map: Vec::new(),
+                        });
+                        windows.len() - 1
+                    }
+                };
+                let mut gf = Vec::new();
+                collect_fields(v, &mut gf);
+                let rebuilt = rebuild_over_keys(&mut windows[wi].map, v, &gf, 0)?;
+                sort_rebuilt.push((k, wi, rebuilt));
             }
             let win_base = self.streams.len() as u8 + self.base - 1;
             for (i, w) in windows.iter_mut().enumerate() {
@@ -8741,6 +8928,20 @@ impl<'a> P<'a> {
             // into their fids now that contexts are assigned
             for (vi, wi, rebuilt) in &rebuilt_exprs {
                 vals[*vi] = patch_fid_ctx(rebuilt, windows[*wi].ctx);
+            }
+            for (k, (desc, nulls, src)) in win_sort.iter().enumerate() {
+                let v = match src {
+                    Err(i) => vals.get(*i)?.clone(),
+                    Ok(_) => {
+                        let (_, wi, r) = sort_rebuilt.iter().find(|(j, _, _)| *j == k)?;
+                        patch_fid_ctx(r, windows[*wi].ctx)
+                    }
+                };
+                let v = match nulls {
+                    Some(b) => Val::NullsPlaced(*b, Box::new(v)),
+                    None => v,
+                };
+                sort.push((*desc, v));
             }
             vals
         } else if aggregate {
@@ -8800,7 +9001,7 @@ impl<'a> P<'a> {
             self.i += 1;
             // FIRST/SKIP refuse beside the structures they always
             // have - re-check now that they may have just appeared
-            if has_wins || union_.is_some() || !joins.is_empty() {
+            if union_.is_some() || !joins.is_empty() {
                 return None;
             }
         }
@@ -8837,7 +9038,7 @@ impl<'a> P<'a> {
                 // ROWS n alone is blr_first n (measured)
                 first = Some(Val::Int(m));
             }
-            if has_wins || union_.is_some() || !joins.is_empty() {
+            if union_.is_some() || !joins.is_empty() {
                 return None;
             }
         }
@@ -8952,9 +9153,6 @@ impl<'a> P<'a> {
             (None, None)
         };
         let map = std::mem::take(&mut self.agg_map);
-        if has_wins && !sort.is_empty() {
-            return None; // statement ORDER BY over windows: unprobed
-        }
         if union_.is_some()
             && (!sort.is_empty() || lock || cursor.is_some())
         {
@@ -8979,7 +9177,6 @@ impl<'a> P<'a> {
         // reference, so the guard term fell in slice 43)
         if distinct
             && (aggregate
-                || has_wins
                 || union_.is_some()
                 || !joins.is_empty()
                 || cursor.is_some()
@@ -14954,6 +15151,20 @@ mod tests {
     }
 
     #[test]
+    fn window_statement_sort() {
+        // the statement ORDER BY reads the window streams: an unselected
+        // column joins the DEFAULT window's map after the items and the
+        // sort names its fid; a position sorts on the item's own fid
+        // (RDB$PROCEDURE_BLR on 2196)
+        let c = compile_procedure("CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, ROW_NUMBER() OVER (ORDER BY UA) FROM U2 ORDER BY ID INTO :R1, :R2 DO SUSPEND; END").unwrap();
+        let map = [blr::MAP, 2, 0, 0, 0, blr::FIELD, 0, 3, b'U', b'I', b'D', 1, 0, blr::FIELD, 0, 2, b'I', b'D'];
+        assert!(c.windows(map.len()).any(|w| w == map), "{:02X?}", c);
+        assert!(c.windows(7).any(|w| w == [blr::SORT, 1, blr::ASCENDING, blr::FID, 1, 1, 0]), "{:02X?}", c);
+        let p = compile_procedure("CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, ROW_NUMBER() OVER (ORDER BY UA) RN FROM U2 ORDER BY RN DESC INTO :R1, :R2 DO SUSPEND; END").unwrap();
+        assert!(p.windows(7).any(|w| w == [blr::SORT, 1, blr::DESCENDING, blr::FID, 2, 0, 0]), "{:02X?}", p);
+    }
+
+    #[test]
     fn window_refusals() {
         for sql in [
             // windows beside GROUP BY/aggregates: unprobed
@@ -14962,8 +15173,10 @@ mod tests {
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) OVER () FROM T A JOIN U2 B ON A.ID = B.UID INTO :R1 DO SUSPEND; END",
             // the singular form with a window: unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN SELECT COUNT(*) OVER () FROM U2 INTO :R1; SUSPEND; END",
-            // statement-level ORDER BY over windows: unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, COUNT(*) OVER () FROM U2 ORDER BY UID INTO :R1, :R2 DO SUSPEND; END",
+            // a window FUNCTION as a statement sort key: unprobed
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT UID, COUNT(*) OVER () FROM U2 ORDER BY RANK() OVER (ORDER BY UA) INTO :R1, :R2 DO SUSPEND; END",
+            // two items under the sort key's name: the engine's 42702
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER, R3 INTEGER) AS BEGIN FOR SELECT UID, UID, COUNT(*) OVER () FROM U2 ORDER BY UID INTO :R1, :R2, :R3 DO SUSPEND; END",
             // a frame DEMANDS an order (unprobed without one)
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT SUM(UA) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM U2 INTO :R1 DO SUSPEND; END",
             // named windows (the WINDOW clause): unprobed
