@@ -1531,8 +1531,13 @@ fn sf_int_rounded(v: &Value) -> Result<i128, String> {
         Value::Int(n) => Ok(*n as i128),
         Value::Scaled(raw, s) => exe_rescale(*raw as i128, *s, 0).ok_or_else(|| "integer overflow".to_string()),
         Value::Int128(raw, s) => exe_rescale(*raw, *s, 0).ok_or_else(|| "integer overflow".to_string()),
-        Value::Double(d) if d.is_finite() && d.abs() < 1e30 => Ok(d.round() as i128),
-        Value::Float(f) if f.is_finite() => Ok((*f as f64).round() as i128),
+        // an approximate operand converts through INT64 on the engine
+        // (MOV_get_int64): past its range that is 22003, so the run fails and
+        // the interpreter raises it - `MOD(1e19, 7)` answered 3 here once
+        // DOUBLE literals reached the executor (cmpparam X4)
+        Value::Double(d) if d.is_finite() && d.round() >= -9.223372036854775808e18 && d.round() < 9.223372036854775808e18 => Ok(d.round() as i128),
+        Value::Float(f) if f.is_finite() && (*f as f64).round() >= -9.223372036854775808e18 && ((*f as f64).round()) < 9.223372036854775808e18 => Ok((*f as f64).round() as i128),
+        Value::Double(_) | Value::Float(_) => Err("integer overflow".into()),
         _ => Err("an integer operand of another kind unconverted".into()),
     }
 }
