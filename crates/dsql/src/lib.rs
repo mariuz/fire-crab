@@ -1531,7 +1531,9 @@ enum MapEntry {
     /// LIST([DISTINCT] value [, delimiter]): blr_agg_list (AA) or
     /// blr_agg_list_distinct (AB), the value, the delimiter - a written
     /// default `','` when omitted (measured)
-    List(bool, Val, Val),
+    /// `.. WITHIN GROUP (ORDER BY ..)` adds `EB <n> <sort keys>` after the
+    /// delimiter (measured)
+    List(bool, Val, Val, Vec<(bool, Val)>),
 }
 
 struct P<'a> {
@@ -3213,10 +3215,49 @@ impl<'a> P<'a> {
                 return None;
             }
             self.i += 1;
+            // WITHIN GROUP (ORDER BY keys): the keys read the source rows
+            let mut order = Vec::new();
+            if self.kw("WITHIN") {
+                if !self.kw("GROUP") || !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                    return None;
+                }
+                self.i += 1;
+                if !self.kw("ORDER") || !self.kw("BY") {
+                    return None;
+                }
+                let saved = self.agg_mode;
+                self.agg_mode = false;
+                let keys = (|| {
+                    let mut keys = Vec::new();
+                    loop {
+                        let k = self.val()?;
+                        let desc = if self.kw("DESC") {
+                            true
+                        } else {
+                            let _ = self.kw("ASC");
+                            false
+                        };
+                        let k = self.nulls_placement(k)?;
+                        keys.push((desc, k));
+                        if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                            self.i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(keys)
+                })();
+                self.agg_mode = saved;
+                order = keys?;
+                if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                    return None;
+                }
+                self.i += 1;
+            }
             if contains_fid_ctx(&v, self.agg_fid_ctx) || contains_fid_ctx(&d, self.agg_fid_ctx) {
                 return None;
             }
-            let entry = MapEntry::List(distinct, v, d);
+            let entry = MapEntry::List(distinct, v, d, order);
             let slot = match self.agg_map.iter().position(|e| *e == entry) {
                 Some(i) => i,
                 None => {
@@ -7532,10 +7573,17 @@ fn emit_map_entries(out: &mut Vec<u8>, map: &[MapEntry]) {
                     emit_val(out, a);
                 }
             }
-            MapEntry::List(distinct, v, d) => {
+            MapEntry::List(distinct, v, d, order) => {
                 out.push(if *distinct { 0xAB } else { 0xAA });
                 emit_val(out, v);
                 emit_val(out, d);
+                if !order.is_empty() {
+                    out.push(0xEB); // the WITHIN GROUP ordering
+                    out.push(order.len() as u8);
+                    for (desc, k) in order {
+                        emit_sort_key(out, *desc, k);
+                    }
+                }
             }
         }
     }
