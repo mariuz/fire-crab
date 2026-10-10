@@ -520,8 +520,9 @@ rec  "15 LPAD in a procedure" "SELECT * FROM PP('ab', 5);" \
      "R|éééab" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
 rec  "15 RPAD under GROUP BY ... HAVING" "SELECT RPAD(S, 5, '*') AS X FROM T GROUP BY 1 HAVING RPAD(S, 5, '*') > '';" \
      "X|abc**|xyz**" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
-rec  "15 LPAD in an IN (subquery)" "SELECT 1 FROM T WHERE '**abc' IN (SELECT LPAD(S, 5, '*') FROM T);" \
-     "CONSTANT|1|1" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error"
+# promoted 2026-10-10: a literal on the left of IN (SELECT ..) answers
+# (resolve_subqueries keys a column's probe only - 8051b0a)
+same "15 LPAD in an IN (subquery)" "SELECT 1 FROM T WHERE '**abc' IN (SELECT LPAD(S, 5, '*') FROM T);"
 echo "--- 7. RECORDED, not fixed"
 # the describe of a NEGATIVE constant pad length: the engine's makePad
 # computes 2 + fixLength(-1 * bpc) into a USHORT and announces VARYING(1);
