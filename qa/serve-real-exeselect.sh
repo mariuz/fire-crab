@@ -228,6 +228,16 @@ CS=UTF8 route "18 ...over no row: NULL" served "SELECT CAST(LIST(S) AS VARCHAR(1
 CS=UTF8 route "18 ...WITHIN GROUP by a key" served "SELECT CAST(LIST(S, ',') WITHIN GROUP (ORDER BY ID DESC) AS VARCHAR(100)) FROM T"
 CS=UTF8 route "18 ...WITHIN GROUP: a tie between different values is the sort's order (declined)" declined "SELECT CAST(LIST(S, ',') WITHIN GROUP (ORDER BY G) AS VARCHAR(100)) FROM T"
 CS=UTF8 route "18 grouped LIST folds in the sort's order (declined)" declined "SELECT G, CAST(LIST(S) AS VARCHAR(100)) FROM T GROUP BY G ORDER BY G"
+# --- 19. STATISTICAL AGGREGATES over exact sums; windows stay with the interpreter here -------------------
+# The route declines EVERY window (the 2026-10-06 tie guard), so exe's statistical
+# window functions run only inside stored routines - pinned in qa/exe-run-blr.sh.
+# These cells hold the route's answer, which must stay the engine's.
+route "19 OVER (): declined at the route's window guard" declined "SELECT ID, VAR_SAMP(N) OVER (), STDDEV_POP(ID) OVER () FROM T ORDER BY ID"
+route "19 OVER (ORDER BY a unique key): running, declined likewise" declined "SELECT ID, VAR_POP(N) OVER (ORDER BY ID), STDDEV_SAMP(N) OVER (ORDER BY ID) FROM T ORDER BY ID"
+route "19 ...partitioned and running" declined "SELECT ID, VAR_SAMP(N) OVER (PARTITION BY G ORDER BY ID), CORR(N, ID) OVER (PARTITION BY G ORDER BY ID) FROM T ORDER BY ID"
+route "19 ...a sliding ROWS frame" declined "SELECT ID, VAR_POP(N) OVER (ORDER BY ID ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM T ORDER BY ID"
+route "19 ...doubles, running" declined "SELECT ID, VAR_SAMP(D) OVER (ORDER BY ID), REGR_SLOPE(D, ID) OVER (ORDER BY ID) FROM A ORDER BY ID"
+route "19 grouped statistical aggregates over small integers: exact, served" served "SELECT G, VAR_SAMP(ID), STDDEV_POP(B), CORR(ID, G) FROM T GROUP BY G ORDER BY G"
 route "10 IN over a FLOAT (slice 15: the items are typed among THEMSELVES - int64 scale -1 here - and the FLOAT operand never shapes them, measured; promoted from declined)" served "SELECT ID FROM A WHERE R IN (0.1, 1.5) ORDER BY ID"
 route "10 BETWEEN over a DOUBLE" served "SELECT ID, D FROM A WHERE D BETWEEN 0 AND 3 ORDER BY D"
 route "10 MIN / MAX keep the kind" served "SELECT MIN(R), MAX(D), MAX(R) FROM A"

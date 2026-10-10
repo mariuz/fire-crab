@@ -849,6 +849,16 @@ impl<'a> P<'a> {
                         let t = [self.u8()?, self.u8()?, self.u8()?, self.u8()?];
                         Value::Timestamp(i32::from_le_bytes(d), u32::from_le_bytes(t))
                     }
+                    // blr_double: a COUNTED STRING, the literal's source text
+                    // (dsql emits `1e0` / `0.1e0` spelled as written) - read
+                    // as the engine's IEEE conversion of the decimal text
+                    27 => {
+                        let n = self.u16()? as usize;
+                        let bytes = self.b.get(self.i..self.i + n).ok_or("literal ends early")?.to_vec();
+                        self.i += n;
+                        let text = String::from_utf8(bytes).map_err(|_| "literal not utf8")?;
+                        Value::Double(text.trim().parse::<f64>().map_err(|_| format!("a double literal {:?} unconverted", text))?)
+                    }
                     other => return Err(format!("literal dtype {} unconverted", other)),
                 }))
             }
@@ -3641,6 +3651,64 @@ impl<'a> Exec<'a> {
                                         slot_rows[*ri][*slot as usize] = v;
                                     }
                                 }
+                                n if stat_kind(n).is_some() => {
+                                    // a statistical aggregate over each row's FRAME,
+                                    // folded in partition order - the engine's fold
+                                    // (measured digit for digit over running,
+                                    // partitioned and sliding frames). Partition
+                                    // order inside a TIE is the sort's (the rest of
+                                    // the record), so a tie is served only when the
+                                    // sums are EXACT ([stat_exact]) and any order
+                                    // gives the same bits
+                                    let ties = if w.order.is_empty() {
+                                        !w.partition.is_empty() && part.len() > 1
+                                    } else {
+                                        (0..part.len()).any(|k| peer_end_arr[k] - peer_start[k] > 1)
+                                    };
+                                    let mut tuples: Vec<Option<Vec<f64>>> = Vec::with_capacity(part.len());
+                                    let mut exact = true;
+                                    for (_, _, ri) in part {
+                                        let vals = self.with_binding(&rows[*ri].binding.clone(), |ex| {
+                                            args.iter().map(|a| ex.eval(a)).collect::<Result<Vec<_>, _>>()
+                                        })?;
+                                        if vals.iter().any(|v| matches!(v, Value::Null)) {
+                                            tuples.push(None);
+                                            continue;
+                                        }
+                                        exact &= vals.iter().all(|v| matches!(v, Value::Int(n) if n.unsigned_abs() < 1 << 20));
+                                        tuples.push(Some(vals.iter().map(stat_f64).collect::<Result<Vec<_>, _>>()?));
+                                    }
+                                    // |x| < 2^20 over at most 2^12 rows keeps every
+                                    // square and every sum under 2^53: exact
+                                    exact &= part.len() <= 1 << 12;
+                                    if ties && !exact {
+                                        return Err(format!("{} over tied rows (the sort's fold order) unconverted", n));
+                                    }
+                                    for (j, (_, _, ri)) in part.iter().enumerate() {
+                                        let (fs, fe) = self.frame_span(
+                                            &w.frame,
+                                            !w.order.is_empty(),
+                                            j,
+                                            part.len(),
+                                            &peer_start,
+                                            &peer_end_arr,
+                                            &key0,
+                                            dir0_desc,
+                                            &rows[*ri].binding.clone(),
+                                        )?;
+                                        let (mut cnt, mut sx, mut sxx, mut sy, mut syy, mut sxy) = (0i64, 0f64, 0f64, 0f64, 0f64, 0f64);
+                                        for t in tuples[fs..fe].iter().flatten() {
+                                            let (y, x) = if t.len() == 2 { (t[0], t[1]) } else { (0.0, t[0]) };
+                                            cnt += 1;
+                                            sx += x;
+                                            sxx += x * x;
+                                            sy += y;
+                                            syy += y * y;
+                                            sxy += x * y;
+                                        }
+                                        slot_rows[*ri][*slot as usize] = stat_result(n, cnt, sx, sxx, sy, syy, sxy);
+                                    }
+                                }
                                 other => {
                                     return Err(format!(
                                         "window function {} unconverted",
@@ -4382,7 +4450,7 @@ impl<'a> Exec<'a> {
             // a statistical aggregate: n and the five sums over the rows
             // whose operands are all non-NULL, accumulated in the engine's
             // order (CorrAggNode::aggPass) so the DOUBLE bits match
-            Stat { name: String, n: i64, sx: f64, sxx: f64, sy: f64, syy: f64, sxy: f64 },
+            Stat { name: String, n: i64, sx: f64, sxx: f64, sy: f64, syy: f64, sxy: f64, exact: bool },
             // LIST: (WITHIN GROUP keys, rendered text) per non-NULL value,
             // and the separator
             List { items: Vec<(Vec<Value>, String)>, delim: Option<String> },
@@ -4409,6 +4477,7 @@ impl<'a> Exec<'a> {
                             sy: 0.0,
                             syy: 0.0,
                             sxy: 0.0,
+                            exact: true,
                         },
                         MapItem::List { .. } => Fold::List { items: Vec::new(), delim: None },
                         MapItem::Value(_) => Fold::Pass(Value::Null),
@@ -4476,15 +4545,17 @@ impl<'a> Exec<'a> {
                     // on that order (aggfold: {-1e308, 1e308, -1e308, 1e308}
                     // reaches -Inf first and STDDEV_POP is NaN there, Inf in
                     // scan order) - unconverted, as a double SUM is
-                    if !agg.group_by.is_empty() {
-                        return Err("a grouped statistical aggregate (the sort's fold order) unconverted".into());
-                    }
+                    // ...served anyway when every operand is a small integer:
+                    // the sums are then exact and any order gives the same
+                    // bits (checked at the finish, [Fold::Stat]'s `exact`)
                     let vals = args.iter().map(|e| self.eval(e)).collect::<Result<Vec<_>, _>>()?;
                     if vals.iter().any(|v| matches!(v, Value::Null)) {
                         continue;
                     }
+                    let small = vals.iter().all(|v| matches!(v, Value::Int(n) if n.unsigned_abs() < 1 << 20));
                     let xs = vals.iter().map(stat_f64).collect::<Result<Vec<_>, _>>()?;
-                    if let Fold::Stat { n, sx, sxx, sy, syy, sxy, .. } = &mut groups[gi].slots[slot_i].1 {
+                    if let Fold::Stat { n, sx, sxx, sy, syy, sxy, exact, .. } = &mut groups[gi].slots[slot_i].1 {
+                        *exact &= small && *n < 1 << 12;
                         // one argument is X; two are (Y, X), SQL order
                         let (y, x) = if xs.len() == 2 { (xs[0], xs[1]) } else { (0.0, xs[0]) };
                         *n += 1;
@@ -4634,7 +4705,16 @@ impl<'a> Exec<'a> {
                     Fold::AvgD(x, c) => Value::Double(x / c as f64),
                     Fold::Min(v) | Fold::Max(v) => v.unwrap_or(Value::Null),
                     Fold::Pass(v) => v,
-                    Fold::Stat { name, n, sx, sxx, sy, syy, sxy } => stat_result(&name, n, sx, sxx, sy, syy, sxy),
+                    Fold::Stat { name, n, sx, sxx, sy, syy, sxy, exact } => {
+                        // UNDER A GROUP BY the engine folds each group in its
+                        // SORT's order (ties broken by the rest of the record),
+                        // and an inexact double sum depends on it (aggfold:
+                        // {-1e308, 1e308, ..} is NaN sorted, Inf scanned)
+                        if !agg.group_by.is_empty() && !exact {
+                            return Err("a grouped statistical aggregate over inexact sums (the sort's fold order) unconverted".into());
+                        }
+                        stat_result(&name, n, sx, sxx, sy, syy, sxy)
+                    }
                     Fold::List { items, delim } => {
                         let spec = agg.map.iter().find(|(s, _)| *s == slot).map(|(_, m)| m);
                         let Some(MapItem::List { distinct, order, .. }) = spec else { unreachable!("a List fold has its item") };
