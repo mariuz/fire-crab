@@ -6646,6 +6646,10 @@ struct BodyUnion {
 struct Win {
     ctx: u8,
     part: Vec<Val>,
+    /// each partition key REMAPPED onto the window's own map: a column's
+    /// slot (shared by a repeat), an expression rebuilt over its columns'
+    /// slots (measured: `PARTITION BY UPPER(S)` maps S, remaps UPPER(fid))
+    remap: Vec<Val>,
     ord: Vec<(bool, Val)>,
     map: Vec<MapEntry>,
     frame: Option<(u8, (u8, Option<Val>), (u8, Option<Val>))>,
@@ -7533,7 +7537,6 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.push(blr::END);
                 out.push(f.windows.len() as u8);
                 for w in &f.windows {
-                    let key_base = w.map.len() - w.part.len();
                     if let Some((unit, b1, b2)) = &w.frame {
                         // the v4 verb: subcoded clauses, then the
                         // extent, then its OWN end (probed)
@@ -7545,14 +7548,8 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                             for k in &w.part {
                                 emit_val(out, k);
                             }
-                            for ki in 0..w.part.len() {
-                                emit_val(
-                                    out,
-                                    &Val::Fid(
-                                        w.ctx,
-                                        (key_base + ki) as u16,
-                                    ),
-                                );
+                            for r in &w.remap {
+                                emit_val(out, r);
                             }
                         }
                         if !w.ord.is_empty() {
@@ -7588,11 +7585,8 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     for k in &w.part {
                         emit_val(out, k);
                     }
-                    for ki in 0..w.part.len() {
-                        emit_val(
-                            out,
-                            &Val::Fid(w.ctx, (key_base + ki) as u16),
-                        );
+                    for r in &w.remap {
+                        emit_val(out, r);
                     }
                     out.push(blr::SORT);
                     out.push(w.ord.len() as u8);
@@ -8849,6 +8843,7 @@ impl<'a> P<'a> {
                             ord,
                             frame,
                             map: Vec::new(),
+                            remap: Vec::new(),
                         });
                         windows.len() - 1
                     }
@@ -8904,6 +8899,7 @@ impl<'a> P<'a> {
                             ord: Vec::new(),
                             frame: None,
                             map: Vec::new(),
+                            remap: Vec::new(),
                         });
                         windows.len() - 1
                     }
@@ -8927,10 +8923,17 @@ impl<'a> P<'a> {
                     proc_args: None,
                 });
             }
+            // the partition keys join each window's map after its items:
+            // a column (or an aggregate's fid) takes a slot, an expression
+            // contributes its columns and remaps rebuilt over them (measured)
             for w in &mut windows {
                 let keys = w.part.clone();
                 for k in keys {
-                    w.map.push(MapEntry::Key(k));
+                    // a column already mapped reuses its slot (measured:
+                    // `PARTITION BY G, G` and `UPPER(S), S` map S once)
+                    let mut gf = Vec::new();
+                    collect_fields_deep(&k, &mut gf);
+                    w.remap.push(rebuild_over_keys(&mut w.map, &k, &gf, w.ctx)?);
                 }
             }
             slots
@@ -10021,6 +10024,22 @@ impl<'a> P<'a> {
             }
             if is_keyword(a) {
                 return None;
+            }
+            // anything but a bare or qualified column is an EXPRESSION key:
+            // emitted as written in the window's sort, rebuilt over the map
+            // as a partition key (measured: `PARTITION BY G + 1`, `ORDER BY
+            // ABS(N)`)
+            let col_end = if matches!(p.t.get(p.i + 1), Some(Tok::Dot)) { p.i + 3 } else { p.i + 1 };
+            let bare = match p.t.get(col_end) {
+                Some(Tok::Comma) | Some(Tok::RParen) => true,
+                Some(Tok::Ident(w)) => matches!(
+                    w.as_str(),
+                    "ASC" | "ASCENDING" | "DESC" | "DESCENDING" | "NULLS" | "ORDER" | "ROWS" | "RANGE"
+                ),
+                _ => false,
+            };
+            if !bare {
+                return p.val();
             }
             let a = a.clone();
             p.i += 1;
