@@ -535,6 +535,10 @@ enum Val {
     /// statement's ORDER BY, an aggregate's and a window's alike (measured);
     /// only [emit_sort_key] reads it - it never stands as a value
     NullsPlaced(u8, Box<Val>),
+    /// a window function met INSIDE a select item's expression: the index
+    /// of its spec in the parser's `win_found`, resolved to a window fid
+    /// when the windows are built (never emitted)
+    WinRef(u16),
 }
 
 /// One sort key: `[nulls byte] <ascending|descending> <value>`.
@@ -1497,6 +1501,11 @@ struct P<'a> {
     /// set while parsing HAVING: aggregate calls in func() resolve
     /// to blr_fid slots against agg_map
     agg_mode: bool,
+    /// set while a FOR SELECT item is parsed: (the stream depth, the
+    /// stream context) - a window call met in func() at that depth is
+    /// captured into `win_found` as a [Val::WinRef]
+    win_cap: Option<(usize, u8)>,
+    win_found: Vec<WinSpec>,
     /// the procedure's INPUT parameter names, in message-0 order;
     /// `:name` in an expression resolves against this
     in_params: Vec<String>,
@@ -1599,6 +1608,8 @@ impl<'a> P<'a> {
             sub: None,
             agg_map: Vec::new(),
             agg_mode: false,
+            win_cap: None,
+            win_found: Vec::new(),
             in_params: Vec::new(),
             local_vars: Vec::new(),
             next_label: 1,
@@ -2340,6 +2351,15 @@ impl<'a> P<'a> {
     /// - the SCALAR caller only; quantified/IN comparisons over
     /// aggregate output are unprobed and refuse
     fn subselect_ex(&mut self, need_col: bool, allow_agg: bool) -> Option<SubQ> {
+        // a window inside a subquery is the subquery's own: never captured
+        // into the outer item
+        let saved = self.win_cap.take();
+        let r = self.subselect_ex_inner(need_col, allow_agg);
+        self.win_cap = saved;
+        r
+    }
+
+    fn subselect_ex_inner(&mut self, need_col: bool, allow_agg: bool) -> Option<SubQ> {
         if self.outer.is_none() || self.merge_scope.is_some() {
             // a subquery inside an ON clause (or any multi-stream
             // scope) would interleave the stream numbering: unprobed
@@ -2992,6 +3012,19 @@ impl<'a> P<'a> {
     /// the built-in functions whose compiled BLR was probed; self.i
     /// sits ON the opening paren
     fn func(&mut self, name: &str) -> Option<Val> {
+        // a window call inside a select item (measured: `ROW_NUMBER() OVER
+        // (..) + 1`, `CAST(SUM(X) OVER (..) AS ..)`, `COALESCE(SUM(V) OVER
+        // (..), 0)`): captured, resolved when the windows are built
+        if let Some((depth, wctx)) = self.win_cap {
+            if depth == self.streams.len()
+                && is_window_name(name)
+                && self.window_call_end(self.i - 1).is_some()
+            {
+                let spec = self.window_call(name, wctx)?;
+                self.win_found.push(spec);
+                return Some(Val::WinRef((self.win_found.len() - 1) as u16));
+            }
+        }
         if self.agg_mode
             && matches!(name, "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
         {
@@ -3305,6 +3338,110 @@ impl<'a> P<'a> {
             }
             other => lift_over_agg(&mut self.agg_map, other, gfields, fid_ctx),
         }
+    }
+
+    /// The index of the paren closing the one at `open`.
+    fn paren_close(&self, open: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut j = open;
+        loop {
+            match self.t.get(j)? {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+    }
+
+    /// `<name>(..) OVER (..)` starting at `i`: the index just past the
+    /// OVER clause's closing paren.
+    fn window_call_end(&self, i: usize) -> Option<usize> {
+        if !matches!(self.t.get(i), Some(Tok::Ident(_))) || !matches!(self.t.get(i + 1), Some(Tok::LParen)) {
+            return None;
+        }
+        let close = self.paren_close(i + 1)?;
+        if !matches!(self.t.get(close + 1), Some(Tok::Ident(w)) if w == "OVER") {
+            return None;
+        }
+        if !matches!(self.t.get(close + 2), Some(Tok::LParen)) {
+            return None;
+        }
+        Some(self.paren_close(close + 2)? + 1)
+    }
+
+    /// A window call with `self.i` ON its opening paren (the name already
+    /// read): the aggregate verbs through parse_agg, the named functions
+    /// canonicalized exactly as a whole window item's (LAG/LEAD to three
+    /// arguments, NTH_VALUE with its FROM FIRST indicator), then OVER.
+    fn window_call(&mut self, name: &str, ctx: u8) -> Option<WinSpec> {
+        // a window INSIDE a window's arguments or keys is the engine's
+        // 42000: nothing nested is captured, so the inner call refuses
+        let saved = self.win_cap.take();
+        let r = self.window_call_inner(name, ctx);
+        self.win_cap = saved;
+        r
+    }
+
+    fn window_call_inner(&mut self, name: &str, ctx: u8) -> Option<WinSpec> {
+        let entry = if matches!(name, "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+            let (verb, arg) = self.parse_agg(name)?;
+            MapEntry::Agg(verb, arg)
+        } else {
+            self.i += 1;
+            let mut args = Vec::new();
+            if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                loop {
+                    args.push(self.val()?);
+                    match self.t.get(self.i)? {
+                        Tok::Comma => self.i += 1,
+                        Tok::RParen => break,
+                        _ => return None,
+                    }
+                }
+            }
+            self.i += 1;
+            match name {
+                "ROW_NUMBER" | "RANK" | "DENSE_RANK" => {
+                    if !args.is_empty() {
+                        return None;
+                    }
+                }
+                "FIRST_VALUE" | "LAST_VALUE" => {
+                    if args.len() != 1 {
+                        return None;
+                    }
+                }
+                "NTH_VALUE" => {
+                    if args.len() != 2 {
+                        return None;
+                    }
+                    args.push(Val::Int(0));
+                }
+                _ => {
+                    if args.is_empty() || args.len() > 3 {
+                        return None;
+                    }
+                    if args.len() < 2 {
+                        args.push(Val::Int(1));
+                    }
+                    if args.len() < 3 {
+                        args.push(Val::Null);
+                    }
+                }
+            }
+            MapEntry::Fn(name.to_string(), args)
+        };
+        if !self.kw("OVER") {
+            return None;
+        }
+        let (part, ord, frame) = self.over_clause(ctx)?;
+        Some((entry, part, ord, frame))
     }
 
     /// The NAMES of [star_fields]' columns, in the same order: a
@@ -4591,6 +4728,9 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
         // a placement reaching a value position would be a parser slip:
         // emit the key it wraps (emit_sort_key is the one reader)
         Val::NullsPlaced(_, inner) => emit_val(out, inner),
+        // a captured window call is always rebuilt to a window fid before
+        // the emitter runs (only the window builder consumes WinRef items)
+        Val::WinRef(_) => unreachable!("a window reference reached the emitter"),
         Val::Fn(name, args) => {
             out.push(blr::FUNCTION);
             out.push(name.len() as u8);
@@ -5020,6 +5160,8 @@ pub fn compile_view_columns(sql: &str) -> Option<Vec<Option<Vec<u8>>>> {
         sub: None,
         agg_map: Vec::new(),
         agg_mode: false,
+        win_cap: None,
+        win_found: Vec::new(),
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
@@ -5178,6 +5320,8 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         sub: None,
         agg_map: Vec::new(),
         agg_mode: false,
+        win_cap: None,
+        win_found: Vec::new(),
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
@@ -5532,6 +5676,89 @@ fn whole_sort_key(t: &[Tok], j: usize) -> bool {
             _ => true,
         }
         && after_ok
+}
+
+fn is_window_name(n: &str) -> bool {
+    matches!(
+        n,
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "ROW_NUMBER" | "RANK" | "DENSE_RANK"
+            | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" | "LAG" | "LEAD"
+    )
+}
+
+fn contains_winref(v: &Val) -> bool {
+    match v {
+        Val::WinRef(_) => true,
+        _ => {
+            let mut hit = false;
+            let _ = map_children(v, &mut |c| {
+                hit |= contains_winref(c);
+                Some(c.clone())
+            });
+            hit
+        }
+    }
+}
+
+/// An item expression holding window calls, rebuilt over the windows
+/// under construction: each call takes (or reuses) its entry in the window
+/// of its spec - created in encounter order - and a column its slot in the
+/// DEFAULT window; every fid carries the WINDOW INDEX as its context until
+/// [patch_fid_win] (measured: `SUM(N) OVER (PARTITION BY G) * 100 /
+/// COUNT(*) OVER ()`, `ROW_NUMBER() OVER (..) - ROW_NUMBER() OVER (..)`)
+fn rebuild_win_expr(windows: &mut Vec<Win>, v: &Val, found: &[WinSpec]) -> Option<Val> {
+    let mut slot_in = |windows: &mut Vec<Win>, part: &Vec<Val>, ord: &Vec<(bool, Val)>, frame: &Option<(u8, (u8, Option<Val>), (u8, Option<Val>))>, e: MapEntry| -> Option<Val> {
+        let wi = match windows.iter().position(|w| w.part == *part && w.ord == *ord && w.frame == *frame) {
+            Some(i) => i,
+            None => {
+                windows.push(Win {
+                    ctx: 0,
+                    part: part.clone(),
+                    ord: ord.clone(),
+                    frame: frame.clone(),
+                    map: Vec::new(),
+                    remap: Vec::new(),
+                });
+                windows.len() - 1
+            }
+        };
+        let map = &mut windows[wi].map;
+        let slot = match map.iter().position(|x| *x == e) {
+            Some(k) => k,
+            None => {
+                map.push(e);
+                map.len() - 1
+            }
+        };
+        Some(Val::Fid(u8::try_from(wi).ok()?, slot as u16))
+    };
+    match v {
+        Val::WinRef(k) => {
+            let (e, part, ord, frame) = found.get(*k as usize)?;
+            let nested = |x: &Val| contains_winref(x);
+            let in_entry = match e {
+                MapEntry::Agg(_, Some(a)) => nested(a),
+                MapEntry::Fn(_, args) => args.iter().any(nested),
+                _ => false,
+            };
+            if in_entry || part.iter().any(nested) || ord.iter().any(|(_, x)| nested(x)) {
+                return None;
+            }
+            slot_in(windows, part, ord, frame, e.clone())
+        }
+        Val::Field(..) | Val::Fid(..) => slot_in(windows, &Vec::new(), &Vec::new(), &None, MapEntry::Key(v.clone())),
+        v if is_leaf_val(v) => Some(v.clone()),
+        _ => map_children(v, &mut |c| rebuild_win_expr(windows, c, found)),
+    }
+}
+
+/// [rebuild_win_expr]'s window indexes become the windows' contexts.
+fn patch_fid_win(v: &Val, windows: &[Win]) -> Option<Val> {
+    match v {
+        Val::Fid(wi, slot) => Some(Val::Fid(windows.get(*wi as usize)?.ctx, *slot)),
+        other if is_leaf_val(other) => Some(other.clone()),
+        other => map_children(other, &mut |c| patch_fid_win(c, windows)),
+    }
 }
 
 /// A value with NO child values: a literal, a parameter, a variable, a
@@ -6643,6 +6870,14 @@ struct BodyUnion {
 /// One window of a windowed select: blr_partition_by's operands -
 /// or blr_window_win's when a FRAME rides along (unit, two bounds,
 /// each a code and an optional value; probed).
+/// A window call: the map entry, partition keys, order keys, frame.
+type WinSpec = (
+    MapEntry,
+    Vec<Val>,
+    Vec<(bool, Val)>,
+    Option<(u8, (u8, Option<Val>), (u8, Option<Val>))>,
+);
+
 struct Win {
     ctx: u8,
     part: Vec<Val>,
@@ -7976,6 +8211,7 @@ impl<'a> P<'a> {
         }
         let mut items: Vec<Item> = Vec::new();
         let mut aliases: Vec<String> = Vec::new();
+        self.win_found.clear();
         // each item's NAME as an ORDER BY key sees it: its alias, else the
         // column a bare (or qualified) column reference names, else none
         let mut item_names: Vec<Option<String>> = Vec::new();
@@ -7985,12 +8221,19 @@ impl<'a> P<'a> {
             let mut keys_seen: Vec<Val> = Vec::new();
             let item_start = self.i;
             let mut star_names: Option<Vec<String>> = None;
+            // a window call that is NOT the whole item (an operand of an
+            // expression, a function's argument) parses as a value below
+            let win_whole = self.window_call_end(self.i).map_or(true, |e| {
+                e == list_end
+                    || matches!(self.t.get(e), Some(Tok::Comma))
+                    || matches!(self.t.get(e), Some(Tok::Ident(a)) if a == "AS" || !is_keyword(a))
+            });
             match self.t.get(self.i)? {
                 Tok::Ident(w)
                     if matches!(
                         w.as_str(),
                         "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
-                    ) && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) =>
+                    ) && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) && win_whole =>
                 {
                     let w = w.clone();
                     self.i += 1;
@@ -8032,7 +8275,7 @@ impl<'a> P<'a> {
                             | "NTH_VALUE"
                             | "LAG"
                             | "LEAD"
-                    ) && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) =>
+                    ) && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) && win_whole =>
                 {
                     let w = w.clone();
                     self.i += 2;
@@ -8167,8 +8410,14 @@ impl<'a> P<'a> {
                     // a full value expression at the stream context
                     // (bare names resolve as COLUMNS here - the
                     // stream scope is set); a plain column keeps its
-                    // Col shape for the aggregate/cursor paths
-                    let v = self.val()?;
+                    // Col shape for the aggregate/cursor paths; a window call
+                    // inside is captured (not under GROUP BY: unprobed)
+                    if !grouped_ahead {
+                        self.win_cap = Some((self.streams.len(), ctx));
+                    }
+                    let v = self.val();
+                    self.win_cap = None;
+                    let v = v?;
                     collect_fields_deep(&v, &mut keys_seen);
                     items.push(match v {
                         Val::Field(..) => Item::Col(v),
@@ -8487,7 +8736,8 @@ impl<'a> P<'a> {
         {
             return None;
         }
-        let has_wins = items.iter().any(|it| matches!(it, Item::Win(..)));
+        let win_found = std::mem::take(&mut self.win_found);
+        let has_wins = !win_found.is_empty() || items.iter().any(|it| matches!(it, Item::Win(..)));
         if union_.is_some() && has_wins {
             return None;
         }
@@ -8800,6 +9050,7 @@ impl<'a> P<'a> {
         let mut windows: Vec<Win> = Vec::new();
         let mut rebuilt_exprs: Vec<(usize, usize, Val)> = Vec::new();
         let mut sort_rebuilt: Vec<(usize, usize, Val)> = Vec::new();
+        let mut win_exprs: Vec<(usize, Val)> = Vec::new();
         let win_slots: Vec<(usize, u16)> = if has_wins {
             let mut slots = Vec::new();
             for it in &items {
@@ -8818,6 +9069,12 @@ impl<'a> P<'a> {
                         None,
                         WSlot::Direct(MapEntry::Key(v.clone())),
                     ),
+                    Item::Expr(v) if contains_winref(v) => {
+                        let r = rebuild_win_expr(&mut windows, v, &win_found)?;
+                        slots.push((0, u16::MAX));
+                        win_exprs.push((slots.len() - 1, r));
+                        continue;
+                    }
                     Item::Expr(v) => (
                         Vec::new(),
                         Vec::new(),
@@ -8953,6 +9210,9 @@ impl<'a> P<'a> {
             // into their fids now that contexts are assigned
             for (vi, wi, rebuilt) in &rebuilt_exprs {
                 vals[*vi] = patch_fid_ctx(rebuilt, windows[*wi].ctx);
+            }
+            for (vi, r) in &win_exprs {
+                vals[*vi] = patch_fid_win(r, &windows)?;
             }
             for (k, (desc, nulls, src)) in win_sort.iter().enumerate() {
                 let v = match src {
@@ -11924,6 +12184,8 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
         sub: None,
         agg_map: Vec::new(),
         agg_mode: false,
+        win_cap: None,
+        win_found: Vec::new(),
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
@@ -12010,6 +12272,8 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
         sub: None,
         agg_map: Vec::new(),
         agg_mode: false,
+        win_cap: None,
+        win_found: Vec::new(),
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
@@ -12083,6 +12347,8 @@ pub fn compile_index_condition(sql: &str) -> Option<Vec<u8>> {
         sub: None,
         agg_map: Vec::new(),
         agg_mode: false,
+        win_cap: None,
+        win_found: Vec::new(),
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
@@ -12176,6 +12442,8 @@ fn compile_check_inner(sql: &str, table: &str) -> Option<Vec<u8>> {
         sub: Some(1),
         agg_map: Vec::new(),
         agg_mode: false,
+        win_cap: None,
+        win_found: Vec::new(),
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
@@ -12437,6 +12705,8 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
         sub: None,
         agg_map: Vec::new(),
         agg_mode: false,
+        win_cap: None,
+        win_found: Vec::new(),
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
@@ -12544,6 +12814,8 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         sub: None,
         agg_map: Vec::new(),
         agg_mode: false,
+        win_cap: None,
+        win_found: Vec::new(),
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
