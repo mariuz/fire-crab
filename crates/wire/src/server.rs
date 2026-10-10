@@ -31723,9 +31723,17 @@ fn dsql_catalog_for(
         }
         if fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, word).is_some() {
             // the current format's descriptors are indexed by FIELD ID
+            // a SYSTEM relation has no RDB$FORMATS rows: its format is the
+            // engine's own, built by sysfmt (an IN list over RDB$RELATION_NAME
+            // needs it - the engine casts each literal to CHAR(63) set 4)
             let descs: Vec<Descriptor> = db
                 .relation_meta(word)
                 .and_then(|m| m.formats.last().map(|f| f.1.clone()))
+                .filter(|d| !d.is_empty())
+                .or_else(|| {
+                    fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, word)
+                        .and_then(|f| f.last().map(|f| f.1.clone()))
+                })
                 .unwrap_or_default();
             let cols: Vec<(String, Option<fire_crab_dsql::TypeSpec>)> =
                 relation_columns(&db.bytes(), db.page_size, word)

@@ -243,6 +243,8 @@ echo "--- 9 system relations: their formats are built in, never stored (slice 4)
 route "9 a SYSTEM relation, numeric outputs" served "SELECT RDB\$RELATION_ID, RDB\$SYSTEM_FLAG FROM RDB\$RELATIONS WHERE RDB\$RELATION_ID < 12 ORDER BY 1"
 route "9 ...an aggregate over one" served "SELECT COUNT(*), MAX(RDB\$FIELD_POSITION) FROM RDB\$RELATION_FIELDS WHERE RDB\$SYSTEM_FLAG = 0"
 route "9 ...joined to a user table's count" served "SELECT COUNT(*) FROM RDB\$RELATIONS R JOIN RDB\$RELATION_FIELDS F ON F.RDB\$RELATION_NAME = R.RDB\$RELATION_NAME WHERE R.RDB\$SYSTEM_FLAG = 0"
+route "9 ...an IN list over a system NAME column (each literal cast to CHAR(63) set 4: the built-in format typed)" served "SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME IN ('RDB\$DATABASE', 'RDB\$FIELDS', 'NOPE')"
+route "9 ...NOT IN beside a numeric key" served "SELECT COUNT(*) FROM RDB\$RELATIONS WHERE RDB\$RELATION_ID < 12 AND RDB\$RELATION_NAME NOT IN ('RDB\$DATABASE')"
 route "9 a VIRTUAL relation declines (its rows are computed)" declined "SELECT MON\$PAGE_SIZE FROM MON\$DATABASE"
 route "9 ...and a MON\$ column beside a numeric expression" declined "SELECT MON\$SQL_DIALECT + 0 FROM MON\$DATABASE"
 route "4 a view joined to a table (the BLR's relation list names only the base: COUNT 0)" declined "SELECT COUNT(*) FROM VT JOIN U ON U.T_ID = VT.ID"
