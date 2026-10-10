@@ -6547,6 +6547,11 @@ fn map_children(v: &Val, f: &mut dyn FnMut(&Val) -> Option<Val>) -> Option<Val> 
         Val::NullsPlaced(k, x) => Val::NullsPlaced(*k, b(f(x)?)),
         Val::Coalesce(vs) => Val::Coalesce(vs.iter().map(|x| f(x)).collect::<Option<Vec<_>>>()?),
         Val::SysFn(n, vs) => Val::SysFn(n.clone(), vs.iter().map(|x| f(x)).collect::<Option<Vec<_>>>()?),
+        // a stored (or packaged) function call rebuilds like any operator:
+        // the rewrite is structural - `HAVING F1(G) > 1` is `F1(fid)`
+        // (measured); what the function does at run time is the executor's
+        Val::Fn(n, vs) => Val::Fn(n.clone(), vs.iter().map(|x| f(x)).collect::<Option<Vec<_>>>()?),
+        Val::PkgFn(p, n, vs) => Val::PkgFn(p.clone(), n.clone(), vs.iter().map(|x| f(x)).collect::<Option<Vec<_>>>()?),
         Val::Decode(sel, cs, rs) => Val::Decode(
             b(f(sel)?),
             cs.iter().map(|x| f(x)).collect::<Option<Vec<_>>>()?,

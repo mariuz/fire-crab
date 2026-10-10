@@ -36,15 +36,36 @@ fn catalog_from_env() {
     fire_crab_dsql::set_catalog_typed(entries);
 }
 
+/// `FCDSQL_FUNCS`: the plain user functions the catalog holds, as the server
+/// hands them to the compiler - `F1:1:1;F2:2:1` (name, parameter count,
+/// required count) - so a procedure calling one compiles here as it does
+/// in the server (blr_function).
+fn funcs_from_env() -> Vec<(String, usize, usize)> {
+    let Ok(fs) = std::env::var("FCDSQL_FUNCS") else { return Vec::new() };
+    fs.split(';')
+        .filter_map(|f| {
+            let mut it = f.trim().split(':');
+            let name = it.next()?.trim().to_ascii_uppercase();
+            let total = it.next()?.trim().parse().ok()?;
+            let required = it.next()?.trim().parse().ok()?;
+            (!name.is_empty()).then_some((name, total, required))
+        })
+        .collect()
+}
+
 fn main() {
     catalog_from_env();
+    let funcs = funcs_from_env();
     let sql: String = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     if sql.trim().is_empty() {
         eprintln!("usage: fcdsql <select statement>");
         std::process::exit(2);
     }
     let upper = sql.trim_start().to_uppercase();
-    let compiled = if upper.starts_with("CREATE PROCEDURE") {
+    let compiled = if upper.starts_with("CREATE PROCEDURE") && !funcs.is_empty() {
+        fire_crab_dsql::compile_procedure_full_with_funcs(&sql, &funcs)
+            .map(|c| c.blob.iter().map(|b| format!("{:02X}", b)).collect::<String>())
+    } else if upper.starts_with("CREATE PROCEDURE") {
         fire_crab_dsql::compile_procedure_hex(&sql)
     } else if upper.starts_with("CREATE TRIGGER") {
         fire_crab_dsql::compile_trigger_hex(&sql)
