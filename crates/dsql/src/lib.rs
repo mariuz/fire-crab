@@ -1528,6 +1528,10 @@ enum MapEntry {
     Key(Val),
     Agg(u8, Option<Val>),
     Fn(String, Vec<Val>),
+    /// LIST([DISTINCT] value [, delimiter]): blr_agg_list (AA) or
+    /// blr_agg_list_distinct (AB), the value, the delimiter - a written
+    /// default `','` when omitted (measured)
+    List(bool, Val, Val),
 }
 
 struct P<'a> {
@@ -3194,6 +3198,33 @@ impl<'a> P<'a> {
                 self.win_found.push(spec);
                 return Some(Val::WinRef((self.win_found.len() - 1) as u16));
             }
+        }
+        if self.agg_mode && name == "LIST" {
+            self.i += 1; // (
+            let distinct = self.kw("DISTINCT");
+            let v = self.val()?;
+            let d = if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                self.i += 1;
+                self.val()?
+            } else {
+                Val::Str(",".to_string())
+            };
+            if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                return None;
+            }
+            self.i += 1;
+            if contains_fid_ctx(&v, self.agg_fid_ctx) || contains_fid_ctx(&d, self.agg_fid_ctx) {
+                return None;
+            }
+            let entry = MapEntry::List(distinct, v, d);
+            let slot = match self.agg_map.iter().position(|e| *e == entry) {
+                Some(i) => i,
+                None => {
+                    self.agg_map.push(entry);
+                    self.agg_map.len() - 1
+                }
+            };
+            return Some(Val::Fid(self.agg_fid_ctx, slot as u16));
         }
         if self.agg_mode && stat_agg_arity(name).is_some() {
             // a statistical aggregate: blr_agg_function in the map (measured)
@@ -7501,6 +7532,11 @@ fn emit_map_entries(out: &mut Vec<u8>, map: &[MapEntry]) {
                     emit_val(out, a);
                 }
             }
+            MapEntry::List(distinct, v, d) => {
+                out.push(if *distinct { 0xAB } else { 0xAA });
+                emit_val(out, v);
+                emit_val(out, d);
+            }
         }
     }
 }
@@ -8842,7 +8878,7 @@ impl<'a> P<'a> {
                     }
                     Some(Tok::Comma) if stack.is_empty() => item_starts.push(k + 1),
                     Some(Tok::Ident(w))
-                        if stat_agg_arity(w).is_some()
+                        if (stat_agg_arity(w).is_some() || w == "LIST")
                             && matches!(self.t.get(k + 1), Some(Tok::LParen))
                             && !stack.iter().any(|x| *x) =>
                     {
@@ -9416,9 +9452,21 @@ impl<'a> P<'a> {
                 return None;
             }
             // keys are full EXPRESSIONS (probed): the group list
-            // holds them raw; the map carries their BARE fields
+            // holds them raw; the map carries their BARE fields. A bare
+            // integer is a POSITION in the select list - byte-identical
+            // to writing that item's expression (measured: `GROUP BY 1`
+            // over `G + 1` is `GROUP BY G + 1`); an aggregate's position
+            // is the engine's error
             loop {
-                group_keys.push(self.val()?);
+                let key = self.val()?;
+                let key = match key {
+                    Val::Int(n) => match items.get(usize::try_from(n).ok()?.checked_sub(1)?)? {
+                        Item::Col(v) | Item::Expr(v) if !contains_fid_ctx(v, self.agg_fid_ctx) || !agg_expr_ahead => v.clone(),
+                        _ => return None,
+                    },
+                    other => other,
+                };
+                group_keys.push(key);
                 if matches!(self.t.get(self.i), Some(Tok::Comma)) {
                     self.i += 1;
                 } else {
