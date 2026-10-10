@@ -7994,12 +7994,16 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                         emit_val(out, c);
                     }
                 }
-                if !u.all {
-                    out.push(blr::PROJECT);
-                    out.push(u.branches[0].3.len() as u8);
-                    for i in 0..u.branches[0].3.len() {
-                        emit_val(out, &Val::Fid(u.ctx, i as u16));
-                    }
+                // a trailing ROWS / OFFSET / FETCH is the statement's: after
+                // the union, before its sort (measured); the DISTINCT
+                // union's project follows the sort, below
+                if let Some(v) = &f.first {
+                    out.push(blr::FIRST);
+                    emit_val(out, v);
+                }
+                if let Some(v) = &f.skip {
+                    out.push(blr::SKIP);
+                    emit_val(out, v);
                 }
             } else if !f.windows.is_empty() {
                 // blr_window wraps the inner rse (its WHERE inside);
@@ -8116,6 +8120,15 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.push(f.sort.len() as u8);
                 for (desc, key) in &f.sort {
                     emit_sort_key(out, *desc, key);
+                }
+            }
+            if let Some(u) = f.union_.as_ref().filter(|u| !u.all) {
+                // a DISTINCT union: blr_project over its fids, after the
+                // statement's sort (measured)
+                out.push(blr::PROJECT);
+                out.push(u.branches[0].3.len() as u8);
+                for i in 0..u.branches[0].3.len() {
+                    emit_val(out, &Val::Fid(u.ctx, i as u16));
                 }
             }
             if f.distinct {
@@ -9170,6 +9183,33 @@ impl<'a> P<'a> {
                 if matches!(key, Val::Dec(..)) {
                     return None;
                 }
+                // over a UNION only a POSITION sorts - the union stream's
+                // fid of that column (measured: `.. UNION ALL .. ORDER BY 1`
+                // is `blr_sort 1 asc fid(union, 0)` after the union); a name,
+                // even the first branch's alias, is the engine's -104
+                // "invalid ORDER BY clause"
+                if let Some(u) = &union_ {
+                    if named.is_some() {
+                        return None;
+                    }
+                    let i = usize::try_from(position?).ok()?.checked_sub(1)?;
+                    if i >= items.len() {
+                        return None;
+                    }
+                    let descending = if self.kw("DESC") {
+                        true
+                    } else {
+                        let _ = self.kw("ASC");
+                        false
+                    };
+                    let key = self.nulls_placement(Val::Fid(u.ctx, i as u16))?;
+                    sort.push((descending, key));
+                    if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        self.i += 1;
+                        continue;
+                    }
+                    break;
+                }
                 if has_wins {
                     // OVER WINDOWS a key is compiled once the windows are
                     // built: a position (or a name) sorts on the item's own
@@ -9498,7 +9538,7 @@ impl<'a> P<'a> {
             self.i += 1;
             // FIRST/SKIP refuse beside the structures they always
             // have - re-check now that they may have just appeared
-            if union_.is_some() || !joins.is_empty() {
+            if !joins.is_empty() {
                 return None;
             }
         }
@@ -9535,7 +9575,7 @@ impl<'a> P<'a> {
                 // ROWS n alone is blr_first n (measured)
                 first = Some(Val::Int(m));
             }
-            if union_.is_some() || !joins.is_empty() {
+            if !joins.is_empty() {
                 return None;
             }
         }
@@ -9661,9 +9701,7 @@ impl<'a> P<'a> {
             (None, None)
         };
         let map = std::mem::take(&mut self.agg_map);
-        if union_.is_some()
-            && (!sort.is_empty() || lock || cursor.is_some())
-        {
+        if union_.is_some() && (lock || cursor.is_some()) {
             return None;
         }
         if plan.is_some()

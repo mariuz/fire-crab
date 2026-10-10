@@ -287,6 +287,10 @@ pub enum Bool {
 pub struct SortKey {
     pub expr: Expr,
     pub desc: bool,
+    /// an explicit NULLS FIRST (Some(true)) / NULLS LAST (Some(false)) -
+    /// blr_nullsfirst / blr_nullslast (178 / 180) before the direction;
+    /// None is the engine's default (low: first ascending, last descending)
+    pub nulls: Option<bool>,
 }
 
 /// One aggregate-map entry: the output slot and what fills it - an
@@ -608,12 +612,14 @@ impl<'a> P<'a> {
         let sn = self.u8()? as usize;
         let mut order = Vec::new();
         for _ in 0..sn {
+            // (a window's NULLS placement: its frames and peers read these
+            // keys - unconverted)
             let desc = match self.u8()? {
                 blr::ASCENDING => false,
                 blr::DESCENDING => true,
                 other => return Err(format!("sort direction {} unconverted", other)),
             };
-            order.push(SortKey { expr: self.expr()?, desc });
+            order.push(SortKey { expr: self.expr()?, desc, nulls: None });
         }
         Ok(order)
     }
@@ -1255,14 +1261,23 @@ impl<'a> P<'a> {
                 blr::SORT => {
                     let n = self.u8()? as usize;
                     for _ in 0..n {
-                        let desc = match self.u8()? {
+                        let mut d = self.u8()?;
+                        let nulls = match d {
+                            0xB2 => Some(true),  // blr_nullsfirst
+                            0xB4 => Some(false), // blr_nullslast
+                            _ => None,
+                        };
+                        if nulls.is_some() {
+                            d = self.u8()?;
+                        }
+                        let desc = match d {
                             blr::ASCENDING => false,
                             blr::DESCENDING => true,
                             other => {
                                 return Err(format!("sort direction {} unconverted", other))
                             }
                         };
-                        sort.push(SortKey { expr: self.expr()?, desc });
+                        sort.push(SortKey { expr: self.expr()?, desc, nulls });
                     }
                 }
                 blr::END => break,
@@ -3193,10 +3208,10 @@ impl<'a> Exec<'a> {
                 })?;
                 keyed.push((keys, binding));
             }
-            let dirs: Vec<bool> = rse.sort.iter().map(|k| k.desc).collect();
+            let dirs: Vec<(bool, Option<bool>)> = rse.sort.iter().map(|k| (k.desc, k.nulls)).collect();
             keyed.sort_by(|(a, _), (b, _)| {
-                for (i, desc) in dirs.iter().enumerate() {
-                    let o = null_aware_cmp(&a[i], &b[i], *desc);
+                for (i, (desc, nulls)) in dirs.iter().enumerate() {
+                    let o = placed_cmp(&a[i], &b[i], *desc, *nulls);
                     if o != std::cmp::Ordering::Equal {
                         return o;
                     }
@@ -5533,6 +5548,21 @@ pub fn value_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 /// Sort comparison: like [value_cmp] but total - NULLs collate FIRST
 /// on an ascending key and LAST on a descending one (the engine's
 /// default: NULLs sort LOW), and the direction flips the order.
+/// [null_aware_cmp] under an explicit NULLS placement: the NULLs go first
+/// or last whatever the direction, the values between them ordered by it.
+fn placed_cmp(a: &Value, b: &Value, desc: bool, nulls: Option<bool>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let Some(first) = nulls else {
+        return null_aware_cmp(a, b, desc);
+    };
+    match (matches!(a, Value::Null), matches!(b, Value::Null)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => if first { Ordering::Less } else { Ordering::Greater },
+        (false, true) => if first { Ordering::Greater } else { Ordering::Less },
+        (false, false) => null_aware_cmp(a, b, desc),
+    }
+}
+
 fn null_aware_cmp(a: &Value, b: &Value, desc: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let o = match (matches!(a, Value::Null), matches!(b, Value::Null)) {
