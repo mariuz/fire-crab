@@ -3198,8 +3198,12 @@ impl<'a> P<'a> {
         if self.agg_mode
             && matches!(name, "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
         {
-            // inside HAVING: an aggregate resolves to its map slot
+            // inside HAVING: an aggregate resolves to its map slot; one
+            // nested in another is the engine's 42000 (measured)
             let (verb, arg) = self.parse_agg(name)?;
+            if arg.as_ref().is_some_and(|a| contains_fid_ctx(a, self.agg_fid_ctx)) {
+                return None;
+            }
             let slot = self.agg_slot(verb, arg);
             return Some(Val::Fid(self.agg_fid_ctx, slot));
         }
@@ -6196,6 +6200,52 @@ fn collect_fields(v: &Val, out: &mut Vec<Val>) {
     }
 }
 
+/// Does a value read an aggregate map slot of context `ctx`?
+fn contains_fid_ctx(v: &Val, ctx: u8) -> bool {
+    match v {
+        Val::Fid(c, _) => *c == ctx,
+        _ => {
+            let mut hit = false;
+            let _ = map_children(v, &mut |c| {
+                hit |= contains_fid_ctx(c, ctx);
+                Some(c.clone())
+            });
+            hit
+        }
+    }
+}
+
+/// An aggregate statement's item rebuilt over the map IN ORDER OF
+/// APPEARANCE, left to right (measured: `G + SUM(N)` maps G then SUM,
+/// `SUM(N) + G` SUM then G, `MAX(N), MAX(N) + 1` one MAX): a group field
+/// takes (or reuses) its key slot, an aggregate parsed in aggregate mode -
+/// a fid into `parse_map` - takes (or reuses) its verb's slot.
+fn rebuild_agg_item(map: &mut Vec<MapEntry>, v: &Val, gfields: &[Val], fid_ctx: u8, parse_map: &[MapEntry]) -> Option<Val> {
+    let mut slot_of = |map: &mut Vec<MapEntry>, e: MapEntry| -> u16 {
+        match map.iter().position(|x| *x == e) {
+            Some(i) => i as u16,
+            None => {
+                map.push(e);
+                (map.len() - 1) as u16
+            }
+        }
+    };
+    match v {
+        Val::Fid(c, s) if *c == fid_ctx => {
+            let e = parse_map.get(*s as usize)?.clone();
+            Some(Val::Fid(fid_ctx, slot_of(map, e)))
+        }
+        Val::Field(..) => {
+            if !gfields.contains(v) {
+                return None;
+            }
+            Some(Val::Fid(fid_ctx, slot_of(map, MapEntry::Key(v.clone()))))
+        }
+        v if is_leaf_val(v) => Some(v.clone()),
+        _ => map_children(v, &mut |c| rebuild_agg_item(map, c, gfields, fid_ctx, parse_map)),
+    }
+}
+
 /// [collect_fields] through every PURE node [map_children] walks (a
 /// function's operands too) - what a window's passthrough expression
 /// reads. Kept apart: the GROUP BY key sets stay on the arithmetic walk.
@@ -8718,7 +8768,56 @@ impl<'a> P<'a> {
             }
             found
         };
-        if grouped_ahead {
+        // an AGGREGATE INSIDE an item (an operand, a function's argument -
+        // `COUNT(*) * 2`, `G + SUM(N)`, `COALESCE(MAX(N), 0)`): the items
+        // parse in aggregate mode and the map is rebuilt from them in
+        // order of appearance ([rebuild_agg_item]); not inside a subquery,
+        // not a window call
+        let agg_expr_ahead = {
+            let mut item_starts = vec![list_start];
+            let mut stack: Vec<bool> = Vec::new();
+            let mut found = false;
+            let mut k = list_start;
+            while k < list_end {
+                // a WINDOW call's span - its arguments and keys - belongs to
+                // the window (`SUM(SUM(X)) OVER ()` under a GROUP BY)
+                if matches!(self.t.get(k), Some(Tok::Ident(_))) {
+                    if let Some(e) = self.window_call_end(k) {
+                        k = e;
+                        continue;
+                    }
+                }
+                match self.t.get(k) {
+                    Some(Tok::LParen) => stack.push(matches!(self.t.get(k + 1), Some(Tok::Ident(w)) if w == "SELECT")),
+                    Some(Tok::RParen) => {
+                        stack.pop();
+                    }
+                    Some(Tok::Comma) if stack.is_empty() => item_starts.push(k + 1),
+                    Some(Tok::Ident(w))
+                        if matches!(w.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+                            && matches!(self.t.get(k + 1), Some(Tok::LParen))
+                            && !stack.iter().any(|x| *x)
+                            && self.window_call_end(k).is_none() =>
+                    {
+                        let mut end = self.paren_close(k + 1).map_or(list_end, |c| c + 1);
+                        if matches!(self.t.get(end), Some(Tok::Ident(f)) if f == "FILTER") {
+                            end = self.paren_close(end + 1).map_or(list_end, |c| c + 1);
+                        }
+                        let whole = item_starts.last() == Some(&k)
+                            && (end == list_end
+                                || matches!(self.t.get(end), Some(Tok::Comma))
+                                || matches!(self.t.get(end), Some(Tok::Ident(a)) if a == "AS" || !is_keyword(a)));
+                        if !whole {
+                            found = true;
+                        }
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            found
+        };
+        if grouped_ahead || agg_expr_ahead {
             self.agg_fid_ctx = self.streams.len() as u8 + self.base;
             self.agg_map = Vec::new();
         }
@@ -8741,12 +8840,23 @@ impl<'a> P<'a> {
                     || matches!(self.t.get(e), Some(Tok::Comma))
                     || matches!(self.t.get(e), Some(Tok::Ident(a)) if a == "AS" || !is_keyword(a))
             });
+            // an aggregate call that is the WHOLE item takes its own arm;
+            // inside an expression it is a value of the aggregate's map
+            let agg_whole = !agg_expr_ahead || self.window_call_end(self.i).is_some() || {
+                let mut end = self.paren_close(self.i + 1).map_or(list_end, |c| c + 1);
+                if matches!(self.t.get(end), Some(Tok::Ident(f)) if f == "FILTER") {
+                    end = self.paren_close(end + 1).map_or(list_end, |c| c + 1);
+                }
+                end == list_end
+                    || matches!(self.t.get(end), Some(Tok::Comma))
+                    || matches!(self.t.get(end), Some(Tok::Ident(a)) if a == "AS" || !is_keyword(a))
+            };
             match self.t.get(self.i)? {
                 Tok::Ident(w)
                     if matches!(
                         w.as_str(),
                         "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
-                    ) && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) && win_whole =>
+                    ) && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) && win_whole && agg_whole =>
                 {
                     let w = w.clone();
                     self.i += 1;
@@ -8770,6 +8880,11 @@ impl<'a> P<'a> {
                             frame,
                         ));
                     } else {
+                        // an aggregate INSIDE an aggregate is the engine's
+                        // 42000 unless a window takes it (`SUM(SUM(X)) OVER ()`)
+                        if arg.as_ref().is_some_and(|a| contains_fid_ctx(a, self.agg_fid_ctx) && grouped_ahead) {
+                            return None;
+                        }
                         items.push(Item::Agg(verb, arg));
                     }
                 }
@@ -8925,10 +9040,15 @@ impl<'a> P<'a> {
                     // stream scope is set); a plain column keeps its
                     // Col shape for the aggregate/cursor paths; a window call
                     // inside is captured (not under GROUP BY: unprobed)
-                    if !grouped_ahead {
+                    if !grouped_ahead && !agg_expr_ahead {
                         self.win_cap = Some((self.streams.len(), ctx));
                     }
+                    let saved_mode = self.agg_mode;
+                    if agg_expr_ahead {
+                        self.agg_mode = true;
+                    }
                     let v = self.val();
+                    self.agg_mode = saved_mode;
                     self.win_cap = None;
                     let v = v?;
                     collect_fields_deep(&v, &mut keys_seen);
@@ -9022,7 +9142,13 @@ impl<'a> P<'a> {
         if cols_n == 0 {
             return None;
         }
-        let has_aggs = items.iter().any(|it| matches!(it, Item::Agg(..)));
+        let agg_ctx_ahead = self.agg_fid_ctx;
+        // (the lookahead found an aggregate call outside any subquery and
+        // window: the statement IS an aggregate whatever node holds the
+        // call - a CASE's condition included, which then refuses in the
+        // rebuild rather than compile a map slot with no aggregate node)
+        let _ = agg_ctx_ahead;
+        let has_aggs = items.iter().any(|it| matches!(it, Item::Agg(..))) || agg_expr_ahead;
         let mut boolean = if self.kw("WHERE") {
             Some(self.bool_or()?)
         } else {
@@ -9262,6 +9388,10 @@ impl<'a> P<'a> {
         if union_.is_some() && has_wins {
             return None;
         }
+        // an aggregate inside an item beside a window: unprobed
+        if agg_expr_ahead && has_wins {
+            return None;
+        }
         // a DERIVED stream beside a window: unprobed; a GROUP BY over an
         // EXPRESSION item of one: unprobed (the aggregate, FIRST / SKIP and
         // join shapes are measured - the nested rse stands as the stream)
@@ -9381,8 +9511,14 @@ impl<'a> P<'a> {
             let fid_ctx = self.agg_fid_ctx;
             let mut map: Vec<MapEntry> = Vec::new();
             let mut vals: Vec<Val> = Vec::new();
+            // the map the items' inner aggregates were parsed against: their
+            // fids translate through it as the map rebuilds in order
+            let parse_map = std::mem::take(&mut self.agg_map);
             for it in &items {
                 match it {
+                    Item::Col(v) | Item::Expr(v) if agg_expr_ahead => {
+                        vals.push(rebuild_agg_item(&mut map, v, &gfields, fid_ctx, &parse_map)?);
+                    }
                     Item::Col(v) | Item::Expr(v) => {
                         vals.push(rebuild_over_keys(
                             &mut map, v, &gfields, fid_ctx,
