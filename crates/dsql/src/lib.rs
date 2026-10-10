@@ -1494,6 +1494,15 @@ struct Derived {
     /// relation (its WHERE inside), the windows taking the contexts after
     /// the relation's; the outer columns read their maps by fid (measured)
     wins: Vec<Win>,
+    /// a UNION as the body ([P::derived_union])
+    union: Option<DerivedUnion>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DerivedUnion {
+    all: bool,
+    /// per branch: its relation, context, WHERE and map values
+    branches: Vec<(String, u8, Option<Bool>, Vec<Val>)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1899,6 +1908,33 @@ impl<'a> P<'a> {
     fn derived_body(&mut self, alias: String) -> Option<Stream> {
         if self.in_sub {
             return None; // derived tables in subroutines: unprobed
+        }
+        {
+            // a UNION at the body's own depth: [P::derived_union]
+            let mut j = self.i;
+            let mut depth = 0i32;
+            let mut has_union = false;
+            while let Some(t) = self.t.get(j) {
+                match t {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    Tok::Semi => break,
+                    Tok::Ident(w) if depth == 0 && w == "UNION" => {
+                        has_union = true;
+                        break;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if has_union {
+                return self.derived_union(alias);
+            }
         }
         if !self.kw("SELECT") {
             return None;
@@ -2310,6 +2346,7 @@ impl<'a> P<'a> {
                 project: if distinct { Some(project) } else { None },
                 agg,
                 wins,
+                union: None,
             })),
             sub: self.in_sub,
             cur: None,
@@ -3473,6 +3510,207 @@ impl<'a> P<'a> {
         }
     }
 
+    /// A UNION's branch columns, unified per column: every branch value of
+    /// another type is CAST to the common one, an identical one stays raw
+    /// (measured: `S UNION ALL U` - a NONE VARCHAR(20) beside a UTF8
+    /// VARCHAR(10) - casts BOTH to VARCHAR(20) UTF8; `ID UNION ALL S` casts
+    /// the INTEGER to S's type and leaves S raw). A branch of unknown type
+    /// keeps the plain map; known types that do not unify here refuse.
+    /// The branch streams must still be in scope.
+    fn unify_union(&self, cols: &mut [Vec<Val>]) -> Option<()> {
+        let n = cols.first()?.len();
+        for i in 0..n {
+            let owns: Option<Vec<Dsc>> = cols
+                .iter()
+                .map(|c| match &c[i] {
+                    Val::Field(ctx, name) => self.field_dsc(*ctx, name),
+                    _ => None,
+                })
+                .collect();
+            let Some(owns) = owns else { continue };
+            let bytes = |d: Dsc| {
+                let mut o = Vec::new();
+                emit_dsc(&mut o, d);
+                o
+            };
+            if owns.iter().all(|d| bytes(*d) == bytes(owns[0])) {
+                continue;
+            }
+            let vals: Vec<Val> = cols.iter().map(|c| c[i].clone()).collect();
+            let common = self.unify_branches(&vals.iter().collect::<Vec<_>>())?;
+            for (k, own) in owns.iter().enumerate() {
+                if bytes(*own) != bytes(common) {
+                    let v = cols[k][i].clone();
+                    cols[k][i] = Val::Cast(common, Box::new(v));
+                }
+            }
+        }
+        Some(())
+    }
+
+    /// A UNION as a derived table's body (measured on 2196): blr_union at
+    /// the DERIVED table's own context, each branch's relation at the next
+    /// ones - carrying the derived table's alias text, `"Z" "PUBLIC"."T"`,
+    /// or a plain blr_relation without an alias - the branch WHERE inside
+    /// its rse, then its map; a DISTINCT union's project before the derived
+    /// rse closes. Such a stream occupies 1 + n contexts; the outer columns
+    /// read the union's fids, named by the FIRST branch. Branches are plain
+    /// column lists over one relation (no inner alias, no FIRST / SKIP /
+    /// DISTINCT, no ORDER BY): anything else is unprobed.
+    fn derived_union(&mut self, alias: String) -> Option<Stream> {
+        let base_len = self.streams.len();
+        let dctx = base_len as u8 + self.base;
+        self.streams.push(Stream {
+            name: String::new(),
+            alias: None,
+            derived: None,
+            sub: self.in_sub,
+            cur: None,
+            proc_args: None,
+        });
+        let r = self.derived_union_inner(alias, dctx);
+        self.streams.truncate(base_len);
+        r
+    }
+
+    fn derived_union_inner(&mut self, alias: String, dctx: u8) -> Option<Stream> {
+        let mut branches: Vec<(String, u8, Option<Bool>, Vec<Val>)> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut all: Option<bool> = None;
+        loop {
+            if !self.kw("SELECT") {
+                return None;
+            }
+            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if matches!(w.as_str(), "FIRST" | "SKIP" | "DISTINCT" | "ALL")) {
+                return None;
+            }
+            let mut raw: Vec<(Option<String>, String, Option<String>)> = Vec::new();
+            loop {
+                let Some(Tok::Ident(a)) = self.t.get(self.i) else { return None };
+                if is_keyword(a) {
+                    return None;
+                }
+                let a = a.clone();
+                self.i += 1;
+                let (q, n) = if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                    self.i += 1;
+                    let Some(Tok::Ident(b)) = self.t.get(self.i) else { return None };
+                    let b = b.clone();
+                    self.i += 1;
+                    (Some(a), b)
+                } else {
+                    (None, a)
+                };
+                let al = if self.kw("AS") {
+                    let Some(Tok::Ident(x)) = self.t.get(self.i) else { return None };
+                    let x = x.clone();
+                    self.i += 1;
+                    Some(x)
+                } else if let Some(Tok::Ident(x)) = self.t.get(self.i) {
+                    if x != "FROM" && !is_keyword(x) {
+                        let x = x.clone();
+                        self.i += 1;
+                        Some(x)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                raw.push((q, n, al));
+                match self.t.get(self.i)? {
+                    Tok::Comma => self.i += 1,
+                    Tok::Ident(w) if w == "FROM" => {
+                        self.i += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            let Some(Tok::Ident(table)) = self.t.get(self.i) else { return None };
+            if is_keyword(table) {
+                return None;
+            }
+            let table = table.clone();
+            self.i += 1;
+            // an inner alias, a procedure, a join: unprobed here
+            match self.t.get(self.i) {
+                Some(Tok::RParen) | None => {}
+                Some(Tok::Ident(w)) if w == "WHERE" || w == "UNION" => {}
+                _ => return None,
+            }
+            self.streams.push(Stream {
+                name: table.clone(),
+                alias: None,
+                derived: None,
+                sub: self.in_sub,
+                cur: None,
+                proc_args: None,
+            });
+            let bidx = self.streams.len() - 1;
+            let bctx = bidx as u8 + self.base;
+            let saved = self.sub.replace(bidx);
+            let cols: Option<Vec<Val>> = raw.iter().map(|(q, n, _)| self.field(q.as_deref(), n)).collect();
+            let wher = if cols.is_some() && self.kw("WHERE") { self.bool_or() } else { None };
+            self.sub = saved;
+            let cols = cols?;
+            if self.t.get(self.i.saturating_sub(1)).is_some() && matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w != "UNION") {
+                return None; // GROUP BY, ORDER BY .. inside a branch: unprobed
+            }
+            if branches.is_empty() {
+                names = raw.iter().map(|(_, n, al)| al.clone().unwrap_or_else(|| n.clone())).collect();
+            } else if cols.len() != names.len() {
+                return None;
+            }
+            branches.push((table, bctx, wher, cols));
+            if !self.kw("UNION") {
+                break;
+            }
+            let a = self.kw("ALL");
+            match all {
+                Some(x) if x != a => return None, // mixed ALL/distinct: unprobed
+                _ => all = Some(a),
+            }
+        }
+        if branches.len() < 2 {
+            return None;
+        }
+        let mut colsets: Vec<Vec<Val>> = branches.iter().map(|b| b.3.clone()).collect();
+        self.unify_union(&mut colsets)?;
+        for (b, c) in branches.iter_mut().zip(colsets) {
+            b.3 = c;
+        }
+        for (k, n) in names.iter().enumerate() {
+            if names[..k].contains(n) {
+                return None; // two columns under one name: the engine's -104
+            }
+        }
+        let cols = names
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| (n, DCol::Fid(Val::Fid(dctx, i as u16))))
+            .collect();
+        Some(Stream {
+            name: String::new(),
+            alias: if alias.is_empty() { None } else { Some(alias) },
+            derived: Some(Box::new(Derived {
+                wher: None,
+                cols,
+                inner_alias: None,
+                first: None,
+                skip: None,
+                sort: Vec::new(),
+                project: None,
+                agg: None,
+                wins: Vec::new(),
+                union: Some(DerivedUnion { all: all.unwrap_or(false), branches }),
+            })),
+            sub: self.in_sub,
+            cur: None,
+            proc_args: None,
+        })
+    }
+
     /// The index of the paren closing the one at `open`.
     fn paren_close(&self, open: usize) -> Option<usize> {
         let mut depth = 0i32;
@@ -3611,7 +3849,9 @@ impl<'a> P<'a> {
     /// past it (measured: a join to such a table takes context 2)
     fn claim_derived_agg_slot(&mut self, st: &Stream) {
         // a derived table's WINDOWS occupy the contexts after its own
-        let n_wins = st.derived.as_ref().map_or(0, |d| d.wins.len());
+        let n_wins = st.derived.as_ref().map_or(0, |d| {
+            d.wins.len() + d.union.as_ref().map_or(0, |u| u.branches.len())
+        });
         for _ in 0..n_wins {
             self.streams.push(Stream {
                 name: String::new(),
@@ -5215,6 +5455,56 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
     if let Some(d) = &st.derived {
         out.push(blr::RSE);
         out.push(1);
+        if let Some(u) = &d.union {
+            out.push(blr::UNION);
+            out.push(ctx);
+            out.push(u.branches.len() as u8);
+            for (table, bctx, wher, cols) in &u.branches {
+                out.push(blr::RSE);
+                out.push(1);
+                match &st.alias {
+                    None => {
+                        out.push(0x4A); // blr_relation
+                        out.push(table.len() as u8);
+                        out.extend_from_slice(table.as_bytes());
+                    }
+                    Some(alias) => {
+                        if is_system_relation(table) {
+                            emit_relation3(out, table);
+                        } else {
+                            out.push(blr::RELATION2);
+                            out.push(table.len() as u8);
+                            out.extend_from_slice(table.as_bytes());
+                        }
+                        let text = format!("\"{}\" \"{}\".\"{}\"", alias, relation_schema(table), table);
+                        out.push(text.len() as u8);
+                        out.extend_from_slice(text.as_bytes());
+                    }
+                }
+                out.push(*bctx);
+                if let Some(w) = wher {
+                    out.push(blr::BOOLEAN);
+                    emit_bool(out, w);
+                }
+                out.push(blr::END);
+                out.push(blr::MAP);
+                out.extend_from_slice(&(cols.len() as u16).to_le_bytes());
+                for (fi, c) in cols.iter().enumerate() {
+                    out.extend_from_slice(&(fi as u16).to_le_bytes());
+                    emit_val(out, c);
+                }
+            }
+            if !u.all {
+                let n = u.branches[0].3.len();
+                out.push(blr::PROJECT);
+                out.push(n as u8);
+                for i in 0..n {
+                    emit_val(out, &Val::Fid(ctx, i as u16));
+                }
+            }
+            out.push(blr::END);
+            return;
+        }
         if !d.wins.is_empty() {
             out.push(blr::WINDOW);
             out.push(blr::RSE);
@@ -8924,36 +9214,12 @@ impl<'a> P<'a> {
                     return None; // mixed ALL/distinct: unprobed
                 }
             }
-            // the branches' types UNIFY per column and every branch value of
-            // another type is CAST to the common one (measured: `S UNION ALL
-            // U` - a NONE VARCHAR(20) beside a UTF8 VARCHAR(10) - casts BOTH
-            // to VARCHAR(20) UTF8; `ID UNION ALL S` casts the INTEGER to S's
-            // type and leaves S raw). A branch of unknown type keeps the
-            // plain map; known types that do not unify here refuse
-            for i in 0..first_cols.len() {
-                let owns: Option<Vec<Dsc>> = branches
-                    .iter()
-                    .map(|b| match &b.3[i] {
-                        Val::Field(c, n) => self.field_dsc(*c, n),
-                        _ => None,
-                    })
-                    .collect();
-                let Some(owns) = owns else { continue };
-                let bytes = |d: Dsc| {
-                    let mut o = Vec::new();
-                    emit_dsc(&mut o, d);
-                    o
-                };
-                if owns.iter().all(|d| bytes(*d) == bytes(owns[0])) {
-                    continue;
-                }
-                let vals: Vec<Val> = branches.iter().map(|b| b.3[i].clone()).collect();
-                let common = self.unify_branches(&vals.iter().collect::<Vec<_>>())?;
-                for (k, own) in owns.iter().enumerate() {
-                    if bytes(*own) != bytes(common) {
-                        let v = branches[k].3[i].clone();
-                        branches[k].3[i] = Val::Cast(common, Box::new(v));
-                    }
+            // the branches' types UNIFY per column ([P::unify_union])
+            {
+                let mut cols: Vec<Vec<Val>> = branches.iter().map(|b| b.3.clone()).collect();
+                self.unify_union(&mut cols)?;
+                for (b, c) in branches.iter_mut().zip(cols) {
+                    b.3 = c;
                 }
             }
             union_ = Some(BodyUnion {
