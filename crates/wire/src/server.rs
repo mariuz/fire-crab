@@ -115045,12 +115045,17 @@ fn resolve_subqueries(
                         l => l,
                     };
                     let fc = subq_fold_coll(lhs, subq_icu_ttype(sql, db_opt), outer_cols, outer_descs)?;
+                    // only a COLUMN on the left is a hash join's probe side:
+                    // a literal or an expression there (`'a' IN (SELECT ..)`,
+                    // `CAST(..) IN (SELECT ..)`) is compared as an ordinary
+                    // IN list - keyed text values refused the whole statement
+                    let lhs_is_col = matches!(lhs, Some(Tok::Ident(_)));
                     out.push(Tok::In);
                     // a NOT still standing in front of the column makes
                     // this an anti-join, which the engine does not hash
                     let negated = toks.get(i.wrapping_sub(1)).is_some_and(|t| matches!(t, Tok::Not));
                     out.extend(
-                        list_tokens(&rows.values, keys && !negated && conjunctive_position(toks, i), &fc)?,
+                        list_tokens(&rows.values, keys && lhs_is_col && !negated && conjunctive_position(toks, i), &fc)?,
                     );
                 }
                 i += 2;

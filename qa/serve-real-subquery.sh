@@ -98,6 +98,14 @@ same "IN with an inner WHERE"        "SELECT ID FROM A WHERE ID IN (SELECT AID F
 same "IN over an EMPTY subquery"     "SELECT ID FROM A WHERE ID IN (SELECT AID FROM B WHERE M > 9999)"
 same "NOT IN over an EMPTY subquery" "SELECT ID FROM A WHERE ID NOT IN (SELECT AID FROM B WHERE M > 9999)"
 same "IN over a TEXT column"         "SELECT ID FROM A WHERE S IN (SELECT T FROM B)"
+# a TEXT LITERAL or an expression on the LEFT (2026-10-10): the folded list was
+# spelt as hash keys, which only a column can probe - the statement refused
+same "a text literal IN (subquery), matching"      "SELECT COUNT(*) FROM RDB\$DATABASE WHERE 'x' IN (SELECT T FROM B)"
+same "a text literal IN (subquery), no match"      "SELECT COUNT(*) FROM RDB\$DATABASE WHERE 'q' IN (SELECT T FROM B)"
+same "a text literal NOT IN, the set holds a NULL" "SELECT COUNT(*) FROM RDB\$DATABASE WHERE 'q' NOT IN (SELECT T FROM B)"
+same "a padded text literal IN (subquery)"         "SELECT COUNT(*) FROM RDB\$DATABASE WHERE 'y  ' IN (SELECT T FROM B)"
+same "a CAST on the left of IN (subquery)"         "SELECT COUNT(*) FROM RDB\$DATABASE WHERE CAST('y' AS VARCHAR(5)) IN (SELECT T FROM B)"
+same "a text literal IN beside a column filter"    "SELECT ID FROM A WHERE ID > 0 AND 'x' IN (SELECT T FROM B) ORDER BY ID"
 same "NOT IN over a TEXT column"     "SELECT ID FROM A WHERE S NOT IN (SELECT T FROM B WHERE T IS NOT NULL)"
 
 # --- EXISTS ------------------------------------------------------------

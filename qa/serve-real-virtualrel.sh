@@ -97,10 +97,9 @@ both "3 a lookup by name" "SELECT RDB\$CONFIG_VALUE FROM RDB\$CONFIG WHERE RDB\$
 both "3 the BOOLEAN and the NULL source" "SELECT RDB\$CONFIG_IS_SET, COUNT(*), COUNT(RDB\$CONFIG_SOURCE) FROM RDB\$CONFIG GROUP BY 1;" "<false> 70 0"
 both "3 sorted by name, a window" "SELECT FIRST 3 RDB\$CONFIG_NAME, ROW_NUMBER() OVER (ORDER BY RDB\$CONFIG_NAME) FROM RDB\$CONFIG ORDER BY RDB\$CONFIG_NAME;" "AllowEncryptedSecurityDatabase 1|"
 both "3 an EXISTS subquery over it" "SELECT COUNT(*) FROM RDB\$DATABASE WHERE EXISTS (SELECT 1 FROM RDB\$CONFIG WHERE RDB\$CONFIG_NAME = 'TcpNoNagle');" "|1|"
-# RECORDED (pre-existing, every computed relation alike): a LITERAL on the left of
-# IN (SELECT .. FROM <virtual relation>) is refused at prepare - a column on the
-# left answers (section 1), and EXISTS answers
-rec "3 RECORDED a literal IN (SELECT .. FROM a virtual relation) is refused" "SELECT COUNT(*) FROM RDB\$DATABASE WHERE 'TcpNoNagle' IN (SELECT RDB\$CONFIG_NAME FROM RDB\$CONFIG);" "COUNT|=====================|1|X|======|DONE|" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|X|======|DONE|"
+# (promoted 2026-10-10: a TEXT literal on the left of any IN (SELECT ..) was
+# refused - the folded list was spelt as hash keys only a column can probe)
+both "3 a text literal IN (SELECT .. FROM it)" "SELECT COUNT(*) FROM RDB\$DATABASE WHERE 'TcpNoNagle' IN (SELECT RDB\$CONFIG_NAME FROM RDB\$CONFIG);" "|1|"
 both "3 joined to a user table" "SELECT T.ID, C.RDB\$CONFIG_ID FROM T JOIN RDB\$CONFIG C ON C.RDB\$CONFIG_NAME = T.S;" "DONE"
 
 echo "--- panic check"
