@@ -302,6 +302,9 @@ pub enum MapItem {
     /// blr_agg_function: a statistical aggregate by NAME over its
     /// arguments (VAR_SAMP(x), CORR(y, x) ..) - [stat_kind]
     Fn(String, Vec<Expr>),
+    /// blr_agg_list / blr_agg_list_distinct: LIST([DISTINCT] value,
+    /// delimiter) with its WITHIN GROUP ordering (blr EB) when written
+    List { distinct: bool, value: Expr, delim: Expr, order: Vec<SortKey> },
     Value(Expr),
 }
 
@@ -1213,6 +1216,18 @@ impl<'a> P<'a> {
                             }
                             MapItem::Fn(name, args)
                         }
+                        Some(&(v @ (0xAA | 0xAB))) => {
+                            self.i += 1;
+                            let value = self.expr()?;
+                            let delim = self.expr()?;
+                            let order = if self.b.get(self.i) == Some(&0xEB) {
+                                self.i += 1;
+                                self.sort_keys()?
+                            } else {
+                                Vec::new()
+                            };
+                            MapItem::List { distinct: v == 0xAB, value, delim, order }
+                        }
                         _ => MapItem::Value(self.expr()?),
                     };
                     map.push((slot, item));
@@ -2110,6 +2125,51 @@ fn sys_fn(name: &str, args: &[Value]) -> Result<Value, String> {
 // variance is zero; REGR_INTERCEPT is ONE fused multiply-add (re-measured).
 // An INT128 / DECFLOAT / text operand folds in the
 // engine's DECIMAL128 path, unconverted here: the run fails.
+
+/// LIST's result over its collected (WITHIN GROUP keys, text) items, as
+/// measured on 2196: NULL over no value; scan order without an ordering;
+/// DISTINCT sorted ascending and unique (b, a, c, a -> a,b,c); WITHIN GROUP
+/// by its keys. Every order the engine's sort could decide - a tie between
+/// two different values in the keys, DISTINCT over trailing blanks (PAD
+/// SPACE) or non-ASCII text (a collation), DISTINCT beside an ordering -
+/// fails the run instead of guessing.
+fn list_result(mut items: Vec<(Vec<Value>, String)>, delim: Option<String>, distinct: bool, order: &[SortKey]) -> Result<Value, String> {
+    if items.is_empty() {
+        return Ok(Value::Null);
+    }
+    if distinct {
+        if !order.is_empty() {
+            return Err("LIST DISTINCT with an ordering unconverted".into());
+        }
+        if items.iter().any(|(_, t)| !t.is_ascii() || t.ends_with(' ')) {
+            return Err("LIST DISTINCT over padded or non-ASCII text unconverted".into());
+        }
+        items.sort_by(|a, b| a.1.cmp(&b.1));
+        items.dedup_by(|a, b| a.1 == b.1);
+    } else if !order.is_empty() {
+        if order.iter().any(|k| k.nulls.is_some()) {
+            return Err("LIST WITHIN GROUP with a NULLS placement unconverted".into());
+        }
+        items.sort_by(|a, b| {
+            for (i, k) in order.iter().enumerate() {
+                let o = null_aware_cmp(&a.0[i], &b.0[i], k.desc);
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        for w in items.windows(2) {
+            let tie = w[0].0.iter().zip(&w[1].0).all(|(x, y)| value_cmp(x, y) == Some(std::cmp::Ordering::Equal)
+                || (matches!(x, Value::Null) && matches!(y, Value::Null)));
+            if tie && w[0].1 != w[1].1 {
+                return Err("LIST WITHIN GROUP ties (the sort's order) unconverted".into());
+            }
+        }
+    }
+    let d = delim.unwrap_or_else(|| ",".to_string());
+    Ok(Value::Text(items.into_iter().map(|(_, t)| t).collect::<Vec<_>>().join(&d)))
+}
 
 /// (is it two-argument, argument count) of a statistical aggregate name
 fn stat_kind(name: &str) -> Option<(bool, usize)> {
@@ -4323,6 +4383,9 @@ impl<'a> Exec<'a> {
             // whose operands are all non-NULL, accumulated in the engine's
             // order (CorrAggNode::aggPass) so the DOUBLE bits match
             Stat { name: String, n: i64, sx: f64, sxx: f64, sy: f64, syy: f64, sxy: f64 },
+            // LIST: (WITHIN GROUP keys, rendered text) per non-NULL value,
+            // and the separator
+            List { items: Vec<(Vec<Value>, String)>, delim: Option<String> },
         }
         let new_acc = |keys: Vec<Value>, map: &[(u16, MapItem)]| Acc {
             keys,
@@ -4347,6 +4410,7 @@ impl<'a> Exec<'a> {
                             syy: 0.0,
                             sxy: 0.0,
                         },
+                        MapItem::List { .. } => Fold::List { items: Vec::new(), delim: None },
                         MapItem::Value(_) => Fold::Pass(Value::Null),
                     };
                     (*slot, f)
@@ -4377,6 +4441,35 @@ impl<'a> Exec<'a> {
                 }
             };
             for (slot_i, (_, item)) in agg.map.iter().enumerate() {
+                if let MapItem::List { value, delim, order, .. } = item {
+                    // grouped, the engine folds in its SORT's order, ties
+                    // broken by the rest of the record (measured: G = 1 rows
+                    // scanned b, a, a list as a,a,b) - unconverted
+                    if !agg.group_by.is_empty() {
+                        return Err("a grouped LIST (the sort's fold order) unconverted".into());
+                    }
+                    let v = self.eval(value)?;
+                    let d = self.eval(delim)?;
+                    let text = match &v {
+                        Value::Null => continue,
+                        Value::Text(t) => t.clone(),
+                        Value::Int(n) => n.to_string(),
+                        _ => return Err("LIST over this operand's rendering unconverted".into()),
+                    };
+                    let d = match d {
+                        Value::Text(t) => t,
+                        _ => return Err("a LIST separator that is not text unconverted".into()),
+                    };
+                    let keys = order.iter().map(|k| self.eval(&k.expr)).collect::<Result<Vec<_>, _>>()?;
+                    if let Fold::List { items, delim } = &mut groups[gi].slots[slot_i].1 {
+                        if delim.as_ref().is_some_and(|x| *x != d) {
+                            return Err("a LIST separator that varies by row unconverted".into());
+                        }
+                        *delim = Some(d);
+                        items.push((keys, text));
+                    }
+                    continue;
+                }
                 if let MapItem::Fn(_, args) = item {
                     // UNDER A GROUP BY the engine folds each group in its
                     // SORT's order, not the scan's, and a double sum depends
@@ -4406,7 +4499,7 @@ impl<'a> Exec<'a> {
                 let operand = match item {
                     MapItem::Agg(_, Some(e)) | MapItem::Value(e) => Some(self.eval(e)?),
                     MapItem::Agg(_, None) => None,
-                    MapItem::Fn(..) => unreachable!("folded above"),
+                    MapItem::Fn(..) | MapItem::List { .. } => unreachable!("folded above"),
                 };
                 let fold = &mut groups[gi].slots[slot_i].1;
                 match (fold, item, operand) {
@@ -4542,6 +4635,11 @@ impl<'a> Exec<'a> {
                     Fold::Min(v) | Fold::Max(v) => v.unwrap_or(Value::Null),
                     Fold::Pass(v) => v,
                     Fold::Stat { name, n, sx, sxx, sy, syy, sxy } => stat_result(&name, n, sx, sxx, sy, syy, sxy),
+                    Fold::List { items, delim } => {
+                        let spec = agg.map.iter().find(|(s, _)| *s == slot).map(|(_, m)| m);
+                        let Some(MapItem::List { distinct, order, .. }) = spec else { unreachable!("a List fold has its item") };
+                        list_result(items, delim, *distinct, order)?
+                    }
                 };
             }
             out.push(row);
@@ -5527,7 +5625,7 @@ pub fn shape(req: &Request) -> Shape {
                     self.rse(&a.source);
                     a.group_by.iter().for_each(|x| self.expr(x));
                     for (_, m) in &a.map {
-                        match m { MapItem::Agg(_, Some(x)) | MapItem::Value(x) => self.expr(x), MapItem::Fn(_, v) => v.iter().for_each(|x| self.expr(x)), _ => {} }
+                        match m { MapItem::Agg(_, Some(x)) | MapItem::Value(x) => self.expr(x), MapItem::Fn(_, v) => v.iter().for_each(|x| self.expr(x)), MapItem::List { value, delim, order, .. } => { self.expr(value); self.expr(delim); order.iter().for_each(|k| self.expr(&k.expr)) } _ => {} }
                     }
                 }
                 Stream::Join { streams, on, .. } => {
