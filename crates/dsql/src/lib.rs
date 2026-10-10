@@ -3195,6 +3195,37 @@ impl<'a> P<'a> {
                 return Some(Val::WinRef((self.win_found.len() - 1) as u16));
             }
         }
+        if self.agg_mode && stat_agg_arity(name).is_some() {
+            // a statistical aggregate: blr_agg_function in the map (measured)
+            self.i += 1; // (
+            let mut args = Vec::new();
+            loop {
+                args.push(self.val()?);
+                match self.t.get(self.i)? {
+                    Tok::Comma => self.i += 1,
+                    Tok::RParen => {
+                        self.i += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            if Some(args.len()) != stat_agg_arity(name) {
+                return None;
+            }
+            if args.iter().any(|a| contains_fid_ctx(a, self.agg_fid_ctx)) {
+                return None; // an aggregate inside an aggregate: the engine's 42000
+            }
+            let entry = MapEntry::Fn(name.to_string(), args);
+            let slot = match self.agg_map.iter().position(|e| *e == entry) {
+                Some(i) => i,
+                None => {
+                    self.agg_map.push(entry);
+                    self.agg_map.len() - 1
+                }
+            };
+            return Some(Val::Fid(self.agg_fid_ctx, slot as u16));
+        }
         if self.agg_mode
             && matches!(name, "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
         {
@@ -3782,6 +3813,11 @@ impl<'a> P<'a> {
             }
             self.i += 1;
             match name {
+                n if stat_agg_arity(n).is_some() => {
+                    if Some(args.len()) != stat_agg_arity(n) {
+                        return None;
+                    }
+                }
                 "ROW_NUMBER" | "RANK" | "DENSE_RANK" => {
                     if !args.is_empty() {
                         return None;
@@ -6291,7 +6327,19 @@ fn is_window_name(n: &str) -> bool {
         n,
         "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "ROW_NUMBER" | "RANK" | "DENSE_RANK"
             | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" | "LAG" | "LEAD"
-    )
+    ) || stat_agg_arity(n).is_some()
+}
+
+/// The STATISTICAL aggregates and their arity: each compiles to
+/// blr_agg_function with the counted name, the argument count and the
+/// arguments - an aggregate map entry or a window's alike (measured).
+fn stat_agg_arity(n: &str) -> Option<usize> {
+    Some(match n {
+        "VAR_POP" | "VAR_SAMP" | "STDDEV_POP" | "STDDEV_SAMP" => 1,
+        "COVAR_POP" | "COVAR_SAMP" | "CORR" | "REGR_AVGX" | "REGR_AVGY" | "REGR_COUNT"
+        | "REGR_INTERCEPT" | "REGR_R2" | "REGR_SLOPE" | "REGR_SXX" | "REGR_SXY" | "REGR_SYY" => 2,
+        _ => return None,
+    })
 }
 
 fn contains_winref(v: &Val) -> bool {
@@ -8793,6 +8841,13 @@ impl<'a> P<'a> {
                         stack.pop();
                     }
                     Some(Tok::Comma) if stack.is_empty() => item_starts.push(k + 1),
+                    Some(Tok::Ident(w))
+                        if stat_agg_arity(w).is_some()
+                            && matches!(self.t.get(k + 1), Some(Tok::LParen))
+                            && !stack.iter().any(|x| *x) =>
+                    {
+                        found = true;
+                    }
                     Some(Tok::Ident(w))
                         if matches!(w.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
                             && matches!(self.t.get(k + 1), Some(Tok::LParen))
