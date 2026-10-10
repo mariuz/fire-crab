@@ -77912,13 +77912,13 @@ fn stat2_result(func: AggFn, n: i64, sx: f64, sx2: f64, sy: f64, sy2: f64, sxy: 
             if var_pop_x == 0.0 {
                 Value::Null
             } else {
-                // `avgY - slope * avgX` with TWO roundings, as the engine's
-                // x86-64 build computes it (no FMA instruction in its
-                // target; the fused form answered 0.5000000000000003 over
-                // X {1, 2, 4} / Y {1, 2, 3} where the engine says
-                // 0.5000000000000002 - measured 2026-09-26; the earlier
-                // "fused" data set gave the same bits either way)
-                Value::Double(avg_y - slope * avg_x)
+                // `avgY - slope * avgX` as ONE FUSED multiply-add. Re-measured
+                // on 2196 (2026-10-10): X {1, 2, 4} / Y {1, 2, 3} answers
+                // 0.5000000000000003 and the exeselect fixture's
+                // REGR_INTERCEPT(N, ID) -3.124999999999998 - both the fused
+                // bits. The 2026-09-26 claim (two roundings, ...02) was an
+                // older engine build's answer.
+                Value::Double((-slope).mul_add(avg_x, avg_y))
             }
         }
         AggFn::RegrR2 => {

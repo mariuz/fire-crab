@@ -299,6 +299,9 @@ pub struct SortKey {
 #[derive(Clone, Debug)]
 pub enum MapItem {
     Agg(u8, Option<Expr>),
+    /// blr_agg_function: a statistical aggregate by NAME over its
+    /// arguments (VAR_SAMP(x), CORR(y, x) ..) - [stat_kind]
+    Fn(String, Vec<Expr>),
     Value(Expr),
 }
 
@@ -1197,6 +1200,19 @@ impl<'a> P<'a> {
                             self.i += 1;
                             MapItem::Agg(v, Some(self.expr()?))
                         }
+                        Some(&blr::AGG_FUNCTION) => {
+                            self.i += 1;
+                            let name = self.counted_name()?;
+                            let argc = self.u8()? as usize;
+                            if stat_kind(&name).map(|(_, a)| a) != Some(argc) {
+                                return Err(format!("aggregate function {} unconverted", name));
+                            }
+                            let mut args = Vec::with_capacity(argc);
+                            for _ in 0..argc {
+                                args.push(self.expr()?);
+                            }
+                            MapItem::Fn(name, args)
+                        }
                         _ => MapItem::Value(self.expr()?),
                     };
                     map.push((slot, item));
@@ -2080,6 +2096,105 @@ fn sys_fn(name: &str, args: &[Value]) -> Result<Value, String> {
         "LAST_DAY" => sf_first_last_day(sf_part(arg(0)?)?, arg(1)?, true)?,
         _ => return Err(format!("system function {} unconverted", name)),
     })
+}
+
+// ------------------------------------------------- statistical aggregates
+//
+// Ported from the interpreter (crates/wire: the variance fold and
+// stat2_result), whose laws were measured digit for digit on 2196: the
+// naive sum of squares (Sxx - Sx*Sx/n over n or n-1); an exact operand
+// converts by DIVIDING by the power of ten (CVT_get_double, one rounding);
+// VAR_SAMP / STDDEV_SAMP / COVAR_SAMP over fewer than two rows and every
+// other function over none are NULL; a NaN variance's STDDEV stays NaN;
+// CORR / REGR_* over a zero variance are NULL, REGR_R2 1 when only Y's
+// variance is zero; REGR_INTERCEPT is ONE fused multiply-add (re-measured).
+// An INT128 / DECFLOAT / text operand folds in the
+// engine's DECIMAL128 path, unconverted here: the run fails.
+
+/// (is it two-argument, argument count) of a statistical aggregate name
+fn stat_kind(name: &str) -> Option<(bool, usize)> {
+    Some(match name {
+        "VAR_POP" | "VAR_SAMP" | "STDDEV_POP" | "STDDEV_SAMP" => (false, 1),
+        "COVAR_POP" | "COVAR_SAMP" | "CORR" | "REGR_AVGX" | "REGR_AVGY" | "REGR_COUNT"
+        | "REGR_INTERCEPT" | "REGR_R2" | "REGR_SLOPE" | "REGR_SXX" | "REGR_SXY" | "REGR_SYY" => (true, 2),
+        _ => return None,
+    })
+}
+
+fn stat_f64(v: &Value) -> Result<f64, String> {
+    match v {
+        Value::Int(n) => Ok(*n as f64),
+        Value::Scaled(raw, s) => Ok(if *s >= 0 {
+            *raw as f64 * 10f64.powi(*s as i32)
+        } else {
+            *raw as f64 / 10f64.powi(-(*s as i32))
+        }),
+        Value::Double(d) => Ok(*d),
+        Value::Float(f) => Ok(*f as f64),
+        _ => Err("a statistical aggregate over this operand (the DECIMAL128 path) unconverted".into()),
+    }
+}
+
+fn stat_result(name: &str, n: i64, sx: f64, sxx: f64, sy: f64, syy: f64, sxy: f64) -> Value {
+    let nf = n as f64;
+    match name {
+        "VAR_POP" | "VAR_SAMP" | "STDDEV_POP" | "STDDEV_SAMP" => {
+            let sample = matches!(name, "VAR_SAMP" | "STDDEV_SAMP");
+            if n == 0 || (sample && n < 2) {
+                return Value::Null;
+            }
+            let ssd = sxx - sx * sx / nf;
+            let var = if sample { ssd / (n - 1) as f64 } else { ssd / nf };
+            return Value::Double(match name {
+                "VAR_POP" | "VAR_SAMP" => var,
+                _ if var.is_nan() => var,
+                _ => var.max(0.0).sqrt(),
+            });
+        }
+        "REGR_COUNT" => return Value::Int(n),
+        "COVAR_SAMP" => {
+            return if n < 2 { Value::Null } else { Value::Double((sxy - sy * sx / nf) / (n - 1) as f64) };
+        }
+        _ => {}
+    }
+    if n == 0 {
+        return Value::Null;
+    }
+    let var_pop_x = (sxx - sx * sx / nf) / nf;
+    let var_pop_y = (syy - sy * sy / nf) / nf;
+    let covar_pop = (sxy - sy * sx / nf) / nf;
+    let avg_x = sx / nf;
+    let avg_y = sy / nf;
+    let slope = covar_pop / var_pop_x;
+    let sq = var_pop_x.sqrt() * var_pop_y.sqrt();
+    let corr = covar_pop / sq;
+    match name {
+        "COVAR_POP" => Value::Double(covar_pop),
+        "CORR" => if sq == 0.0 { Value::Null } else { Value::Double(corr) },
+        "REGR_AVGX" => Value::Double(avg_x),
+        "REGR_AVGY" => Value::Double(avg_y),
+        // FUSED: the engine's build computes `avgY - slope * avgX` as one
+        // multiply-add (re-measured on 2196, 2026-10-10: X {1,2,4} / Y {1,2,3}
+        // answers 0.5000000000000003, the fused bits; an earlier build answered
+        // ...02, the two-rounding form)
+        "REGR_INTERCEPT" => if var_pop_x == 0.0 { Value::Null } else { Value::Double((-slope).mul_add(avg_x, avg_y)) },
+        "REGR_R2" => {
+            if var_pop_x == 0.0 {
+                Value::Null
+            } else if var_pop_y == 0.0 {
+                Value::Double(1.0)
+            } else if sq == 0.0 {
+                Value::Null
+            } else {
+                Value::Double(corr * corr)
+            }
+        }
+        "REGR_SLOPE" => if var_pop_x == 0.0 { Value::Null } else { Value::Double(covar_pop / var_pop_x) },
+        "REGR_SXX" => Value::Double(nf * var_pop_x),
+        "REGR_SXY" => Value::Double(nf * covar_pop),
+        "REGR_SYY" => Value::Double(nf * var_pop_y),
+        _ => Value::Null,
+    }
 }
 
 fn num_parts(v: &Value) -> Option<(i128, i8)> {
@@ -4204,6 +4319,10 @@ impl<'a> Exec<'a> {
             Min(Option<Value>),
             Max(Option<Value>),
             Pass(Value),
+            // a statistical aggregate: n and the five sums over the rows
+            // whose operands are all non-NULL, accumulated in the engine's
+            // order (CorrAggNode::aggPass) so the DOUBLE bits match
+            Stat { name: String, n: i64, sx: f64, sxx: f64, sy: f64, syy: f64, sxy: f64 },
         }
         let new_acc = |keys: Vec<Value>, map: &[(u16, MapItem)]| Acc {
             keys,
@@ -4218,6 +4337,15 @@ impl<'a> Exec<'a> {
                             blr::AGG_MIN => Fold::Min(None),
                             blr::AGG_MAX => Fold::Max(None),
                             _ => unreachable!("parse admitted the verb"),
+                        },
+                        MapItem::Fn(name, _) => Fold::Stat {
+                            name: name.clone(),
+                            n: 0,
+                            sx: 0.0,
+                            sxx: 0.0,
+                            sy: 0.0,
+                            syy: 0.0,
+                            sxy: 0.0,
                         },
                         MapItem::Value(_) => Fold::Pass(Value::Null),
                     };
@@ -4249,9 +4377,36 @@ impl<'a> Exec<'a> {
                 }
             };
             for (slot_i, (_, item)) in agg.map.iter().enumerate() {
+                if let MapItem::Fn(_, args) = item {
+                    // UNDER A GROUP BY the engine folds each group in its
+                    // SORT's order, not the scan's, and a double sum depends
+                    // on that order (aggfold: {-1e308, 1e308, -1e308, 1e308}
+                    // reaches -Inf first and STDDEV_POP is NaN there, Inf in
+                    // scan order) - unconverted, as a double SUM is
+                    if !agg.group_by.is_empty() {
+                        return Err("a grouped statistical aggregate (the sort's fold order) unconverted".into());
+                    }
+                    let vals = args.iter().map(|e| self.eval(e)).collect::<Result<Vec<_>, _>>()?;
+                    if vals.iter().any(|v| matches!(v, Value::Null)) {
+                        continue;
+                    }
+                    let xs = vals.iter().map(stat_f64).collect::<Result<Vec<_>, _>>()?;
+                    if let Fold::Stat { n, sx, sxx, sy, syy, sxy, .. } = &mut groups[gi].slots[slot_i].1 {
+                        // one argument is X; two are (Y, X), SQL order
+                        let (y, x) = if xs.len() == 2 { (xs[0], xs[1]) } else { (0.0, xs[0]) };
+                        *n += 1;
+                        *sx += x;
+                        *sxx += x * x;
+                        *sy += y;
+                        *syy += y * y;
+                        *sxy += x * y;
+                    }
+                    continue;
+                }
                 let operand = match item {
                     MapItem::Agg(_, Some(e)) | MapItem::Value(e) => Some(self.eval(e)?),
                     MapItem::Agg(_, None) => None,
+                    MapItem::Fn(..) => unreachable!("folded above"),
                 };
                 let fold = &mut groups[gi].slots[slot_i].1;
                 match (fold, item, operand) {
@@ -4386,6 +4541,7 @@ impl<'a> Exec<'a> {
                     Fold::AvgD(x, c) => Value::Double(x / c as f64),
                     Fold::Min(v) | Fold::Max(v) => v.unwrap_or(Value::Null),
                     Fold::Pass(v) => v,
+                    Fold::Stat { name, n, sx, sxx, sy, syy, sxy } => stat_result(&name, n, sx, sxx, sy, syy, sxy),
                 };
             }
             out.push(row);
@@ -5371,7 +5527,7 @@ pub fn shape(req: &Request) -> Shape {
                     self.rse(&a.source);
                     a.group_by.iter().for_each(|x| self.expr(x));
                     for (_, m) in &a.map {
-                        match m { MapItem::Agg(_, Some(x)) | MapItem::Value(x) => self.expr(x), _ => {} }
+                        match m { MapItem::Agg(_, Some(x)) | MapItem::Value(x) => self.expr(x), MapItem::Fn(_, v) => v.iter().for_each(|x| self.expr(x)), _ => {} }
                     }
                 }
                 Stream::Join { streams, on, .. } => {
