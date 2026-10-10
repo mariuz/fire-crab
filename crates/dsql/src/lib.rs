@@ -539,6 +539,11 @@ enum Val {
     /// of its spec in the parser's `win_found`, resolved to a window fid
     /// when the windows are built (never emitted)
     WinRef(u16),
+    /// blr_derived_expr over SEVERAL contexts: an expression column of a
+    /// derived table with windows inside names every window stream
+    /// (measured: `BF 02 01 02` beside two windows, `BF 01 01` for a
+    /// constant beside one)
+    DerivedWrapN(Vec<u8>, Box<Val>),
 }
 
 /// One sort key: `[nulls byte] <ascending|descending> <value>`.
@@ -2185,12 +2190,6 @@ impl<'a> P<'a> {
             let found = std::mem::take(&mut self.win_found);
             let mut rebuilt = Vec::new();
             for (outer, v) in raw_items.drain(..) {
-                let mut fs = Vec::new();
-                collect_fields_deep(&v, &mut fs);
-                if fs.is_empty() && !contains_winref(&v) {
-                    restore_agg(self, saved_agg);
-                    return None; // a constant item beside windows: unprobed
-                }
                 let Some(r) = rebuild_win_expr(&mut wins, &v, &found) else {
                     restore_agg(self, saved_agg);
                     return None;
@@ -2210,12 +2209,21 @@ impl<'a> P<'a> {
                     w.remap.push(r);
                 }
             }
+            if wins.is_empty() {
+                restore_agg(self, saved_agg);
+                return None;
+            }
+            let win_ctxs: Vec<u8> = wins.iter().map(|w| w.ctx).collect();
             for (outer, r) in rebuilt {
-                // an expression over the window streams as a derived column:
-                // unprobed
-                let Some(f @ Val::Fid(..)) = patch_fid_win(&r, &wins) else {
+                let Some(f) = patch_fid_win(&r, &wins) else {
                     restore_agg(self, saved_agg);
                     return None;
+                };
+                // a column reads its fid; an expression (or a constant) is
+                // wrapped in blr_derived_expr over EVERY window context
+                let f = match f {
+                    Val::Fid(..) => f,
+                    other => Val::DerivedWrapN(win_ctxs.clone(), Box::new(other)),
                 };
                 cols.push((outer, DCol::Fid(f)));
             }
@@ -4654,6 +4662,12 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.push(0xBF); // blr_derived_expr
             out.push(1);
             out.push(*ctx);
+            emit_val(out, inner);
+        }
+        Val::DerivedWrapN(ctxs, inner) => {
+            out.push(0xBF); // blr_derived_expr
+            out.push(ctxs.len() as u8);
+            out.extend_from_slice(ctxs);
             emit_val(out, inner);
         }
         Val::CastInt64(inner) => {
@@ -8854,7 +8868,9 @@ impl<'a> P<'a> {
             return None;
         }
         if grouped
-            && stream.derived.as_ref().is_some_and(|d| d.cols.iter().any(|(_, c)| matches!(c, DCol::Expr(_))))
+            && stream.derived.as_ref().is_some_and(|d| {
+                d.cols.iter().any(|(_, c)| matches!(c, DCol::Expr(_) | DCol::Fid(Val::DerivedWrapN(..))))
+            })
         {
             return None;
         }
