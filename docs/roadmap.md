@@ -49,7 +49,7 @@ replacement of the C++ engine is below, in priority order. Full text:
    Index keys from an unconvertible literal raise in joins and subqueries
    (`92ea9c4`, `cb8ea7f`; LEFT-join row order left); expressions over a
    procedure's outputs and virtual RDB$TIME_ZONES / RDB$KEYWORDS: done
-   (`768bc86`, `529313c`); RDB$CONFIG answers no rows.
+   (`768bc86`, `529313c`); RDB$CONFIG answers the reference engine's 70 rows (2026-10-10).
    DECFLOAT left: GROUP BY a DECFLOAT expression and its NaN/cohort laws.
    Done: traps, specials, signed zero, the four DECFLOAT functions
    (`e07317d`), DECFLOAT in PSQL (`7fdb054`), all eight ROUND modes and

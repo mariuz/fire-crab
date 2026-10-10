@@ -199,7 +199,7 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
 - [ ] **P2** The FLOAT/ROUND/DECFLOAT wrong answers first; then the rounds 6–8 items still refused (mixed multi-clause ALTER TABLE, `WHERE CURRENT OF` via `RDB$DB_KEY`) - the rest re-measured and agrees
 - [x] **P2** WRONG ANSWER: the virtual RDB$TIME_ZONES / RDB$KEYWORDS answered NO ROWS (the zone list lacked America/Coyhaique
       too), and a subquery over any computed relation - MON$ included - walked its empty storage (`qa/serve-real-virtualrel.sh`).
-      RDB$CONFIG (this host's firebird.conf, 70 rows) still answers none - recorded.
+      RDB$CONFIG answers the reference engine's 70 rows since 2026-10-10 (crates/ods/src/config.rs, generated; virtualrel section 3).
 - [x] **P2** An expression over a selectable procedure's outputs with no clause (`SELECT CHAR_LENGTH(R), K * 2 FROM P`)
       was refused - the bare call's picker took only plain columns (`qa/serve-real-procexpr.sh`). A non-ASCII literal
       in a procedure body made under a NONE attachment is still "PSQL this server does not interpret".

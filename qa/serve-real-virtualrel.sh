@@ -11,7 +11,7 @@
 # RDB$KEYWORDS is (VARCHAR(63) ASCII, BOOLEAN reserved), scanned in name
 # order, 233 reserved. The keyword table is GENERATED from the engine
 # (crates/ods/src/keywords.rs). RDB$CONFIG (the server's configuration,
-# 70 rows of this host's firebird.conf) is RECORDED, not served. And a
+# 70 rows) is generated the same way (crates/ods/src/config.rs). And a
 # SUBQUERY over any computed relation - MON$ included - walked its empty
 # storage: `3 IN (SELECT MON$SQL_DIALECT FROM MON$DATABASE)` was false.
 #
@@ -87,8 +87,21 @@ both "2 the two relations joined to each other: nothing shared" "SELECT COUNT(*)
 echo "--- 4 a subquery over ANY computed relation read its empty storage (MON\$ too)"
 both "4 IN (SELECT .. FROM MON\$DATABASE)" "SELECT COUNT(*) FROM RDB\$DATABASE WHERE 3 IN (SELECT MON\$SQL_DIALECT FROM MON\$DATABASE);" "|1|"
 both "4 EXISTS over MON\$DATABASE" "SELECT COUNT(*) FROM RDB\$DATABASE WHERE EXISTS (SELECT 1 FROM MON\$DATABASE WHERE MON\$SQL_DIALECT = 3);" "|1|"
-echo "--- 3 RECORDED: RDB\$CONFIG (this host's configuration) is not served"
-rec "3 RECORDED RDB\$CONFIG answers no rows here" "SELECT COUNT(*) FROM RDB\$CONFIG;" "COUNT|=====================|70|X|======|DONE|" "COUNT|=====================|0|X|======|DONE|"
+echo "--- 3 RDB\$CONFIG: the reference engine's 70 rows (generated into crates/ods/src/config.rs)"
+# (promoted 2026-10-10: it answered no rows here; the rows are the reference
+# engine's - none set in its firebird.conf, every value its default)
+both "3 COUNT (70 rows)" "SELECT COUNT(*) FROM RDB\$CONFIG;" "|70|"
+both "3 the describe and the first rows" "SET SQLDA_DISPLAY ON; SELECT FIRST 3 * FROM RDB\$CONFIG;" "TempBlockSize"
+both "3 every row, in scan order" "SELECT RDB\$CONFIG_ID, RDB\$CONFIG_NAME, RDB\$CONFIG_VALUE, RDB\$CONFIG_DEFAULT, RDB\$CONFIG_IS_SET, RDB\$CONFIG_SOURCE FROM RDB\$CONFIG;" "DefaultDbCachePages"
+both "3 a lookup by name" "SELECT RDB\$CONFIG_VALUE FROM RDB\$CONFIG WHERE RDB\$CONFIG_NAME = 'TempCacheLimit';" "67108864"
+both "3 the BOOLEAN and the NULL source" "SELECT RDB\$CONFIG_IS_SET, COUNT(*), COUNT(RDB\$CONFIG_SOURCE) FROM RDB\$CONFIG GROUP BY 1;" "<false> 70 0"
+both "3 sorted by name, a window" "SELECT FIRST 3 RDB\$CONFIG_NAME, ROW_NUMBER() OVER (ORDER BY RDB\$CONFIG_NAME) FROM RDB\$CONFIG ORDER BY RDB\$CONFIG_NAME;" "AllowEncryptedSecurityDatabase 1|"
+both "3 an EXISTS subquery over it" "SELECT COUNT(*) FROM RDB\$DATABASE WHERE EXISTS (SELECT 1 FROM RDB\$CONFIG WHERE RDB\$CONFIG_NAME = 'TcpNoNagle');" "|1|"
+# RECORDED (pre-existing, every computed relation alike): a LITERAL on the left of
+# IN (SELECT .. FROM <virtual relation>) is refused at prepare - a column on the
+# left answers (section 1), and EXISTS answers
+rec "3 RECORDED a literal IN (SELECT .. FROM a virtual relation) is refused" "SELECT COUNT(*) FROM RDB\$DATABASE WHERE 'TcpNoNagle' IN (SELECT RDB\$CONFIG_NAME FROM RDB\$CONFIG);" "COUNT|=====================|1|X|======|DONE|" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|X|======|DONE|"
+both "3 joined to a user table" "SELECT T.ID, C.RDB\$CONFIG_ID FROM T JOIN RDB\$CONFIG C ON C.RDB\$CONFIG_NAME = T.S;" "DONE"
 
 echo "--- panic check"
 ran=$((ran + 1))
@@ -96,5 +109,5 @@ if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 22 ]; then echo "FAIL only $ran checks ran (floor 22) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 30 ]; then echo "FAIL only $ran checks ran (floor 30) - cells went missing"; fail=1; fi
 exit $fail

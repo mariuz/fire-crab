@@ -207,7 +207,8 @@ Wrong answers rank above refusals; a refusal is safe, a wrong answer is not.
       (`92ea9c4`) and subqueries (`cb8ea7f`) now raise too. Left: under a LEFT
       join the engine streams a row before the raise, where this server raises
       first.
-    - `RDB$CONFIG` answers no rows.
+    - Done 2026-10-10: `RDB$CONFIG` answers the reference engine's 70 rows
+      (generated into `crates/ods/src/config.rs`, like `RDB$KEYWORDS`).
     - Wrong answer fixed (`a88ecfd`, `qa/serve-real-ctxwords.sh`): a bare
       CURRENT_USER / USER / CURRENT_ROLE in a view, CHECK or routine this
       server compiled was stored as a column reference.

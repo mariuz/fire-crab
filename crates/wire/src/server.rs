@@ -8955,7 +8955,7 @@ enum RowSource {
 /// record headers that a computed relation has none of.
 fn mon_computed_relation(db: &Database, rel: u16) -> bool {
     let image = db.bytes();
-    ["MON$DATABASE", "MON$ATTACHMENTS", "MON$TRANSACTIONS", "MON$STATEMENTS", "RDB$TIME_ZONES", "RDB$KEYWORDS"]
+    ["MON$DATABASE", "MON$ATTACHMENTS", "MON$TRANSACTIONS", "MON$STATEMENTS", "RDB$TIME_ZONES", "RDB$KEYWORDS", "RDB$CONFIG"]
         .iter()
         .any(|n| fire_crab_ods::resolve_relation(&image, db.page_size, n) == Some(rel))
 }
@@ -9294,6 +9294,27 @@ fn mon_rows(
                     let mut row = vec![Value::Null; width];
                     if let Some(f) = at("RDB$KEYWORD_NAME") { row[f] = Value::Text((*name).to_string()); }
                     if let Some(f) = at("RDB$KEYWORD_RESERVED") { row[f] = Value::Bool(*reserved); }
+                    row
+                })
+                .collect()
+        });
+    }
+    // RDB$CONFIG: the server's configuration, the reference engine's rows
+    // (generated into fire_crab_ods::config) - it answered NO ROWS here
+    if fire_crab_ods::resolve_relation(&image, db.page_size, "RDB$CONFIG") == Some(rel) {
+        let width = formats.iter().max_by_key(|(n, _)| *n)?.1.len();
+        return named("RDB$CONFIG", &mut |at| {
+            fire_crab_ods::config::CONFIG
+                .iter()
+                .map(|c| {
+                    let text = |v: Option<&str>| v.map_or(Value::Null, |t| Value::Text(t.to_string()));
+                    let mut row = vec![Value::Null; width];
+                    if let Some(f) = at("RDB$CONFIG_ID") { row[f] = Value::Int(c.id as i64); }
+                    if let Some(f) = at("RDB$CONFIG_NAME") { row[f] = Value::Text(c.name.to_string()); }
+                    if let Some(f) = at("RDB$CONFIG_VALUE") { row[f] = text(c.value); }
+                    if let Some(f) = at("RDB$CONFIG_DEFAULT") { row[f] = text(c.default); }
+                    if let Some(f) = at("RDB$CONFIG_IS_SET") { row[f] = Value::Bool(c.is_set); }
+                    if let Some(f) = at("RDB$CONFIG_SOURCE") { row[f] = text(c.source); }
                     row
                 })
                 .collect()
