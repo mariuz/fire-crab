@@ -128485,6 +128485,11 @@ fn try_procedure_blr_at(
     let Ok(req) = fire_crab_exe::parse(&blr) else {
         return BlrProcOutcome::Outside;
     };
+    if fire_crab_exe::shape(&req).collated_cast {
+        // an inline COLLATE: the executor compares bytes, the source
+        // interpreter carries the collation (see Shape::collated_cast)
+        return BlrProcOutcome::Outside;
+    }
     if req.uses_generators {
         // GEN_ID advances must PERSIST; this executor's overlay does
         // not - the interpreter (whose GenIdIncrement path writes the
@@ -128627,6 +128632,9 @@ fn try_function_blr_at(database: &Option<Database>, name: &str, args: &[Value], 
     let Ok(req) = fire_crab_exe::parse(&blr) else {
         return FnBlrOutcome::Outside;
     };
+    if fire_crab_exe::shape(&req).collated_cast {
+        return FnBlrOutcome::Outside; // an inline COLLATE (Shape::collated_cast)
+    }
     if req.uses_generators {
         return FnBlrOutcome::Outside;
     }
@@ -130663,6 +130671,9 @@ fn exe_select(
         }
         if shape.row_reading_window {
             return decline("a window");
+        }
+        if shape.collated_cast {
+            return decline("a collated cast");
         }
         if shape.non_literal_pattern {
             return decline("a non-literal pattern");

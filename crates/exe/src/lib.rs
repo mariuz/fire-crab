@@ -5211,6 +5211,12 @@ pub struct Shape {
     /// (`'ab' || _win1252 'é'` is 6 octets under UTF8 and 4 under NONE -
     /// concatcs; the server rewrites an introducer into such a CAST)
     pub codepage_cast: bool,
+    /// a CAST to a text type carrying a COLLATION (the ttype's high byte):
+    /// `U COLLATE UNICODE_CI` compiles to one, and this executor compares
+    /// and sorts text by its bytes - measured on 2196, an engine-created
+    /// procedure counting `U COLLATE UNICODE_CI = 'a'` over 'a', 'A' answers
+    /// 2 there and answered 1 here; its ORDER BY answered 3 1 2 for 3 2 1
+    pub collated_cast: bool,
 }
 
 pub fn shape(req: &Request) -> Shape {
@@ -5225,6 +5231,7 @@ pub fn shape(req: &Request) -> Shape {
         text_coalesce: bool,
         octets: bool,
         codepage_cast: bool,
+        collated_cast: bool,
     }
     impl W {
         fn pair(&mut self, a: &Expr, b: &Expr) {
@@ -5246,6 +5253,13 @@ pub fn shape(req: &Request) -> Shape {
                 Expr::Arith(_, a, b) => { self.expr(a); self.expr(b) }
                 Expr::Negate(a) if !matches!(**a, Expr::Literal(_)) => { self.negates = true; self.expr(a) }
                 Expr::StrLen(2, a) => { self.octets = true; self.expr(a) }
+                Expr::Cast(slot, a)
+                    if matches!(slot.dtype, blr::DT_TEXT | blr::DT_TEXT2 | blr::DT_VARYING | blr::DT_VARYING2)
+                        && slot.ttype >> 8 != 0 =>
+                {
+                    self.collated_cast = true;
+                    self.expr(a)
+                }
                 Expr::Cast(slot, a)
                     if matches!(slot.dtype, blr::DT_TEXT | blr::DT_TEXT2 | blr::DT_VARYING | blr::DT_VARYING2)
                         && !matches!(slot.ttype & 0xFF, 0 | 2 | 3 | 4) =>
@@ -5366,7 +5380,7 @@ pub fn shape(req: &Request) -> Shape {
     }
     let mut w = W::default();
     w.stmt(&req.body);
-    let W { ctx, cmps, negates, fields, row_window, pattern, text_coalesce, octets, codepage_cast } = w;
+    let W { ctx, cmps, negates, fields, row_window, pattern, text_coalesce, octets, codepage_cast, collated_cast } = w;
     let rel = |c: u8| ctx.get(&c).cloned().unwrap_or_default();
     Shape {
         text_cmps: cmps.into_iter().map(|(c, f, t)| (rel(c), f, t)).collect(),
@@ -5377,6 +5391,7 @@ pub fn shape(req: &Request) -> Shape {
         text_coalesce,
         octet_length: octets,
         codepage_cast,
+        collated_cast,
     }
 }
 
