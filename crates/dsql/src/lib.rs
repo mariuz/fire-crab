@@ -1462,6 +1462,10 @@ struct Derived {
     /// derived table's, so such a stream occupies TWO context slots; the
     /// outer columns read its map by fid
     agg: Option<DerivedAgg>,
+    /// WINDOWS inside: the nested rse's stream is then blr_window over the
+    /// relation (its WHERE inside), the windows taking the contexts after
+    /// the relation's; the outer columns read their maps by fid (measured)
+    wins: Vec<Win>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1932,9 +1936,11 @@ impl<'a> P<'a> {
         // FROM): the items parse in aggregate mode against a map of their
         // own, the aggregate taking the context after the relation's
         let agg_inner = {
+            // (an aggregate verb followed by OVER is a WINDOW call)
             let mut found = (list_start..list_end).any(|k| {
                 matches!(self.t.get(k), Some(Tok::Ident(w)) if matches!(w.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"))
                     && matches!(self.t.get(k + 1), Some(Tok::LParen))
+                    && self.window_call_end(k).is_none()
             });
             let mut j = after_from;
             let mut depth = 0i32;
@@ -1961,6 +1967,16 @@ impl<'a> P<'a> {
         if agg_inner && (first.is_some() || skip.is_some() || distinct) {
             return None; // FIRST / SKIP / DISTINCT over an inner aggregate: unprobed
         }
+        // WINDOWS inside: every item reads the window streams (measured);
+        // FIRST / SKIP / DISTINCT beside them, or over an inner aggregate:
+        // unprobed
+        let win_inner = (list_start..list_end).any(|k| matches!(self.t.get(k), Some(Tok::Ident(w)) if w == "OVER"));
+        if win_inner && (agg_inner || first.is_some() || skip.is_some() || distinct) {
+            self.sub = saved;
+            self.streams.pop();
+            return None;
+        }
+        let outer_found = std::mem::take(&mut self.win_found);
         let saved_agg = (std::mem::take(&mut self.agg_map), self.agg_fid_ctx, self.agg_mode);
         let agg_ctx = inner_ctx + 1;
         if agg_inner {
@@ -1992,7 +2008,7 @@ impl<'a> P<'a> {
                     None => true,
                     Some(q) => inner_alias.as_deref().map_or(*q == name, |a| a == q),
                 };
-                let ok = !agg_inner && (q.is_some() || bare_alone) && names_it;
+                let ok = !agg_inner && !win_inner && (q.is_some() || bare_alone) && names_it;
                 let Some(expanded) = catalog_columns(&name).filter(|_| ok) else {
                     restore_agg(self, saved_agg);
                     return None;
@@ -2014,7 +2030,12 @@ impl<'a> P<'a> {
                     }
                 }
             }
-            let Some(v) = self.val() else {
+            if win_inner {
+                self.win_cap = Some((self.streams.len(), inner_ctx));
+            }
+            let v = self.val();
+            self.win_cap = None;
+            let Some(v) = v else {
                 restore_agg(self, saved_agg);
                 return None;
             };
@@ -2050,7 +2071,7 @@ impl<'a> P<'a> {
                     _ => return None, // an expression needs its name
                 }
             };
-            if agg_inner {
+            if agg_inner || win_inner {
                 raw_items.push((outer, v));
             } else {
                 let dcol = match &v {
@@ -2156,6 +2177,50 @@ impl<'a> P<'a> {
             };
             agg = Some(DerivedAgg { group_keys, map: std::mem::take(&mut self.agg_map), having });
         }
+        // the windows, built exactly as a statement's: every item rebuilt
+        // over them in order (a column into the default window, a call into
+        // its spec's), contexts after the relation's, partition keys remapped
+        let mut wins: Vec<Win> = Vec::new();
+        if win_inner {
+            let found = std::mem::take(&mut self.win_found);
+            let mut rebuilt = Vec::new();
+            for (outer, v) in raw_items.drain(..) {
+                let mut fs = Vec::new();
+                collect_fields_deep(&v, &mut fs);
+                if fs.is_empty() && !contains_winref(&v) {
+                    restore_agg(self, saved_agg);
+                    return None; // a constant item beside windows: unprobed
+                }
+                let Some(r) = rebuild_win_expr(&mut wins, &v, &found) else {
+                    restore_agg(self, saved_agg);
+                    return None;
+                };
+                rebuilt.push((outer, r));
+            }
+            for (k, w) in wins.iter_mut().enumerate() {
+                w.ctx = inner_ctx + 1 + k as u8;
+                let keys = w.part.clone();
+                for key in keys {
+                    let mut gf = Vec::new();
+                    collect_fields_deep(&key, &mut gf);
+                    let Some(r) = rebuild_over_keys(&mut w.map, &key, &gf, w.ctx) else {
+                        restore_agg(self, saved_agg);
+                        return None;
+                    };
+                    w.remap.push(r);
+                }
+            }
+            for (outer, r) in rebuilt {
+                // an expression over the window streams as a derived column:
+                // unprobed
+                let Some(f @ Val::Fid(..)) = patch_fid_win(&r, &wins) else {
+                    restore_agg(self, saved_agg);
+                    return None;
+                };
+                cols.push((outer, DCol::Fid(f)));
+            }
+        }
+        self.win_found = outer_found;
         let mut sort: Vec<(bool, Val)> = Vec::new();
         if self.kw("ORDER") {
             if !self.kw("BY") {
@@ -2187,6 +2252,9 @@ impl<'a> P<'a> {
         if agg.is_some() && !sort.is_empty() {
             return None; // an ORDER BY beside an inner aggregate: unprobed
         }
+        if !wins.is_empty() && !sort.is_empty() {
+            return None; // an ORDER BY beside inner windows: unprobed
+        }
         if distinct && any_expr {
             return None; // a projection over an expression item: unprobed
         }
@@ -2210,6 +2278,7 @@ impl<'a> P<'a> {
                 sort,
                 project: if distinct { Some(project) } else { None },
                 agg,
+                wins,
             })),
             sub: self.in_sub,
             cur: None,
@@ -3477,6 +3546,18 @@ impl<'a> P<'a> {
     /// its own too (the aggregate node's); claim it so later streams number
     /// past it (measured: a join to such a table takes context 2)
     fn claim_derived_agg_slot(&mut self, st: &Stream) {
+        // a derived table's WINDOWS occupy the contexts after its own
+        let n_wins = st.derived.as_ref().map_or(0, |d| d.wins.len());
+        for _ in 0..n_wins {
+            self.streams.push(Stream {
+                name: String::new(),
+                alias: None,
+                derived: None,
+                sub: self.in_sub,
+                cur: None,
+                proc_args: None,
+            });
+        }
         if st.derived.as_ref().is_some_and(|d| d.agg.is_some()) {
             self.streams.push(Stream {
                 name: String::new(),
@@ -4965,6 +5046,76 @@ fn emit_join_chain(out: &mut Vec<u8>, first: &Stream, ctx: u8, joins: &[(u8, Str
     }
 }
 
+/// The window list after a blr_window's source rse: the count, then each
+/// window - blr_partition_by (or the v4 framed verb) with its keys, the
+/// remapped keys, the sort and the map.
+fn emit_window_list(out: &mut Vec<u8>, windows: &[Win]) {
+    out.push(windows.len() as u8);
+    for w in windows {
+        if let Some((unit, b1, b2)) = &w.frame {
+            // the v4 verb: subcoded clauses, then the
+            // extent, then its OWN end (probed)
+            out.push(blr::WINDOW_WIN);
+            out.push(w.ctx);
+            if !w.part.is_empty() {
+                out.push(1); // win_partition
+                out.push(w.part.len() as u8);
+                for k in &w.part {
+                    emit_val(out, k);
+                }
+                for r in &w.remap {
+                    emit_val(out, r);
+                }
+            }
+            if !w.ord.is_empty() {
+                out.push(2); // win_order
+                out.push(w.ord.len() as u8);
+                for (desc, k) in &w.ord {
+                    emit_sort_key(out, *desc, k);
+                }
+            }
+            out.push(3); // win_map
+            out.extend_from_slice(
+                &(w.map.len() as u16).to_le_bytes(),
+            );
+            emit_map_entries(out, &w.map);
+            out.push(4); // extent unit
+            out.push(*unit);
+            for (j, b) in [b1, b2].into_iter().enumerate() {
+                out.push(5); // frame bound
+                out.push(j as u8 + 1);
+                out.push(b.0);
+                if let Some(v) = &b.1 {
+                    out.push(6); // frame value
+                    out.push(j as u8 + 1);
+                    emit_val(out, v);
+                }
+            }
+            out.push(blr::END);
+            continue;
+        }
+        out.push(blr::PARTITION_BY);
+        out.push(w.ctx);
+        out.push(w.part.len() as u8);
+        for k in &w.part {
+            emit_val(out, k);
+        }
+        for r in &w.remap {
+            emit_val(out, r);
+        }
+        out.push(blr::SORT);
+        out.push(w.ord.len() as u8);
+        for (desc, k) in &w.ord {
+            emit_sort_key(out, *desc, k);
+        }
+        out.push(blr::MAP);
+        out.extend_from_slice(
+            &(w.map.len() as u16).to_le_bytes(),
+        );
+        emit_map_entries(out, &w.map);
+    }
+}
+
 fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
     // a selectable procedure source (measured, ALL_LANGS): blr_procedure,
     // the counted name, the context, a u16 input count, the inputs
@@ -4994,6 +5145,11 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
     if let Some(d) = &st.derived {
         out.push(blr::RSE);
         out.push(1);
+        if !d.wins.is_empty() {
+            out.push(blr::WINDOW);
+            out.push(blr::RSE);
+            out.push(1);
+        }
         if d.agg.is_some() {
             out.push(blr::AGGREGATE);
             out.push(ctx + 1);
@@ -5040,6 +5196,18 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
                 out.push(blr::BOOLEAN);
                 emit_bool(out, h);
             }
+            out.push(blr::END);
+            return;
+        }
+        if !d.wins.is_empty() {
+            // the window's source rse holds the WHERE; the window list
+            // follows and the derived rse closes (measured)
+            if let Some(w) = &d.wher {
+                out.push(blr::BOOLEAN);
+                emit_bool(out, w);
+            }
+            out.push(blr::END);
+            emit_window_list(out, &d.wins);
             out.push(blr::END);
             return;
         }
@@ -6878,6 +7046,7 @@ type WinSpec = (
     Option<(u8, (u8, Option<Val>), (u8, Option<Val>))>,
 );
 
+#[derive(Clone, Debug, PartialEq)]
 struct Win {
     ctx: u8,
     part: Vec<Val>,
@@ -7770,70 +7939,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     }
                 }
                 out.push(blr::END);
-                out.push(f.windows.len() as u8);
-                for w in &f.windows {
-                    if let Some((unit, b1, b2)) = &w.frame {
-                        // the v4 verb: subcoded clauses, then the
-                        // extent, then its OWN end (probed)
-                        out.push(blr::WINDOW_WIN);
-                        out.push(w.ctx);
-                        if !w.part.is_empty() {
-                            out.push(1); // win_partition
-                            out.push(w.part.len() as u8);
-                            for k in &w.part {
-                                emit_val(out, k);
-                            }
-                            for r in &w.remap {
-                                emit_val(out, r);
-                            }
-                        }
-                        if !w.ord.is_empty() {
-                            out.push(2); // win_order
-                            out.push(w.ord.len() as u8);
-                            for (desc, k) in &w.ord {
-                                emit_sort_key(out, *desc, k);
-                            }
-                        }
-                        out.push(3); // win_map
-                        out.extend_from_slice(
-                            &(w.map.len() as u16).to_le_bytes(),
-                        );
-                        emit_map_entries(out, &w.map);
-                        out.push(4); // extent unit
-                        out.push(*unit);
-                        for (j, b) in [b1, b2].into_iter().enumerate() {
-                            out.push(5); // frame bound
-                            out.push(j as u8 + 1);
-                            out.push(b.0);
-                            if let Some(v) = &b.1 {
-                                out.push(6); // frame value
-                                out.push(j as u8 + 1);
-                                emit_val(out, v);
-                            }
-                        }
-                        out.push(blr::END);
-                        continue;
-                    }
-                    out.push(blr::PARTITION_BY);
-                    out.push(w.ctx);
-                    out.push(w.part.len() as u8);
-                    for k in &w.part {
-                        emit_val(out, k);
-                    }
-                    for r in &w.remap {
-                        emit_val(out, r);
-                    }
-                    out.push(blr::SORT);
-                    out.push(w.ord.len() as u8);
-                    for (desc, k) in &w.ord {
-                        emit_sort_key(out, *desc, k);
-                    }
-                    out.push(blr::MAP);
-                    out.extend_from_slice(
-                        &(w.map.len() as u16).to_le_bytes(),
-                    );
-                    emit_map_entries(out, &w.map);
-                }
+                emit_window_list(out, &f.windows);
                 // FIRST / SKIP ride the outer rse after the window list,
                 // before the sort (measured)
                 if let Some(v) = &f.first {
