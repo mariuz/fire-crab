@@ -8345,8 +8345,11 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 }
             }
             out.push(blr::RSE);
-            // a flat comma list counts every stream; a JOIN chain is one
-            out.push(if f.aggregate { 1 } else { rse_stream_count(&f.joins) });
+            // a flat comma list counts every stream; a JOIN chain is one - and
+            // a window (or an aggregate) is ONE stream whatever its source
+            // holds (measured: `.. FROM T, SRC` beside a window is `rse 1
+            // window (rse 2 ..)`)
+            out.push(if f.aggregate || !f.windows.is_empty() { 1 } else { rse_stream_count(&f.joins) });
             if let Some(rc) = &f.recurse {
                 // the recursion tower: a wrapper rse whose stream is
                 // blr_recurse - context, the SECONDARY recursive
@@ -8490,7 +8493,11 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 // the map; the shared rse END below closes it all
                 out.push(blr::WINDOW);
                 out.push(blr::RSE);
-                out.push(1);
+                // over a JOIN the window's source is the joined rse itself -
+                // the chain with its ON, or a comma list's streams - the WHERE
+                // inside, the windows numbered after every join stream
+                // (measured)
+                out.push(if f.aggregate { 1 } else { rse_stream_count(&f.joins) });
                 if f.aggregate {
                     // the aggregate node stands as the window's stream, its
                     // HAVING after its map (measured)
@@ -8517,7 +8524,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                         emit_bool(out, h);
                     }
                 } else {
-                    emit_stream(out, &f.stream, f.ctx);
+                    emit_join_chain(out, &f.stream, f.ctx, &f.joins);
                     if let Some(b) = &f.boolean {
                         out.push(blr::BOOLEAN);
                         emit_bool(out, b);
@@ -9563,7 +9570,7 @@ impl<'a> P<'a> {
         }
         // windows beside aggregates, joins, FIRST/SKIP or in the
         // singular form: unprobed
-        if has_wins && (!joins.is_empty() || !is_for) {
+        if has_wins && !is_for {
             return None;
         }
         // windows over an aggregate: only the GROUP BY form is measured
