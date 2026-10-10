@@ -772,6 +772,28 @@ const CHARSET_BPC: &[(u16, u16)] = &[
 
 /// An explicit set's (id, bytes per character), or None for a name the
 /// engine does not carry.
+/// A collation's id within its character set: UTF8's five (measured on
+/// 2196: UTF8 0, UCS_BASIC 1, UNICODE 2, UNICODE_CI 3, UNICODE_CI_AI 4),
+/// and for every set its own default - the set's name or alias, id 0.
+/// Anything else (the other sets' named collations) is unprobed.
+fn collation_id(cs: u16, name: &str) -> Option<u16> {
+    if cs == 4 {
+        let id = match name {
+            "UTF8" => 0,
+            "UCS_BASIC" => 1,
+            "UNICODE" => 2,
+            "UNICODE_CI" => 3,
+            "UNICODE_CI_AI" => 4,
+            _ => return None,
+        };
+        return Some(id);
+    }
+    match charset_by_name(name) {
+        Some((id, _)) if id == cs => Some(0),
+        _ => None,
+    }
+}
+
 fn charset_by_name(name: &str) -> Option<(u16, u16)> {
     let id = CHARSET_NAMES.iter().find(|(n, _)| *n == name).map(|(_, i)| *i)?;
     let bpc = CHARSET_BPC.iter().find(|(i, _)| *i == id).map(|(_, b)| *b)?;
@@ -872,7 +894,8 @@ fn emit_dsc(out: &mut Vec<u8>, d: Dsc) {
             out.extend_from_slice(&l.saturating_mul(bpc).to_le_bytes());
         }
         Dsc::TextCs(l, cs) | Dsc::VaryingCs(l, cs) => {
-            let bpc = CHARSET_BPC.iter().find(|(i, _)| *i == cs).map_or(1, |(_, b)| *b);
+            // (the high byte is a COLLATION: the width is the set's)
+            let bpc = CHARSET_BPC.iter().find(|(i, _)| *i == cs & 0xFF).map_or(1, |(_, b)| *b);
             out.push(if matches!(d, Dsc::TextCs(..)) { blr::TEXT2 } else { blr::VARYING2 });
             out.extend_from_slice(&cs.to_le_bytes());
             out.extend_from_slice(&l.saturating_mul(bpc).to_le_bytes());
@@ -2915,7 +2938,40 @@ impl<'a> P<'a> {
         Some(left)
     }
 
+    /// An atom, then `COLLATE <name>` after a COLUMN: a cast to the
+    /// column's own type with the collation in the text type's high byte
+    /// (measured: `U COLLATE UNICODE_CI` over a UTF8 VARCHAR(10) is `83 26
+    /// 04 03 28 00 <field>`; a CHAR keeps blr_text2). A literal's COLLATE
+    /// is the engine's 22021, an expression's unprobed: both refuse.
     fn val_atom(&mut self) -> Option<Val> {
+        let v = self.val_atom_inner()?;
+        if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "COLLATE") {
+            return Some(v);
+        }
+        self.i += 1;
+        let Some(Tok::Ident(cn)) = self.t.get(self.i) else {
+            return None;
+        };
+        let cn = cn.clone();
+        self.i += 1;
+        let Val::Field(ctx, name) = &v else {
+            return None;
+        };
+        let d = self.field_dsc(*ctx, name)?;
+        let (text, len, cs) = match d {
+            Dsc::TextCs(l, cs) => (true, l, cs),
+            Dsc::VaryingCs(l, cs) => (false, l, cs),
+            Dsc::Text(l) => (true, l, DEFAULT_CS.with(|c| c.get()).0),
+            Dsc::Varying(l) => (false, l, DEFAULT_CS.with(|c| c.get()).0),
+            _ => return None,
+        };
+        let coll = collation_id(cs & 0xFF, &cn)?;
+        let ttype = (cs & 0xFF) | (coll << 8);
+        let dsc = if text { Dsc::TextCs(len, ttype) } else { Dsc::VaryingCs(len, ttype) };
+        Some(Val::Cast(dsc, Box::new(v)))
+    }
+
+    fn val_atom_inner(&mut self) -> Option<Val> {
         let v = match self.t.get(self.i)? {
             Tok::Ident(x) if x == "CASE" => {
                 self.i += 1;
