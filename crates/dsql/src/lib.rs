@@ -5226,20 +5226,32 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
             out.push(blr::RSE);
             out.push(1);
         }
+        // a SYSTEM relation inside takes blr_relation3 (schema SYSTEM) with
+        // the alias slot always present, and the qualified alias text names
+        // SYSTEM (measured: `"Q" "SYSTEM"."RDB$DATABASE"`)
+        let system = is_system_relation(&st.name);
         match &st.alias {
             // alias-less: a plain blr_relation inside (measured)
+            None if system => {
+                emit_relation3(out, &st.name);
+                out.push(0);
+            }
             None => {
                 out.push(0x4A); // blr_relation
                 out.push(st.name.len() as u8);
                 out.extend_from_slice(st.name.as_bytes());
             }
             Some(alias) => {
-                out.push(blr::RELATION2);
-                out.push(st.name.len() as u8);
-                out.extend_from_slice(st.name.as_bytes());
+                if system {
+                    emit_relation3(out, &st.name);
+                } else {
+                    out.push(blr::RELATION2);
+                    out.push(st.name.len() as u8);
+                    out.extend_from_slice(st.name.as_bytes());
+                }
                 let text = match &d.inner_alias {
                     Some(ia) => format!("\"{}\" \"{}\"", alias, ia),
-                    None => format!("\"{}\" \"PUBLIC\".\"{}\"", alias, st.name),
+                    None => format!("\"{}\" \"{}\".\"{}\"", alias, relation_schema(&st.name), st.name),
                 };
                 out.push(text.len() as u8);
                 out.extend_from_slice(text.as_bytes());
@@ -5317,9 +5329,9 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
         // (probed; relation3's slot takes the same string in subs)
         let alias = match &st.alias {
             Some(a) => format!("\"{}\" \"{}\"", cn, a),
-            None => format!("\"{}\" \"PUBLIC\".\"{}\"", cn, st.name),
+            None => format!("\"{}\" \"{}\".\"{}\"", cn, relation_schema(&st.name), st.name),
         };
-        if st.sub {
+        if st.sub || is_system_relation(&st.name) {
             emit_relation3(out, &st.name);
         } else {
             out.push(blr::RELATION2);
@@ -5331,10 +5343,13 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
         out.push(ctx);
         return;
     }
-    if st.sub {
-        // a subroutine body qualifies every relation: blr_relation3
-        // with schema PUBLIC, an empty package, and the alias slot
-        // ALWAYS present - the quoted alias or a counted empty
+    // a subroutine body qualifies every relation: blr_relation3 with schema
+    // PUBLIC, an empty package, and the alias slot ALWAYS present - the
+    // quoted alias or a counted empty; a SYSTEM relation takes the same
+    // form EVERYWHERE, schema SYSTEM (measured: `FROM RDB$DATABASE` is `94
+    // 06 'SYSTEM' 00 0C 'RDB$DATABASE' 00 <ctx>`, aliased `.. 03 '"D"'`, in
+    // a join, an EXISTS body, MON$ tables alike)
+    if st.sub || is_system_relation(&st.name) {
         emit_relation3(out, &st.name);
         match &st.alias {
             Some(a) => {
@@ -5365,12 +5380,27 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
     out.push(ctx);
 }
 
-/// The blr_relation3 head: schema PUBLIC, empty package, the name -
+/// The schema a relation lives in: the engine's own tables (RDB$, MON$,
+/// SEC$) are SYSTEM's, everything a user creates here PUBLIC's.
+fn relation_schema(name: &str) -> &'static str {
+    if is_system_relation(name) {
+        "SYSTEM"
+    } else {
+        "PUBLIC"
+    }
+}
+
+fn is_system_relation(name: &str) -> bool {
+    name.starts_with("RDB$") || name.starts_with("MON$") || name.starts_with("SEC$")
+}
+
+/// The blr_relation3 head: the relation's schema, empty package, the name -
 /// the caller appends the alias slot and context.
 fn emit_relation3(out: &mut Vec<u8>, name: &str) {
+    let schema = relation_schema(name);
     out.push(blr::RELATION3);
-    out.push(6);
-    out.extend_from_slice(b"PUBLIC");
+    out.push(schema.len() as u8);
+    out.extend_from_slice(schema.as_bytes());
     out.push(0);
     out.push(name.len() as u8);
     out.extend_from_slice(name.as_bytes());
@@ -6233,7 +6263,7 @@ fn emit_cursor_decl(out: &mut Vec<u8>, d: &CursorDecl) {
         out.push(blr::JOIN);
         out.push(2);
     }
-    if d.sub {
+    if d.sub || is_system_relation(&d.table) {
         emit_relation3(out, &d.table);
     } else {
         out.push(blr::RELATION2);
@@ -6242,7 +6272,7 @@ fn emit_cursor_decl(out: &mut Vec<u8>, d: &CursorDecl) {
     }
     let alias = match &d.alias {
         Some(a) => format!("\"{}\" \"{}\"", d.name, a),
-        None => format!("\"{}\" \"PUBLIC\".\"{}\"", d.name, d.table),
+        None => format!("\"{}\" \"{}\".\"{}\"", d.name, relation_schema(&d.table), d.table),
     };
     out.push(alias.len() as u8);
     out.extend_from_slice(alias.as_bytes());
@@ -7859,9 +7889,13 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 // anchor
                 out.push(blr::RSE);
                 out.push(1);
-                out.push(0x92); // blr_relation2
-                out.push(rc.anchor_table.len() as u8);
-                out.extend_from_slice(rc.anchor_table.as_bytes());
+                if is_system_relation(&rc.anchor_table) {
+                    emit_relation3(out, &rc.anchor_table);
+                } else {
+                    out.push(0x92); // blr_relation2
+                    out.push(rc.anchor_table.len() as u8);
+                    out.extend_from_slice(rc.anchor_table.as_bytes());
+                }
                 out.push(rc.anchor_alias.len() as u8);
                 out.extend_from_slice(rc.anchor_alias.as_bytes());
                 out.push(rc.anchor_ctx);
@@ -8024,7 +8058,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 // AS CURSOR: the name rides the relation2 alias
                 // exactly like a DECLAREd cursor's - relation3 with
                 // the same alias string inside a subroutine (probed)
-                if f.stream.sub {
+                if f.stream.sub || is_system_relation(&f.stream.name) {
                     emit_relation3(out, &f.stream.name);
                 } else {
                     out.push(blr::RELATION2);
@@ -8036,7 +8070,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 let alias = match &f.stream.alias {
                     Some(a) => format!("\"{}\" \"{}\"", cn, a),
                     None => {
-                        format!("\"{}\" \"PUBLIC\".\"{}\"", cn, f.stream.name)
+                        format!("\"{}\" \"{}\".\"{}\"", cn, relation_schema(&f.stream.name), f.stream.name)
                     }
                 };
                 out.push(alias.len() as u8);
@@ -9567,6 +9601,17 @@ impl<'a> P<'a> {
             {
                 return None;
             }
+            // the cursor's select is a DERIVED TABLE: every column needs a
+            // name and no two may share one - the engine refuses at prepare
+            // (measured: `FOR SELECT ID + 1 FROM T .. AS CURSOR C` is "no
+            // column name specified for column number 1 in derived table
+            // C", `SELECT ID, ID .. AS CURSOR C` a duplicate)
+            for (k, n) in item_names.iter().enumerate() {
+                let Some(n) = n else { return None };
+                if item_names[..k].iter().any(|m| m.as_deref() == Some(n.as_str())) {
+                    return None;
+                }
+            }
             let Some(Tok::Ident(cn)) = self.t.get(self.i) else {
                 return None;
             };
@@ -10814,8 +10859,9 @@ impl<'a> P<'a> {
                 secondary,
                 anchor_table: table.to_ascii_uppercase(),
                 anchor_alias: format!(
-                    "\"{}\" \"PUBLIC\".\"{}\"",
+                    "\"{}\" \"{}\".\"{}\"",
                     cte.to_ascii_uppercase(),
+                    relation_schema(&table.to_ascii_uppercase()),
                     table.to_ascii_uppercase()
                 ),
                 anchor_ctx,

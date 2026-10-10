@@ -135,6 +135,10 @@ mod blr {
     pub const INDICES: u8 = 144;
     pub const RETRIEVE: u8 = 145;
     pub const RELATION2: u8 = 146;
+    /// schema, package, name, alias, context - the engine's form for a
+    /// SYSTEM relation everywhere (and for every relation inside a
+    /// subroutine body, which this executor does not run)
+    pub const RELATION3: u8 = 148;
     pub const SKIP: u8 = 175;
     pub const END: u8 = 255;
     pub const EOC: u8 = 76;
@@ -617,6 +621,20 @@ impl<'a> P<'a> {
     /// One blr_rs_stream node: stream count, the sources (relations
     /// or NESTED rs_streams - chains left-nest), the optional
     /// join_type and ON boolean, its end.
+    /// blr_relation3 after its verb: (name, context) for a relation in schema
+    /// SYSTEM; any other schema (a subroutine body's PUBLIC) is unconverted.
+    fn relation3(&mut self) -> Result<(String, u8), String> {
+        let schema = self.counted_name()?;
+        let package = self.counted_name()?;
+        let name = self.counted_name()?;
+        let _alias = self.counted_name()?;
+        let context = self.u8()?;
+        if schema != "SYSTEM" || !package.is_empty() {
+            return Err("relation3 outside schema SYSTEM unconverted".into());
+        }
+        Ok((name, context))
+    }
+
     fn rs_stream(&mut self) -> Result<Stream, String> {
         let n = self.u8()? as usize;
         let mut streams = Vec::new();
@@ -631,6 +649,10 @@ impl<'a> P<'a> {
                     let name = self.counted_name()?;
                     let _alias = self.counted_name()?;
                     let context = self.u8()?;
+                    streams.push(JoinSource::Rel(JoinStream { name, context }));
+                }
+                blr::RELATION3 => {
+                    let (name, context) = self.relation3()?;
                     streams.push(JoinSource::Rel(JoinStream { name, context }));
                 }
                 blr::RS_STREAM => {
@@ -928,6 +950,10 @@ impl<'a> P<'a> {
                 let context = self.u8()?;
                 Stream::Relation { name, context }
             }
+            blr::RELATION3 => {
+                let (name, context) = self.relation3()?;
+                Stream::Relation { name, context }
+            }
             blr::RS_STREAM => self.rs_stream()?,
             blr::RSE => {
                 // a derived table: an rse standing in the stream slot
@@ -1205,6 +1231,9 @@ impl<'a> P<'a> {
                             let _name = self.counted_name()?;
                             let _alias = self.counted_name()?;
                             let _ctx = self.u8()?;
+                        }
+                        blr::RELATION3 => {
+                            let _ = self.relation3()?;
                         }
                         other => {
                             return Err(format!("plan stream verb {} unconverted", other))
