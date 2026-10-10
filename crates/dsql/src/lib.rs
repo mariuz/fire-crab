@@ -16341,8 +16341,9 @@ mod tests {
         for sql in [
             // windows beside GROUP BY/aggregates: unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR SELECT COUNT(*), SUM(UA) OVER () FROM U2 INTO :R1, :R2 DO SUSPEND; END",
-            // windows over a JOIN: unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT COUNT(*) OVER () FROM T A JOIN U2 B ON A.ID = B.UID INTO :R1 DO SUSPEND; END",
+            // FIRST beside a windowed join: unprobed (a window over a join
+            // itself compiles - dsql slice 37)
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR SELECT FIRST 1 COUNT(*) OVER () FROM T A JOIN U2 B ON A.ID = B.UID INTO :R1 DO SUSPEND; END",
             // the singular form with a window: unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN SELECT COUNT(*) OVER () FROM U2 INTO :R1; SUSPEND; END",
             // a window FUNCTION as a statement sort key: unprobed
