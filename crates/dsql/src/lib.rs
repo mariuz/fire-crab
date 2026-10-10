@@ -8924,6 +8924,38 @@ impl<'a> P<'a> {
                     return None; // mixed ALL/distinct: unprobed
                 }
             }
+            // the branches' types UNIFY per column and every branch value of
+            // another type is CAST to the common one (measured: `S UNION ALL
+            // U` - a NONE VARCHAR(20) beside a UTF8 VARCHAR(10) - casts BOTH
+            // to VARCHAR(20) UTF8; `ID UNION ALL S` casts the INTEGER to S's
+            // type and leaves S raw). A branch of unknown type keeps the
+            // plain map; known types that do not unify here refuse
+            for i in 0..first_cols.len() {
+                let owns: Option<Vec<Dsc>> = branches
+                    .iter()
+                    .map(|b| match &b.3[i] {
+                        Val::Field(c, n) => self.field_dsc(*c, n),
+                        _ => None,
+                    })
+                    .collect();
+                let Some(owns) = owns else { continue };
+                let bytes = |d: Dsc| {
+                    let mut o = Vec::new();
+                    emit_dsc(&mut o, d);
+                    o
+                };
+                if owns.iter().all(|d| bytes(*d) == bytes(owns[0])) {
+                    continue;
+                }
+                let vals: Vec<Val> = branches.iter().map(|b| b.3[i].clone()).collect();
+                let common = self.unify_branches(&vals.iter().collect::<Vec<_>>())?;
+                for (k, own) in owns.iter().enumerate() {
+                    if bytes(*own) != bytes(common) {
+                        let v = branches[k].3[i].clone();
+                        branches[k].3[i] = Val::Cast(common, Box::new(v));
+                    }
+                }
+            }
             union_ = Some(BodyUnion {
                 ctx: uctx,
                 all,
