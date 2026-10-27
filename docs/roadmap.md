@@ -26,12 +26,16 @@ replacement of the C++ engine is below, in priority order. Full text:
    (`a771c23`) text outputs, slice 3 (`fee1e98`) bound parameters, slice 4
    (`529313c`) system relations, slice 5 (`768bc86`) DOUBLE / FLOAT, slice 6
    (`69d712e`) attachment-set text under UTF8, slice 7 (`983cd3c`) BOOLEAN,
-   slice 8 (`ee344b8`) INT128, slice 9 (`c975df7`) the transaction's own view, slice 10 (`644ef69`) arithmetic over DOUBLE / FLOAT, slice 11 (`204f43a`) DECFLOAT read-only;
-   INNER-join equalities hash (`3828117`). Switch-on sweep: no served-wrong
-   cell left after slice 6, ~4,180 statements served after slice 9. Decision
-   before default-on: pin the 11 interpreter index-trace gates or trace `exe`.
-   Next: the compile / attachment-set / lossy-move / text-literal decline
-   classes, DECFLOAT arithmetic / grouping, zoned / BLOB outputs, views, index use in `exe`.
+   slice 8 (`ee344b8`) INT128, slice 9 (`c975df7`) the transaction's own view, slice 10 (`644ef69`) arithmetic over DOUBLE / FLOAT, slice 11 (`204f43a`) DECFLOAT read-only,
+   slice 12 (`97c8cf8`) select-list aliases, slice 13 (`93f0f17`) SPEED — a field resolves once per statement, indexed equalities and ranges retrieve through the index,
+   slice 14 (`e17794b`) typed temporal literals, slice 15 (`66fa285`) the compile census, slice 16 (`c7a671c`) NULLS placement and derived tables as nested rses,
+   slice 17 (`0b2ef87`) exe runs blr_sys_function, slice 18 (`9154bfc`) windows over an aggregate, slice 19 (`dbfe68e`) an aggregate inside a derived table,
+   slice 20 (`017e123`) `*`, slices 21–28 windows composed with the statement ORDER BY, pure functions, expressions and derived tables, COLLATE, SYSTEM blr_relation3,
+   slices 29–31 UNION (ORDER BY, branch-type unification, UNION as a derived body), slice 32 aggregates in item expressions, slice 33 the statistical aggregates,
+   slices 34–35 LIST with WITHIN GROUP and GROUP BY position, slice 36 stored calls over aggregate/window slots, slice 37 (`0aa1e6c`) windows over a join.
+   INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~6,500 statements
+   with no served-wrong cell and the interpreter answers every decline. Next: the remaining compile declines, BLOB / zoned outputs,
+   DECFLOAT arithmetic and grouping, wider index use in `exe`.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

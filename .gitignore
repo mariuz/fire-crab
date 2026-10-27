@@ -1,2 +1,6 @@
 /target
 Cargo.lock
+
+# gate scratch databases never live in the tree (a $A once got committed)
+/$A
+/$B

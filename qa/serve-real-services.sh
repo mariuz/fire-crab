@@ -9,13 +9,12 @@
 #      directories, security database and architecture this way. The
 #      response byte format was captured from the real Firebird server
 #      ([tag][u16 len][string], SvcInfoCode 55/56/58/59/60) and mirrored.
-#   2. create_database() -> op_create: fire-crab does not synthesise a
-#      valid ODS from nothing (a separate large conversion); it
-#      MATERIALISES an empty database with the engine (isql CREATE
-#      DATABASE), then serves and mutates it - the same real-file basis
-#      every gate uses. The driver then runs CREATE TABLE / INSERT /
-#      SELECT against the fresh database, and the ENGINE validates the
-#      file fire-crab wrote into it.
+#   2. create_database() -> op_create: fire-crab writes the engine's own
+#      empty database from its templates (no isql on PATH needed -
+#      qa/serve-real-nativecreate.sh proves it), then serves and mutates
+#      it - the same real-file basis every gate uses. The driver then runs
+#      CREATE TABLE / INSERT / SELECT against the fresh database, and the
+#      ENGINE validates the file fire-crab wrote into it.
 #
 # This does NOT run the full firebird-qa suite: past these two, the
 # plugin bootstrap attaches to the `employee` sample database and probes
@@ -41,8 +40,7 @@ if [ -z "$FCPY" ] || ! "$FCPY" -c "import firebird.driver" 2>/dev/null; then
 fi
 
 rm -f "$NEWDB"
-# the server materialises op_create databases with this isql
-FC_ISQL="$ISQL" "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-services.log 2>&1 &
+"$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-services.log 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null; rm -f "$NEWDB"' EXIT
 i=0; while [ $i -lt 20 ]; do

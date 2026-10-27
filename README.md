@@ -25,7 +25,7 @@ a methodical conversion experiment with three rules:
 
 The project grew out of
 [a conceptual-architecture paper on Firebird](https://github.com/mariuz/conceptual-architecture-for-firebird-paper)
-whose 43 subsystem documents (each with verified hands-on samples in five
+whose 44 subsystem documents (each with verified hands-on samples in eight
 languages) serve as the conversion's guidebook: each subsystem document tells
 the converter what the C++ is *doing* before they read a line of it.
 
