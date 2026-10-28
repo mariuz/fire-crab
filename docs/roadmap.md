@@ -32,10 +32,13 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 17 (`0b2ef87`) exe runs blr_sys_function, slice 18 (`9154bfc`) windows over an aggregate, slice 19 (`dbfe68e`) an aggregate inside a derived table,
    slice 20 (`017e123`) `*`, slices 21–28 windows composed with the statement ORDER BY, pure functions, expressions and derived tables, COLLATE, SYSTEM blr_relation3,
    slices 29–31 UNION (ORDER BY, branch-type unification, UNION as a derived body), slice 32 aggregates in item expressions, slice 33 the statistical aggregates,
-   slices 34–35 LIST with WITHIN GROUP and GROUP BY position, slice 36 stored calls over aggregate/window slots, slice 37 (`0aa1e6c`) windows over a join.
+   slices 34–35 LIST with WITHIN GROUP and GROUP BY position, slice 36 stored calls over aggregate/window slots, slice 37 (`0aa1e6c`) windows over a join,
+   slice 38 BLOB and WITH TIME ZONE outputs (the id / instant halves travel; GROUP BY / DISTINCT / UNION DISTINCT over tz keys decline — the engine's
+   tie representative is an unstable sort artifact, and the interpreter refuses it too).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~6,500 statements
-   with no served-wrong cell and the interpreter answers every decline. Next: the remaining compile declines, BLOB / zoned outputs,
-   DECFLOAT arithmetic and grouping, wider index use in `exe`.
+   and the interpreter answers every decline. Next: the remaining compile declines, DECFLOAT arithmetic and grouping, wider index use in `exe`.
+   RECORDED (found during slice 38; pre-existing across ALL types, the route's first known served-wrong shape): UNION [ALL] with ORDER BY over TRUE ties —
+   the engine merges pre-sorted branches (branch-ordinal tiebreak), fc sorts the concatenation. Follow-up slice: the union-tie law (3+-branch probes, both executors).
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

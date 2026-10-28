@@ -7817,6 +7817,9 @@ fn run_gbak_restore_core(
                     precision: None,
                     default: pp.default.clone(),
                     charset: None,
+                    // a restore binds the file's own carried domains, so the
+                    // writer (the only segment reader) never runs for these
+                    segment: None,
                 })
             };
             let mut ins = Vec::new();
@@ -7889,6 +7892,11 @@ fn run_gbak_restore_core(
                     precision,
                     mech: a.mech,
                     charset: None,
+                    // a restore carries no segment size through here (the
+                    // backup's domain records are not threaded to this
+                    // writer), so an exotic SEGMENT SIZE restores as the
+                    // engine's 80 - a recorded boundary, as for charsets
+                    segment: None,
                 });
             }
             args.sort_by_key(|a| a.position);
@@ -31729,8 +31737,8 @@ fn proc_default_of(src: &str) -> Option<(Vec<u8>, String)> {
 /// compiler unifies a CASE / NULLIF / IIF / FILTER over a column and
 /// types an IN list beside one the way the engine does
 /// (`fire_crab_dsql::set_catalog_typed`). A procedure's outputs and a
-/// column whose descriptor the compiler has no cast dsc for (BLOB, zoned
-/// temporals, a collated text) carry None and leave those shapes refused.
+/// column the compiler has no unification law for (BLOB, zoned temporals,
+/// a collated text) carry None and leave those shapes refused.
 fn dsql_catalog_for(
     db: &Option<Database>,
     sql: &str,
@@ -31878,7 +31886,8 @@ fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<
         scale: m.scale,
         sub_type: m.sub_type,
         precision: m.precision,
-        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m.field_type)),
+        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m)),
+        segment: m.segment,
     };
     Some((
         Plan::CreateProcedure {
@@ -32132,8 +32141,12 @@ fn param_default_marker(src: Option<&str>) -> Option<(Vec<u8>, String)> {
 /// database's `X VARCHAR(5)` is 20 bytes of set 4, where this wrote set 0
 /// over 5 bytes and the engine, reading the procedure, refused a 'héllo'
 /// argument as *string right truncation* (measured). Non-text: None.
-fn routine_text_cs(field_type: i16) -> Option<u8> {
-    matches!(field_type, 14 | 37).then(|| DDL_DB_CS.with(|c| c.get()).unwrap_or(0))
+fn routine_text_cs(m: &fire_crab_dsql::ProcParamMeta) -> Option<u8> {
+    // a SUB_TYPE TEXT blob parameter takes the database default like a
+    // text one (probed: DU1); any other blob subtype carries no set
+    // (probed: DP1.Q, DP4), and neither does any other kind
+    (matches!(m.field_type, 14 | 37) || (m.field_type == 261 && m.sub_type == 1))
+        .then(|| DDL_DB_CS.with(|c| c.get()).unwrap_or(0))
 }
 
 /// Compile a routine under the database's default set ([routine_text_cs]):
@@ -32156,7 +32169,8 @@ fn proc_param_of(m: &fire_crab_dsql::ProcParamMeta) -> fire_crab_ods::ddl::ProcP
         name: m.name.clone(), field_type: m.field_type,
         length: m.length, scale: m.scale, sub_type: m.sub_type,
         precision: m.precision,
-        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m.field_type)),
+        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m)),
+        segment: m.segment,
     }
 }
 fn fn_arg_of(m: &fire_crab_dsql::ProcParamMeta, position: i64, named: bool) -> fire_crab_ods::ddl::FnArgDef {
@@ -32169,7 +32183,8 @@ fn fn_arg_of(m: &fire_crab_dsql::ProcParamMeta, position: i64, named: bool) -> f
         // create_package_body guard refuses a > i32 body default too
         default: if named { param_default_marker(m.default.as_deref()) } else { None },
         inline: false, precision: None, mech: -1,
-        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m.field_type)),
+        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m)),
+        segment: m.segment,
     }
 }
 
@@ -32230,7 +32245,8 @@ fn plan_create_package(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         name: m.name.clone(), field_type: m.field_type,
         length: m.length, scale: m.scale, sub_type: m.sub_type,
         precision: m.precision,
-        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m.field_type)),
+        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m)),
+        segment: m.segment,
     };
     let fnarg = |m: &fire_crab_dsql::ProcParamMeta, position: i64, named: bool| fire_crab_ods::ddl::FnArgDef {
         name: if named { Some(m.name.to_ascii_uppercase()) } else { None },
@@ -32238,7 +32254,8 @@ fn plan_create_package(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         sub_type: m.sub_type, null_flag: false,
         default: if named { m.default.as_deref().and_then(proc_default_of) } else { None },
         inline: false, precision: None, mech: -1,
-        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m.field_type)),
+        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m)),
+        segment: m.segment,
     };
     // refuse a header member whose default source cannot be encoded (a > i32
     // integer), the way plan_create_function / plan_create_procedure do
@@ -32822,7 +32839,8 @@ fn plan_create_function(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         inline: false,
         precision: None,
         mech: -1, // a PSQL function's RDB$MECHANISM is NULL (probed)
-        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m.field_type)),
+        charset: m.charset.map(|c| c as u8).or_else(|| routine_text_cs(m)),
+        segment: m.segment,
     };
     let mut args: Vec<fire_crab_ods::ddl::FnArgDef> = vec![arg(&c.outs[0], 0, false)];
     for (i, m) in c.ins.iter().enumerate() {
@@ -130488,6 +130506,34 @@ fn exe_select(
             // DECFLOAT (slice 11)
             32760 => "DECFLOAT(16)".to_string(),
             32762 => "DECFLOAT(34)".to_string(),
+            // WITH TIME ZONE outputs (slice 38): the instant halves travel,
+            // the client renders them - the describe is the interpreter's
+            32756 => "TIME WITH TIME ZONE".to_string(),
+            32754 => "TIMESTAMP WITH TIME ZONE".to_string(),
+            // BLOB outputs (slice 38): the 8-byte id travels, content via
+            // the blob ops. The describe's blob convention is sub_type in
+            // `sub_type`, charset in `scale` ([wire_for]); the synthesis
+            // spells it explicitly - a bare SUB_TYPE TEXT would take the
+            // compile default, not the column's set
+            520 => {
+                let (st, cs) = (c.sub_type, c.scale);
+                if st == 0 && cs == 0 {
+                    "BLOB".to_string()
+                } else if st == 1 {
+                    let Some(name) = cs
+                        .try_into()
+                        .ok()
+                        .and_then(charset_sql_name)
+                    else {
+                        return decline("a blob output in an unnamed set");
+                    };
+                    format!("BLOB SUB_TYPE TEXT CHARACTER SET {}", name)
+                } else if cs == 0 {
+                    format!("BLOB SUB_TYPE {}", st)
+                } else {
+                    return decline("a blob output of unprobed shape");
+                }
+            }
             // A TEXT OUTPUT IN ITS OWN SET: a plain column's ttype (the
             // length in bytes), or an expression's real-set sentinel (the
             // length in characters); the attachment's set ([ATT_SUBTYPE])
@@ -130779,6 +130825,14 @@ fn exe_select(
                 .collect(),
         );
     }
+    // the engine's 22008 read-side range check: a stored TIMESTAMP WITH
+    // TIME ZONE past 0001..9999 raises at READ on both servers - the
+    // interpreter raises it, so the route declines to it
+    if rows.iter().any(|r: &Vec<Value>| {
+        r.iter().any(|v| matches!(v, Value::TimestampTz(ud, _, _) if !(-678_575..=2_973_483).contains(ud)))
+    }) {
+        return decline("a timestamp out of the engine's read range");
+    }
     // THE VALUES MUST BE OF THEIR COLUMNS' KINDS: an executor value the
     // column's wire form does not encode (a double in an INTEGER slot) would
     // go out as garbage - decline instead
@@ -130792,6 +130846,9 @@ fn exe_select(
             (32760, Value::DecFloat16(_)) | (32762, Value::DecFloat34(_)) => true,
             (32752, Value::Int(_) | Value::Scaled(..) | Value::Int128(..)) => true,
             (448 | 452, Value::Text(_)) => true,
+            (520, Value::Blob(..)) => true,
+            (32756, Value::TimeTz(..)) => true,
+            (32754, Value::TimestampTz(..)) => true,
             _ => false,
         }
     };

@@ -70,6 +70,19 @@ INSERT INTO DF VALUES (3, 1.00, 1E-6000, -1);
 INSERT INTO DF VALUES (4, NULL, NULL, NULL);
 CREATE TABLE E (ID INT, N INT);
 CREATE INDEX E_N ON E (N);
+CREATE TABLE Z (ID INT, T TIME WITH TIME ZONE, TS TIMESTAMP WITH TIME ZONE);
+INSERT INTO Z VALUES (1, TIME '10:00:00 +02:00', TIMESTAMP '2024-01-02 10:00:00 +02:00');
+INSERT INTO Z VALUES (2, TIME '09:30:00 UTC', TIMESTAMP '2023-12-31 23:59:59 UTC');
+INSERT INTO Z VALUES (3, NULL, NULL);
+INSERT INTO Z VALUES (4, TIME '10:00:00 +02:00', TIMESTAMP '2024-01-02 08:00:00 UTC');
+INSERT INTO Z VALUES (5, TIME '07:07:07 Europe/Paris', TIMESTAMP '2024-05-05 10:00:00 Europe/Paris');
+CREATE TABLE ZR (ID INT, TS TIMESTAMP WITH TIME ZONE);
+INSERT INTO ZR VALUES (1, TIMESTAMP '2024-01-02 10:00:00 +02:00');
+INSERT INTO ZR VALUES (2, '9999-12-31 23:00:00 -02:00');
+CREATE TABLE BL (ID INT, B BLOB SUB_TYPE TEXT, BB BLOB);
+INSERT INTO BL VALUES (1, 'hello blob', 'binary bytes');
+INSERT INTO BL VALUES (2, 'second row text blob with more content here', 'more binary');
+INSERT INTO BL VALUES (3, NULL, NULL);
 COMMIT;\n" "$REAL" "$ENG" "$U" "$P" | "$ISQL" -q -b > /tmp/exs-build.log 2>&1
 [ -s "$ENG" ] || { echo "FAIL fixture not created"; sed 's/^/   /' /tmp/exs-build.log; exit 1; }
 cp "$ENG" "$FC"; chmod 666 "$FC"
@@ -298,6 +311,44 @@ rec "5 RECORDED an ordinal past the select list: the engine's -104 vector, a bar
 CREATE PROCEDURE PO7 RETURNS (R INT) AS BEGIN FOR SELECT ID FROM T ORDER BY 2 INTO :R DO SUSPEND; END^
 SET TERM ;^
 ROLLBACK;" 'Statement failed, SQLSTATE = 42000|unsuccessful metadata update|-CREATE PROCEDURE "PUBLIC"."PO7" failed|-Dynamic SQL Error|-SQL error code = -104|-Invalid column position used in the ORDER BY clause|X|======|DONE|' 'Statement failed, SQLSTATE = 42000|Dynamic SQL Error|X|======|DONE|'
+
+echo "--- 38 BLOB and WITH TIME ZONE outputs on the BLR path (slice 38)"
+route "38 a BLOB SUB_TYPE TEXT output" served "SELECT ID, B FROM BL ORDER BY ID"
+route "38 a binary BLOB output" served "SELECT ID, BB FROM BL ORDER BY ID"
+route "38 TIME / TIMESTAMP WITH TIME ZONE outputs" served "SELECT ID, T, TS FROM Z ORDER BY ID"
+route "38 ...filtered on a plain column" served "SELECT ID, TS FROM Z WHERE ID > 2 ORDER BY ID"
+route "38 ORDER BY a zoned column (UTC instant)" served "SELECT ID, TS FROM Z ORDER BY TS, ID"
+route "38 ORDER BY TIME WITH TIME ZONE" served "SELECT ID, T FROM Z ORDER BY T, ID"
+route "38 ORDER BY zoned, true ties keep scan order" served "SELECT ID, TS FROM Z ORDER BY TS"
+route "38 WHERE zoned IS NULL" served "SELECT ID FROM Z WHERE TS IS NULL OR T IS NULL ORDER BY ID"
+route "38 MIN / MAX over zoned columns" served "SELECT MIN(TS), MAX(TS), MIN(T), MAX(T) FROM Z"
+route "38 a zoned equi-join" served "SELECT A.ID, B.ID FROM Z A JOIN Z B ON B.TS = A.TS ORDER BY 1, 2"
+route "38 UNION ALL over zoned serves, branch order" served "SELECT TS FROM Z UNION ALL SELECT TS FROM Z"
+# NOTE (found on the way, recorded in docs/roadmap.md item 3): UNION ALL
+# with ORDER BY over TRUE ties is a served-wrong on BOTH fc executors for
+# ALL types (text included, pre-existing): the engine merges pre-sorted
+# branches (branch-ordinal tiebreak), fc sorts the concatenation. No
+# ORDER BY tie cell is pinned here until the union-tie-law slice lands.
+route "38 CAST from BLOB declines to the interpreter" declined "SELECT CAST(B AS VARCHAR(20)) FROM BL ORDER BY ID"
+route "38 a past-calendar instant declines to the 22008 raise" declined "SELECT ID, TS FROM ZR ORDER BY ID"
+# GROUP BY / DISTINCT / UNION DISTINCT over tz keys: the route must DECLINE -
+# the interpreter refuses (the engine's tie representative flips with plan
+# shape, pinned in serve-real-tzdml.sh) and the route serving it would be a
+# served-wrong. fc-only pins: the engine's representative is not pinned here.
+dec() { # <label> <sql>
+    ran=$((ran + 1))
+    local c before after
+    before=$(grep -ac "exe_select served [0-9]* rows: \"$(printf '%s' "$2" | sed 's/[][\.*^$/]/\\&/g')\"" "$LOG")
+    c=$(run "127.0.0.1/$PORT:$FC" "$2;")
+    after=$(grep -ac "exe_select served [0-9]* rows: \"$(printf '%s' "$2" | sed 's/[][\.*^$/]/\\&/g')\"" "$LOG")
+    case "$c" in *"Dynamic SQL Error"*)
+        if [ "$after" -gt "$before" ]; then echo "FAIL $1 - the BLR path SERVED it"; fail=1
+        else echo "OK   $1 (declined, interpreter refuses)"; fi;;
+        *) echo "DIFF $1 - no refusal: [$c]"; fail=1;; esac
+}
+dec "38 GROUP BY a zoned column declines (unstable engine representative)" "SELECT TS, COUNT(*) FROM Z GROUP BY TS"
+dec "38 DISTINCT over zoned declines" "SELECT DISTINCT TS FROM Z"
+dec "38 UNION DISTINCT over zoned declines" "SELECT TS FROM Z UNION SELECT TS FROM Z"
 
 echo "--- panic check"
 ran=$((ran + 1))

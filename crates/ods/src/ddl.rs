@@ -13773,6 +13773,8 @@ pub struct ProcParamDef {
     /// VARCHAR(10) is 40 bytes of set 4). None is the legacy row - set 0,
     /// `length` as given (a restore binds its own carried domain instead)
     pub charset: Option<u8>,
+    /// a BLOB parameter's SEGMENT SIZE; None takes the engine's 80
+    pub segment: Option<u16>,
 }
 
 /// `CREATE PROCEDURE` - the catalog rows the engine writes, measured
@@ -13950,6 +13952,13 @@ pub fn create_procedure_with_id(
             if matches!(p.field_type, 14 | 37) {
                 text_domain_vals(&mut field_vals, p.charset, p.length);
             }
+            // a blob parameter's domain: SEGMENT_LENGTH always (the declared
+            // size, else the engine's 80); a SUB_TYPE TEXT blob carries its
+            // set and COLLATION_ID 0, any other subtype carries neither
+            // (probed: DP1/DP2/DP4/DU1/DU2)
+            if p.field_type == 261 {
+                blob_domain_vals(&mut field_vals, p.sub_type, p.charset, p.segment);
+            }
             if !pre_existing {
                 let frel = crate::resolve_relation(file, page_size, "RDB$FIELDS")
                     .ok_or("no RDB$FIELDS relation")?;
@@ -14017,6 +14026,24 @@ fn text_domain_vals(vals: &mut Vec<(&str, SysVal<'_>)>, charset: Option<u8>, len
     }
     vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(cs as i64)));
     vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(length as i64)));
+}
+
+/// A routine parameter's blob domain facts: SEGMENT_LENGTH always (the
+/// declared size, else the engine's 80); a SUB_TYPE TEXT blob carries its
+/// set (explicit, else the database default resolved by the caller) and
+/// COLLATION_ID 0; any other subtype carries neither (probed:
+/// DP1/DP2/DP4/DU1/DU2 - and the same rule table columns follow).
+fn blob_domain_vals(
+    vals: &mut Vec<(&str, SysVal<'_>)>,
+    sub_type: i16,
+    charset: Option<u8>,
+    segment: Option<u16>,
+) {
+    vals.push(("RDB$SEGMENT_LENGTH", SysVal::I(segment.unwrap_or(80) as i64)));
+    if sub_type == 1 {
+        vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(charset.unwrap_or(0) as i64)));
+        vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+    }
 }
 
 /// Mint one carrier domain (`RDB$<n>`) with the given type facts and
@@ -14785,6 +14812,8 @@ pub struct FnArgDef {
     pub mech: i64,
     /// a TEXT argument's character set ([ProcParamDef::charset])
     pub charset: Option<u8>,
+    /// a BLOB argument's SEGMENT SIZE ([ProcParamDef::segment])
+    pub segment: Option<u16>,
 }
 
 /// The EXTERNAL half of a carried function declaration: the code the
@@ -14993,6 +15022,9 @@ pub fn restore_carried_function(
         }
         if matches!(a.field_type, 14 | 37) {
             text_domain_vals(&mut field_vals, a.charset, a.length);
+        }
+        if a.field_type == 261 {
+            blob_domain_vals(&mut field_vals, a.sub_type, a.charset, a.segment);
         }
         let fdrel = crate::resolve_relation(file, page_size, "RDB$FIELDS")
             .ok_or("no RDB$FIELDS relation")?;

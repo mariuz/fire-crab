@@ -164,6 +164,12 @@ mod blr {
     pub const DT_DEC64: u8 = 24;
     pub const DT_DEC128: u8 = 25;
     pub const DT_FLOAT: u8 = 10;
+    /// blr_blob2 (17): sub_type word, ttype word - the id travels, the
+    /// content stays in the pages (slice 38)
+    pub const DT_BLOB2: u8 = 17;
+    /// blr_sql_time_tz (28) / blr_timestamp_tz (29): the dtype byte alone
+    pub const DT_TIME_TZ: u8 = 28;
+    pub const DT_TIMESTAMP_TZ: u8 = 29;
 }
 
 /// One slot of a message: its BLR dtype and, for text, the declared
@@ -177,8 +183,12 @@ pub struct MsgSlot {
     pub scale: i8,
     /// a text slot's ttype (the charset-carrying twins' u16; 0 = NONE
     /// for the plain forms) - what turns `length`, a BYTE count, into
-    /// the character count an assignment is measured against
+    /// the character count an assignment is measured against. A blob
+    /// slot's ttype word rides here too; its subtype rides `blob_sub`.
     pub ttype: u16,
+    /// a blr_blob2 slot's SUB_TYPE word (text vs binary); 0 for every
+    /// other dtype - carried, never interpreted here
+    pub blob_sub: u16,
 }
 
 /// A value expression the looper can evaluate - the slice-1 subset of
@@ -544,25 +554,37 @@ impl<'a> P<'a> {
                 length: 0,
                 scale: self.u8()? as i8,
                 ttype: 0,
+                blob_sub: 0,
             },
             blr::DT_TEXT | blr::DT_VARYING => MsgSlot {
                 dtype,
                 length: self.u16()?,
                 scale: 0,
                 ttype: 0,
+                blob_sub: 0,
             },
             // the charset-carrying twins: u16 ttype, then the length
             blr::DT_TEXT2 | blr::DT_VARYING2 => {
                 let ttype = self.u16()?;
-                MsgSlot { dtype, length: self.u16()?, scale: 0, ttype }
+                MsgSlot { dtype, length: self.u16()?, scale: 0, ttype, blob_sub: 0 }
             }
             // the temporal kinds carry no length, scale or set
             blr::DT_SQL_DATE | blr::DT_SQL_TIME | blr::DT_TIMESTAMP => {
-                MsgSlot { dtype, length: 0, scale: 0, ttype: 0 }
+                MsgSlot { dtype, length: 0, scale: 0, ttype: 0, blob_sub: 0 }
             }
             // ...and so do the approximate ones (slice 5)
             blr::DT_DOUBLE | blr::DT_FLOAT | blr::DT_BOOL | blr::DT_DEC64 | blr::DT_DEC128 => {
-                MsgSlot { dtype, length: 0, scale: 0, ttype: 0 }
+                MsgSlot { dtype, length: 0, scale: 0, ttype: 0, blob_sub: 0 }
+            }
+            // blr_blob2: the sub_type word and the ttype word
+            blr::DT_BLOB2 => {
+                let sub = self.u16()?;
+                let ttype = self.u16()?;
+                MsgSlot { dtype, length: 0, scale: 0, ttype, blob_sub: sub }
+            }
+            // the zoned clocks: the dtype byte alone
+            blr::DT_TIME_TZ | blr::DT_TIMESTAMP_TZ => {
+                MsgSlot { dtype, length: 0, scale: 0, ttype: 0, blob_sub: 0 }
             }
             other => return Err(format!("message dtype {} unconverted", other)),
         })
@@ -2420,17 +2442,26 @@ fn coerce_text(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
     Ok(Value::Text(out))
 }
 
-/// An assignment into a DATE / TIME / TIMESTAMP slot: a value of that
-/// very kind (or NULL) moves as it is; any other - a text to parse, a
-/// timestamp to narrow - is a conversion this executor does not make, and
-/// it refuses so the source interpreter answers it.
+/// An assignment into a DATE / TIME / TIMESTAMP / WITH TIME ZONE slot:
+/// a value of that very kind (or NULL) moves as it is; any other - a text
+/// to parse, a timestamp to narrow, a zoned value across the zone boundary -
+/// is a conversion this executor does not make, and it refuses so the
+/// source interpreter answers it.
 fn coerce_temporal(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
     let ok = match (slot.map(|s| s.dtype), &v) {
         (_, Value::Null) => true,
         (Some(blr::DT_SQL_DATE), Value::Date(_)) => true,
         (Some(blr::DT_SQL_TIME), Value::Time(_)) => true,
         (Some(blr::DT_TIMESTAMP), Value::Timestamp(..)) => true,
+        (Some(blr::DT_TIME_TZ), Value::TimeTz(..)) => true,
+        (Some(blr::DT_TIMESTAMP_TZ), Value::TimestampTz(..)) => true,
         (Some(blr::DT_SQL_DATE | blr::DT_SQL_TIME | blr::DT_TIMESTAMP), _) => false,
+        // a zoned value into any other slot, or any other value into a
+        // zoned slot, is the session-zone conversion this executor does
+        // not make (a missing arm passed the wrong-kind value through,
+        // which the send then carried under the slot's dtype)
+        (Some(blr::DT_TIME_TZ | blr::DT_TIMESTAMP_TZ), _)
+        | (Some(_), Value::TimeTz(..) | Value::TimestampTz(..)) => false,
         _ => true,
     };
     if ok {
@@ -3372,6 +3403,11 @@ impl<'a> Exec<'a> {
                 // the engine's cohort law - unconverted here
                 if keys.iter().any(|k| matches!(k, Value::DecFloat16(_) | Value::DecFloat34(_))) {
                     return Err("DISTINCT over a DECFLOAT unconverted".into());
+                }
+                // DISTINCT over a WITH TIME ZONE key: which of equal instants
+                // survives is the engine's unstable artifact, as for GROUP BY
+                if keys.iter().any(|k| matches!(k, Value::TimeTz(..) | Value::TimestampTz(..))) {
+                    return Err("DISTINCT over a WITH TIME ZONE key unconverted".into());
                 }
                 keyed.push((keys, binding));
             }
@@ -4504,6 +4540,12 @@ impl<'a> Exec<'a> {
             if keys.iter().any(|k| matches!(k, Value::DecFloat16(_) | Value::DecFloat34(_))) {
                 return Err("GROUP BY a DECFLOAT unconverted".into());
             }
+            // GROUP BY a WITH TIME ZONE key: the group's representative is
+            // the engine's unstable sort artifact (it flips with plan shape;
+            // the interpreter refuses in plan_tz_dedup) - unconverted here
+            if keys.iter().any(|k| matches!(k, Value::TimeTz(..) | Value::TimestampTz(..))) {
+                return Err("GROUP BY a WITH TIME ZONE key unconverted".into());
+            }
             let gi = match groups.iter().position(|g| {
                 g.keys.len() == keys.len()
                     && g.keys.iter().zip(&keys).all(|(a, b)| group_eq(a, b))
@@ -5530,6 +5572,10 @@ fn hash_key(v: &Value) -> Option<Option<String>> {
         Value::Date(d) => format!("d{}", d),
         Value::Time(t) => format!("m{}", t),
         Value::Timestamp(d, t) => format!("s{}:{}", d, t),
+        // zoned keys hash by UTC instant, the equality value_cmp uses - the
+        // zone spelling is not part of the key, so +02:00 meets UTC
+        Value::TimeTz(t, _) => format!("z{}", t),
+        Value::TimestampTz(d, t, _) => format!("Z{}:{}", d, t),
         _ => return None,
     }))
 }
@@ -5799,6 +5845,13 @@ pub fn value_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Date(x), Date(y)) => Some(x.cmp(y)),
         (Time(x), Time(y)) => Some(x.cmp(y)),
         (Timestamp(xd, xt), Timestamp(yd, yt)) => Some((xd, xt).cmp(&(yd, yt))),
+        // WITH TIME ZONE values compare by UTC INSTANT across spellings -
+        // the stored halves already are UTC, the zone riding along - while
+        // a zoned value beside anything not zoned (a zoneless temporal, a
+        // text, a blob beside anything at all) has no order here: it falls
+        // through to INCOMPARABLE and fails the run, as a NaN does
+        (TimeTz(x, _), TimeTz(y, _)) => Some(x.cmp(y)),
+        (TimestampTz(xd, xt, _), TimestampTz(yd, yt, _)) => Some((xd, xt).cmp(&(yd, yt))),
         // AN APPROXIMATE OPERAND compares as a DOUBLE, an exact one
         // converted to it (the engine's rule for a mixed comparison); a NaN
         // has orders of its own (the primary-operand law, totalOrder in a

@@ -173,6 +173,11 @@ mod blr {
     pub const DATE: u8 = 0x0C;
     pub const TIME: u8 = 0x0D;
     pub const TIMESTAMP: u8 = 0x23;
+    /// blr_blob2: sub_type word, ttype word (probed: P1/P2/Q1-Q4)
+    pub const BLOB2: u8 = 0x11;
+    /// blr_sql_time_tz / blr_timestamp_tz: the dtype byte alone (probed: P3/P4)
+    pub const TIME_TZ: u8 = 0x1C;
+    pub const TIMESTAMP_TZ: u8 = 0x1D;
     /// blr_any - EXISTS: the verb and ONE rse, the subquery's WHERE
     /// as that rse's boolean (probed; the subquery's select list
     /// leaves no trace, like a view's)
@@ -561,7 +566,8 @@ fn emit_sort_key(out: &mut Vec<u8>, descending: bool, key: &Val) {
 
 /// A cast target descriptor, exactly the dsc bytes blr_cast carries
 /// (each layout probed: numerics are dtype + scale, texts carry a
-/// 2-byte charset then a 2-byte length, temporals are the dtype alone)
+/// 2-byte charset then a 2-byte length, temporals are the dtype alone,
+/// blobs are a sub_type word and a ttype word)
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Dsc {
     /// blr_short / blr_long / blr_int64 with a scale byte
@@ -587,6 +593,20 @@ enum Dsc {
     /// blr_bool (23): the dtype byte alone (measured: a BOOLEAN output's
     /// message slot is `17`)
     Boolean,
+    /// blr_blob2 (17): the subtype and the ttype words. `charset` is an
+    /// EXPLICIT `CHARACTER SET` only - a bare SUB_TYPE TEXT blob takes the
+    /// database default at emit, exactly like a bare CHAR (probed: DU1 in
+    /// a UTF8 database carries 4 in slot and domain); a bare binary (or
+    /// any other-subtype) blob carries 0 (probed: Q6, DP4). `segment` is
+    /// SEGMENT SIZE, catalog-only - it leaves no BLR trace (probed: Q2).
+    /// A COLLATE refuses (unprobed: Q3's ttype high byte exists on the
+    /// engine but is not compiled here), as does an explicit set on a
+    /// non-TEXT subtype (unprobed).
+    Blob { sub_type: i16, charset: Option<u16>, segment: Option<u16> },
+    /// blr_sql_time_tz (28) / blr_timestamp_tz (29): the dtype byte alone
+    /// (probed: P3/P4)
+    TimeTz,
+    TimestampTz,
 }
 
 /// Every character set the engine carries: (name or alias, RDB$CHARACTER_SET_ID),
@@ -908,6 +928,18 @@ fn emit_dsc(out: &mut Vec<u8>, d: Dsc) {
         Dsc::Double => out.push(27),
         Dsc::Float => out.push(10),
         Dsc::Boolean => out.push(23),
+        Dsc::Blob { sub_type, charset, .. } => {
+            // a bare SUB_TYPE TEXT blob takes the database default, like a
+            // bare CHAR (DU1); any other bare subtype takes 0 (Q6, DP4)
+            let cs = charset.unwrap_or_else(|| {
+                if sub_type == 1 { DEFAULT_CS.with(|c| c.get()).0 } else { 0 }
+            });
+            out.push(blr::BLOB2);
+            out.extend_from_slice(&(sub_type as u16).to_le_bytes());
+            out.extend_from_slice(&cs.to_le_bytes());
+        }
+        Dsc::TimeTz => out.push(blr::TIME_TZ),
+        Dsc::TimestampTz => out.push(blr::TIMESTAMP_TZ),
     }
 }
 
@@ -937,6 +969,10 @@ fn dsc_to_branch(d: Dsc) -> Option<BranchDsc> {
             BranchDsc::Exact(dt, sc)
         }
         Dsc::Num(..) | Dsc::Dec64 | Dsc::Dec128 => return None,
+        // a blob or zoned branch: the engine's unification law for them is
+        // unprobed, so a CASE / IN-list over one refuses (the interpreter
+        // answers it)
+        Dsc::Blob { .. } | Dsc::TimeTz | Dsc::TimestampTz => return None,
         Dsc::Text(l) => BranchDsc::Text { varying: false, chars: l, cs: DEFAULT_CS.with(|c| c.get()).0 },
         Dsc::Varying(l) => BranchDsc::Text { varying: true, chars: l, cs: DEFAULT_CS.with(|c| c.get()).0 },
         Dsc::TextCs(l, cs) => BranchDsc::Text { varying: false, chars: l, cs },
@@ -4332,8 +4368,7 @@ impl<'a> P<'a> {
     }
 
     /// the cast targets whose dsc bytes were probed; anything else -
-    /// FLOAT, BLOB, DECFLOAT, INT128, zones, explicit charsets -
-    /// refuses
+    /// FLOAT(p), arrays, domains, `TYPE OF` - refuses
     fn cast_target(&mut self) -> Option<Dsc> {
         let Some(Tok::Ident(name)) = self.t.get(self.i) else {
             return None;
@@ -4425,8 +4460,93 @@ impl<'a> P<'a> {
                 }
             }
             "DATE" => Dsc::Date,
-            "TIME" => Dsc::Time,
-            "TIMESTAMP" => Dsc::Timestamp,
+            // TIME [WITH TIME ZONE] / TIMESTAMP [WITH TIME ZONE]: the zoned
+            // dtypes (probed: P3/P4); WITHOUT TIME ZONE is the bare dtype
+            // (probed: P5/Q5)
+            "TIME" | "TIMESTAMP" => {
+                let zoned = name == "TIME";
+                let is_tz = |p: &Self, w: &str| matches!(p.t.get(p.i), Some(Tok::Ident(x)) if x == w);
+                let takes_zone = |p: &mut Self| -> Option<bool> {
+                    if is_tz(p, "WITH") || is_tz(p, "WITHOUT") {
+                        let with = is_tz(p, "WITH");
+                        let t1 = matches!(p.t.get(p.i + 1), Some(Tok::Ident(x)) if x == "TIME");
+                        let t2 = matches!(p.t.get(p.i + 2), Some(Tok::Ident(x)) if x == "ZONE");
+                        if !t1 || !t2 {
+                            return None;
+                        }
+                        p.i += 3;
+                        Some(with)
+                    } else {
+                        Some(false)
+                    }
+                };
+                match takes_zone(self)? {
+                    true if zoned => Dsc::TimeTz,
+                    true => Dsc::TimestampTz,
+                    false if zoned => Dsc::Time,
+                    false => Dsc::Timestamp,
+                }
+            }
+            // BLOB [SUB_TYPE n|TEXT|BINARY] [SEGMENT SIZE n]
+            // [CHARACTER SET name]: the subtype and ttype words (probed:
+            // P1/P2/Q1/Q2/Q4/DU1/DU2). SEGMENT SIZE is catalog-only; a
+            // COLLATE, and an explicit set on a non-TEXT subtype, refuse.
+            "BLOB" => {
+                let mut sub_type: i16 = 0;
+                let mut charset: Option<u16> = None;
+                let mut segment: Option<u16> = None;
+                if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "SUB_TYPE") {
+                    self.i += 1;
+                    let neg = matches!(self.t.get(self.i), Some(Tok::Minus));
+                    if neg {
+                        self.i += 1;
+                    }
+                    match self.t.get(self.i) {
+                        Some(Tok::Ident(w)) if w == "TEXT" && !neg => {
+                            sub_type = 1;
+                            self.i += 1;
+                        }
+                        Some(Tok::Ident(w)) if w == "BINARY" && !neg => {
+                            self.i += 1;
+                        }
+                        Some(Tok::Int(n)) => {
+                            let n = i16::try_from(*n).ok()?;
+                            sub_type = if neg { -n } else { n };
+                            self.i += 1;
+                        }
+                        _ => return None,
+                    }
+                }
+                if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "SEGMENT")
+                    && matches!(self.t.get(self.i + 1), Some(Tok::Ident(w)) if w == "SIZE")
+                {
+                    self.i += 2;
+                    let Some(Tok::Int(n)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    segment = Some(u16::try_from(*n).ok()?);
+                    self.i += 1;
+                }
+                if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "CHARACTER")
+                    && matches!(self.t.get(self.i + 1), Some(Tok::Ident(w)) if w == "SET")
+                {
+                    self.i += 2;
+                    let Some(Tok::Ident(cs_name)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    // an explicit set on a non-TEXT subtype is unprobed
+                    if sub_type != 1 {
+                        return None;
+                    }
+                    let (cs, _) = charset_by_name(cs_name)?;
+                    charset = Some(cs);
+                    self.i += 1;
+                }
+                if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "COLLATE") {
+                    return None;
+                }
+                Dsc::Blob { sub_type, charset, segment }
+            }
             "DOUBLE" => {
                 if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "PRECISION") {
                     return None;
@@ -13404,6 +13524,13 @@ impl TypeSpec {
             (27, _) => Dsc::Double,
             (10, _) => Dsc::Float,
             (23, _) => Dsc::Boolean,
+            (28, _) => Dsc::TimeTz,
+            (29, _) => Dsc::TimestampTz,
+            // 17 arrives only from a hand-built TypeSpec (type_spec_of
+            // keeps blobs untyped, and the live catalog maps 261 to None);
+            // the subtype is lost here, which is safe because every Blob
+            // Dsc refuses in dsc_to_branch - it can only decline, never emit
+            (17, cs) => Dsc::Blob { sub_type: 1, charset: cs, segment: None },
             (t, _) => Dsc::Num(t, self.scale),
         }
     }
@@ -13425,6 +13552,12 @@ pub fn type_spec_of(sql: &str) -> Option<TypeSpec> {
     if p.i != toks.len() {
         return None;
     }
+    // a blob or zoned column stays UNTYPED in the catalog - exactly as
+    // before this slice (cast_target refused them): unification over one
+    // refuses and the interpreter answers
+    if matches!(d, Dsc::Blob { .. } | Dsc::TimeTz | Dsc::TimestampTz) {
+        return None;
+    }
     let (def_cs, def_bpc) = DEFAULT_CS.with(|c| c.get());
     Some(match d {
         Dsc::Num(dt, sc) => TypeSpec { blr_type: dt, length: 0, scale: sc, charset: None },
@@ -13440,6 +13573,8 @@ pub fn type_spec_of(sql: &str) -> Option<TypeSpec> {
         Dsc::Boolean => TypeSpec { blr_type: 23, length: 1, scale: 0, charset: None },
         Dsc::Dec64 => TypeSpec { blr_type: 24, length: 8, scale: 0, charset: None },
         Dsc::Dec128 => TypeSpec { blr_type: 25, length: 16, scale: 0, charset: None },
+        // untyped by the early return above; unification over blob/tz refuses
+        Dsc::Blob { .. } | Dsc::TimeTz | Dsc::TimestampTz => unreachable!("blob/zoned stay untyped"),
     })
 }
 
@@ -13873,6 +14008,8 @@ pub struct ProcParamMeta {
     /// a TEXT parameter's EXPLICIT `CHARACTER SET` (its id); None takes the
     /// database's default
     pub charset: Option<u16>,
+    /// a BLOB parameter's SEGMENT SIZE; None takes the engine's 80
+    pub segment: Option<u16>,
     /// an input parameter DEFAULT value SOURCE (`5`, `'x'`, `NULL`); None
     /// for outputs and undefaulted inputs. The wire turns it into the
     /// stored RDB$DEFAULT_SOURCE / VALUE.
@@ -13904,6 +14041,11 @@ fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
         Dsc::Double => (27, 8, 0),
         Dsc::Float => (10, 4, 0),
         Dsc::Boolean => (23, 1, 0),
+        // a blob parameter is RDB$FIELD_TYPE 261, length 8 (probed: DP1);
+        // the zoned clocks are 28/29 at 8/12 bytes (probed: DP2/DP3)
+        Dsc::Blob { .. } => (261, 8, 0),
+        Dsc::TimeTz => (28, 8, 0),
+        Dsc::TimestampTz => (29, 12, 0),
     };
     ProcParamMeta {
         name: name.to_string(),
@@ -13913,7 +14055,11 @@ fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
         // a scaled exact-numeric parameter is NUMERIC (RDB$FIELD_SUB_TYPE
         // 1); a plain integer or a non-numeric type is 0. DECIMAL (2) is
         // not distinguished from NUMERIC by the Dsc here - a boundary.
-        sub_type: if scale != 0 { 1 } else { 0 },
+        // A blob parameter carries its SUB_TYPE (probed: DP1/DP4).
+        sub_type: match d {
+            Dsc::Blob { sub_type, .. } => *sub_type,
+            _ => if scale != 0 { 1 } else { 0 },
+        },
         // a DECFLOAT's RDB$FIELD_PRECISION is its digits (16 / 34, probed)
         precision: match d {
             Dsc::Dec64 => Some(16),
@@ -13926,6 +14072,13 @@ fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
         default: None,
         charset: match d {
             Dsc::TextCs(_, cs) | Dsc::VaryingCs(_, cs) => Some(*cs),
+            Dsc::Blob { charset: Some(cs), .. } => Some(*cs),
+            _ => None,
+        },
+        // SEGMENT SIZE rides to the catalog (RDB$SEGMENT_LENGTH); None
+        // takes the engine's 80 (probed: DP1/DP2)
+        segment: match d {
+            Dsc::Blob { segment, .. } => *segment,
             _ => None,
         },
     }
