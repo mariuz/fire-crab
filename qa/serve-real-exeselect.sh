@@ -139,6 +139,55 @@ INSERT INTO TIE_CI VALUES ('b');
 CREATE TABLE TIE_O (G INT, O BOOLEAN);
 INSERT INTO TIE_O VALUES (1, TRUE);
 INSERT INTO TIE_O VALUES (1, FALSE);
+CREATE TABLE DFA (G INT, A DECFLOAT(16), B DECFLOAT(34));
+INSERT INTO DFA VALUES (1, '0.1', '0.2');
+INSERT INTO DFA VALUES (1, '1.5', '2.25');
+INSERT INTO DFA VALUES (2, NULL, NULL);
+INSERT INTO DFA VALUES (2, '-0', '0');
+CREATE TABLE DFC (V DECFLOAT(34));
+INSERT INTO DFC VALUES ('1.5');
+INSERT INTO DFC VALUES ('1.500');
+INSERT INTO DFC VALUES ('1.50');
+INSERT INTO DFC VALUES ('0');
+INSERT INTO DFC VALUES ('-0');
+INSERT INTO DFC VALUES ('0E5');
+INSERT INTO DFC VALUES ('-0E-3');
+INSERT INTO DFC VALUES ('0.00');
+INSERT INTO DFC VALUES ('99');
+INSERT INTO DFC VALUES ('100');
+INSERT INTO DFC VALUES ('0.5');
+INSERT INTO DFC VALUES ('-3.5');
+CREATE TABLE DFS (V DECFLOAT(34));
+INSERT INTO DFS VALUES ('NaN');
+INSERT INTO DFS VALUES ('sNaN');
+INSERT INTO DFS VALUES ('NaN123');
+INSERT INTO DFS VALUES ('NaN456');
+INSERT INTO DFS VALUES ('Infinity');
+INSERT INTO DFS VALUES ('-Infinity');
+INSERT INTO DFS VALUES ('-NaN');
+INSERT INTO DFS VALUES ('-sNaN');
+INSERT INTO DFS VALUES ('NaN999');
+INSERT INTO DFS VALUES ('NaN1000');
+INSERT INTO DFS VALUES (NULL);
+CREATE TABLE DFM (V DECFLOAT(34), W INT);
+INSERT INTO DFM VALUES ('1.5', 100);
+INSERT INTO DFM VALUES ('1.50', 7);
+CREATE TABLE DFN (V DECFLOAT(34));
+INSERT INTO DFN VALUES ('1.5');
+CREATE TABLE DFO (V DECFLOAT(34));
+INSERT INTO DFO VALUES ('88');
+INSERT INTO DFO VALUES ('88.0');
+INSERT INTO DFO VALUES ('88.00');
+INSERT INTO DFO VALUES ('-88');
+INSERT INTO DFO VALUES ('-88.0');
+INSERT INTO DFO VALUES ('9.99E+33');
+INSERT INTO DFO VALUES ('99.9E+32');
+INSERT INTO DFO VALUES ('9990000000000000000000000000000000');
+INSERT INTO DFO VALUES ('88E-2080');
+INSERT INTO DFO VALUES ('880E-2081');
+INSERT INTO DFN VALUES (NULL);
+INSERT INTO DFN VALUES ('NaN');
+INSERT INTO DFN VALUES ('2.5');
 COMMIT;\n" "$REAL" "$ENG" "$U" "$P" | "$ISQL" -q -b > /tmp/exs-build.log 2>&1
 [ -s "$ENG" ] || { echo "FAIL fixture not created"; sed 's/^/   /' /tmp/exs-build.log; exit 1; }
 cp "$ENG" "$FC"; chmod 666 "$FC"
@@ -248,7 +297,7 @@ route "4 a DATE literal in the predicate (slice 14: the BLR compiler takes the I
 route "4 ...a TIMESTAMP and a TIME literal" served "SELECT ID FROM T WHERE TS < TIMESTAMP '2024-01-02 10:00:00' OR TM = TIME '23:00:00' ORDER BY ID"
 route "4 ...a spelling outside the ISO subset declines" declined "SELECT ID FROM T WHERE D = DATE '2024-2-1'"
 route "4 a CAST to TIMESTAMP (the executor has no such cast)" declined "SELECT CAST(D AS TIMESTAMP) FROM T ORDER BY ID"
-route "4 a DOUBLE output" declined "SELECT CAST(N AS DOUBLE PRECISION) FROM T ORDER BY ID"
+route "4 a DOUBLE output" served "SELECT CAST(N AS DOUBLE PRECISION) FROM T ORDER BY ID"
 echo "--- 10 the approximate kinds (slice 5): compared and folded as doubles, FLOAT beside FLOAT or exact in SINGLE precision"
 route "10 DOUBLE and FLOAT outputs" served "SELECT ID, R, D FROM A ORDER BY ID"
 route "10 SUM / AVG over the approximate kinds decline (the sum depends on its order and overflows to a raise: aggfold)" declined "SELECT SUM(R), AVG(R), SUM(D), AVG(D), MIN(R), MAX(D) FROM A"
@@ -331,7 +380,7 @@ route "13 = an exact literal: 1.0 and 1.00 are 1" served "SELECT ID FROM DF WHER
 route "13 beside an exact column" served "SELECT ID FROM DF WHERE A > N ORDER BY ID"
 route "13 MAX / MIN at the exponent extremes" served "SELECT MAX(B), MIN(B) FROM DF"
 route "13 GROUP BY a DECFLOAT declines (the cohort law)" declined "SELECT A, COUNT(*) FROM DF GROUP BY A"
-route "13 arithmetic declines" declined "SELECT A * 2 FROM DF WHERE ID = 2"
+route "13 arithmetic over DECFLOAT (slice 40 serves it)" served "SELECT A * 2 FROM DF WHERE ID = 2"
 echo "--- 14 INDEX retrieval (slice 13): an equality or a range on an indexed exact column"
 route "14 the PRIMARY KEY by equality" served "SELECT ID, N FROM T WHERE ID = 2"
 route "14 ...by a parameter-free range, both bounds" served "SELECT ID FROM T WHERE ID BETWEEN 2 AND 3 ORDER BY ID"
@@ -430,11 +479,85 @@ route "39 ROW_NUMBER over ties numbers in data order (interpreter)" declined "SE
 route "39 ...a double's low mantissa numbers first (interpreter)" declined "SELECT D, ROW_NUMBER() OVER (ORDER BY G) FROM TIE_D ORDER BY 2"
 route "39 ...varchar length numbers before characters (interpreter)" declined "SELECT V, ROW_NUMBER() OVER (ORDER BY G) FROM TIE_V WHERE G = 1 ORDER BY 2"
 
+# --- §40 decfloat arithmetic, ordering, grouping (NaN/cohort/total-order) ---
+route "40 exact decimal add 0.1+0.2" served "SELECT CAST('0.1' AS DECFLOAT(16)) + CAST('0.2' AS DECFLOAT(16)) FROM RDB\$DATABASE"
+route "40 division rounds to 34 digits" served "SELECT CAST(1 AS DECFLOAT(34)) / CAST(3 AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 division rounds to 16 digits" served "SELECT CAST(1 AS DECFLOAT(16)) / CAST(3 AS DECFLOAT(16)) FROM RDB\$DATABASE"
+route "40 divide by zero is 22012" declined "SELECT CAST(1 AS DECFLOAT(34)) / CAST(0 AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 0/0 is 22000" declined "SELECT CAST(0 AS DECFLOAT(34)) / CAST(0 AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 overflow is 22003 (dec16)" declined "SELECT CAST('9.999999999999999E+6144' AS DECFLOAT(16)) * CAST(100 AS DECFLOAT(16)) FROM RDB\$DATABASE"
+route "40 overflow is 22003 (dec34)" declined "SELECT CAST('9.999999999999999999999999999999999E+6144' AS DECFLOAT(34)) * CAST(100 AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 mixed widths widen to 34" served "SELECT CAST('1.1' AS DECFLOAT(16)) + CAST('2.22' AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 decfloat plus integer" served "SELECT CAST('1.5' AS DECFLOAT(16)) + 2 FROM RDB\$DATABASE"
+route "40 decfloat plus numeric" served "SELECT CAST('1.5' AS DECFLOAT(34)) + CAST(225 AS NUMERIC(10,2)) FROM RDB\$DATABASE"
+route "40 decfloat plus double" served "SELECT CAST('1.5' AS DECFLOAT(34)) + CAST(2.25 AS DOUBLE PRECISION) FROM RDB\$DATABASE"
+route "40 minus zero renders" served "SELECT CAST('-0' AS DECFLOAT(34)), CAST('-1' AS DECFLOAT(34)) * CAST(0 AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 ties round half up away from zero" served "SELECT CAST('1.0000000000000005' AS DECFLOAT(16)), CAST('-1.0000000000000005' AS DECFLOAT(16)) FROM RDB\$DATABASE"
+route "40 cohort renders and adds" served "SELECT CAST('1.50' AS DECFLOAT(34)), CAST('1.5' AS DECFLOAT(34)) + CAST('0.00' AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 specials render" served "SELECT CAST('Infinity' AS DECFLOAT(34)), CAST('NaN' AS DECFLOAT(34)), CAST('sNaN' AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 underflow clamps to 0E-Etiny" served "SELECT CAST('1E-6143' AS DECFLOAT(16)) / CAST(10 AS DECFLOAT(16)) FROM RDB\$DATABASE"
+route "40 quiet NaN propagates" served "SELECT CAST('NaN' AS DECFLOAT(34)) + 1 FROM RDB\$DATABASE"
+route "40 signaling sNaN is 22000" declined "SELECT CAST('sNaN' AS DECFLOAT(34)) + 1 FROM RDB\$DATABASE"
+route "40 NaN equality signals" declined "SELECT CAST('NaN' AS DECFLOAT(34)) = CAST('NaN' AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 NaN comparison signals" declined "SELECT CAST('NaN' AS DECFLOAT(34)) < CAST(1 AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 arithmetic over a table, nulls, ordered" served "SELECT A + B, A * B FROM DFA ORDER BY 1"
+route "40 total order over specials" served "SELECT V FROM DFS ORDER BY 1"
+route "40 total order over specials reversed" served "SELECT V FROM DFS ORDER BY 1 DESC"
+route "40 cohorts order by bytes, plus zero first" served "SELECT V FROM DFC ORDER BY 1"
+route "40 value order across exponents" declined "SELECT CAST('99' AS DECFLOAT(34)) FROM RDB\$DATABASE UNION ALL SELECT CAST('100' AS DECFLOAT(34)) FROM RDB\$DATABASE UNION ALL SELECT CAST('999' AS DECFLOAT(34)) FROM RDB\$DATABASE UNION ALL SELECT CAST('1000' AS DECFLOAT(34)) FROM RDB\$DATABASE ORDER BY 1"
+route "40 DISTINCT keeps the MAX cohort" served "SELECT DISTINCT V FROM DFC ORDER BY 1"
+route "40 DISTINCT payloads merge to MAX, sNaN apart" served "SELECT DISTINCT V FROM DFS ORDER BY 1"
+route "40 UNION DISTINCT over three branches" served "SELECT V FROM DFM WHERE W = 100 UNION SELECT V FROM DFM WHERE W = 7 UNION SELECT V FROM DFM WHERE W > 0 ORDER BY 1"
+route "40 cohorts and zeros keep tiebreak DESC" served "SELECT V FROM DFC ORDER BY 1 DESC"
+route "40 Infinity minus Infinity is 22000" declined "SELECT CAST('Infinity' AS DECFLOAT(34)) - CAST('Infinity' AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 Infinity over Infinity is 22000" declined "SELECT CAST('Infinity' AS DECFLOAT(34)) / CAST('Infinity' AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 Infinity times zero is 22000" declined "SELECT CAST('Infinity' AS DECFLOAT(34)) * CAST(0 AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 MIN/MAX keep first arrival" served "SELECT MIN(V), MAX(V) FROM DFC"
+route "40 MIN/MAX over NaN signals" declined "SELECT MIN(V), MAX(V) FROM DFS"
+route "40 SUM/AVG propagate quiet NaN" served "SELECT SUM(V), AVG(V) FROM DFN"
+route "40 SUM over sNaN signals" declined "SELECT SUM(V) FROM DFS"
+route "40 COUNT DISTINCT over cohorts and NaN" served "SELECT COUNT(DISTINCT V) FROM DFC"
+route "40 GROUP BY decfloat over cohorts and zeros (NaN-free)" declined "SELECT V, COUNT(*) FROM DFC GROUP BY V ORDER BY 1"
+route "40 GROUP BY decfloat signals on a NaN boundary (NaN)" declined "SELECT V, COUNT(*) FROM DFS WHERE V IS NOT NULL GROUP BY V ORDER BY 1"
+route "40 ABS CEIL FLOOR" served "SELECT ABS(V), CEIL(V), FLOOR(V) FROM DFC ORDER BY 1"
+route "40 ROUND half up TRUNC SIGN" declined "SELECT ROUND(V), TRUNC(V), SIGN(V) FROM DFC ORDER BY 1"
+route "40 SQRT POWER" declined "SELECT SQRT(V), POWER(V, 2) FROM DFM WHERE W > 0 ORDER BY 1"
+route "40 EXP LN" declined "SELECT EXP(V), LN(V) FROM DFM WHERE W > 0 ORDER BY 1"
+route "40 MOD is half-up integer-cast" declined "SELECT MOD(CAST('5.5' AS DECFLOAT(34)), CAST(2 AS DECFLOAT(34))), MOD(CAST(5.5 AS DOUBLE PRECISION), CAST(2 AS DOUBLE PRECISION)) FROM RDB\$DATABASE"
+route "40 SQRT of negative is 42000" declined "SELECT SQRT(CAST(-1 AS DECFLOAT(34))) FROM RDB\$DATABASE"
+route "40 LN of zero is 42000" declined "SELECT LN(CAST(0 AS DECFLOAT(34))) FROM RDB\$DATABASE"
+route "40 POWER of negative to fraction is 22000" declined "SELECT POWER(CAST(-2 AS DECFLOAT(34)), CAST(0.5 AS DECFLOAT(34))) FROM RDB\$DATABASE"
+route "40 EXP overflow is 22003" declined "SELECT EXP(CAST(20000 AS DECFLOAT(34))) FROM RDB\$DATABASE"
+route "40 CAST decfloat to int rounds half up" served "SELECT CAST(CAST('2.5' AS DECFLOAT(34)) AS INTEGER), CAST(CAST('-2.5' AS DECFLOAT(34)) AS INTEGER), CAST(CAST('2.4' AS DECFLOAT(34)) AS INTEGER) FROM RDB\$DATABASE"
+route "40 CAST decfloat to int overflow is 22000" declined "SELECT CAST(CAST('1E30' AS DECFLOAT(34)) AS INTEGER) FROM RDB\$DATABASE"
+CS=UTF8 route "40 CAST decfloat to varchar renders cohort" served "SELECT CAST(CAST('1.50' AS DECFLOAT(34)) AS VARCHAR(40)), CAST(CAST('NaN' AS DECFLOAT(34)) AS VARCHAR(40)) FROM RDB\$DATABASE"
+route "40 CAST varchar to decfloat" served "SELECT CAST('1.50' AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 CAST garbage varchar is 22018" declined "SELECT CAST('zzz' AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 CAST int to decfloat" served "SELECT CAST(7 AS DECFLOAT(16)), CAST(7 AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 CAST NaN to double is 22000" declined "SELECT CAST(CAST('NaN' AS DECFLOAT(34)) AS DOUBLE PRECISION) FROM RDB\$DATABASE"
+route "40 CAST double to decfloat" served "SELECT CAST(CAST(2.25 AS DOUBLE PRECISION) AS DECFLOAT(16)), CAST(CAST(2.25 AS DOUBLE PRECISION) AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 CAST dec16 to dec34 widens" served "SELECT CAST(CAST('1.5' AS DECFLOAT(16)) AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 COMPARE_DECFLOAT cohort and NaN" served "SELECT COMPARE_DECFLOAT(CAST('1.5' AS DECFLOAT(34)), CAST('1.50' AS DECFLOAT(34))), COMPARE_DECFLOAT(CAST('NaN' AS DECFLOAT(34)), CAST(1 AS DECFLOAT(34))) FROM RDB\$DATABASE"
+route "40 WHERE decfloat equality is cohort-blind" served "SELECT COUNT(*) FROM DFC WHERE V = CAST('1.5' AS DECFLOAT(34))"
+route "40 WHERE decfloat equality streams partial then signals" declined "SELECT V FROM DFS WHERE V = CAST('1.5' AS DECFLOAT(34))"
+route "40 88-cohort orders by the record" served "SELECT V FROM DFO WHERE V = 88 ORDER BY 1"
+route "40 88-cohort keeps the record order DESC" served "SELECT V FROM DFO WHERE V = 88 ORDER BY 1 DESC"
+route "40 negative 88-cohort" served "SELECT V FROM DFO WHERE V = -88 ORDER BY 1"
+route "40 full-width cohort member sorts first" served "SELECT V FROM DFO WHERE V = CAST('9.99E+33' AS DECFLOAT(34)) ORDER BY 1"
+route "40 combination field never decides" served "SELECT V FROM DFO WHERE V = CAST('8.8E-2079' AS DECFLOAT(34)) ORDER BY 1"
+route "40 exotic cohorts order and cohort-match" served "SELECT V FROM DFO ORDER BY 1"
+route "40 exotic cohorts reversed" served "SELECT V FROM DFO ORDER BY 1 DESC"
+route "40 exotic DISTINCT keeps record-greatest" served "SELECT DISTINCT V FROM DFO ORDER BY 1"
+route "40 exotic GROUP BY merges by value" declined "SELECT V, COUNT(*) FROM DFO GROUP BY V ORDER BY 1"
+route "40 dec16 column orders natively" served "SELECT A FROM DF ORDER BY 1"
+route "40 33-digit payload renders" served "SELECT CAST('NaN123456789012345678901234567890123' AS DECFLOAT(34)) FROM RDB\$DATABASE"
+route "40 34-digit payload is 22018" declined "SELECT CAST('NaN1234567890123456789012345678901234' AS DECFLOAT(34)) FROM RDB\$DATABASE"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 111 ]; then echo "FAIL only $ran checks ran (floor 111) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 171 ]; then echo "FAIL only $ran checks ran (floor 171) - cells went missing"; fail=1; fi
 exit $fail

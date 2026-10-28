@@ -15278,13 +15278,13 @@ impl Term {
                     // The column NaN is caught here; a NaN LITERAL (the
                     // `'NaN'` text form) once the row is known non-NULL,
                     // below.
-                    Some(fire_crab_ods::decfloat::Dec::Nan) => {
+                    Some(x) if x.is_nan() => {
                         dec_nan_cmp(v, &Value::Null)?;
                         Some(ord_ok(std::cmp::Ordering::Equal, *op))
                     }
                     Some(d) => {
                         let lit = fire_crab_ods::decfloat::decode_dec128(*bits);
-                        if matches!(lit, fire_crab_ods::decfloat::Dec::Nan) {
+                        if lit.is_nan() {
                             dec_nan_cmp(v, &Value::Null)?;
                             return Ok(Some(ord_ok(std::cmp::Ordering::Equal, *op)));
                         }
@@ -35422,34 +35422,12 @@ const DF_TRAP_DIV: u8 = 1;
 const DF_TRAP_INVALID: u8 = 2;
 const DF_TRAP_OVERFLOW: u8 = 4;
 
-/// IEEE 754 totalOrder of two decoded DECFLOATs (decQuadCompareTotal):
-/// numeric order first; among equal values a -0 before a +0, then the
-/// cohorts - the smaller exponent first for a positive value, the larger
-/// for a negative one (`1.00 < 1.0 < 1`, `-1 < -1.0`); a NaN beyond
-/// +Infinity (the only NaN a decoded value carries is the quiet,
-/// unsigned one).
-fn dec_total_cmp(a: &fire_crab_ods::decfloat::Dec, b: &fire_crab_ods::decfloat::Dec) -> std::cmp::Ordering {
-    use fire_crab_ods::decfloat::{cmp, Dec};
-    use std::cmp::Ordering::*;
-    match (a, b) {
-        (Dec::Nan, Dec::Nan) => return Equal,
-        (Dec::Nan, _) => return Greater,
-        (_, Dec::Nan) => return Less,
-        _ => {}
-    }
-    match cmp(a, b) {
-        Equal => {}
-        o => return o,
-    }
-    match (a, b) {
-        (Dec::Finite { neg: na, exp: ea, .. }, Dec::Finite { neg: nb, exp: eb, .. }) => {
-            if na != nb {
-                return if *na { Less } else { Greater };
-            }
-            if *na { eb.cmp(ea) } else { ea.cmp(eb) }
-        }
-        _ => Equal,
-    }
+/// Shared with the BLR executor: TOTALORDER/COMPARE_DECFLOAT's order.
+fn dec_total_cmp(
+    a: &fire_crab_ods::decfloat::Dec,
+    b: &fire_crab_ods::decfloat::Dec,
+) -> std::cmp::Ordering {
+    fire_crab_ods::decfloat::totalorder_cmp(a, b)
 }
 
 /// QUANTIZE / NORMALIZE_DECFLOAT / COMPARE_DECFLOAT / TOTALORDER over
@@ -35470,7 +35448,7 @@ fn dec_fn_eval(f: &SysFn, vs: &[Value]) -> Result<Value, EvalErr> {
                 .map(fire_crab_ods::decfloat::decode_dec128)
                 .map_err(|over| if over { EvalErr::DecfloatOverflow } else { EvalErr::DecfloatConvError(s.clone()) }),
             v => match approx_of(v) {
-                Some(x) if !x.is_finite() => Ok(if x.is_nan() { Dec::Nan } else { Dec::Infinity { neg: x < 0.0 } }),
+                Some(x) if !x.is_finite() => Ok(if x.is_nan() { Dec::quiet_nan() } else { Dec::Infinity { neg: x < 0.0 } }),
                 Some(x) => f64_to_dec(x, if wide { 17 } else { 16 }).ok_or(EvalErr::ConversionError(None)),
                 None => value_as_dec(v).ok_or_else(|| nonnumeric_conv(v)),
             },
@@ -35499,7 +35477,7 @@ fn dec_fn_eval(f: &SysFn, vs: &[Value]) -> Result<Value, EvalErr> {
         if decfloat_trapped(DF_TRAP_INVALID) {
             Err(EvalErr::DecfloatInvalidOperation)
         } else {
-            out(Dec::Nan, wide)
+            out(Dec::quiet_nan(), wide)
         }
     };
     match f {
@@ -35517,7 +35495,8 @@ fn dec_fn_eval(f: &SysFn, vs: &[Value]) -> Result<Value, EvalErr> {
         SysFn::Quantize => {
             let (x, y) = (at_width(arg(&vs[0], wide)?, wide), at_width(arg(&vs[1], wide)?, wide));
             match (&x, &y) {
-                (Dec::Nan, _) | (_, Dec::Nan) => out(Dec::Nan, wide),
+                (x @ Dec::Nan { .. }, _) => out(*x, wide),
+                (_, y @ Dec::Nan { .. }) => out(*y, wide),
                 (Dec::Infinity { .. }, Dec::Infinity { .. }) => out(x, wide),
                 (Dec::Infinity { .. }, _) | (_, Dec::Infinity { .. }) => invalid(wide),
                 (Dec::Finite { neg, exp: ex, .. }, Dec::Finite { exp: ey, .. }) => {
@@ -35541,7 +35520,7 @@ fn dec_fn_eval(f: &SysFn, vs: &[Value]) -> Result<Value, EvalErr> {
             let (x, y) = (arg(&vs[0], true)?, arg(&vs[1], true)?);
             let o = dec_total_cmp(&x, &y);
             Ok(Value::Int(match f {
-                SysFn::CompareDecfloat if matches!(x, Dec::Nan) || matches!(y, Dec::Nan) => 3,
+                SysFn::CompareDecfloat if x.is_nan() || y.is_nan() => 3,
                 SysFn::CompareDecfloat => match o {
                     std::cmp::Ordering::Equal => 0,
                     std::cmp::Ordering::Less => 1,
@@ -64508,6 +64487,13 @@ fn rows_equal(a: &[Value], b: &[Value], coll: &[u16]) -> bool {
             match (x, y) {
                 (Value::Null, Value::Null) => true,
                 (Value::Null, _) | (_, Value::Null) => false,
+                // two DECFLOATs share a group by the dedup law (cohorts
+                // and quiet-NaN payloads merge, signs and sNaN apart) -
+                // never by the value compare (which merges signed NaNs)
+                // nor the total order (which splits cohorts)
+                _ if dec_of(x).is_some() && dec_of(y).is_some() => {
+                    fire_crab_ods::decfloat::dedup_eq(&dec_of(x).unwrap(), &dec_of(y).unwrap())
+                }
                 // a BINARY column is the same value under the 0x00 pad,
                 // not the blank one: `x'61'` and `x'6100'` are ONE row
                 // to a set
@@ -65028,6 +65014,25 @@ fn distinct_rows(
     for r in sorted {
         if let Some(last) = kept.last_mut() {
             if rows_equal(&last[..width], &r[..width], coll) {
+                // A DECFLOAT collision's survivor is the TOTAL-GREATEST
+                // of the two (the engine's MAX-cohort / MAX-payload
+                // representative), decided by the first DECFLOAT column
+                // that distinguishes them - never the later row
+                let dec_win = (0..width).find_map(|i| match (dec_of(&last[i]), dec_of(&r[i])) {
+                    (Some(x), Some(y)) => {
+                        match dec_order_cmp(&last[i], &x, &r[i], &y, false) {
+                            std::cmp::Ordering::Equal => None,
+                            o => Some(o),
+                        }
+                    }
+                    _ => None,
+                });
+                if let Some(o) = dec_win {
+                    if o == std::cmp::Ordering::Less {
+                        *last = r;
+                    }
+                    continue;
+                }
                 // A collision of two DIFFERENT spellings: which survives
                 // is the record law in the doc comment. A CHAR survivor
                 // is re-padded to its declared width by the encoder, so
@@ -75654,6 +75659,17 @@ fn order_cmp(a: &[Value], b: &[Value], keys: &[OrderKey]) -> std::cmp::Ordering 
                     _ => Greater,
                 }
             }
+        } else if let (Some(x), Some(y)) = (dec_of(va), dec_of(vb)) {
+            // two DECFLOATs order by the engine's total law (the sort
+            // key folded with the record tiebreak), which carries its
+            // own direction (descending keeps every tiebreak ascending
+            // - never a blind reverse). In memory there are no record
+            // bytes past the keys, so an expression key's value-ties
+            // break by the KEY values' own records - right for direct
+            // keys, while a zero-tie under ABS (exeselect 40's
+            // ABS/CEIL/FLOOR cell) needs the SOURCE row's bytes and is
+            // the BLR path's shape, served there.
+            dec_order_cmp(va, &x, vb, &y, desc)
         } else {
             let o = if key.coll == fire_crab_ods::coll::TTYPE_PXW_INTL {
                 collated_text_cmp(va, vb).unwrap_or_else(|| value_cmp(va, vb))
@@ -78094,6 +78110,50 @@ fn derived_record_items(inner: &Plan, cols: &[ProjCol], order_by: &[OrderKey]) -
     Some(items)
 }
 
+/// GROUP BY's boundary over one sorted row pair, key by key in
+/// order: a NULL beside anything breaks (or merges, NULL with NULL)
+/// WITHOUT touching a NaN (the NULL group emits before a NaN boundary
+/// ever traps - the NaN-vs-NULL pair short-circuits); a DECFLOAT key
+/// comparison TRAPS (22000) when either NON-NULL side is NaN (the
+/// engine's MOV_compare signals mid-formation - H1-H5/J1-J4: a lone
+/// NaN row groups without a boundary to trap on), else
+/// cohorts/zeros/payloads merge by value ([dedup_eq]); any other key
+/// by single-key order-equality. A differing earlier key breaks before
+/// a later NaN is ever compared (J3's `(1, 1.5), (2, NaN)` serves two
+/// groups).
+fn same_group_keys(a: &[Value], b: &[Value], keys: &[OrderKey]) -> Result<bool, EvalErr> {
+    let nullv = Value::Null;
+    for k in keys {
+        let va = a.get(k.field).unwrap_or(&nullv);
+        let vb = b.get(k.field).unwrap_or(&nullv);
+        match (matches!(va, Value::Null), matches!(vb, Value::Null)) {
+            (true, true) => continue,
+            (true, false) | (false, true) => return Ok(false),
+            (false, false) => {}
+        }
+        let (da, db) = (dec_of(va), dec_of(vb));
+        if matches!(&da, Some(x) if x.is_nan()) || matches!(&db, Some(y) if y.is_nan()) {
+            return Err(EvalErr::DecfloatInvalidOperation);
+        }
+        match (da, db) {
+            (Some(x), Some(y)) => {
+                if !fire_crab_ods::decfloat::dedup_eq(&x, &y) {
+                    return Ok(false);
+                }
+            }
+            (None, None) => {
+                if order_cmp(a, b, std::slice::from_ref(k)) != std::cmp::Ordering::Equal {
+                    return Ok(false);
+                }
+            }
+            // a decfloat beside a non-decfloat (a typed key never
+            // mixes in practice): separate groups, never a trap
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn group_rows(
     mut input: Vec<Vec<Value>>,
@@ -78124,6 +78184,14 @@ fn group_rows(
     if key_fids.is_empty() {
         out.push(compute_group(&input, gitems)?);
     } else {
+        // GROUP BY a DECFLOAT key serves: cohorts, zeros and payloads
+        // merge by value ([same_group_keys]) with the record-greatest
+        // surviving (the grouping sort's LAST row, which
+        // [compute_group]'s Key arm reads), while a boundary touching
+        // a NaN key signals 22000 mid-formation (the engine streams
+        // the groups closed before it - an H1-shaped partial output
+        // answers a bare trap here instead, a known gap: this
+        // bucketing collects where the engine streams).
         let keys: Vec<OrderKey> = key_fids
             .iter()
             .enumerate()
@@ -78456,10 +78524,10 @@ fn group_rows(
         let mut i = 0;
         while i < input.len() {
             let mut j = i + 1;
-            while j < input.len()
-                && !key_nan(&input[i])
-                && order_cmp(&input[i], &input[j], &keys) == std::cmp::Ordering::Equal
-            {
+            while j < input.len() && !key_nan(&input[i]) {
+                if !same_group_keys(&input[i], &input[j], &keys)? {
+                    break;
+                }
                 j += 1;
             }
             // a fold in DELIVERY order (a real join's) has no record order
@@ -78600,7 +78668,10 @@ fn stat2_dec_result(
         if matches!(after, Dec::Infinity { .. }) && before.iter().all(|d| fin(d)) && decfloat_trapped(DF_TRAP_OVERFLOW) {
             return Err(EvalErr::DecfloatOverflow);
         }
-        if matches!(after, Dec::Nan) && !before.iter().any(|d| matches!(d, Dec::Nan)) && decfloat_trapped(DF_TRAP_INVALID) {
+        if (matches!(after, Dec::Nan { .. }) && !before.iter().any(|d| d.is_nan())
+            || before.iter().any(|d| d.is_signaling_nan()))
+            && decfloat_trapped(DF_TRAP_INVALID)
+        {
             return Err(EvalErr::DecfloatInvalidOperation);
         }
         Ok(after)
@@ -78664,7 +78735,9 @@ fn stat2_dec_result(
             // execute, which tests the divisor first (above).
             let safe_dv = |a: &Dec, b: &Dec| -> Result<Dec, EvalErr> {
                 let q = dfl::div(a, b);
-                if matches!(q, Dec::Nan) && !matches!(a, Dec::Nan) && !matches!(b, Dec::Nan) && decfloat_trapped(DF_TRAP_INVALID) {
+                if ((q.is_nan() && !a.is_nan() && !b.is_nan()) || a.is_signaling_nan() || b.is_signaling_nan())
+                    && decfloat_trapped(DF_TRAP_INVALID)
+                {
                     return Err(EvalErr::DecfloatInvalidOperation);
                 }
                 Ok(q)
@@ -79257,12 +79330,19 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         if matches!(v, Value::Null) {
                             continue;
                         }
-                        let dup = seen.iter().any(|s| match src {
-                            // a text field's DISTINCT key ([distinct_fold_cmp])
-                            AggSrc::CollField(_, tt) => {
-                                distinct_fold_key_cmp(s, &v, *tt) == std::cmp::Ordering::Equal
+                        let dup = seen.iter().any(|s| {
+                            // two DECFLOATs dedup by the dedup law, not
+                            // the fold compare (see [rows_equal])
+                            if let (Some(x), Some(y)) = (dec_of(s), dec_of(&v)) {
+                                return fire_crab_ods::decfloat::dedup_eq(&x, &y);
                             }
-                            _ => fold_cmp(s, &v, src) == std::cmp::Ordering::Equal,
+                            match src {
+                                // a text field's DISTINCT key ([distinct_fold_cmp])
+                                AggSrc::CollField(_, tt) => {
+                                    distinct_fold_key_cmp(s, &v, *tt) == std::cmp::Ordering::Equal
+                                }
+                                _ => fold_cmp(s, &v, src) == std::cmp::Ordering::Equal,
+                            }
                         });
                         if !dup {
                             seen.push(v);
@@ -79295,6 +79375,12 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                                 if matches!(func, AggFn::Min) { v } else { b }
                             }
                             Some(b) => {
+                                // a DECFLOAT NaN on either side: the
+                                // engine's MIN/MAX compare signals
+                                // (22000) - it never orders NaN
+                                if dec_is_nan(&b) || dec_is_nan(&v) {
+                                    return Err(EvalErr::DecfloatInvalidOperation);
+                                }
                                 let ord = fold_cmp(&b, &v, src);
                                 let keep_b = if matches!(func, AggFn::Min) {
                                     ord != std::cmp::Ordering::Greater
@@ -79337,7 +79423,12 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                     for r in rows {
                         let v = src_value(src, r)?;
                         if *distinct && !matches!(v, Value::Null) {
-                            if seen.iter().any(|s| fold_cmp(s, &v, src) == std::cmp::Ordering::Equal) {
+                            if seen.iter().any(|s| {
+                                if let (Some(x), Some(y)) = (dec_of(s), dec_of(&v)) {
+                                    return fire_crab_ods::decfloat::dedup_eq(&x, &y);
+                                }
+                                fold_cmp(s, &v, src) == std::cmp::Ordering::Equal
+                            }) {
                                 continue;
                             }
                             seen.push(v.clone());
@@ -79390,9 +79481,11 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                                 // (SUM / AVG, grouped and windowed, measured);
                                 // a NaN INPUT still propagates as NaN
                                 if decfloat_trapped(DF_TRAP_INVALID)
-                                    && matches!(next, fire_crab_ods::decfloat::Dec::Nan)
-                                    && !matches!(d, fire_crab_ods::decfloat::Dec::Nan)
-                                    && !matches!(acc0, Some(fire_crab_ods::decfloat::Dec::Nan))
+                                    && ((next.is_nan()
+                                        && !d.is_nan()
+                                        && !matches!(acc0, Some(x) if x.is_nan()))
+                                        || d.is_signaling_nan()
+                                        || matches!(acc0, Some(x) if x.is_signaling_nan()))
                                 {
                                     return Err(EvalErr::DecfloatInvalidOperation);
                                 }
@@ -79468,7 +79561,9 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                                     Dec::Infinity { neg } => {
                                         Some(dfl::encode_dec64_special(*neg, false))
                                     }
-                                    Dec::Nan => Some(dfl::encode_dec64_special(false, true)),
+                                    Dec::Nan { neg, signaling, payload } => {
+                                        Some(dfl::encode_dec64_nan(*neg, *signaling, *payload))
+                                    }
                                 };
                                 match bits {
                                     Some(b) => Value::DecFloat16(b),
@@ -79541,7 +79636,10 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                             if matches!(after, Dec::Infinity { .. }) && before.iter().all(|d| fin(d)) && decfloat_trapped(DF_TRAP_OVERFLOW) {
                                 return Err(EvalErr::DecfloatOverflow);
                             }
-                            if matches!(after, Dec::Nan) && !before.iter().any(|d| matches!(d, Dec::Nan)) && decfloat_trapped(DF_TRAP_INVALID) {
+                            if (after.is_nan() && !before.iter().any(|d| d.is_nan())
+                                || before.iter().any(|d| d.is_signaling_nan()))
+                                && decfloat_trapped(DF_TRAP_INVALID)
+                            {
                                 return Err(EvalErr::DecfloatInvalidOperation);
                             }
                             Ok(())
@@ -79670,7 +79768,10 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                             if matches!(after, Dec::Infinity { .. }) && before.iter().all(|d| fin(d)) && decfloat_trapped(DF_TRAP_OVERFLOW) {
                                 return Err(EvalErr::DecfloatOverflow);
                             }
-                            if matches!(after, Dec::Nan) && !before.iter().any(|d| matches!(d, Dec::Nan)) && decfloat_trapped(DF_TRAP_INVALID) {
+                            if (after.is_nan() && !before.iter().any(|d| d.is_nan())
+                                || before.iter().any(|d| d.is_signaling_nan()))
+                                && decfloat_trapped(DF_TRAP_INVALID)
+                            {
                                 return Err(EvalErr::DecfloatInvalidOperation);
                             }
                             Ok(after)
@@ -100003,14 +100104,7 @@ fn narrow_dec16_bind(bits: u128) -> u128 {
 /// the shape [text_to_dec128] ACCEPTS and [literal_to_dec128] must
 /// REJECT, and it is written once so the two cannot drift apart.
 fn dec_special_text(s: &str) -> bool {
-    let t = s.strip_prefix(['+', '-']).unwrap_or(s).to_ascii_lowercase();
-    if t == "inf" || t == "infinity" {
-        return true;
-    }
-    match t.strip_prefix("snan").or_else(|| t.strip_prefix("nan")) {
-        Some(payload) => payload.bytes().all(|c| c.is_ascii_digit()),
-        None => false,
-    }
+    fire_crab_ods::decfloat::is_special_text(s)
 }
 
 /// A string LITERAL compared against a DECFLOAT column, converted the way
@@ -101090,10 +101184,6 @@ thread_local! {
     /// the folds the NEXT [plan_query_inner_at] takes as its own
     /// [ITEM_FOLDS] - set by a caller that knows what the planned
     /// query's items are assigned to (a derived table, INSERT .. SELECT)
-    /// set while a cast to DOUBLE / FLOAT evaluates its DECFLOAT cast
-    /// operand: a signalling or negative NaN text may take the quiet
-    /// NaN's form there, whose conversion raises the same 22000
-    static SNAN_TO_APPROX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PENDING_ITEM_FOLDS: std::cell::RefCell<Option<Vec<(RawExpr, ItemFold)>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -101918,114 +102008,9 @@ fn cvt_text_to_double(text: &str) -> Option<f64> {
 }
 
 fn text_to_dec128(s: &str) -> Option<u128> {
-    let b = s.as_bytes();
-    let mut i = 0;
-    let neg = match b.first() {
-        Some(b'+') => {
-            i = 1;
-            false
-        }
-        Some(b'-') => {
-            i = 1;
-            true
-        }
-        _ => false,
-    };
-    // the decNumber specials (probed): `inf`/`infinity` is ±Infinity - a
-    // normal ordered value in a comparison - and `nan`/`snan` (with an
-    // optional payload of digits) is a NaN, which TRAPS the comparison
-    // (SQLSTATE 22000, handled at [Term::matches]). Case-insensitive;
-    // anything trailing (`Infinityx`) falls through and raises 22018.
-    // [dec_special_text] is the SINGLE gate on this shape: the literal
-    // path has to reject exactly what this one accepts, so the two read
-    // the same predicate rather than two copies that can drift.
-    if dec_special_text(s) {
-        let rest = s[i..].to_ascii_lowercase();
-        let inf = rest == "inf" || rest == "infinity";
-        return Some(fire_crab_ods::decfloat::encode_dec128_special(neg, !inf));
-    }
-    let mut digits: Vec<u8> = Vec::new();
-    let mut seen_dot = false;
-    let mut frac: i64 = 0;
-    while i < b.len() {
-        match b[i] {
-            c @ b'0'..=b'9' => {
-                digits.push(c);
-                if seen_dot {
-                    frac += 1;
-                }
-                i += 1;
-            }
-            b'.' => {
-                if seen_dot {
-                    return None;
-                }
-                seen_dot = true;
-                i += 1;
-            }
-            b'e' | b'E' => break,
-            _ => return None,
-        }
-    }
-    if digits.is_empty() {
-        return None;
-    }
-    let mut exp: i64 = -frac;
-    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
-        i += 1;
-        let esign: i64 = match b.get(i) {
-            Some(b'+') => {
-                i += 1;
-                1
-            }
-            Some(b'-') => {
-                i += 1;
-                -1
-            }
-            _ => 1,
-        };
-        let estart = i;
-        let mut ev: i64 = 0;
-        while i < b.len() && b[i].is_ascii_digit() {
-            ev = ev.checked_mul(10)?.checked_add((b[i] - b'0') as i64)?;
-            i += 1;
-        }
-        if i == estart {
-            return None;
-        }
-        exp += esign * ev;
-    }
-    if i != b.len() {
-        return None; // trailing junk
-    }
-    // round the significant digits to 34, HALF-UP, the dropped places
-    // moving into the exponent (the string can be longer than u128 holds,
-    // so only the kept 34 are folded)
-    let first = digits.iter().position(|&d| d != b'0').unwrap_or(digits.len() - 1);
-    let sig = &digits[first..];
-    let fold = |ds: &[u8]| ds.iter().fold(0u128, |m, &d| m * 10 + (d - b'0') as u128);
-    let (coeff, drop) = if sig.len() <= 34 {
-        (fold(sig), 0i64)
-    } else {
-        let mut c = fold(&sig[..34]);
-        let rest = &sig[34..];
-        let mut ea = rest.len() as i64;
-        if rest[0] >= b'5' {
-            c += 1;
-            if c == 10u128.pow(34) {
-                c /= 10;
-                ea += 1;
-            }
-        }
-        (c, ea)
-    };
-    let biased = exp + drop + 6176;
-    // outside decimal128's exponent range: an exotic huge/tiny exponent -
-    // refuse rather than panic (the engine over/underflows there)
-    if !(0..=12287).contains(&biased) {
-        return None;
-    }
-    Some(fire_crab_ods::decfloat::encode_dec128(neg, coeff, (exp + drop) as i32))
+    // the strict grammar lives in ods now (one copy for both
+    // executors); the bits are this wrapper's only addition
+    fire_crab_ods::decfloat::parse(s).map(|d| fire_crab_ods::decfloat::dec_to_bits(&d))
 }
 
 /// Encode a numeric literal as the decimal128 bits a DECFLOAT column
@@ -104671,40 +104656,12 @@ fn dec_math_operands(vs: &[Value]) -> Option<Vec<fire_crab_ods::decfloat::Dec>> 
         .collect()
 }
 
-/// CVT_get_double's range test on a decimal text: the scale - the
-/// fraction digits less the signed exponent - past DBL_MAX_10_EXP (308)
-/// either way, or an exponent magnitude of 3276 or more, is 22003 *numeric
-/// value is out of range* BEFORE any value is computed. So a zero or a
-/// value a double could hold refuses too (measured on 2182: '1e-307'
-/// answers, '2.3e-308', '0e-400', '0.00001e-305' and '1e-400' raise;
-/// SIGN('-1.5e-400'), SQRT('1e-400'), SIGN('1e400') alike).
+/// CVT_get_double's range test on a decimal text - the law lives in
+/// ods now ([fire_crab_ods::decfloat::cvt_double_scale_out_of_range],
+/// the single gate both executors read); this wrapper keeps the
+/// caller's name.
 fn cvt_double_scale_out_of_range(s: &str) -> bool {
-    let t = s.trim_matches(' ');
-    let (mant, exp) = match t.find(['e', 'E']) {
-        Some(i) => (&t[..i], Some(&t[i + 1..])),
-        None => (t, None),
-    };
-    let frac = mant.split_once('.').map_or(0, |(_, f)| f.chars().filter(|c| c.is_ascii_digit()).count()) as i64;
-    let exp = match exp {
-        Some(e) => {
-            let e = e.trim_matches(' ');
-            let (neg, digits) = match e.strip_prefix('-') {
-                Some(d) => (true, d),
-                None => (false, e.strip_prefix('+').unwrap_or(e)),
-            };
-            let mut n: i64 = 0;
-            for c in digits.chars().filter(|c| c.is_ascii_digit()) {
-                n = n * 10 + i64::from(c as u8 - b'0');
-                // cvt.cpp's SHORT_LIMIT, (1 << 14) / 5
-                if n >= 3276 {
-                    return true;
-                }
-            }
-            if neg { -n } else { n }
-        }
-        None => 0,
-    };
-    (frac - exp).abs() > 308
+    fire_crab_ods::decfloat::cvt_double_scale_out_of_range(s)
 }
 
 /// Fold a numeric operand to f64 for the DOUBLE math functions: an
@@ -104724,7 +104681,7 @@ fn fn_f64(v: &Value) -> Result<f64, EvalErr> {
         use fire_crab_ods::decfloat::Dec;
         return match dec {
             Dec::Infinity { .. } => Err(EvalErr::FloatOverflowBare),
-            Dec::Nan => Err(EvalErr::DecfloatInvalidOperation),
+            Dec::Nan { .. } => Err(EvalErr::DecfloatInvalidOperation),
             Dec::Finite { .. } => match fire_crab_ods::decfloat::to_string(&dec).parse::<f64>() {
                 Ok(d) if d.is_infinite() => Err(EvalErr::FloatOverflowBare),
                 Ok(d) => Ok(d),
@@ -104795,22 +104752,14 @@ enum RndMode {
 /// measured), a non-negative exponent and a special value pass through
 /// unchanged (`FLOOR(1.5E+2)` is 1.5E+2, `FLOOR(NaN)` NaN, measured).
 fn dec_to_integral(d: &fire_crab_ods::decfloat::Dec, mode: RndMode) -> fire_crab_ods::decfloat::Dec {
-    use fire_crab_ods::decfloat::Dec;
-    let Dec::Finite { neg, coeff, exp } = d else { return d.clone() };
-    if *exp >= 0 {
-        return d.clone();
-    }
-    let (q, rem) = match 10u128.checked_pow((-exp) as u32) {
-        Some(p) => (coeff / p, coeff % p),
-        None => (0, *coeff),
+    use fire_crab_ods::decfloat::IntegralMode;
+    let m = match mode {
+        RndMode::Ceil => IntegralMode::Ceil,
+        RndMode::Floor => IntegralMode::Floor,
+        RndMode::Trunc => IntegralMode::Trunc,
+        RndMode::Round => IntegralMode::Round,
     };
-    let up = match mode {
-        RndMode::Trunc => false,
-        RndMode::Floor => *neg && rem != 0,
-        RndMode::Ceil => !*neg && rem != 0,
-        RndMode::Round => 10u128.checked_pow((-exp - 1) as u32).is_some_and(|h| rem >= 5 * h),
-    };
-    Dec::Finite { neg: *neg, coeff: q + up as u128, exp: 0 }
+    fire_crab_ods::decfloat::to_integral(d, m)
 }
 
 /// FLOOR / CEILING / ROUND / TRUNC over a DECFLOAT operand - the engine's
@@ -104858,7 +104807,9 @@ fn dec_round_family(
     // Invalid (22000) and an Overflow (22003) made from finite operands
     let fin = |x: &Dec| matches!(x, Dec::Finite { .. });
     let trap = |before: &[&Dec], after: Dec| -> Result<Dec, EvalErr> {
-        if matches!(after, Dec::Nan) && !before.iter().any(|x| matches!(x, Dec::Nan)) {
+        if (after.is_nan() && !before.iter().any(|x| x.is_nan()))
+            || before.iter().any(|x| x.is_signaling_nan())
+        {
             return Err(EvalErr::DecfloatInvalidOperation);
         }
         if matches!(after, Dec::Infinity { .. }) && before.iter().all(|x| fin(x)) {
@@ -104890,6 +104841,9 @@ fn dec_round_family(
         let r = dfl::sub(x, &ip);
         Ok((ip, trap(&[x], r)?))
     };
+    if d.is_signaling_nan() {
+        return Err(EvalErr::DecfloatInvalidOperation);
+    }
     match mode {
         RndMode::Ceil | RndMode::Floor => Ok(out(dec_to_integral(d, mode))),
         RndMode::Round => {
@@ -105335,7 +105289,7 @@ fn cvt_dec_to_int128(d: &fire_crab_ods::decfloat::Dec, scale: i32) -> Result<i12
     let scaled = match d {
         Dec::Finite { neg, coeff, exp } => Dec::Finite { neg: *neg, coeff: *coeff, exp: exp - scale },
         Dec::Infinity { .. } => return Err(EvalErr::NumericOutOfRange),
-        Dec::Nan => return Err(EvalErr::DecfloatInvalidOperation),
+        Dec::Nan { .. } => return Err(EvalErr::DecfloatInvalidOperation),
     };
     let lim = |neg: bool| Dec::Finite { neg, coeff: 1_701_411_834_604_692_317_316_873_037_158_841, exp: 5 };
     if dfl::cmp(&scaled, &lim(true)) == std::cmp::Ordering::Less
@@ -105435,39 +105389,36 @@ fn dec_nan_key_eq(x: &Value, y: &Value) -> Result<bool, EvalErr> {
     }
 }
 
-/// THE FORM OF A DECFLOAT NaN - (negative, signalling) - read off its
-/// bits, which [Dec::Nan] does not keep. A conditional's DECFLOAT result
+/// THE FORM OF A DECFLOAT NaN - (negative, signalling, payload) - as
+/// decoded. A conditional's DECFLOAT result
 /// is its branch moved into the common type, and the move keeps the form:
 /// measured on 2182 over stored DECFLOAT(16) sNaN and -NaN, `IIF(1 = 1,
 /// A, 0)`, `COALESCE(A, 1)`, `CASE WHEN .. THEN A END` and the MAXVALUE /
 /// MINVALUE that answer A (beside 1, 9, 0.5e0, an INT128, A itself, and
 /// under `|| 'é'`) print sNaN and -NaN - they printed NaN here.
 ///
-/// [Dec::Nan]: fire_crab_ods::decfloat::Dec::Nan
-fn dec_nan_form(v: &Value) -> Option<(bool, bool)> {
-    if !dec_is_nan(v) {
-        return None;
-    }
-    match v {
-        Value::DecFloat16(b) => Some((b >> 63 == 1, (b >> 57) & 1 == 1)),
-        Value::DecFloat34(b) => Some((b >> 127 == 1, (b >> 121) & 1 == 1)),
+fn dec_nan_form(v: &Value) -> Option<(bool, bool, u128)> {
+    match dec_of(v) {
+        Some(fire_crab_ods::decfloat::Dec::Nan { neg, signaling, payload }) => {
+            Some((neg, signaling, payload))
+        }
         _ => None,
     }
 }
 
 /// The NaN of `form` ([dec_nan_form]) at a width.
-fn dec_nan_of_form((neg, signalling): (bool, bool), wide: bool) -> Value {
-    use fire_crab_ods::decfloat::{encode_dec128_special, encode_dec64_special};
+fn dec_nan_of_form((neg, signalling, payload): (bool, bool, u128), wide: bool) -> Value {
+    use fire_crab_ods::decfloat::{encode_dec128_nan, encode_dec64_nan};
     if wide {
-        Value::DecFloat34(encode_dec128_special(neg, true) | ((signalling as u128) << 121))
+        Value::DecFloat34(encode_dec128_nan(neg, signalling, payload))
     } else {
-        Value::DecFloat16(encode_dec64_special(neg, true) | ((signalling as u64) << 57))
+        Value::DecFloat16(encode_dec64_nan(neg, signalling, payload))
     }
 }
 
 /// A DECFLOAT value holding a NaN (either width).
 fn dec_is_nan(v: &Value) -> bool {
-    matches!(dec_of(v), Some(fire_crab_ods::decfloat::Dec::Nan))
+    dec_of(v).is_some_and(|d| d.is_nan())
 }
 
 /// The DECFLOAT a value holds, decoded - `None` for any other value
@@ -105476,6 +105427,25 @@ fn dec_of(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
         Value::DecFloat34(b) => Some(fire_crab_ods::decfloat::decode_dec128(*b)),
         Value::DecFloat16(b) => Some(fire_crab_ods::decfloat::decode_dec64(*b)),
         _ => None,
+    }
+}
+
+/// Two decfloat Values by the engine's total law at NATIVE width: two
+/// dec16 records compare as 8-byte records, two dec34 as 16-byte ones
+/// (the sort compared those exact bytes); a mixed pair widens to
+/// dec128 (the union's widening). `x`/`y` decode `xv`/`yv`.
+fn dec_order_cmp(
+    xv: &Value,
+    x: &fire_crab_ods::decfloat::Dec,
+    yv: &Value,
+    y: &fire_crab_ods::decfloat::Dec,
+    desc: bool,
+) -> std::cmp::Ordering {
+    use fire_crab_ods::decfloat as dfl;
+    match (xv, yv) {
+        (Value::DecFloat16(a), Value::DecFloat16(b)) => dfl::cmp_total_64(x, *a, y, *b, desc),
+        (Value::DecFloat34(a), Value::DecFloat34(b)) => dfl::cmp_total_128(x, *a, y, *b, desc),
+        _ => dfl::cmp_total(x, y, desc),
     }
 }
 
@@ -106979,7 +106949,7 @@ impl Expr {
                         text_to_dec128_clamped(t).map_err(|_| conv())?
                     };
                     let lit = df::decode_dec128(bits);
-                    if matches!(d, Dec::Nan) || matches!(lit, Dec::Nan) {
+                    if d.is_nan() || lit.is_nan() {
                         return Err(EvalErr::DecfloatInvalidOperation);
                     }
                     Ok(df::cmp(&d, &lit))
@@ -107516,7 +107486,7 @@ impl Expr {
                                     if decfloat_trapped(DF_TRAP_INVALID) {
                                         return Err(EvalErr::DecfloatInvalidOperation);
                                     }
-                                    df::Dec::Nan
+                                    df::Dec::quiet_nan()
                                 } else {
                                     if decfloat_trapped(DF_TRAP_DIV) {
                                         return Err(EvalErr::DecfloatDivideByZero);
@@ -107525,14 +107495,21 @@ impl Expr {
                                     let neg_b = matches!(db, df::Dec::Finite { neg: true, .. });
                                     df::Dec::Infinity { neg: neg_a != neg_b }
                                 }
-                            } else if df::is_zero(&db) {
+                            } else if df::is_zero(&db) && !da.is_nan() {
+                                // Infinity / 0 is decNumber's Invalid (as
+                                // Inf / Inf is); a NaN dividend propagates
+                                // instead and falls through to div
                                 return Err(EvalErr::DecfloatInvalidOperation);
                             } else {
                                 df::div(&da, &db)
                             }
                         }
                     };
-                    if matches!(r, df::Dec::Nan) && decfloat_trapped(DF_TRAP_INVALID) {
+                    if ((r.is_nan() && !da.is_nan() && !db.is_nan())
+                        || da.is_signaling_nan()
+                        || db.is_signaling_nan())
+                        && decfloat_trapped(DF_TRAP_INVALID)
+                    {
                         return Err(EvalErr::DecfloatInvalidOperation);
                     }
                     // a FINITE pair can only reach Infinity by OVERFLOW - the
@@ -107713,17 +107690,13 @@ impl Expr {
                 }
             },
             Expr::Cast(e, t, cs) => {
-                // [SNAN_TO_APPROX]: taken by the first cast evaluated
-                // under it, which is the DECFLOAT operand of a cast to
-                // DOUBLE / FLOAT
-                let snan_ok = SNAN_TO_APPROX.with(|c| c.replace(false));
                 let v = if matches!(t, CastTarget::Approx | CastTarget::Float)
                     && matches!(**e, Expr::Cast(_, CastTarget::DecFloat { .. }, _))
                 {
-                    SNAN_TO_APPROX.with(|c| c.set(true));
-                    let v = e.eval(values);
-                    SNAN_TO_APPROX.with(|c| c.set(false));
-                    v?
+                    // straight into a cast to DOUBLE / FLOAT (kept as
+                    // its own arm: any NaN is the conversion's 22000
+                    // there, whatever its form)
+                    e.eval(values)?
                 } else {
                     e.eval(values)?
                 };
@@ -107911,24 +107884,6 @@ impl Expr {
                     // decimal64 (16). NaN/Infinity carry through as-is (a
                     // CAST re-represents, it does not trap).
                     CastTarget::DecFloat { wide } => {
-                        // a SIGNALLING or a NEGATIVE NaN has no form here:
-                        // the decoded value is one quiet, unsigned NaN,
-                        // so every consumer would answer the quiet one's
-                        // result where the engine's differs (measured on
-                        // 2182: CEILING / FLOOR / TRUNC / EXP / POWER of
-                        // 'sNaN' raise 22000, SIGN('-NaN') is -1, and
-                        // the casts themselves print sNaN / -NaN) - the
-                        // cast refuses rather than answer the wrong one.
-                        // Straight into a cast to DOUBLE / FLOAT the two
-                        // agree - any NaN is the conversion's 22000 there
-                        // (`CAST(CAST('sNaN' AS DECFLOAT(34)) AS DOUBLE
-                        // PRECISION)`, measured; castdfnonfinite's cells)
-                        if let (false, Value::Text(s)) = (snan_ok, &v) {
-                            let t = s.to_ascii_lowercase();
-                            if dec_special_text(s) && (t.trim_start_matches(['+', '-']).starts_with("snan") || (t.starts_with('-') && t.contains("nan"))) {
-                                return Err(EvalErr::Unsupported);
-                            }
-                        }
                         // a DECFLOAT NaN keeps its FORM through the
                         // cast - a signalling or negative one is not the
                         // quiet NaN its decoded value is ([dec_nan_form])
@@ -108672,7 +108627,7 @@ impl Expr {
                                 // engine's uninitialised garbage (NUMERIC(18,2)
                                 // 78863920565143470.08, NUMERIC(38,2) 10^27 -
                                 // measured on 2196): refused, not imitated
-                                if matches!(dec, fire_crab_ods::decfloat::Dec::Nan)
+                                if dec.is_nan()
                                     && !decfloat_trapped(DF_TRAP_INVALID)
                                     && (*bytes == 16 && *scale != 0 || *bytes == 8 && *scale != 0)
                                 {
@@ -108828,13 +108783,13 @@ impl Expr {
                                     fire_crab_ods::decfloat::Dec::Infinity { neg } if !decfloat_trapped(DF_TRAP_OVERFLOW) => {
                                         return Ok(Value::Float(if neg { f32::NEG_INFINITY } else { f32::INFINITY }))
                                     }
-                                    fire_crab_ods::decfloat::Dec::Nan if !decfloat_trapped(DF_TRAP_INVALID) => {
+                                    fire_crab_ods::decfloat::Dec::Nan { .. } if !decfloat_trapped(DF_TRAP_INVALID) => {
                                         return Ok(Value::Float(f32::NAN))
                                     }
                                     fire_crab_ods::decfloat::Dec::Infinity { .. } => {
                                         return Err(EvalErr::FloatOverflowBare)
                                     }
-                                    fire_crab_ods::decfloat::Dec::Nan => {
+                                    fire_crab_ods::decfloat::Dec::Nan { .. } => {
                                         return Err(EvalErr::DecfloatInvalidOperation)
                                     }
                                     fire_crab_ods::decfloat::Dec::Finite { .. } => {}
@@ -108871,13 +108826,13 @@ impl Expr {
                                 fire_crab_ods::decfloat::Dec::Infinity { neg } if !decfloat_trapped(DF_TRAP_OVERFLOW) => {
                                     return Ok(Value::Double(if neg { f64::NEG_INFINITY } else { f64::INFINITY }))
                                 }
-                                fire_crab_ods::decfloat::Dec::Nan if !decfloat_trapped(DF_TRAP_INVALID) => {
+                                fire_crab_ods::decfloat::Dec::Nan { .. } if !decfloat_trapped(DF_TRAP_INVALID) => {
                                     return Ok(Value::Double(f64::NAN))
                                 }
                                 fire_crab_ods::decfloat::Dec::Infinity { .. } => {
                                     return Err(EvalErr::FloatOverflowBare)
                                 }
-                                fire_crab_ods::decfloat::Dec::Nan => {
+                                fire_crab_ods::decfloat::Dec::Nan { .. } => {
                                     return Err(EvalErr::DecfloatInvalidOperation)
                                 }
                                 fire_crab_ods::decfloat::Dec::Finite { .. } => {}
@@ -109734,7 +109689,18 @@ impl Expr {
                     // sign flips, nothing else (decQuadAbs)
                     SysFn::Abs if matches!(vs[0], Value::DecFloat16(_) | Value::DecFloat34(_)) => {
                         use fire_crab_ods::decfloat::{decode_dec128, decode_dec64, dec_to_bits, dec_to_dec64_bits, negate, Dec};
-                        let pos = |d: Dec| if matches!(d, Dec::Finite { neg: true, .. } | Dec::Infinity { neg: true }) { negate(&d) } else { d };
+                        let pos = |d: Dec| {
+                            if matches!(
+                                d,
+                                Dec::Finite { neg: true, .. }
+                                    | Dec::Infinity { neg: true }
+                                    | Dec::Nan { neg: true, .. }
+                            ) {
+                                negate(&d)
+                            } else {
+                                d
+                            }
+                        };
                         match vs[0] {
                             Value::DecFloat16(b) => Value::DecFloat16(dec_to_dec64_bits(&pos(decode_dec64(b)))),
                             Value::DecFloat34(b) => Value::DecFloat34(dec_to_bits(&pos(decode_dec128(b)))),
@@ -110147,7 +110113,7 @@ impl Expr {
                         // where EXP and POWER (no compare) let a quiet NaN
                         // through as NaN (measured on 2182, both ways)
                         let dcmp = |d: &Dec| -> Result<std::cmp::Ordering, EvalErr> {
-                            if matches!(d, Dec::Nan) {
+                            if d.is_nan() {
                                 return Err(EvalErr::DecfloatInvalidOperation);
                             }
                             Ok(cmp(d, &zero))
@@ -110190,7 +110156,7 @@ impl Expr {
                                 let sign = |d: &Dec| match d {
                                     Dec::Finite { neg, coeff, .. } => *neg && *coeff != 0,
                                     Dec::Infinity { neg } => *neg,
-                                    Dec::Nan => false,
+                                    Dec::Nan { .. } => false,
                                 };
                                 match (dm::ln(&ds[1]), dm::ln(&ds[0])) {
                                     (Ok(a), Ok(b)) => match (&a, &b) {
@@ -110235,7 +110201,7 @@ impl Expr {
                         match r {
                             Ok(d) => Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&d)),
                             Err(dm::MathErr::Invalid) if !decfloat_trapped(DF_TRAP_INVALID) => {
-                                Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&Dec::Nan))
+                                Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&Dec::quiet_nan()))
                             }
                             Err(dm::MathErr::DivByZero) if !decfloat_trapped(DF_TRAP_DIV) => {
                                 Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&Dec::Infinity { neg: neg() }))
@@ -122990,7 +122956,7 @@ fn psql_num_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         // DECFLOAT(34) side or with the Invalid trap stood down (`IF (R =
         // R)` over a DECFLOAT(16) NaN takes THEN, measured on 2196); the
         // 22000 the engine raises otherwise stays this refusal
-        if matches!(x, Dec::Nan) || matches!(y, Dec::Nan) {
+        if x.is_nan() || y.is_nan() {
             return dec_nan_cmp(a, b).ok();
         }
         return Some(dfl::cmp(&x, &y));
@@ -123145,7 +123111,7 @@ fn psql_dec_arith(kind: char, a: &Value, b: &Value) -> Result<Value, PsqlStop> {
         }
         _ => return Err(PsqlStop::Unsupported),
     };
-    if matches!(r, Dec::Nan) && !matches!(x, Dec::Nan) && !matches!(y, Dec::Nan) {
+    if (r.is_nan() && !x.is_nan() && !y.is_nan()) || x.is_signaling_nan() || y.is_signaling_nan() {
         return Err(psql_raise(EvalErr::DecfloatInvalidOperation));
     }
     if matches!(r, Dec::Infinity { .. }) && fin(&x) && fin(&y) {
@@ -149792,9 +149758,21 @@ mod tests {
         assert!(matches!(decode_dec128(text_to_dec128("Infinity").unwrap()), Dec::Infinity { neg: false }));
         assert!(matches!(decode_dec128(text_to_dec128("inf").unwrap()), Dec::Infinity { neg: false }));
         assert!(matches!(decode_dec128(text_to_dec128("-INF").unwrap()), Dec::Infinity { neg: true }));
-        assert!(matches!(decode_dec128(text_to_dec128("NaN").unwrap()), Dec::Nan));
-        assert!(matches!(decode_dec128(text_to_dec128("snan").unwrap()), Dec::Nan));
-        assert!(matches!(decode_dec128(text_to_dec128("NaN0").unwrap()), Dec::Nan));
+        assert!(matches!(decode_dec128(text_to_dec128("NaN").unwrap()), Dec::Nan { .. }));
+        assert!(matches!(
+            decode_dec128(text_to_dec128("snan").unwrap()),
+            Dec::Nan { signaling: true, payload: 0, .. }
+        ));
+        assert!(matches!(decode_dec128(text_to_dec128("NaN0").unwrap()), Dec::Nan { payload: 0, .. }));
+        assert_eq!(
+            decode_dec128(text_to_dec128("sNaN789").unwrap()),
+            Dec::Nan { neg: false, signaling: true, payload: 789 }
+        );
+        assert_eq!(
+            decode_dec128(text_to_dec128("-nan123").unwrap()),
+            Dec::Nan { neg: true, signaling: false, payload: 123 }
+        );
+        assert!(text_to_dec128("nan12345678901234567890123456789012345").is_none());
     }
 
     fn desc(dt: u8, len: u16, scale: i8) -> Descriptor {
@@ -165360,8 +165338,8 @@ mod builtins_round {
     #[test]
     fn decfloat_nan_law() {
         use fire_crab_ods::decfloat::{dec_to_bits, dec_to_dec64_bits, Dec};
-        let nan16 = Value::DecFloat16(dec_to_dec64_bits(&Dec::Nan));
-        let nan34 = Value::DecFloat34(dec_to_bits(&Dec::Nan));
+        let nan16 = Value::DecFloat16(dec_to_dec64_bits(&Dec::quiet_nan()));
+        let nan34 = Value::DecFloat34(dec_to_bits(&Dec::quiet_nan()));
         // a DECFLOAT(16) comparison finds a NaN equal to anything ...
         assert_eq!(dec_nan_cmp(&nan16, &Value::Int(1)), Ok(std::cmp::Ordering::Equal));
         assert_eq!(dec_nan_cmp(&Value::Double(2.5), &nan16), Ok(std::cmp::Ordering::Equal));
@@ -165383,14 +165361,16 @@ mod builtins_round {
     /// ([dec_nan_key_eq]).
     #[test]
     fn decfloat_nan_forms() {
-        let snan16 = dec_nan_of_form((false, true), false);
-        let mnan16 = dec_nan_of_form((true, false), false);
-        let nan16 = dec_nan_of_form((false, false), false);
+        let snan16 = dec_nan_of_form((false, true, 0), false);
+        let mnan16 = dec_nan_of_form((true, false, 0), false);
+        let nan16 = dec_nan_of_form((false, false, 0), false);
         assert_eq!(snan16.render(), "sNaN");
         assert_eq!(mnan16.render(), "-NaN");
         assert_eq!(nan16.render(), "NaN");
-        assert_eq!(dec_nan_of_form((true, true), true).render(), "-sNaN");
-        assert_eq!(dec_nan_form(&snan16), Some((false, true)));
+        assert_eq!(dec_nan_of_form((true, true, 0), true).render(), "-sNaN");
+        assert_eq!(dec_nan_of_form((false, false, 123), true).render(), "NaN123");
+        assert_eq!(dec_nan_form(&snan16), Some((false, true, 0)));
+        assert_eq!(dec_nan_form(&dec_nan_of_form((false, false, 123), true)), Some((false, false, 123)));
         assert_eq!(dec_nan_form(&Value::Int(1)), None);
         let cast = Expr::Cast(Box::new(Expr::Col(0)), CastTarget::DecFloat { wide: false }, 0);
         assert_eq!(cast.eval(&[snan16.clone()]).unwrap().render(), "sNaN");
@@ -165402,7 +165382,7 @@ mod builtins_round {
         assert_eq!(dec_nan_key_eq(&nan16, &Value::Int(1)), Ok(false));
         assert_eq!(dec_nan_key_eq(&Value::Int(1), &mnan16), Ok(false));
         // ...and a met pair beside a DECFLOAT(34) is the trapped Invalid
-        let nan34 = dec_nan_of_form((false, false), true);
+        let nan34 = dec_nan_of_form((false, false, 0), true);
         assert_eq!(dec_nan_key_eq(&nan16, &nan34), Err(EvalErr::DecfloatInvalidOperation));
         assert_eq!(dec_nan_key_eq(&nan34, &Value::Int(1)), Ok(false));
     }

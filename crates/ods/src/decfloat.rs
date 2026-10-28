@@ -86,12 +86,34 @@ const DPD2BIN: [u16; 1024] = [
     770, 771, 772, 773, 774, 775, 776, 777, 778, 779, 796, 797, 976, 977, 998, 999,];
 
 /// A decoded DECFLOAT: finite (sign, coefficient, exponent of the last
-/// digit - the cohort as stored), infinity, or NaN.
+/// digit - the cohort as stored), infinity, or NaN (sign, signaling,
+/// payload - all three observable: `-NaN` renders, `sNaN` traps, and
+/// payloads order numerically and propagate through arithmetic).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Dec {
     Finite { neg: bool, coeff: u128, exp: i32 },
     Infinity { neg: bool },
-    Nan,
+    Nan { neg: bool, signaling: bool, payload: u128 },
+}
+
+impl Dec {
+    /// TRUE for a quiet NaN (which propagates through arithmetic).
+    pub fn is_quiet_nan(&self) -> bool {
+        matches!(self, Dec::Nan { signaling: false, .. })
+    }
+    /// TRUE for a signaling NaN (which traps: 22000, wherever a quiet
+    /// NaN would propagate or a comparison would signal).
+    pub fn is_signaling_nan(&self) -> bool {
+        matches!(self, Dec::Nan { signaling: true, .. })
+    }
+    /// TRUE for either NaN.
+    pub fn is_nan(&self) -> bool {
+        matches!(self, Dec::Nan { .. })
+    }
+    /// The quiet NaN with no payload.
+    pub fn quiet_nan() -> Dec {
+        Dec::Nan { neg: false, signaling: false, payload: 0 }
+    }
 }
 
 /// Split a combination field: (exponent top bits, leading digit), or a
@@ -115,13 +137,193 @@ fn declets(mut coeff: u128, raw: u128, n: u32) -> u128 {
     coeff
 }
 
+/// TRUE for decNumber's special spellings (case-insensitive, an
+/// optional sign): `inf`/`infinity`, `nan`/`snan` with an optional
+/// payload of digits. The SINGLE gate on this shape: every consumer
+/// reads this predicate rather than its own copy that could drift.
+pub fn is_special_text(s: &str) -> bool {
+    let t = s.strip_prefix(['+', '-']).unwrap_or(s).to_ascii_lowercase();
+    if t == "inf" || t == "infinity" {
+        return true;
+    }
+    match t.strip_prefix("snan").or_else(|| t.strip_prefix("nan")) {
+        Some(payload) => payload.bytes().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// Parse text by decNumber's grammar - the conversion an explicit CAST
+/// (and a bound parameter) gets: an optional sign, digits with one dot,
+/// an optional `e` exponent; the specials ([is_special_text]) with their
+/// form. Surrounding BLANKS ARE NOT TRIMMED (`' 1.50 '` is a conversion
+/// error - probed). Significant digits round to 34 HALF-UP; an exponent
+/// outside decimal128's range refuses (None - the clamped assignment
+/// and the overflow error live with the callers).
+pub fn parse(s: &str) -> Option<Dec> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let neg = match b.first() {
+        Some(b'+') => {
+            i = 1;
+            false
+        }
+        Some(b'-') => {
+            i = 1;
+            true
+        }
+        _ => false,
+    };
+    if is_special_text(s) {
+        let rest = s[i..].to_ascii_lowercase();
+        if rest == "inf" || rest == "infinity" {
+            return Some(Dec::Infinity { neg });
+        }
+        // `snan` before `nan` (it ends with it); a payload past 33
+        // significant digits is a conversion error (22018, probed -
+        // decNumber's 11 declets hold no more)
+        let (signaling, digits) = match rest.strip_prefix("snan") {
+            Some(d) => (true, d),
+            None => (false, rest.strip_prefix("nan").unwrap_or("")),
+        };
+        let sig = digits.trim_start_matches('0');
+        if sig.len() > 33 {
+            return None;
+        }
+        let payload = sig.parse::<u128>().unwrap_or(0);
+        return Some(Dec::Nan { neg, signaling, payload });
+    }
+    let mut digits: Vec<u8> = Vec::new();
+    let mut seen_dot = false;
+    let mut frac: i64 = 0;
+    while i < b.len() {
+        match b[i] {
+            c @ b'0'..=b'9' => {
+                digits.push(c);
+                if seen_dot {
+                    frac += 1;
+                }
+                i += 1;
+            }
+            b'.' => {
+                if seen_dot {
+                    return None;
+                }
+                seen_dot = true;
+                i += 1;
+            }
+            b'e' | b'E' => break,
+            _ => return None,
+        }
+    }
+    if digits.is_empty() {
+        return None;
+    }
+    let mut exp: i64 = -frac;
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        let esign: i64 = match b.get(i) {
+            Some(b'+') => {
+                i += 1;
+                1
+            }
+            Some(b'-') => {
+                i += 1;
+                -1
+            }
+            _ => 1,
+        };
+        let estart = i;
+        let mut ev: i64 = 0;
+        while i < b.len() && b[i].is_ascii_digit() {
+            ev = ev.checked_mul(10)?.checked_add((b[i] - b'0') as i64)?;
+            i += 1;
+        }
+        if i == estart {
+            return None;
+        }
+        exp += esign * ev;
+    }
+    if i != b.len() {
+        return None; // trailing junk
+    }
+    // round the significant digits to 34, HALF-UP, the dropped places
+    // moving into the exponent (the string can be longer than u128 holds,
+    // so only the kept 34 are folded)
+    let first = digits.iter().position(|&d| d != b'0').unwrap_or(digits.len() - 1);
+    let sig = &digits[first..];
+    let fold = |ds: &[u8]| ds.iter().fold(0u128, |m, &d| m * 10 + (d - b'0') as u128);
+    let (coeff, drop) = if sig.len() <= 34 {
+        (fold(sig), 0i64)
+    } else {
+        let mut c = fold(&sig[..34]);
+        let rest = &sig[34..];
+        let mut ea = rest.len() as i64;
+        if rest[0] >= b'5' {
+            c += 1;
+            if c == 10u128.pow(34) {
+                c /= 10;
+                ea += 1;
+            }
+        }
+        (c, ea)
+    };
+    let biased = exp + drop + 6176;
+    if !(0..=12287).contains(&biased) {
+        return None;
+    }
+    Some(Dec::Finite { neg, coeff, exp: (exp + drop) as i32 })
+}
+
+/// CVT_get_double's range test on a decimal text: the scale - the
+/// fraction digits less the signed exponent - past DBL_MAX_10_EXP (308)
+/// either way, or an exponent magnitude of 3276 or more, is 22003 *numeric
+/// value is out of range* BEFORE any value is computed. So a zero or a
+/// value a double could hold refuses too (measured on 2182: '1e-307'
+/// answers, '2.3e-308', '0e-400', '0.00001e-305' and '1e-400' raise;
+/// SIGN('-1.5e-400'), SQRT('1e-400'), SIGN('1e400') alike). The SINGLE
+/// gate on this shape: both executors read this predicate rather than
+/// their own copies that could drift.
+pub fn cvt_double_scale_out_of_range(s: &str) -> bool {
+    let t = s.trim_matches(' ');
+    let (mant, exp) = match t.find(['e', 'E']) {
+        Some(i) => (&t[..i], Some(&t[i + 1..])),
+        None => (t, None),
+    };
+    let frac = mant.split_once('.').map_or(0, |(_, f)| f.chars().filter(|c| c.is_ascii_digit()).count()) as i64;
+    let exp = match exp {
+        Some(e) => {
+            let e = e.trim_matches(' ');
+            let (neg, digits) = match e.strip_prefix('-') {
+                Some(d) => (true, d),
+                None => (false, e.strip_prefix('+').unwrap_or(e)),
+            };
+            let mut n: i64 = 0;
+            for c in digits.chars().filter(|c| c.is_ascii_digit()) {
+                n = n * 10 + i64::from(c as u8 - b'0');
+                // cvt.cpp's SHORT_LIMIT, (1 << 14) / 5
+                if n >= 3276 {
+                    return true;
+                }
+            }
+            if neg { -n } else { n }
+        }
+        None => 0,
+    };
+    (frac - exp).abs() > 308
+}
+
 /// Decode a decimal64 from its little-endian-loaded 64 bits
-/// (decimal64.c decimal64ToNumber).
+/// (decimal64.c decimal64ToNumber): bit 57 is the signaling flag and
+/// the low 50 bits (5 declets) the payload - `sourhi &= 0x0003ffff`.
 pub fn decode_dec64(v: u64) -> Dec {
     let neg = v >> 63 != 0;
     match combination((v >> 58) as u32 & 0x1F) {
         Err(true) => Dec::Infinity { neg },
-        Err(false) => Dec::Nan,
+        Err(false) => Dec::Nan {
+            neg,
+            signaling: v >> 57 & 1 == 1,
+            payload: declets(0, v as u128 & ((1 << 50) - 1), 5),
+        },
         Ok((exp_top, msd)) => {
             let exp = ((exp_top << 8) | ((v >> 50) as u32 & 0xFF)) as i32 - 398;
             Dec::Finite { neg, coeff: declets(msd, v as u128, 5), exp }
@@ -130,12 +332,17 @@ pub fn decode_dec64(v: u64) -> Dec {
 }
 
 /// Decode a decimal128 from its little-endian-loaded 128 bits
-/// (decimal128.c decimal128ToNumber).
+/// (decimal128.c decimal128ToNumber): bit 121 is the signaling flag
+/// and the low 110 bits (11 declets) the payload.
 pub fn decode_dec128(v: u128) -> Dec {
     let neg = v >> 127 != 0;
     match combination((v >> 122) as u32 & 0x1F) {
         Err(true) => Dec::Infinity { neg },
-        Err(false) => Dec::Nan,
+        Err(false) => Dec::Nan {
+            neg,
+            signaling: v >> 121 & 1 == 1,
+            payload: declets(0, v & ((1 << 110) - 1), 11),
+        },
         Ok((exp_top, msd)) => {
             let exp = ((exp_top << 12) | ((v >> 110) as u32 & 0xFFF)) as i32 - 6176;
             Dec::Finite { neg, coeff: declets(msd, v, 11), exp }
@@ -148,7 +355,23 @@ pub fn to_string(d: &Dec) -> String {
     match d {
         Dec::Infinity { neg: false } => "Infinity".into(),
         Dec::Infinity { neg: true } => "-Infinity".into(),
-        Dec::Nan => "NaN".into(),
+        // decToString's NaN branch: the sign first, `s` for a
+        // signaling NaN, then the payload when it is not a clean
+        // zero (`NaN123`, `sNaN789`, `-NaN` - all probed)
+        Dec::Nan { neg, signaling, payload } => {
+            let mut s = String::new();
+            if *neg {
+                s.push('-');
+            }
+            if *signaling {
+                s.push('s');
+            }
+            s.push_str("NaN");
+            if *payload != 0 {
+                s.push_str(&payload.to_string());
+            }
+            s
+        }
         Dec::Finite { neg, coeff, exp } => {
             let digits = coeff.to_string();
             let len = digits.len() as i32;
@@ -175,14 +398,17 @@ pub fn to_string(d: &Dec) -> String {
     }
 }
 
-/// Order two decoded values the way the engine sorts DECFLOAT: sign
-/// first, then magnitude by adjusted exponent and digit comparison;
-/// every zero cohort is equal; infinities beyond all finites, NaN
-/// beyond everything (the engine's NaN-last total order).
+/// Order two decoded values by VALUE the way the engine compares
+/// DECFLOAT: sign first, then magnitude by adjusted exponent and digit
+/// comparison; every zero cohort is equal, as is every cohort
+/// (`1.5 == 1.50`); infinities beyond all finites. A NaN operand ranks
+/// past +Infinity here - the engine's `=`/`<`/MIN/MAX TRAP on one
+/// (22000), they never order by it, so callers that implement those
+/// check [Dec::is_nan] first ([cmp_value] does it for them).
 pub fn cmp(a: &Dec, b: &Dec) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
     let rank = |d: &Dec| match d {
-        Dec::Nan => 2,
+        Dec::Nan { .. } => 2,
         Dec::Infinity { neg: false } => 1,
         Dec::Infinity { neg: true } => -1,
         Dec::Finite { .. } => 0,
@@ -219,6 +445,273 @@ pub fn cmp(a: &Dec, b: &Dec) -> std::cmp::Ordering {
         o => o,
     };
     if *na { mag.reverse() } else { mag }
+}
+
+/// A VALUE comparison that traps like the engine's: `Err(())` when
+/// either side is a NaN (quiet or signaling - the engine's 22000),
+/// else [cmp]. For `=`/`<`/MIN/MAX/fold comparisons.
+pub fn cmp_value(a: &Dec, b: &Dec) -> Result<std::cmp::Ordering, ()> {
+    if a.is_nan() || b.is_nan() {
+        return Err(());
+    }
+    Ok(cmp(a, b))
+}
+
+/// The sort record past the keys, the way sort.cpp's `DO_32_COMPARE`
+/// compares it: the record's ULONGs in address order, each numeric
+/// ascending (on x86 a little-endian load, so within one ULONG the
+/// HIGH byte is major - four big-endian groups in address order).
+/// Two decimal128 records: all four words.
+pub fn rec_cmp_128(a: u128, b: u128) -> std::cmp::Ordering {
+    let (aw, bw) = (a.to_le_bytes(), b.to_le_bytes());
+    (0..4)
+        .map(|i| {
+            let s = 4 * i;
+            u32::from_le_bytes([aw[s], aw[s + 1], aw[s + 2], aw[s + 3]])
+                .cmp(&u32::from_le_bytes([bw[s], bw[s + 1], bw[s + 2], bw[s + 3]]))
+        })
+        .find(|o| *o != std::cmp::Ordering::Equal)
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// Two decimal64 records: the same law over two ULONGs (a native
+/// dec16 sort's 8-byte records: the exponent rides ULONG[1], so a
+/// dec128 re-encode can order an exotic middle-declet tie
+/// differently - the 64-bit entry points below keep the width).
+pub fn rec_cmp_64(a: u64, b: u64) -> std::cmp::Ordering {
+    let (aw, bw) = (a.to_le_bytes(), b.to_le_bytes());
+    (0..2)
+        .map(|i| {
+            let s = 4 * i;
+            u32::from_le_bytes([aw[s], aw[s + 1], aw[s + 2], aw[s + 3]])
+                .cmp(&u32::from_le_bytes([bw[s], bw[s + 1], bw[s + 2], bw[s + 3]]))
+        })
+        .find(|o| *o != std::cmp::Ordering::Equal)
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// Order two decoded values the way the engine's ORDER BY does: the
+/// sort-key order of DecFloat.cpp `make` (specials by class, finites
+/// by value - `make` normalizes every cohort, zero and payload group
+/// to ONE key), then the sort record past the keys (sort.cpp compares
+/// the whole record in memory: `m_longs - 1` ULONGs), all probed.
+/// Ascending:
+///
+/// `-NaN < -sNaN < -Inf < negative < zero < positive < +Inf < +sNaN <
+/// +NaN`; value ties break by the canonical record bytes
+/// ([rec_cmp_128]): `88.0 < 88 < 88.00` (ULONG[0] 14 < 78 < 8204),
+/// `1.5 < 1.50 < 1.500`, `0.00 < 0 < 0E+5 < -0E-3 < -0`, the
+/// full-width cohort member first; NaNs of one (sign, class) likewise
+/// (`NaN < NaN123 < NaN999 < NaN456 < NaN1000`: ULONG[0] 0 < 163 <
+/// 255 < 598 < 1024). Descending reverses the ranks and the finite
+/// values but keeps EVERY tiebreak ascending (`desc`).
+///
+/// The tiebreak re-encodes both sides at dec128 width (a union widens
+/// dec16 to dec34 before the sort, so mixed widths meet here); a
+/// NATIVE dec16 sort wants [cmp_total_64], a native dec34 one
+/// [cmp_total_128], both of which compare the caller's record bytes.
+pub fn cmp_total(a: &Dec, b: &Dec, desc: bool) -> std::cmp::Ordering {
+    cmp_total_with(a, b, desc, || rec_cmp_128(dec_to_bits(a), dec_to_bits(b)))
+}
+
+/// [cmp_total] over two native decimal128 records: the ranks and the
+/// value from the decoded pair, the tiebreak from the caller's record
+/// bytes (the exact bytes the sort compared - no re-encode).
+pub fn cmp_total_128(a: &Dec, abits: u128, b: &Dec, bbits: u128, desc: bool) -> std::cmp::Ordering {
+    cmp_total_with(a, b, desc, || rec_cmp_128(abits, bbits))
+}
+
+/// [cmp_total] over two native decimal64 records: same ranks and
+/// value, the tiebreak over the 8-byte records ([rec_cmp_64]).
+pub fn cmp_total_64(a: &Dec, abits: u64, b: &Dec, bbits: u64, desc: bool) -> std::cmp::Ordering {
+    cmp_total_with(a, b, desc, || rec_cmp_64(abits, bbits))
+}
+
+/// Order two decoded values by the engine's SORT KEY alone
+/// (DecFloat.cpp `make`): the class ranks, then the value - cohorts,
+/// zeros and payloads compare EQUAL here, the record past the keys
+/// deciding them in the sort. Descending reverses ranks and values.
+/// This is what a sort's KEY comparison is; [cmp_total] folds the
+/// record tiebreak in for sorts without record bytes (the
+/// interpreter's in-memory order, DISTINCT survivors).
+/// The sort-key class rank: `make()`'s key order (OFF_inf = 3,
+/// OFF_snan = 2, OFF_nan = 1, signs negated) with finites split by
+/// sign: `-NaN < -sNaN < -Inf < negative < zero < positive < +Inf <
+/// +sNaN < +NaN`.
+fn class_rank(d: &Dec) -> u8 {
+    match d {
+        Dec::Nan { neg: true, signaling: false, .. } => 0,
+        Dec::Nan { neg: true, signaling: true, .. } => 1,
+        Dec::Infinity { neg: true } => 2,
+        Dec::Finite { coeff: 0, .. } => 4,
+        Dec::Finite { neg: false, .. } => 5,
+        Dec::Finite { neg: true, .. } => 3,
+        Dec::Infinity { neg: false } => 6,
+        Dec::Nan { neg: false, signaling: true, .. } => 7,
+        Dec::Nan { neg: false, signaling: false, .. } => 8,
+        Dec::Nan { .. } => unreachable!("signs covered"),
+    }
+}
+
+pub fn cmp_key(a: &Dec, b: &Dec, desc: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    let (ra, rb) = (class_rank(a), class_rank(b));
+    if ra != rb {
+        let o = ra.cmp(&rb);
+        return if desc { o.reverse() } else { o };
+    }
+    match (a, b) {
+        (Dec::Nan { .. }, Dec::Nan { .. }) => Equal,
+        (Dec::Finite { .. }, Dec::Finite { .. }) => match cmp(a, b) {
+            Equal => Equal,
+            o => {
+                if desc {
+                    o.reverse()
+                } else {
+                    o
+                }
+            }
+        },
+        _ => Equal,
+    }
+}
+
+/// The integral-rounding direction for [to_integral].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntegralMode {
+    Ceil,
+    Floor,
+    Trunc,
+    Round,
+}
+
+/// `decQuadToIntegralValue` (Decimal128::floor / ceil / evlTrunc /
+/// evlRound): toward +inf, -inf, zero, or HALF-UP-away-from-zero.
+/// Non-finite values pass through (the caller traps sNaN first);
+/// the cohort keeps its sign, the exponent lands on 0.
+pub fn to_integral(d: &Dec, mode: IntegralMode) -> Dec {
+    let Dec::Finite { neg, coeff, exp } = d else { return d.clone() };
+    if *exp >= 0 {
+        return d.clone();
+    }
+    let (q, rem) = match 10u128.checked_pow((-exp) as u32) {
+        Some(p) => (coeff / p, coeff % p),
+        None => (0, *coeff),
+    };
+    let up = match mode {
+        IntegralMode::Trunc => false,
+        IntegralMode::Floor => *neg && rem != 0,
+        IntegralMode::Ceil => !*neg && rem != 0,
+        IntegralMode::Round => 10u128.checked_pow((-exp - 1) as u32).is_some_and(|h| rem >= 5 * h),
+    };
+    Dec::Finite { neg: *neg, coeff: q + up as u128, exp: 0 }
+}
+
+fn cmp_total_with(
+    a: &Dec,
+    b: &Dec,
+    desc: bool,
+    tie: impl FnOnce() -> std::cmp::Ordering,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    let (ra, rb) = (class_rank(a), class_rank(b));
+    if ra != rb {
+        let o = ra.cmp(&rb);
+        return if desc { o.reverse() } else { o };
+    }
+    match (a, b) {
+        // one (sign, class): make() drops the payload from the key,
+        // so the record past the keys decides, either direction
+        (Dec::Nan { .. }, Dec::Nan { .. }) => tie(),
+        (Dec::Finite { .. }, Dec::Finite { .. }) => match cmp(a, b) {
+            // one value: make() normalized every cohort to one key,
+            // so the record past the keys decides, either direction
+            Equal => tie(),
+            o => {
+                if desc {
+                    o.reverse()
+                } else {
+                    o
+                }
+            }
+        },
+        _ => Equal,
+    }
+}
+
+/// TRUE when two decoded values share a DISTINCT / UNION / deduplication
+/// group on the engine: finites of one value and (past zero) one sign,
+/// infinities of one sign, quiet NaNs of one sign across payloads, an
+/// sNaN only with its identical twin. Never traps (dedup answers over
+/// NaN where `=` signals). The surviving representative is the
+/// [cmp_total]-greatest (ascending) of the group.
+pub fn dedup_eq(a: &Dec, b: &Dec) -> bool {
+    match (a, b) {
+        (
+            Dec::Finite { neg: na, coeff: ca, .. },
+            Dec::Finite { neg: nb, coeff: cb, .. },
+        ) => cmp(a, b) == std::cmp::Ordering::Equal && (ca == &0 || cb == &0 || na == nb),
+        (Dec::Infinity { neg: x }, Dec::Infinity { neg: y }) => x == y,
+        (
+            Dec::Nan { neg: x, signaling: false, .. },
+            Dec::Nan { neg: y, signaling: false, .. },
+        ) => x == y,
+        (
+            Dec::Nan { neg: x, signaling: true, payload: px },
+            Dec::Nan { neg: y, signaling: true, payload: py },
+        ) => x == y && px == py,
+        _ => false,
+    }
+}
+
+/// IEEE 754 totalOrder of two decoded DECFLOATs (decQuadCompareTotal):
+/// numeric order first; among equal values a -0 before a +0, then the
+/// cohorts - the smaller exponent first for a positive value, the larger
+/// for a negative one (`1.00 < 1.0 < 1`, `-1 < -1.0`); a NaN beyond
+/// +Infinity, signed NaNs below -Infinity, signaling before quiet on the
+/// positive side and after it on the negative one (negation symmetry),
+/// payloads smaller-first (reversed for negatives, by the same symmetry).
+/// This is TOTALORDER/COMPARE_DECFLOAT's order - NOT ORDER BY's (whose
+/// zeros and cohorts sort the other way: [cmp_total]).
+pub fn totalorder_cmp(a: &Dec, b: &Dec) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    // the NaN ranks: -qNaN < -sNaN < everything < +sNaN < +qNaN
+    let nan_rank = |d: &Dec| match d {
+        Dec::Nan { neg: true, signaling: false, .. } => Some(0),
+        Dec::Nan { neg: true, signaling: true, .. } => Some(1),
+        Dec::Nan { neg: false, signaling: true, .. } => Some(3),
+        Dec::Nan { neg: false, signaling: false, .. } => Some(4),
+        _ => None,
+    };
+    match (nan_rank(a), nan_rank(b)) {
+        (Some(x), Some(y)) if x != y => return x.cmp(&y),
+        (Some(_), Some(_)) => {
+            // one (sign, class): payloads smaller-first, reversed for
+            // negatives (totalOrder(-x, -y) is totalOrder(y, x))
+            let (Dec::Nan { neg: na, payload: pa, .. }, Dec::Nan { neg: nb, payload: pb, .. }) = (a, b)
+            else {
+                unreachable!()
+            };
+            debug_assert_eq!(na, nb);
+            return if *na { pb.cmp(pa) } else { pa.cmp(pb) };
+        }
+        (Some(r), None) => return if r < 2 { Less } else { Greater },
+        (None, Some(r)) => return if r < 2 { Greater } else { Less },
+        (None, None) => {}
+    }
+    match cmp(a, b) {
+        Equal => {}
+        o => return o,
+    }
+    match (a, b) {
+        (Dec::Finite { neg: na, exp: ea, .. }, Dec::Finite { neg: nb, exp: eb, .. }) => {
+            if na != nb {
+                return if *na { Less } else { Greater };
+            }
+            if *na { eb.cmp(ea) } else { ea.cmp(eb) }
+        }
+        _ => Equal,
+    }
 }
 
 /// `BIN2DPD` (decDPD.h:317): 3 decimal digits (0..=999) -> the 10-bit
@@ -693,8 +1186,11 @@ pub fn is_zero(d: &Dec) -> bool {
 /// (`Infinity / Infinity` is NaN, `finite / Infinity` is 0).
 pub fn div(a: &Dec, b: &Dec) -> Dec {
     match (a, b) {
-        (Dec::Nan, _) | (_, Dec::Nan) => return Dec::Nan,
-        (Dec::Infinity { .. }, Dec::Infinity { .. }) => return Dec::Nan,
+        // the LEFT NaN wins, carried whole (sign and payload - the
+        // caller traps a signaling one, as for every arithmetic verb)
+        (x @ Dec::Nan { .. }, _) => return *x,
+        (_, y @ Dec::Nan { .. }) => return *y,
+        (Dec::Infinity { .. }, Dec::Infinity { .. }) => return Dec::quiet_nan(),
         (Dec::Infinity { neg: x }, Dec::Finite { neg: f, .. }) => {
             return Dec::Infinity { neg: x != f };
         }
@@ -708,7 +1204,7 @@ pub fn div(a: &Dec, b: &Dec) -> Dec {
     let (na, ca, ea) = parts(a);
     let (nb, cb, eb) = parts(b);
     if cb == b"0" {
-        return if ca == b"0" { Dec::Nan } else { Dec::Infinity { neg: na != nb } };
+        return if ca == b"0" { Dec::quiet_nan() } else { Dec::Infinity { neg: na != nb } };
     }
     let ideal = ea - eb;
     let (mut q, mut rem) = udivmod(&ca, &cb);
@@ -730,17 +1226,20 @@ pub fn dec_to_bits(d: &Dec) -> u128 {
     match d {
         Dec::Finite { neg, coeff, exp } => encode_dec128(*neg, *coeff, *exp),
         Dec::Infinity { neg } => encode_dec128_special(*neg, false),
-        Dec::Nan => encode_dec128_special(false, true),
+        Dec::Nan { neg, signaling, payload } => encode_dec128_nan(*neg, *signaling, *payload),
     }
 }
 
 /// Negate: flips the sign of a finite value - a ZERO too, `-CAST(0 AS
-/// DECFLOAT(16))` is -0 on the engine - or an Infinity (NaN stays NaN).
+/// DECFLOAT(16))` is -0 on the engine - or an Infinity, or a NaN
+/// (`-NaN123` renders so).
 pub fn negate(d: &Dec) -> Dec {
     match d {
         Dec::Finite { neg, coeff, exp } => Dec::Finite { neg: !*neg, coeff: *coeff, exp: *exp },
         Dec::Infinity { neg } => Dec::Infinity { neg: !*neg },
-        Dec::Nan => Dec::Nan,
+        Dec::Nan { neg, signaling, payload } => {
+            Dec::Nan { neg: !*neg, signaling: *signaling, payload: *payload }
+        }
     }
 }
 
@@ -749,9 +1248,13 @@ pub fn negate(d: &Dec) -> Dec {
 /// propagates as decNumber does.
 pub fn add(a: &Dec, b: &Dec) -> Dec {
     match (a, b) {
-        (Dec::Nan, _) | (_, Dec::Nan) => return Dec::Nan,
+        // the RIGHT NaN wins, carried whole - measured on the engine
+        // both constant-folded and table-driven (`NaN123 + NaN456` is
+        // NaN456, and the reverse is NaN123)
+        (_, y @ Dec::Nan { .. }) => return *y,
+        (x @ Dec::Nan { .. }, _) => return *x,
         (Dec::Infinity { neg: x }, Dec::Infinity { neg: y }) => {
-            return if x == y { Dec::Infinity { neg: *x } } else { Dec::Nan };
+            return if x == y { Dec::Infinity { neg: *x } } else { Dec::quiet_nan() };
         }
         (Dec::Infinity { neg }, _) | (_, Dec::Infinity { neg }) => return Dec::Infinity { neg: *neg },
         _ => {}
@@ -785,8 +1288,15 @@ pub fn add(a: &Dec, b: &Dec) -> Dec {
     finite_signed(sign, kept, e + drop)
 }
 
-/// `a - b`.
+/// `a - b`: the LEFT NaN wins, carried whole and UNNEGATED
+/// (`1 - NaN456` is NaN456 on the engine), so the NaN arms sit ahead
+/// of the negate-then-add finite path.
 pub fn sub(a: &Dec, b: &Dec) -> Dec {
+    match (a, b) {
+        (x @ Dec::Nan { .. }, _) => return *x,
+        (_, y @ Dec::Nan { .. }) => return *y,
+        _ => {}
+    }
     add(a, &negate(b))
 }
 
@@ -794,9 +1304,11 @@ pub fn sub(a: &Dec, b: &Dec) -> Dec {
 pub fn mul(a: &Dec, b: &Dec) -> Dec {
     let zero = |d: &Dec| matches!(d, Dec::Finite { coeff: 0, .. });
     match (a, b) {
-        (Dec::Nan, _) | (_, Dec::Nan) => return Dec::Nan,
+        // the RIGHT NaN wins, as for [+](`NaN123 * NaN456` is NaN456)
+        (_, y @ Dec::Nan { .. }) => return *y,
+        (x @ Dec::Nan { .. }, _) => return *x,
         // Infinity * 0 is an invalid operation (NaN)
-        (Dec::Infinity { .. }, x) | (x, Dec::Infinity { .. }) if zero(x) => return Dec::Nan,
+        (Dec::Infinity { .. }, x) | (x, Dec::Infinity { .. }) if zero(x) => return Dec::quiet_nan(),
         (Dec::Infinity { neg: x }, Dec::Infinity { neg: y }) => {
             return Dec::Infinity { neg: x != y };
         }
@@ -892,9 +1404,10 @@ fn uisqrt(n: &[u8]) -> Vec<u8> {
 /// trap; +Infinity and NaN propagate.
 pub fn sqrt(a: &Dec) -> Dec {
     match a {
-        Dec::Nan => return Dec::Nan,
+        // a NaN propagates whole (the caller traps a signaling one)
+        x @ Dec::Nan { .. } => return *x,
         Dec::Infinity { neg: false } => return *a,
-        Dec::Infinity { neg: true } => return Dec::Nan,
+        Dec::Infinity { neg: true } => return Dec::quiet_nan(),
         Dec::Finite { .. } => {}
     }
     let (neg, c, e) = parts(a);
@@ -903,7 +1416,7 @@ pub fn sqrt(a: &Dec) -> Dec {
         return Dec::Finite { neg, coeff: 0, exp: ideal.clamp(-6176, 6111) as i32 };
     }
     if neg {
-        return Dec::Nan;
+        return Dec::quiet_nan();
     }
     let l = c.len() as i64;
     // widen to at least 70 digits (a root of at least 35) at an even
@@ -951,11 +1464,27 @@ pub fn sqrt(a: &Dec) -> Dec {
 /// forms decNumber's string grammar accepts as `inf`/`infinity`/`nan`/
 /// `snan`. The combination field alone carries them - `11110` is infinity,
 /// `11111` NaN ([combination]/[decode_dec128]); the coefficient and
-/// exponent are unread. (sNaN vs NaN is not distinguished: [decode_dec128]
-/// collapses both to [Dec::Nan], and either traps a comparison the same.)
+/// exponent are unread. A bare NaN (no payload, quiet); [encode_dec128_nan]
+/// carries the signaling flag and the payload.
 pub fn encode_dec128_special(neg: bool, nan: bool) -> u128 {
     let comb: u128 = if nan { 0b11111 } else { 0b11110 };
     ((neg as u128) << 127) | (comb << 122)
+}
+
+/// The decimal128 bits of a NaN with its form: bit 121 signals, the low
+/// 110 bits carry the payload in 11 canonical declets (the exact inverse
+/// of [decode_dec128]'s NaN arm).
+pub fn encode_dec128_nan(neg: bool, signaling: bool, payload: u128) -> u128 {
+    let mut v: u128 = ((neg as u128) << 127) | (0b11111 << 122) | ((signaling as u128) << 121);
+    let digits = format!("{payload:0>33}");
+    let db = digits.as_bytes();
+    for j in 0..11 {
+        let s = 3 * j;
+        let three =
+            (db[s] - b'0') as usize * 100 + (db[s + 1] - b'0') as usize * 10 + (db[s + 2] - b'0') as usize;
+        v |= (BIN2DPD[three] as u128) << (10 * (10 - j));
+    }
+    v
 }
 
 /// The decimal64 bits of a SPECIAL value (`±Infinity` / `NaN`), the dec64
@@ -963,6 +1492,23 @@ pub fn encode_dec128_special(neg: bool, nan: bool) -> u128 {
 pub fn encode_dec64_special(neg: bool, nan: bool) -> u64 {
     let comb: u64 = if nan { 0b11111 } else { 0b11110 };
     ((neg as u64) << 63) | (comb << 58)
+}
+
+/// The decimal64 bits of a NaN with its form: bit 57 signals, the low 50
+/// bits carry the payload in 5 canonical declets (the exact inverse of
+/// [decode_dec64]'s NaN arm). A payload past 15 digits keeps its LOW 15
+/// (the engine's 34-to-16 narrowing, probed).
+pub fn encode_dec64_nan(neg: bool, signaling: bool, payload: u128) -> u64 {
+    let mut v: u64 = ((neg as u64) << 63) | (0b11111 << 58) | ((signaling as u64) << 57);
+    let digits = format!("{:0>15}", payload % 1_000_000_000_000_000);
+    let db = digits.as_bytes();
+    for j in 0..5 {
+        let s = 3 * j;
+        let three =
+            (db[s] - b'0') as usize * 100 + (db[s + 1] - b'0') as usize * 10 + (db[s + 2] - b'0') as usize;
+        v |= (BIN2DPD[three] as u64) << (10 * (4 - j));
+    }
+    v
 }
 
 /// Encode a computed [Dec] as DECFLOAT(16) (decimal64) bits, rounding a
@@ -974,7 +1520,7 @@ pub fn dec_to_dec64_bits(d: &Dec) -> u64 {
             _ => encode_dec64_special(false, true),
         },
         Dec::Infinity { neg } => encode_dec64_special(*neg, false),
-        Dec::Nan => encode_dec64_special(false, true),
+        Dec::Nan { neg, signaling, payload } => encode_dec64_nan(*neg, *signaling, *payload),
     }
 }
 
@@ -1148,7 +1694,7 @@ mod tests {
         );
         // specials
         assert!(matches!(decode_dec64(0x7800000000000000), Dec::Infinity { neg: false }));
-        assert!(matches!(decode_dec64(0x7C00000000000000), Dec::Nan));
+        assert!(matches!(decode_dec64(0x7C00000000000000), Dec::Nan { .. }));
     }
 
     #[test]
@@ -1166,7 +1712,7 @@ mod tests {
         assert_eq!(s(fin(2500, -4)), "0.50");
         assert_eq!(s(fin(4, 0)), "2");
         assert_eq!(s(fin(0, -3)), "0.00");
-        assert!(matches!(sqrt(&Dec::Finite { neg: true, coeff: 4, exp: 0 }), Dec::Nan));
+        assert!(matches!(sqrt(&Dec::Finite { neg: true, coeff: 4, exp: 0 }), Dec::Nan { .. }));
         // one rounding: 1.000..01 (34 digits) squared + -1 keeps the tail
         let a = fin(1000000000000000000000000000000001, -33);
         let m1 = Dec::Finite { neg: true, coeff: 1, exp: 0 };
@@ -1199,7 +1745,7 @@ mod tests {
         assert_eq!(cmp(&fin(false, 0, -2), &fin(false, 0, 5)), Equal); // zeros equal
         assert_eq!(cmp(&fin(true, 1, 0), &fin(false, 0, 0)), Less); // -1 < 0
         assert_eq!(cmp(&Dec::Infinity { neg: true }, &fin(true, 999, 30)), Less);
-        assert_eq!(cmp(&Dec::Nan, &Dec::Infinity { neg: false }), Greater);
+        assert_eq!(cmp(&Dec::quiet_nan(), &Dec::Infinity { neg: false }), Greater);
     }
 
     #[test]
@@ -1298,8 +1844,8 @@ mod tests {
         assert_eq!(s(&div(&d(true, 6, 0), &d(false, 2, 0))), "-3"); // sign
         // Infinity arithmetic
         assert!(matches!(add(&Dec::Infinity { neg: false }, &d(false, 1, 0)), Dec::Infinity { neg: false }));
-        assert!(matches!(add(&Dec::Infinity { neg: false }, &Dec::Infinity { neg: true }), Dec::Nan));
-        assert!(matches!(mul(&Dec::Infinity { neg: false }, &d(false, 0, 0)), Dec::Nan));
+        assert!(matches!(add(&Dec::Infinity { neg: false }, &Dec::Infinity { neg: true }), Dec::Nan { .. }));
+        assert!(matches!(mul(&Dec::Infinity { neg: false }, &d(false, 0, 0)), Dec::Nan { .. }));
     }
 
     #[test]
@@ -1313,7 +1859,7 @@ mod tests {
         assert_eq!(r(&d(false, wide, 0)), "1.234567890123457E+16");
         // specials carry through
         assert!(matches!(decode_dec64(dec_to_dec64_bits(&Dec::Infinity { neg: true })), Dec::Infinity { neg: true }));
-        assert!(matches!(decode_dec64(dec_to_dec64_bits(&Dec::Nan)), Dec::Nan));
+        assert!(matches!(decode_dec64(dec_to_dec64_bits(&Dec::quiet_nan())), Dec::Nan { .. }));
     }
 
     #[test]
@@ -1326,8 +1872,8 @@ mod tests {
             decode_dec128(encode_dec128_special(true, false)),
             Dec::Infinity { neg: true }
         ));
-        assert!(matches!(decode_dec128(encode_dec128_special(false, true)), Dec::Nan));
-        assert!(matches!(decode_dec128(encode_dec128_special(true, true)), Dec::Nan));
+        assert!(matches!(decode_dec128(encode_dec128_special(false, true)), Dec::Nan { .. }));
+        assert!(matches!(decode_dec128(encode_dec128_special(true, true)), Dec::Nan { .. }));
     }
 
     #[test]
@@ -1381,5 +1927,284 @@ mod tests {
             round_to_dec34(false, 99999999999999999999999999999999999u128, 0), // 35 nines
             Dec::Finite { neg: false, coeff: 1000000000000000000000000000000000, exp: 2 }
         );
+    }
+
+    #[test]
+    fn nan_keeps_signaling_and_payload() {
+        let n = |neg, signaling, payload| Dec::Nan { neg, signaling, payload };
+        // decode bit 121/57 + the payload declets (vectors from the C probe)
+        assert_eq!(
+            decode_dec128(0x7c0000000000000000000000000000a3),
+            n(false, false, 123)
+        );
+        assert_eq!(
+            decode_dec128(0x7e0000000000000000000000000003cf),
+            n(false, true, 789)
+        );
+        assert_eq!(
+            decode_dec128(0xfc000000000000000000000000000000),
+            n(true, false, 0)
+        );
+        assert_eq!(decode_dec64(0x7e00000000000000), n(false, true, 0));
+        // encode is the inverse, canonical declets
+        for d in [
+            n(false, false, 0),
+            n(false, false, 123456),
+            n(false, true, 789),
+            n(true, false, 0),
+            n(true, true, 7),
+        ] {
+            assert_eq!(decode_dec128(dec_to_bits(&d)), d);
+        }
+        assert_eq!(decode_dec64(dec_to_dec64_bits(&n(false, true, 42))), n(false, true, 42));
+        // renders like decToString
+        assert_eq!(to_string(&n(false, false, 0)), "NaN");
+        assert_eq!(to_string(&n(false, false, 123)), "NaN123");
+        assert_eq!(to_string(&n(false, true, 0)), "sNaN");
+        assert_eq!(to_string(&n(false, true, 789)), "sNaN789");
+        assert_eq!(to_string(&n(true, false, 0)), "-NaN");
+        assert_eq!(to_string(&negate(&n(false, false, 123))), "-NaN123");
+    }
+
+    #[test]
+    fn nan_arithmetic_priority_and_traps() {
+        let n = |neg, signaling, payload| Dec::Nan { neg, signaling, payload };
+        let one = Dec::Finite { neg: false, coeff: 1, exp: 0 };
+        let s = |x: &Dec| to_string(x);
+        // add/mul: the RIGHT NaN wins; sub/div: the LEFT (probed)
+        assert_eq!(s(&add(&n(false, false, 123), &n(false, false, 456))), "NaN456");
+        assert_eq!(s(&mul(&n(false, false, 123), &n(false, false, 456))), "NaN456");
+        assert_eq!(s(&sub(&n(false, false, 123), &n(false, false, 456))), "NaN123");
+        assert_eq!(s(&div(&n(false, false, 123), &n(false, false, 456))), "NaN123");
+        // a lone NaN propagates whole and unnegated
+        assert_eq!(s(&sub(&one, &n(false, false, 456))), "NaN456");
+        assert_eq!(s(&mul(&one, &n(false, false, 456))), "NaN456");
+        assert_eq!(s(&div(&n(false, false, 123), &one)), "NaN123");
+        // a signaling operand survives for the caller to trap
+        assert!(add(&n(false, true, 0), &one).is_signaling_nan());
+        assert!(mul(&one, &n(false, true, 9)).is_signaling_nan());
+        // invalid operations answer the bare quiet NaN
+        assert_eq!(div(&one, &Dec::Finite { neg: false, coeff: 0, exp: 0 }), Dec::Infinity { neg: false });
+        assert_eq!(div(&Dec::Finite { neg: false, coeff: 0, exp: 0 }, &Dec::Finite { neg: false, coeff: 0, exp: 0 }), Dec::quiet_nan());
+        assert!(cmp_value(&n(false, false, 0), &one).is_err());
+        assert!(cmp_value(&one, &n(false, true, 0)).is_err());
+    }
+
+    #[test]
+    fn total_order_and_dedup_follow_the_engine() {
+        use std::cmp::Ordering::*;
+        let fin = |neg, coeff: u128, exp| Dec::Finite { neg, coeff, exp };
+        let n = |neg, signaling, payload| Dec::Nan { neg, signaling, payload };
+        let t = |a: &Dec, b: &Dec| cmp_total(a, b, false);
+        // class ranks ascending
+        let chain = [
+            n(true, false, 0),
+            n(true, true, 0),
+            Dec::Infinity { neg: true },
+            fin(true, 35, -1),
+            fin(false, 0, 0),
+            fin(false, 15, -1),
+            Dec::Infinity { neg: false },
+            n(false, true, 0),
+            n(false, false, 0),
+        ];
+        for w in chain.windows(2) {
+            assert_eq!(t(&w[0], &w[1]), Less, "{:?} vs {:?}", w[0], w[1]);
+        }
+        // value ties: the record past the keys (ULONGs ascending)
+        assert_eq!(t(&fin(false, 0, 0), &fin(true, 0, 0)), Less); // +0 < -0
+        assert_eq!(t(&fin(false, 15, -1), &fin(false, 150, -2)), Less); // 1.5 < 1.50
+        assert_eq!(t(&fin(false, 150, -2), &fin(false, 1500, -3)), Less);
+        assert_eq!(t(&fin(false, 0, -100), &fin(false, 0, 5)), Less); // 0E-100 < 0E+5
+        // payloads by the record bytes (ULONG[0] 255 < 1024 here)
+        assert_eq!(t(&n(false, false, 999), &n(false, false, 1000)), Less);
+        assert_eq!(t(&n(false, true, 0), &n(false, true, 789)), Less);
+        // descending reverses ranks and values, never the tiebreaks
+        let td = |a: &Dec, b: &Dec| cmp_total(a, b, true);
+        assert_eq!(td(&n(false, false, 0), &Dec::Infinity { neg: false }), Less);
+        assert_eq!(td(&fin(false, 15, -1), &fin(false, 150, -2)), Less); // 1.5 still first
+        assert_eq!(td(&fin(false, 0, 0), &fin(true, 0, 0)), Less); // +0 still first
+        assert_eq!(td(&n(false, false, 0), &n(false, false, 456)), Less);
+        assert_eq!(td(&fin(false, 2, 0), &fin(false, 1, 0)), Less); // values reverse
+        // dedup groups
+        assert!(dedup_eq(&fin(false, 15, -1), &fin(false, 1500, -3))); // cohorts merge
+        assert!(dedup_eq(&fin(false, 0, 0), &fin(true, 0, -3))); // zeros merge
+        assert!(!dedup_eq(&fin(false, 15, -1), &fin(true, 15, -1))); // signs apart
+        assert!(dedup_eq(&n(false, false, 123), &n(false, false, 456))); // payloads merge
+        assert!(!dedup_eq(&n(false, false, 0), &n(true, false, 0))); // signed apart
+        assert!(dedup_eq(&n(false, true, 0), &n(false, true, 0))); // identical twins merge
+        assert!(!dedup_eq(&n(false, true, 0), &n(false, true, 789))); // payloads apart
+        assert!(!dedup_eq(&n(false, false, 0), &n(false, true, 0))); // classes apart
+        // the representative is the ascending-greatest
+        assert_eq!(t(&fin(false, 15, -1), &fin(false, 1500, -3)), Less); // 1.500 wins
+        assert_eq!(t(&fin(false, 0, 0), &fin(true, 0, 0)), Less); // -0 wins
+        assert_eq!(t(&n(false, false, 123), &n(false, false, 456)), Less); // NaN456 wins
+    }
+
+    #[test]
+    fn parse_reads_the_decnumber_grammar() {
+        // cohorts kept, specials with form, blanks rejected
+        assert_eq!(parse("1.50"), Some(Dec::Finite { neg: false, coeff: 150, exp: -2 }));
+        assert_eq!(parse("-0"), Some(Dec::Finite { neg: true, coeff: 0, exp: 0 }));
+        assert_eq!(parse("1E30"), Some(Dec::Finite { neg: false, coeff: 1, exp: 30 }));
+        assert_eq!(parse("0E5"), Some(Dec::Finite { neg: false, coeff: 0, exp: 5 }));
+        assert_eq!(parse("inf"), Some(Dec::Infinity { neg: false }));
+        assert_eq!(parse("-Infinity"), Some(Dec::Infinity { neg: true }));
+        assert_eq!(parse("sNaN789"), Some(Dec::Nan { neg: false, signaling: true, payload: 789 }));
+        assert_eq!(parse("-nan123"), Some(Dec::Nan { neg: true, signaling: false, payload: 123 }));
+        assert_eq!(parse(" 1.50 "), None);
+        assert_eq!(parse("zzz"), None);
+        assert_eq!(parse("Infinityx"), None);
+        assert_eq!(parse("nan12345678901234567890123456789012345"), None); // 35 payload digits
+        assert_eq!(parse("nan1234567890123456789012345678901234"), None); // 34: 22018
+        assert_eq!(
+            parse("nan123456789012345678901234567890123"),
+            Some(Dec::Nan { neg: false, signaling: false, payload: 123456789012345678901234567890123 })
+        ); // 33: the declets hold it
+        assert_eq!(parse("1E99999"), None); // exponent past decimal128
+        // 35 significant digits round HALF-UP to 34
+        assert_eq!(
+            parse("9.9999999999999999999999999999999999"),
+            Some(Dec::Finite { neg: false, coeff: 1000000000000000000000000000000000, exp: -32 })
+        );
+    }
+
+    #[test]
+    fn record_tiebreak_orders_cohorts_zeros_and_payloads() {
+        use std::cmp::Ordering::*;
+        let fin = |neg, coeff: u128, exp| Dec::Finite { neg, coeff, exp };
+        let n = |neg, signaling, payload| Dec::Nan { neg, signaling, payload };
+        let t = |a: &Dec, b: &Dec| cmp_total(a, b, false);
+        let td = |a: &Dec, b: &Dec| cmp_total(a, b, true);
+        let chain = |cs: &[Dec]| {
+            for w in cs.windows(2) {
+                assert_eq!(t(&w[0], &w[1]), Less, "{:?} vs {:?}", w[0], w[1]);
+                assert_eq!(td(&w[0], &w[1]), Less, "DESC keeps {:?}", w[0]);
+            }
+        };
+        // the mechanism, pinned: ULONG[0] of the canonical record
+        let u0 = |d: &Dec| u32::from_le_bytes(dec_to_bits(d).to_le_bytes()[0..4].try_into().unwrap());
+        assert_eq!(u0(&fin(false, 880, -1)), 14); // DPD(880)
+        assert_eq!(u0(&fin(false, 88, 0)), 78); // DPD(088)
+        assert_eq!(u0(&fin(false, 8800, -2)), 8204); // DPD(800) | DPD(008) << 10
+        assert_eq!(u0(&n(false, false, 0)), 0);
+        assert_eq!(u0(&n(false, false, 123)), 163);
+        assert_eq!(u0(&n(false, false, 999)), 255);
+        assert_eq!(u0(&n(false, false, 456)), 598);
+        assert_eq!(u0(&n(false, false, 1000)), 1024);
+        // T5/T8/T9: the 88-cohort is NOT coefficient order, either sign
+        chain(&[fin(false, 880, -1), fin(false, 88, 0), fin(false, 8800, -2)]);
+        chain(&[fin(true, 880, -1), fin(true, 88, 0)]);
+        // T3/T4: payloads by the record bytes (999's DPD(999) = 255
+        // sits between 123 and 456; 1000's second declet puts it last)
+        chain(&[
+            n(false, false, 0),
+            n(false, false, 123),
+            n(false, false, 999),
+            n(false, false, 456),
+            n(false, false, 1000),
+        ]);
+        // T1/T2: the DFC zeros (+0s by biased exponent, then -0s)
+        chain(&[
+            fin(false, 0, -2),
+            fin(false, 0, 0),
+            fin(false, 0, 5),
+            fin(true, 0, -3),
+            fin(true, 0, 0),
+        ]);
+        // C3: the full-width (MSD 9) cohort member sorts first - its
+        // low declets are all zero
+        let wide: u128 = 999_000_000_000_000_000_000_000_000_000_000_0;
+        chain(&[fin(false, wide, 0), fin(false, 999, 31), fin(false, 9990, 30)]);
+        // G1/G2: the combination field never decides (880-form first
+        // across the E13E12 straddle, both directions)
+        chain(&[fin(false, 880, -2081), fin(false, 88, -2080)]);
+        // sNaN payloads ride the same record law (make() drops the
+        // payload for OFF_snan too)
+        assert_eq!(t(&n(false, true, 123), &n(false, true, 456)), Less);
+        // mixed widths meet at dec128 (the union's widening)
+        assert_eq!(t(&fin(false, 88, 0), &fin(false, 880, -1)), Greater);
+        // the native 64-bit entries agree on a dec16 88-cohort
+        let e64 = |c: u64, e: i32| encode_dec64(false, c, e);
+        let d64 = |c: u64, e: i32| decode_dec64(e64(c, e));
+        let t64 = |a: u64, b: u64| cmp_total_64(&d64(a, 0), e64(a, 0), &d64(b, -1), e64(b, -1), false);
+        assert_eq!(t64(88, 880), Greater); // 88.0 first
+        assert_eq!(rec_cmp_64(e64(88, 0), e64(880, -1)), Greater);
+        // ...and the native 128-bit entries read the caller's bytes
+        let e128 = |c: u128, e: i32| encode_dec128(false, c, e);
+        let d128 = |c: u128, e: i32| decode_dec128(e128(c, e));
+        assert_eq!(
+            cmp_total_128(&d128(88, 0), e128(88, 0), &d128(880, -1), e128(880, -1), false),
+            Greater
+        );
+    }
+
+    #[test]
+    fn sort_key_order_ties_cohorts_zeros_and_payloads() {
+        use std::cmp::Ordering::*;
+        let fin = |neg, coeff: u128, exp| Dec::Finite { neg, coeff, exp };
+        let n = |neg, signaling, payload| Dec::Nan { neg, signaling, payload };
+        let k = |a: &Dec, b: &Dec| cmp_key(a, b, false);
+        let kd = |a: &Dec, b: &Dec| cmp_key(a, b, true);
+        // make() normalizes every cohort, zero and payload group
+        assert_eq!(k(&fin(false, 88, 0), &fin(false, 880, -1)), Equal);
+        assert_eq!(k(&fin(false, 0, 5), &fin(true, 0, -3)), Equal);
+        assert_eq!(k(&n(false, false, 123), &n(false, false, 456)), Equal);
+        assert_eq!(kd(&fin(false, 88, 0), &fin(false, 880, -1)), Equal);
+        // ...while ranks and values order, reversed when descending
+        assert_eq!(k(&fin(false, 2, 0), &fin(false, 1, 0)), Greater);
+        assert_eq!(kd(&fin(false, 2, 0), &fin(false, 1, 0)), Less);
+        assert_eq!(k(&n(false, false, 0), &Dec::Infinity { neg: false }), Greater);
+        assert_eq!(kd(&n(false, false, 0), &Dec::Infinity { neg: false }), Less);
+        assert_eq!(k(&fin(true, 35, -1), &fin(false, 0, 0)), Less);
+    }
+
+    #[test]
+    fn integral_rounding_matches_decquad() {
+        let fin = |neg, coeff: u128, exp| Dec::Finite { neg, coeff, exp };
+        let f = |c: u128, e: i32| fin(false, c, e);
+        assert_eq!(to_integral(&f(25, -1), IntegralMode::Ceil), fin(false, 3, 0));
+        assert_eq!(to_integral(&f(25, -1), IntegralMode::Floor), fin(false, 2, 0));
+        assert_eq!(to_integral(&f(25, -1), IntegralMode::Trunc), fin(false, 2, 0));
+        assert_eq!(to_integral(&f(25, -1), IntegralMode::Round), fin(false, 3, 0));
+        assert_eq!(
+            to_integral(&fin(true, 25, -1), IntegralMode::Ceil),
+            fin(true, 2, 0)
+        );
+        assert_eq!(
+            to_integral(&fin(true, 25, -1), IntegralMode::Floor),
+            fin(true, 3, 0)
+        );
+        assert_eq!(to_integral(&f(20, -1), IntegralMode::Ceil), fin(false, 2, 0));
+        assert_eq!(to_integral(&f(7, 0), IntegralMode::Floor), f(7, 0));
+        assert_eq!(
+            to_integral(&Dec::Infinity { neg: true }, IntegralMode::Ceil),
+            Dec::Infinity { neg: true }
+        );
+        assert_eq!(
+            to_integral(
+                &Dec::Nan { neg: false, signaling: false, payload: 456 },
+                IntegralMode::Floor
+            ),
+            Dec::Nan { neg: false, signaling: false, payload: 456 }
+        );
+    }
+
+    #[test]
+    fn double_scale_range_matches_cvt() {
+        // the measured vectors the predicate moved with (builtins 14)
+        assert!(!cvt_double_scale_out_of_range("1e-307"));
+        assert!(!cvt_double_scale_out_of_range("1e308"));
+        assert!(!cvt_double_scale_out_of_range("-2.5e-300"));
+        assert!(!cvt_double_scale_out_of_range("4e-306"));
+        assert!(!cvt_double_scale_out_of_range("0e308"));
+        assert!(cvt_double_scale_out_of_range("2.3e-308"));
+        assert!(cvt_double_scale_out_of_range("0e-400"));
+        assert!(cvt_double_scale_out_of_range("0.00001e-305"));
+        assert!(cvt_double_scale_out_of_range("1e-400"));
+        assert!(cvt_double_scale_out_of_range("1e400"));
+        assert!(cvt_double_scale_out_of_range("-1.5e-400"));
+        assert!(cvt_double_scale_out_of_range("1e3276"));
+        assert!(!cvt_double_scale_out_of_range("1.5"));
     }
 }

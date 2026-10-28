@@ -659,8 +659,16 @@ fn pow_of_infinity(lneg: bool, rhs: &Dec) -> Result<Dec, MathErr> {
 /// `x ** 0` is 1, `1 ** y` is a padded 1.000...
 pub fn pow(lhs: &Dec, rhs: &Dec) -> Result<Dec, MathErr> {
     let set = d128();
-    if matches!(lhs, Dec::Nan) || matches!(rhs, Dec::Nan) {
-        return Ok(Dec::Nan);
+    // a signaling NaN operand is the Invalid operation; a quiet one
+    // propagates, the leftmost winning (decNumberPower's order)
+    if lhs.is_signaling_nan() || rhs.is_signaling_nan() {
+        return Err(MathErr::Invalid);
+    }
+    if let x @ Dec::Nan { .. } = lhs {
+        return Ok(*x);
+    }
+    if let y @ Dec::Nan { .. } = rhs {
+        return Ok(*y);
     }
     if let Dec::Infinity { neg: rneg } = rhs {
         return pow_to_infinity(lhs, *rneg);
@@ -773,7 +781,8 @@ pub fn pow(lhs: &Dec, rhs: &Dec) -> Result<Dec, MathErr> {
 pub fn ln(x: &Dec) -> Result<Dec, MathErr> {
     let set = d128();
     let n = match x {
-        Dec::Nan => return Ok(Dec::Nan),
+        Dec::Nan { signaling: true, .. } => return Err(MathErr::Invalid),
+        x @ Dec::Nan { .. } => return Ok(*x),
         Dec::Infinity { neg: false } => return Ok(*x),
         Dec::Infinity { neg: true } => return Err(MathErr::Invalid),
         _ => Num::from_dec(x).ok_or(MathErr::Invalid)?,
@@ -795,7 +804,8 @@ pub fn ln(x: &Dec) -> Result<Dec, MathErr> {
 pub fn log10(x: &Dec) -> Result<Dec, MathErr> {
     let set = d128();
     let n = match x {
-        Dec::Nan => return Ok(Dec::Nan),
+        Dec::Nan { signaling: true, .. } => return Err(MathErr::Invalid),
+        x @ Dec::Nan { .. } => return Ok(*x),
         Dec::Infinity { neg: false } => return Ok(*x),
         Dec::Infinity { neg: true } => return Err(MathErr::Invalid),
         _ => Num::from_dec(x).ok_or(MathErr::Invalid)?,
@@ -837,7 +847,9 @@ pub fn exp(x: &Dec) -> Result<Dec, MathErr> {
 /// [crate::decfloat::sqrt]; a negative operand is Invalid.
 pub fn sqrt(x: &Dec) -> Result<Dec, MathErr> {
     match dfl::sqrt(x) {
-        Dec::Nan if !matches!(x, Dec::Nan) => Err(MathErr::Invalid),
+        // a quiet NaN propagates (payload kept); anything else NaN -
+        // a negative operand, or a signaling one - is Invalid
+        Dec::Nan { .. } if !x.is_quiet_nan() => Err(MathErr::Invalid),
         r => Ok(r),
     }
 }
@@ -948,7 +960,7 @@ mod tests {
         assert_eq!(s(pow(&d(0, 0), &inf)), "0");
         assert_eq!(s(exp(&inf)), "Infinity");
         assert_eq!(s(exp(&ninf)), "0");
-        assert_eq!(s(pow(&Dec::Nan, &d(2, 0))), "NaN");
+        assert_eq!(s(pow(&Dec::quiet_nan(), &d(2, 0))), "NaN");
     }
 
     #[test]

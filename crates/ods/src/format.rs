@@ -314,11 +314,15 @@ impl Value {
             // the decoded value no longer carries (measured on 2182:
             // `MAXVALUE(<stored sNaN>, 1) || 'x'` is sNaNx)
             Value::DecFloat16(b) => match crate::decfloat::decode_dec64(*b) {
-                crate::decfloat::Dec::Nan => nan_text(b >> 63 == 1, (b >> 57) & 1 == 1),
+                crate::decfloat::Dec::Nan { neg, signaling, payload } => {
+                    nan_text(neg, signaling, payload)
+                }
                 d => crate::decfloat::to_string(&d),
             },
             Value::DecFloat34(b) => match crate::decfloat::decode_dec128(*b) {
-                crate::decfloat::Dec::Nan => nan_text(b >> 127 == 1, (b >> 121) & 1 == 1),
+                crate::decfloat::Dec::Nan { neg, signaling, payload } => {
+                    nan_text(neg, signaling, payload)
+                }
                 d => crate::decfloat::to_string(&d),
             },
             Value::TimeTz(t, zone) => render_time_tz(*t, *zone),
@@ -330,8 +334,13 @@ impl Value {
 }
 
 /// A DECFLOAT NaN's text by its form: `NaN`, `sNaN`, `-NaN`, `-sNaN`.
-fn nan_text(neg: bool, signalling: bool) -> String {
-    format!("{}{}NaN", if neg { "-" } else { "" }, if signalling { "s" } else { "" })
+fn nan_text(neg: bool, signalling: bool, payload: u128) -> String {
+    format!(
+        "{}{}NaN{}",
+        if neg { "-" } else { "" },
+        if signalling { "s" } else { "" },
+        if payload == 0 { String::new() } else { payload.to_string() }
+    )
 }
 
 /// An approximate value as the engine prints it: 8 SIGNIFICANT digits for

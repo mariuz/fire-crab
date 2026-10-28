@@ -35,14 +35,30 @@ replacement of the C++ engine is below, in priority order. Full text:
    slices 34–35 LIST with WITHIN GROUP and GROUP BY position, slice 36 stored calls over aggregate/window slots, slice 37 (`0aa1e6c`) windows over a join,
    slice 38 BLOB and WITH TIME ZONE outputs (the id / instant halves travel; GROUP BY / DISTINCT / UNION DISTINCT over tz keys decline — the engine's
    tie representative is an unstable sort artifact, and the interpreter refuses it too), slice 39 the sort-record tiebreak (the slice-38 RECORDED item,
-   resolved — the branch-ordinal theory was wrong; key ties break by the full sort record on both executors).
+   resolved — the branch-ordinal theory was wrong; key ties break by the full sort record on both executors), slice 40 DECFLOAT arithmetic and grouping
+   (the ORDER law is the make()-key order plus the record past the keys — cohorts and payloads order by ULONGs, `88.0 < 88 < 88.00`; GROUP BY merges by value
+   and signals 22000 on a NaN boundary; CAST to scaled is eager now).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~6,500 statements
-   and the interpreter answers every decline. Next: the remaining compile declines, DECFLOAT arithmetic and grouping, wider index use in `exe`.
+   and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
    and key ties break by the FULL SORT RECORD past the keys (sort.cpp's low-word-first word compare over diddle/flags/data/dbkey), pinned cell by cell in
    exeselect §39 (22 cells: per-type byte laws, WHERE-only participation, unreferenced exclusion, the refetch shape, the collated DISTINCT representative).
    Both executors share the layout (`fire-crab-ods::sortrec`); boundaries: spilling sorts stay keys-only, full-data ties keep arrival order (no dbkeys),
    collated keys decline (ICU), RDB$DB_KEY stays refused (Phase 2 item 7).
+   DONE (slice 40): DECFLOAT arithmetic and grouping on the BLR path — the engine's ORDER BY is `make()`'s sort keys (value and class ranks, every cohort
+   and payload group normalizing to ONE key) plus the sort record past the keys (sort.cpp compares `m_longs - 1` ULONGs in memory), so cohorts, zeros and
+   payloads order by the canonical record's ULONGs (`88.0 < 88 < 88.00`, `NaN123 < NaN999 < NaN456 < NaN1000`, the full-width cohort member first, the
+   combination field never deciding), pinned in exeselect §40 (72 cells) and exe-run-blr (+30 over new D/DN/D16 fixtures). The BLR executor compares
+   decfloat keys by value and breaks ties by the row's record bytes (an expression key's ties by the SOURCE row's — a folded total law splits them too
+   finely); GROUP BY merges by value with the record-greatest surviving and signals 22000 on a NaN boundary (a NULL beside NaN short-circuits; a lone NaN
+   row groups without a boundary to trap on). Boundaries: GROUP BY a decfloat stays BLR-declined (the interpreter serves), MOD stays declined, a
+   partial-then-trap GROUP shape answers a bare trap (the interpreter collects where the engine streams — known gap), spilling sorts stay keys-only.
+   Triage drew three decline lines the new reachability needed (all HEAD-baselined): a CAST to DECFLOAT over a double literal refuses (the assignment
+   fold re-reads the spelling, and blr_double's text is gone by eval — widenum 9/11 fall to the interpreter), a text past the double's decimal scale
+   refuses out of the new text→double arm (CVT_get_double's 308 law, now the shared `ods::decfloat::cvt_double_scale_out_of_range` gate — builtins 14),
+   and an approximate value into a DECFLOAT slot refuses (a mistyped producer — the stat folds the engine folds in decimal128 — aggplan 16). Pre-existing
+   reds confirmed at HEAD, not this slice's: widenum 2 (REGR_INTERCEPT last digit), builtins 13 (BLOB_APPEND NULL-first), semchk 5 (WITH LOCK on RDB$DATABASE),
+   ddltx/ddlsavepoint (DDL under savepoints; §2's engine-silent FAILs are a stale gate premise — 2182 accepts SAVEPOINT+DDL silently).
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

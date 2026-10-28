@@ -814,8 +814,8 @@ pin  'CONTROL 15 beside a DECFLOAT(34) it raises' 'SELECT IIF(A > B, '"'"'T'"'"'
      'CASE|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.'
 pin  'CONTROL 15 ... and so does a DECFLOAT(34) NaN' 'SELECT MAXVALUE(1, B) FROM TN WHERE ID = 2;' \
      'MAXVALUE|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation.'
-rec  '15 RECORDED a signalling or negative NaN literal cast is refused' 'SELECT MAXVALUE(CAST('"'"'sNaN'"'"' AS DECFLOAT(16)), 1) FROM RDB$DATABASE;' \
-     'MAXVALUE|sNaN' 'MAXVALUE|Statement failed, SQLSTATE = 42000|Dynamic SQL Error'
+pin  '15 MAXVALUE of a signalling NaN answers sNaN' 'SELECT MAXVALUE(CAST('"'"'sNaN'"'"' AS DECFLOAT(16)), 1) FROM RDB$DATABASE;' \
+     'MAXVALUE|sNaN'
 pin  '15 UNICODE_VAL / ASCII_VAL of a blob of 32767 bytes answer' 'SELECT UNICODE_VAL(BT), ASCII_VAL(BN), UNICODE_VAL(BU) FROM TC WHERE ID = 6;' \
      'UNICODE_VAL ASCII_VAL UNICODE_VAL|97 97 97'
 pin  '15 ... of 32768 bytes: the blob truncation' 'SELECT UNICODE_VAL(BT) FROM TC WHERE ID = 7;' \

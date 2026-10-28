@@ -346,7 +346,7 @@ refused "10 GROUP BY a decfloat expression" "SELECT SQRT(I), COUNT(*) FROM FX GR
 refused "10 a TEXT places count (the exact family refuses it too)" "SELECT ROUND(CAST('1.5' AS DECFLOAT(34)), '2') $DUAL;" "ROUND|1.50"
 pin  "10 a derived table's literal cast under an AGGREGATE runs the double conversion (recorded; the assignment's fold agrees now)" "SELECT SUM(X) FROM (SELECT CAST(1e30 AS NUMERIC(38,6)) X $DUAL);" "SUM|1000000000000000042420637374017.961984"
 differs "10 COVAR_POP(NULL, I) is a TEXT NULL on the engine" "SELECT COVAR_POP(NULL, I) FROM BIG2;" "COVAR_POP|<null>" "COVAR_POP|0.000000000000000"
-differs "10 the sign of a decimal ZERO through multiply and TRUNC (decNumber keeps it)" "SELECT CAST('-1' AS DECFLOAT(34)) * 0, TRUNC(CAST('-0.0012345' AS DECFLOAT(34)), 2) $DUAL;" "MULTIPLY TRUNC|-0 -0" "MULTIPLY TRUNC|0 0"
+pin "10 the sign of a decimal ZERO through multiply and TRUNC (decNumber keeps it)" "SELECT CAST('-1' AS DECFLOAT(34)) * 0, TRUNC(CAST('-0.0012345' AS DECFLOAT(34)), 2) $DUAL;" "MULTIPLY TRUNC|-0 -0"
 
 echo "--- 11. THE MERGED-BINARY REVIEW: a DOUBLE fold over a mixed conditional, the negated literal, the fold through CAST TO DOUBLE, subquery compares, subnormals, the specials"
 dpin "11 VAR_POP over IIF(<INT128>, <DOUBLE>) describes DOUBLE" "SELECT VAR_POP(IIF(ID = 1, I, DBL)) FROM BIG2;" "$DBL"
@@ -379,8 +379,8 @@ pin  "11 TRUNC of an Infinity is Inf - Inf, the 22000; of a NaN, NaN" "SELECT TR
 echo "--- 12. RECORDED (the merged-binary review): the engine answers, this server refuses or differs"
 refused "12 a DECFLOAT scalar subquery in the SELECT LIST" "SELECT (SELECT VAR_POP(I) FROM BIG2) $DUAL;" "VAR_POP|1.555555555555555555555555555555557"
 refused "12 a non-finite DECFLOAT folded into an IN list" "SELECT COUNT(*) FROM BIG2 WHERE I IN (SELECT CAST('Inf' AS DECFLOAT(34)) $DUAL);" "COUNT|0"
-refused "12 a SIGNALLING NaN has no form here (its CAST refuses; FLOOR / CEILING / EXP of it trap on the engine)" "SELECT CEILING(CAST('sNaN' AS DECFLOAT(34))) $DUAL;" "CEILING|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation."
-refused "12 nor a NEGATIVE NaN (the engine's SIGN of it is -1)" "SELECT SIGN(CAST('-NaN' AS DECFLOAT(34))), CAST('-NaN' AS DECFLOAT(34)) $DUAL;" "SIGN CAST|-1 -NaN"
+pin "12 CEILING of a SIGNALLING NaN traps 22000 as the engine" "SELECT CEILING(CAST('sNaN' AS DECFLOAT(34))) $DUAL;" "CEILING|Statement failed, SQLSTATE = 22000|Decimal float invalid operation. An indeterminant error occurred during an operation."
+pin "12 SIGN of a NEGATIVE NaN is -1, the NaN keeps its sign" "SELECT SIGN(CAST('-NaN' AS DECFLOAT(34))), CAST('-NaN' AS DECFLOAT(34)) $DUAL;" "SIGN CAST|-1 -NaN"
 differs "12 a bare literal cast under a VARCHAR item still folds here (the engine converts cvt.cpp's double)" "SELECT CAST(1e37 AS NUMERIC(38,0)) || '' $DUAL;" "CONCATENATION|10000000000000000719354278919532445696" "CONCATENATION|10000000000000000000000000000000000000"
 
 echo "--- 13. THE FOLD IS THE ASSIGNMENT'S TARGET's: a DML column, the outer item over a derived table / CTE / subquery; a FLOAT conditional's exact branch; a literal's two spellings"

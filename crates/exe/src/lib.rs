@@ -106,6 +106,7 @@ mod blr {
     pub const AGG_TOTAL: u8 = 86;
     pub const AGG_AVERAGE: u8 = 87;
     pub const AGG_COUNT2: u8 = 93;
+    pub const AGG_COUNT_DISTINCT: u8 = 94;
     pub const JOIN_TYPE: u8 = 80;
     pub const RS_STREAM: u8 = 119;
     // blr_join_type operands (blr.h): inner 0, left 1, right 2, full 3
@@ -1232,7 +1233,7 @@ impl<'a> P<'a> {
                             MapItem::Agg(blr::AGG_COUNT, None)
                         }
                         Some(&v @ (blr::AGG_MAX | blr::AGG_MIN | blr::AGG_TOTAL
-                            | blr::AGG_AVERAGE | blr::AGG_COUNT2)) => {
+                            | blr::AGG_AVERAGE | blr::AGG_COUNT2 | blr::AGG_COUNT_DISTINCT)) => {
                             self.i += 1;
                             MapItem::Agg(v, Some(self.expr()?))
                         }
@@ -1827,11 +1828,70 @@ fn sys_fn(name: &str, args: &[Value]) -> Result<Value, String> {
         Ok(Value::Double(r))
     };
     Ok(match name {
+        "COMPARE_DECFLOAT" => {
+            use fire_crab_ods::decfloat as dfl;
+            let cvt = |v: &Value| -> Result<dfl::Dec, String> {
+                match v {
+                    Value::Text(t) => dfl::parse(t)
+                        .ok_or_else(|| "COMPARE_DECFLOAT over this text unconverted".to_string()),
+                    other => dec_of(other)
+                        .or_else(|| dec_promote_exact(other))
+                        .or_else(|| dec_from_double(other))
+                        .ok_or_else(|| {
+                            "COMPARE_DECFLOAT over this operand unconverted".to_string()
+                        }),
+                }
+            };
+            let x = cvt(arg(0)?)?;
+            let y = cvt(arg(1)?)?;
+            Value::Int(if x.is_nan() || y.is_nan() {
+                3
+            } else {
+                match dfl::totalorder_cmp(&x, &y) {
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Less => 1,
+                    std::cmp::Ordering::Greater => 2,
+                }
+            })
+        }
         "ABS" => match arg(0)? {
             Value::Int(n) => Value::Int(n.checked_abs().ok_or("integer overflow")?),
             Value::Scaled(r, s) => Value::Scaled(r.checked_abs().ok_or("integer overflow")?, *s),
             Value::Int128(r, s) => Value::Int128(r.checked_abs().ok_or("integer overflow")?, *s),
             Value::Double(d) => Value::Double(d.abs()),
+            // a DECFLOAT keeps its width and cohort: the sign flips,
+            // nothing else (decQuadAbs) - even an sNaN passes, never
+            // a trap (the interpreter's arm, measured)
+            Value::DecFloat16(b) => {
+                use fire_crab_ods::decfloat as dfl;
+                let d = dfl::decode_dec64(*b);
+                let p = if matches!(
+                    d,
+                    dfl::Dec::Finite { neg: true, .. }
+                        | dfl::Dec::Infinity { neg: true }
+                        | dfl::Dec::Nan { neg: true, .. }
+                ) {
+                    dfl::negate(&d)
+                } else {
+                    d
+                };
+                Value::DecFloat16(dfl::dec_to_dec64_bits(&p))
+            }
+            Value::DecFloat34(b) => {
+                use fire_crab_ods::decfloat as dfl;
+                let d = dfl::decode_dec128(*b);
+                let p = if matches!(
+                    d,
+                    dfl::Dec::Finite { neg: true, .. }
+                        | dfl::Dec::Infinity { neg: true }
+                        | dfl::Dec::Nan { neg: true, .. }
+                ) {
+                    dfl::negate(&d)
+                } else {
+                    d
+                };
+                Value::DecFloat34(dfl::dec_to_bits(&p))
+            }
             _ => return Err("ABS over this kind unconverted".into()),
         },
         "SIGN" => Value::Int(match arg(0)? {
@@ -1849,6 +1909,28 @@ fn sys_fn(name: &str, args: &[Value]) -> Result<Value, String> {
                 Value::Double(_) | Value::Float(_) => {
                     let d = sf_f64(arg(0)?)?;
                     Value::Double(if ceil { d.ceil() } else { d.floor() })
+                }
+                // a DECFLOAT answers DECFLOAT(34) whatever the width
+                // (Decimal128::floor/ceil, measured): an sNaN declines
+                // for the interpreter's 22000, a quiet NaN or Infinity
+                // passes, a finite rounds to integral
+                Value::DecFloat16(x) => {
+                    use fire_crab_ods::decfloat as dfl;
+                    let d = dfl::decode_dec64(*x);
+                    if d.is_signaling_nan() {
+                        return Err(format!("{} of an sNaN unconverted", name));
+                    }
+                    let m = if ceil { dfl::IntegralMode::Ceil } else { dfl::IntegralMode::Floor };
+                    Value::DecFloat34(dfl::dec_to_bits(&dfl::to_integral(&d, m)))
+                }
+                Value::DecFloat34(x) => {
+                    use fire_crab_ods::decfloat as dfl;
+                    let d = dfl::decode_dec128(*x);
+                    if d.is_signaling_nan() {
+                        return Err(format!("{} of an sNaN unconverted", name));
+                    }
+                    let m = if ceil { dfl::IntegralMode::Ceil } else { dfl::IntegralMode::Floor };
+                    Value::DecFloat34(dfl::dec_to_bits(&dfl::to_integral(&d, m)))
                 }
                 v => {
                     let (raw, s) = num_parts(v).ok_or("FLOOR over this kind unconverted")?;
@@ -2478,14 +2560,36 @@ fn coerce_temporal(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
 /// text) is unconverted too - both fail the run.
 fn coerce_bool(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
     let Some(dt) = slot.map(|s| s.dtype) else { return Ok(v) };
-    // ...and a DECFLOAT the same way: a value into a DECFLOAT slot must be
-    // one of that width, and a DECFLOAT into another kind is unconverted
-    // (the engine's conversions, traps and rounding modes are not made here)
+    // ...and a DECFLOAT by conversion: into a DECFLOAT slot anything the
+    // CAST takes; out of one, the slot kind's own value (the chain below
+    // still range- and width-checks it). Whatever does not convert fails
+    // the run for the interpreter, which raises the engine's error.
+    //
+    // EXCEPT an approximate value into a DECFLOAT slot: a producer that
+    // yields a DOUBLE where the slot is DECFLOAT took the wrong type
+    // path - the statistical folds over INT128-backed inputs, which the
+    // engine folds in decimal128 (aggplan 16: VAR_POP over a derived
+    // SUM answers 0.87500000000000000 in double where the engine
+    // answers 0.8750). Converting it here would serve the mistyped
+    // value; refuse to the interpreter, which folds it in decimal.
+    // (An explicit CAST of a runtime double still converts - that arm
+    // is the user's conversion, not a producer's type.)
     match (dt, &v) {
         (_, Value::Null) => {}
         (blr::DT_DEC64, Value::DecFloat16(_)) | (blr::DT_DEC128, Value::DecFloat34(_)) => return Ok(v),
-        (blr::DT_DEC64 | blr::DT_DEC128, _) | (_, Value::DecFloat16(_) | Value::DecFloat34(_)) => {
-            return Err("a DECFLOAT assignment unconverted".into())
+        (blr::DT_DEC64 | blr::DT_DEC128, Value::Double(_) | Value::Float(_)) => {
+            return Err("an approximate value into a DECFLOAT slot unconverted".into())
+        }
+        (blr::DT_DEC64 | blr::DT_DEC128, _) => {
+            return dec_cast_target(&v, dt == blr::DT_DEC128)
+        }
+        (_, Value::DecFloat16(x)) => {
+            let d = fire_crab_ods::decfloat::decode_dec64(*x);
+            return dec_to_slot_value(&d, slot);
+        }
+        (_, Value::DecFloat34(x)) => {
+            let d = fire_crab_ods::decfloat::decode_dec128(*x);
+            return dec_to_slot_value(&d, slot);
         }
         _ => {}
     }
@@ -3369,7 +3473,7 @@ fn mapitem_desc(
     use fire_crab_ods::format::dtype;
     match item {
         MapItem::Agg(v, op) => {
-            if *v == blr::AGG_COUNT || *v == blr::AGG_COUNT2 {
+            if *v == blr::AGG_COUNT || *v == blr::AGG_COUNT2 || *v == blr::AGG_COUNT_DISTINCT {
                 return Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 });
             }
             let e = op.as_ref()?;
@@ -3471,6 +3575,7 @@ fn sysfn_desc(
             })
         }
         "SIGN" | "ASCII_VAL" => Some(SlotDesc { dtype: dtype::SHORT, len: 2, charset: 0, coll: 0 }),
+        "COMPARE_DECFLOAT" => Some(SlotDesc { dtype: dtype::SHORT, len: 2, charset: 0, coll: 0 }),
         "POSITION" | "UNICODE_VAL" => {
             Some(SlotDesc { dtype: dtype::LONG, len: 4, charset: 0, coll: 0 })
         }
@@ -3913,11 +4018,45 @@ impl<'a> Exec<'a> {
             let mut rec = layout.zero();
             let mut row_vals = Vec::with_capacity(kept.len());
             for mf in &kept {
-                let v = binding
-                    .get(mf.frame)
-                    .and_then(|fr| fr.row.get(mf.id))
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                let fr = binding.get(mf.frame);
+                let mut v =
+                    fr.and_then(|fr| fr.row.get(mf.id)).cloned().unwrap_or(Value::Null);
+                // a slot-indexed frame stamps its unified descs (a union's
+                // output desc): the sort record holds the UNION output's
+                // bytes, so an exact value under a decfloat slot renders
+                // as the WIDENED decfloat's bytes (a value-tied int and
+                // decfloat would otherwise break by heterogeneous bytes),
+                // and a dec16 value under a dec34 slot widens (re-encoded,
+                // bias and all). An approximate or text value under a
+                // decfloat slot declines (its widening is the
+                // interpreter's shape); a decfloat past dec16's range
+                // likewise.
+                if let Some(sd) =
+                    fr.and_then(|fr| fr.slot_descs.as_ref()).and_then(|s| s.get(mf.id))
+                {
+                    use fire_crab_ods::decfloat as dfl;
+                    if matches!(sd.dtype, dtype::DEC64 | dtype::DEC128)
+                        && !matches!(v, Value::DecFloat16(_) | Value::DecFloat34(_) | Value::Null)
+                    {
+                        match dec_promote_exact(&v) {
+                            Some(d) if sd.dtype == dtype::DEC128 => {
+                                v = Value::DecFloat34(dfl::dec_to_bits(&d));
+                            }
+                            Some(dfl::Dec::Finite { neg, coeff, exp }) => {
+                                match dfl::fit_dec64(neg, coeff, exp) {
+                                    Some(b) => v = Value::DecFloat16(b),
+                                    None => return Err("a sort over a decfloat past dec16's range unconverted".into()),
+                                }
+                            }
+                            _ => return Err("a sort over an approximate value in a decfloat union slot unconverted".into()),
+                        }
+                    }
+                    if sd.dtype == dtype::DEC128 {
+                        if let Value::DecFloat16(x) = v {
+                            v = Value::DecFloat34(dfl::dec_to_bits(&dfl::decode_dec64(x)));
+                        }
+                    }
+                }
                 row_vals.push(v);
             }
             let mut ids = Vec::with_capacity(frames.len());
@@ -4740,11 +4879,6 @@ impl<'a> Exec<'a> {
                 let keys = self.with_binding(&binding, |ex| {
                     rse.project.iter().map(|e| ex.eval(e)).collect::<Result<Vec<_>, _>>()
                 })?;
-                // which of two equal DECFLOATs (1.0, 1.00) DISTINCT keeps is
-                // the engine's cohort law - unconverted here
-                if keys.iter().any(|k| matches!(k, Value::DecFloat16(_) | Value::DecFloat34(_))) {
-                    return Err("DISTINCT over a DECFLOAT unconverted".into());
-                }
                 // DISTINCT over a WITH TIME ZONE key: which of equal instants
                 // survives is the engine's unstable artifact, as for GROUP BY
                 if keys.iter().any(|k| matches!(k, Value::TimeTz(..) | Value::TimestampTz(..))) {
@@ -4761,10 +4895,45 @@ impl<'a> Exec<'a> {
                 }
                 std::cmp::Ordering::Equal
             });
-            keyed.dedup_by(|(a, _), (b, _)| {
-                a.iter().zip(b.iter()).all(|(x, y)| group_eq(x, y))
-            });
-            bindings = keyed.into_iter().map(|(_, b)| b).collect();
+            // a DECFLOAT anywhere in the keys dedups by the dedup law
+            // (cohorts and quiet-NaN payloads merge) and keeps the
+            // TOTAL-GREATEST row of each run - the engine's
+            // representative (1.500 over 1.5, NaN456 over NaN123),
+            // decided by the first DECFLOAT column that distinguishes
+            // the rows. A double in the same column as one refuses
+            // (the coercion renders - the interpreter's shape).
+            let width = keyed.first().map(|(k, _)| k.len()).unwrap_or(0);
+            for i in 0..width {
+                let has_dec = keyed.iter().any(|(k, _)| dec_of(&k[i]).is_some());
+                let has_approx = keyed.iter().any(|(k, _)| {
+                    matches!(k[i], Value::Double(_) | Value::Float(_))
+                });
+                if has_dec && has_approx {
+                    return Err("DISTINCT over mixed decimal operands unconverted".into());
+                }
+            }
+            let has_decfloat =
+                keyed.iter().any(|(k, _)| k.iter().any(|v| dec_of(v).is_some()));
+            if has_decfloat {
+                let mut kept: Vec<(Vec<Value>, Vec<StreamFrame>)> = Vec::new();
+                for (keys, binding) in keyed {
+                    if let Some((lk, _)) = kept.last() {
+                        if distinct_keys_eq(lk, &keys) {
+                            if distinct_row_greater(&keys, lk) {
+                                *kept.last_mut().unwrap() = (keys, binding);
+                            }
+                            continue;
+                        }
+                    }
+                    kept.push((keys, binding));
+                }
+                bindings = kept.into_iter().map(|(_, b)| b).collect();
+            } else {
+                keyed.dedup_by(|(a, _), (b, _)| {
+                    a.iter().zip(b.iter()).all(|(x, y)| group_eq(x, y))
+                });
+                bindings = keyed.into_iter().map(|(_, b)| b).collect();
+            }
         }
         // SortedStream
         if !rse.sort.is_empty() {
@@ -5945,12 +6114,20 @@ impl<'a> Exec<'a> {
         }
         enum Fold {
             Count(i64),
+            // COUNT(DISTINCT x): the distinct non-NULL values seen
+            CountDistinct(Vec<Value>),
             // exact folds carry (raw, scale) at the SOURCE's scale, so a
             // SUM over DECIMAL(12,2) stays a scale-2 number (probed on
             // the employee sample: SUB_TOT_BUDGET's SUM(budget) is
             // 2350000.00, and a fold that only took integers gave NULL)
             Sum(Option<(i128, i8)>),
             Avg(Option<(i128, i8, i64)>),
+            // a DECFLOAT operand switches the fold to decimal: the
+            // running sum, whether a DECFLOAT(34) was seen (the AVG
+            // result width - SUM is always 34), and the non-NULL
+            // count for AVG's division
+            SumDec(Option<fire_crab_ods::decfloat::Dec>, bool),
+            AvgDec(Option<fire_crab_ods::decfloat::Dec>, bool, i64),
             // an APPROXIMATE operand folds as a double: SUM and AVG of a
             // FLOAT or DOUBLE are DOUBLE PRECISION, summed in scan order
             SumD(f64),
@@ -5974,6 +6151,7 @@ impl<'a> Exec<'a> {
                     let f = match item {
                         MapItem::Agg(v, _) => match *v {
                             blr::AGG_COUNT | blr::AGG_COUNT2 => Fold::Count(0),
+                            blr::AGG_COUNT_DISTINCT => Fold::CountDistinct(Vec::new()),
                             blr::AGG_TOTAL => Fold::Sum(None),
                             blr::AGG_AVERAGE => Fold::Avg(None),
                             blr::AGG_MIN => Fold::Min(None),
@@ -6098,6 +6276,33 @@ impl<'a> Exec<'a> {
                             *n += 1;
                         }
                     }
+                    (Fold::CountDistinct(seen), _, op) => {
+                        // a DECFLOAT dedups by the dedup law, anything
+                        // else the way DISTINCT's rows do; a double
+                        // beside one refuses (the coercion renders)
+                        if let Some(v) = op {
+                            if !matches!(v, Value::Null)
+                                && seen.iter().any(|s| dec_mixed_approx(s, &v))
+                            {
+                                return Err(
+                                    "COUNT DISTINCT over mixed decimal operands unconverted".into(),
+                                );
+                            }
+                            if !matches!(v, Value::Null)
+                                && !seen.iter().any(|s| match (dec_of(s), dec_of(&v)) {
+                                    (Some(x), Some(y)) => {
+                                        fire_crab_ods::decfloat::dedup_eq(&x, &y)
+                                    }
+                                    // mixed or plain pairs compare the
+                                    // grouping way (which declines NaN
+                                    // to unequal, never equal)
+                                    _ => group_eq(s, &v),
+                                })
+                            {
+                                seen.push(v.clone());
+                            }
+                        }
+                    }
                     // SUM / AVG take an exact operand at its scale and an
                     // approximate one as a double; any OTHER non-NULL
                     // operand fails the run - skipping it answered a NULL
@@ -6116,6 +6321,56 @@ impl<'a> Exec<'a> {
                     // raises on the engine, folds to 0 here)
                     (Fold::Sum(_) | Fold::Avg(_), _, Some(Value::Int128(..))) => {
                         return Err("SUM / AVG over an INT128 operand unconverted".into());
+                    }
+                    // a DECFLOAT operand switches an exact SUM / AVG fold
+                    // to the decimal one (the engine promotes the whole
+                    // aggregate): the exact sum so far converts exactly,
+                    // then this value folds in as decimal
+                    (fold @ (Fold::Sum(_) | Fold::Avg(_)), _, Some(v))
+                        if dec_of(&v).is_some() =>
+                    {
+                        use fire_crab_ods::decfloat as dfl;
+                        let is_sum = matches!(fold, Fold::Sum(_));
+                        let (exact, count) = match fold {
+                            Fold::Sum(a) => (*a, 0),
+                            Fold::Avg(a) => match a {
+                                Some((r, s, c)) => (Some((*r, *s)), *c),
+                                None => (None, 0),
+                            },
+                            _ => unreachable!("guard matched"),
+                        };
+                        let mut acc: Option<dfl::Dec> = match exact {
+                            Some((r, s)) => {
+                                match dfl::round_to_dec34(r < 0, r.unsigned_abs() as u128, s as i32)
+                                {
+                                    f @ dfl::Dec::Finite { .. } => Some(f),
+                                    _ => {
+                                        return Err(
+                                            "SUM / AVG over an undecimal operand unconverted".into(),
+                                        )
+                                    }
+                                }
+                            }
+                            None => None,
+                        };
+                        let mut wide = false;
+                        sumdec_step(&mut acc, &mut wide, &v)?;
+                        if is_sum {
+                            *fold = Fold::SumDec(acc, wide);
+                        } else {
+                            *fold = Fold::AvgDec(acc, wide, count + 1);
+                        }
+                    }
+                    (Fold::SumDec(acc, wide), _, Some(v)) => {
+                        if !matches!(v, Value::Null) {
+                            sumdec_step(acc, wide, &v)?;
+                        }
+                    }
+                    (Fold::AvgDec(acc, wide, count), _, Some(v)) => {
+                        if !matches!(v, Value::Null) {
+                            sumdec_step(acc, wide, &v)?;
+                            *count += 1;
+                        }
                     }
                     (Fold::SumD(acc), _, Some(v)) => match v {
                         Value::Null => {}
@@ -6146,15 +6401,23 @@ impl<'a> Exec<'a> {
                             return Err("AVG over a non-exact operand unconverted".into());
                         }
                     }
-                    (Fold::Min(acc) | Fold::Max(acc), _, Some(v))
-                        if matches!(v, Value::DecFloat16(_) | Value::DecFloat34(_))
-                            && acc.as_ref().is_some_and(|cur| {
-                                value_cmp(&v, cur) == Some(std::cmp::Ordering::Equal) && *cur != v
-                            }) =>
+                    // MIN / MAX over a DECFLOAT NaN: the engine's
+                    // compare signals (22000) - this run refuses to the
+                    // interpreter, which raises it. Equal cohorts keep
+                    // the first arrival (the keep-unless-strictly rule
+                    // below does that with no special case).
+                    (Fold::Min(_) | Fold::Max(_), _, Some(v))
+                        if dec_of(&v).is_some_and(|d| d.is_nan()) =>
                     {
-                        // two EQUAL DECFLOATs of different cohorts: which one
-                        // MIN / MAX answers is the engine's law - unconverted
-                        return Err("MIN / MAX over equal DECFLOAT cohorts unconverted".into());
+                        return Err("MIN / MAX over a DECFLOAT NaN unconverted".into());
+                    }
+                    // MIN / MAX over a DECFLOAT beside a double: the
+                    // engine moves the double into decimal first (the
+                    // value compare cannot order them) - refused
+                    (Fold::Min(acc) | Fold::Max(acc), _, Some(v))
+                        if acc.as_ref().is_some_and(|cur| dec_mixed_approx(&v, cur)) =>
+                    {
+                        return Err("MIN / MAX over mixed decimal operands unconverted".into());
                     }
                     (Fold::Min(acc), _, Some(v)) => {
                         if !matches!(v, Value::Null) {
@@ -6211,6 +6474,7 @@ impl<'a> Exec<'a> {
             for (slot, fold) in g.slots {
                 row[slot as usize] = match fold {
                     Fold::Count(n) => Value::Int(n),
+                    Fold::CountDistinct(seen) => Value::Int(seen.len() as i64),
                     Fold::Sum(v) => v.map(|(r, s)| mk_num(r, s)).unwrap_or(Value::Null),
                     // the average is taken AT THE SOURCE'S SCALE by an
                     // integer division truncating toward zero, like the
@@ -6220,6 +6484,47 @@ impl<'a> Exec<'a> {
                     Fold::Avg(v) => v.map(|(r, s, c)| mk_num(r / c as i128, s)).unwrap_or(Value::Null),
                     Fold::SumD(x) => Value::Double(x),
                     Fold::AvgD(x, c) => Value::Double(x / c as f64),
+                    // SUM answers DECFLOAT(34); AVG divides by the non-NULL
+                    // count and presents at the source width (a 34 seen
+                    // anywhere widens)
+                    Fold::SumDec(acc, _) => match acc {
+                        Some(d) => Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&d)),
+                        None => Value::Null,
+                    },
+                    Fold::AvgDec(acc, wide, count) => match acc {
+                        None => Value::Null,
+                        Some(sum) => {
+                            use fire_crab_ods::decfloat as dfl;
+                            let q = dfl::div(
+                                &sum,
+                                &dfl::Dec::Finite { neg: false, coeff: count as u128, exp: 0 },
+                            );
+                            if wide {
+                                Value::DecFloat34(dfl::dec_to_bits(&q))
+                            } else {
+                                match &q {
+                                    dfl::Dec::Finite { neg, coeff, exp } => {
+                                        match dfl::fit_dec64(*neg, *coeff, *exp) {
+                                            Some(b) => Value::DecFloat16(b),
+                                            None => {
+                                                return Err(
+                                                    "a DECFLOAT(16) average unconverted".into(),
+                                                )
+                                            }
+                                        }
+                                    }
+                                    dfl::Dec::Infinity { neg } => Value::DecFloat16(
+                                        dfl::encode_dec64_special(*neg, false),
+                                    ),
+                                    dfl::Dec::Nan { neg, signaling, payload } => {
+                                        Value::DecFloat16(dfl::encode_dec64_nan(
+                                            *neg, *signaling, *payload,
+                                        ))
+                                    }
+                                }
+                            }
+                        }
+                    },
                     Fold::Min(v) | Fold::Max(v) => v.unwrap_or(Value::Null),
                     Fold::Pass(v) => v,
                     Fold::Stat { name, n, sx, sxx, sy, syy, sxy, exact } => {
@@ -6400,25 +6705,54 @@ impl<'a> Exec<'a> {
                                 // CHAR padding included (the engine's, and
                                 // fc's own main-path, convention)
                                 .map_err(|_| format!("conversion error from string \"{}\"", t))?,
+                            // a DECFLOAT rounds HALF-UP, away from zero on a
+                            // tie (2.5 -> 3, -2.5 -> -3); a NaN, an
+                            // Infinity, or a value past i64 is the
+                            // interpreter's error (22000)
+                            Value::DecFloat16(x) => dec_to_int(
+                                &fire_crab_ods::decfloat::decode_dec64(*x),
+                            )
+                            .ok_or("cast of a DECFLOAT to integer unconverted")?,
+                            Value::DecFloat34(x) => dec_to_int(
+                                &fire_crab_ods::decfloat::decode_dec128(*x),
+                            )
+                            .ok_or("cast of a DECFLOAT to integer unconverted")?,
                             other => int_of(other)
                                 .ok_or("cast to integer unconverted for this value")?,
                         };
+                        // EAGER scale: the value carries its scale (like a
+                        // decoded table row), so an expression aboard sees
+                        // 225.00, not 225 (a lazy Int here answered 226.5
+                        // for `decfloat + CAST(225 AS NUMERIC(10,2))`);
+                        // scale 0 still answers Int, as before
+                        let r = exe_rescale(n as i128, 0, slot.scale).ok_or("integer overflow")?;
                         let fits = match slot.dtype {
-                            blr::DT_SHORT => i16::try_from(n).is_ok(),
-                            blr::DT_LONG => i32::try_from(n).is_ok(),
-                            _ => true,
+                            blr::DT_SHORT => i16::try_from(r).is_ok(),
+                            blr::DT_LONG => i32::try_from(r).is_ok(),
+                            _ => i64::try_from(r).is_ok(),
                         };
                         if !fits {
                             return Err("integer overflow".into());
                         }
-                        Value::Int(n)
+                        mk_num(r, slot.scale)
                     }
                     blr::DT_TEXT | blr::DT_TEXT2 | blr::DT_VARYING
                     | blr::DT_VARYING2 => {
-                        // integers render in plain decimal
+                        // integers render in plain decimal, a DECFLOAT
+                        // its cohort (`1.50` stays `1.50`)
                         let t = match v {
                             Value::Text(t) => t,
                             Value::Int(n) => n.to_string(),
+                            Value::DecFloat16(x) => {
+                                fire_crab_ods::decfloat::to_string(
+                                    &fire_crab_ods::decfloat::decode_dec64(x),
+                                )
+                            }
+                            Value::DecFloat34(x) => {
+                                fire_crab_ods::decfloat::to_string(
+                                    &fire_crab_ods::decfloat::decode_dec128(x),
+                                )
+                            }
                             _ => {
                                 return Err(
                                     "cast to text unconverted for this value".into()
@@ -6434,6 +6768,85 @@ impl<'a> Exec<'a> {
                         // 's  ' - CHAR_LENGTH 3, `|| '|'` is 's  |'
                         // (inselcond / condpattern under the switch)
                         coerce_text(Value::Text(t), Some(slot))?
+                    }
+                    blr::DT_DOUBLE => {
+                        // a DECFLOAT converts decimal -> binary through its
+                        // canonical string (correctly rounded); a NaN is
+                        // 22000, an Infinity or a finite past range 22003 -
+                        // all the interpreter's errors. Text parses (blanks
+                        // trimmed, the engine's conversion); an exact
+                        // numeric rides its own decimal spelling.
+                        match &v {
+                            Value::Double(d) => Value::Double(*d),
+                            Value::Float(x) => Value::Double(*x as f64),
+                            Value::DecFloat16(x) => {
+                                dec_to_double(&fire_crab_ods::decfloat::decode_dec64(*x))?
+                            }
+                            Value::DecFloat34(x) => {
+                                dec_to_double(&fire_crab_ods::decfloat::decode_dec128(*x))?
+                            }
+                            Value::Text(t) => {
+                                // CVT_get_double's range test FIRST: a text
+                                // whose decimal scale is past the double's
+                                // is the engine's 22003 BEFORE any value is
+                                // computed - even '2.3e-308', which a double
+                                // could hold (builtins 14, measured). Refuse
+                                // to the interpreter, which raises it.
+                                if fire_crab_ods::decfloat::cvt_double_scale_out_of_range(t) {
+                                    return Err("a text past the double's decimal scale unconverted".into());
+                                }
+                                t.trim_matches(' ')
+                                    .parse::<f64>()
+                                    .ok()
+                                    .filter(|f| f.is_finite())
+                                    .map(Value::Double)
+                                    .ok_or("cast of text to double unconverted")?
+                            }
+                            Value::Int(n) => Value::Double(*n as f64),
+                            Value::Scaled(r, s) => format!("{r}e{s}")
+                                .parse::<f64>()
+                                .ok()
+                                .filter(|f| f.is_finite())
+                                .map(Value::Double)
+                                .ok_or("cast of a numeric to double unconverted")?,
+                            Value::Int128(r, s) => format!("{r}e{s}")
+                                .parse::<f64>()
+                                .ok()
+                                .filter(|f| f.is_finite())
+                                .map(Value::Double)
+                                .ok_or("cast of a numeric to double unconverted")?,
+                            _ => {
+                                return Err(
+                                    "cast to double unconverted for this value".into()
+                                )
+                            }
+                        }
+                    }
+                    blr::DT_DEC64 | blr::DT_DEC128 => {
+                        // everything a CAST to DECFLOAT takes: a DECFLOAT
+                        // (widened, or narrowed HALF-UP), an exact numeric
+                        // at its cohort, a double by the 17-digit
+                        // conversion, text by the strict grammar. Whatever
+                        // does not convert refuses to the interpreter.
+                        //
+                        // EXCEPT a double LITERAL anywhere under the cast:
+                        // that is the engine's assignment fold
+                        // (LiteralNode::pass2 re-reads the literal's TEXT
+                        // as a decimal before the operators run), which
+                        // this executor cannot do - blr_double's spelling
+                        // was parsed to f64 at read, so the 17-digit
+                        // conversion of the runtime value answers
+                        // 3.0000000000000000 for CAST(1.5e0 * 2 AS
+                        // DECFLOAT(34)) where the engine answers 3.0
+                        // (widenum 11, measured). Refuse to the
+                        // interpreter, which owns the fold; a runtime
+                        // double (column, parameter, arithmetic result)
+                        // still converts below.
+                        if expr_has_double_literal(inner) {
+                            return Err("a double literal under a CAST to DECFLOAT unconverted".into());
+                        }
+                        let wide = slot.dtype == blr::DT_DEC128;
+                        dec_cast_target(&v, wide)?
                     }
                     other => {
                         return Err(format!("cast target dtype {} unconverted", other))
@@ -6556,6 +6969,10 @@ impl<'a> Exec<'a> {
                 Value::Int(n) => Value::Int(-n),
                 Value::Scaled(raw, sc) => Value::Scaled(-raw, sc),
                 Value::Int128(raw, sc) => Value::Int128(-raw, sc),
+                // no DECFLOAT arm: a non-literal negate never reaches
+                // this executor (the shape's `negates` refuses it for
+                // the integer-overflow hole), and a DECFLOAT negate is
+                // never a literal - serving one waits on that redesign
                 _ => return Err("negate over a non-numeric value".into()),
             },
             Expr::Arith(verb, l, r) => {
@@ -6570,6 +6987,11 @@ impl<'a> Exec<'a> {
                         _ => Err("concatenation over a non-text value".to_string()),
                     };
                     return Ok(Value::Text(format!("{}{}", text(&lv)?, text(&rv)?)));
+                }
+                // A DECFLOAT OPERAND makes it decimal arithmetic (even
+                // beside a double, which converts - [dec_arith])
+                if dec_of(&lv).is_some() || dec_of(&rv).is_some() {
+                    return dec_arith(*verb, &lv, &rv);
                 }
                 // AN APPROXIMATE OPERAND makes it double arithmetic: IEEE,
                 // as the engine's C++ doubles are. An integer operand joins
@@ -7351,7 +7773,12 @@ pub fn value_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
                 }
             };
             match (d(a), d(b)) {
-                (Some(x), Some(y)) if !matches!(x, dfl::Dec::Nan) && !matches!(y, dfl::Dec::Nan) => {
+                // a VALUE comparison for predicates, MIN/MAX and
+                // grouping: cohorts equal, a NaN unorderable (the
+                // engine traps - the run refuses instead). ORDER BY
+                // never comes here ([null_aware_cmp] orders DECFLOAT
+                // by the total law, [dfl::cmp_total]).
+                (Some(x), Some(y)) if !x.is_nan() && !y.is_nan() => {
                     Some(dfl::cmp(&x, &y))
                 }
                 _ => {
@@ -7433,6 +7860,35 @@ fn placed_cmp(a: &Value, b: &Value, desc: bool, nulls: Option<bool>) -> std::cmp
 
 fn null_aware_cmp(a: &Value, b: &Value, desc: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+    // two DECFLOATs of ONE width order by the engine's SORT KEY alone
+    // (class ranks and value, `decfloat::cmp_key` - descending reverses
+    // those); cohorts, zeros and payloads tie here and the sort record
+    // past the keys decides them (`build_tiebreak`, the engine's own
+    // mechanism - an expression key's ties break by the SOURCE row's
+    // bytes, which a value-folded total law would split too finely).
+    // A promoted exact, or a MIXED-width pair, folds the widened
+    // record in instead (it has no union bytes of its own -
+    // `dec_total_cmp`). NaN is orderable here, never INCOMPARABLE; a
+    // double beside one fails the run instead (the 17-digit cohort
+    // renders - the interpreter's shape).
+    if dec_mixed_approx(a, b) {
+        INCOMPARABLE.with(|f| f.set(true));
+        return Ordering::Equal;
+    }
+    let dec_pair = |v: &Value| dec_of(v).or_else(|| dec_promote_exact(v));
+    if let (Some(x), Some(y)) = (dec_pair(a), dec_pair(b)) {
+        if dec_of(a).is_some() || dec_of(b).is_some() {
+            let native = matches!(
+                (a, b),
+                (Value::DecFloat16(_), Value::DecFloat16(_))
+                    | (Value::DecFloat34(_), Value::DecFloat34(_))
+            );
+            if native {
+                return fire_crab_ods::decfloat::cmp_key(&x, &y, desc);
+            }
+            return dec_total_cmp(a, &x, b, &y, desc);
+        }
+    }
     let o = match (matches!(a, Value::Null), matches!(b, Value::Null)) {
         (true, true) => Ordering::Equal,
         // NULLs sort LOW: first ascending, and the flip below puts
@@ -7446,6 +7902,440 @@ fn null_aware_cmp(a: &Value, b: &Value, desc: bool) -> std::cmp::Ordering {
     } else {
         o
     }
+}
+
+/// A decfloat Value decoded, either width; None for anything else.
+fn dec_of(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
+    use fire_crab_ods::decfloat as dfl;
+    match v {
+        Value::DecFloat16(x) => Some(dfl::decode_dec64(*x)),
+        Value::DecFloat34(x) => Some(dfl::decode_dec128(*x)),
+        _ => None,
+    }
+}
+
+/// Two decfloat Values by the engine's total law at NATIVE width: two
+/// dec16 records compare as 8-byte records, two dec34 as 16-byte ones
+/// (the sort compared those exact bytes); a mixed or promoted pair
+/// widens to dec128 (the union's widening). `x`/`y` decode `xv`/`yv`.
+fn dec_total_cmp(
+    xv: &Value,
+    x: &fire_crab_ods::decfloat::Dec,
+    yv: &Value,
+    y: &fire_crab_ods::decfloat::Dec,
+    desc: bool,
+) -> std::cmp::Ordering {
+    use fire_crab_ods::decfloat as dfl;
+    match (xv, yv) {
+        (Value::DecFloat16(a), Value::DecFloat16(b)) => dfl::cmp_total_64(x, *a, y, *b, desc),
+        (Value::DecFloat34(a), Value::DecFloat34(b)) => dfl::cmp_total_128(x, *a, y, *b, desc),
+        _ => dfl::cmp_total(x, y, desc),
+    }
+}
+
+/// An exact-numeric Value promoted to decimal at its own cohort (an
+/// INT128 past 34 digits rounds the way the engine's conversion does);
+/// None for anything else. The engine unifies exact values beside a
+/// DECFLOAT this way before it compares, dedups, or computes.
+fn dec_promote_exact(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
+    use fire_crab_ods::decfloat as dfl;
+    use fire_crab_ods::decfloat::Dec;
+    match v {
+        Value::Int(n) => Some(Dec::Finite { neg: *n < 0, coeff: n.unsigned_abs() as u128, exp: 0 }),
+        Value::Scaled(r, s) => {
+            Some(Dec::Finite { neg: *r < 0, coeff: r.unsigned_abs() as u128, exp: *s as i32 })
+        }
+        Value::Int128(r, s) => match dfl::round_to_dec34(*r < 0, r.unsigned_abs(), *s as i32) {
+            f @ Dec::Finite { .. } => Some(f),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether a double literal spells anywhere in `e`: a `blr_double`
+/// literal node (an `Expr::Literal` double - a field, parameter or
+/// computed value is a runtime double, not this). The CAST-to-DECFLOAT
+/// arm refuses on it (the assignment fold it cannot do); every other
+/// shape - including a literal under a nested CAST, a function call,
+/// or a conditional's condition (all part of the assignment's source
+/// on the engine) - counts. A scalar subquery's rows are another
+/// assignment's scope, so the walk stops at the `Via` stream and its
+/// value (an inner CAST there declines on its own when evaluated);
+/// only the else - the no-row default, evaluated out here - is walked.
+fn expr_has_double_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(Value::Double(_) | Value::Float(_)) => true,
+        Expr::Literal(_) => false,
+        Expr::Arith(_, a, b) => expr_has_double_literal(a) || expr_has_double_literal(b),
+        Expr::Negate(a)
+        | Expr::CaseMap(_, a)
+        | Expr::StrLen(_, a)
+        | Expr::Trim(_, a)
+        | Expr::Cast(_, a) => expr_has_double_literal(a),
+        Expr::GenId(_, s) => s.as_ref().is_some_and(|x| expr_has_double_literal(x)),
+        Expr::Substr(a, b, c) => {
+            expr_has_double_literal(a) || expr_has_double_literal(b) || expr_has_double_literal(c)
+        }
+        Expr::Coalesce(v) => v.iter().any(expr_has_double_literal),
+        Expr::Decode(x, cs, rs) => {
+            expr_has_double_literal(x) || cs.iter().any(expr_has_double_literal) || rs.iter().any(expr_has_double_literal)
+        }
+        Expr::ValueIf(c, a, b) => {
+            bool_has_double_literal(c) || expr_has_double_literal(a) || expr_has_double_literal(b)
+        }
+        Expr::Via(_, _, els) => expr_has_double_literal(els),
+        Expr::Function(_, _, args) | Expr::SysFn(_, args) => args.iter().any(expr_has_double_literal),
+        Expr::Field(..) | Expr::Variable(_) | Expr::Parameter(..) | Expr::Fid(..) | Expr::Null => false,
+    }
+}
+
+/// Whether a double literal spells anywhere in the boolean `c` (a
+/// conditional's condition is part of the assignment's source too).
+fn bool_has_double_literal(c: &Bool) -> bool {
+    match c {
+        Bool::Cmp(_, a, b) | Bool::Like(a, b) | Bool::Starting(a, b) => {
+            expr_has_double_literal(a) || expr_has_double_literal(b)
+        }
+        Bool::And(a, b) | Bool::Or(a, b) => bool_has_double_literal(a) || bool_has_double_literal(b),
+        Bool::Not(a) => bool_has_double_literal(a),
+        Bool::Missing(x) => expr_has_double_literal(x),
+        Bool::InList(x, v) => expr_has_double_literal(x) || v.iter().any(expr_has_double_literal),
+        Bool::Between(x, lo, hi) => {
+            expr_has_double_literal(x) || expr_has_double_literal(lo) || expr_has_double_literal(hi)
+        }
+        // a subquery's rows are another assignment's scope
+        Bool::Any(_) | Bool::UniqueRse(_) | Bool::Quantified { .. } => false,
+    }
+}
+
+/// A double beside a DECFLOAT: the engine converts by the 17-digit
+/// rendering (`Decimal128::set(double)`), which this parses back -
+/// the only shapes the renderer emits. None when it cannot be one.
+fn dec_from_double(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
+    use fire_crab_ods::decfloat::Dec;
+    let x = match v {
+        Value::Double(d) => *d,
+        Value::Float(f) => *f as f64,
+        _ => return None,
+    };
+    if x.is_nan() {
+        return Some(Dec::quiet_nan());
+    }
+    if x.is_infinite() {
+        return Some(Dec::Infinity { neg: x < 0.0 });
+    }
+    if x == 0.0 {
+        // 0E-16, signed - the engine's decimal128 zero exponent
+        return Some(Dec::Finite { neg: x.is_sign_negative(), coeff: 0, exp: -16 });
+    }
+    let t = format!("{x:.16e}");
+    let (mant, ex) = t.split_once('e')?;
+    let exp: i32 = ex.parse().ok()?;
+    let neg = mant.starts_with('-');
+    let digits: String = mant.chars().filter(|c| c.is_ascii_digit()).collect();
+    let coeff: u128 = digits.parse().ok()?;
+    // one digit before the point, sixteen after
+    Some(Dec::Finite { neg, coeff, exp: exp - 16 })
+}
+
+/// A DECFLOAT as the i64 a CAST to integer answers: HALF-UP on the
+/// magnitude (away from zero: 2.5 -> 3, -2.5 -> -3). None for a NaN,
+/// an Infinity, or a value past i64 (the interpreter raises 22000).
+fn dec_to_int(d: &fire_crab_ods::decfloat::Dec) -> Option<i64> {
+    use fire_crab_ods::decfloat::Dec;
+    let Dec::Finite { neg, coeff, exp } = d else { return None };
+    let mag: u128 = if *exp >= 0 {
+        coeff.checked_mul(10u128.checked_pow(*exp as u32)?)?
+    } else {
+        let div = 10u128.checked_pow((-*exp) as u32)?;
+        let (q, r) = (coeff / div, coeff % div);
+        // twice the remainder against the divisor: an exact half
+        // rounds UP (half-up, on the magnitude)
+        if r.checked_mul(2)? >= div {
+            q.checked_add(1)?
+        } else {
+            q
+        }
+    };
+    if *neg {
+        if mag == i64::MAX as u128 + 1 {
+            // i64::MIN's own magnitude
+            Some(i64::MIN)
+        } else {
+            i64::try_from(mag).ok().and_then(|m| m.checked_neg())
+        }
+    } else {
+        i64::try_from(mag).ok()
+    }
+}
+
+/// A DECFLOAT as the raw a scaled-exact slot answers: HALF-UP to the
+/// slot's scale on the magnitude. None past i128 (the chain's own range
+/// check still applies after - this is only the decimal rounding).
+fn dec_to_scaled(d: &fire_crab_ods::decfloat::Dec, scale: i8) -> Option<i128> {
+    use fire_crab_ods::decfloat::Dec;
+    let Dec::Finite { neg, coeff, exp } = d else { return None };
+    let shift = *exp as i64 - scale as i64;
+    let mag: u128 = if shift >= 0 {
+        coeff.checked_mul(10u128.checked_pow(shift as u32)?)?
+    } else {
+        let div = 10u128.checked_pow((-shift) as u32)?;
+        let (q, r) = (coeff / div, coeff % div);
+        if r.checked_mul(2)? >= div {
+            q.checked_add(1)?
+        } else {
+            q
+        }
+    };
+    if *neg {
+        if mag == i128::MAX as u128 + 1 {
+            Some(i128::MIN)
+        } else {
+            i128::try_from(mag).ok().and_then(|m| m.checked_neg())
+        }
+    } else {
+        i128::try_from(mag).ok()
+    }
+}
+
+/// A DECFLOAT moved into a non-DECFLOAT slot: the slot kind's own
+/// value (an integer at the slot's scale, a double, the rendered text).
+/// Whatever has no form there refuses (boolean, temporal, blob - and a
+/// NaN, an Infinity, or a value past the kind).
+fn dec_to_slot_value(
+    d: &fire_crab_ods::decfloat::Dec,
+    slot: Option<&MsgSlot>,
+) -> Result<Value, String> {
+    let Some(slot) = slot else {
+        return Err("a DECFLOAT assignment unconverted".into());
+    };
+    match slot.dtype {
+        // exact slots take the raw at their own scale (the chain
+        // rescales - a no-op - and range-checks it past this)
+        blr::DT_SHORT | blr::DT_LONG | blr::DT_INT64 | blr::DT_INT128 => dec_to_scaled(d, slot.scale)
+            .map(|r| Value::Int128(r, slot.scale))
+            .ok_or("a DECFLOAT assignment unconverted".into()),
+        blr::DT_DOUBLE => dec_to_double(d),
+        blr::DT_FLOAT => match dec_to_double(d)? {
+            Value::Double(f) => Ok(Value::Float(f as f32)),
+            v => Ok(v),
+        },
+        blr::DT_TEXT | blr::DT_TEXT2 | blr::DT_VARYING | blr::DT_VARYING2 => {
+            Ok(Value::Text(fire_crab_ods::decfloat::to_string(d)))
+        }
+        _ => Err("a DECFLOAT assignment unconverted".into()),
+    }
+}
+
+/// A DECFLOAT as the double a CAST answers: through the canonical
+/// string (correctly rounded). A NaN, an Infinity, or a finite past
+/// range refuses (the interpreter raises 22000 / 22003).
+fn dec_to_double(d: &fire_crab_ods::decfloat::Dec) -> Result<Value, String> {
+    use fire_crab_ods::decfloat as dfl;
+    if d.is_nan() {
+        return Err("cast of NaN to double unconverted".into());
+    }
+    if matches!(d, dfl::Dec::Infinity { .. }) {
+        return Err("cast of Infinity to double unconverted".into());
+    }
+    let f: f64 = dfl::to_string(d)
+        .parse()
+        .map_err(|_| "cast of a DECFLOAT to double unconverted".to_string())?;
+    if !f.is_finite() {
+        return Err("cast of a DECFLOAT to double unconverted".into());
+    }
+    Ok(Value::Double(f))
+}
+
+/// A CAST to DECFLOAT (wide = 34, else 16) from anything the engine
+/// takes: a DECFLOAT, an exact numeric, a double, text. Whatever does
+/// not convert refuses to the interpreter (22018, 22003, the clamped
+/// underflow - all its shapes).
+fn dec_cast_target(v: &Value, wide: bool) -> Result<Value, String> {
+    use fire_crab_ods::decfloat as dfl;
+    use fire_crab_ods::decfloat::Dec;
+    let d = match v {
+        Value::DecFloat16(x) => dfl::decode_dec64(*x),
+        Value::DecFloat34(x) => dfl::decode_dec128(*x),
+        Value::Text(t) => {
+            dfl::parse(t).ok_or("cast of text to DECFLOAT unconverted".to_string())?
+        }
+        other => dec_promote_exact(other)
+            .or_else(|| dec_from_double(other))
+            .ok_or("cast to DECFLOAT unconverted for this value".to_string())?,
+    };
+    if wide {
+        Ok(Value::DecFloat34(dfl::dec_to_bits(&d)))
+    } else {
+        match &d {
+            Dec::Finite { neg, coeff, exp } => match dfl::fit_dec64(*neg, *coeff, *exp) {
+                Some(bits) => Ok(Value::DecFloat16(bits)),
+                None => Err("cast to DECFLOAT(16) unconverted".into()),
+            },
+            // specials narrow by the form (a payload keeps its low 15)
+            _ => Ok(Value::DecFloat16(dfl::dec_to_dec64_bits(&d))),
+        }
+    }
+}
+
+/// TRUE for a DECFLOAT beside a DOUBLE/FLOAT: the engine moves the
+/// double into decimal (whose 17-digit cohort renders), which this
+/// executor declines - the interpreter coerces the union branch.
+fn dec_mixed_approx(a: &Value, b: &Value) -> bool {
+    let approx = |v: &Value| matches!(v, Value::Double(_) | Value::Float(_));
+    (dec_of(a).is_some() && approx(b)) || (approx(a) && dec_of(b).is_some())
+}
+
+/// Decimal arithmetic for [Expr::Arith] with a DECFLOAT aboard: the
+/// other side promotes (an exact one at its cohort, a double by the
+/// 17-digit conversion); the result is DECFLOAT(34) unless both sides
+/// are DECFLOAT(16) (a double widens - probed). An error situation -
+/// a zero divisor, an overflow, a fresh or signaling NaN - refuses to
+/// the interpreter, which raises the engine's error; a quiet NaN
+/// propagates as the answer.
+fn dec_arith(verb: u8, lv: &Value, rv: &Value) -> Result<Value, String> {
+    use fire_crab_ods::decfloat as dfl;
+    use fire_crab_ods::decfloat::Dec;
+    let approx = |v: &Value| matches!(v, Value::Double(_) | Value::Float(_));
+    let wide = matches!(lv, Value::DecFloat34(_))
+        || matches!(rv, Value::DecFloat34(_))
+        || approx(lv)
+        || approx(rv);
+    let cvt = |v: &Value| -> Result<Dec, String> {
+        dec_of(v)
+            .or_else(|| dec_promote_exact(v))
+            .or_else(|| dec_from_double(v))
+            .ok_or_else(|| "decimal arithmetic over this operand unconverted".to_string())
+    };
+    let a = cvt(lv)?;
+    let b = cvt(rv)?;
+    if a.is_signaling_nan() || b.is_signaling_nan() {
+        return Err("decimal arithmetic over a signaling NaN unconverted".into());
+    }
+    let fin = |x: &Dec| matches!(x, Dec::Finite { .. });
+    if verb == blr::DIVIDE && matches!(b, Dec::Finite { coeff: 0, .. }) {
+        // the interpreter raises 22012 (or 22000 for 0/0)
+        return Err("a decimal division by zero unconverted".into());
+    }
+    let r = match verb {
+        blr::ADD => dfl::add(&a, &b),
+        blr::SUBTRACT => dfl::sub(&a, &b),
+        blr::MULTIPLY => dfl::mul(&a, &b),
+        blr::DIVIDE => dfl::div(&a, &b),
+        _ => return Err("a decimal verb unconverted".into()),
+    };
+    if r.is_nan() && !a.is_nan() && !b.is_nan() {
+        return Err("a decimal invalid operation unconverted".into());
+    }
+    if matches!(r, Dec::Infinity { .. }) && fin(&a) && fin(&b) {
+        return Err("a decimal overflow unconverted".into());
+    }
+    if wide {
+        Ok(Value::DecFloat34(dfl::dec_to_bits(&r)))
+    } else {
+        // both sides DECFLOAT(16): fit to 16 (an unrepresentable
+        // quotient refuses - the interpreter raises 22003)
+        match &r {
+            Dec::Finite { neg, coeff, exp } => match dfl::fit_dec64(*neg, *coeff, *exp) {
+                Some(bits) => Ok(Value::DecFloat16(bits)),
+                None => Err("a DECFLOAT(16) result unconverted".into()),
+            },
+            Dec::Infinity { .. } => Err("a DECFLOAT(16) overflow unconverted".into()),
+            Dec::Nan { .. } => Ok(Value::DecFloat16(dfl::dec_to_dec64_bits(&r))),
+        }
+    }
+}
+
+/// DISTINCT's row equality with a DECFLOAT in the keys: every column
+/// equal, a DECFLOAT pair by the dedup law ([dfl::dedup_eq]), the rest
+/// by [group_eq].
+fn distinct_keys_eq(a: &[Value], b: &[Value]) -> bool {
+    use fire_crab_ods::decfloat as dfl;
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| match (dec_of(x), dec_of(y)) {
+            (Some(dx), Some(dy)) => dfl::dedup_eq(&dx, &dy),
+            _ => group_eq(x, y),
+        })
+}
+
+/// Fold one value into a decimal SUM / AVG accumulator: a DECFLOAT
+/// as is, an exact numeric at its own cohort (a double beside either
+/// refuses - the engine's mixed promotion is unconverted here). The
+/// first value folds as `0 + d`, exactly as the interpreter does. A
+/// signaling NaN, a fresh NaN (+Inf meeting -Inf), or an overflow to
+/// Infinity refuses to the interpreter, which raises the engine's
+/// error; a quiet NaN propagates as the answer.
+fn sumdec_step(
+    acc: &mut Option<fire_crab_ods::decfloat::Dec>,
+    wide: &mut bool,
+    v: &Value,
+) -> Result<(), String> {
+    use fire_crab_ods::decfloat as dfl;
+    use fire_crab_ods::decfloat::Dec;
+    if matches!(v, Value::DecFloat34(_)) {
+        *wide = true;
+    }
+    // an exact row promotes as the engine's conversion does: rounded
+    // to 34 digits where it does not fit (an INT128 past them)
+    let d = match v {
+        Value::DecFloat16(x) => dfl::decode_dec64(*x),
+        Value::DecFloat34(x) => dfl::decode_dec128(*x),
+        Value::Int(n) => Dec::Finite { neg: *n < 0, coeff: n.unsigned_abs() as u128, exp: 0 },
+        Value::Scaled(r, s) => Dec::Finite {
+            neg: *r < 0,
+            coeff: r.unsigned_abs() as u128,
+            exp: *s as i32,
+        },
+        Value::Int128(r, s) => {
+            let (neg, coeff) = (*r < 0, r.unsigned_abs());
+            match dfl::round_to_dec34(neg, coeff, *s as i32) {
+                f @ Dec::Finite { .. } => f,
+                _ => return Err("SUM / AVG over an undecimal operand unconverted".into()),
+            }
+        }
+        _ => return Err("SUM / AVG over a mixed decimal operand unconverted".into()),
+    };
+    if d.is_signaling_nan() {
+        return Err("SUM / AVG over a signaling NaN unconverted".into());
+    }
+    let acc0 = acc.clone();
+    let next = match acc0 {
+        None => dfl::add(&Dec::Finite { neg: false, coeff: 0, exp: 0 }, &d),
+        Some(ref a) => dfl::add(a, &d),
+    };
+    let fin = |x: &Dec| matches!(x, Dec::Finite { .. });
+    if matches!(next, Dec::Infinity { .. })
+        && fin(&d)
+        && acc0.as_ref().map_or(true, fin)
+    {
+        return Err("a decimal SUM overflow unconverted".into());
+    }
+    if next.is_nan() && !d.is_nan() && !acc0.as_ref().is_some_and(|a| a.is_nan()) {
+        return Err("a decimal SUM invalid operation unconverted".into());
+    }
+    *acc = Some(next);
+    Ok(())
+}
+
+/// TRUE when the candidate DISTINCT row's representative beats the
+/// kept one: the first DECFLOAT column that distinguishes them,
+/// total-greatest wins ([dfl::cmp_total] ascending) - an exact value
+/// beside one promotes to its cohort first, the engine's unification.
+fn distinct_row_greater(cand: &[Value], kept: &[Value]) -> bool {
+    let dec_pair = |v: &Value| dec_of(v).or_else(|| dec_promote_exact(v));
+    for (x, y) in cand.iter().zip(kept.iter()) {
+        if let (Some(dx), Some(dy)) = (dec_pair(x), dec_pair(y)) {
+            if dec_of(x).is_some() || dec_of(y).is_some() {
+                match dec_total_cmp(x, &dx, y, &dy, false) {
+                    std::cmp::Ordering::Greater => return true,
+                    std::cmp::Ordering::Less => return false,
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+        }
+    }
+    false
 }
 
 /// One column of the first committed primary row of a system relation
@@ -7830,5 +8720,42 @@ mod tests {
             ),
             Some(Equal)
         );
+    }
+
+    #[test]
+    fn double_literal_walk() {
+        let lit = |d: f64| Expr::Literal(Value::Double(d));
+        let int = Expr::Literal(Value::Int(2));
+        // a bare literal, and under the operators a CAST operand wears
+        assert!(expr_has_double_literal(&lit(1.5)));
+        assert!(expr_has_double_literal(&Expr::Negate(Box::new(lit(0.5)))));
+        assert!(expr_has_double_literal(&Expr::Arith(
+            blr::MULTIPLY,
+            Box::new(lit(1.5)),
+            Box::new(int.clone())
+        )));
+        // under a nested CAST, a function call, a conditional's condition
+        let slot = MsgSlot { dtype: blr::DT_DOUBLE, length: 8, scale: 0, ttype: 0, blob_sub: 0 };
+        assert!(expr_has_double_literal(&Expr::Cast(slot.clone(), Box::new(lit(1e37)))));
+        assert!(expr_has_double_literal(&Expr::SysFn(
+            "ABS".into(),
+            vec![lit(-2.5)]
+        )));
+        assert!(expr_has_double_literal(&Expr::ValueIf(
+            Box::new(Bool::Cmp(blr::GTR, lit(0.1), int.clone())),
+            Box::new(int.clone()),
+            Box::new(int.clone()),
+        )));
+        // a runtime double is not a literal: a field, a parameter, a
+        // computed value, an exact literal
+        assert!(!expr_has_double_literal(&Expr::Field(0, "DBL".into())));
+        assert!(!expr_has_double_literal(&Expr::Parameter(0, 0)));
+        assert!(!expr_has_double_literal(&Expr::Arith(
+            blr::ADD,
+            Box::new(Expr::Field(0, "DBL".into())),
+            Box::new(int.clone())
+        )));
+        assert!(!expr_has_double_literal(&int));
+        assert!(!expr_has_double_literal(&Expr::Null));
     }
 }
