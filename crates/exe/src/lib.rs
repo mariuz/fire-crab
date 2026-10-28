@@ -27,6 +27,7 @@ use fire_crab_ods::{
     resolve_relation, system_relation_formats, visible_rows, DataPage, TipChain,
     Value,
 };
+use fire_crab_ods::sortrec::{self, SlotDesc, TieField};
 
 /// The BLR verbs this executor understands - `blr.h` values. The
 /// numbers are the same table `fire-crab-dsql` emits from; this crate
@@ -2720,6 +2721,1245 @@ struct StreamFrame {
     relation: Option<String>,
     /// field-id (or map-slot) -> values of the CURRENT row
     row: Vec<Value>,
+    /// the row's record number and version transaction - the sort
+    /// record's dbkey/trans pair; None for a frame with no row
+    /// (aggregate output, an outer join's padding, a union row).
+    recno: Option<u64>,
+    txn: Option<u64>,
+    /// a slot-indexed (relation-less) frame's per-slot sort
+    /// descriptors, stamped by its producer (union, aggregate,
+    /// recursion): the sort map's data fields. None when the
+    /// producer could not derive them (a sort over ties then
+    /// declines); Some(empty) for window-extra frames, whose
+    /// computed columns the tiebreak omits (roadmap boundary).
+    slot_descs: Option<Vec<SlotDesc>>,
+}
+
+/// One scanned row with its record identity - what the sort record's
+/// dbkey/trans pair is built from.
+struct RowHit {
+    row: Vec<Value>,
+    recno: u64,
+    txn: u64,
+}
+
+/// Fields referenced anywhere in a request scope, per context: the
+/// executor's csb_fields (Optimizer::generateSort reads the bitmap the
+/// optimizer collected globally). Collected once per Stmt::For by
+/// [collect_sort_fields]; each sort filters it to its frames'
+/// contexts for the sort map's data fields.
+#[derive(Clone, Debug, Default)]
+struct SortFields {
+    /// context -> field NAMES (uppercased, BLR form)
+    names: std::collections::HashMap<u8, std::collections::HashSet<String>>,
+    /// context -> fid slots (aggregate/union/recursion output)
+    slots: std::collections::HashMap<u8, std::collections::HashSet<u16>>,
+}
+
+/// Collect every field a request scope references: the rse AND the
+/// body (the send list's output columns ride the sort map too - a
+/// `SELECT V ... ORDER BY G` breaks G-ties by V). Subquery rse's are
+/// descended into (a correlated EXISTS references the outer streams);
+/// each sort site keeps only its own frames' contexts.
+fn collect_sort_fields(rse: &Rse, body: &Stmt) -> SortFields {
+    struct W {
+        out: SortFields,
+    }
+    impl W {
+        fn field(&mut self, c: u8, name: &str) {
+            self.out.names.entry(c).or_default().insert(name.to_ascii_uppercase());
+        }
+        fn fid(&mut self, c: u8, slot: u16) {
+            self.out.slots.entry(c).or_default().insert(slot);
+        }
+        fn expr(&mut self, e: &Expr) {
+            match e {
+                Expr::Field(c, n) => self.field(*c, n),
+                Expr::Fid(c, s) => self.fid(*c, *s),
+                Expr::Arith(_, a, b) => {
+                    self.expr(a);
+                    self.expr(b);
+                }
+                Expr::Negate(a)
+                | Expr::CaseMap(_, a)
+                | Expr::StrLen(_, a)
+                | Expr::Trim(_, a)
+                | Expr::Cast(_, a) => self.expr(a),
+                Expr::GenId(_, a) => {
+                    if let Some(x) = a {
+                        self.expr(x);
+                    }
+                }
+                Expr::Substr(a, b, c) => {
+                    self.expr(a);
+                    self.expr(b);
+                    self.expr(c);
+                }
+                Expr::Coalesce(v) | Expr::Function(_, _, v) | Expr::SysFn(_, v) => {
+                    v.iter().for_each(|x| self.expr(x));
+                }
+                Expr::Decode(a, c, r) => {
+                    self.expr(a);
+                    c.iter().for_each(|x| self.expr(x));
+                    r.iter().for_each(|x| self.expr(x));
+                }
+                Expr::ValueIf(c, a, b) => {
+                    self.boolean(c);
+                    self.expr(a);
+                    self.expr(b);
+                }
+                Expr::Via(r, a, b) => {
+                    self.rse(r);
+                    self.expr(a);
+                    self.expr(b);
+                }
+                Expr::Variable(_) | Expr::Parameter(..) | Expr::Literal(_) | Expr::Null => {}
+            }
+        }
+        fn boolean(&mut self, b: &Bool) {
+            match b {
+                Bool::Cmp(_, x, y) | Bool::Like(x, y) | Bool::Starting(x, y) => {
+                    self.expr(x);
+                    self.expr(y);
+                }
+                Bool::And(x, y) | Bool::Or(x, y) => {
+                    self.boolean(x);
+                    self.boolean(y);
+                }
+                Bool::Not(x) => self.boolean(x),
+                Bool::Missing(x) => self.expr(x),
+                Bool::InList(x, v) => {
+                    self.expr(x);
+                    v.iter().for_each(|y| self.expr(y));
+                }
+                Bool::Between(x, lo, hi) => {
+                    self.expr(x);
+                    self.expr(lo);
+                    self.expr(hi);
+                }
+                Bool::Any(r) | Bool::UniqueRse(r) => self.rse(r),
+                Bool::Quantified { rse, .. } => self.rse(rse),
+            }
+        }
+        fn rse(&mut self, r: &Rse) {
+            self.stream(&r.stream);
+            if let Some(b) = &r.boolean {
+                self.boolean(b);
+            }
+            r.sort.iter().for_each(|k| self.expr(&k.expr));
+            r.project.iter().for_each(|x| self.expr(x));
+            for x in r.first.iter().chain(r.skip.iter()) {
+                self.expr(x);
+            }
+        }
+        fn stream(&mut self, s: &Stream) {
+            match s {
+                Stream::Relation { .. } => {}
+                Stream::Aggregate(a) => {
+                    self.rse(&a.source);
+                    a.group_by.iter().for_each(|x| self.expr(x));
+                    for (_, m) in &a.map {
+                        match m {
+                            MapItem::Agg(_, Some(x)) | MapItem::Value(x) => self.expr(x),
+                            MapItem::Fn(_, v) => v.iter().for_each(|x| self.expr(x)),
+                            MapItem::List { value, delim, order, .. } => {
+                                self.expr(value);
+                                self.expr(delim);
+                                order.iter().for_each(|k| self.expr(&k.expr));
+                            }
+                            MapItem::Agg(_, None) => {}
+                        }
+                    }
+                }
+                Stream::Join { streams, on, .. } => {
+                    for j in streams {
+                        match j {
+                            JoinSource::Rel(_) => {}
+                            JoinSource::Nested(n) => self.stream(n),
+                        }
+                    }
+                    if let Some(b) = on {
+                        self.boolean(b);
+                    }
+                }
+                Stream::Derived(r) => self.rse(r),
+                Stream::Union { branches, .. } => {
+                    for (r, m) in branches {
+                        self.rse(r);
+                        m.iter().for_each(|(_, x)| self.expr(x));
+                    }
+                }
+                Stream::Recurse { anchor, anchor_map, rec_boolean, rec_map, .. } => {
+                    self.rse(anchor);
+                    anchor_map.iter().chain(rec_map.iter()).for_each(|(_, x)| self.expr(x));
+                    if let Some(b) = rec_boolean {
+                        self.boolean(b);
+                    }
+                }
+                Stream::Window { source, windows } => {
+                    self.rse(source);
+                    for w in windows {
+                        w.partition.iter().for_each(|x| self.expr(x));
+                        w.order.iter().for_each(|k| self.expr(&k.expr));
+                        for (_, it) in &w.map {
+                            match it {
+                                WinItem::Agg(_, Some(x)) | WinItem::Value(x) => self.expr(x),
+                                WinItem::Fn(_, v) => v.iter().for_each(|x| self.expr(x)),
+                                WinItem::Agg(_, None) => {}
+                            }
+                        }
+                        if let Some(f) = &w.frame {
+                            for b in [&f.start, &f.end] {
+                                if let Some(v) = &b.value {
+                                    self.expr(v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fn stmt(&mut self, s: &Stmt) {
+            match s {
+                Stmt::Begin(v) => v.iter().for_each(|x| self.stmt(x)),
+                Stmt::Label(_, x) | Stmt::Send(_, x) | Stmt::Loop(_, x) => self.stmt(x),
+                Stmt::For(_, r, b) => {
+                    self.rse(r);
+                    self.stmt(b);
+                }
+                Stmt::Assign(x, _) => self.expr(x),
+                Stmt::If(c, a, b) => {
+                    self.boolean(c);
+                    self.stmt(a);
+                    if let Some(x) = b {
+                        self.stmt(x);
+                    }
+                }
+                Stmt::Stall | Stmt::Leave(_) | Stmt::Continue(_) => {}
+            }
+        }
+    }
+    let mut w = W { out: SortFields::default() };
+    w.rse(rse);
+    w.stmt(body);
+    w.out
+}
+
+/// Derive an expression's sort descriptor (dtype, dsc_length, ttype):
+/// DSQL's `getDesc` rules, needed for the sort key region's length
+/// (which aligns everything past it) and for slot-stamping union and
+/// aggregate output. `frames` resolves fields and fids (a producer
+/// passes its input bindings' first row). None = underivable (a sort
+/// that needs it over ties declines).
+fn expr_desc(
+    file: &fire_crab_ods::Image,
+    page_size: usize,
+    msg_slots: &[Vec<MsgSlot>],
+    var_slots: &[Option<MsgSlot>],
+    frames: &[StreamFrame],
+    e: &Expr,
+) -> Option<SlotDesc> {
+    use fire_crab_ods::format::dtype;
+    match e {
+        Expr::Field(c, name) => {
+            let f = frames.iter().find(|f| f.context == *c)?;
+            let rel = f.relation.as_ref()?;
+            let rel_id = resolve_relation(file, page_size, rel)?;
+            let formats = relation_or_system_formats(file, page_size, rel_id, rel);
+            let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+            let cols = relation_columns(file, page_size, rel);
+            let want = name.trim_end().to_ascii_uppercase();
+            let fid = cols.iter().find(|col| col.name.trim_end().to_ascii_uppercase() == want)?;
+            let d = descs.get(fid.field_id as usize)?;
+            Some(SlotDesc {
+                dtype: d.dtype,
+                len: d.length as usize,
+                charset: fire_crab_ods::intl::charset_id(d.sub_type),
+                coll: fire_crab_ods::intl::collation_id(d.sub_type),
+            })
+        }
+        Expr::Fid(c, slot) => {
+            let f = frames.iter().find(|f| f.context == *c)?;
+            let stamped = f.slot_descs.as_ref()?;
+            stamped.get(*slot as usize).copied()
+        }
+        Expr::Literal(v) => literal_desc(v),
+        Expr::Parameter(m, s) => {
+            msg_slots.get(*m as usize)?.get(*s as usize).map(msgslot_desc)
+        }
+        Expr::Variable(n) => var_slots.get(*n as usize)?.as_ref().map(msgslot_desc),
+        Expr::Cast(slot, _) => Some(msgslot_desc(slot)),
+        Expr::Negate(a) => expr_desc(file, page_size, msg_slots, var_slots, frames, a),
+        Expr::Arith(v, a, b) => {
+            let da = expr_desc(file, page_size, msg_slots, var_slots, frames, a)?;
+            let db = expr_desc(file, page_size, msg_slots, var_slots, frames, b)?;
+            arith_desc(*v, &da, &db)
+        }
+        // CHAR_LENGTH / OCTET_LENGTH: LONG, INT64 over a blob
+        // (StrLenNode::getDesc).
+        Expr::StrLen(_, a) => {
+            let da = expr_desc(file, page_size, msg_slots, var_slots, frames, a)?;
+            if da.dtype == dtype::BLOB {
+                Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 })
+            } else {
+                Some(SlotDesc { dtype: dtype::LONG, len: 4, charset: 0, coll: 0 })
+            }
+        }
+        Expr::CaseMap(_, a) => expr_desc(file, page_size, msg_slots, var_slots, frames, a),
+        // TRIM is VARYING over the operand's bytes (TrimNode::getDesc;
+        // a non-text operand is ASCII).
+        Expr::Trim(_, a) => {
+            let mut da = expr_desc(file, page_size, msg_slots, var_slots, frames, a)?;
+            if da.dtype == dtype::BLOB {
+                return Some(da);
+            }
+            if !matches!(da.dtype, dtype::TEXT | dtype::VARYING | sortrec::CSTRING) {
+                da.charset = fire_crab_ods::intl::CS_ASCII;
+                da.coll = 0;
+                da.len = 30;
+                da.dtype = dtype::TEXT;
+            }
+            let payload = if da.dtype == dtype::VARYING { da.len.saturating_sub(2) } else { da.len };
+            da.dtype = dtype::VARYING;
+            da.len = payload + 2;
+            Some(da)
+        }
+        // SUBSTRING is VARYING over min(operand, constant length)
+        // (makeSubstr); a blob stays a blob.
+        Expr::Substr(a, _start, len) => {
+            let da = expr_desc(file, page_size, msg_slots, var_slots, frames, a)?;
+            if da.dtype == dtype::BLOB {
+                return Some(da);
+            }
+            let mut payload: usize = if da.dtype == dtype::VARYING {
+                da.len.saturating_sub(2)
+            } else if matches!(da.dtype, dtype::TEXT | sortrec::CSTRING) {
+                da.len
+            } else {
+                return None;
+            };
+            if let Expr::Literal(Value::Int(n)) = &**len {
+                if *n >= 0 {
+                    let bpc = fire_crab_ods::intl::bytes_per_char(da.charset).max(1) as usize;
+                    payload = payload.min((*n as usize).saturating_mul(bpc)).min(32765);
+                }
+            }
+            Some(SlotDesc { dtype: dtype::VARYING, len: payload + 2, charset: da.charset, coll: da.coll })
+        }
+        Expr::Coalesce(v) => {
+            let mut acc: Option<SlotDesc> = None;
+            for x in v {
+                // a NULL branch contributes no type
+                if matches!(x, Expr::Null) {
+                    continue;
+                }
+                let d = expr_desc(file, page_size, msg_slots, var_slots, frames, x)?;
+                acc = Some(match acc {
+                    None => d,
+                    Some(a) => unify_descs(&a, &d)?,
+                });
+            }
+            acc
+        }
+        // the simple CASE returns one of its results
+        Expr::Decode(_, _, r) => {
+            let mut acc: Option<SlotDesc> = None;
+            for x in r {
+                if matches!(x, Expr::Null) {
+                    continue;
+                }
+                let d = expr_desc(file, page_size, msg_slots, var_slots, frames, x)?;
+                acc = Some(match acc {
+                    None => d,
+                    Some(a) => unify_descs(&a, &d)?,
+                });
+            }
+            acc
+        }
+        Expr::ValueIf(_, a, b) => {
+            let da = expr_desc(file, page_size, msg_slots, var_slots, frames, a)?;
+            let db = expr_desc(file, page_size, msg_slots, var_slots, frames, b)?;
+            unify_descs(&da, &db)
+        }
+        Expr::Via(_, value, _) => expr_desc(file, page_size, msg_slots, var_slots, frames, value),
+        Expr::GenId(_, _) => {
+            Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 })
+        }
+        Expr::SysFn(name, args) => sysfn_desc(file, page_size, msg_slots, var_slots, frames, name, args),
+        // a UDF's return type lives in the catalog; the engine reads
+        // it at compile time and this port declines instead
+        Expr::Function(..) => None,
+        // `ORDER BY NULL` is a constant sort: unreachable past the
+        // keys-tie prescan unless a row exists, and then declined
+        Expr::Null => None,
+    }
+}
+
+/// A BLR literal's descriptor, from its decoded value. Integer
+/// literals ride blr_long (this compiler) or wider; the provisional
+/// rule below (by range) is confirmed by the PSQL-BLR probe for the
+/// engine's own literals.
+fn literal_desc(v: &Value) -> Option<SlotDesc> {
+    use fire_crab_ods::format::dtype;
+    let num = |n: i64| {
+        if n >= i16::MIN as i64 && n <= i16::MAX as i64 {
+            // provisional SHORT: the engine's literal typing probe
+            // decides SHORT-vs-LONG for small engine literals
+            SlotDesc { dtype: dtype::SHORT, len: 2, charset: 0, coll: 0 }
+        } else if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
+            SlotDesc { dtype: dtype::LONG, len: 4, charset: 0, coll: 0 }
+        } else {
+            SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 }
+        }
+    };
+    Some(match v {
+        Value::Int(n) => num(*n),
+        Value::Scaled(raw, _s) | Value::Rounded(raw, _s) => {
+            // a decimal literal's NUMERIC precision is its written
+            // digits; the width follows the p<=4/9/18/38 ladder
+            let digits = raw.unsigned_abs().to_string().len();
+            let (dtype, len) = if digits <= 4 {
+                (dtype::SHORT, 2)
+            } else if digits <= 9 {
+                (dtype::LONG, 4)
+            } else if digits <= 18 {
+                (dtype::INT64, 8)
+            } else {
+                (dtype::INT128, 16)
+            };
+            SlotDesc { dtype, len, charset: 0, coll: 0 }
+        }
+        Value::Int128(_, _) => SlotDesc { dtype: dtype::INT128, len: 16, charset: 0, coll: 0 },
+        Value::Float(_) => SlotDesc { dtype: dtype::REAL, len: 4, charset: 0, coll: 0 },
+        Value::Double(_) => SlotDesc { dtype: dtype::DOUBLE, len: 8, charset: 0, coll: 0 },
+        Value::Bool(_) => SlotDesc { dtype: dtype::BOOLEAN, len: 1, charset: 0, coll: 0 },
+        Value::Date(_) => SlotDesc { dtype: dtype::SQL_DATE, len: 4, charset: 0, coll: 0 },
+        Value::Time(_) => SlotDesc { dtype: dtype::SQL_TIME, len: 4, charset: 0, coll: 0 },
+        Value::Timestamp(_, _) => SlotDesc { dtype: dtype::TIMESTAMP, len: 8, charset: 0, coll: 0 },
+        Value::TimeTz(_, _) => SlotDesc { dtype: dtype::SQL_TIME_TZ, len: 8, charset: 0, coll: 0 },
+        Value::TimestampTz(_, _, _) => {
+            SlotDesc { dtype: dtype::TIMESTAMP_TZ, len: 12, charset: 0, coll: 0 }
+        }
+        Value::DecFloat16(_) => SlotDesc { dtype: dtype::DEC64, len: 8, charset: 0, coll: 0 },
+        Value::DecFloat34(_) => SlotDesc { dtype: dtype::DEC128, len: 16, charset: 0, coll: 0 },
+        // a string literal is CHAR in the connection charset (NONE
+        // here: one byte per char); the PSQL-BLR probe confirms the
+        // CHAR-vs-VARCHAR shape for engine literals
+        Value::Text(s) => SlotDesc {
+            dtype: dtype::TEXT,
+            len: s.len(),
+            charset: fire_crab_ods::intl::CS_NONE,
+            coll: 0,
+        },
+        _ => return None,
+    })
+}
+
+/// A message slot's descriptor (CAST targets, parameters, variables).
+fn msgslot_desc(s: &MsgSlot) -> SlotDesc {
+    use fire_crab_ods::format::dtype;
+    let (dt, len) = match s.dtype {
+        blr::DT_SHORT => (dtype::SHORT, 2),
+        blr::DT_LONG => (dtype::LONG, 4),
+        blr::DT_INT64 => (dtype::INT64, 8),
+        blr::DT_INT128 => (dtype::INT128, 16),
+        blr::DT_TEXT | blr::DT_TEXT2 => (dtype::TEXT, s.length as usize),
+        blr::DT_VARYING | blr::DT_VARYING2 => {
+            // the slot length counts CHARACTERS: dsc_length is bytes + 2
+            let bpc = fire_crab_ods::intl::bytes_per_char((s.ttype & 0xFF) as u8).max(1) as usize;
+            (dtype::VARYING, s.length as usize * bpc + 2)
+        }
+        blr::DT_SQL_DATE => (dtype::SQL_DATE, 4),
+        blr::DT_SQL_TIME => (dtype::SQL_TIME, 4),
+        blr::DT_TIMESTAMP => (dtype::TIMESTAMP, 8),
+        blr::DT_DOUBLE => (dtype::DOUBLE, 8),
+        blr::DT_FLOAT => (dtype::REAL, 4),
+        blr::DT_BOOL => (dtype::BOOLEAN, 1),
+        blr::DT_DEC64 => (dtype::DEC64, 8),
+        blr::DT_DEC128 => (dtype::DEC128, 16),
+        blr::DT_BLOB2 => (dtype::BLOB, 8),
+        blr::DT_TIME_TZ => (dtype::SQL_TIME_TZ, 8),
+        blr::DT_TIMESTAMP_TZ => (dtype::TIMESTAMP_TZ, 12),
+        _ => (dtype::LONG, 4),
+    };
+    SlotDesc {
+        dtype: dt,
+        len,
+        charset: (s.ttype & 0xFF) as u8,
+        coll: ((s.ttype >> 8) & 0xFF) as u8,
+    }
+}
+
+/// Dialect-3 arithmetic result descriptors (ExprNodes.cpp addDialect3
+/// and the DSC_multiply_result table): ADD/SUB widens small ints to
+/// INT64, MUL/DIV follows the table, CONCATENATE makes VARYING.
+fn arith_desc(verb: u8, a: &SlotDesc, b: &SlotDesc) -> Option<SlotDesc> {
+    use fire_crab_ods::format::dtype;
+    if verb == blr::CONCATENATE {
+        if a.dtype == dtype::BLOB || b.dtype == dtype::BLOB {
+            return Some(SlotDesc { dtype: dtype::BLOB, len: 8, charset: a.charset, coll: 0 });
+        }
+        let pay = |d: &SlotDesc| -> Option<usize> {
+            if d.dtype == dtype::VARYING {
+                Some(d.len.saturating_sub(2))
+            } else if matches!(d.dtype, dtype::TEXT | sortrec::CSTRING) {
+                Some(d.len)
+            } else {
+                None
+            }
+        };
+        let total = pay(a)?.saturating_add(pay(b)?).min(32765);
+        let (charset, coll) = unify_ttype(a, b)?;
+        return Some(SlotDesc { dtype: dtype::VARYING, len: total + 2, charset, coll });
+    }
+    let num = |d: &SlotDesc| {
+        matches!(
+            d.dtype,
+            dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 | dtype::REAL | dtype::DOUBLE
+        )
+    };
+    let approx = |d: &SlotDesc| matches!(d.dtype, dtype::REAL | dtype::DOUBLE);
+    let texty = |d: &SlotDesc| matches!(d.dtype, dtype::TEXT | dtype::VARYING | sortrec::CSTRING);
+    let decf = |d: &SlotDesc| matches!(d.dtype, dtype::DEC64 | dtype::DEC128);
+    // datetime arithmetic: date-time minus date-time is a number,
+    // date-time plus a number is the date-time (addDialect3)
+    let temporal = |d: &SlotDesc| {
+        matches!(
+            d.dtype,
+            dtype::SQL_DATE | dtype::SQL_TIME | dtype::TIMESTAMP | dtype::SQL_TIME_TZ | dtype::TIMESTAMP_TZ
+        )
+    };
+    if verb == blr::SUBTRACT && temporal(a) && temporal(b) {
+        if a.dtype == dtype::SQL_DATE && b.dtype == dtype::SQL_DATE {
+            return Some(SlotDesc { dtype: dtype::LONG, len: 4, charset: 0, coll: 0 });
+        }
+        if matches!(a.dtype, dtype::SQL_TIME | dtype::SQL_TIME_TZ)
+            && matches!(b.dtype, dtype::SQL_TIME | dtype::SQL_TIME_TZ)
+        {
+            return Some(SlotDesc { dtype: dtype::LONG, len: 4, charset: 0, coll: 0 });
+        }
+        return Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 });
+    }
+    if (verb == blr::ADD || verb == blr::SUBTRACT) && temporal(a) && num(b) {
+        return Some(*a);
+    }
+    if verb == blr::ADD && num(a) && temporal(b) {
+        return Some(*b);
+    }
+    if temporal(a) || temporal(b) {
+        return None;
+    }
+    if verb == blr::ADD || verb == blr::SUBTRACT {
+        if decf(a) || decf(b) {
+            return Some(SlotDesc { dtype: dtype::DEC128, len: 16, charset: 0, coll: 0 });
+        }
+        if a.dtype == dtype::INT128 || b.dtype == dtype::INT128 {
+            return Some(SlotDesc { dtype: dtype::INT128, len: 16, charset: 0, coll: 0 });
+        }
+        if approx(a) || approx(b) || texty(a) || texty(b) {
+            return Some(SlotDesc { dtype: dtype::DOUBLE, len: 8, charset: 0, coll: 0 });
+        }
+        if num(a) && num(b) {
+            return Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 });
+        }
+        return None;
+    }
+    if verb == blr::MULTIPLY || verb == blr::DIVIDE {
+        if decf(a) || decf(b) {
+            return Some(SlotDesc { dtype: dtype::DEC128, len: 16, charset: 0, coll: 0 });
+        }
+        if approx(a) || approx(b) || texty(a) || texty(b) {
+            return Some(SlotDesc { dtype: dtype::DOUBLE, len: 8, charset: 0, coll: 0 });
+        }
+        let small = |d: &SlotDesc| matches!(d.dtype, dtype::SHORT | dtype::LONG);
+        if small(a) && small(b) {
+            return Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 });
+        }
+        if num(a) && num(b) {
+            return Some(SlotDesc { dtype: dtype::INT128, len: 16, charset: 0, coll: 0 });
+        }
+        return None;
+    }
+    None
+}
+
+/// Unify two text types: same wins, NONE absorbs, anything else
+/// declines (a cross-charset union the engine transliterates or
+/// rejects per case - unconverted here).
+fn unify_ttype(a: &SlotDesc, b: &SlotDesc) -> Option<(u8, u8)> {
+    use fire_crab_ods::intl;
+    if a.charset == b.charset && a.coll == b.coll {
+        return Some((a.charset, a.coll));
+    }
+    if a.charset == intl::CS_NONE && b.coll == 0 {
+        return Some((b.charset, b.coll));
+    }
+    if b.charset == intl::CS_NONE && a.coll == 0 {
+        return Some((a.charset, a.coll));
+    }
+    None
+}
+
+/// Unify two descriptors (COALESCE / CASE / UNION): numerics widen,
+/// text takes the varying shape and the longer side, everything else
+/// must match. None = incompatible (the engine errors there too).
+fn unify_descs(a: &SlotDesc, b: &SlotDesc) -> Option<SlotDesc> {
+    use fire_crab_ods::format::dtype;
+    if a.dtype == b.dtype {
+        if matches!(a.dtype, dtype::TEXT | dtype::VARYING | sortrec::CSTRING) {
+            let (charset, coll) = unify_ttype(a, b)?;
+            let pay = |d: &SlotDesc| {
+                if d.dtype == dtype::VARYING {
+                    d.len.saturating_sub(2)
+                } else {
+                    d.len
+                }
+            };
+            if a.dtype == dtype::VARYING || b.dtype == dtype::VARYING {
+                return Some(SlotDesc {
+                    dtype: dtype::VARYING,
+                    len: pay(a).max(pay(b)) + 2,
+                    charset,
+                    coll,
+                });
+            }
+            return Some(SlotDesc { dtype: a.dtype, len: a.len.max(b.len), charset, coll });
+        }
+        return Some(SlotDesc {
+            dtype: a.dtype,
+            len: a.len.max(b.len),
+            charset: a.charset,
+            coll: a.coll,
+        });
+    }
+    let width = |d: &SlotDesc| match d.dtype {
+        dtype::SHORT => Some(2),
+        dtype::LONG => Some(4),
+        dtype::INT64 => Some(8),
+        dtype::INT128 => Some(16),
+        _ => None,
+    };
+    if let (Some(wa), Some(wb)) = (width(a), width(b)) {
+        let (dtype, len) = if wa >= wb { (a.dtype, a.len) } else { (b.dtype, b.len) };
+        return Some(SlotDesc { dtype, len, charset: 0, coll: 0 });
+    }
+    let approx = |d: &SlotDesc| matches!(d.dtype, dtype::REAL | dtype::DOUBLE);
+    if approx(a) || approx(b) {
+        let other = if approx(a) { b } else { a };
+        if width(other).is_some() || approx(other) {
+            return Some(SlotDesc { dtype: dtype::DOUBLE, len: 8, charset: 0, coll: 0 });
+        }
+        return None;
+    }
+    None
+}
+
+/// An aggregate map item's output descriptor (AggNodes.cpp getDesc):
+/// COUNT is INT64, SUM/AVG widen per the operand, MIN/MAX pass the
+/// operand through, LIST is a blob, the statistical functions are
+/// DOUBLE (REGR_COUNT is INT64).
+fn mapitem_desc(
+    file: &fire_crab_ods::Image,
+    page_size: usize,
+    msg_slots: &[Vec<MsgSlot>],
+    var_slots: &[Option<MsgSlot>],
+    frames: &[StreamFrame],
+    item: &MapItem,
+) -> Option<SlotDesc> {
+    use fire_crab_ods::format::dtype;
+    match item {
+        MapItem::Agg(v, op) => {
+            if *v == blr::AGG_COUNT || *v == blr::AGG_COUNT2 {
+                return Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 });
+            }
+            let e = op.as_ref()?;
+            let d = expr_desc(file, page_size, msg_slots, var_slots, frames, e)?;
+            if *v == blr::AGG_MIN || *v == blr::AGG_MAX {
+                return Some(d);
+            }
+            if *v == blr::AGG_TOTAL {
+                match d.dtype {
+                    dtype::SHORT | dtype::LONG => {
+                        return Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 })
+                    }
+                    dtype::INT64 | dtype::INT128 => {
+                        return Some(SlotDesc { dtype: dtype::INT128, len: 16, charset: 0, coll: 0 })
+                    }
+                    dtype::REAL | dtype::DOUBLE | dtype::TEXT | dtype::VARYING | sortrec::CSTRING => {
+                        return Some(SlotDesc { dtype: dtype::DOUBLE, len: 8, charset: 0, coll: 0 })
+                    }
+                    dtype::DEC64 | dtype::DEC128 => {
+                        return Some(SlotDesc { dtype: dtype::DEC128, len: 16, charset: 0, coll: 0 })
+                    }
+                    _ => return None,
+                }
+            }
+            if *v == blr::AGG_AVERAGE {
+                match d.dtype {
+                    dtype::SHORT | dtype::LONG | dtype::INT64 => {
+                        return Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 })
+                    }
+                    dtype::INT128 => {
+                        return Some(SlotDesc { dtype: dtype::INT128, len: 16, charset: 0, coll: 0 })
+                    }
+                    dtype::DEC64 | dtype::DEC128 => return Some(d),
+                    dtype::REAL | dtype::DOUBLE => {
+                        return Some(SlotDesc { dtype: dtype::DOUBLE, len: 8, charset: 0, coll: 0 })
+                    }
+                    _ => return None,
+                }
+            }
+            None
+        }
+        MapItem::Fn(name, _) => {
+            if name == "REGR_COUNT" {
+                Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 })
+            } else if stat_kind(name).is_some() {
+                Some(SlotDesc { dtype: dtype::DOUBLE, len: 8, charset: 0, coll: 0 })
+            } else {
+                None
+            }
+        }
+        MapItem::List { .. } => Some(SlotDesc { dtype: dtype::BLOB, len: 8, charset: 0, coll: 0 }),
+        MapItem::Value(e) => expr_desc(file, page_size, msg_slots, var_slots, frames, e),
+    }
+}
+
+/// A scalar SysFunction call's descriptor (SysFunction.cpp make*):
+/// each arm is one maker below.
+fn sysfn_desc(
+    file: &fire_crab_ods::Image,
+    page_size: usize,
+    msg_slots: &[Vec<MsgSlot>],
+    var_slots: &[Option<MsgSlot>],
+    frames: &[StreamFrame],
+    name: &str,
+    args: &[Expr],
+) -> Option<SlotDesc> {
+    use fire_crab_ods::format::dtype;
+    use fire_crab_ods::intl;
+    let arg = |i: usize| -> Option<SlotDesc> {
+        expr_desc(file, page_size, msg_slots, var_slots, frames, args.get(i)?)
+    };
+    let dbl = || SlotDesc { dtype: dtype::DOUBLE, len: 8, charset: 0, coll: 0 };
+    // the transcendental family and friends: DOUBLE (DEC128 over a
+    // decimal argument - makeDblDecResult)
+    if matches!(
+        name,
+        "ACOS" | "ACOSH" | "ASIN" | "ASINH" | "ATAN" | "ATAN2" | "ATANH" | "COS" | "COSH" | "COT"
+            | "SIN" | "SINH" | "TAN" | "TANH" | "EXP" | "LN" | "LOG" | "LOG10" | "POWER" | "SQRT"
+            | "PI"
+    ) {
+        if name != "PI" {
+            let d = arg(0)?;
+            if matches!(d.dtype, dtype::DEC64 | dtype::DEC128) {
+                return Some(SlotDesc { dtype: dtype::DEC128, len: 16, charset: 0, coll: 0 });
+            }
+        }
+        return Some(dbl());
+    }
+    match name {
+        // ABS: SHORT->LONG, LONG->INT64, the rest through (makeAbs)
+        "ABS" => {
+            let d = arg(0)?;
+            Some(match d.dtype {
+                dtype::SHORT => SlotDesc { dtype: dtype::LONG, len: 4, charset: 0, coll: 0 },
+                dtype::LONG => SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 },
+                dtype::REAL | dtype::DOUBLE | dtype::INT64 | dtype::INT128 | dtype::DEC64
+                | dtype::DEC128 => d,
+                _ => return Some(dbl()),
+            })
+        }
+        "SIGN" | "ASCII_VAL" => Some(SlotDesc { dtype: dtype::SHORT, len: 2, charset: 0, coll: 0 }),
+        "POSITION" | "UNICODE_VAL" => {
+            Some(SlotDesc { dtype: dtype::LONG, len: 4, charset: 0, coll: 0 })
+        }
+        // CEIL/FLOOR widen small ints (makeCeilFloor)
+        "CEIL" | "CEILING" | "FLOOR" => {
+            let d = arg(0)?;
+            Some(match d.dtype {
+                dtype::SHORT => SlotDesc { dtype: dtype::LONG, len: 4, charset: 0, coll: 0 },
+                dtype::LONG | dtype::INT64 => {
+                    SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 }
+                }
+                dtype::INT128 => SlotDesc { dtype: dtype::INT128, len: 16, charset: 0, coll: 0 },
+                dtype::DEC64 | dtype::DEC128 => {
+                    SlotDesc { dtype: dtype::DEC128, len: 16, charset: 0, coll: 0 }
+                }
+                _ => return Some(dbl()),
+            })
+        }
+        // ROUND/TRUNC pass the operand through (scale 0 over one
+        // argument - the width is what matters here)
+        "ROUND" => {
+            let d = arg(0)?;
+            if matches!(
+                d.dtype,
+                dtype::SHORT
+                    | dtype::LONG
+                    | dtype::INT64
+                    | dtype::INT128
+                    | dtype::REAL
+                    | dtype::DOUBLE
+                    | dtype::DEC64
+                    | dtype::DEC128
+            ) {
+                Some(d)
+            } else {
+                None
+            }
+        }
+        "TRUNC" => {
+            let d = arg(0)?;
+            if matches!(
+                d.dtype,
+                dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 | dtype::DEC64 | dtype::DEC128
+            ) {
+                Some(d)
+            } else {
+                Some(dbl())
+            }
+        }
+        // MOD keeps the first operand's width (makeMod)
+        "MOD" => {
+            let d = arg(0)?;
+            if matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128) {
+                Some(d)
+            } else {
+                Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 })
+            }
+        }
+        // bitwise: the widest exact operand, at least LONG (makeBin);
+        // shifts are INT64 (INT128 over one - makeBinShift)
+        "BIN_AND" | "BIN_OR" | "BIN_XOR" | "BIN_NOT" => {
+            let width = |d: &SlotDesc| -> Option<usize> {
+                Some(match d.dtype {
+                    dtype::SHORT | dtype::LONG => 4,
+                    dtype::INT64 => 8,
+                    dtype::INT128 => 16,
+                    _ => return None,
+                })
+            };
+            let mut w = 4;
+            for x in args {
+                let d = expr_desc(file, page_size, msg_slots, var_slots, frames, x)?;
+                w = w.max(width(&d)?);
+            }
+            let (dtype, len) =
+                if w <= 4 { (dtype::LONG, 4) } else if w <= 8 { (dtype::INT64, 8) } else { (dtype::INT128, 16) };
+            Some(SlotDesc { dtype, len, charset: 0, coll: 0 })
+        }
+        "BIN_SHL" | "BIN_SHR" => {
+            let d = arg(0)?;
+            if d.dtype == dtype::INT128 {
+                Some(SlotDesc { dtype: dtype::INT128, len: 16, charset: 0, coll: 0 })
+            } else {
+                Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 })
+            }
+        }
+        // DATEADD is its temporal; DATEDIFF is INT64 (makeDateAdd/Diff)
+        "DATEADD" => arg(2),
+        "DATEDIFF" => Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 }),
+        "FIRST_DAY" | "LAST_DAY" => {
+            let d = arg(1)?;
+            if d.dtype == dtype::TIMESTAMP {
+                Some(SlotDesc { dtype: dtype::TIMESTAMP, len: 8, charset: 0, coll: 0 })
+            } else if d.dtype == dtype::TIMESTAMP_TZ {
+                Some(SlotDesc { dtype: dtype::TIMESTAMP_TZ, len: 12, charset: 0, coll: 0 })
+            } else {
+                Some(SlotDesc { dtype: dtype::SQL_DATE, len: 4, charset: 0, coll: 0 })
+            }
+        }
+        "MAXVALUE" | "MINVALUE" => {
+            let mut acc: Option<SlotDesc> = None;
+            for x in args {
+                let d = expr_desc(file, page_size, msg_slots, var_slots, frames, x)?;
+                acc = Some(match acc {
+                    None => d,
+                    Some(a) => unify_descs(&a, &d)?,
+                });
+            }
+            acc
+        }
+        "ASCII_CHAR" => {
+            Some(SlotDesc { dtype: dtype::TEXT, len: 1, charset: intl::CS_NONE, coll: 0 })
+        }
+        "UNICODE_CHAR" => {
+            Some(SlotDesc { dtype: dtype::TEXT, len: 4, charset: intl::CS_UTF8, coll: 0 })
+        }
+        // HASH is INT64; CRYPT_HASH is VARYING BINARY (makeHash)
+        "HASH" => Some(SlotDesc { dtype: dtype::INT64, len: 8, charset: 0, coll: 0 }),
+        // CRYPT_HASH digests to VARYING BINARY sized by the named
+        // algorithm (makeHash) - underived, declines over ties
+        "CRYPT_HASH" => None,
+        // LEFT/RIGHT/REVERSE keep the operand's bytes as VARYING
+        "LEFT" | "RIGHT" | "REVERSE" => {
+            let d = arg(0)?;
+            if d.dtype == dtype::BLOB {
+                return Some(d);
+            }
+            let payload = if d.dtype == dtype::VARYING {
+                d.len.saturating_sub(2)
+            } else if matches!(d.dtype, dtype::TEXT | sortrec::CSTRING) {
+                d.len
+            } else {
+                return None;
+            };
+            Some(SlotDesc {
+                dtype: dtype::VARYING,
+                len: payload + 2,
+                charset: d.charset,
+                coll: d.coll,
+            })
+        }
+        // LPAD/RPAD size by the constant length, else MAX_STR_SIZE
+        "LPAD" | "RPAD" => {
+            let d = arg(0)?;
+            if d.dtype == dtype::BLOB {
+                return Some(d);
+            }
+            if !matches!(d.dtype, dtype::TEXT | dtype::VARYING | sortrec::CSTRING) {
+                return None;
+            }
+            let payload = match args.get(1) {
+                Some(Expr::Literal(Value::Int(n))) if *n >= 0 => {
+                    let bpc = intl::bytes_per_char(d.charset).max(1) as usize;
+                    (*n as usize).saturating_mul(bpc).min(32765)
+                }
+                _ => 32765,
+            };
+            Some(SlotDesc {
+                dtype: dtype::VARYING,
+                len: payload + 2,
+                charset: d.charset,
+                coll: d.coll,
+            })
+        }
+        // OVERLAY concatenates the two sides' bytes (makeOverlay)
+        "OVERLAY" => {
+            let a = arg(0)?;
+            let b = arg(1)?;
+            if a.dtype == dtype::BLOB {
+                return Some(a);
+            }
+            if b.dtype == dtype::BLOB {
+                return Some(b);
+            }
+            let pay = |d: &SlotDesc| {
+                if d.dtype == dtype::VARYING {
+                    Some(d.len.saturating_sub(2))
+                } else if matches!(d.dtype, dtype::TEXT | sortrec::CSTRING) {
+                    Some(d.len)
+                } else {
+                    None
+                }
+            };
+            let (charset, coll) = unify_ttype(&a, &b)?;
+            Some(SlotDesc {
+                dtype: dtype::VARYING,
+                len: pay(&a)?.saturating_add(pay(&b)?).min(32765) + 2,
+                charset,
+                coll,
+            })
+        }
+        // REPLACE sizes by the substitution math (makeReplace)
+        "REPLACE" => {
+            let s = arg(0)?;
+            let f = arg(1)?;
+            let r = arg(2)?;
+            for d in [&s, &f, &r] {
+                if d.dtype == dtype::BLOB {
+                    return Some(*d);
+                }
+                if !matches!(d.dtype, dtype::TEXT | dtype::VARYING | sortrec::CSTRING) {
+                    return None;
+                }
+            }
+            let pay = |d: &SlotDesc| {
+                if d.dtype == dtype::VARYING {
+                    d.len.saturating_sub(2)
+                } else {
+                    d.len
+                }
+            };
+            let (sl, fl, rl) = (pay(&s), pay(&f), pay(&r));
+            let total = if fl == 0 {
+                sl
+            } else {
+                sl.max(sl + (sl / fl) * rl.saturating_sub(fl)).min(32765)
+            };
+            let ab = unify_ttype(&s, &f)?;
+            let tmp = SlotDesc { dtype: dtype::VARYING, len: 0, charset: ab.0, coll: ab.1 };
+            let (charset, coll) = unify_ttype(&tmp, &r)?;
+            Some(SlotDesc { dtype: dtype::VARYING, len: total + 2, charset, coll })
+        }
+        // BASE64/HEX encodings: ASCII VARYING over the expanded bytes
+        "BASE64_ENCODE" => {
+            let d = arg(0)?;
+            if d.dtype == dtype::BLOB {
+                return Some(SlotDesc { dtype: dtype::BLOB, len: 8, charset: 2, coll: 0 });
+            }
+            let payload = if d.dtype == dtype::VARYING {
+                d.len.saturating_sub(2)
+            } else if matches!(d.dtype, dtype::TEXT | sortrec::CSTRING) {
+                d.len
+            } else {
+                return None;
+            };
+            let total = (payload + 2) / 3 * 4;
+            if total > 32765 {
+                return Some(SlotDesc { dtype: dtype::BLOB, len: 8, charset: 2, coll: 0 });
+            }
+            Some(SlotDesc { dtype: dtype::VARYING, len: total + 2, charset: 2, coll: 0 })
+        }
+        "HEX_ENCODE" => {
+            let d = arg(0)?;
+            if d.dtype == dtype::BLOB {
+                return Some(SlotDesc { dtype: dtype::BLOB, len: 8, charset: 2, coll: 0 });
+            }
+            let payload = if d.dtype == dtype::VARYING {
+                d.len.saturating_sub(2)
+            } else if matches!(d.dtype, dtype::TEXT | sortrec::CSTRING) {
+                d.len
+            } else {
+                return None;
+            };
+            let total = payload.saturating_mul(2);
+            if total > 32765 {
+                return Some(SlotDesc { dtype: dtype::BLOB, len: 8, charset: 2, coll: 0 });
+            }
+            Some(SlotDesc { dtype: dtype::VARYING, len: total + 2, charset: 2, coll: 0 })
+        }
+        _ => None,
+    }
+}
+
+/// One sort-map data field: which frame and field id (or slot) to
+/// read, and its record shape.
+struct MapField {
+    frame: usize,
+    id: usize,
+    field: TieField,
+}
+
+/// A sort's tiebreak: every row's filled record bytes, in row
+/// order. The comparator refines key ties by them.
+struct Tiebreak {
+    bytes: Vec<Vec<u8>>,
+}
+
+impl<'a> Exec<'a> {
+    /// Build every row's sort-record tiebreak bytes: the data fields
+    /// the request references (filtered to these frames' contexts),
+    /// the per-stream dbkeys, and the varying-key stashes. `key_exprs`
+    /// are the sort key expressions (for the key region's length),
+    /// `keyvals` the evaluated keys per row (for stash lengths).
+    /// Err = the port cannot render this sort (declined, never wrong).
+    fn build_tiebreak(
+        &self,
+        key_exprs: &[Expr],
+        keyvals: &[Vec<Value>],
+        bindings: &[Vec<StreamFrame>],
+        fields_of: &SortFields,
+    ) -> Result<Tiebreak, String> {
+        use fire_crab_ods::format::dtype;
+        let frames = bindings.first().ok_or("sort over no rows unconverted")?;
+        // key descriptors and the key region's length
+        let mut key_descs = Vec::with_capacity(key_exprs.len());
+        for e in key_exprs {
+            let d = expr_desc(self.file, self.page_size, &self.msg_slots, &self.var_slots, frames, e)
+                .ok_or_else(|| "a sort key outside the converted descriptors unconverted")?;
+            key_descs.push(d);
+        }
+        let mut key_lens = Vec::with_capacity(key_descs.len());
+        let mut stashes: Vec<Option<u8>> = Vec::with_capacity(key_descs.len());
+        for d in &key_descs {
+            let texty = matches!(d.dtype, dtype::TEXT | dtype::VARYING | sortrec::CSTRING);
+            let is_intl = texty && d.ttype() > 4;
+            if texty && d.coll != 0 {
+                // a collated key's length is the ICU collation's
+                // version-dependent keyLength - unconvertible here
+                return Err("a sort over a collated key with ties unconverted".into());
+            }
+            if is_intl {
+                let payload =
+                    if d.dtype == dtype::VARYING { d.len.saturating_sub(2) } else { d.len };
+                let bpc = fire_crab_ods::intl::bytes_per_char(d.charset).max(1) as usize;
+                let kl = if bpc > 1 { payload / 2 * 4 } else { payload };
+                key_lens.push((d.dtype, kl, 1));
+                stashes.push(None);
+            } else {
+                key_lens.push((d.dtype, sortrec::key_len(d.dtype, d.len), 0));
+                stashes.push(if sortrec::varying_key(d.dtype, false) {
+                    Some(d.charset)
+                } else {
+                    None
+                });
+            }
+        }
+        let key_len = sortrec::key_region_len(&key_lens);
+        // data fields: per frame, field-id order, key-deduped
+        let volatile = |dt: u8, ttype: u16| {
+            let intl = matches!(dt, dtype::TEXT | dtype::VARYING | sortrec::CSTRING) && ttype > 4;
+            intl || matches!(dt, dtype::DEC64 | dtype::DEC128 | dtype::SQL_TIME_TZ | dtype::TIMESTAMP_TZ)
+        };
+        let mut fields: Vec<MapField> = Vec::new();
+        let mut persistent: Vec<bool> = Vec::new();
+        for (fi, f) in frames.iter().enumerate() {
+            if let Some(rel) = f.relation.as_ref() {
+                let rel_id =
+                    resolve_relation(self.file, self.page_size, rel).ok_or("sort over a missing relation unconverted")?;
+                let formats = relation_or_system_formats(self.file, self.page_size, rel_id, rel);
+                let (_, descs) =
+                    formats.iter().max_by_key(|(n, _)| *n).ok_or("sort over a relation without format unconverted")?;
+                let cols = relation_columns(self.file, self.page_size, rel);
+                // field-id (bitmap) order, not reference order
+                let mut got: Vec<(usize, MapField)> = Vec::new();
+                if let Some(names) = fields_of.names.get(&f.context) {
+                    for want in names {
+                        let want = want.trim_end();
+                        let Some(col) = cols.iter().find(|c| {
+                            c.name.trim_end().eq_ignore_ascii_case(want)
+                        }) else {
+                            continue;
+                        };
+                        let fid = col.field_id as usize;
+                        let Some(d) = descs.get(fid) else { continue };
+                        // a plain-column key carries no second copy
+                        // (unless volatile: INTL/decfloat/tz keys do)
+                        let ttype = d.sub_type as u16;
+                        let is_key = key_exprs.iter().any(|e| match e {
+                            Expr::Field(c, n) => {
+                                *c == f.context && n.trim_end().eq_ignore_ascii_case(want)
+                            }
+                            _ => false,
+                        });
+                        if is_key && !volatile(d.dtype, ttype) {
+                            continue;
+                        }
+                        got.push((fid, MapField {
+                            frame: fi,
+                            id: fid,
+                            field: TieField {
+                                dtype: d.dtype,
+                                len: d.length as usize,
+                                charset: fire_crab_ods::intl::charset_id(d.sub_type) as u32,
+                                binary: fire_crab_ods::intl::charset_id(d.sub_type)
+                                    == fire_crab_ods::intl::CS_OCTETS,
+                            },
+                        }));
+                    }
+                }
+                got.sort_by_key(|g| g.0);
+                for (_, mf) in got {
+                    fields.push(mf);
+                    persistent.push(true);
+                }
+            } else {
+                // a slot frame: stamped descriptors or nothing
+                let stamped = f.slot_descs.as_ref().ok_or(
+                    "a sort over an underived union branch with ties unconverted",
+                )?;
+                if stamped.is_empty() {
+                    // window-extra frames: computed columns omitted
+                    // (roadmap boundary)
+                    continue;
+                }
+                if let Some(slots) = fields_of.slots.get(&f.context) {
+                    let mut got: Vec<u16> = slots.iter().copied().collect();
+                    got.sort_unstable();
+                    for slot in got {
+                        let Some(d) = stamped.get(slot as usize) else {
+                            return Err(
+                                "a sort over a short union stamp with ties unconverted".into()
+                            );
+                        };
+                        let is_key = key_exprs.iter().any(|e| match e {
+                            Expr::Fid(c, s) => *c == f.context && *s == slot,
+                            _ => false,
+                        });
+                        if is_key && !volatile(d.dtype, d.ttype()) {
+                            continue;
+                        }
+                        fields.push(MapField {
+                            frame: fi,
+                            id: slot as usize,
+                            field: d.tie_field(),
+                        });
+                        persistent.push(false);
+                    }
+                }
+            }
+        }
+        // refetch: past the threshold the persistent fields leave the
+        // record and rows refetch by dbkey (this executor serves no
+        // views, so every relation frame is persistent)
+        let total: usize = fields.iter().map(|f| f.field.len).sum();
+        let mut kept: Vec<MapField> = Vec::new();
+        if sortrec::refetch(total) {
+            for (f, p) in fields.into_iter().zip(persistent.iter()) {
+                if !p {
+                    kept.push(f);
+                }
+            }
+        } else {
+            kept = fields;
+        }
+        let tie_fields: Vec<TieField> = kept.iter().map(|f| f.field).collect();
+        let layout = sortrec::TieLayout::build(key_len, &tie_fields, frames.len(), stashes.iter().filter(|s| s.is_some()).count(), true);
+        // fill every row
+        let mut bytes = Vec::with_capacity(bindings.len());
+        for (bi, binding) in bindings.iter().enumerate() {
+            let mut rec = layout.zero();
+            let mut row_vals = Vec::with_capacity(kept.len());
+            for mf in &kept {
+                let v = binding
+                    .get(mf.frame)
+                    .and_then(|fr| fr.row.get(mf.id))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                row_vals.push(v);
+            }
+            let mut ids = Vec::with_capacity(frames.len());
+            for (fi, _) in frames.iter().enumerate() {
+                let (db, tr, valid) = match binding.get(fi) {
+                    Some(fr) => match (fr.recno, fr.txn) {
+                        (Some(r), Some(t)) => (r, t as i64, true),
+                        _ => (0, 0, false),
+                    },
+                    None => (0, 0, false),
+                };
+                ids.push((db, tr, valid));
+            }
+            let kv = keyvals.get(bi).cloned().unwrap_or_default();
+            let mut stash_vals = Vec::new();
+            for (ki, sc) in stashes.iter().enumerate() {
+                let Some(cs) = sc else { continue };
+                let kvv = kv.get(ki).unwrap_or(&Value::Null);
+                let len = match kvv {
+                    Value::Null => 0,
+                    Value::Text(s) => {
+                        match sortrec::encode_text_value(s, *cs) {
+                            Some(b) => b.len().min(65535) as u16,
+                            None => {
+                                return Err(
+                                    "a sort key untransliterable to its charset unconverted".into()
+                                )
+                            }
+                        }
+                    }
+                    _ => return Err("a varying sort key with a non-text value unconverted".into()),
+                };
+                stash_vals.push(len);
+            }
+            let encode = |s: &str, cs: u32| sortrec::encode_text_value(s, cs as u8);
+            if !sortrec::fill_row(&layout, &mut rec, &tie_fields, &row_vals, &ids, &stash_vals, &encode) {
+                return Err("a sort value outside the converted record bytes unconverted".into());
+            }
+            bytes.push(rec);
+        }
+        Ok(Tiebreak { bytes })
+    }
 }
 
 struct Exec<'a> {
@@ -2752,6 +3992,11 @@ struct Exec<'a> {
     field_ids: std::collections::HashMap<(String, String), usize>,
     /// EXECUTE PROCEDURE mode: the first blr_stall ends the request
     halt_at_stall: bool,
+    /// fields referenced anywhere in the current request scope, per
+    /// context: the executor's csb_fields, collected once per
+    /// Stmt::For. Sorts filter it to their frames' contexts for the
+    /// sort map's data fields.
+    sort_fields: SortFields,
 }
 
 /// The looper (`EXE_looper`): execute the statement tree synchronously,
@@ -2887,6 +4132,7 @@ fn bind_and_execute_mode_inner(
         computed: std::collections::HashMap::new(),
         field_ids: std::collections::HashMap::new(),
         halt_at_stall,
+        sort_fields: SortFields::default(),
     };
     ex.stmt(&request.body)?;
     Ok(ex.sends)
@@ -2999,6 +4245,7 @@ impl<'a> Exec<'a> {
                 }
             }
             Stmt::For(label, rse, body) => {
+                self.sort_fields = collect_sort_fields(rse, body);
                 let bindings = self.open_rse(rse)?;
                 if rse.singular && bindings.len() > 1 {
                     // the engine's sing_err: a singleton select with
@@ -3063,6 +4310,11 @@ impl<'a> Exec<'a> {
         Ok(())
     }
 
+    /// Fields referenced anywhere in a request scope, per context:
+    /// the executor's csb_fields. The engine's optimizer collects the
+    /// same map globally and each sort filters it to its own streams;
+    /// this one is collected once per Stmt::For (a request scope) and
+    /// each sort site filters it to its frames' contexts.
     /// Open the record source tower for an rse - the engine's own
     /// stacking: FullTableScan / NestedLoopJoin / AggregatedStream at
     /// the bottom, FilteredStream (the boolean), the DISTINCT project
@@ -3087,22 +4339,33 @@ impl<'a> Exec<'a> {
                     self.scan_relation_bitmap(name, &rse.plan_indices)?
                 };
                 rows.into_iter()
-                    .map(|row| {
+                    .map(|hit| {
                         vec![StreamFrame {
                             context: *context,
                             relation: Some(name.clone()),
-                            row,
+                            row: hit.row,
+                            recno: Some(hit.recno),
+                            txn: Some(hit.txn),
+                            slot_descs: None,
                         }]
                     })
                     .collect()
             }
-            Stream::Aggregate(agg) => self
-                .open_aggregate(agg)?
-                .into_iter()
-                .map(|row| {
-                    vec![StreamFrame { context: agg.context, relation: None, row }]
-                })
-                .collect(),
+            Stream::Aggregate(agg) => {
+                let (rows, descs) = self.open_aggregate(agg)?;
+                rows.into_iter()
+                    .map(|row| {
+                        vec![StreamFrame {
+                            context: agg.context,
+                            relation: None,
+                            row,
+                            recno: None,
+                            txn: None,
+                            slot_descs: descs.clone(),
+                        }]
+                    })
+                    .collect()
+            }
             Stream::Join { streams, kind, on } => {
                 match kind {
                     JoinKind::Inner => {
@@ -3300,7 +4563,33 @@ impl<'a> Exec<'a> {
                     .unwrap_or(0);
                 let mut out: Vec<Vec<StreamFrame>> = Vec::new();
                 let mut wave: Vec<Vec<Value>> = Vec::new();
-                for binding in self.open_rse(anchor)? {
+                let anchor_bindings = self.open_rse(anchor)?;
+                // the recursion's output descriptors come from the
+                // anchor map (the recursive map agrees by construction)
+                let rec_descs: Option<Vec<SlotDesc>> = (|| {
+                    let frames = anchor_bindings.first()?;
+                    let mut stamped = vec![
+                        SlotDesc {
+                            dtype: fire_crab_ods::format::dtype::LONG,
+                            len: 4,
+                            charset: 0,
+                            coll: 0
+                        };
+                        width
+                    ];
+                    for (slot, e) in anchor_map {
+                        stamped[*slot as usize] = expr_desc(
+                            self.file,
+                            self.page_size,
+                            &self.msg_slots,
+                            &self.var_slots,
+                            frames,
+                            e,
+                        )?;
+                    }
+                    Some(stamped)
+                })();
+                for binding in anchor_bindings {
                     let row = self.with_binding(&binding, |ex| {
                         let mut row = vec![Value::Null; width];
                         for (slot, e) in anchor_map {
@@ -3319,6 +4608,9 @@ impl<'a> Exec<'a> {
                             context: *context,
                             relation: None,
                             row: row.clone(),
+                            recno: None,
+                            txn: None,
+                            slot_descs: rec_descs.clone(),
                         }]);
                     }
                     depth += 1;
@@ -3331,6 +4623,9 @@ impl<'a> Exec<'a> {
                             context: *context,
                             relation: None,
                             row,
+                            recno: None,
+                            txn: None,
+                            slot_descs: rec_descs.clone(),
                         }];
                         let keep = match rec_boolean {
                             None => Some(true),
@@ -3354,13 +4649,56 @@ impl<'a> Exec<'a> {
             }
             Stream::Union { context, branches } => {
                 // branches concatenate in order; each row is the
-                // branch map's slot values on the union's context
-                let mut out = Vec::new();
+                // branch map's slot values on the union's context.
+                // The per-slot descriptors unify across branches
+                // (the engine's union output desc); an underivable
+                // slot stamps None and a sort over ties declines.
+                let mut opened: Vec<(Vec<Vec<StreamFrame>>, Vec<(u16, Expr)>)> = Vec::new();
                 for (rse, map) in branches {
-                    let width =
-                        map.iter().map(|(sl, _)| *sl as usize + 1).max().unwrap_or(0);
-                    for binding in self.open_rse(rse)? {
-                        let row = self.with_binding(&binding, |ex| {
+                    opened.push((self.open_rse(rse)?, map.clone()));
+                }
+                let width = opened
+                    .iter()
+                    .flat_map(|(_, m)| m.iter().map(|(sl, _)| *sl as usize + 1))
+                    .max()
+                    .unwrap_or(0);
+                let union_descs: Option<Vec<SlotDesc>> = (|| {
+                    let mut acc: Vec<Option<SlotDesc>> = vec![None; width];
+                    for (bindings, map) in &opened {
+                        let Some(frames) = bindings.first() else { continue };
+                        for (slot, e) in map {
+                            let d = expr_desc(
+                                self.file,
+                                self.page_size,
+                                &self.msg_slots,
+                                &self.var_slots,
+                                frames,
+                                e,
+                            )?;
+                            let entry = &mut acc[*slot as usize];
+                            *entry = match entry.take() {
+                                Some(a) => Some(unify_descs(&a, &d)?),
+                                None => Some(d),
+                            };
+                        }
+                    }
+                    let mut stamped = Vec::with_capacity(width);
+                    for e in acc {
+                        // a slot no branch maps: the engine's union
+                        // output still types it - LONG here
+                        stamped.push(e.unwrap_or(SlotDesc {
+                            dtype: fire_crab_ods::format::dtype::LONG,
+                            len: 4,
+                            charset: 0,
+                            coll: 0,
+                        }));
+                    }
+                    Some(stamped)
+                })();
+                let mut out = Vec::new();
+                for (bindings, map) in &opened {
+                    for binding in bindings {
+                        let row = self.with_binding(binding, |ex| {
                             let mut row = vec![Value::Null; width];
                             for (slot, e) in map {
                                 row[*slot as usize] = ex.eval(e)?;
@@ -3371,6 +4709,9 @@ impl<'a> Exec<'a> {
                             context: *context,
                             relation: None,
                             row,
+                            recno: None,
+                            txn: None,
+                            slot_descs: union_descs.clone(),
                         }]);
                     }
                 }
@@ -3435,7 +4776,7 @@ impl<'a> Exec<'a> {
                 keyed.push((keys, binding));
             }
             let dirs: Vec<(bool, Option<bool>)> = rse.sort.iter().map(|k| (k.desc, k.nulls)).collect();
-            keyed.sort_by(|(a, _), (b, _)| {
+            let keys_cmp = |a: &[Value], b: &[Value]| {
                 for (i, (desc, nulls)) in dirs.iter().enumerate() {
                     let o = placed_cmp(&a[i], &b[i], *desc, *nulls);
                     if o != std::cmp::Ordering::Equal {
@@ -3443,8 +4784,34 @@ impl<'a> Exec<'a> {
                     }
                 }
                 std::cmp::Ordering::Equal
-            });
-            bindings = keyed.into_iter().map(|(_, b)| b).collect();
+            };
+            keyed.sort_by(|(a, _), (b, _)| keys_cmp(a, b));
+            // key ties break by the sort record past the keys (data,
+            // dbkeys, stashes - [sortrec]); without ties the keys
+            // alone decide and no descriptor is derived
+            let tied = keyed.windows(2).any(|w| keys_cmp(&w[0].0, &w[1].0) == std::cmp::Ordering::Equal);
+            if tied {
+                let rows: Vec<Vec<StreamFrame>> = keyed.iter().map(|(_, b)| b.clone()).collect();
+                let keyvals: Vec<Vec<Value>> = keyed.iter().map(|(k, _)| k.clone()).collect();
+                let key_exprs: Vec<Expr> = rse.sort.iter().map(|k| k.expr.clone()).collect();
+                let fields_of = self.sort_fields.clone();
+                let tie = self.build_tiebreak(&key_exprs, &keyvals, &rows, &fields_of)?;
+                let mut keyed2: Vec<(Vec<Value>, Vec<StreamFrame>, Vec<u8>)> = keyed
+                    .into_iter()
+                    .zip(tie.bytes.into_iter())
+                    .map(|((k, b), t)| (k, b, t))
+                    .collect();
+                keyed2.sort_by(|(a, _, ta), (b, _, tb)| {
+                    let o = keys_cmp(a, b);
+                    if o != std::cmp::Ordering::Equal {
+                        return o;
+                    }
+                    sortrec::cmp_tie(ta, tb)
+                });
+                bindings = keyed2.into_iter().map(|(_, b, _)| b).collect();
+            } else {
+                bindings = keyed.into_iter().map(|(_, b)| b).collect();
+            }
         }
         // SkipRowsStream, then FirstRowsStream
         if let Some(e) = &rse.skip {
@@ -3520,7 +4887,7 @@ impl<'a> Exec<'a> {
                 keyed.push((pk, sk, i));
             }
             let dirs: Vec<bool> = w.order.iter().map(|k| k.desc).collect();
-            keyed.sort_by(|(pa, sa, _), (pb, sb, _)| {
+            let wkeys_cmp = |pa: &[Value], sa: &[Value], pb: &[Value], sb: &[Value]| {
                 for (x, y) in pa.iter().zip(pb) {
                     let o = null_aware_cmp(x, y, false);
                     if o != std::cmp::Ordering::Equal {
@@ -3534,7 +4901,43 @@ impl<'a> Exec<'a> {
                     }
                 }
                 std::cmp::Ordering::Equal
+            };
+            keyed.sort_by(|(pa, sa, _), (pb, sb, _)| wkeys_cmp(pa, sa, pb, sb));
+            // window key ties break by the input record, exactly like
+            // an ORDER BY's (probed: ROW_NUMBER over tied keys
+            // numbers in data order, not arrival order)
+            let wtied = keyed.windows(2).any(|w2| {
+                wkeys_cmp(&w2[0].0, &w2[0].1, &w2[1].0, &w2[1].1) == std::cmp::Ordering::Equal
             });
+            if wtied {
+                let wkey_exprs: Vec<Expr> = w
+                    .partition
+                    .iter()
+                    .cloned()
+                    .chain(w.order.iter().map(|k| k.expr.clone()))
+                    .collect();
+                let wrows: Vec<Vec<StreamFrame>> =
+                    keyed.iter().map(|(_, _, i)| rows[*i].binding.clone()).collect();
+                let wkeyvals: Vec<Vec<Value>> = keyed
+                    .iter()
+                    .map(|(pa, sa, _)| pa.iter().cloned().chain(sa.iter().cloned()).collect())
+                    .collect();
+                let fields_of = self.sort_fields.clone();
+                let tie = self.build_tiebreak(&wkey_exprs, &wkeyvals, &wrows, &fields_of)?;
+                let mut keyed2: Vec<(Vec<Value>, Vec<Value>, usize, Vec<u8>)> = keyed
+                    .into_iter()
+                    .zip(tie.bytes.into_iter())
+                    .map(|((p, s, i), t)| (p, s, i, t))
+                    .collect();
+                keyed2.sort_by(|(pa, sa, _, ta), (pb, sb, _, tb)| {
+                    let o = wkeys_cmp(pa, sa, pb, sb);
+                    if o != std::cmp::Ordering::Equal {
+                        return o;
+                    }
+                    sortrec::cmp_tie(ta, tb)
+                });
+                keyed = keyed2.into_iter().map(|(p, s, i, _)| (p, s, i)).collect();
+            }
             // per-row slot values, indexed by ORIGINAL row position
             let mut slot_rows: Vec<Vec<Value>> = vec![vec![Value::Null; width]; rows.len()];
             let mut p_start = 0usize;
@@ -3798,6 +5201,9 @@ impl<'a> Exec<'a> {
                     context: w.context,
                     relation: None,
                     row: slots,
+                    recno: None,
+                    txn: None,
+                    slot_descs: Some(Vec::new()),
                 });
             }
             let mut reordered = Vec::with_capacity(rows.len());
@@ -3960,11 +5366,14 @@ impl<'a> Exec<'a> {
             JoinSource::Rel(js) => Ok(self
                 .scan_relation(&js.name)?
                 .into_iter()
-                .map(|row| {
+                .map(|hit| {
                     vec![StreamFrame {
                         context: js.context,
                         relation: Some(js.name.clone()),
-                        row,
+                        row: hit.row,
+                        recno: Some(hit.recno),
+                        txn: Some(hit.txn),
+                        slot_descs: None,
                     }]
                 })
                 .collect()),
@@ -3992,7 +5401,7 @@ impl<'a> Exec<'a> {
         &mut self,
         name: &str,
         indices: &[String],
-    ) -> Result<Vec<Vec<Value>>, String> {
+    ) -> Result<Vec<RowHit>, String> {
         let rel = resolve_relation(self.file, self.page_size, name)
             .ok_or_else(|| format!("relation {} not found", name))?;
         let mut bitmap = std::collections::BTreeSet::new();
@@ -4017,15 +5426,22 @@ impl<'a> Exec<'a> {
         // index-driven read of an old row must re-scale and default-fill
         // it too
         let newest_defaults = self.newest_defaults(rel);
-        let rows: Vec<Vec<Value>> = visible_rows_now(self.file, self.page_size, rel, &descs, &tips)
+        let rows: Vec<RowHit> = visible_rows_now(self.file, self.page_size, rel, &descs, &tips)
             .into_iter()
             .filter(|vr| bitmap.contains(&vr.recno))
-            .map(|vr| {
-                fire_crab_ods::format::present_record(&vr.image, vr.format, &formats, &newest_defaults)
+            .map(|vr| RowHit {
+                row: fire_crab_ods::format::present_record(
+                    &vr.image,
+                    vr.format,
+                    &formats,
+                    &newest_defaults,
+                ),
+                recno: vr.recno,
+                txn: vr.txn,
             })
             .collect();
         // the lazy 22003 the scan above explains
-        if rows.iter().any(|r| r.iter().any(|v| matches!(v, Value::OutOfRange))) {
+        if rows.iter().any(|h| h.row.iter().any(|v| matches!(v, Value::OutOfRange))) {
             return Err("an out-of-range presentation unconverted".into());
         }
         Ok(rows)
@@ -4147,7 +5563,7 @@ impl<'a> Exec<'a> {
         name: &str,
         context: u8,
         boolean: Option<&Bool>,
-    ) -> Result<Option<Vec<Vec<Value>>>, String> {
+    ) -> Result<Option<Vec<RowHit>>, String> {
         use fire_crab_ods::btw;
         fn conjuncts<'b>(b: &'b Bool, out: &mut Vec<&'b Bool>) {
             match b {
@@ -4338,7 +5754,7 @@ impl<'a> Exec<'a> {
         rel: u16,
         formats: &[(u8, Vec<fire_crab_ods::Descriptor>)],
         mut recnos: Vec<u64>,
-    ) -> Result<Vec<Vec<Value>>, String> {
+    ) -> Result<Vec<RowHit>, String> {
         recnos.sort_unstable();
         recnos.dedup();
         let tips = TipChain::read(self.file, self.page_size).ok_or("cannot read transaction inventory")?;
@@ -4379,13 +5795,13 @@ impl<'a> Exec<'a> {
             if row.iter().any(|x| matches!(x, Value::OutOfRange)) {
                 return Err("an out-of-range presentation unconverted".into());
             }
-            out.push(row);
+            out.push(RowHit { row, recno, txn: v.txn });
         }
         Ok(out)
     }
 
     /// The committed-visibility scan of one relation.
-    fn scan_relation(&mut self, name: &str) -> Result<Vec<Vec<Value>>, String> {
+    fn scan_relation(&mut self, name: &str) -> Result<Vec<RowHit>, String> {
         let rel = resolve_relation(self.file, self.page_size, name)
             .ok_or_else(|| format!("relation {} not found", name))?;
         let formats = relation_or_system_formats(self.file, self.page_size, rel, name);
@@ -4406,17 +5822,24 @@ impl<'a> Exec<'a> {
         // wrong numbers where a client SELECT over the same file read
         // right ones.
         let newest_defaults = self.newest_defaults(rel);
-        let rows: Vec<Vec<Value>> = visible_rows_now(self.file, self.page_size, rel, &descs, &tips)
+        let rows: Vec<RowHit> = visible_rows_now(self.file, self.page_size, rel, &descs, &tips)
             .into_iter()
-            .map(|vr| {
-                fire_crab_ods::format::present_record(&vr.image, vr.format, &formats, &newest_defaults)
+            .map(|vr| RowHit {
+                row: fire_crab_ods::format::present_record(
+                    &vr.image,
+                    vr.format,
+                    &formats,
+                    &newest_defaults,
+                ),
+                recno: vr.recno,
+                txn: vr.txn,
             })
             .collect();
         // an old row whose value the newest format cannot PRESENT rides as
         // OutOfRange; the engine raises 22003 LAZILY, only where that value
         // is used - which this executor does not track (`COUNT(N)` counted
         // it, ovlazy under the switch) - so it fails the run
-        if rows.iter().any(|r| r.iter().any(|v| matches!(v, Value::OutOfRange))) {
+        if rows.iter().any(|h| h.row.iter().any(|v| matches!(v, Value::OutOfRange))) {
             return Err("an out-of-range presentation unconverted".into());
         }
         Ok(rows)
@@ -4462,11 +5885,58 @@ impl<'a> Exec<'a> {
     /// operands do not contribute; integer AVG truncates (sum/count
     /// in integer division). A zero-row source with NO group keys
     /// still yields ONE row - the aggregate of the empty set.
-    fn open_aggregate(&mut self, agg: &Aggregate) -> Result<Vec<Vec<Value>>, String> {
+    fn open_aggregate(
+        &mut self,
+        agg: &Aggregate,
+    ) -> Result<(Vec<Vec<Value>>, Option<Vec<SlotDesc>>), String> {
         if matches!(agg.source.stream, Stream::Aggregate(_)) {
             return Err("aggregate over an aggregate unconverted".into());
         }
         let source_bindings = self.open_rse(&agg.source)?;
+        // the output descriptors stamp the aggregate's frames for
+        // sorts above (a group key's desc is its expression's, a
+        // map slot's its item's)
+        let width = agg
+            .map
+            .iter()
+            .map(|(sl, _)| *sl as usize + 1)
+            .max()
+            .unwrap_or(0)
+            .max(agg.group_by.len());
+        let agg_descs: Option<Vec<SlotDesc>> = (|| {
+            let frames = source_bindings.first()?;
+            let mut stamped = vec![
+                SlotDesc {
+                    dtype: fire_crab_ods::format::dtype::LONG,
+                    len: 4,
+                    charset: 0,
+                    coll: 0
+                };
+                width
+            ];
+            for (slot, item) in &agg.map {
+                stamped[*slot as usize] = mapitem_desc(
+                    self.file,
+                    self.page_size,
+                    &self.msg_slots,
+                    &self.var_slots,
+                    frames,
+                    item,
+                )?;
+            }
+            for (i, e) in agg.group_by.iter().enumerate() {
+                if i < stamped.len() {
+                    // group keys occupy the leading slots when the
+                    // map passes them through - unify, never narrow
+                    if let Some(d) =
+                        expr_desc(self.file, self.page_size, &self.msg_slots, &self.var_slots, frames, e)
+                    {
+                        stamped[i] = unify_descs(&stamped[i], &d).unwrap_or(d);
+                    }
+                }
+            }
+            Some(stamped)
+        })();
         // fold state per group, keyed by the group-by values; groups
         // keep FIRST-ENCOUNTER order and sort by key below
         struct Acc {
@@ -4771,7 +6241,7 @@ impl<'a> Exec<'a> {
             }
             out.push(row);
         }
-        Ok(out)
+        Ok((out, agg_descs))
     }
 
     fn eval(&mut self, e: &Expr) -> Result<Value, String> {
@@ -5236,7 +6706,7 @@ impl<'a> Exec<'a> {
                     Some(Err(e)) => return Err(format!("computed field {}: {}", name, e)),
                     Some(Ok(expr)) => {
                         let row = self.frames[fi].row.clone();
-                        self.frames.push(StreamFrame { context: 0, relation: Some(rel_name), row });
+                        self.frames.push(StreamFrame { context: 0, relation: Some(rel_name), row, recno: None, txn: None, slot_descs: None });
                         let v = self.eval(&expr);
                         self.frames.pop();
                         v?
@@ -5458,6 +6928,9 @@ fn padding_frames(src: &JoinSource) -> Vec<StreamFrame> {
             context: js.context,
             relation: Some(js.name.clone()),
             row: Vec::new(),
+            recno: None,
+            txn: None,
+            slot_descs: None,
         }],
         JoinSource::Nested(inner) => match &**inner {
             Stream::Join { streams, .. } => {
@@ -5467,6 +6940,9 @@ fn padding_frames(src: &JoinSource) -> Vec<StreamFrame> {
                 context: *context,
                 relation: Some(name.clone()),
                 row: Vec::new(),
+                recno: None,
+                txn: None,
+                slot_descs: None,
             }],
             _ => Vec::new(),
         },

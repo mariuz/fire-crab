@@ -83,6 +83,62 @@ CREATE TABLE BL (ID INT, B BLOB SUB_TYPE TEXT, BB BLOB);
 INSERT INTO BL VALUES (1, 'hello blob', 'binary bytes');
 INSERT INTO BL VALUES (2, 'second row text blob with more content here', 'more binary');
 INSERT INTO BL VALUES (3, NULL, NULL);
+CREATE TABLE TIE_I (G INT, V BIGINT);
+INSERT INTO TIE_I VALUES (1, 200);
+INSERT INTO TIE_I VALUES (1, 1);
+INSERT INTO TIE_I VALUES (2, 7);
+INSERT INTO TIE_I VALUES (2, 3000000000);
+INSERT INTO TIE_I VALUES (2, -5);
+INSERT INTO TIE_I VALUES (3, 4294967295);
+INSERT INTO TIE_I VALUES (3, -2);
+INSERT INTO TIE_I VALUES (3, 4294967296);
+INSERT INTO TIE_I VALUES (3, -1);
+CREATE TABLE TIE_D (G INT, D DOUBLE PRECISION);
+INSERT INTO TIE_D VALUES (1, 1.1);
+INSERT INTO TIE_D VALUES (1, 2.0);
+CREATE TABLE TIE_V (G INT, V VARCHAR(10));
+INSERT INTO TIE_V VALUES (1, 'b');
+INSERT INTO TIE_V VALUES (1, 'a ');
+INSERT INTO TIE_V VALUES (1, 'aa');
+INSERT INTO TIE_V VALUES (2, NULL);
+INSERT INTO TIE_V VALUES (2, '');
+INSERT INTO TIE_V VALUES (2, 'a');
+CREATE TABLE TIE_WH (G INT, H INT, X INT, V VARCHAR(10));
+INSERT INTO TIE_WH VALUES (1, 1, 100, 'k');
+INSERT INTO TIE_WH VALUES (1, 2, 0, 'k');
+CREATE TABLE TIE_U1 (G INT, V INT);
+INSERT INTO TIE_U1 VALUES (1, 10);
+INSERT INTO TIE_U1 VALUES (1, 30);
+CREATE TABLE TIE_U2 (G INT, V INT);
+INSERT INTO TIE_U2 VALUES (1, 20);
+INSERT INTO TIE_U2 VALUES (1, 40);
+CREATE TABLE TIE_W (G INT, A VARCHAR(500), B VARCHAR(500), C VARCHAR(500));
+INSERT INTO TIE_W VALUES (1, 'x', 'x', 'x');
+INSERT INTO TIE_W VALUES (1, 'a', 'a', 'a');
+CREATE TABLE TIE_RN (G INT, V INT);
+INSERT INTO TIE_RN VALUES (1, 30);
+INSERT INTO TIE_RN VALUES (1, 10);
+INSERT INTO TIE_RN VALUES (1, 20);
+CREATE TABLE TIE_S (G INT, S1 SMALLINT, S2 SMALLINT);
+INSERT INTO TIE_S VALUES (1, 1, 2);
+INSERT INTO TIE_S VALUES (1, 2, 1);
+CREATE TABLE TIE_TZ (G INT, W TIME WITH TIME ZONE);
+INSERT INTO TIE_TZ VALUES (1, TIME '10:00:00 -03:00');
+INSERT INTO TIE_TZ VALUES (1, TIME '10:00:00 +05:00');
+CREATE TABLE TIE_B (G INT, X BLOB SUB_TYPE TEXT);
+INSERT INTO TIE_B VALUES (1, 'zzz');
+INSERT INTO TIE_B VALUES (1, 'a');
+CREATE TABLE TIE_C (G INT, V VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE_CI);
+INSERT INTO TIE_C VALUES (1, 'a');
+INSERT INTO TIE_C VALUES (1, 'B');
+CREATE TABLE TIE_CI (V VARCHAR(10) CHARACTER SET UTF8 COLLATE UNICODE_CI);
+INSERT INTO TIE_CI VALUES ('A');
+INSERT INTO TIE_CI VALUES ('a');
+INSERT INTO TIE_CI VALUES ('B');
+INSERT INTO TIE_CI VALUES ('b');
+CREATE TABLE TIE_O (G INT, O BOOLEAN);
+INSERT INTO TIE_O VALUES (1, TRUE);
+INSERT INTO TIE_O VALUES (1, FALSE);
 COMMIT;\n" "$REAL" "$ENG" "$U" "$P" | "$ISQL" -q -b > /tmp/exs-build.log 2>&1
 [ -s "$ENG" ] || { echo "FAIL fixture not created"; sed 's/^/   /' /tmp/exs-build.log; exit 1; }
 cp "$ENG" "$FC"; chmod 666 "$FC"
@@ -324,11 +380,11 @@ route "38 WHERE zoned IS NULL" served "SELECT ID FROM Z WHERE TS IS NULL OR T IS
 route "38 MIN / MAX over zoned columns" served "SELECT MIN(TS), MAX(TS), MIN(T), MAX(T) FROM Z"
 route "38 a zoned equi-join" served "SELECT A.ID, B.ID FROM Z A JOIN Z B ON B.TS = A.TS ORDER BY 1, 2"
 route "38 UNION ALL over zoned serves, branch order" served "SELECT TS FROM Z UNION ALL SELECT TS FROM Z"
-# NOTE (found on the way, recorded in docs/roadmap.md item 3): UNION ALL
-# with ORDER BY over TRUE ties is a served-wrong on BOTH fc executors for
-# ALL types (text included, pre-existing): the engine merges pre-sorted
-# branches (branch-ordinal tiebreak), fc sorts the concatenation. No
-# ORDER BY tie cell is pinned here until the union-tie-law slice lands.
+# NOTE (slice 38 finding, resolved by slice 39): UNION ALL with ORDER BY
+# over TRUE ties was a served-wrong on BOTH fc executors - and the cause
+# was not the union at all but the sort's full-record tiebreak, which
+# section 39 pins cell by cell (the "39 UNION ALL + ORDER BY" cell is
+# this note's shape, now served).
 route "38 CAST from BLOB declines to the interpreter" declined "SELECT CAST(B AS VARCHAR(20)) FROM BL ORDER BY ID"
 route "38 a past-calendar instant declines to the 22008 raise" declined "SELECT ID, TS FROM ZR ORDER BY ID"
 # GROUP BY / DISTINCT / UNION DISTINCT over tz keys: the route must DECLINE -
@@ -350,11 +406,35 @@ dec "38 GROUP BY a zoned column declines (unstable engine representative)" "SELE
 dec "38 DISTINCT over zoned declines" "SELECT DISTINCT TS FROM Z"
 dec "38 UNION DISTINCT over zoned declines" "SELECT TS FROM Z UNION SELECT TS FROM Z"
 
+echo "--- 39 the sort-record tiebreak (slice 39): key ties break by the record past the keys"
+route "39 int data past 255 orders numerically, raw" served "SELECT V FROM TIE_I WHERE G = 1 ORDER BY G"
+route "39 negative int data sorts after positives" served "SELECT V FROM TIE_I WHERE G = 2 ORDER BY G"
+route "39 bigint compares the low word first" served "SELECT V FROM TIE_I WHERE G = 3 ORDER BY G"
+route "39 double compares the low mantissa first" served "SELECT D FROM TIE_D ORDER BY G"
+route "39 varchar length decides before characters" served "SELECT V FROM TIE_V WHERE G = 1 ORDER BY G"
+route "39 empty sorts before NULL before a value (interpreter)" declined "SELECT V, OCTET_LENGTH(V) FROM TIE_V WHERE G = 2 ORDER BY G"
+route "39 a WHERE-only column breaks ties" served "SELECT H, G FROM TIE_WH WHERE H IN (1, 2) ORDER BY G"
+route "39 unreferenced columns do not participate" served "SELECT G, X FROM TIE_WH ORDER BY G"
+route "39 ...on the interpreter (OCTET_LENGTH twin)" declined "SELECT G, X, OCTET_LENGTH(V) FROM TIE_WH ORDER BY G"
+route "39 DESC keys still break ties ascending" served "SELECT V FROM TIE_RN ORDER BY G DESC"
+route "39 UNION ALL + ORDER BY ties follow data" served "SELECT G, V FROM TIE_U1 UNION ALL SELECT G, V FROM TIE_U2 ORDER BY 1"
+route "39 UNION ALL self: full ties keep arrival" served "SELECT G, V FROM TIE_RN UNION ALL SELECT G, V FROM TIE_RN ORDER BY 1, 2"
+route "39 UNION DISTINCT over a collated key: the full-strength representative (interpreter)" declined "SELECT V FROM TIE_CI UNION SELECT V FROM TIE_CI ORDER BY 1"
+route "39 wide rows refetch: ties keep scan order" served "SELECT A, B, C FROM TIE_W ORDER BY G"
+route "39 shorts share their long with the flags" served "SELECT S1, S2 FROM TIE_S ORDER BY G"
+route "39 tz ties break by halves" served "SELECT W FROM TIE_TZ ORDER BY G"
+route "39 blob ties break by id" served "SELECT X FROM TIE_B ORDER BY G"
+route "39 collated data compares raw (interpreter: collation unrouted)" declined "SELECT V FROM TIE_C ORDER BY G"
+route "39 boolean data: false first" served "SELECT O FROM TIE_O ORDER BY G"
+route "39 ROW_NUMBER over ties numbers in data order (interpreter)" declined "SELECT V, ROW_NUMBER() OVER (ORDER BY G) FROM TIE_RN ORDER BY 2"
+route "39 ...a double's low mantissa numbers first (interpreter)" declined "SELECT D, ROW_NUMBER() OVER (ORDER BY G) FROM TIE_D ORDER BY 2"
+route "39 ...varchar length numbers before characters (interpreter)" declined "SELECT V, ROW_NUMBER() OVER (ORDER BY G) FROM TIE_V WHERE G = 1 ORDER BY 2"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 91 ]; then echo "FAIL only $ran checks ran (floor 91) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 111 ]; then echo "FAIL only $ran checks ran (floor 111) - cells went missing"; fail=1; fi
 exit $fail

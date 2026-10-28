@@ -430,7 +430,7 @@ refused '10 RECORDED DATEADD(WEEKDAY) is the engine'\''s execute-time '\''Invali
 refused '10 RECORDED a UNION of a number and a DATE is HY004 '\''UNION'\''' 'SELECT ID FROM T1 UNION ALL SELECT D FROM T1;' 'Statement failed, SQLSTATE = HY004|SQL error code = -104|-Datatypes are not comparable in expression UNION'
 refused '10 RECORDED a numeric string past 22 characters is the engine'\''s truncation' 'INSERT INTO TS (S) VALUES ('\''99999999999999999999999'\''); ROLLBACK;' 'Statement failed, SQLSTATE = 22001|arithmetic exception, numeric overflow, or string truncation|-string right truncation|-expected length 22, actual 23'
 refused '10 RECORDED an UPDATE'\''s unconvertible literal: the engine raises per row at EXECUTE' 'INSERT INTO TS (S) VALUES (1); UPDATE TS SET S = '\''x'\''; ROLLBACK;' 'Statement failed, SQLSTATE = 22018|conversion error from string "x"'
-differs '10 RECORDED the tie order of a UNION ALL under ORDER BY' 'SELECT ID, V FROM T1 UNION ALL SELECT T1ID, S FROM T2 ORDER BY 1;' 'ID V|1 one|1 two|1 apple|2 three|2 banana|3 cherry' 'ID V|1 apple|1 one|1 two|2 banana|2 three|3 cherry'
+pin '10 the tie order of a UNION ALL under ORDER BY is the record, length before letters (slice 39)' 'SELECT ID, V FROM T1 UNION ALL SELECT T1ID, S FROM T2 ORDER BY 1;' 'ID V|1 one|1 two|1 apple|2 three|2 banana|3 cherry'
 
 ran=$((ran + 1))
 echo '--- 11. THE REVIEW OF THE DIAGNOSIS: UPDATE TARGETS FIRST, AN ON'\''S OWN SCOPE, THE GRAMMAR'\''S WORDS, FILTER / WITHIN GROUP, COMPUTED COLUMNS, THE LITERALS'

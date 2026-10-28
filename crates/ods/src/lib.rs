@@ -44,6 +44,7 @@ pub mod pages;
 pub mod pip;
 pub mod pointer;
 pub mod sqz;
+pub mod sortrec;
 pub mod keywords;
 pub mod config;
 pub mod sysfmt;

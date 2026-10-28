@@ -34,11 +34,15 @@ replacement of the C++ engine is below, in priority order. Full text:
    slices 29–31 UNION (ORDER BY, branch-type unification, UNION as a derived body), slice 32 aggregates in item expressions, slice 33 the statistical aggregates,
    slices 34–35 LIST with WITHIN GROUP and GROUP BY position, slice 36 stored calls over aggregate/window slots, slice 37 (`0aa1e6c`) windows over a join,
    slice 38 BLOB and WITH TIME ZONE outputs (the id / instant halves travel; GROUP BY / DISTINCT / UNION DISTINCT over tz keys decline — the engine's
-   tie representative is an unstable sort artifact, and the interpreter refuses it too).
+   tie representative is an unstable sort artifact, and the interpreter refuses it too), slice 39 the sort-record tiebreak (the slice-38 RECORDED item,
+   resolved — the branch-ordinal theory was wrong; key ties break by the full sort record on both executors).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~6,500 statements
    and the interpreter answers every decline. Next: the remaining compile declines, DECFLOAT arithmetic and grouping, wider index use in `exe`.
-   RECORDED (found during slice 38; pre-existing across ALL types, the route's first known served-wrong shape): UNION [ALL] with ORDER BY over TRUE ties —
-   the engine merges pre-sorted branches (branch-ordinal tiebreak), fc sorts the concatenation. Follow-up slice: the union-tie law (3+-branch probes, both executors).
+   RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
+   and key ties break by the FULL SORT RECORD past the keys (sort.cpp's low-word-first word compare over diddle/flags/data/dbkey), pinned cell by cell in
+   exeselect §39 (22 cells: per-type byte laws, WHERE-only participation, unreferenced exclusion, the refetch shape, the collated DISTINCT representative).
+   Both executors share the layout (`fire-crab-ods::sortrec`); boundaries: spilling sorts stay keys-only, full-data ties keep arrival order (no dbkeys),
+   collated keys decline (ICU), RDB$DB_KEY stays refused (Phase 2 item 7).
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

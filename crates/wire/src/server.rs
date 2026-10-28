@@ -8853,6 +8853,28 @@ enum Flow {
 // finished: Aggregate, NestedLoopJoin, Union, and an IndexScan leaf -
 // the last being the one that makes `fire-crab-opt`'s access-path
 // choices executable rather than advisory.
+/// A materialised sort's record tiebreak: the referenced fields'
+/// record items ([RecItem], slots indexing the sorted rows) plus the
+/// key region's length ([sort_key_len]). Empty ([SortRecSpec::none])
+/// keeps the keys-only order. The record carries no dbkeys - this
+/// executor's rows do not know their record numbers, so full-data ties
+/// keep arrival order where the engine answers dbkey order (roadmap).
+#[derive(Clone, Debug, Default)]
+struct SortRecSpec {
+    items: Vec<RecItem>,
+    key_len: Option<usize>,
+}
+
+impl SortRecSpec {
+    fn none() -> SortRecSpec {
+        SortRecSpec::default()
+    }
+
+    fn is_none(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
 #[derive(Clone)]
 enum RowSource {
     /// every record of a relation, in storage order. `width` is the
@@ -8893,10 +8915,15 @@ enum RowSource {
         input: Box<RowSource>,
         pred: Option<Predicate>,
     },
-    /// `input`, ordered - materialising, since a sort must see them all
+    /// `input`, ordered - materialising, since a sort must see them all.
+    /// `rec` is the record tiebreak ([SortRecSpec]): key ties break by
+    /// the sort record, as the engine's do. An empty spec keeps the
+    /// keys-only order (arrival ties) - the sites that cannot spell
+    /// the record (lateral buffers, generator emits) or predate it.
     Sort {
         input: Box<RowSource>,
         keys: Vec<OrderKey>,
+        rec: SortRecSpec,
     },
     /// an inner PLAN's rows. A derived table's side of a join has no
     /// relation id to scan - it has a query - and this is what lets a
@@ -9551,7 +9578,7 @@ impl RowSource {
             // blocking made an unsorted FIRST n materialise the whole
             // relation - and raise on a row the engine never reaches.
             // It passes rows through, which is what it does to them.
-            RowSource::Sort { input, keys } if keys.is_empty() => input.for_each(db, sink),
+            RowSource::Sort { input, keys, .. } if keys.is_empty() => input.for_each(db, sink),
             // A LEFT or INNER join STREAMS ITS DRIVER. Both read only
             // the outer row in hand, so "concatenating the per-row
             // results IS the whole-pass result" - the identity the
@@ -9745,8 +9772,8 @@ impl RowSource {
             // the merge one at a time - a `Flow::Stop` (FIRST n) ends the
             // delivery without the output ever being a Vec. The runs are
             // written whole either way; so are the engine's (sort.cpp).
-            RowSource::Sort { input, keys } if !keys.is_empty() => {
-                let mut cursor = sorted_cursor_over(input, db, keys)?;
+            RowSource::Sort { input, keys, rec } if !keys.is_empty() => {
+                let mut cursor = sorted_cursor_over(input, db, keys, rec)?;
                 while let Some(r) = cursor.next().map_err(|e| {
                     eprintln!("[srv] sort merge: {}", e);
                     EvalErr::Unsupported
@@ -9973,9 +10000,22 @@ impl RowSource {
                     rec_descs,
                 )
             }
-            RowSource::Sort { input, keys } => {
+            RowSource::Sort { input, keys, rec } => {
                 let rows = input.rows(db)?;
-                Ok(sort_rows_spilling(rows, keys)?)
+                if rec.is_none() || keys.is_empty() {
+                    return Ok(sort_rows_spilling(rows, keys)?);
+                }
+                // a spelled record: exact in-memory while the rows fit
+                // the spill budget, keys-only past it (a spilling sort
+                // is several engine runs, whose key-only merge no
+                // portable order matches - roadmap)
+                let budget = crate::extsort::budget();
+                let est: usize = rows.iter().map(|r| crate::extsort::row_bytes(r)).sum();
+                if est <= budget {
+                    sort_by_record(rows, keys, rec.items.clone(), rec.key_len)
+                } else {
+                    Ok(sort_rows_spilling(rows, keys)?)
+                }
             }
         }
     }
@@ -9993,11 +10033,13 @@ impl RowSource {
         key_fids: &[usize],
         key_exprs: &[Expr],
         synth_base: usize,
+        in_descs: Option<&[Descriptor]>,
         having: &Option<Predicate>,
         keys: &[OrderKey],
         tie_order: bool,
         key_coll: Vec<u16>,
     ) -> RowSource {
+        let rec = aggregate_sort_rec(gitems, key_exprs, synth_base, in_descs, keys);
         RowSource::Sort {
             input: Box::new(RowSource::Aggregate {
                 input: Box::new(input),
@@ -10010,21 +10052,35 @@ impl RowSource {
                 key_coll,
             }),
             keys: keys.to_vec(),
+            rec,
         }
     }
 
     /// The scan-filter-sort tree every single-relation plan builds.
+    /// `cols` is the projection, whose fields the sort's record
+    /// carries alongside the filter's and the keys' ([project_sort_rec]).
     fn scan_filter_sort(
         rel: u16,
         formats: Vec<(u8, Vec<Descriptor>)>,
         pred: Option<Predicate>,
         keys: Vec<OrderKey>,
         index: Option<IndexAccess>,
+        cols: &[ProjCol],
     ) -> RowSource {
         let navigate = index.as_ref().is_some_and(|a| a.navigate());
         // the LEAF is the optimizer's choice; everything above it is
         // the same tree either way, which is what makes "the answers do
         // not move" a property of the shape rather than a hope
+        let row_descs: Vec<Descriptor> = formats
+            .iter()
+            .max_by_key(|(n, _)| *n)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_default();
+        let rec = if keys.is_empty() {
+            SortRecSpec::none()
+        } else {
+            project_sort_rec(cols, &pred, &keys, &row_descs)
+        };
         let leaf = leaf_source(rel, formats, &index);
         let filtered = RowSource::Filter { input: Box::new(leaf), pred };
         // NAVIGATION: the index walked the rows in key order, so the
@@ -10034,7 +10090,7 @@ impl RowSource {
         if navigate {
             return filtered;
         }
-        RowSource::Sort { input: Box::new(filtered), keys }
+        RowSource::Sort { input: Box::new(filtered), keys, rec }
     }
 }
 
@@ -14846,6 +14902,27 @@ fn collect_term_fids(t: &Term, mark: &dyn Fn(usize) -> bool) -> bool {
             true
         }
         Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) | Term::BadExprLike(e, ..) => {
+            expr_reads(e, mark);
+            true
+        }
+        // a SIMILAR TO over a column reads the column; over a bound
+        // `?` it reads nothing (decided at bind, like every Param
+        // term with the `?` on the left)
+        Term::Similar(fid, ..) | Term::ParamSimilar(fid, ..) => {
+            mark(*fid);
+            true
+        }
+        Term::ParamIsNull(..) | Term::ParamLike(..) | Term::ParamStarting(..) | Term::ParamSimilarLhs(..) => true,
+        // an expression against a bound `?` reads the expression's
+        // fields; a malformed LIKE and a bad SIMILAR read theirs to
+        // raise ([BadSimilar] over a bound literal reads none)
+        Term::ExprSimilar(e, ..)
+        | Term::BadSimilar(e, ..)
+        | Term::MalformedLike(e)
+        | Term::ExprParam(e, ..)
+        | Term::ExprStartingParam(e, ..)
+        | Term::ExprLikeParam(e, ..)
+        | Term::ExprContainingParam(e, ..) => {
             expr_reads(e, mark);
             true
         }
@@ -63280,6 +63357,8 @@ fn lateral_rows(
     RowSource::Sort {
         input: Box::new(RowSource::Filter { input: Box::new(RowSource::Rows(combined)), pred }),
         keys: order_by.to_vec(),
+        // a lateral buffer carries no descriptors: keys-only (roadmap)
+        rec: SortRecSpec::none(),
     }
     .rows(dbr)
 }
@@ -63319,9 +63398,10 @@ fn materialise_laterals_src(
             input: Box::new(materialise_laterals_src(input, db, args)?),
             pred: pred.clone(),
         }),
-        RowSource::Sort { input, keys } => Some(RowSource::Sort {
+        RowSource::Sort { input, keys, rec } => Some(RowSource::Sort {
             input: Box::new(materialise_laterals_src(input, db, args)?),
             keys: keys.clone(),
+            rec: rec.clone(),
         }),
         _ => None,
     }
@@ -63905,6 +63985,7 @@ fn stream_first_n(
                 filter,
                 order_by.clone(),
                 index.clone(),
+                cols,
             );
             src.prune_leaf(project_read_len(inner));
             let mut out: Vec<Vec<Value>> = Vec::new();
@@ -64167,6 +64248,7 @@ fn branch_rows_res(
             key_fids,
             key_exprs,
             *synth_base,
+            Some(&descs_now),
             &having,
             order_by,
             true,
@@ -64205,11 +64287,11 @@ fn branch_rows_res(
         } else if order_by.is_empty() {
             filtered
         } else if let Some(t) = tie.as_deref().filter(|t| !t.outer.is_empty()) {
-            sort_by_record(filtered, order_by, t.outer.clone())?
+            sort_by_record(filtered, order_by, t.outer.clone(), None)?
         } else if let Some(items) = derived_record_items(inner, cols, order_by) {
-            sort_by_record(filtered, order_by, items)?
+            sort_by_record(filtered, order_by, items, None)?
         } else {
-            RowSource::Sort { input: Box::new(RowSource::Rows(filtered)), keys: order_by.clone() }.rows(db)?
+            RowSource::Sort { input: Box::new(RowSource::Rows(filtered)), keys: order_by.clone(), rec: SortRecSpec::none() }.rows(db)?
         };
         return out
             .iter()
@@ -64268,6 +64350,7 @@ fn branch_rows_res(
             key_fids,
             key_exprs,
             *synth_base,
+            None,
             &having,
             order_by,
             // a bound derived/CTE/view fold has NO join parts: its ties
@@ -64304,7 +64387,7 @@ fn branch_rows_res(
         Plan::Project { index, .. } => index.clone(),
         _ => None,
     };
-    let mut src = RowSource::scan_filter_sort(*rel, formats.clone(), filter, order_by, index);
+    let mut src = RowSource::scan_filter_sort(*rel, formats.clone(), filter, order_by, index, cols);
     // PARTIAL DECOMPRESSION: this materialising path serves the plain
     // cursor fetch, so a wide-table narrow projection prunes its scan here
     src.prune_leaf(project_read_len(plan));
@@ -64394,6 +64477,7 @@ fn branch_rows_each(
             filter,
             order_by.clone(),
             index.clone(),
+            cols,
         );
         src.prune_leaf(project_read_len(plan));
         for values in &src.rows(db)? {
@@ -74233,7 +74317,28 @@ impl SortedCursor {
         } else {
             Src::Scan(StreamCursor::open_inner(db, plan, args, true)?)
         };
-        let mut sorter = spill_sorter(order_by);
+        // the record tiebreak ([project_sort_rec]) over the same
+        // fields the row-source sort spells - every referenced field
+        // is decoded ([project_read_len] marks the same set), so no
+        // image slot reads a pruned NULL. A join's combined rows
+        // carry no descriptors here, so they keep the keys-only order
+        // (roadmap).
+        let rec = match plan {
+            Plan::Project { formats, cols, filter, order_by, .. } => {
+                let row_descs: Vec<Descriptor> = formats
+                    .iter()
+                    .max_by_key(|(n, _)| *n)
+                    .map(|(_, d)| d.clone())
+                    .unwrap_or_default();
+                project_sort_rec(cols, filter, order_by, &row_descs)
+            }
+            _ => SortRecSpec::none(),
+        };
+        let mut sorter = if rec.is_none() {
+            spill_sorter(order_by)
+        } else {
+            spill_sorter_rec(order_by, &rec.items, rec.key_len)
+        };
         let mut pending_err = None;
         loop {
             let batch = match &mut src {
@@ -75275,6 +75380,93 @@ fn decorate_for_sort(keys: &[OrderKey], r: Vec<Value>) -> Result<Vec<Value>, Eva
     Ok(dec)
 }
 
+/// [spill_sorter] with the record tiebreak: key ties break by the
+/// sort record of `items` (row-relative slots), then by the values
+/// the image cannot spell, exactly as [sort_by_record] orders them -
+/// so a streamed sort (FIRST n) answers the same order as a
+/// materialised one while the rows stay in one run. Past the spill
+/// budget the merge is the runs' own (key-only, earlier run wins),
+/// which no portable order matches - roadmap.
+fn spill_sorter_rec(
+    keys: &[OrderKey],
+    items: &[RecItem],
+    key_len: Option<usize>,
+) -> crate::extsort::ExternalSort<Box<dyn Fn(&[Value], &[Value]) -> std::cmp::Ordering>> {
+    let nk = keys.len();
+    let prefix_keys: Vec<OrderKey> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll, coll_explicit: k.coll_explicit, own_coll: k.own_coll })
+        .collect();
+    let items: Vec<RecItem> = items
+        .iter()
+        .cloned()
+        .filter(|it| {
+            let Some(f) = it.slot.filter(|_| !it.null) else { return true };
+            let key = keys.iter().any(|k| k.expr.is_none() && k.field == f);
+            !(key && it.desc.is_none_or(|d| sort_key_restored(&d)))
+        })
+        .collect();
+    let descs: Vec<Option<Descriptor>> =
+        items.iter().map(|it| if it.slot.is_some() || it.null { it.desc } else { None }).collect();
+    let layout = match key_len {
+        Some(k) => SortRecImage::new_with_keys(&descs, k),
+        None => SortRecImage::new(&descs),
+    };
+    let slots: Vec<Option<usize>> = items.iter().map(|it| it.slot.map(|f| f + nk)).collect();
+    let nulls: Vec<bool> = items.iter().map(|it| it.null).collect();
+    let opaque: Vec<usize> = layout
+        .at
+        .iter()
+        .zip(items.iter())
+        .filter(|((_, d), it)| d.is_none() && !it.null)
+        .filter_map(|(_, it)| it.slot.map(|f| f + nk))
+        .collect();
+    let null = Value::Null;
+    let absent = Value::Int(0);
+    let cmp: Box<dyn Fn(&[Value], &[Value]) -> std::cmp::Ordering> = Box::new(move |a, b| {
+        let o = order_cmp(a, b, &prefix_keys);
+        if o != std::cmp::Ordering::Equal {
+            return o;
+        }
+        // a field the rows do not carry is a constant non-NULL value
+        fn vals<'a>(
+            slots: &[Option<usize>],
+            nulls: &[bool],
+            null: &'a Value,
+            absent: &'a Value,
+            r: &'a [Value],
+        ) -> Vec<&'a Value> {
+            slots
+                .iter()
+                .zip(nulls.iter())
+                .map(|(s, n)| {
+                    if *n {
+                        null
+                    } else {
+                        match s {
+                            None => absent,
+                            Some(f) => r.get(*f).unwrap_or(null),
+                        }
+                    }
+                })
+                .collect()
+        }
+        let va = vals(&slots, &nulls, &null, &absent, a);
+        let vb = vals(&slots, &nulls, &null, &absent, b);
+        let o = SortRecImage::cmp(&layout.image(&va), &layout.image(&vb));
+        if o != std::cmp::Ordering::Equal {
+            return o;
+        }
+        opaque
+            .iter()
+            .map(|&f| value_cmp(a.get(f).unwrap_or(&null), b.get(f).unwrap_or(&null)))
+            .find(|c| c.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    crate::extsort::ExternalSort::new(cmp)
+}
+
 /// The rows a source yields, sorted by `keys`, as a cursor over the
 /// merge - the key prefix stripped on the way out.
 struct SortedRows {
@@ -75288,8 +75480,17 @@ impl SortedRows {
     }
 }
 
-fn sorted_cursor_over(input: &RowSource, db: &Database, keys: &[OrderKey]) -> Result<SortedRows, EvalErr> {
-    let mut sorter = spill_sorter(keys);
+fn sorted_cursor_over(
+    input: &RowSource,
+    db: &Database,
+    keys: &[OrderKey],
+    rec: &SortRecSpec,
+) -> Result<SortedRows, EvalErr> {
+    let mut sorter = if rec.is_none() {
+        spill_sorter(keys)
+    } else {
+        spill_sorter_rec(keys, &rec.items, rec.key_len)
+    };
     input.for_each(db, &mut |r| {
         let dec = decorate_for_sort(keys, r)?;
         sorter.put(dec).map_err(|e| {
@@ -75304,8 +75505,12 @@ fn sorted_cursor_over(input: &RowSource, db: &Database, keys: &[OrderKey]) -> Re
     })?;
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!(
-            "[srv] sort cursor: rows={} runs={} spilled={}",
-            cursor.stats.0, cursor.stats.1, cursor.stats.2
+            "[srv] sort cursor: rows={} runs={} spilled={} recitems={:?} keylen={:?}",
+            cursor.stats.0,
+            cursor.stats.1,
+            cursor.stats.2,
+            rec.items.iter().map(|it| (it.slot, it.desc.map(|d| (d.dtype, d.length, d.sub_type)), it.null)).collect::<Vec<_>>(),
+            rec.key_len,
         );
     }
     Ok(SortedRows { cursor, nk: keys.len() })
@@ -76707,6 +76912,35 @@ fn sort_rec_put(slot: &mut [u8], v: &Value, d: &Descriptor) -> Option<()> {
             Value::DecFloat34(x) => put(slot, &x.to_le_bytes())?,
             _ => return None,
         },
+        // a blob sorts by its ID, never its content (the bid bytes:
+        // relation, reserved (always 0 - RecordNumber.h clears first),
+        // number-up, number)
+        dtype::BLOB | dtype::ARRAY | dtype::QUAD => match v {
+            Value::Blob(rel, num) => {
+                put(slot, &rel.to_le_bytes())?;
+                if slot.len() > 3 {
+                    slot[3] = (num >> 32) as u8;
+                }
+                put(slot.get_mut(4..)?, &(*num as u32).to_le_bytes())?;
+            }
+            _ => return None,
+        },
+        // zoned values sort by their stored halves (UTC, zone id)
+        dtype::SQL_TIME_TZ | dtype::EX_TIME_TZ => match v {
+            Value::TimeTz(t, z) => {
+                put(slot, &t.to_le_bytes())?;
+                put(slot.get_mut(4..)?, &z.to_le_bytes())?;
+            }
+            _ => return None,
+        },
+        dtype::TIMESTAMP_TZ | dtype::EX_TIMESTAMP_TZ => match v {
+            Value::TimestampTz(d, t, z) => {
+                put(slot, &d.to_le_bytes())?;
+                put(slot.get_mut(4..)?, &t.to_le_bytes())?;
+                put(slot.get_mut(8..)?, &z.to_le_bytes())?;
+            }
+            _ => return None,
+        },
         _ => return None,
     }
     Some(())
@@ -77107,15 +77341,25 @@ fn outer_window_tie(rec: &WinRecord, windows: &[WinSpec], win_base: usize) -> Ve
 /// of 4, so it moves no value's place within its word.
 struct SortRecImage {
     /// (offset, descriptor) of each field, None for one this image cannot
-    /// spell (a blob id, a zoned time) - compared by value
-    /// after the image, in field order
+    /// spell (no descriptor, or a dtype past sort_rec_put) - compared by
+    /// value after the image, in field order
     at: Vec<(usize, Option<Descriptor>)>,
     len: usize,
 }
 
 impl SortRecImage {
     fn new(descs: &[Option<Descriptor>]) -> SortRecImage {
-        let mut off = descs.len(); // the NULL flags
+        SortRecImage::new_with_keys(descs, 0)
+    }
+
+    /// The same layout hung past a key region of `key_len` bytes: the
+    /// flags sit at `key_len` and every field aligns absolutely, as
+    /// `generateSort` lays them. The key length is always a multiple
+    /// of 4 (so words group the same), but an 8-aligned field (BIGINT,
+    /// DOUBLE) shifts when it is 4 past a multiple of 8 - a BIGINT
+    /// key is 12 bytes - which the key-less layout gets wrong.
+    fn new_with_keys(descs: &[Option<Descriptor>], key_len: usize) -> SortRecImage {
+        let mut off = key_len + descs.len(); // the NULL flags
         let mut at = Vec::with_capacity(descs.len());
         for d in descs {
             let (align, size) = match d.map(|d| (d.dtype, d.length as usize)) {
@@ -77150,12 +77394,19 @@ impl SortRecImage {
                         | dtype::BOOLEAN
                         | dtype::DEC64
                         | dtype::DEC128
+                        | dtype::BLOB
+                        | dtype::ARRAY
+                        | dtype::QUAD
+                        | dtype::SQL_TIME_TZ
+                        | dtype::EX_TIME_TZ
+                        | dtype::TIMESTAMP_TZ
+                        | dtype::EX_TIMESTAMP_TZ
                 )
             });
-            at.push((off, spelt));
+            at.push((off - key_len, spelt));
             off += size;
         }
-        SortRecImage { at, len: off.div_ceil(4) * 4 }
+        SortRecImage { at, len: (off - key_len).div_ceil(4) * 4 }
     }
 
     /// The record image of one row's fields (`vals` in field order); a
@@ -77233,13 +77484,371 @@ struct RecItem {
     null: bool,
 }
 
+/// One sort key's descriptor: a field key's row descriptor, an
+/// expression key's described type ([build_expr_col_from]). None when
+/// the key's type is underivable.
+fn sort_key_desc(key: &OrderKey, row_descs: &[Descriptor]) -> Option<Descriptor> {
+    match &key.expr {
+        None => row_descs.get(key.field).copied(),
+        Some(e) => {
+            let col = build_expr_col_from(e.clone(), "", row_descs)?;
+            Some(desc_of_projcol(&col))
+        }
+    }
+}
+
+/// The sort record's key region length for `order_by`: per key a
+/// 1-byte null flag plus the key proper, each key 4-aligned (sort.h
+/// `setSkdOffset`, little-endian), rounded up to a long. DECFLOAT
+/// keys diddle wider (12/20); INTL text keys become collation keys
+/// (uncollated single-byte: the payload; uncollated multibyte:
+/// `utf16KeyLength`; collated: the ICU version-dependent length -
+/// None, and the sort keeps the key-less layout).
+fn sort_key_len(order_by: &[OrderKey], row_descs: &[Descriptor]) -> Option<usize> {
+    let mut off = 0usize;
+    for (i, k) in order_by.iter().enumerate() {
+        let d = sort_key_desc(k, row_descs)?;
+        let texty = matches!(d.dtype, dtype::TEXT | dtype::VARYING | fire_crab_ods::sortrec::CSTRING);
+        let kl = if texty && d.sub_type as u16 > 4 {
+            let coll = fire_crab_ods::intl::collation_id(d.sub_type);
+            if coll != 0 {
+                return None;
+            }
+            let payload =
+                if d.dtype == dtype::VARYING { d.length.saturating_sub(2) as usize } else { d.length as usize };
+            let cs = fire_crab_ods::intl::charset_id(d.sub_type);
+            if fire_crab_ods::intl::bytes_per_char(cs) > 1 {
+                payload / 2 * 4
+            } else {
+                payload
+            }
+        } else {
+            match d.dtype {
+                dtype::DEC64 => 12,
+                dtype::DEC128 => 20,
+                _ => d.length as usize,
+            }
+        };
+        if i > 0 {
+            off = off.div_ceil(4) * 4;
+        }
+        off += 1;
+        off = off.div_ceil(4) * 4;
+        off += kl;
+    }
+    Some(off.div_ceil(4) * 4)
+}
+
+/// Collect every field id an expression reads: [expr_reads] visits
+/// with `||`/`any`, so a marker that always answers false sees them
+/// all (the ArrayElem arm visits regardless).
+fn expr_read_fids(e: &Expr, out: &mut std::collections::BTreeSet<usize>) {
+    let found = std::cell::RefCell::new(Vec::new());
+    expr_reads(e, &|f| {
+        found.borrow_mut().push(f);
+        false
+    });
+    out.extend(found.into_inner());
+}
+
+/// Collect a predicate's field ids; on an unprovable term the set is
+/// completed to every field (the request may reference it - a
+/// documented superset, vanishingly rare).
+fn pred_read_fids(pred: &Predicate, width: usize, out: &mut std::collections::BTreeSet<usize>) {
+    let mut complete = true;
+    for grp in &pred.groups {
+        for t in grp {
+            let found = std::cell::RefCell::new(Vec::new());
+            complete &= collect_term_fids(t, &|f| {
+                found.borrow_mut().push(f);
+                true
+            });
+            out.extend(found.into_inner());
+        }
+    }
+    if !complete {
+        out.extend(0..width);
+    }
+}
+
+/// Whether a sort keeps a plain-column key's second copy in the data
+/// (RecordSource.h `hasVolatileKey`): INTL text, DECFLOAT and zoned
+/// keys do; every other plain key is restored from its key slot.
+fn sort_key_volatile(d: &Descriptor) -> bool {
+    let texty = matches!(d.dtype, dtype::TEXT | dtype::VARYING | fire_crab_ods::sortrec::CSTRING);
+    (texty && d.sub_type as u16 > 4)
+        || matches!(
+            d.dtype,
+            dtype::DEC64 | dtype::DEC128 | dtype::SQL_TIME_TZ | dtype::TIMESTAMP_TZ
+        )
+}
+
+/// Drop each plain-field key the sort restores from its key slot
+/// (unless volatile - [sort_key_volatile]). [sort_by_record] filters
+/// again by its own carrier-only rule, which this superset disarms.
+fn sort_dedup_keys(items: Vec<RecItem>, order_by: &[OrderKey]) -> Vec<RecItem> {
+    items
+        .into_iter()
+        .filter(|it| {
+            let Some(f) = it.slot.filter(|_| !it.null) else { return true };
+            let key = order_by.iter().any(|k| k.expr.is_none() && k.field == f);
+            if !key {
+                return true;
+            }
+            // a key without a descriptor cannot prove non-volatility:
+            // keep it (an opaque value compare, documented)
+            it.desc.as_ref().is_none_or(sort_key_volatile)
+        })
+        .collect()
+}
+
+/// A plain single-relation sort's record spec: the fields the request
+/// references (projection, filter, keys) in field-id order with the
+/// relation's descriptors, plus the key region's length. `row_descs`
+/// are the sorted rows' per-slot descriptors (newest format).
+fn project_sort_rec(
+    cols: &[ProjCol],
+    pred: &Option<Predicate>,
+    keys: &[OrderKey],
+    row_descs: &[Descriptor],
+) -> SortRecSpec {
+    let mut fids = std::collections::BTreeSet::new();
+    for c in cols {
+        match &c.expr {
+            None => {
+                fids.insert(c.field_id);
+            }
+            Some(e) => expr_read_fids(e, &mut fids),
+        }
+    }
+    if let Some(p) = pred {
+        pred_read_fids(p, row_descs.len(), &mut fids);
+    }
+    for k in keys {
+        match &k.expr {
+            None => {
+                fids.insert(k.field);
+            }
+            Some(e) => expr_read_fids(e, &mut fids),
+        }
+    }
+    let items: Vec<RecItem> = fids
+        .into_iter()
+        .filter(|f| *f < row_descs.len())
+        .map(|f| RecItem { slot: Some(f), desc: Some(row_descs[f]), null: false })
+        .collect();
+    let total: usize = items.iter().filter_map(|it| it.desc.as_ref()).map(|d| d.length as usize).sum();
+    // refetch past the threshold: the persistent fields leave the
+    // record and rows refetch by dbkey - which this executor does
+    // not know, so full-data ties keep arrival order (roadmap)
+    let items = if fire_crab_ods::sortrec::refetch(total) { Vec::new() } else { items };
+    let items = sort_dedup_keys(items, keys);
+    if items.is_empty() {
+        return SortRecSpec::none();
+    }
+    let key_len = sort_key_len(keys, row_descs);
+    SortRecSpec { items, key_len }
+}
+
+/// A server value back into an expression, for describing per-group
+/// constants ([build_expr_col_from] types literals from their form).
+fn const_expr_of(v: &Value) -> Option<Expr> {
+    Some(match v {
+        Value::Int(n) => Expr::Int(*n),
+        Value::Int128(x, s) => {
+            if *s == 0 {
+                Expr::Int128(*x)
+            } else {
+                return None;
+            }
+        }
+        Value::DecFloat34(x) => Expr::DecFloat34(*x),
+        Value::DecFloat16(_) => return None,
+        Value::Scaled(r, s) | Value::Rounded(r, s) => Expr::Dec(*r, *s),
+        Value::Double(x) => Expr::Double(*x),
+        Value::Float(x) => Expr::Double(*x as f64),
+        Value::Bool(b) => Expr::Bool(*b),
+        Value::Text(s) => Expr::Str(s.clone()),
+        Value::Date(d) => Expr::DateLit(*d),
+        Value::Time(t) => Expr::TimeLit(*t),
+        Value::Timestamp(d, t) => Expr::TsLit(*d, *t),
+        Value::TimeTz(t, z) => Expr::TimeTzLit(*t, *z),
+        Value::TimestampTz(d, t, z) => Expr::TsTzLit(*d, *t, *z),
+        _ => return None,
+    })
+}
+
+/// An aggregate-fold slot's descriptor (AggNodes.cpp getDesc): COUNT
+/// is INT64, MIN/MAX pass the operand through, SUM/AVG widen per the
+/// operand, LIST is a blob, the statistical folds are DOUBLE
+/// (REGR_COUNT is INT64), PERCENTILE_DISC keeps its value's type,
+/// hypothetical RANK/DENSE_RANK are INT64. None = opaque (compared by
+/// value, documented).
+fn fold_slot_desc(
+    func: &AggFn,
+    src: &AggSrc,
+    in_descs: Option<&[Descriptor]>,
+) -> Option<Descriptor> {
+    use fire_crab_ods::format::dtype as dt;
+    let num = |dtype: u8, length: u16| Descriptor { dtype, scale: 0, length, sub_type: 0, flags: 0, offset: 0 };
+    let operand = |src: &AggSrc| -> Option<Descriptor> {
+        let descs = in_descs?;
+        match src {
+            AggSrc::Star => None,
+            AggSrc::Field(fid) | AggSrc::CollField(fid, _) => descs.get(*fid).copied(),
+            AggSrc::Expr(e) => {
+                let col = build_expr_col_from(e.clone(), "", descs)?;
+                Some(desc_of_projcol(&col))
+            }
+            AggSrc::Pair(..) | AggSrc::Percentile { .. } | AggSrc::Hypo { .. } | AggSrc::List { .. } => None,
+        }
+    };
+    match func {
+        AggFn::Count => Some(num(dt::INT64, 8)),
+        AggFn::Min | AggFn::Max => operand(src),
+        AggFn::Sum => {
+            let d = operand(src)?;
+            Some(match d.dtype {
+                dt::SHORT | dt::LONG => num(dt::INT64, 8),
+                dt::INT64 | dt::INT128 => num(dt::INT128, 16),
+                dt::REAL | dt::DOUBLE | dt::TEXT | dt::VARYING => num(dt::DOUBLE, 8),
+                dt::DEC64 | dt::DEC128 => num(dt::DEC128, 16),
+                _ => return None,
+            })
+        }
+        AggFn::Avg => {
+            let d = operand(src)?;
+            Some(match d.dtype {
+                dt::SHORT | dt::LONG | dt::INT64 => num(dt::INT64, 8),
+                dt::INT128 => num(dt::INT128, 16),
+                dt::DEC64 | dt::DEC128 => d,
+                dt::REAL | dt::DOUBLE => num(dt::DOUBLE, 8),
+                _ => return None,
+            })
+        }
+        AggFn::RegrCount => Some(num(dt::INT64, 8)),
+        AggFn::VarPop
+        | AggFn::VarSamp
+        | AggFn::StddevPop
+        | AggFn::StddevSamp
+        | AggFn::Corr
+        | AggFn::CovarPop
+        | AggFn::CovarSamp
+        | AggFn::RegrSlope
+        | AggFn::RegrIntercept
+        | AggFn::RegrR2
+        | AggFn::RegrAvgx
+        | AggFn::RegrAvgy
+        | AggFn::RegrSxx
+        | AggFn::RegrSyy
+        | AggFn::RegrSxy => Some(num(dt::DOUBLE, 8)),
+        AggFn::PercentileCont => Some(num(dt::DOUBLE, 8)),
+        AggFn::PercentileDisc => {
+            let descs = in_descs?;
+            let AggSrc::Percentile { order, .. } = src else { return None };
+            let col = build_expr_col_from(order.clone(), "", descs)?;
+            Some(desc_of_projcol(&col))
+        }
+        AggFn::HypoRank | AggFn::HypoDenseRank => Some(num(dt::INT64, 8)),
+        AggFn::HypoPercentRank | AggFn::HypoCumeDist => Some(num(dt::DOUBLE, 8)),
+        AggFn::List => Some(num(dt::BLOB, 8)),
+    }
+}
+
+/// An aggregate-output sort's record spec: every group slot in order
+/// (group keys, then folds). `in_descs` are the fold INPUT rows'
+/// descriptors (None past a join - operands go opaque then);
+/// expression keys live in synthetic slots past `synth_base`
+/// ([parse_group_by]), described from `key_exprs` in order.
+fn aggregate_sort_rec(
+    gitems: &[GItem],
+    key_exprs: &[Expr],
+    synth_base: usize,
+    in_descs: Option<&[Descriptor]>,
+    keys: &[OrderKey],
+) -> SortRecSpec {
+    // without the fold input's descriptors nothing spells - the sort
+    // keeps the delivery order (a join's combined rows, measured).
+    // An opaque value fallback is NOT a substitute: value order is
+    // not byte order (psqlassign 13b).
+    if in_descs.is_none() {
+        return SortRecSpec::none();
+    }
+    let row_descs: Vec<Option<Descriptor>> = gitems
+        .iter()
+        .map(|gi| match gi {
+            GItem::Key(fid) => {
+                if *fid < synth_base {
+                    in_descs.and_then(|d| d.get(*fid).copied())
+                } else {
+                    let e = key_exprs.get(fid - synth_base)?;
+                    let col = build_expr_col_from(e.clone(), "", in_descs.unwrap_or(&[]))?;
+                    Some(desc_of_projcol(&col))
+                }
+            }
+            GItem::Agg(func, src, _) => fold_slot_desc(func, src, in_descs),
+            GItem::Const(v) => {
+                let e = const_expr_of(v)?;
+                let col = build_expr_col_from(e, "", in_descs.unwrap_or(&[]))?;
+                Some(desc_of_projcol(&col))
+            }
+        })
+        .collect();
+    // a per-group CONSTANT is the same value in every group row (it
+    // references no column), so it never breaks a tie - and its slot
+    // holds an unevaluated placeholder, whose NULL flag would corrupt
+    // the image (psqlassign 13b: the X slot reads NULL in all rows).
+    // It still lends its width to the key region below.
+    let items: Vec<RecItem> = row_descs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !matches!(gitems[*i], GItem::Const(_)))
+        .map(|(i, d)| RecItem { slot: Some(i), desc: *d, null: false })
+        .collect();
+    let items = sort_dedup_keys(items, keys);
+    if items.is_empty() {
+        return SortRecSpec::none();
+    }
+    // the key region measures over the group row's descriptors; an
+    // opaque key falls back to the key-less layout
+    let mut kd = Vec::with_capacity(row_descs.len());
+    for d in row_descs.iter().flatten() {
+        kd.push(*d);
+    }
+    let key_len = if kd.len() == row_descs.len() { sort_key_len(keys, &kd) } else { None };
+    SortRecSpec { items, key_len }
+}
+
+/// A union/derived output sort's record spec: every output column in
+/// order. The consumer above may ignore some columns, which the
+/// engine then omits from the map - a documented superset, exact
+/// whenever the consumer reads them all (the usual shape).
+fn output_sort_rec(cols: &[ProjCol], keys: &[OrderKey]) -> SortRecSpec {
+    let row_descs: Vec<Descriptor> = cols.iter().map(desc_of_projcol).collect();
+    let items: Vec<RecItem> = row_descs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| RecItem { slot: Some(i), desc: Some(*d), null: false })
+        .collect();
+    let items = sort_dedup_keys(items, keys);
+    if items.is_empty() {
+        return SortRecSpec::none();
+    }
+    let key_len = sort_key_len(keys, &row_descs);
+    SortRecSpec { items, key_len }
+}
+
 /// Sort by the ORDER BY keys, then by the engine's record of `items`
 /// ([SortRecImage]) less each plain-field key the sort restores from its
 /// key slot (`Optimizer::generateSort` pops it), then in arrival order.
+/// `key_len` is the key region's length ([sort_key_len]); None keeps the
+/// key-less layout, which misaligns 8-aligned fields past a key region
+/// 4 beyond a multiple of 8 (a BIGINT key is 12 bytes).
 fn sort_by_record(
     rows: Vec<Vec<Value>>,
     order_by: &[OrderKey],
     items: Vec<RecItem>,
+    key_len: Option<usize>,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
     let items: Vec<RecItem> = items
         .into_iter()
@@ -77251,7 +77860,10 @@ fn sort_by_record(
         .collect();
     let descs: Vec<Option<Descriptor>> =
         items.iter().map(|it| if it.slot.is_some() || it.null { it.desc } else { None }).collect();
-    let layout = SortRecImage::new(&descs);
+    let layout = match key_len {
+        Some(k) => SortRecImage::new_with_keys(&descs, k),
+        None => SortRecImage::new(&descs),
+    };
     // a field the rows do not carry is a constant non-NULL value
     let absent = Value::Int(0);
     let null = Value::Null;
@@ -77363,7 +77975,7 @@ fn fold_windows_ordered(
             it
         })
         .collect();
-    sort_by_record(rows, order_by, items)
+    sort_by_record(rows, order_by, items, None)
 }
 
 /// The outer sort's record for a DERIVED TABLE OVER A WINDOWED SELECT,
@@ -79571,6 +80183,7 @@ fn fold_project_windows(
         filter,
         Vec::new(),
         access,
+        cols,
     )
     .rows(db)?;
     let descs = window_slot_descs(descs_now.iter().map(|d| Some(*d)).collect(), cols, windows.len(), win_base);
@@ -83686,6 +84299,7 @@ fn emit_rows_inner(
                                 filter,
                                 order_by.clone(),
                                 index.clone(),
+                                cols,
                             );
                             let mut enc: Option<EvalErr> = None;
                             src.for_each(db, &mut |values| {
@@ -83735,6 +84349,7 @@ fn emit_rows_inner(
                             filter,
                             order_by.clone(),
                             index.clone(),
+                            cols,
                         );
                         let sorted = src.rows(db).map_err(EmitErr::Eval)?;
                         let mut rows_v: Vec<Vec<Value>> = Vec::with_capacity(sorted.len());
@@ -84041,6 +84656,7 @@ fn emit_rows_inner(
                             filter.clone(),
                             Vec::new(),
                             index.clone(),
+                            cols,
                         )
                         .rows(db)
                         .map_err(EmitErr::Eval)?,
@@ -84129,6 +84745,7 @@ fn emit_rows_inner(
                         filter.clone(),
                         order_by.clone(),
                         index.clone(),
+                        cols,
                     )
                     .rows(db)
                     .map_err(EmitErr::Eval)?;
@@ -84185,6 +84802,7 @@ fn emit_rows_inner(
                     let mut rows = RowSource::Sort {
                         input: Box::new(RowSource::Rows(filtered)),
                         keys: order_by.clone(),
+                        rec: SortRecSpec::none(),
                     }
                     .rows(db)
                     .map_err(EmitErr::Eval)?;
@@ -84233,7 +84851,7 @@ fn emit_rows_inner(
                     let rows = RowSource::Filter { input: Box::new(RowSource::Rows(rows)), pred }
                         .rows(db)
                         .map_err(EmitErr::Eval)?;
-                    let rows = sort_by_record(rows, order_by, t.outer.clone()).map_err(EmitErr::Eval)?;
+                    let rows = sort_by_record(rows, order_by, t.outer.clone(), None).map_err(EmitErr::Eval)?;
                     for values in &rows {
                         encode_row(w, cols, values, out)?;
                     }
@@ -84309,6 +84927,7 @@ fn emit_rows_inner(
                                 ifilter,
                                 rkeys,
                                 index.clone(),
+                                icols,
                             );
                             let pred = bind_filter(filter, args)?;
                             src.for_each(db, &mut |values| {
@@ -84333,7 +84952,7 @@ fn emit_rows_inner(
                             let filtered = RowSource::Filter { input: Box::new(RowSource::Rows(rows)), pred }
                                 .rows(db)
                                 .map_err(EmitErr::Eval)?;
-                            sort_by_record(filtered, order_by, items).map_err(EmitErr::Eval)?
+                            sort_by_record(filtered, order_by, items, None).map_err(EmitErr::Eval)?
                         }
                         None => RowSource::Sort {
                             input: Box::new(RowSource::Filter {
@@ -84341,6 +84960,7 @@ fn emit_rows_inner(
                                 pred,
                             }),
                             keys: order_by.clone(),
+                            rec: SortRecSpec::none(),
                         }
                         .rows(db)
                         .map_err(EmitErr::Eval)?,
@@ -84429,6 +85049,7 @@ fn emit_rows_inner(
                     key_fids,
                     key_exprs,
                     *synth_base,
+                    None,
                     &having,
                     order_by,
                     parts.is_empty(),
@@ -84487,6 +85108,7 @@ fn emit_rows_inner(
                     key_fids,
                     key_exprs,
                     *synth_base,
+                    Some(&descs_now),
                     &having,
                     order_by,
                     true,
@@ -129509,9 +130131,9 @@ fn materialise_user_fn_rows(
     let base: Vec<Vec<Value>> = {
         let db = database.as_ref().ok_or(EvalErr::Unsupported)?;
         let src = if lazy {
-            RowSource::scan_filter_sort(*rel, formats.clone(), None, Vec::new(), index.clone())
+            RowSource::scan_filter_sort(*rel, formats.clone(), None, Vec::new(), index.clone(), &[])
         } else {
-            RowSource::scan_filter_sort(*rel, formats.clone(), filter.clone(), order_by.clone(), index.clone())
+            RowSource::scan_filter_sort(*rel, formats.clone(), filter.clone(), order_by.clone(), index.clone(), &[])
         };
         src.rows(db)?
     };
@@ -148166,6 +148788,7 @@ mod tests {
         let sorted = RowSource::Sort {
             input: Box::new(base.clone()),
             keys: vec![OrderKey::field(1, false, NullsAt::Default)],
+            rec: SortRecSpec::none(),
         }
         .rows(&db)
         .unwrap();
@@ -148188,6 +148811,7 @@ mod tests {
             &[1],
             &[],
             8,
+            None,
             &None,
             &[OrderKey::field(0, false, NullsAt::Default)],
             false,
@@ -148245,6 +148869,7 @@ mod tests {
         let desc = RowSource::Sort {
             input: Box::new(base),
             keys: vec![OrderKey::field(1, true, NullsAt::Default)],
+            rec: SortRecSpec::none(),
         }
         .rows(&db)
         .unwrap();
@@ -161144,13 +161769,14 @@ mod tests {
             hi: Some((vec![0xC0, 8], true)),
             navigate: false,
         };
-        let scan = RowSource::scan_filter_sort(128, Vec::new(), None, Vec::new(), None);
+        let scan = RowSource::scan_filter_sort(128, Vec::new(), None, Vec::new(), None, &[]);
         let idx = RowSource::scan_filter_sort(
             128,
             Vec::new(),
             None,
             Vec::new(),
             Some(IndexAccess::one(pick.clone())),
+            &[],
         );
         let leaf_of = |s: &RowSource| -> String {
             match s {
@@ -161181,6 +161807,7 @@ mod tests {
             None,
             keys.clone(),
             Some(IndexAccess::one(pick.clone())),
+            &[],
         );
         assert!(matches!(sorted, RowSource::Sort { .. }));
         let navigated = RowSource::scan_filter_sort(
@@ -161189,6 +161816,7 @@ mod tests {
             None,
             keys,
             Some(IndexAccess::one(IndexPick { navigate: true, ..pick })),
+            &[],
         );
         assert!(matches!(navigated, RowSource::Filter { .. }));
     }

@@ -203,6 +203,8 @@ pub struct VisibleRow {
     pub versions_walked: u32,
     /// how many of those steps reconstructed a delta (rhd_delta)
     pub deltas_applied: u32,
+    /// the visible version's transaction ([VisibleVersion::txn]).
+    pub txn: u64,
 }
 
 /// The version of one record chain a reader should see, and the image
@@ -231,6 +233,9 @@ pub struct VisibleVersion {
     /// chain steps back to it (0 = the primary version)
     pub walked: u32,
     pub deltas: u32,
+    /// the found version's transaction - the engine's `rpb_transaction_nr`,
+    /// which rides in the sort record past the dbkey (SortedStream map).
+    pub txn: u64,
 }
 
 /// A transaction's SNAPSHOT of the inventory, captured at its start -
@@ -425,6 +430,7 @@ pub fn visible_version_2pc_prefix(
                     format: current.format,
                     walked,
                     deltas,
+                    txn: current.transaction,
                 }),
                 None => None,
             });
@@ -626,6 +632,7 @@ pub fn visible_rows_as(
                 image: v.image,
                 versions_walked: v.walked,
                 deltas_applied: v.deltas,
+                txn: v.txn,
             });
         }
     }
