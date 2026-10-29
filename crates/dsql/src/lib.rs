@@ -119,6 +119,10 @@ mod blr {
     pub const CONCATENATE: u8 = 0x27;
     /// FB5+'s dedicated IN-list verb: value, u16 count, values
     pub const IN_LIST: u8 = 0x40;
+    /// a boolean evaluated as a VALUE: blr_bool_as_value over the
+    /// predicate (a comparison, LIKE, IN, IS NULL, AND/OR/NOT... in
+    /// item position - measured off RDB$PROCEDURE_BLR)
+    pub const BOOL_AS_VALUE: u8 = 0xC9;
     /// an explicit join: stream count, streams, sub-clauses, blr_end -
     /// nested inside the rse like a stream
     pub const JOIN: u8 = 0x77;
@@ -549,6 +553,10 @@ enum Val {
     /// (measured: `BF 02 01 02` beside two windows, `BF 01 01` for a
     /// constant beside one)
     DerivedWrapN(Vec<u8>, Box<Val>),
+    /// a boolean in VALUE position: blr_bool_as_value over the
+    /// predicate (a comparison, LIKE, IN, IS NULL, AND/OR/NOT... as
+    /// a select item - measured off RDB$PROCEDURE_BLR)
+    BoolVal(Box<Bool>),
 }
 
 /// One sort key: `[nulls byte] <ascending|descending> <value>`.
@@ -2005,7 +2013,11 @@ impl<'a> P<'a> {
                     depth -= 1;
                     self.i += 1;
                 }
-                Tok::Ident(w) if w == "FROM" && depth == 0 => break self.i,
+                Tok::Ident(w)
+                    if w == "FROM" && depth == 0 && !self.from_is_distinct(self.i) =>
+                {
+                    break self.i
+                }
                 _ => self.i += 1,
             }
         };
@@ -2606,7 +2618,7 @@ impl<'a> P<'a> {
                         }
                         depth -= 1;
                     }
-                    Tok::Ident(w) if depth == 0 && w == "FROM" => {
+                    Tok::Ident(w) if depth == 0 && w == "FROM" && !self.from_is_distinct(k) => {
                         fpos = Some(k);
                         break;
                     }
@@ -3208,6 +3220,17 @@ impl<'a> P<'a> {
                     return Some(Val::ScalarSub(Box::new(sub)));
                 }
                 self.i += 1;
+                // a parenthesised PREDICATE is a boolean value
+                // (`(EMP_NO > 1) IS TRUE` wraps it in blr_bool_as_value -
+                // measured); a plain parenthesised value is not.
+                if self.group_holds_predicate() {
+                    let b = self.bool_or()?;
+                    if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                        return None;
+                    }
+                    self.i += 1;
+                    return Some(Val::BoolVal(Box::new(b)));
+                }
                 let inner = self.val()?;
                 if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
                     return None;
@@ -4678,18 +4701,121 @@ impl<'a> P<'a> {
         if matches!(self.t.get(self.i), Some(Tok::LParen)) {
             // a paren opens a boolean group OR a parenthesised value
             // ((A + 1) * 2 = 8): try the group on a saved position,
-            // fall through to the leaf parser otherwise
+            // fall through to the leaf parser otherwise - but when a
+            // predicate CONTINUES past the group (`(a > b) IS TRUE`,
+            // `(a) = (b)`), the group is a BOOLEAN VALUE feeding it:
+            // rewind and let the leaf parser wrap it (val() makes the
+            // blr_bool_as_value - measured). the speculative parse is
+            // DISCARDED on rewind, so its stream and window
+            // allocations roll back too - parsing allocates context
+            // numbers, and without the rollback the re-parse numbered
+            // every subquery past the group one slot too high
+            // (`(x IN (SELECT..)) IS TRUE` compiled its subquery as
+            // context 2 where the engine numbers it 1 - measured).
             let save = self.i;
+            let save_streams = self.streams.len();
+            let save_wins = self.win_found.len();
             self.i += 1;
             if let Some(inner) = self.bool_or() {
                 if matches!(self.t.get(self.i), Some(Tok::RParen)) {
                     self.i += 1;
+                    if self.predicate_ahead() {
+                        self.i = save;
+                        self.streams.truncate(save_streams);
+                        self.win_found.truncate(save_wins);
+                        return self.leaf();
+                    }
                     return Some(inner);
                 }
             }
             self.i = save;
+            self.streams.truncate(save_streams);
+            self.win_found.truncate(save_wins);
         }
         self.leaf()
+    }
+
+    /// Whether the parenthesised group just opened holds a predicate
+    /// at ITS top level: scan to the matching close paren (depth-aware;
+    /// a nested group decides for itself on the recursive descent, and a
+    /// CASE..END hides its conditions - `(CASE WHEN a > b ..)` stays a
+    /// plain parenthesised value).
+    fn group_holds_predicate(&self) -> bool {
+        let mut depth = 0;
+        let mut case: i32 = 0;
+        let mut j = self.i;
+        while let Some(t) = self.t.get(j) {
+            match t {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                Tok::Cmp(_) if depth == 0 && case == 0 => return true,
+                Tok::Ident(w)
+                    if depth == 0
+                        && matches!(
+                            w.as_str(),
+                            "IS" | "NOT" | "BETWEEN" | "LIKE" | "CONTAINING" | "SIMILAR"
+                                | "STARTING" | "IN"
+                        ) =>
+                {
+                    if case == 0 {
+                        return true;
+                    }
+                }
+                Tok::Ident(w) if w == "CASE" && depth == 0 => case += 1,
+                Tok::Ident(w) if w == "END" && depth == 0 => case = case.saturating_sub(1),
+                _ => {}
+            }
+            j += 1;
+        }
+        false
+    }
+
+    /// Whether a predicate continues at the cursor: a comparison, IS,
+    /// NOT, BETWEEN, LIKE, CONTAINING, SIMILAR, STARTING or IN (the
+    /// [`leaf`] set) - what turns a select item just parsed into a
+    /// boolean-as-value rewind.
+    fn predicate_ahead(&self) -> bool {
+        match self.t.get(self.i) {
+            Some(Tok::Cmp(_)) => true,
+            Some(Tok::Ident(w)) => matches!(
+                w.as_str(),
+                "IS" | "NOT" | "BETWEEN" | "LIKE" | "CONTAINING" | "SIMILAR" | "STARTING" | "IN"
+            ),
+            _ => false,
+        }
+    }
+
+    /// Whether the FROM at `i` belongs to an `IS [NOT] DISTINCT FROM`
+    /// predicate rather than ending the select list - the only
+    /// predicate with a bare FROM (EXTRACT / TRIM / SUBSTRING keep
+    /// theirs inside parens). Every select-list splitter must skip
+    /// it, or the list truncates mid-item (`SELECT a IS DISTINCT
+    /// FROM b ...` read its list as `a IS DISTINCT` - measured).
+    fn from_is_distinct(&self, i: usize) -> bool {
+        if !matches!(self.t.get(i), Some(Tok::Ident(w)) if w == "FROM") {
+            return false;
+        }
+        if !matches!(
+            self.t.get(i.wrapping_sub(1)),
+            Some(Tok::Ident(w)) if w == "DISTINCT"
+        ) {
+            return false;
+        }
+        matches!(
+            self.t.get(i.wrapping_sub(2)),
+            Some(Tok::Ident(w)) if w == "IS"
+        ) || (matches!(
+            self.t.get(i.wrapping_sub(2)),
+            Some(Tok::Ident(w)) if w == "NOT"
+        ) && matches!(
+            self.t.get(i.wrapping_sub(3)),
+            Some(Tok::Ident(w)) if w == "IS"
+        ))
     }
 
     fn leaf(&mut self) -> Option<Bool> {
@@ -4717,6 +4843,36 @@ impl<'a> P<'a> {
                 }
                 let e = Bool::Equiv(left, self.val()?);
                 return Some(if negated { e } else { Bool::Not(Box::new(e)) });
+            }
+            // IS TRUE / FALSE is blr_equiv against the boolean literal,
+            // IS UNKNOWN blr_missing (measured off RDB$PROCEDURE_BLR);
+            // IS NOT wraps blr_not around either (negate() keeps it -
+            // blr_equiv has no inverse verb, like DISTINCT FROM).
+            // The operand MUST be boolean (`1 IS TRUE` is the engine's
+            // 22000 Invalid usage of boolean expression - measured): a
+            // boolean column, literal, parenthesised predicate, CAST to
+            // BOOLEAN, or NULL (which tests FALSE / TRUE).
+            let truth_ahead = matches!(self.t.get(self.i), Some(Tok::Ident(w)) if matches!(w.as_str(), "TRUE" | "FALSE" | "UNKNOWN"));
+            if truth_ahead {
+                let boolean = match &left {
+                    Val::Bool(_) | Val::BoolVal(_) | Val::Null => true,
+                    Val::Field(c, n) => matches!(self.field_dsc(*c, n), Some(Dsc::Boolean)),
+                    Val::Cast(d, _) => matches!(d, Dsc::Boolean),
+                    _ => false,
+                };
+                if !boolean {
+                    return None;
+                }
+            }
+            for (kw, truth) in [("TRUE", true), ("FALSE", false)] {
+                if self.kw(kw) {
+                    let e = Bool::Equiv(left, Val::Bool(truth));
+                    return Some(if negated { Bool::Not(Box::new(e)) } else { e });
+                }
+            }
+            if self.kw("UNKNOWN") {
+                let m = Bool::Missing(left);
+                return Some(if negated { Bool::Not(Box::new(m)) } else { m });
             }
             if !self.kw("NULL") {
                 return None;
@@ -5389,6 +5545,10 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             }
             out.push(blr::END);
         }
+        Val::BoolVal(b) => {
+            out.push(blr::BOOL_AS_VALUE);
+            emit_bool(out, b);
+        }
     }
 }
 
@@ -6002,7 +6162,7 @@ pub fn compile_view_columns(sql: &str) -> Option<Vec<Option<Vec<u8>>>> {
                 items.push((start, p.i));
                 start = p.i + 1;
             }
-            Tok::Ident(w) if depth == 0 && w == "FROM" => {
+            Tok::Ident(w) if depth == 0 && w == "FROM" && !p.from_is_distinct(p.i) => {
                 items.push((start, p.i));
                 p.i += 1;
                 break;
@@ -6677,8 +6837,70 @@ fn map_children(v: &Val, f: &mut dyn FnMut(&Val) -> Option<Val>) -> Option<Val> 
             cs.iter().map(|x| f(x)).collect::<Option<Vec<_>>>()?,
             rs.iter().map(|x| f(x)).collect::<Option<Vec<_>>>()?,
         ),
+        Val::BoolVal(x) => Val::BoolVal(Box::new(map_bool_children(x, f)?)),
         _ => return None,
     })
+}
+
+/// Rebuild a boolean's VALUE leaves through `f` - the [`map_children`]
+/// twin for [`Val::BoolVal`], mirroring [`stamp_bool`] (a subquery's own
+/// items live in its own scope; only its conditions rebuild here).
+fn map_bool_children(b: &Bool, f: &mut dyn FnMut(&Val) -> Option<Val>) -> Option<Bool> {
+    let b2 = |x: Bool| Box::new(x);
+    Some(match b {
+        Bool::And(l, r) => Bool::And(b2(map_bool_children(l, f)?), b2(map_bool_children(r, f)?)),
+        Bool::Or(l, r) => Bool::Or(b2(map_bool_children(l, f)?), b2(map_bool_children(r, f)?)),
+        Bool::Not(x) => Bool::Not(b2(map_bool_children(x, f)?)),
+        Bool::Cmp(op, a, c) => Bool::Cmp(*op, f(a)?, f(c)?),
+        Bool::Like(a, c) => Bool::Like(f(a)?, f(c)?),
+        Bool::Starting(a, c) => Bool::Starting(f(a)?, f(c)?),
+        Bool::Equiv(a, c) => Bool::Equiv(f(a)?, f(c)?),
+        Bool::Containing(a, c) => Bool::Containing(f(a)?, f(c)?),
+        Bool::Similar(a, c, e) => Bool::Similar(f(a)?, f(c)?, e.as_ref().and_then(|x| f(x))),
+        Bool::AnsiLike(a, c, e) => Bool::AnsiLike(f(a)?, f(c)?, f(e)?),
+        Bool::Missing(v) => Bool::Missing(f(v)?),
+        Bool::Between(v, lo, hi) => Bool::Between(f(v)?, f(lo)?, f(hi)?),
+        Bool::InList(v, items) => Bool::InList(
+            f(v)?,
+            items.iter().map(|x| f(x)).collect::<Option<Vec<_>>>()?,
+        ),
+        Bool::Any(sub) => Bool::Any({
+            let mut s = sub.clone();
+            map_subq_children(&mut s, f)?;
+            s
+        }),
+        Bool::Unique(sub) => Bool::Unique({
+            let mut s = sub.clone();
+            map_subq_children(&mut s, f)?;
+            s
+        }),
+        Bool::AnsiAny(op, left, sub) => Bool::AnsiAny(*op, f(left)?, {
+            let mut s = sub.clone();
+            map_subq_children(&mut s, f)?;
+            s
+        }),
+        Bool::AnsiAll(op, left, sub) => Bool::AnsiAll(*op, f(left)?, {
+            let mut s = sub.clone();
+            map_subq_children(&mut s, f)?;
+            s
+        }),
+    })
+}
+
+/// Rebuild a subquery's CONDITIONS through `f` (its items live in their
+/// own scope - mirrors [`stamp_subq`]).
+fn map_subq_children(sub: &mut SubQ, f: &mut dyn FnMut(&Val) -> Option<Val>) -> Option<()> {
+    if let Some(w) = &mut sub.wher {
+        *w = Box::new(map_bool_children(w, f)?);
+    }
+    if let Some(u) = &mut sub.union_ {
+        for (_, _, wher, _) in &mut u.branches {
+            if let Some(w) = wher {
+                *w = Box::new(map_bool_children(w, f)?);
+            }
+        }
+    }
+    Some(())
 }
 
 /// Rebuild a select item over an aggregate map being built: every
@@ -8872,7 +9094,11 @@ impl<'a> P<'a> {
                     depth -= 1;
                     self.i += 1;
                 }
-                Tok::Ident(w) if w == "FROM" && depth == 0 => break self.i,
+                Tok::Ident(w)
+                    if w == "FROM" && depth == 0 && !self.from_is_distinct(self.i) =>
+                {
+                    break self.i
+                }
                 _ => self.i += 1,
             }
         };
@@ -9318,9 +9544,44 @@ impl<'a> P<'a> {
                     if agg_expr_ahead {
                         self.agg_mode = true;
                     }
+                    let save_streams = self.streams.len();
+                    let save_wins = self.win_found.len();
                     let v = self.val();
                     self.agg_mode = saved_mode;
                     self.win_cap = None;
+                    // A PREDICATE in item position (`EMP_NO > 1`, `S LIKE
+                    // 'a%'`, `ID IN (...)`, `X IS NULL`, AND/OR/NOT over
+                    // those): the value just parsed is the predicate's
+                    // left side - rewind and parse the whole boolean,
+                    // wrapped as blr_bool_as_value (measured). An
+                    // aggregate or window inside stays refused (bool_or
+                    // takes no aggregates; a WinRef fails the check).
+                    // The first parse is DISCARDED on rewind, so its
+                    // stream and window allocations roll back too (a
+                    // scalar-subquery value would otherwise number its
+                    // subquery twice - measured).
+                    let v = match v {
+                        Some(v) if !self.predicate_ahead() => Some(v),
+                        _ => {
+                            self.i = item_start;
+                            self.streams.truncate(save_streams);
+                            self.win_found.truncate(save_wins);
+                            if !grouped_ahead && !agg_expr_ahead {
+                                self.win_cap = Some((self.streams.len(), ctx));
+                            }
+                            if agg_expr_ahead {
+                                self.agg_mode = true;
+                            }
+                            let b = self.bool_or();
+                            self.agg_mode = saved_mode;
+                            self.win_cap = None;
+                            let w = Val::BoolVal(Box::new(b?));
+                            if contains_winref(&w) {
+                                return None;
+                            }
+                            Some(w)
+                        }
+                    };
                     let v = v?;
                     collect_fields_deep(&v, &mut keys_seen);
                     items.push(match v {
@@ -12482,7 +12743,9 @@ impl<'a> P<'a> {
                             depth -= 1;
                             self.i += 1;
                         }
-                        Tok::Ident(w) if w == "FROM" && depth == 0 => {
+                        Tok::Ident(w)
+                            if w == "FROM" && depth == 0 && !self.from_is_distinct(self.i) =>
+                        {
                             break self.i
                         }
                         _ => self.i += 1,

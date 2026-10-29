@@ -65,6 +65,10 @@ fn main() {
                     cells.push(match v {
                         Value::Null => "<null>".to_string(),
                         Value::Text(t) => t.trim_end_matches(' ').to_string(),
+                        // isql spells booleans <true> / <false> (measured)
+                        Value::Bool(b) => {
+                            if b { "<true>" } else { "<false>" }.to_string()
+                        }
                         other => other.render(),
                     });
                 }

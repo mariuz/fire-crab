@@ -63,6 +63,10 @@ mod blr {
     pub const TRIM: u8 = 183;
     pub const VALUE_IF: u8 = 105;
     pub const CAST: u8 = 131;
+    /// blr_bool_as_value (201): a boolean in value position (a
+    /// comparison, LIKE, IN, IS NULL... as a select item) - UNKNOWN
+    /// evaluates to NULL
+    pub const BOOL_AS_VALUE: u8 = 201;
     pub const COALESCE: u8 = 202;
     pub const DECODE: u8 = 203;
     pub const FIELD: u8 = 23;
@@ -70,6 +74,10 @@ mod blr {
     pub const PARAMETER: u8 = 25;
     pub const VARIABLE: u8 = 26;
     pub const PARAMETER2: u8 = 41;
+    /// blr_equiv (46): null-SAFE equality - IS TRUE / FALSE against
+    /// the boolean literal, IS [NOT] DISTINCT FROM (NULL operands
+    /// compare instead of spreading UNKNOWN)
+    pub const EQUIV: u8 = 46;
     pub const EQL: u8 = 47;
     pub const NEQ: u8 = 48;
     pub const GTR: u8 = 49;
@@ -260,6 +268,9 @@ pub enum Expr {
     /// over their arguments ([sys_fn]); a name outside the converted set
     /// fails the run
     SysFn(String, Vec<Expr>),
+    /// blr_bool_as_value: a boolean in value position - UNKNOWN
+    /// evaluates to NULL
+    BoolAsValue(Box<Bool>),
     /// blr_null
     Null,
 }
@@ -742,6 +753,7 @@ impl<'a> P<'a> {
                 Ok(Expr::Fid(ctx, self.u16()?))
             }
             blr::NULL => Ok(Expr::Null),
+            blr::BOOL_AS_VALUE => Ok(Expr::BoolAsValue(Box::new(self.boolean()?))),
             blr::CAST => {
                 let slot = self.msg_slot()?;
                 Ok(Expr::Cast(slot, Box::new(self.expr()?)))
@@ -928,7 +940,7 @@ impl<'a> P<'a> {
     fn boolean(&mut self) -> Result<Bool, String> {
         let verb = self.u8()?;
         Ok(match verb {
-            blr::EQL | blr::NEQ | blr::GTR | blr::GEQ | blr::LSS | blr::LEQ => {
+            blr::EQL | blr::NEQ | blr::GTR | blr::GEQ | blr::LSS | blr::LEQ | blr::EQUIV => {
                 Bool::Cmp(verb, self.expr()?, self.expr()?)
             }
             blr::AND => Bool::And(Box::new(self.boolean()?), Box::new(self.boolean()?)),
@@ -2917,6 +2929,7 @@ fn collect_sort_fields(rse: &Rse, body: &Stmt) -> SortFields {
                     self.expr(a);
                     self.expr(b);
                 }
+                Expr::BoolAsValue(b) => self.boolean(b),
                 Expr::Variable(_) | Expr::Parameter(..) | Expr::Literal(_) | Expr::Null => {}
             }
         }
@@ -3193,6 +3206,10 @@ fn expr_desc(
         // a UDF's return type lives in the catalog; the engine reads
         // it at compile time and this port declines instead
         Expr::Function(..) => None,
+        // a boolean as a value is BOOLEAN, one byte
+        Expr::BoolAsValue(_) => {
+            Some(SlotDesc { dtype: dtype::BOOLEAN, len: 1, charset: 0, coll: 0 })
+        }
         // `ORDER BY NULL` is a constant sort: unreachable past the
         // keys-tie prescan unless a row exists, and then declined
         Expr::Null => None,
@@ -6553,6 +6570,12 @@ impl<'a> Exec<'a> {
         Ok(match e {
             Expr::Null => Value::Null,
             Expr::Literal(v) => v.clone(),
+            // blr_bool_as_value: the engine's three-valued boolean as
+            // a value - UNKNOWN evaluates to NULL (measured)
+            Expr::BoolAsValue(b) => match self.bool_eval(b)? {
+                Some(v) => Value::Bool(v),
+                None => Value::Null,
+            },
             Expr::Coalesce(ops) => {
                 let mut out = Value::Null;
                 for e in ops {
@@ -7143,6 +7166,16 @@ impl<'a> Exec<'a> {
             Bool::Cmp(verb, l, r) => {
                 let lv = self.eval(l)?;
                 let rv = self.eval(r)?;
+                // blr_equiv is null-SAFE (measured: NULL IS TRUE is
+                // FALSE, NULL IS UNKNOWN TRUE): NULL operands compare
+                // instead of spreading UNKNOWN
+                if *verb == blr::EQUIV {
+                    let ln = matches!(lv, Value::Null);
+                    let rn = matches!(rv, Value::Null);
+                    if ln || rn {
+                        return Ok(Some(ln && rn));
+                    }
+                }
                 match value_cmp(&lv, &rv) {
                     None => None,
                     Some(o) => Some(match *verb {
@@ -7152,6 +7185,7 @@ impl<'a> Exec<'a> {
                         blr::GEQ => o != std::cmp::Ordering::Less,
                         blr::LSS => o == std::cmp::Ordering::Less,
                         blr::LEQ => o != std::cmp::Ordering::Greater,
+                        blr::EQUIV => o == std::cmp::Ordering::Equal,
                         _ => unreachable!(),
                     }),
                 }
@@ -7226,7 +7260,17 @@ impl<'a> Exec<'a> {
                 // is the comparison, evaluated per subquery row -
                 // ANY: true beats unknown beats false; ALL: false
                 // beats unknown beats true; the empty set answers
-                // false for ANY and true for ALL
+                // false for ANY and true for ALL. the fold itself is
+                // TWO-VALUED: the engine's RseBoolNode::execute answers
+                // a bare bool (BoolNodes.cpp returns TriState(value),
+                // never Unknown - the VLU_null escape is dead code), so
+                // an UNKNOWN comparison never surfaces: no match over a
+                // NULL-holding or NULL-compared set is FALSE, in a WHERE
+                // and under blr_bool_as_value alike (measured:
+                // qshape section 6 - `a in (select x from t2)` is FALSE
+                // for the NULL row and every no-match row, `a > all`
+                // over a NULL-holding set FALSE, while the literal-list
+                // twin `a in (10, null)` stays three-valued NULL)
                 let comparison = rse.boolean.clone();
                 let inner = Rse {
                     stream: rse.stream.clone(),
@@ -7252,7 +7296,7 @@ impl<'a> Exec<'a> {
                     }
                 }
                 if unknown {
-                    None
+                    Some(false)
                 } else {
                     Some(*all)
                 }
@@ -7618,6 +7662,13 @@ pub fn shape(req: &Request) -> Shape {
                 }
                 Expr::ValueIf(c, a, b) => { self.boolean(c); self.expr(a); self.expr(b) }
                 Expr::Via(r, a, b) => { self.rse(r); self.expr(a); self.expr(b) }
+                // a boolean in value position takes the SAME guards as a
+                // WHERE boolean: a LIKE / STARTING with a column pattern
+                // meets the operand across character sets (carriermix),
+                // a text comparison converts (textnumwhere) - without
+                // this arm the item world was invisible to every guard
+                // below and served what the predicate world declined
+                Expr::BoolAsValue(b) => self.boolean(b),
                 _ => {}
             }
         }
@@ -7985,6 +8036,7 @@ fn expr_has_double_literal(e: &Expr) -> bool {
             bool_has_double_literal(c) || expr_has_double_literal(a) || expr_has_double_literal(b)
         }
         Expr::Via(_, _, els) => expr_has_double_literal(els),
+        Expr::BoolAsValue(b) => bool_has_double_literal(b),
         Expr::Function(_, _, args) | Expr::SysFn(_, args) => args.iter().any(expr_has_double_literal),
         Expr::Field(..) | Expr::Variable(_) | Expr::Parameter(..) | Expr::Fid(..) | Expr::Null => false,
     }

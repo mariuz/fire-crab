@@ -37,8 +37,9 @@ replacement of the C++ engine is below, in priority order. Full text:
    tie representative is an unstable sort artifact, and the interpreter refuses it too), slice 39 the sort-record tiebreak (the slice-38 RECORDED item,
    resolved — the branch-ordinal theory was wrong; key ties break by the full sort record on both executors), slice 40 DECFLOAT arithmetic and grouping
    (the ORDER law is the make()-key order plus the record past the keys — cohorts and payloads order by ULONGs, `88.0 < 88 < 88.00`; GROUP BY merges by value
-   and signals 22000 on a NaN boundary; CAST to scaled is eager now).
-   INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~6,500 statements
+   and signals 22000 on a NaN boundary; CAST to scaled is eager now), slice 41 boolean select items (a predicate in item position compiles to
+   `blr_bool_as_value`, IS TRUE/FALSE/UNKNOWN to `blr_equiv`/`blr_missing`; quantified subqueries two-valued; `IS DISTINCT` items compile).
+   INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
    and key ties break by the FULL SORT RECORD past the keys (sort.cpp's low-word-first word compare over diddle/flags/data/dbkey), pinned cell by cell in
@@ -59,6 +60,20 @@ replacement of the C++ engine is below, in priority order. Full text:
    and an approximate value into a DECFLOAT slot refuses (a mistyped producer — the stat folds the engine folds in decimal128 — aggplan 16). Pre-existing
    reds confirmed at HEAD, not this slice's: widenum 2 (REGR_INTERCEPT last digit), builtins 13 (BLOB_APPEND NULL-first), semchk 5 (WITH LOCK on RDB$DATABASE),
    ddltx/ddlsavepoint (DDL under savepoints; §2's engine-silent FAILs are a stale gate premise — 2182 accepts SAVEPOINT+DDL silently).
+   DONE (slice 41): boolean select items on the BLR path — a predicate in item position compiles to `blr_bool_as_value` over the predicate (comparisons,
+   IN-list/LIKE/BETWEEN/IS NULL, AND/OR/NOT, parenthesised groups with a depth-aware, CASE-hiding lookahead), `IS TRUE/FALSE` to `blr_equiv` against the
+   boolean literal, `IS UNKNOWN` to `blr_missing`, all byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +24, exe-run-blr +12; `fcexe` renders `<true>` /
+   `<false>` for isql parity). Three laws the newly served statements settled: quantified subqueries are TWO-VALUED in every position (the engine's
+   `RseBoolNode::execute` answers a bare bool — `BoolNodes.cpp` returns `TriState(value)`, never Unknown — so `a IN (SELECT..)` over a NULL row is FALSE,
+   exposed by qshape §6's ten cells, green again); the shape analysis walks `blr_bool_as_value` like a WHERE boolean (a column-pattern LIKE meets the
+   operand across character sets — carriermix's two cells newly served-wrong without the arm, declining again now); and every select-list splitter skips
+   `IS [NOT] DISTINCT FROM`'s bare FROM (the only predicate with one — the list truncated mid-item, so the items never compiled). Two parser-hygiene fixes
+   with them: speculative parses roll their stream/window allocations back on rewind (a re-parsed subquery numbered twice — the engine numbers it once),
+   and `IS TRUE/FALSE/UNKNOWN` refuses a non-boolean operand (the engine's 22000). Compile declines 1841 → 1634 (BOOL_ITEM 174 → 91, IS_TRUE 38 → 3,
+   every other cluster bit-stable — UNION 213, COLLATE 110, WITHIN 63); boundaries: aggregates/windows in booleans, boolean columns as operands, FILTER —
+   the interpreter serves all declines. Pre-existing reds re-confirmed at HEAD by stash-compare (identical cells): textcolcmp (DOUBLE 130-cap), exeselect 17
+   (REGR_INTERCEPT last digit, the widenum-2 class), numericwhere (decfloat division rendering), explit (2^63 exponent literals), math (POWER domain),
+   dffuncs (TOTALORDER sNaN), castfromdecfloat, decfloatdoublearith, blobappend, gendurable/gencomp (generators), virtualrel (RDB$CONFIG order).
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).
