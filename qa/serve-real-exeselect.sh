@@ -573,6 +573,16 @@ route "43 GROUP BY an alias over a call" served "SELECT UPPER(S) AS U, COUNT(*) 
 route "43 an alias shadows a same-named column" served "SELECT N AS ID, COUNT(*) FROM T GROUP BY ID ORDER BY ID"
 route "43 GROUP BY the raw call" served "SELECT UPPER(S), COUNT(*) FROM T GROUP BY UPPER(S) ORDER BY 1"
 
+echo "--- 44 JOIN ... USING (slice 44): ON equalities, COALESCE merged names, merged star"
+route "44 equijoin via USING" served "SELECT A.ID, B.G FROM T A JOIN T B USING (ID) ORDER BY 1"
+route "44 a bare merged name in list and WHERE" served "SELECT ID FROM T A JOIN T B USING (ID) WHERE ID > 2 ORDER BY 1"
+route "44 star lists each pair at the left column" served "SELECT * FROM T A JOIN T B USING (ID) ORDER BY 1"
+route "44 LEFT JOIN via USING" served "SELECT A.ID, B.S FROM T A LEFT JOIN T B USING (ID) ORDER BY 1"
+route "44 FULL JOIN via USING" served "SELECT A.ID FROM T A FULL JOIN T B USING (ID) ORDER BY 1"
+# Boundary the interpreter serves: a derived table inside a join is past
+# the BLR executor (join stream verb 67), USING or ON alike.
+route "44 a derived side declines to the interpreter" declined "SELECT ID, B.V FROM T A LEFT JOIN (SELECT ID, V FROM U) B USING (ID) ORDER BY 1"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1

@@ -1580,6 +1580,12 @@ fn lex(sql: &str) -> Option<Vec<Tok>> {
 struct Stream {
     name: String,
     alias: Option<String>,
+    /// `JOIN ... USING (cols)`: the merged columns with the LEFT stream's
+    /// index each pairs with (the RIGHT stream carries the record) - a
+    /// bare reference to one compiles to COALESCE(left.col, right.col)
+    /// and a bare `*` lists the pairs at the left column's position
+    /// (measured U2/U3)
+    using: Vec<(String, usize)>,
     /// a SELECTABLE PROCEDURE called with arguments as the source
     /// (`FROM show_langs(:code, :grade, :country)`): emitted as
     /// blr_procedure with the inputs, no relation
@@ -1886,6 +1892,11 @@ impl<'a> P<'a> {
                 None => {
                     let hits: Vec<usize> = (start..end).filter(|&i| has_col(&self.streams[i])).collect();
                     if hits.len() != 1 {
+                        if hits.len() == 2 {
+                            if let Some(v) = self.using_coalesce(&hits, name) {
+                                return Some(v);
+                            }
+                        }
                         return None;
                     }
                     hits[0] as u8 + self.base
@@ -1915,6 +1926,11 @@ impl<'a> P<'a> {
                             let hits: Vec<usize> =
                                 (0..n_outer).filter(|&i| has_col(&self.streams[i])).collect();
                             if hits.len() != 1 {
+                                if hits.len() == 2 {
+                                    if let Some(v) = self.using_coalesce(&hits, name) {
+                                        return Some(v);
+                                    }
+                                }
                                 return None;
                             }
                             hits[0] as u8 + self.base
@@ -1926,10 +1942,17 @@ impl<'a> P<'a> {
             }
         };
         let idx = (ctx - self.base) as usize;
+        self.stream_col_val(idx, name)
+    }
+
+    /// A known stream's column as a value: a plain table names the
+    /// field, a derived table translates the outer name (an expression
+    /// item wraps over the context its fields live in: the relation's,
+    /// or the inner aggregate's (ctx + 1))
+    fn stream_col_val(&self, idx: usize, name: &str) -> Option<Val> {
+        let ctx = idx as u8 + self.base;
         if let Some(d) = &self.streams[idx].derived {
             let (_, inner) = d.cols.iter().find(|(o, _)| o == name)?;
-            // an expression item wraps over the context its fields live in:
-            // the relation's, or the inner aggregate's (ctx + 1)
             let expr_ctx = if d.agg.is_some() { ctx + 1 } else { ctx };
             return Some(match inner {
                 DCol::Col(n) => Val::Field(ctx, n.clone()),
@@ -1940,8 +1963,32 @@ impl<'a> P<'a> {
         Some(Val::Field(ctx, name.to_string()))
     }
 
+    /// A bare name hitting exactly a USING pair compiles to the merged
+    /// column: COALESCE(left.col, right.col), the left stream's side
+    /// first (measured U2/U3/U9). Anything else ambiguous refuses as
+    /// before; a column merged twice (transitive) refuses - unprobed
+    fn using_coalesce(&self, hits: &[usize], name: &str) -> Option<Val> {
+        let [a, b] = hits else {
+            return None;
+        };
+        if !self.streams[*b]
+            .using
+            .iter()
+            .any(|(c, l)| c == name && *l == *a)
+        {
+            return None;
+        }
+        if self.streams[*a].using.iter().any(|(c, _)| c == name) {
+            return None;
+        }
+        Some(Val::Coalesce(vec![
+            self.stream_col_val(*a, name)?,
+            self.stream_col_val(*b, name)?,
+        ]))
+    }
+
     /// `TABLE [alias]` in a FROM clause or a subquery, or a derived
-    /// table `(SELECT cols FROM TABLE [WHERE ...]) ALIAS`
+    /// table `(SELECT cols FROM name [WHERE ...]) ALIAS`
     fn stream_item(&mut self) -> Option<Stream> {
         if matches!(self.t.get(self.i), Some(Tok::LParen))
             && matches!(self.t.get(self.i + 1), Some(Tok::Ident(w)) if w == "SELECT")
@@ -2006,7 +2053,9 @@ impl<'a> P<'a> {
             }
             _ => None,
         };
-        Some(Stream { name, alias, derived: None, sub: self.in_sub, cur: None, proc_args })
+        Some(Stream { name, alias, derived: None, sub: self.in_sub, cur: None, proc_args ,
+        using: Vec::new(),
+    })
     }
 
     /// A derived table: pass-through column list, ONE underlying
@@ -2031,7 +2080,7 @@ impl<'a> P<'a> {
             }
             _ => None,
         };
-        Some(Stream { alias, ..st })
+        Some(Stream { alias, ..st  })
     }
 
     /// The body of a derived table or a WITH cte: `SELECT cols FROM
@@ -2138,6 +2187,7 @@ impl<'a> P<'a> {
             sub: self.in_sub,
             cur: None,
             proc_args: None,
+            using: Vec::new(),
         });
         let si = self.streams.len() - 1;
         let saved = self.sub.replace(si);
@@ -2497,6 +2547,7 @@ impl<'a> P<'a> {
             sub: self.in_sub,
             cur: None,
             proc_args: None,
+            using: Vec::new(),
         })
     }
 
@@ -2835,6 +2886,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
+                using: Vec::new(),
             });
             (self.streams.len() - 1) as u8 + self.base
         } else {
@@ -2907,6 +2959,7 @@ impl<'a> P<'a> {
             sub: self.in_sub,
             cur: None,
             proc_args: None,
+            using: Vec::new(),
         });
         let ctx = (self.streams.len() - 1) as u8 + self.base;
         let mut branches: Vec<(Stream, u8, Option<Box<Bool>>, Val)> = Vec::new();
@@ -3026,7 +3079,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
-            },
+                using: Vec::new(),},
             ctx,
             wher: None,
             col: None,
@@ -3998,6 +4051,7 @@ impl<'a> P<'a> {
             sub: self.in_sub,
             cur: None,
             proc_args: None,
+            using: Vec::new(),
         });
         let r = self.derived_union_inner(alias, dctx);
         self.streams.truncate(base_len);
@@ -4039,7 +4093,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
-            };
+                using: Vec::new(),};
             self.streams.push(bst.clone());
             let bidx = self.streams.len() - 1;
             let bctx = bidx as u8 + self.base;
@@ -4115,6 +4169,7 @@ impl<'a> P<'a> {
             sub: self.in_sub,
             cur: None,
             proc_args: None,
+            using: Vec::new(),
         })
     }
 
@@ -4272,6 +4327,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
+                using: Vec::new(),
             });
         }
         if st.derived.as_ref().is_some_and(|d| d.agg.is_some()) {
@@ -4282,6 +4338,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
+                using: Vec::new(),
             });
         }
     }
@@ -6870,6 +6927,7 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
         sub: p.in_sub,
         cur: None,
         proc_args: None,
+        using: Vec::new(),
     });
     // no outer scope: qualified names resolve only through the
     // current branch's stream, bare names bind to it
@@ -9688,6 +9746,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
+                using: Vec::new(),
             });
             Some((self.streams.len() - 1) as u8 + self.base)
         } else {
@@ -9730,17 +9789,88 @@ impl<'a> P<'a> {
             } else {
                 break;
             };
-            let st2 = self.stream_item()?;
+            let mut st2 = self.stream_item()?;
             self.streams.push(st2.clone());
-            let ctx2 = (self.streams.len() - 1) as u8 + self.base;
+            let right = self.streams.len() - 1;
+            let ctx2 = right as u8 + self.base;
             self.claim_derived_agg_slot(&st2);
-            if !self.kw("ON") {
-                return None;
-            }
-            let saved_scope = self.merge_scope;
-            self.merge_scope = Some((sidx, self.streams.len()));
-            let on = self.bool_or()?;
-            self.merge_scope = saved_scope;
+            let on = if self.kw("USING") {
+                // `JOIN ... USING (c1, c2)` ≡ `ON l.c1 = r.c1 AND ...`
+                // (measured U4==U4C byte-identical, U7 left-nested); the
+                // merged columns ride on the right stream for bare-name
+                // and star resolution
+                if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                    return None;
+                }
+                self.i += 1;
+                let mut cols = Vec::new();
+                loop {
+                    let Some(Tok::Ident(c)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    cols.push(c.clone());
+                    self.i += 1;
+                    if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        self.i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if cols.is_empty() {
+                    return None;
+                }
+                if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                    return None;
+                }
+                self.i += 1;
+                {
+                    let mut sorted = cols.clone();
+                    sorted.sort();
+                    sorted.dedup();
+                    if sorted.len() != cols.len() {
+                        return None; // the engine rejects a doubled column (U7)
+                    }
+                }
+                let has_col = |idx: usize, col: &str| match &self.streams[idx].derived {
+                    None => catalog_has(&self.streams[idx].name, col),
+                    Some(d) => d.cols.iter().any(|(o, _)| o == col),
+                };
+                let mut pair = Vec::with_capacity(cols.len());
+                for col in &cols {
+                    if !has_col(right, col) {
+                        return None;
+                    }
+                    let lefts: Vec<usize> =
+                        (sidx..right).filter(|&i| has_col(i, col)).collect();
+                    if lefts.len() != 1 {
+                        return None;
+                    }
+                    pair.push((col.clone(), lefts[0]));
+                }
+                let mut eqs = pair.iter().map(|(c, l)| {
+                    Some(Bool::Cmp(
+                        CmpOp::Eql,
+                        self.stream_col_val(*l, c)?,
+                        self.stream_col_val(right, c)?,
+                    ))
+                });
+                let mut on = eqs.next()??;
+                for e in eqs {
+                    on = Bool::And(Box::new(on), Box::new(e?));
+                }
+                st2.using = pair.clone();
+                self.streams[right].using = pair;
+                on
+            } else {
+                if !self.kw("ON") {
+                    return None;
+                }
+                let saved_scope = self.merge_scope;
+                self.merge_scope = Some((sidx, self.streams.len()));
+                let on = self.bool_or()?;
+                self.merge_scope = saved_scope;
+                on
+            };
             joins.push((jt, st2, ctx2, on));
         }
         // a COMMA-SEPARATED stream list (`FROM sales s, customer c`, the
@@ -10041,13 +10171,45 @@ impl<'a> P<'a> {
                         return None;
                     }
                     self.i += 1;
+                    // a column merged twice (transitive) refuses on star: unprobed
+                    for idx in sidx..self.streams.len() {
+                        for (c, l) in &self.streams[idx].using {
+                            if self.streams[*l].using.iter().any(|(d, _)| d == c) {
+                                return None;
+                            }
+                        }
+                    }
                     let mut names = Vec::new();
                     for idx in sidx..self.streams.len() {
                         if self.streams[idx].name.is_empty() && self.streams[idx].derived.is_none() {
                             continue; // a derived aggregate's placeholder slot
                         }
-                        names.extend(self.star_names(idx)?);
-                        for v in self.star_fields(idx)? {
+                        let fields = self.star_fields(idx)?;
+                        for (nm, v) in self.star_names(idx)?.into_iter().zip(fields) {
+                            // right side of a merge: skipped, the pair rides on the left
+                            if self.streams[idx].using.iter().any(|(c, _)| c == &nm) {
+                                continue;
+                            }
+                            // left side of a merge: the COALESCE pair in place
+                            let pair = (idx + 1..self.streams.len()).find_map(|r| {
+                                self.streams[r]
+                                    .using
+                                    .iter()
+                                    .find(|(c, l)| c == &nm && *l == idx)
+                                    .map(|_| r)
+                            });
+                            let (nm, v) = if let Some(r) = pair {
+                                (
+                                    nm.clone(),
+                                    Val::Coalesce(vec![
+                                        self.stream_col_val(idx, &nm)?,
+                                        self.stream_col_val(r, &nm)?,
+                                    ]),
+                                )
+                            } else {
+                                (nm, v)
+                            };
+                            names.push(nm);
                             collect_fields_deep(&v, &mut keys_seen);
                             items.push(match v {
                                 Val::Field(..) => Item::Col(v),
@@ -10520,6 +10682,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
+                using: Vec::new(),
             });
             let mut gfields: Vec<Val> = Vec::new();
             for k in &group_keys {
@@ -10580,6 +10743,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
+                using: Vec::new(),
             });
             // the map takes each select item's contribution in
             // SELECT-LIST order: a column or expression contributes
@@ -10985,6 +11149,7 @@ impl<'a> P<'a> {
                     sub: self.in_sub,
                     cur: None,
                     proc_args: None,
+                    using: Vec::new(),
                 });
             }
             // the partition keys join each window's map after its items:
@@ -11703,6 +11868,7 @@ impl<'a> P<'a> {
             sub: self.in_sub,
             cur: None,
             proc_args: None,
+            using: Vec::new(),
         });
         let sidx = self.streams.len() - 1;
         let ctx = sidx as u8 + self.base;
@@ -11761,7 +11927,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: Some(name.clone()),
                 proc_args: None,
-            };
+                using: Vec::new(),};
             self.streams.push(st2.clone());
             let ctx2 = (self.streams.len() - 1) as u8 + self.base;
             if !self.kw("ON") {
@@ -11811,6 +11977,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
+                using: Vec::new(),
             });
             Some((self.streams.len() - 1) as u8 + self.base)
         } else {
@@ -12027,6 +12194,7 @@ impl<'a> P<'a> {
             sub: self.in_sub,
             cur: None,
             proc_args: None,
+            using: Vec::new(),
         });
         let new_ctx = (self.streams.len() - 1) as u8 + self.base;
         if !self.kw("SET") {
@@ -12273,6 +12441,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
+                using: Vec::new(),
             });
         }
         let secondary = (self.streams.len() - 3) as u8 + self.base;
@@ -12426,7 +12595,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
-            },
+                using: Vec::new(),},
             ctx,
             cursor: None,
             lock: false,
@@ -13371,7 +13540,7 @@ impl<'a> P<'a> {
                     sub: self.in_sub,
                     cur: None,
                     proc_args: None,
-                };
+                    using: Vec::new(),};
                 self.streams.push(tgt.clone());
                 let tgt_ctx = (self.streams.len() - 1) as u8 + self.base;
                 return Some(TrigStmt::InsertSel {
@@ -13415,7 +13584,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
-            };
+                using: Vec::new(),};
             self.streams.push(st.clone());
             let ctx = (self.streams.len() - 1) as u8 + self.base;
             return Some(TrigStmt::Insert(
@@ -13511,6 +13680,7 @@ impl<'a> P<'a> {
                     sub: p.in_sub,
                     cur: None,
                     proc_args: None,
+                    using: Vec::new(),
                 })
             };
             let tgt = named(self)?;
@@ -13679,6 +13849,7 @@ impl<'a> P<'a> {
                                     sub: self.in_sub,
                                     cur: None,
                                     proc_args: None,
+                                    using: Vec::new(),
                                 });
                                 MergeAct::Upd(
                                     (self.streams.len() - 1) as u8
@@ -13702,6 +13873,7 @@ impl<'a> P<'a> {
                             sub: self.in_sub,
                             cur: None,
                             proc_args: None,
+                            using: Vec::new(),
                         });
                         (
                             c,
@@ -13816,7 +13988,7 @@ impl<'a> P<'a> {
                     sub: self.in_sub,
                     cur: None,
                     proc_args: None,
-                };
+                    using: Vec::new(),};
                 // contexts: store, modify-new, rse-org - in order
                 let base = self.base;
                 self.streams.push(st.clone());
@@ -13828,6 +14000,7 @@ impl<'a> P<'a> {
                     sub: self.in_sub,
                     cur: None,
                     proc_args: None,
+                    using: Vec::new(),
                 });
                 let new_ctx = (self.streams.len() - 1) as u8 + base;
                 self.streams.push(Stream {
@@ -13837,6 +14010,7 @@ impl<'a> P<'a> {
                     sub: self.in_sub,
                     cur: None,
                     proc_args: None,
+                    using: Vec::new(),
                 });
                 let org_ctx = (self.streams.len() - 1) as u8 + base;
                 return Some(TrigStmt::UpdateOrInsert {
@@ -13905,6 +14079,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
+                using: Vec::new(),
             });
             let new_ctx = (self.streams.len() - 1) as u8 + self.base;
             let st = Stream {
@@ -13914,7 +14089,7 @@ impl<'a> P<'a> {
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
-            };
+                using: Vec::new(),};
             self.streams.push(st.clone());
             let org_idx = self.streams.len() - 1;
             let org_ctx = org_idx as u8 + self.base;
@@ -14085,7 +14260,7 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
             sub: false,
             cur: None,
             proc_args: None,
-        }],
+            using: Vec::new(),}],
         base: 0,
         outer: Some(1),
         sub: None,
@@ -14160,7 +14335,7 @@ pub fn compile_index_condition(sql: &str) -> Option<Vec<u8>> {
             sub: false,
             cur: None,
             proc_args: None,
-        }],
+            using: Vec::new(),}],
         base: 0,
         outer: Some(1),
         sub: None,
@@ -14246,7 +14421,7 @@ fn compile_check_inner(sql: &str, table: &str) -> Option<Vec<u8>> {
                 sub: false,
                 cur: None,
                 proc_args: None,
-            },
+                using: Vec::new(),},
             Stream {
                 name: table.to_ascii_uppercase(),
                 alias: None,
@@ -14254,7 +14429,7 @@ fn compile_check_inner(sql: &str, table: &str) -> Option<Vec<u8>> {
                 sub: false,
                 cur: None,
                 proc_args: None,
-            },
+                using: Vec::new(),},
         ],
         base: 0,
         outer: Some(0),
@@ -14638,7 +14813,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
                 sub: false,
                 cur: None,
                 proc_args: None,
-            },
+                using: Vec::new(),},
             Stream {
                 name: "NEW".to_string(),
                 alias: None,
@@ -14646,7 +14821,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
                 sub: false,
                 cur: None,
                 proc_args: None,
-            },
+                using: Vec::new(),},
         ],
         base: 0,
         outer: Some(2),
