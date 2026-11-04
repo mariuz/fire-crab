@@ -41,7 +41,8 @@ replacement of the C++ engine is below, in priority order. Full text:
    `blr_bool_as_value`, IS TRUE/FALSE/UNKNOWN to `blr_equiv`/`blr_missing`; quantified subqueries two-valued; `IS DISTINCT` items compile),
    slice 42 UNION branch expressions (value expressions in branch lists, unified per column — arithmetic to INT64, exacts beside texts to a common
    VARYING; the route serves them), slice 43 GROUP BY keys (aliases resolve the select list first, function calls group by the raw call; uncovered
-   items refuse), slice 44 JOIN ... USING (ON equalities, COALESCE merged names, merged star).
+   items refuse), slice 44 JOIN ... USING (ON equalities, COALESCE merged names, merged star),
+   slice 45 UNION branch FIRST / SKIP (in-rse, before each branch's boolean; the leading limit is the first branch's).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -102,6 +103,14 @@ replacement of the C++ engine is below, in priority order. Full text:
    right stream, so scoping comes free; doubled columns, missing columns, qualified or empty lists, and a column merged twice (ambiguous chained
    left side) all refuse, as does a bare name over a non-USING join. Boundaries the interpreter serves: a derived table inside a join is past the
    BLR executor (join stream verb 67, USING or ON alike), and USING in views and cursors stays refused (proc frame only).
+   DONE (slice 45): UNION branch FIRST / SKIP on the BLR path - a branch's own limit prefix lands inside its rse, FIRST then SKIP then
+   the boolean (body FOR SELECTs, view unions, IN-subquery unions and derived-table unions alike), the LEADING limit belonging to the
+   FIRST branch while a trailing ROWS / OFFSET / FETCH stays the statement's after the whole union (ROWS on a non-final branch is the
+   engine's own error), all byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +19, dsql-view-blr +6, exe-run-blr +8 with no executor
+   change - the generic rse path honors the verbs; the route serves four new shapes in exeselect §45). FIRST + DISTINCT in one branch
+   stays refused (the branch-DISTINCT gap, whose transcript pins FIRST before the branch project for its own slice), as do parenthesised
+   branches and `DISTINCT FIRST` (the engine's error too). Pre-existing reds: exe EP101/EP158 and exeselect 17 unchanged from slice 44,
+   the two view DIFFs re-confirmed at HEAD by stash-compare (identical cells); branchtype 69/69, unit tests 82+5.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

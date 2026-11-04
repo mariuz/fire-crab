@@ -1168,9 +1168,9 @@ enum Bool {
 /// ones, and the comparison reads fid(union ctx, 0) (probed).
 #[derive(Clone, Debug, PartialEq)]
 struct SubUnion {
-    /// per branch: the stream, its context, its WHERE, and the
-    /// single select item
-    branches: Vec<(Stream, u8, Option<Box<Bool>>, Val)>,
+    /// per branch: the stream, its context, its WHERE, the single
+    /// select item, and the branch's own FIRST / SKIP (slice 45)
+    branches: Vec<(Stream, u8, Option<Box<Bool>>, Val, Option<Val>, Option<Val>)>,
 }
 
 /// A single-stream subquery: its stream (already holding a context id
@@ -1241,7 +1241,7 @@ fn stamp_subq(sub: &mut SubQ, cn: &str) {
         stamp_bool(w, cn);
     }
     if let Some(u) = &mut sub.union_ {
-        for (st, _, wher, _) in &mut u.branches {
+        for (st, _, wher, ..) in &mut u.branches {
             st.cur = Some(cn.to_string());
             if let Some(w) = wher {
                 stamp_bool(w, cn);
@@ -1643,8 +1643,9 @@ struct Derived {
 #[derive(Clone, Debug, PartialEq)]
 struct DerivedUnion {
     all: bool,
-    /// per branch: its relation, context, WHERE and map values
-    branches: Vec<(String, u8, Option<Bool>, Vec<Val>)>,
+    /// per branch: its relation, context, WHERE, map values, and
+    /// the branch's own FIRST / SKIP (slice 45)
+    branches: Vec<(String, u8, Option<Bool>, Vec<Val>, Option<Val>, Option<Val>)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2962,9 +2963,22 @@ impl<'a> P<'a> {
             using: Vec::new(),
         });
         let ctx = (self.streams.len() - 1) as u8 + self.base;
-        let mut branches: Vec<(Stream, u8, Option<Box<Bool>>, Val)> = Vec::new();
+        let mut branches: Vec<(Stream, u8, Option<Box<Bool>>, Val, Option<Val>, Option<Val>)> =
+            Vec::new();
         loop {
-            // one branch: <col> FROM <stream> [WHERE ...]
+            // one branch: [FIRST n] [SKIP n] <col> FROM <stream>
+            // [WHERE ...] - the limit prefix is the branch's own
+            // (slice 45, measured inside the branch's rse)
+            let bfirst = if self.kw("FIRST") {
+                Some(self.limit_operand()?)
+            } else {
+                None
+            };
+            let bskip = if self.kw("SKIP") {
+                Some(self.limit_operand()?)
+            } else {
+                None
+            };
             let Some(Tok::Ident(a)) = self.t.get(self.i) else {
                 return None;
             };
@@ -3039,7 +3053,7 @@ impl<'a> P<'a> {
             };
             self.sub = saved;
             self.host = saved_host;
-            branches.push((stream, bctx, wher, item));
+            branches.push((stream, bctx, wher, item, bfirst, bskip));
             if self.kw("UNION") {
                 if !self.kw("ALL") {
                     return None; // the distinct form: unprobed
@@ -3062,9 +3076,9 @@ impl<'a> P<'a> {
         // int64, and every PLAIN branch wraps in cast(int64)
         let unified = branches
             .iter()
-            .any(|(.., item)| matches!(item, Val::Add(..) | Val::Sub(..) | Val::Mul(..)));
+            .any(|(_, _, _, item, _, _)| matches!(item, Val::Add(..) | Val::Sub(..) | Val::Mul(..)));
         if unified {
-            for (.., item) in branches.iter_mut() {
+            for (_, _, _, item, _, _) in branches.iter_mut() {
                 if matches!(item, Val::Field(..)) {
                     let taken = std::mem::replace(item, Val::Int(0));
                     *item = Val::CastInt64(Box::new(taken));
@@ -4059,14 +4073,28 @@ impl<'a> P<'a> {
     }
 
     fn derived_union_inner(&mut self, alias: String, dctx: u8) -> Option<Stream> {
-        let mut branches: Vec<(String, u8, Option<Bool>, Vec<Val>)> = Vec::new();
+        let mut branches: Vec<(String, u8, Option<Bool>, Vec<Val>, Option<Val>, Option<Val>)> =
+            Vec::new();
         let mut names: Vec<String> = Vec::new();
         let mut all: Option<bool> = None;
         loop {
             if !self.kw("SELECT") {
                 return None;
             }
-            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if matches!(w.as_str(), "FIRST" | "SKIP" | "DISTINCT" | "ALL")) {
+            // a branch's own FIRST / SKIP prefix (slice 45 -
+            // measured inside the branch's rse, before its
+            // boolean); DISTINCT / ALL after it stay refused
+            let bfirst = if self.kw("FIRST") {
+                Some(self.limit_operand()?)
+            } else {
+                None
+            };
+            let bskip = if self.kw("SKIP") {
+                Some(self.limit_operand()?)
+            } else {
+                None
+            };
+            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if matches!(w.as_str(), "DISTINCT" | "ALL")) {
                 return None;
             }
             // branch items are columns AND value expressions (slice 42)
@@ -4123,7 +4151,7 @@ impl<'a> P<'a> {
                 return None;
             }
             let cols: Vec<Val> = resolved.into_iter().map(|(v, _)| v).collect();
-            branches.push((table, bctx, wher, cols));
+            branches.push((table, bctx, wher, cols, bfirst, bskip));
             if !self.kw("UNION") {
                 break;
             }
@@ -6119,10 +6147,18 @@ fn emit_bool(out: &mut Vec<u8>, b: &Bool) {
                 out.push(0x4C); // blr_union
                 out.push(sub.ctx);
                 out.push(u.branches.len() as u8);
-                for (st, bctx, wher, item) in &u.branches {
+                for (st, bctx, wher, item, bfirst, bskip) in &u.branches {
                     out.push(blr::RSE);
                     out.push(1);
                     emit_stream(out, st, *bctx);
+                    if let Some(v) = bfirst {
+                        out.push(blr::FIRST);
+                        emit_val(out, v);
+                    }
+                    if let Some(v) = bskip {
+                        out.push(blr::SKIP);
+                        emit_val(out, v);
+                    }
                     if let Some(w) = wher {
                         out.push(blr::BOOLEAN);
                         emit_bool(out, w);
@@ -6305,7 +6341,7 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
             out.push(blr::UNION);
             out.push(ctx);
             out.push(u.branches.len() as u8);
-            for (table, bctx, wher, cols) in &u.branches {
+            for (table, bctx, wher, cols, bfirst, bskip) in &u.branches {
                 out.push(blr::RSE);
                 out.push(1);
                 match &st.alias {
@@ -6328,6 +6364,14 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
                     }
                 }
                 out.push(*bctx);
+                if let Some(v) = bfirst {
+                    out.push(blr::FIRST);
+                    emit_val(out, v);
+                }
+                if let Some(v) = bskip {
+                    out.push(blr::SKIP);
+                    emit_val(out, v);
+                }
                 if let Some(w) = wher {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, w);
@@ -6935,6 +6979,8 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
     struct Branch {
         cols: Vec<Val>,
         wher: Option<Bool>,
+        first: Option<Val>,
+        skip: Option<Val>,
     }
     let mut branches: Vec<Branch> = Vec::new();
     let mut all: Option<bool> = None;
@@ -6942,6 +6988,18 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
         if !p.kw("SELECT") {
             return None;
         }
+        // a branch's own FIRST / SKIP prefix (slice 45 - measured
+        // inside the branch's rse, before its boolean)
+        let first = if p.kw("FIRST") {
+            Some(p.limit_operand()?)
+        } else {
+            None
+        };
+        let skip = if p.kw("SKIP") {
+            Some(p.limit_operand()?)
+        } else {
+            None
+        };
         if p.kw("DISTINCT") {
             return None; // DISTINCT inside a union branch: unprobed
         }
@@ -6980,7 +7038,12 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
             None
         };
         p.sub = saved;
-        branches.push(Branch { cols: vals, wher });
+        branches.push(Branch {
+            cols: vals,
+            wher,
+            first,
+            skip,
+        });
         if p.i == p.t.len() {
             break;
         }
@@ -7053,6 +7116,14 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
         out.push(blr::RSE);
         out.push(1);
         emit_stream(&mut out, &p.streams[bi + 1], (bi + 2) as u8);
+        if let Some(v) = &b.first {
+            out.push(blr::FIRST);
+            emit_val(&mut out, v);
+        }
+        if let Some(v) = &b.skip {
+            out.push(blr::SKIP);
+            emit_val(&mut out, v);
+        }
         if let Some(w) = &b.wher {
             out.push(blr::BOOLEAN);
             emit_bool(&mut out, w);
@@ -7502,7 +7573,7 @@ fn map_subq_children(sub: &mut SubQ, f: &mut dyn FnMut(&Val) -> Option<Val>) -> 
         *w = Box::new(map_bool_children(w, f)?);
     }
     if let Some(u) = &mut sub.union_ {
-        for (_, _, wher, _) in &mut u.branches {
+        for (_, _, wher, ..) in &mut u.branches {
             if let Some(w) = wher {
                 *w = Box::new(map_bool_children(w, f)?);
             }
@@ -8555,11 +8626,14 @@ enum PlanKind {
 }
 
 /// A body FOR SELECT's UNION: the union context, ALL or distinct,
-/// and per branch its stream, context, WHERE and select columns.
+/// and per branch its stream, context, WHERE, select columns, and
+/// the branch's own FIRST / SKIP (slice 45: a LEADING limit is the
+/// FIRST branch's - a trailing ROWS / OFFSET / FETCH stays the
+/// statement's, after the union)
 struct BodyUnion {
     ctx: u8,
     all: bool,
-    branches: Vec<(Stream, u8, Option<Bool>, Vec<Val>)>,
+    branches: Vec<(Stream, u8, Option<Bool>, Vec<Val>, Option<Val>, Option<Val>)>,
 }
 
 /// One window of a windowed select: blr_partition_by's operands -
@@ -9398,16 +9472,25 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 }
             } else if let Some(u) = &f.union_ {
                 // blr_union at the FIRST slot: count, per branch its
-                // rse (WHERE inside) and map; a DISTINCT union
-                // appends blr_project over the fids; the shared rse
-                // END below closes it (probed)
+                // rse (the branch's FIRST / SKIP, then WHERE, inside)
+                // and map; a DISTINCT union appends blr_project over
+                // the fids; the shared rse END below closes it
+                // (probed)
                 out.push(blr::UNION);
                 out.push(u.ctx);
                 out.push(u.branches.len() as u8);
-                for (st, bctx, bwher, cols) in &u.branches {
+                for (st, bctx, bwher, cols, bfirst, bskip) in &u.branches {
                     out.push(blr::RSE);
                     out.push(1);
                     emit_stream(out, st, *bctx);
+                    if let Some(v) = bfirst {
+                        out.push(blr::FIRST);
+                        emit_val(out, v);
+                    }
+                    if let Some(v) = bskip {
+                        out.push(blr::SKIP);
+                        emit_val(out, v);
+                    }
                     if let Some(b) = bwher {
                         out.push(blr::BOOLEAN);
                         emit_bool(out, b);
@@ -10475,7 +10558,9 @@ impl<'a> P<'a> {
         // arithmetic, literals, and whatever the probe pins beside
         // them); an aggregate, a window, a GROUP BY, a join or a
         // derived stream in any branch still refuses, as does an
-        // item reaching outside its branch scope
+        // item reaching outside its branch scope. A branch takes a
+        // FIRST / SKIP prefix (slice 45) - the leading one is the
+        // FIRST branch's, inside its rse
         let mut union_ = None;
         if let Some(uctx) = union_ctx {
             if !self.kw("UNION") {
@@ -10498,16 +10583,37 @@ impl<'a> P<'a> {
             if first_cols.iter().any(contains_union_scope) {
                 return None;
             }
+            // the LEADING limit is the FIRST branch's (slice 45 -
+            // measured: it lands inside the first branch's rse, while
+            // a trailing ROWS / OFFSET / FETCH lands after the whole
+            // union); the locals go back to None for the trailer
+            let b0first = first.take();
+            let b0skip = skip.take();
             let mut branches = vec![(
                 stream.clone(),
                 ctx,
                 boolean.take(),
                 first_cols.clone(),
+                b0first,
+                b0skip,
             )];
             loop {
                 if !self.kw("SELECT") {
                     return None;
                 }
+                // a branch's own FIRST / SKIP prefix (slice 45 -
+                // measured inside the branch's rse, before its
+                // boolean); DISTINCT after it stays refused here
+                let bfirst = if self.kw("FIRST") {
+                    Some(self.limit_operand()?)
+                } else {
+                    None
+                };
+                let bskip = if self.kw("SKIP") {
+                    Some(self.limit_operand()?)
+                } else {
+                    None
+                };
                 // the branch select list, positionally: columns AND
                 // value expressions (slice 42), or a `*` / `<stream>.*`
                 // standing for the branch stream's columns - split,
@@ -10537,7 +10643,7 @@ impl<'a> P<'a> {
                     None
                 };
                 self.sub = saved_b;
-                branches.push((bst, bctx, bwher, cols));
+                branches.push((bst, bctx, bwher, cols, bfirst, bskip));
                 if !self.kw("UNION") {
                     break;
                 }
@@ -10623,9 +10729,10 @@ impl<'a> P<'a> {
             || grouped
             || matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "HAVING");
         let mut agg_vals: Option<Vec<Val>> = None;
-        if union_.is_some()
-            && (grouped || first.is_some() || skip.is_some())
-        {
+        // beside a union only GROUP BY refuses here now: the
+        // LEADING limit moved into the first branch above (slice
+        // 45), and the trailing one is not parsed yet
+        if union_.is_some() && grouped {
             return None;
         }
         let win_found = std::mem::take(&mut self.win_found);
