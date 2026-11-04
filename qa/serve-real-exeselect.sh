@@ -567,6 +567,12 @@ route "42 two columns, one an expression" served "SELECT B + 1, S FROM T UNION A
 # in exe-run-blr - but the route's CONCATENATE needs text operands).
 route "42 an integer beside text in || declines to the interpreter" declined "SELECT (ID || '-') FROM T UNION ALL SELECT S FROM T ORDER BY 1"
 
+echo "--- 43 GROUP BY aliases and function-call keys (slice 43): a whole key resolves the select list first"
+route "43 GROUP BY an alias" served "SELECT G AS X, COUNT(*) FROM T GROUP BY X ORDER BY X"
+route "43 GROUP BY an alias over a call" served "SELECT UPPER(S) AS U, COUNT(*) FROM T GROUP BY U ORDER BY U"
+route "43 an alias shadows a same-named column" served "SELECT N AS ID, COUNT(*) FROM T GROUP BY ID ORDER BY ID"
+route "43 GROUP BY the raw call" served "SELECT UPPER(S), COUNT(*) FROM T GROUP BY UPPER(S) ORDER BY 1"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1

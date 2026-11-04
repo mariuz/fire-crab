@@ -40,7 +40,8 @@ replacement of the C++ engine is below, in priority order. Full text:
    and signals 22000 on a NaN boundary; CAST to scaled is eager now), slice 41 boolean select items (a predicate in item position compiles to
    `blr_bool_as_value`, IS TRUE/FALSE/UNKNOWN to `blr_equiv`/`blr_missing`; quantified subqueries two-valued; `IS DISTINCT` items compile),
    slice 42 UNION branch expressions (value expressions in branch lists, unified per column — arithmetic to INT64, exacts beside texts to a common
-   VARYING; the route serves them).
+   VARYING; the route serves them), slice 43 GROUP BY keys (aliases resolve the select list first, function calls group by the raw call; uncovered
+   items refuse).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -87,6 +88,13 @@ replacement of the C++ engine is below, in priority order. Full text:
    zoned column stays UNTYPED in the catalog, so unification over one refuses exactly as before. Pre-existing reds: exe EP101/EP158 and the two view
    DIFFs re-confirmed at HEAD by stash-compare (identical cells), exeselect 17 as documented at HEAD in slice 41 (REGR last digit, the widenum-2 class);
    branchtype 69/69, unit tests 82+5.
+   DONE (slice 43): GROUP BY keys on the BLR path - a WHOLE key that is a bare name resolves the select list first, exactly as an ORDER BY key does
+   (one hit substitutes that item's expression, an alias SHADOWS a column of the same name, two are the engine's 42702), and function-call keys
+   group by the raw call with operand fields in the map (UPPER/LOWER, CHAR_LENGTH, SUBSTRING, TRIM, EXTRACT, CAST - the probed shapes; CASE,
+   COALESCE, DECODE and system calls stay out), all byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +20, exe-run-blr +4; the route serves four
+   new shapes in exeselect §43). Past bare keys every item must be COVERED (it matches a key, reads no fields, or reads only bare-field keys) -
+   which also closes a served-wrong the expression keys opened: a bare field under an expression key compiled while the engine rejects it. Aliases
+   in HAVING stay refused (the engine's 42S22), as do quoted identifiers (unlexed) and GROUP BY in the view frame (no aggregates there at all).
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

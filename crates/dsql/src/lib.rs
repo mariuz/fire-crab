@@ -7055,6 +7055,47 @@ fn collect_fields(v: &Val, out: &mut Vec<Val>) {
     }
 }
 
+/// GROUP BY keys beyond the arithmetic walk (measured P10/P11/P14,
+/// F1-F6): a PURE call groups by the raw call and contributes its
+/// operand fields, so items rebuild over their slots like any
+/// expression key. Only the probed shapes descend; anything else
+/// keeps today's behavior exactly (contributes nothing - dependent
+/// items refuse as before, aggregate-only lists compile byte-right
+/// as they already do, measured W1-W3)
+fn collect_group_fields(k: &Val, out: &mut Vec<Val>) {
+    match k {
+        Val::Field(..) => {
+            if !out.contains(k) {
+                out.push(k.clone());
+            }
+        }
+        Val::Add(a, b)
+        | Val::Sub(a, b)
+        | Val::Mul(a, b)
+        | Val::Div(a, b)
+        | Val::Concat(a, b) => {
+            collect_group_fields(a, out);
+            collect_group_fields(b, out);
+        }
+        Val::Neg(a) => collect_group_fields(a, out),
+        Val::Upper(a) | Val::Lower(a) => collect_group_fields(a, out),
+        Val::StrLen(_, a) | Val::Extract(_, a) => collect_group_fields(a, out),
+        Val::Substring(a, b, c) => {
+            collect_group_fields(a, out);
+            collect_group_fields(b, out);
+            collect_group_fields(c, out);
+        }
+        Val::Trim(_, spec, src) => {
+            if let Some(s) = spec {
+                collect_group_fields(s, out);
+            }
+            collect_group_fields(src, out);
+        }
+        Val::Cast(_, a) => collect_group_fields(a, out),
+        _ => {}
+    }
+}
+
 /// Does a value read an aggregate map slot of context `ctx`?
 fn contains_fid_ctx(v: &Val, ctx: u8) -> bool {
     match v {
@@ -7122,13 +7163,16 @@ fn collect_fields_deep(v: &Val, out: &mut Vec<Val>) {
 
 /// An ORDER BY key at `j` that is ONE bare name standing alone - after BY
 /// or a comma, before a comma, a direction, NULLS or the clause's end.
+/// A key that is ONE bare name, not part of a larger expression -
+/// shared by the ORDER BY and GROUP BY loops (a GROUP key may be
+/// followed by HAVING or ORDER BY, which an ORDER key never is)
 fn whole_sort_key(t: &[Tok], j: usize) -> bool {
     let before = j.checked_sub(1).and_then(|k| t.get(k));
     let after_ok = match t.get(j + 1) {
         None | Some(Tok::Comma) | Some(Tok::Semi) => true,
         Some(Tok::Ident(w)) => matches!(
             w.as_str(),
-            "ASC" | "ASCENDING" | "DESC" | "DESCENDING" | "NULLS" | "INTO" | "ROWS" | "OFFSET" | "FETCH" | "PLAN" | "FOR" | "WITH" | "DO"
+            "ASC" | "ASCENDING" | "DESC" | "DESCENDING" | "NULLS" | "INTO" | "ROWS" | "OFFSET" | "FETCH" | "PLAN" | "FOR" | "WITH" | "DO" | "HAVING" | "ORDER"
         ),
         _ => false,
     };
@@ -10146,15 +10190,17 @@ impl<'a> P<'a> {
             self.i += 1;
         }
         self.i = after_from;
-        // a GROUP BY / HAVING naming an alias resolves by the engine's own
-        // rules (an alias beside a column of the same name): refused; so is
-        // an alias INSIDE an ORDER BY expression (the engine does not see it
-        // there - `ORDER BY X + 1` is column unknown). A WHOLE ORDER BY key
-        // naming one is resolved against the item names in the sort loop
+        // an alias in HAVING is the engine's 42S22 (measured H1/H2):
+        // refused, as is an alias INSIDE a GROUP/ORDER BY expression
+        // (the engine does not see it there - `GROUP BY X + 1` is
+        // column unknown, measured E3). A WHOLE GROUP/ORDER BY key
+        // naming one is resolved against the item names in the
+        // group/sort loop (an alias shadows a same-named column,
+        // measured P12)
         if !aliases.is_empty() {
             let mut j = after_from;
             let mut depth = 0i32;
-            let mut clause = 0u8; // 1 ORDER BY, 2 GROUP BY / HAVING
+            let mut clause = 0u8; // 1 ORDER BY, 2 GROUP BY, 3 HAVING
             while let Some(t) = self.t.get(j) {
                 match t {
                     Tok::LParen => depth += 1,
@@ -10162,12 +10208,15 @@ impl<'a> P<'a> {
                     Tok::Semi => break,
                     Tok::Ident(w) if depth == 0 && (w == "INTO" || w == "DO") => break,
                     Tok::Ident(w) if depth == 0 && w == "ORDER" => clause = 1,
-                    Tok::Ident(w) if depth == 0 && (w == "GROUP" || w == "HAVING") => clause = 2,
+                    Tok::Ident(w) if depth == 0 && w == "GROUP" => clause = 2,
+                    Tok::Ident(w) if depth == 0 && w == "HAVING" => clause = 3,
                     Tok::Ident(w)
                         if clause != 0
                             && aliases.iter().any(|a| a == w)
                             && !matches!(self.t.get(j.wrapping_sub(1)), Some(Tok::Dot))
-                            && !(clause == 1 && depth == 0 && whole_sort_key(&self.t, j)) =>
+                            && !((clause == 1 || clause == 2)
+                                && depth == 0
+                                && whole_sort_key(&self.t, j)) =>
                     {
                         return None
                     }
@@ -10361,7 +10410,35 @@ impl<'a> P<'a> {
             // over `G + 1` is `GROUP BY G + 1`); an aggregate's position
             // is the engine's error
             loop {
-                let key = self.val()?;
+                // a WHOLE key that is a bare name looks at the select
+                // list first, exactly as an ORDER BY key does: one hit
+                // substitutes that item's expression (an alias SHADOWS
+                // a column of the same name - measured P12), two are
+                // the engine's 42702 (measured D3), none falls through
+                // to the columns
+                let named = match self.t.get(self.i) {
+                    Some(Tok::Ident(w)) if whole_sort_key(&self.t, self.i) => {
+                        let hits: Vec<usize> = item_names
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, n)| n.as_deref() == Some(w.as_str()))
+                            .map(|(k, _)| k)
+                            .collect();
+                        if hits.len() > 1 {
+                            return None;
+                        }
+                        hits.first().copied()
+                    }
+                    _ => None,
+                };
+                if named.is_some() {
+                    self.i += 1;
+                }
+                let key = if let Some(k) = named {
+                    Val::Int(i32::try_from(k + 1).ok()?)
+                } else {
+                    self.val()?
+                };
                 let key = match key {
                     Val::Int(n) => match items.get(usize::try_from(n).ok()?.checked_sub(1)?)? {
                         Item::Col(v) | Item::Expr(v) if !contains_fid_ctx(v, self.agg_fid_ctx) || !agg_expr_ahead => v.clone(),
@@ -10512,7 +10589,45 @@ impl<'a> P<'a> {
             // on expression keys)
             let mut gfields: Vec<Val> = Vec::new();
             for k in &group_keys {
-                collect_fields(k, &mut gfields);
+                collect_group_fields(k, &mut gfields);
+            }
+            // past bare keys every non-aggregated item must be COVERED:
+            // it matches a key, it reads no fields at all, or every
+            // field it reads is itself a bare-field key (measured
+            // X1-X3, Y1-Y4 - a bare field under an expression key is
+            // the engine's error, as is an expression over one)
+            let bare_or_const = |k: &Val| -> bool {
+                if matches!(k, Val::Field(..)) {
+                    return true;
+                }
+                let mut f = Vec::new();
+                collect_group_fields(k, &mut f);
+                f.is_empty()
+            };
+            if !group_keys.iter().all(bare_or_const) {
+                let bare_keys: Vec<&Val> = group_keys
+                    .iter()
+                    .filter(|k| matches!(k, Val::Field(..)))
+                    .collect();
+                for it in &items {
+                    match it {
+                        Item::Agg(..) => {}
+                        Item::Col(v) | Item::Expr(v) => {
+                            if group_keys.iter().any(|k| k == v) {
+                                continue;
+                            }
+                            let mut f = Vec::new();
+                            collect_group_fields(v, &mut f);
+                            if f.is_empty() {
+                                continue;
+                            }
+                            if !f.iter().all(|x| bare_keys.contains(&x)) {
+                                return None;
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
             }
             let fid_ctx = self.agg_fid_ctx;
             let mut map: Vec<MapEntry> = Vec::new();
