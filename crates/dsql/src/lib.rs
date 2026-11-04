@@ -954,6 +954,8 @@ fn emit_dsc(out: &mut Vec<u8>, d: Dsc) {
 /// What a CASE / IIF / NULLIF / IN-list operand contributes to the
 /// unified descriptor - the engine's DataTypeUtil::makeFromList, as
 /// measured on 2196 through RDB$PROCEDURE_BLR (see [P::unify_branches]).
+/// UNION branches share the shape with two additions of their own (the
+/// zoned temporals, which CASE/IN still refuse): see [P::union_branch_dsc].
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum BranchDsc {
     /// an exact numeric: its blr dtype (SHORT / LONG / INT64 / INT128)
@@ -967,6 +969,10 @@ enum BranchDsc {
     Time,
     Timestamp,
     Boolean,
+    /// TIME / TIMESTAMP WITH TIME ZONE - UNION-only (union probes X13,
+    /// X14 pin same-kind columns answering raw; CASE/IN over one refuse)
+    TimeTz,
+    TimestampTz,
     /// NULL - shapes nothing
     Skip,
 }
@@ -992,6 +998,92 @@ fn dsc_to_branch(d: Dsc) -> Option<BranchDsc> {
         Dsc::Float => BranchDsc::Approx(false),
         Dsc::Boolean => BranchDsc::Boolean,
     })
+}
+
+/// A branch descriptor back to cast bytes: the inverse of
+/// [dsc_to_branch] over the kinds unions wrap. NULL compares as
+/// nothing (it always wraps when a common type exists); the zoned
+/// kinds never compare (same-kind zoned columns stay raw)
+fn branch_dsc_to_dsc(k: BranchDsc) -> Option<Dsc> {
+    Some(match k {
+        BranchDsc::Exact(dt, sc) => Dsc::Num(dt, sc),
+        BranchDsc::Approx(true) => Dsc::Double,
+        BranchDsc::Approx(false) => Dsc::Float,
+        BranchDsc::Text { varying, chars, cs } => {
+            if varying {
+                Dsc::VaryingCs(chars, cs)
+            } else {
+                Dsc::TextCs(chars, cs)
+            }
+        }
+        BranchDsc::Date => Dsc::Date,
+        BranchDsc::Time => Dsc::Time,
+        BranchDsc::Timestamp => Dsc::Timestamp,
+        BranchDsc::Boolean => Dsc::Boolean,
+        BranchDsc::TimeTz | BranchDsc::TimestampTz | BranchDsc::Skip => return None,
+    })
+}
+
+/// An exact value's maximum text rendering width in characters: its
+/// storage maximum's digits at the scale, a sign, and the point plus
+/// fraction digits when scaled (LONG/0 11, INT64/0 20, SHORT/0 6,
+/// LONG/-2 12, INT64/-1 21 - union probes W13, W12, Z2, Z3, X12).
+/// INT128's width is unprobed (X17's 47) and refuses
+fn exact_text_width(dt: u8, sc: i8) -> Option<u16> {
+    let max: i128 = match dt {
+        blr::SHORT => 32767,
+        blr::LONG => 2147483647,
+        blr::INT64 => 9223372036854775807,
+        _ => return None,
+    };
+    let f = 10i128.checked_pow(sc.unsigned_abs() as u32)?;
+    let mut x = max / f;
+    let mut digits = 1u32;
+    while x >= 10 {
+        x /= 10;
+        digits += 1;
+    }
+    let w = digits + 1 + if sc < 0 { 1 + sc.unsigned_abs() as u32 } else { 0 };
+    u16::try_from(w).ok()
+}
+
+/// The union-only fallback when [P::unify_branches] fails: exacts
+/// beside texts (which CASE refuses) cast to a common VARYING -
+/// always varying (Z1-Z3), the width the widest side's rendering
+/// (the text's characters or [exact_text_width]), the set the one
+/// non-NONE set among the texts. NULL shapes nothing; anything else
+/// refuses
+fn union_text_common(kinds: &[BranchDsc]) -> Option<Dsc> {
+    let mut width = 0u16;
+    let mut sets: Vec<u16> = Vec::new();
+    let mut saw_exact = false;
+    let mut saw_text = false;
+    for k in kinds {
+        match k {
+            BranchDsc::Skip => {}
+            BranchDsc::Exact(dt, sc) => {
+                saw_exact = true;
+                width = width.max(exact_text_width(*dt, *sc)?);
+            }
+            BranchDsc::Text { chars, cs, .. } => {
+                saw_text = true;
+                width = width.max(*chars);
+                if *cs != 0 && !sets.contains(cs) {
+                    sets.push(*cs);
+                }
+            }
+            _ => return None,
+        }
+    }
+    if !saw_exact || !saw_text {
+        return None;
+    }
+    let cs = match sets.as_slice() {
+        [] => 0,
+        [one] => *one,
+        _ => return None,
+    };
+    Some(Dsc::VaryingCs(width, cs))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3676,38 +3768,211 @@ impl<'a> P<'a> {
         }
     }
 
+    /// Split a UNION branch select list into item token ranges: depth-0
+    /// commas up to the branch FROM (strings are single tokens, calls
+    /// and subqueries nest inside parens, so no comma hides). Returns
+    /// the ranges and the FROM position; anything else at depth 0 (a
+    /// second clause, a closing paren, the end of tokens) refuses
+    fn split_branch_items(&self) -> Option<(Vec<(usize, usize)>, usize)> {
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut j = self.i;
+        let mut depth = 0i32;
+        let mut start = j;
+        let from = loop {
+            match self.t.get(j) {
+                Some(Tok::LParen) => depth += 1,
+                Some(Tok::RParen) => {
+                    depth -= 1;
+                    if depth < 0 {
+                        break None;
+                    }
+                }
+                Some(Tok::Comma) if depth == 0 => {
+                    ranges.push((start, j));
+                    start = j + 1;
+                }
+                Some(Tok::Ident(w))
+                    if depth == 0
+                        && matches!(
+                            w.as_str(),
+                            "FROM" | "WHERE" | "GROUP" | "ORDER" | "HAVING"
+                                | "UNION" | "INTO" | "DO" | "ROWS" | "OFFSET"
+                                | "FETCH" | "FIRST" | "SKIP"
+                        ) =>
+                {
+                    break if w == "FROM" { Some(j) } else { None };
+                }
+                Some(Tok::Semi) if depth == 0 => break None,
+                None => break None,
+                _ => {}
+            }
+            j += 1;
+        };
+        let f = from?;
+        ranges.push((start, f));
+        if ranges.iter().any(|(s, e)| s == e) {
+            return None; // an empty item: `SELECT , x`, `SELECT x,, y`
+        }
+        Some((ranges, f))
+    }
+
+    /// Resolve split branch items as values at the CURRENT scope (the
+    /// caller parses the branch stream first and sets it): each range a
+    /// `val()`, an optional `AS`/bare alias captured beside it (names
+    /// the derived-table column; skipped everywhere else), the range
+    /// exactly consumed. `star` expands `*` / `<stream>.*` over branch
+    /// stream `bidx` (the body path, pinned) or refuses it (the view
+    /// and derived paths, unprobed there); a bare `*` stands alone
+    /// either way. Any item reaching outside its branch scope refuses.
+    /// Leaves `self.i` inside the ranges; the caller restores it past
+    /// the stream
+    fn resolve_branch_items(
+        &mut self,
+        ranges: &[(usize, usize)],
+        bidx: usize,
+        bst: &Stream,
+        star: bool,
+    ) -> Option<Vec<(Val, Option<String>)>> {
+        let mut cols = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            let (start, end) = (*start, *end);
+            let bare_star =
+                end - start == 1 && matches!(self.t.get(start), Some(Tok::Star));
+            let qstar: Option<String> = match (
+                self.t.get(start),
+                self.t.get(start + 1),
+                self.t.get(start + 2),
+            ) {
+                (Some(Tok::Ident(q)), Some(Tok::Dot), Some(Tok::Star))
+                    if end - start == 3 =>
+                {
+                    Some(q.clone())
+                }
+                _ => None,
+            };
+            if bare_star || qstar.is_some() {
+                if !star {
+                    return None;
+                }
+                if bare_star && ranges.len() != 1 {
+                    return None; // `*` stands alone
+                }
+                if let Some(q) = qstar {
+                    let answers =
+                        bst.alias.as_deref().map_or(bst.name == q, |a| a == q);
+                    if !answers {
+                        return None;
+                    }
+                }
+                for v in self.star_fields(bidx)? {
+                    if contains_union_scope(&v) {
+                        return None;
+                    }
+                    cols.push((v, None));
+                }
+            } else {
+                self.i = start;
+                let v = self.val()?;
+                let mut alias: Option<String> = None;
+                if self.kw("AS") {
+                    let Some(Tok::Ident(a)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    alias = Some(a.clone());
+                    self.i += 1;
+                } else if let Some(Tok::Ident(a)) = self.t.get(self.i) {
+                    if self.i != end && !is_keyword(a) {
+                        alias = Some(a.clone());
+                        self.i += 1;
+                    }
+                }
+                if self.i != end {
+                    return None;
+                }
+                if contains_union_scope(&v) {
+                    return None;
+                }
+                cols.push((v, alias));
+            }
+        }
+        Some(cols)
+    }
+
     /// A UNION's branch columns, unified per column: every branch value of
     /// another type is CAST to the common one, an identical one stays raw
     /// (measured: `S UNION ALL U` - a NONE VARCHAR(20) beside a UTF8
-    /// VARCHAR(10) - casts BOTH to VARCHAR(20) UTF8; `ID UNION ALL S` casts
-    /// the INTEGER to S's type and leaves S raw). A branch of unknown type
-    /// keeps the plain map; known types that do not unify here refuse.
-    /// The branch streams must still be in scope.
+    /// VARCHAR(10) - casts BOTH to VARCHAR(20) UTF8; `N UNION ALL S`
+    /// casts BOTH to VARCHAR(11); `N + 1 UNION ALL N` casts the plain
+    /// branch to INT64). Columns type through [P::union_branch_dsc]:
+    /// all-NULL shapes and wraps nothing (X8); all-unknown columns (no
+    /// catalog) and one untypeable kind throughout (a blob, a zoned
+    /// temporal, a decfloat beside itself) keep the plain map; anything
+    /// else this cannot fully type refuses - an unknown type must not
+    /// emit raw beside a cast its sibling needs. Known types that do
+    /// not unify refuse. The branch streams must still be in scope.
     fn unify_union(&self, cols: &mut [Vec<Val>]) -> Option<()> {
         let n = cols.first()?.len();
         for i in 0..n {
-            let owns: Option<Vec<Dsc>> = cols
-                .iter()
-                .map(|c| match &c[i] {
-                    Val::Field(ctx, name) => self.field_dsc(*ctx, name),
-                    _ => None,
-                })
-                .collect();
-            let Some(owns) = owns else { continue };
+            let kinds: Vec<Option<BranchDsc>> =
+                cols.iter().map(|c| self.union_branch_dsc(&c[i])).collect();
+            if kinds.iter().all(|k| matches!(k, Some(BranchDsc::Skip))) {
+                continue;
+            }
+            if kinds.iter().any(|k| k.is_none()) {
+                // an untypeable column keeps the plain map only when
+                // every value is a column this knows nothing about (no
+                // catalog), or one untypeable kind throughout (blobs,
+                // zoned temporals, decfloats beside their own kind);
+                // anything else - a value beside a cast its sibling
+                // needs, two untypeable kinds mixed - refuses
+                let mut ds: Vec<Dsc> = Vec::new();
+                for c in cols.iter() {
+                    let Val::Field(ctx, name) = &c[i] else {
+                        return None;
+                    };
+                    match typing_of(&c[i]).or_else(|| self.field_dsc(*ctx, name)) {
+                        None => {}
+                        Some(d) => ds.push(d),
+                    }
+                }
+                if ds.is_empty() {
+                    continue;
+                }
+                let bytes = |d: Dsc| {
+                    let mut o = Vec::new();
+                    emit_dsc(&mut o, d);
+                    o
+                };
+                if ds.len() == cols.len() && ds.iter().all(|d| bytes(*d) == bytes(ds[0])) {
+                    continue;
+                }
+                return None;
+            }
+            let kinds: Vec<BranchDsc> = kinds.into_iter().collect::<Option<_>>()?;
+            if kinds.iter().all(|k| matches!(k, BranchDsc::TimeTz))
+                || kinds.iter().all(|k| matches!(k, BranchDsc::TimestampTz))
+            {
+                continue;
+            }
+            let refs: Vec<&Val> = cols.iter().map(|c| &c[i]).collect();
+            let common = self
+                .unify_branches_typed(&refs, Self::union_branch_dsc)
+                .or_else(|| union_text_common(&kinds))?;
             let bytes = |d: Dsc| {
                 let mut o = Vec::new();
                 emit_dsc(&mut o, d);
                 o
             };
-            if owns.iter().all(|d| bytes(*d) == bytes(owns[0])) {
-                continue;
-            }
-            let vals: Vec<Val> = cols.iter().map(|c| c[i].clone()).collect();
-            let common = self.unify_branches(&vals.iter().collect::<Vec<_>>())?;
-            for (k, own) in owns.iter().enumerate() {
-                if bytes(*own) != bytes(common) {
-                    let v = cols[k][i].clone();
-                    cols[k][i] = Val::Cast(common, Box::new(v));
+            for (k, c) in kinds.iter().zip(cols.iter_mut()) {
+                let own: Option<Dsc> = match &c[i] {
+                    Val::Field(ctx, name) => {
+                        typing_of(&c[i]).or_else(|| self.field_dsc(*ctx, name))
+                    }
+                    _ => branch_dsc_to_dsc(*k),
+                };
+                if own.map_or(true, |d| bytes(d) != bytes(common)) {
+                    let v = c[i].clone();
+                    c[i] = Val::Cast(common, Box::new(v));
                 }
             }
         }
@@ -3750,49 +4015,11 @@ impl<'a> P<'a> {
             if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if matches!(w.as_str(), "FIRST" | "SKIP" | "DISTINCT" | "ALL")) {
                 return None;
             }
-            let mut raw: Vec<(Option<String>, String, Option<String>)> = Vec::new();
-            loop {
-                let Some(Tok::Ident(a)) = self.t.get(self.i) else { return None };
-                if is_keyword(a) {
-                    return None;
-                }
-                let a = a.clone();
-                self.i += 1;
-                let (q, n) = if matches!(self.t.get(self.i), Some(Tok::Dot)) {
-                    self.i += 1;
-                    let Some(Tok::Ident(b)) = self.t.get(self.i) else { return None };
-                    let b = b.clone();
-                    self.i += 1;
-                    (Some(a), b)
-                } else {
-                    (None, a)
-                };
-                let al = if self.kw("AS") {
-                    let Some(Tok::Ident(x)) = self.t.get(self.i) else { return None };
-                    let x = x.clone();
-                    self.i += 1;
-                    Some(x)
-                } else if let Some(Tok::Ident(x)) = self.t.get(self.i) {
-                    if x != "FROM" && !is_keyword(x) {
-                        let x = x.clone();
-                        self.i += 1;
-                        Some(x)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                raw.push((q, n, al));
-                match self.t.get(self.i)? {
-                    Tok::Comma => self.i += 1,
-                    Tok::Ident(w) if w == "FROM" => {
-                        self.i += 1;
-                        break;
-                    }
-                    _ => return None,
-                }
-            }
+            // branch items are columns AND value expressions (slice 42)
+            // - split, then resolved at the branch scope once the
+            // stream is parsed; a `*` stays refused (unprobed here)
+            let (ranges, from_at) = self.split_branch_items()?;
+            self.i = from_at + 1;
             let Some(Tok::Ident(table)) = self.t.get(self.i) else { return None };
             if is_keyword(table) {
                 return None;
@@ -3805,29 +4032,43 @@ impl<'a> P<'a> {
                 Some(Tok::Ident(w)) if w == "WHERE" || w == "UNION" => {}
                 _ => return None,
             }
-            self.streams.push(Stream {
+            let bst = Stream {
                 name: table.clone(),
                 alias: None,
                 derived: None,
                 sub: self.in_sub,
                 cur: None,
                 proc_args: None,
-            });
+            };
+            self.streams.push(bst.clone());
             let bidx = self.streams.len() - 1;
             let bctx = bidx as u8 + self.base;
             let saved = self.sub.replace(bidx);
-            let cols: Option<Vec<Val>> = raw.iter().map(|(q, n, _)| self.field(q.as_deref(), n)).collect();
-            let wher = if cols.is_some() && self.kw("WHERE") { self.bool_or() } else { None };
+            let after_stream = self.i;
+            let resolved = self.resolve_branch_items(&ranges, bidx, &bst, false)?;
+            self.i = after_stream;
+            let wher = if self.kw("WHERE") { Some(self.bool_or()?) } else { None };
             self.sub = saved;
-            let cols = cols?;
             if self.t.get(self.i.saturating_sub(1)).is_some() && matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w != "UNION") {
                 return None; // GROUP BY, ORDER BY .. inside a branch: unprobed
             }
             if branches.is_empty() {
-                names = raw.iter().map(|(_, n, al)| al.clone().unwrap_or_else(|| n.clone())).collect();
-            } else if cols.len() != names.len() {
+                // the outer column names: the alias, else the plain
+                // column name; an unnamed expression is the engine's
+                // -104 (no column name in derived table)
+                let mut ns = Vec::with_capacity(resolved.len());
+                for (v, al) in &resolved {
+                    let nm = al.clone().or_else(|| match v {
+                        Val::Field(_, n) => Some(n.clone()),
+                        _ => None,
+                    });
+                    ns.push(nm?);
+                }
+                names = ns;
+            } else if resolved.len() != names.len() {
                 return None;
             }
+            let cols: Vec<Val> = resolved.into_iter().map(|(v, _)| v).collect();
             branches.push((table, bctx, wher, cols));
             if !self.kw("UNION") {
                 break;
@@ -4105,6 +4346,151 @@ impl<'a> P<'a> {
         })
     }
 
+    /// What a UNION branch value contributes to its column's unified
+    /// descriptor: [P::branch_dsc] for the shared kinds (literals,
+    /// columns, explicit casts, NULL) plus the expression laws the
+    /// slice-42 union probes pinned off RDB$VIEW_BLR. Kept UNION-ONLY -
+    /// passed as the `typer` to [P::unify_branches_typed] - so the
+    /// CASE/IN shapes [P::branch_dsc] serves stay byte-identical.
+    /// Anything this cannot type refuses the union (fail-closed)
+    fn union_branch_dsc(&self, v: &Val) -> Option<BranchDsc> {
+        match v {
+            // dialect-3 arithmetic types int64 at the minimum scale
+            // (W1, W11, W15, X1, X3, X6, X9, X10, X16); an INT128
+            // operand stays INT128 (X7); approximate operands are
+            // unprobed and refuse
+            Val::Add(a, b) | Val::Sub(a, b) | Val::Mul(a, b) => {
+                let (ra, sa) = Self::exact_rank(self.union_branch_dsc(a)?)?;
+                let (rb, sb) = Self::exact_rank(self.union_branch_dsc(b)?)?;
+                Some(BranchDsc::Exact(
+                    Self::rank_dtype(ra.max(rb).max(2)),
+                    sa.min(sb),
+                ))
+            }
+            // division widens one step past its widest exact operand -
+            // SHORT/LONG to INT64 (W18), INT64 to INT128 (X5, D1-D4),
+            // INT128 stays - at the minimum scale (Z4, Z5)
+            Val::Div(a, b) => {
+                let (ra, sa) = Self::exact_rank(self.union_branch_dsc(a)?)?;
+                let (rb, sb) = Self::exact_rank(self.union_branch_dsc(b)?)?;
+                let r = match ra.max(rb) {
+                    0 | 1 => 2,
+                    _ => 3,
+                };
+                Some(BranchDsc::Exact(Self::rank_dtype(r), sa.min(sb)))
+            }
+            // negation keeps its operand's descriptor (W16, Z6)
+            Val::Neg(a) => match self.union_branch_dsc(a)? {
+                k @ BranchDsc::Exact(..) => Some(k),
+                _ => None,
+            },
+            // concatenation renders every operand as text and sums the
+            // widths (W14: an INTEGER beside 'x' is VARCHAR(12)); past
+            // VARCHAR's limit, over differing sets, or over an operand
+            // without a text width, it refuses
+            Val::Concat(a, b) => {
+                let (wa, csa) = self.concat_operand(a)?;
+                let (wb, csb) = self.concat_operand(b)?;
+                let cs = match (csa, csb) {
+                    (Some(x), Some(y)) if x == y => x,
+                    (Some(x), None) | (None, Some(x)) => x,
+                    _ => return None,
+                };
+                let chars = wa.saturating_add(wb);
+                if chars > 32765 {
+                    return None;
+                }
+                Some(BranchDsc::Text { varying: true, chars, cs })
+            }
+            // UPPER / LOWER keep their operand's text descriptor (W7,
+            // X11); over a non-text operand the law is unprobed
+            Val::Upper(a) | Val::Lower(a) => match self.union_branch_dsc(a)? {
+                k @ BranchDsc::Text { .. } => Some(k),
+                _ => None,
+            },
+            // COALESCE / simple CASE unify their branches the way a
+            // CASE does (W23, W24); what the branches cannot unify
+            // refuses
+            Val::Coalesce(args) => {
+                let refs: Vec<&Val> = args.iter().collect();
+                dsc_to_branch(self.unify_branches_typed(&refs, Self::union_branch_dsc)?)
+            }
+            Val::Decode(_, _, results) => {
+                let refs: Vec<&Val> = results.iter().collect();
+                dsc_to_branch(self.unify_branches_typed(&refs, Self::union_branch_dsc)?)
+            }
+            // EXTRACT is SMALLINT except SECOND / MILLISECOND (5 / 8),
+            // whose scaled laws are unprobed in unions and refuse (W22)
+            Val::Extract(part, _) if *part != 5 && *part != 8 => {
+                Some(BranchDsc::Exact(blr::SHORT, 0))
+            }
+            Val::Extract(..) => None,
+            Val::CurrentDate => Some(BranchDsc::Date),
+            // CURRENT_TIME / CURRENT_TIMESTAMP carry the zone (X13, X14)
+            Val::CurrentTime => Some(BranchDsc::TimeTz),
+            Val::CurrentTimestamp => Some(BranchDsc::TimestampTz),
+            // a temporal literal's first byte is its dtype (X15)
+            Val::TemporalLit(b) => match b.first() {
+                Some(x) if *x == blr::DATE => Some(BranchDsc::Date),
+                Some(x) if *x == blr::TIME => Some(BranchDsc::Time),
+                Some(x) if *x == blr::TIMESTAMP => Some(BranchDsc::Timestamp),
+                _ => None,
+            },
+            // a hex literal is text in OCTETS
+            Val::Bytes(b) => Some(BranchDsc::Text {
+                varying: false,
+                chars: u16::try_from(b.len()).ok()?,
+                cs: 1,
+            }),
+            other => self.branch_dsc(other),
+        }
+    }
+
+    /// An exact BranchDsc's (rank, scale): SHORT 0, LONG 1, INT64 2,
+    /// INT128 (26) 3; anything else refuses
+    fn exact_rank(k: BranchDsc) -> Option<(u8, i8)> {
+        match k {
+            BranchDsc::Exact(dt, sc) => match dt {
+                blr::SHORT => Some((0, sc)),
+                blr::LONG => Some((1, sc)),
+                blr::INT64 => Some((2, sc)),
+                26 => Some((3, sc)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The inverse: an exact rank's blr dtype
+    fn rank_dtype(r: u8) -> u8 {
+        match r {
+            0 => blr::SHORT,
+            1 => blr::LONG,
+            2 => blr::INT64,
+            _ => 26,
+        }
+    }
+
+    /// A concatenation operand's text width and, for text operands,
+    /// its set: integers render at their maximum scale-0 width
+    /// (SHORT 6, LONG 11, INT64 20 - union probes Z2, W14), texts at
+    /// their length; anything else refuses
+    fn concat_operand(&self, v: &Val) -> Option<(u16, Option<u16>)> {
+        match self.union_branch_dsc(v)? {
+            BranchDsc::Text { chars, cs, .. } => Some((chars, Some(cs))),
+            BranchDsc::Exact(dt, 0) => {
+                let w = match dt {
+                    blr::SHORT => 6,
+                    blr::LONG => 11,
+                    blr::INT64 => 20,
+                    _ => return None,
+                };
+                Some((w, None))
+            }
+            _ => None,
+        }
+    }
+
     /// The descriptor a CASE / IIF / NULLIF casts its branches to, and
     /// an IN list's common item type. Measured on 2196:
     /// - exact numerics: the WIDEST dtype (short < long < int64 < int128)
@@ -4122,9 +4508,20 @@ impl<'a> P<'a> {
     /// - a temporal or BOOLEAN only beside its own kind (DATE beside
     ///   TIMESTAMP is the engine's -804); text beside a number: refused.
     fn unify_branches(&self, branches: &[&Val]) -> Option<Dsc> {
+        self.unify_branches_typed(branches, Self::branch_dsc)
+    }
+
+    /// [P::unify_branches] with the operand typer as an argument:
+    /// CASE/IN pass [P::branch_dsc] (byte-identical to before), UNION
+    /// columns pass [P::union_branch_dsc] (the expression laws)
+    fn unify_branches_typed(
+        &self,
+        branches: &[&Val],
+        typer: fn(&Self, &Val) -> Option<BranchDsc>,
+    ) -> Option<Dsc> {
         let mut kinds: Vec<BranchDsc> = Vec::new();
         for b in branches {
-            match self.branch_dsc(b)? {
+            match typer(self, b)? {
                 BranchDsc::Skip => {}
                 k => kinds.push(k),
             }
@@ -6490,21 +6887,35 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
         if p.kw("DISTINCT") {
             return None; // DISTINCT inside a union branch: unprobed
         }
-        let cols = p.select_list()??;
-        if cols.is_empty() {
-            return None;
-        }
+        // branch items are columns AND value expressions (slice 42) -
+        // split, then resolved at the branch scope once the stream is
+        // parsed; a `*` stays refused (unprobed in a view union)
+        let (ranges, from_at) = p.split_branch_items()?;
+        p.i = from_at + 1;
         let st = p.stream_item()?;
         if st.derived.is_some() {
             return None; // derived branches: unprobed
         }
-        p.streams.push(st);
+        p.streams.push(st.clone());
         let si = p.streams.len() - 1;
         let saved = p.sub.replace(si);
-        let mut vals = Vec::with_capacity(cols.len());
-        for (q, n) in &cols {
-            vals.push(p.field(q.as_deref(), n)?);
+        let after_stream = p.i;
+        let resolved = p.resolve_branch_items(&ranges, si, &st, false)?;
+        p.i = after_stream;
+        if resolved.is_empty() {
+            return None;
         }
+        if branches.is_empty() {
+            // the first branch names every view column: the alias, else
+            // the plain column name; an unnamed expression is the
+            // engine's -104 (union probes V2, V4-V13, V15-V25)
+            for (v, al) in &resolved {
+                if al.is_none() && !matches!(v, Val::Field(..)) {
+                    return None;
+                }
+            }
+        }
+        let vals: Vec<Val> = resolved.into_iter().map(|(v, _)| v).collect();
         let wher = if p.kw("WHERE") {
             Some(p.bool_or()?)
         } else {
@@ -6516,7 +6927,7 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
             break;
         }
         if !p.kw("UNION") {
-            return None;
+            break; // ORDER BY (or the end) after the last branch
         }
         let this_all = p.kw("ALL");
         // mixed UNION / UNION ALL chains bind by their own precedence
@@ -6528,6 +6939,55 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
     let n = branches[0].cols.len();
     if branches.iter().any(|b| b.cols.len() != n) {
         return None;
+    }
+    // ORDER BY over the union: positions only, ascending or
+    // descending - each a fid of the union's own context (measured);
+    // a name is the engine's -104, NULLS placement and row limits
+    // unprobed here and refused
+    let mut sort: Vec<(bool, Val)> = Vec::new();
+    if p.kw("ORDER") {
+        if !p.kw("BY") {
+            return None;
+        }
+        loop {
+            let pos = match p.t.get(p.i) {
+                Some(Tok::Int(n)) => *n,
+                _ => return None,
+            };
+            p.i += 1;
+            let i = usize::try_from(pos).ok()?.checked_sub(1)?;
+            if i >= n {
+                return None;
+            }
+            let descending = if p.kw("DESC") {
+                true
+            } else {
+                let _ = p.kw("ASC");
+                false
+            };
+            if matches!(p.t.get(p.i), Some(Tok::Ident(w)) if w == "NULLS") {
+                return None;
+            }
+            sort.push((descending, Val::Fid(1, i as u16)));
+            if matches!(p.t.get(p.i), Some(Tok::Comma)) {
+                p.i += 1;
+                continue;
+            }
+            break;
+        }
+    }
+    if p.i != p.t.len() {
+        return None;
+    }
+    // the branches' types UNIFY per column ([P::unify_union]) - without
+    // this a view over columns of different types stored raw maps the
+    // engine never writes (union probes V14, W13)
+    {
+        let mut cols: Vec<Vec<Val>> = branches.iter().map(|b| b.cols.clone()).collect();
+        p.unify_union(&mut cols)?;
+        for (b, c) in branches.iter_mut().zip(cols) {
+            b.cols = c;
+        }
     }
     let mut out = vec![blr::VERSION5, blr::RSE, 1, blr::UNION, 1];
     out.push(branches.len() as u8);
@@ -6545,6 +7005,13 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
         for (fi, v) in b.cols.iter().enumerate() {
             out.extend_from_slice(&(fi as u16).to_le_bytes());
             emit_val(&mut out, v);
+        }
+    }
+    if !sort.is_empty() {
+        out.push(blr::SORT);
+        out.push(sort.len() as u8);
+        for (desc, k) in &sort {
+            emit_sort_key(&mut out, *desc, k);
         }
     }
     if all == Some(false) {
@@ -6701,6 +7168,45 @@ fn contains_winref(v: &Val) -> bool {
             let mut hit = false;
             let _ = map_children(v, &mut |c| {
                 hit |= contains_winref(c);
+                Some(c.clone())
+            });
+            hit
+        }
+    }
+}
+
+/// A branch-item value reaching outside its own branch scope - a
+/// subquery, a generator step, a user-function call, an aggregate /
+/// window / union slot, a derived-table wrapper, a sort-only
+/// nulls-placement - or one whose union law is unprobed: a bound
+/// parameter, a PSQL variable, a session/trigger/row-count constant,
+/// an array element, a boolean in value position. UNION branch items
+/// holding one refuse; each waits on its own values slice
+fn contains_union_scope(v: &Val) -> bool {
+    match v {
+        Val::Fid(..)
+        | Val::WinRef(..)
+        | Val::ScalarSub(..)
+        | Val::DerivedWrap(..)
+        | Val::DerivedWrapN(..)
+        | Val::NullsPlaced(..)
+        | Val::SubFn(..)
+        | Val::PkgFn(..)
+        | Val::Fn(..)
+        | Val::GenId(..)
+        | Val::GenId2(..)
+        | Val::InParam(..)
+        | Val::LocalVar(..)
+        | Val::TrigAction
+        | Val::RowCount
+        | Val::CurrentConnection
+        | Val::CurrentTransaction
+        | Val::ArrayElem(..)
+        | Val::BoolVal(..) => true,
+        _ => {
+            let mut hit = false;
+            let _ = map_children(v, &mut |c| {
+                hit |= contains_union_scope(c);
                 Some(c.clone())
             });
             hit
@@ -9753,7 +10259,12 @@ impl<'a> P<'a> {
         }
         // UNION [ALL] branches: each a plain single-stream select -
         // items resolved at ITS stream, WHERE inside its rse; the
-        // whole union refuses beside every other structure
+        // whole union refuses beside every other structure.
+        // Branch items are columns AND value expressions (slice 42:
+        // arithmetic, literals, and whatever the probe pins beside
+        // them); an aggregate, a window, a GROUP BY, a join or a
+        // derived stream in any branch still refuses, as does an
+        // item reaching outside its branch scope
         let mut union_ = None;
         if let Some(uctx) = union_ctx {
             if !self.kw("UNION") {
@@ -9763,11 +10274,17 @@ impl<'a> P<'a> {
             let first_cols: Vec<Val> = items
                 .iter()
                 .map(|it| match it {
-                    Item::Col(v) => Some(v.clone()),
+                    Item::Col(v) | Item::Expr(v) => Some(v.clone()),
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>()?;
             if has_aggs || !joins.is_empty() || stream.derived.is_some() {
+                return None;
+            }
+            if grouped_ahead || agg_expr_ahead {
+                return None; // GROUP BY / aggregates in a branch: unprobed
+            }
+            if first_cols.iter().any(contains_union_scope) {
                 return None;
             }
             let mut branches = vec![(
@@ -9780,58 +10297,13 @@ impl<'a> P<'a> {
                 if !self.kw("SELECT") {
                     return None;
                 }
-                // the branch select list, positionally: plain columns, or
-                // a `*` / `<stream>.*` standing for the branch stream's
-                // columns (resolved once the stream is parsed)
-                enum BrItem {
-                    Col(Option<String>, String),
-                    Star(Option<String>),
-                }
-                let mut raw: Vec<BrItem> = Vec::new();
-                loop {
-                    match (self.t.get(self.i), self.t.get(self.i + 1), self.t.get(self.i + 2)) {
-                        (Some(Tok::Star), _, _) => {
-                            if !raw.is_empty() {
-                                return None; // `*` stands alone
-                            }
-                            self.i += 1;
-                            raw.push(BrItem::Star(None));
-                        }
-                        (Some(Tok::Ident(q)), Some(Tok::Dot), Some(Tok::Star)) => {
-                            raw.push(BrItem::Star(Some(q.clone())));
-                            self.i += 3;
-                        }
-                        _ => {
-                            let Some(Tok::Ident(a)) = self.t.get(self.i) else {
-                                return None;
-                            };
-                            if is_keyword(a) {
-                                return None;
-                            }
-                            let a = a.clone();
-                            self.i += 1;
-                            if matches!(self.t.get(self.i), Some(Tok::Dot)) {
-                                self.i += 1;
-                                let Some(Tok::Ident(b)) = self.t.get(self.i)
-                                else {
-                                    return None;
-                                };
-                                raw.push(BrItem::Col(Some(a), b.clone()));
-                                self.i += 1;
-                            } else {
-                                raw.push(BrItem::Col(None, a));
-                            }
-                        }
-                    }
-                    match self.t.get(self.i)? {
-                        Tok::Comma if !matches!(raw.first(), Some(BrItem::Star(None))) => self.i += 1,
-                        Tok::Ident(w) if w == "FROM" => {
-                            self.i += 1;
-                            break;
-                        }
-                        _ => return None,
-                    }
-                }
+                // the branch select list, positionally: columns AND
+                // value expressions (slice 42), or a `*` / `<stream>.*`
+                // standing for the branch stream's columns - split,
+                // then resolved at the branch scope once the stream is
+                // parsed
+                let (ranges, from_at) = self.split_branch_items()?;
+                self.i = from_at + 1;
                 let bst = self.stream_item()?;
                 if bst.derived.is_some() {
                     return None;
@@ -9840,21 +10312,11 @@ impl<'a> P<'a> {
                 let bidx = self.streams.len() - 1;
                 let bctx = bidx as u8 + self.base;
                 let saved_b = self.sub.replace(bidx);
-                let mut cols = Vec::with_capacity(raw.len());
-                for it in &raw {
-                    match it {
-                        BrItem::Col(q, n) => cols.push(self.field(q.as_deref(), n)?),
-                        BrItem::Star(q) => {
-                            if let Some(q) = q {
-                                let answers = bst.alias.as_deref().map_or(bst.name == *q, |a| a == q);
-                                if !answers {
-                                    return None;
-                                }
-                            }
-                            cols.extend(self.star_fields(bidx)?);
-                        }
-                    }
-                }
+                let after_stream = self.i;
+                let resolved = self.resolve_branch_items(&ranges, bidx, &bst, true)?;
+                self.i = after_stream;
+                let cols: Vec<Val> =
+                    resolved.into_iter().map(|(v, _)| v).collect();
                 if cols.len() != first_cols.len() {
                     return None;
                 }
@@ -13815,10 +14277,13 @@ pub fn type_spec_of(sql: &str) -> Option<TypeSpec> {
     if p.i != toks.len() {
         return None;
     }
-    // a blob or zoned column stays UNTYPED in the catalog - exactly as
-    // before this slice (cast_target refused them): unification over one
-    // refuses and the interpreter answers
-    if matches!(d, Dsc::Blob { .. } | Dsc::TimeTz | Dsc::TimestampTz) {
+    // a blob column stays UNTYPED in the catalog - exactly as before
+    // (its subtype is lost in a TypeSpec, so a text catalog cannot tell
+    // two blob kinds apart): unification over one refuses and the
+    // interpreter answers. Zoned columns type since slice 42 (UNION
+    // branches unify over them: same kind beside itself stays raw,
+    // anything else refuses)
+    if matches!(d, Dsc::Blob { .. }) {
         return None;
     }
     let (def_cs, def_bpc) = DEFAULT_CS.with(|c| c.get());
@@ -13836,8 +14301,10 @@ pub fn type_spec_of(sql: &str) -> Option<TypeSpec> {
         Dsc::Boolean => TypeSpec { blr_type: 23, length: 1, scale: 0, charset: None },
         Dsc::Dec64 => TypeSpec { blr_type: 24, length: 8, scale: 0, charset: None },
         Dsc::Dec128 => TypeSpec { blr_type: 25, length: 16, scale: 0, charset: None },
-        // untyped by the early return above; unification over blob/tz refuses
-        Dsc::Blob { .. } | Dsc::TimeTz | Dsc::TimestampTz => unreachable!("blob/zoned stay untyped"),
+        Dsc::TimeTz => TypeSpec { blr_type: 28, length: 8, scale: 0, charset: None },
+        Dsc::TimestampTz => TypeSpec { blr_type: 29, length: 12, scale: 0, charset: None },
+        // untyped by the early return above; unification over a blob refuses
+        Dsc::Blob { .. } => unreachable!("blobs stay untyped"),
     })
 }
 

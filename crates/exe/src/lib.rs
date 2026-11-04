@@ -7005,8 +7005,14 @@ impl<'a> Exec<'a> {
                     return Ok(Value::Null);
                 }
                 if *verb == blr::CONCATENATE {
+                    // the engine coerces at EVAL time (EVL_concatenate
+                    // converts each side): an integer renders in plain
+                    // decimal beside text - the CAST arm's law, not a
+                    // refusal (a scaled/double/temporal beside text
+                    // stays declined, as a CAST of one is)
                     let text = |v: &Value| match v {
                         Value::Text(t) => Ok(t.clone()),
+                        Value::Int(n) => Ok(n.to_string()),
                         _ => Err("concatenation over a non-text value".to_string()),
                     };
                     return Ok(Value::Text(format!("{}{}", text(&lv)?, text(&rv)?)));

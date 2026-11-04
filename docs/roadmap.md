@@ -38,7 +38,9 @@ replacement of the C++ engine is below, in priority order. Full text:
    resolved — the branch-ordinal theory was wrong; key ties break by the full sort record on both executors), slice 40 DECFLOAT arithmetic and grouping
    (the ORDER law is the make()-key order plus the record past the keys — cohorts and payloads order by ULONGs, `88.0 < 88 < 88.00`; GROUP BY merges by value
    and signals 22000 on a NaN boundary; CAST to scaled is eager now), slice 41 boolean select items (a predicate in item position compiles to
-   `blr_bool_as_value`, IS TRUE/FALSE/UNKNOWN to `blr_equiv`/`blr_missing`; quantified subqueries two-valued; `IS DISTINCT` items compile).
+   `blr_bool_as_value`, IS TRUE/FALSE/UNKNOWN to `blr_equiv`/`blr_missing`; quantified subqueries two-valued; `IS DISTINCT` items compile),
+   slice 42 UNION branch expressions (value expressions in branch lists, unified per column — arithmetic to INT64, exacts beside texts to a common
+   VARYING; the route serves them).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -74,6 +76,17 @@ replacement of the C++ engine is below, in priority order. Full text:
    the interpreter serves all declines. Pre-existing reds re-confirmed at HEAD by stash-compare (identical cells): textcolcmp (DOUBLE 130-cap), exeselect 17
    (REGR_INTERCEPT last digit, the widenum-2 class), numericwhere (decfloat division rendering), explit (2^63 exponent literals), math (POWER domain),
    dffuncs (TOTALORDER sNaN), castfromdecfloat, decfloatdoublearith, blobappend, gendurable/gencomp (generators), virtualrel (RDB$CONFIG order).
+   DONE (slice 42): UNION branch expressions on the BLR path — branch items take value expressions, not just plain columns (first and later branches,
+   view unions, derived-table unions, through two shared helpers behind a fail-closed denylist: subqueries, generators, user functions, params and
+   bools-as-values still refuse, as do aggregates, joins, derived streams, DISTINCT and mixed ALL/distinct), each column UNIFIED (arithmetic to INT64
+   with `cast(int64)` wrapping the plain branches, division a step past its widest operand, exacts beside texts to a common VARYING — always varying,
+   the width the widest side's rendering, the set the one non-NONE set; an integer beside text casts BOTH — a flipped refusal), all byte-identical off
+   `RDB$PROCEDURE_BLR` (dsql-proc-blr +50, dsql-view-blr +71, exe-run-blr +10; `fcexe` coerces an integer beside text in `||` to plain decimal, the CAST
+   arm's law, scaled/double/temporal still declining). The route serves eight new shapes (exeselect §42: arithmetic, literals, DISTINCT, a text function,
+   filtered DESC, a derived union body, three branches, two columns) and declines one boundary (integer `||` text, the interpreter serving). A blob or
+   zoned column stays UNTYPED in the catalog, so unification over one refuses exactly as before. Pre-existing reds: exe EP101/EP158 and the two view
+   DIFFs re-confirmed at HEAD by stash-compare (identical cells), exeselect 17 as documented at HEAD in slice 41 (REGR last digit, the widenum-2 class);
+   branchtype 69/69, unit tests 82+5.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

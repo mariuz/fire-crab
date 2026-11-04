@@ -553,6 +553,20 @@ route "40 dec16 column orders natively" served "SELECT A FROM DF ORDER BY 1"
 route "40 33-digit payload renders" served "SELECT CAST('NaN123456789012345678901234567890123' AS DECFLOAT(34)) FROM RDB\$DATABASE"
 route "40 34-digit payload is 22018" declined "SELECT CAST('NaN1234567890123456789012345678901234' AS DECFLOAT(34)) FROM RDB\$DATABASE"
 
+echo "--- 42 UNION branch expressions (slice 42): value expressions in branch lists, unified per column"
+route "42 arithmetic beside a plain column, int64 unification" served "SELECT B + 1 FROM T UNION ALL SELECT ID FROM U ORDER BY 1"
+route "42 literals in branch lists" served "SELECT 1 FROM T UNION ALL SELECT 2 FROM U"
+route "42 DISTINCT over expression branches" served "SELECT B + 1 FROM T UNION SELECT ID FROM U ORDER BY 1"
+route "42 a text function beside its own column" served "SELECT UPPER(S) FROM T UNION ALL SELECT S FROM T ORDER BY 1"
+route "42 filtered, DESC" served "SELECT G * 2 FROM T WHERE ID > 1 UNION ALL SELECT ID FROM U ORDER BY 1 DESC"
+route "42 a union with expressions as a derived body" served "SELECT Z.X FROM (SELECT B + 1 AS X FROM T UNION ALL SELECT ID FROM U) Z ORDER BY 1"
+route "42 three branches, expressions on two" served "SELECT B + 1 FROM T UNION ALL SELECT ID FROM U UNION ALL SELECT T_ID + 2 FROM U ORDER BY 1"
+route "42 two columns, one an expression" served "SELECT B + 1, S FROM T UNION ALL SELECT ID, S FROM T ORDER BY 2 DESC, 1"
+# Boundary the interpreter serves: the route's shape law declines a
+# concatenation over an integer (the BLR executor evaluates it - pinned
+# in exe-run-blr - but the route's CONCATENATE needs text operands).
+route "42 an integer beside text in || declines to the interpreter" declined "SELECT (ID || '-') FROM T UNION ALL SELECT S FROM T ORDER BY 1"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
