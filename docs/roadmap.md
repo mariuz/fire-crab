@@ -45,7 +45,8 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 45 UNION branch FIRST / SKIP (in-rse, before each branch's boolean; the leading limit is the first branch's),
    slice 46 UNION branch DISTINCT (in-rse project over the raw items; SELECT ALL is traceless),
    slice 47 limits in recursion (anchor/member FIRST / SKIP; the member ROWS trailer is traceless),
-   slice 48 ORDER BY on the recursive member (parses syntactically, no BLR trace).
+   slice 48 ORDER BY on the recursive member (parses syntactically, no BLR trace),
+   slice 49 the outer select over the recursion (WHERE / ORDER BY / DISTINCT / limits over the recurse fids).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -140,6 +141,15 @@ replacement of the C++ engine is below, in priority order. Full text:
    walks as if the trailer were not there (a member ROWS 3 changes no row, re-confirming slice 47's traceless law against the live engine).
    The interpreter raises its 42000 on member ORDER BY, as for member limits - no route cells. Pre-existing reds re-confirmed at HEAD by
    stash-compare (identical cells: exe EP101/EP158, exeselect §17, the two view DIFFs); branchtype 69/69, unit tests 82+5.
+   DONE (slice 49): the outer select over the recursion on the BLR path - FIRST / SKIP, DISTINCT, item expressions, star, WHERE,
+   ORDER BY and the ROWS / OFFSET / FETCH trailer compile over a derived scope whose columns read fid(recurse ctx, slot), the outer
+   clauses riding the rse after the tower (FIRST, SKIP, boolean, SORT, PROJECT - all probed orders and combos), all byte-identical
+   off `RDB$PROCEDURE_BLR` (dsql-proc-blr +69 net with the slice-45 outer-WHERE gap flipped, exe-run-blr +6 with no executor change;
+   the route declines, four new cells in exeselect §49 - the interpreter serves every outer clause). ORDER keys resolve positions
+   and aliases to items, names to fields; the outer alias shadows the cte name (the engine's 42S22); out-of-range positions, unknown
+   columns, WHERE on an alias and HAVING without GROUP are the engine's error too. Aggregates, GROUP BY, joins, qualified stars,
+   boolean items and the long direction spellings stay refused - named gaps, pinned. Pre-existing reds re-confirmed at HEAD by
+   stash-compare (identical cells: exe EP101/EP158, exeselect §17, the two view DIFFs); branchtype 69/69, unit tests 84+5.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

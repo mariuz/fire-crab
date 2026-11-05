@@ -605,6 +605,12 @@ route "47 anchor FIRST declines" declined "WITH RECURSIVE N AS (SELECT FIRST 2 I
 # Slice 48 measured the same 42000 for ORDER BY on the member (the engine
 # answers the walk as if it were not there) - still no route cells.
 
+echo "--- 49 the outer select over a recursion (slice 49): the BLR path declines, the interpreter serves"
+route "49 outer WHERE declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT N.ID FROM N WHERE N.ID > 2"
+route "49 outer ORDER BY declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT N.ID FROM N ORDER BY 1 DESC"
+route "49 outer DISTINCT declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT DISTINCT N.ID FROM N"
+route "49 outer FIRST declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT FIRST 2 N.ID FROM N"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1

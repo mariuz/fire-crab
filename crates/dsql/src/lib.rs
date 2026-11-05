@@ -9611,6 +9611,22 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     emit_val(out, item);
                 }
                 out.push(blr::END); // the wrapper rse's end
+                // the OUTER select's FIRST / SKIP / WHERE ride the
+                // outer rse after the tower, before the shared sort
+                // (slice 49, measured order: FIRST, SKIP, boolean,
+                // SORT, PROJECT)
+                if let Some(v) = &f.first {
+                    out.push(blr::FIRST);
+                    emit_val(out, v);
+                }
+                if let Some(v) = &f.skip {
+                    out.push(blr::SKIP);
+                    emit_val(out, v);
+                }
+                if let Some(b) = &f.boolean {
+                    out.push(blr::BOOLEAN);
+                    emit_bool(out, b);
+                }
             } else if f.aggregate && f.windows.is_empty() {
                 out.push(blr::AGGREGATE);
                 out.push(f.agg_ctx);
@@ -13240,17 +13256,148 @@ impl<'a> P<'a> {
             return None;
         }
         self.i += 1;
-        // ---- the outer select: [<name>.]<col> [, ...] FROM <name>
+        // ---- the outer select over the cte (slice 49): the whole
+        // single-stream surface - FIRST / SKIP, DISTINCT, item
+        // expressions, star, WHERE, ORDER BY, the ROWS / OFFSET /
+        // FETCH trailer - compiled by the general leaf parsers over
+        // a derived scope whose columns read fid(recurse ctx, slot).
+        // Aggregates, GROUP BY / HAVING, joins, windows, PLAN, LOCK,
+        // AS CURSOR, qualified stars and boolean items stay refused
+        // (the engine answers all but LOCK - unmeasured shapes,
+        // named gaps); the long direction spellings refuse with the
+        // general parser's shared gap
         if !self.kw("SELECT") {
             return None;
         }
-        let mut outs = Vec::new();
-        loop {
-            let v = self.rec_val(&cte, ctx, &acols)?;
-            if !matches!(v, Val::Fid(..)) {
-                return None; // outer expressions over the cte: unprobed
+        let outer_first = if self.kw("FIRST") {
+            Some(self.limit_operand()?)
+        } else {
+            None
+        };
+        let outer_skip = if self.kw("SKIP") {
+            Some(self.limit_operand()?)
+        } else {
+            None
+        };
+        let outer_distinct = self.kw("DISTINCT");
+        if !outer_distinct {
+            let _ = self.kw("ALL");
+        }
+        // lookahead: the outer alias (if any) must be known before
+        // the items parse, so a forward scan finds FROM <cte> at
+        // depth 0 (a subquery's or EXTRACT's FROM sits deeper)
+        let mut outer_alias: Option<String> = None;
+        {
+            let mut j = self.i;
+            let mut depth = 0i32;
+            while let Some(t) = self.t.get(j) {
+                match t {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => {
+                        depth -= 1;
+                        if depth < 0 {
+                            break;
+                        }
+                    }
+                    Tok::Ident(w) if depth == 0 && w == "FROM" => {
+                        if matches!(self.t.get(j + 1), Some(Tok::Ident(c)) if *c == cte)
+                        {
+                            let mut k = j + 2;
+                            if matches!(self.t.get(k), Some(Tok::Ident(a)) if a == "AS")
+                            {
+                                k += 1;
+                            }
+                            if let Some(Tok::Ident(a)) = self.t.get(k) {
+                                if !is_keyword(a) {
+                                    outer_alias = Some(a.clone());
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+                j += 1;
             }
-            outs.push(v);
+        }
+        // the cte scope: the recurse-context placeholder becomes a
+        // derived stream answering to the cte name (a self-alias -
+        // an alias-less derived table answers to no qualifier) or
+        // to the outer alias, which SHADOWS it (the engine's 42S22
+        // on the original); its columns are the recurse fids.
+        // Restored before the DO body so no later statement sees it
+        let cte_idx = (ctx - self.base) as usize;
+        let saved_stream = std::mem::replace(
+            &mut self.streams[cte_idx],
+            Stream {
+                name: cte.clone(),
+                alias: Some(outer_alias.clone().unwrap_or_else(|| cte.clone())),
+                using: Vec::new(),
+                proc_args: None,
+                derived: Some(Box::new(Derived {
+                    wher: None,
+                    cols: acols
+                        .iter()
+                        .enumerate()
+                        .map(|(s, c)| {
+                            (c.clone(), DCol::Fid(Val::Fid(ctx, s as u16)))
+                        })
+                        .collect(),
+                    inner_alias: None,
+                    first: None,
+                    skip: None,
+                    sort: Vec::new(),
+                    project: None,
+                    agg: None,
+                    wins: Vec::new(),
+                    union: None,
+                })),
+                sub: self.in_sub,
+                cur: None,
+            },
+        );
+        let saved_sub = self.sub.replace(cte_idx);
+        let saved_agg_mode = std::mem::replace(&mut self.agg_mode, false);
+        // items + aliases; star expands the cte columns (probed:
+        // byte-identical to enumerating them)
+        let mut outs: Vec<Val> = Vec::new();
+        let mut item_names: Vec<Option<String>> = Vec::new();
+        loop {
+            if matches!(self.t.get(self.i), Some(Tok::Star)) {
+                self.i += 1;
+                for v in self.star_fields(cte_idx)? {
+                    outs.push(v);
+                }
+                for c in &acols {
+                    item_names.push(Some(c.clone()));
+                }
+            } else {
+                let v = self.val()?;
+                // the item's NAME as ORDER BY sees it: its alias,
+                // else the column a bare/qualified column reference
+                // names, else none (the general law)
+                let mut iname = match &v {
+                    Val::Fid(_, s) => acols.get(*s as usize).cloned(),
+                    _ => None,
+                };
+                if self.kw("AS") {
+                    let Some(Tok::Ident(a)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    if is_keyword(a) {
+                        return None;
+                    }
+                    iname = Some(a.clone());
+                    self.i += 1;
+                } else if let Some(Tok::Ident(a)) = self.t.get(self.i) {
+                    if !is_keyword(a) {
+                        iname = Some(a.clone());
+                        self.i += 1;
+                    }
+                }
+                outs.push(v);
+                item_names.push(iname);
+            }
             if matches!(self.t.get(self.i), Some(Tok::Comma)) {
                 self.i += 1;
             } else {
@@ -13264,6 +13411,174 @@ impl<'a> P<'a> {
             return None;
         }
         self.i += 1;
+        // the outer alias for real (bare or AS - both probed); it
+        // must be the one the lookahead found
+        let mut found_alias: Option<String> = None;
+        if self.kw("AS") {
+            let Some(Tok::Ident(a)) = self.t.get(self.i) else {
+                return None;
+            };
+            if is_keyword(a) {
+                return None;
+            }
+            found_alias = Some(a.clone());
+            self.i += 1;
+        } else if let Some(Tok::Ident(a)) = self.t.get(self.i) {
+            if !is_keyword(a) {
+                found_alias = Some(a.clone());
+                self.i += 1;
+            }
+        }
+        if found_alias != outer_alias {
+            return None;
+        }
+        let outer_boolean = if self.kw("WHERE") {
+            Some(self.bool_or()?)
+        } else {
+            None
+        };
+        // ORDER BY: a WHOLE bare-name key looks at the select list
+        // first (one hit sorts on that item, two are the engine's
+        // 42702), else positions name items and everything else
+        // reads the columns (measured E1-E4); the general shape
+        let mut outer_sort: Vec<(bool, Val)> = Vec::new();
+        if self.kw("ORDER") {
+            if !self.kw("BY") {
+                return None;
+            }
+            loop {
+                let named = match self.t.get(self.i) {
+                    Some(Tok::Ident(w)) if whole_sort_key(&self.t, self.i) => {
+                        let hits: Vec<usize> = item_names
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, n)| n.as_deref() == Some(w.as_str()))
+                            .map(|(k, _)| k)
+                            .collect();
+                        if hits.len() > 1 {
+                            return None;
+                        }
+                        hits.first().copied()
+                    }
+                    _ => None,
+                };
+                if named.is_some() {
+                    self.i += 1;
+                }
+                let key = if let Some(k) = named {
+                    outs.get(k).cloned()?
+                } else {
+                    self.val()?
+                };
+                // a bare integer is a POSITION in the select list;
+                // a scaled literal is no position (the general law)
+                let key = match key {
+                    Val::Int(n) => {
+                        let idx = usize::try_from(n).ok()?.checked_sub(1)?;
+                        outs.get(idx).cloned()?
+                    }
+                    Val::Int64(n) => {
+                        let idx = usize::try_from(n).ok()?.checked_sub(1)?;
+                        outs.get(idx).cloned()?
+                    }
+                    Val::Dec(..) => return None,
+                    other => other,
+                };
+                let descending = if self.kw("DESC") {
+                    true
+                } else {
+                    let _ = self.kw("ASC");
+                    false
+                };
+                let key = self.nulls_placement(key)?;
+                outer_sort.push((descending, key));
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        // OFFSET n ROW[S] / FETCH FIRST|NEXT n ROW[S] ONLY / ROWS m
+        // [TO n] - the standard and legacy spellings of SKIP and
+        // FIRST, same rse clauses in the same probed order
+        let mut outer_first = outer_first;
+        let mut outer_skip = outer_skip;
+        if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "OFFSET") {
+            if outer_skip.is_some() {
+                return None;
+            }
+            self.i += 1;
+            let Some(Tok::Int(n)) = self.t.get(self.i) else {
+                return None;
+            };
+            outer_skip = Some(Val::Int(i32::try_from(*n).ok()?));
+            self.i += 1;
+            if !(matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ROW" || w == "ROWS"))
+            {
+                return None;
+            }
+            self.i += 1;
+        }
+        if self.kw("FETCH") {
+            if outer_first.is_some() {
+                return None;
+            }
+            if !(matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "FIRST" || w == "NEXT"))
+            {
+                return None;
+            }
+            self.i += 1;
+            let Some(Tok::Int(n)) = self.t.get(self.i) else {
+                return None;
+            };
+            outer_first = Some(Val::Int(i32::try_from(*n).ok()?));
+            self.i += 1;
+            if !(matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ROW" || w == "ROWS"))
+            {
+                return None;
+            }
+            self.i += 1;
+            if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ONLY") {
+                return None;
+            }
+            self.i += 1;
+        }
+        if self.kw("ROWS") {
+            if outer_first.is_some() || outer_skip.is_some() {
+                return None;
+            }
+            let Some(Tok::Int(m)) = self.t.get(self.i) else {
+                return None;
+            };
+            let m = i32::try_from(*m).ok()?;
+            self.i += 1;
+            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "TO") {
+                self.i += 1;
+                let Some(Tok::Int(n)) = self.t.get(self.i) else {
+                    return None;
+                };
+                let n = i32::try_from(*n).ok()?;
+                self.i += 1;
+                outer_first = Some(Val::Add(
+                    Box::new(Val::Sub(
+                        Box::new(Val::Int(n)),
+                        Box::new(Val::Int(m)),
+                    )),
+                    Box::new(Val::Int(1)),
+                ));
+                outer_skip = Some(Val::Sub(
+                    Box::new(Val::Int(m)),
+                    Box::new(Val::Int(1)),
+                ));
+            } else {
+                outer_first = Some(Val::Int(m));
+            }
+        }
+        // the cte scope ends here: later statements must not see it
+        self.streams[cte_idx] = saved_stream;
+        self.sub = saved_sub;
+        self.agg_mode = saved_agg_mode;
         if !self.kw("INTO") {
             return None;
         }
@@ -13310,18 +13625,18 @@ impl<'a> P<'a> {
             lock: false,
             joins: Vec::new(),
             windows: Vec::new(),
-            distinct: false,
+            distinct: outer_distinct,
             plan: None,
             union_: None,
             aggregate: false,
             agg_ctx: self.agg_fid_ctx,
             map: Vec::new(),
             group_keys: Vec::new(),
-            boolean: None,
+            boolean: outer_boolean,
             having: None,
-            sort: Vec::new(),
-            first: None,
-            skip: None,
+            sort: outer_sort,
+            first: outer_first,
+            skip: outer_skip,
             col_vals: outs,
             into,
             do_stmt,
@@ -18117,10 +18432,50 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_forty_nine_shapes_byte_for_byte() {
+        // the OUTER select over a recursion (flips seventy-two and
+        // seventy-three): the whole single-stream surface compiles
+        // over a derived scope whose columns read fid(recurse ctx,
+        // slot) - FIRST / SKIP / WHERE ride the outer rse after
+        // the tower, before the shared sort; DISTINCT projects the
+        // items after it
+        pin_proc(
+            "CREATE PROCEDURE RR1 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR WITH RECURSIVE N AS (SELECT ID, AMT FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1, N.AMT FROM N WHERE N.ID < 3) SELECT N.ID, N.AMT FROM N ORDER BY N.ID INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014301B9010002430192015410224E2220225055424C4943222E22542202472F170202494415080001000000FF4D0200000083100017020249440100170203414D54430047331801000015080003000000FF4D02000000221801000015080001000000010018010100FF46014818010000FF0201180100001A000001180101001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE RR2 RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID FROM NUMS WHERE NUMS.ID > 2 INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014301B9010002430192015413224E554D532220225055424C4943222E22542202472F170202494415080001000000FF4D010000008310001702024944430047331801000015080005000000FF4D01000000221801000015080001000000FF47311801000015080002000000FF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
+    fn slice_forty_nine_refusals() {
+        for sql in [
+            // an aggregate over the recursion: the engine answers
+            // with a blr_aggregate over the tower - unmeasured
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT COUNT(*) FROM NUMS INTO :R1 DO SUSPEND; END",
+            // GROUP BY over the recursion: unmeasured
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID FROM NUMS GROUP BY NUMS.ID INTO :R1 DO SUSPEND; END",
+            // a join to the recursion: unmeasured
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID FROM NUMS JOIN U ON U.UID = NUMS.ID INTO :R1 DO SUSPEND; END",
+            // an out-of-range ORDER position: the engine's -104 too
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID FROM NUMS ORDER BY 2 INTO :R1 DO SUSPEND; END",
+            // an unknown ORDER column: the engine's 42S22 too
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID FROM NUMS ORDER BY ZZ INTO :R1 DO SUSPEND; END",
+            // the outer alias shadows the cte name: the engine's
+            // 42S22 on the original too
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID FROM NUMS N INTO :R1 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
+    }
+
+    #[test]
     fn slice_forty_seven_refusals() {
         for sql in [
-            // an outer column ORDER over the recursion: unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR WITH RECURSIVE N AS (SELECT ID, AMT FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1, N.AMT FROM N WHERE N.ID < 3) SELECT N.ID, N.AMT FROM N ORDER BY N.ID INTO :R1, :R2 DO SUSPEND; END",
+            // (an outer column ORDER over the recursion flipped in
+            // slice 49 - pinned in compiles_slice_forty_nine below)
             // a column the cte does not declare
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 3) SELECT N.AMT FROM N INTO :R1 DO SUSPEND; END",
         ] {
@@ -18146,8 +18501,8 @@ mod tests {
         for sql in [
             // non-recursive cte BESIDE a recursive one: unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5), OTHER AS (SELECT ID FROM T) SELECT NUMS.ID FROM NUMS INTO :R1 DO SUSPEND; END",
-            // an outer WHERE over the recursion: unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID FROM NUMS WHERE NUMS.ID > 2 INTO :R1 DO SUSPEND; END",
+            // (an outer WHERE over the recursion flipped in slice 49 -
+            // pinned in compiles_slice_forty_nine below)
             // multiplication in the recursive item: the dialect-3
             // promotion differs (int64-rank operands) - unprobed
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID * 2 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID FROM NUMS INTO :R1 DO SUSPEND; END",
