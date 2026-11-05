@@ -595,6 +595,14 @@ route "46 DISTINCT in the second branch" served "SELECT G FROM T WHERE ID = 1 UN
 route "46 FIRST beside a branch DISTINCT" served "SELECT FIRST 2 DISTINCT G FROM T WHERE ID >= 3 UNION ALL SELECT ID FROM U WHERE ID = 10 ORDER BY 1"
 route "46 the traceless ALL" served "SELECT ALL G FROM T WHERE ID = 1 UNION ALL SELECT ID FROM U WHERE ID = 10 ORDER BY 1"
 
+echo "--- 47 limits in recursion (slice 47): the BLR path compiles them, the interpreter serves the anchor ones"
+route "47 CONTROL plain recursion declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT N.ID FROM N"
+route "47 anchor FIRST declines" declined "WITH RECURSIVE N AS (SELECT FIRST 2 ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT N.ID FROM N"
+# Boundary the interpreter does NOT serve yet: FIRST / SKIP / ROWS on the
+# recursive MEMBER raise the interpreter's 42000 (the engine accepts all
+# three) - no route cells until that gap closes; the BLR bytes and the
+# executor's per-wave application are pinned in dsql-proc-blr / exe-run-blr.
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1

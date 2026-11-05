@@ -8597,6 +8597,12 @@ struct RecCte {
     /// the anchor's own DISTINCT (slice 46): its project carries
     /// the RAW anchor fields, before any per-column int64 cast
     anchor_distinct: bool,
+    /// the anchor's own FIRST / SKIP (slice 47)
+    anchor_first: Option<Val>,
+    anchor_skip: Option<Val>,
+    /// the recursive member's own FIRST / SKIP (slice 47)
+    rec_first: Option<Val>,
+    rec_skip: Option<Val>,
     /// one entry per cte column: the anchor's item and whether it
     /// wraps in cast(int64). The unification is PER COLUMN (probed
     /// on a two-column recursion): only the column whose RECURSIVE
@@ -9490,6 +9496,14 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.push(rc.anchor_alias.len() as u8);
                 out.extend_from_slice(rc.anchor_alias.as_bytes());
                 out.push(rc.anchor_ctx);
+                if let Some(v) = &rc.anchor_first {
+                    out.push(blr::FIRST);
+                    emit_val(out, v);
+                }
+                if let Some(v) = &rc.anchor_skip {
+                    out.push(blr::SKIP);
+                    emit_val(out, v);
+                }
                 if let Some(b) = &rc.anchor_wher {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, b);
@@ -9519,6 +9533,14 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 // the recursive branch: ZERO streams
                 out.push(blr::RSE);
                 out.push(0);
+                if let Some(v) = &rc.rec_first {
+                    out.push(blr::FIRST);
+                    emit_val(out, v);
+                }
+                if let Some(v) = &rc.rec_skip {
+                    out.push(blr::SKIP);
+                    emit_val(out, v);
+                }
                 if let Some(b) = &rc.rec_wher {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, b);
@@ -12640,6 +12662,73 @@ impl<'a> P<'a> {
     /// FOR WITH RECURSIVE <name> AS (SELECT <col> FROM <table>
     /// [WHERE ...] UNION ALL SELECT <item> FROM <name> [WHERE ...])
     /// SELECT [<name>.]<col> FROM <name> INTO :v DO <stmt> - the
+    /// A ROWS / OFFSET / FETCH trailer on the recursive member:
+    /// consumed and DROPPED (slice 47 - the engine parses it and
+    /// stores no trace, measured byte-identical to the untrailered
+    /// recursion). The grammar mirrors the statement trailer's
+    /// ([OFFSET n ROWS] [FETCH FIRST|NEXT n ROWS ONLY] | [ROWS m
+    /// [TO n]], ints validated, ROWS refusing beside OFFSET/FETCH -
+    /// but unlike a statement, beside member FIRST / SKIP it stays
+    /// accepted (measured C2))
+    fn rec_trailer(&mut self) -> Option<()> {
+        let mut seen = false;
+        if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "OFFSET") {
+            self.i += 1;
+            let Some(Tok::Int(n)) = self.t.get(self.i) else {
+                return None;
+            };
+            i32::try_from(*n).ok()?;
+            self.i += 1;
+            if !(matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ROW" || w == "ROWS"))
+            {
+                return None;
+            }
+            self.i += 1;
+            seen = true;
+        }
+        if self.kw("FETCH") {
+            if !(matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "FIRST" || w == "NEXT"))
+            {
+                return None;
+            }
+            self.i += 1;
+            let Some(Tok::Int(n)) = self.t.get(self.i) else {
+                return None;
+            };
+            i32::try_from(*n).ok()?;
+            self.i += 1;
+            if !(matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ROW" || w == "ROWS"))
+            {
+                return None;
+            }
+            self.i += 1;
+            if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ONLY") {
+                return None;
+            }
+            self.i += 1;
+            seen = true;
+        }
+        if self.kw("ROWS") {
+            if seen {
+                return None;
+            }
+            let Some(Tok::Int(m)) = self.t.get(self.i) else {
+                return None;
+            };
+            i32::try_from(*m).ok()?;
+            self.i += 1;
+            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "TO") {
+                self.i += 1;
+                let Some(Tok::Int(n)) = self.t.get(self.i) else {
+                    return None;
+                };
+                i32::try_from(*n).ok()?;
+                self.i += 1;
+            }
+        }
+        Some(())
+    }
+
     /// blr_recurse tower. Context law (probed): the SECONDARY
     /// recursive context claims the next slot, the recursion context
     /// the one after, the anchor stream the one after that.
@@ -12675,10 +12764,19 @@ impl<'a> P<'a> {
         if !self.kw("SELECT") {
             return None;
         }
-        // the anchor's own DISTINCT (slice 46 - measured in the
-        // anchor rse, after its boolean, over the raw fields), or
-        // the traceless ALL; FIRST / SKIP in the anchor stay
-        // refused (measured WD, unserved)
+        // the anchor's own FIRST / SKIP (slice 47 - measured
+        // inside the anchor rse, before its boolean), then its
+        // DISTINCT or ALL (slice 46)
+        let anchor_first = if self.kw("FIRST") {
+            Some(self.limit_operand()?)
+        } else {
+            None
+        };
+        let anchor_skip = if self.kw("SKIP") {
+            Some(self.limit_operand()?)
+        } else {
+            None
+        };
         let anchor_distinct = self.kw("DISTINCT");
         if !anchor_distinct {
             let _ = self.kw("ALL");
@@ -12721,6 +12819,19 @@ impl<'a> P<'a> {
         if !self.kw("UNION") || !self.kw("ALL") || !self.kw("SELECT") {
             return None;
         }
+        // the recursive member's own FIRST / SKIP (slice 47 -
+        // measured inside the stream-less rse, before its
+        // boolean); DISTINCT there is the engine's error (WC)
+        let rec_first = if self.kw("FIRST") {
+            Some(self.limit_operand()?)
+        } else {
+            None
+        };
+        let rec_skip = if self.kw("SKIP") {
+            Some(self.limit_operand()?)
+        } else {
+            None
+        };
         // ---- the recursive branch: <item> [, ...] FROM <name>
         let mut rec_items = Vec::new();
         loop {
@@ -12759,6 +12870,11 @@ impl<'a> P<'a> {
         } else {
             None
         };
+        // a ROWS / OFFSET / FETCH trailer on the recursive member
+        // parses and leaves NO BLR trace (slice 47, measured A7/B1-B3:
+        // byte-identical to the untrailered recursion) - consumed
+        // and dropped; anything else before the paren refuses
+        self.rec_trailer()?;
         if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
             return None;
         }
@@ -12861,8 +12977,12 @@ impl<'a> P<'a> {
                 anchor_ctx,
                 anchor_wher,
                 anchor_distinct,
+                anchor_first,
+                anchor_skip,
                 anchor_items,
                 rec_wher,
+                rec_first,
+                rec_skip,
                 rec_items,
             }),
         })))

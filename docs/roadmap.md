@@ -43,7 +43,8 @@ replacement of the C++ engine is below, in priority order. Full text:
    VARYING; the route serves them), slice 43 GROUP BY keys (aliases resolve the select list first, function calls group by the raw call; uncovered
    items refuse), slice 44 JOIN ... USING (ON equalities, COALESCE merged names, merged star),
    slice 45 UNION branch FIRST / SKIP (in-rse, before each branch's boolean; the leading limit is the first branch's),
-   slice 46 UNION branch DISTINCT (in-rse project over the raw items; SELECT ALL is traceless).
+   slice 46 UNION branch DISTINCT (in-rse project over the raw items; SELECT ALL is traceless),
+   slice 47 limits in recursion (anchor/member FIRST / SKIP; the member ROWS trailer is traceless).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -120,6 +121,14 @@ replacement of the C++ engine is below, in priority order. Full text:
    DISTINCT in the recursive member are the engine's error too; FIRST / SKIP in the anchor is the engine's answer and stays a gap.
    Pre-existing reds: exe EP101/EP158 and exeselect 17 unchanged from slice 45, the two view DIFFs re-confirmed at HEAD by stash-compare
    (identical cells); branchtype 69/69, unit tests 82+5.
+   DONE (slice 47): limits in recursion on the BLR path - the anchor's and the recursive member's own FIRST / SKIP land in-rse before
+   each boolean (the member's stream-less rse included), all byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +17, exe-run-blr +8;
+   the route declines recursion, two boundary cells in exeselect §47). The executor applies the member's limits per wave (FIRST 0 /
+   SKIP 1 empty the step, so the walk stops at the anchor - matching the engine's rows). A ROWS / OFFSET / FETCH trailer on the member
+   parses and leaves NO trace (byte-identical to the untrailered recursion in every spelling and combination, even beside member FIRST -
+   C2); ROWS on the anchor, DISTINCT FIRST, and OFFSET beside ROWS are the engine's error too. ORDER BY on the member is the engine's
+   answer and stays a gap, as do member limits in the interpreter (its 42000 where the engine answers - the anchor ones it serves).
+   Pre-existing reds unchanged from slice 46 (exe EP101/EP158, exeselect 17, the two view DIFFs); branchtype 69/69, unit tests 82+5.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

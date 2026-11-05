@@ -426,13 +426,16 @@ pub enum Stream {
     /// blr_recurse: the recursion tower - its own context, a
     /// SECONDARY recursive-context byte, an ANCHOR branch (a real
     /// rse + map) and a STREAM-LESS recursive branch whose boolean
-    /// and map read the recursion's own output by fid
+    /// and map read the recursion's own output by fid; the member's
+    /// own FIRST / SKIP apply per wave (slice 47)
     Recurse {
         context: u8,
         anchor: Box<Rse>,
         anchor_map: Vec<(u16, Expr)>,
         rec_boolean: Option<Bool>,
         rec_map: Vec<(u16, Expr)>,
+        rec_first: Option<Expr>,
+        rec_skip: Option<Expr>,
     },
     /// blr_window: the inner rse and the windows over it - every
     /// source row survives (a window is an aggregate that KEEPS its
@@ -1155,9 +1158,13 @@ impl<'a> P<'a> {
                     return Err("recursive branch with streams unconverted".into());
                 }
                 let mut rec_boolean = None;
+                let mut rec_first = None;
+                let mut rec_skip = None;
                 loop {
                     match self.u8()? {
                         blr::BOOLEAN => rec_boolean = Some(self.boolean()?),
+                        blr::FIRST => rec_first = Some(self.expr()?),
+                        blr::SKIP => rec_skip = Some(self.expr()?),
                         blr::END => break,
                         other => {
                             return Err(format!(
@@ -1184,6 +1191,8 @@ impl<'a> P<'a> {
                         anchor_map,
                         rec_boolean,
                         rec_map,
+                        rec_first,
+                        rec_skip,
                     },
                     boolean: None,
                     sort: Vec::new(),
@@ -4704,6 +4713,8 @@ impl<'a> Exec<'a> {
                 anchor_map,
                 rec_boolean,
                 rec_map,
+                rec_first,
+                rec_skip,
             } => {
                 // the recursion's fixpoint: the anchor branch seeds
                 // the output, then the recursive branch runs over
@@ -4798,6 +4809,17 @@ impl<'a> Exec<'a> {
                             Ok(r)
                         })?;
                         next.push(produced);
+                    }
+                    // the member's own SkipRowsStream, then
+                    // FirstRowsStream - per wave, like the engine's
+                    // per-iteration member rse (slice 47)
+                    if let Some(e) = rec_skip {
+                        let n = self.eval_count(e)?;
+                        next = next.into_iter().skip(n).collect();
+                    }
+                    if let Some(e) = rec_first {
+                        let n = self.eval_count(e)?;
+                        next.truncate(n);
                     }
                     wave = next;
                 }
