@@ -46,7 +46,8 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 46 UNION branch DISTINCT (in-rse project over the raw items; SELECT ALL is traceless),
    slice 47 limits in recursion (anchor/member FIRST / SKIP; the member ROWS trailer is traceless),
    slice 48 ORDER BY on the recursive member (parses syntactically, no BLR trace),
-   slice 49 the outer select over the recursion (WHERE / ORDER BY / DISTINCT / limits over the recurse fids).
+   slice 49 the outer select over the recursion (WHERE / ORDER BY / DISTINCT / limits over the recurse fids),
+   slice 50 aggregates and GROUP BY over the recursion (the aggregate node over the tower).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -150,6 +151,17 @@ replacement of the C++ engine is below, in priority order. Full text:
    columns, WHERE on an alias and HAVING without GROUP are the engine's error too. Aggregates, GROUP BY, joins, qualified stars,
    boolean items and the long direction spellings stay refused - named gaps, pinned. Pre-existing reds re-confirmed at HEAD by
    stash-compare (identical cells: exe EP101/EP158, exeselect §17, the two view DIFFs); branchtype 69/69, unit tests 84+5.
+   DONE (slice 50): aggregates and GROUP BY over the recursion on the BLR path - the aggregate node stands as the outer rse's
+   stream over an inner rse whose stream is the tower, group keys raw, the map in select-list order (whole-item aggregates dedup
+   by verb+arg), HAVING/SORT over the aggregate fids, an unselected GROUP field taking a new slot after the items at any depth;
+   COUNT(*) FILTER serves (structural desugar), and unlike over tables an item alias inside HAVING is simply invisible (measured:
+   it resolves as a column) - all byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +53 net with the slice-49 aggregate and
+   GROUP gaps flipped, exe-run-blr +6 with no executor change; the route declines, three new cells in exeselect §50 - the
+   interpreter serves every aggregate shape). Also fixed two slice-49 served-wrongs the probes caught: star must stand alone in
+   the outer list, and OVER / TO / ROW refuse as an alias (FIRST and SKIP the engine accepts). LIST, statistical verbs,
+   aggregates inside expressions, FILTER over column args and IN / LIKE / subqueries in HAVING stay refused - named gaps, pinned.
+   Pre-existing reds re-confirmed at HEAD by stash-compare (identical cells: exe EP101/EP158, exeselect §17, the two view DIFFs);
+   branchtype 69/69, unit tests 86+5.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

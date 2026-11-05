@@ -7837,6 +7837,157 @@ fn map_bool_to_fids(map: &[MapEntry], b: Bool, fid_ctx: u8) -> Option<Bool> {
     })
 }
 
+/// collect_group_fields over RECURSE fids: the aggregate path over a
+/// recursive cte reads fid(recurse ctx, slot) where a table's reads
+/// fields - same descent, Fid leaves (slice 50, measured G4/G10/G31)
+fn collect_rec_group_fields(k: &Val, out: &mut Vec<Val>) {
+    match k {
+        Val::Fid(..) => {
+            if !out.contains(k) {
+                out.push(k.clone());
+            }
+        }
+        Val::Add(a, b)
+        | Val::Sub(a, b)
+        | Val::Mul(a, b)
+        | Val::Div(a, b)
+        | Val::Concat(a, b) => {
+            collect_rec_group_fields(a, out);
+            collect_rec_group_fields(b, out);
+        }
+        Val::Neg(a) => collect_rec_group_fields(a, out),
+        Val::Upper(a) | Val::Lower(a) => collect_rec_group_fields(a, out),
+        Val::StrLen(_, a) | Val::Extract(_, a) => collect_rec_group_fields(a, out),
+        Val::Substring(a, b, c) => {
+            collect_rec_group_fields(a, out);
+            collect_rec_group_fields(b, out);
+            collect_rec_group_fields(c, out);
+        }
+        Val::Trim(_, spec, src) => {
+            if let Some(s) = spec {
+                collect_rec_group_fields(s, out);
+            }
+            collect_rec_group_fields(src, out);
+        }
+        Val::Cast(_, a) => collect_rec_group_fields(a, out),
+        _ => {}
+    }
+}
+
+/// rebuild_over_keys over RECURSE fids: a recurse fid takes (or
+/// reuses) its key slot like a field does over a table - it must be
+/// a group field (slice 50, measured G4/G10/G31)
+fn rebuild_rec_keys(
+    map: &mut Vec<MapEntry>,
+    v: &Val,
+    gfields: &[Val],
+    fid_ctx: u8,
+) -> Option<Val> {
+    match v {
+        Val::Fid(..) | Val::Field(..) => {
+            if !gfields.contains(v) {
+                return None;
+            }
+            let entry = MapEntry::Key(v.clone());
+            let slot = match map.iter().position(|e| *e == entry) {
+                Some(i) => i,
+                None => {
+                    map.push(entry);
+                    map.len() - 1
+                }
+            };
+            Some(Val::Fid(fid_ctx, slot as u16))
+        }
+        v if is_leaf_val(v) => Some(v.clone()),
+        _ => map_children(v, &mut |c| rebuild_rec_keys(map, c, gfields, fid_ctx)),
+    }
+}
+
+/// map_val_to_fid over RECURSE fids: a recurse fid reads its key
+/// slot - an unselected GROUP field takes a new slot after the
+/// items, at any depth (measured G28/G53/G60/G61) - and the
+/// aggregate's own fids pass through (slice 50, measured G6/G16/G17)
+fn map_rec_val_to_fid(
+    map: &mut Vec<MapEntry>,
+    gfields: &[Val],
+    v: &Val,
+    fid_ctx: u8,
+    rec_ctx: u8,
+) -> Option<Val> {
+    match v {
+        Val::Fid(c, _) if *c == rec_ctx => {
+            let entry = MapEntry::Key(v.clone());
+            let idx = match map.iter().position(|e| *e == entry) {
+                Some(i) => i,
+                None => {
+                    if !gfields.contains(v) {
+                        return None;
+                    }
+                    map.push(entry);
+                    map.len() - 1
+                }
+            };
+            Some(Val::Fid(fid_ctx, idx as u16))
+        }
+        Val::Field(..) => {
+            let idx = map
+                .iter()
+                .position(|e| matches!(e, MapEntry::Key(k) if k == v))?;
+            Some(Val::Fid(fid_ctx, idx as u16))
+        }
+        Val::Fid(..)
+        | Val::Int(_)
+        | Val::Int64(_)
+        | Val::Dec(..)
+        | Val::Str(_)
+        | Val::Null
+        | Val::InParam(_)
+        | Val::LocalVar(_) => Some(v.clone()),
+        v if is_leaf_val(v) => Some(v.clone()),
+        _ => map_children(
+            v,
+            &mut |c| map_rec_val_to_fid(map, gfields, c, fid_ctx, rec_ctx),
+        ),
+    }
+}
+
+fn map_rec_bool_to_fids(
+    map: &mut Vec<MapEntry>,
+    gfields: &[Val],
+    b: Bool,
+    fid_ctx: u8,
+    rec_ctx: u8,
+) -> Option<Bool> {
+    Some(match b {
+        Bool::And(l, r) => Bool::And(
+            Box::new(map_rec_bool_to_fids(map, gfields, *l, fid_ctx, rec_ctx)?),
+            Box::new(map_rec_bool_to_fids(map, gfields, *r, fid_ctx, rec_ctx)?),
+        ),
+        Bool::Or(l, r) => Bool::Or(
+            Box::new(map_rec_bool_to_fids(map, gfields, *l, fid_ctx, rec_ctx)?),
+            Box::new(map_rec_bool_to_fids(map, gfields, *r, fid_ctx, rec_ctx)?),
+        ),
+        Bool::Not(inner) => Bool::Not(Box::new(map_rec_bool_to_fids(
+            map, gfields, *inner, fid_ctx, rec_ctx,
+        )?)),
+        Bool::Cmp(op, a, c) => Bool::Cmp(
+            op,
+            map_rec_val_to_fid(map, gfields, &a, fid_ctx, rec_ctx)?,
+            map_rec_val_to_fid(map, gfields, &c, fid_ctx, rec_ctx)?,
+        ),
+        Bool::Missing(v) => {
+            Bool::Missing(map_rec_val_to_fid(map, gfields, &v, fid_ctx, rec_ctx)?)
+        }
+        Bool::Between(v, lo, hi) => Bool::Between(
+            map_rec_val_to_fid(map, gfields, &v, fid_ctx, rec_ctx)?,
+            map_rec_val_to_fid(map, gfields, &lo, fid_ctx, rec_ctx)?,
+            map_rec_val_to_fid(map, gfields, &hi, fid_ctx, rec_ctx)?,
+        ),
+        // LIKE / IN / subqueries over aggregate output: unprobed
+        _ => return None,
+    })
+}
+
 /// RETURNING col INTO :var - a begin of field-to-variable
 /// assignments at the given context (probed: INSERT reads its store
 /// context, UPDATE the NEW record, DELETE the erased stream).
@@ -9535,6 +9686,15 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 // terminator of its own - the wrapper's END closes
                 // it, the shared END below closes the outer rse
                 // (probed)
+                if f.aggregate {
+                    // the aggregate node stands as the outer rse's
+                    // stream, over an inner rse whose stream is the
+                    // tower (slice 50, measured G1)
+                    out.push(blr::AGGREGATE);
+                    out.push(f.agg_ctx);
+                    out.push(blr::RSE);
+                    out.push(1);
+                }
                 out.push(blr::RSE);
                 out.push(1);
                 out.push(0xB9); // blr_recurse
@@ -9611,21 +9771,54 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     emit_val(out, item);
                 }
                 out.push(blr::END); // the wrapper rse's end
-                // the OUTER select's FIRST / SKIP / WHERE ride the
-                // outer rse after the tower, before the shared sort
-                // (slice 49, measured order: FIRST, SKIP, boolean,
-                // SORT, PROJECT)
-                if let Some(v) = &f.first {
-                    out.push(blr::FIRST);
-                    emit_val(out, v);
-                }
-                if let Some(v) = &f.skip {
-                    out.push(blr::SKIP);
-                    emit_val(out, v);
-                }
-                if let Some(b) = &f.boolean {
-                    out.push(blr::BOOLEAN);
-                    emit_bool(out, b);
+                if f.aggregate {
+                    // the WHERE lives in the aggregate's inner rse,
+                    // after the tower; then GROUP_BY in clause order,
+                    // the MAP in select-list order, FIRST / SKIP,
+                    // HAVING - the shared sort follows (slice 50,
+                    // measured G1/G5/G9/G24)
+                    if let Some(b) = &f.boolean {
+                        out.push(blr::BOOLEAN);
+                        emit_bool(out, b);
+                    }
+                    out.push(blr::END);
+                    out.push(blr::GROUP_BY);
+                    out.push(f.group_keys.len() as u8);
+                    for k in &f.group_keys {
+                        emit_val(out, k);
+                    }
+                    out.push(blr::MAP);
+                    out.extend_from_slice(&(f.map.len() as u16).to_le_bytes());
+                    emit_map_entries(out, &f.map);
+                    if let Some(v) = &f.first {
+                        out.push(blr::FIRST);
+                        emit_val(out, v);
+                    }
+                    if let Some(v) = &f.skip {
+                        out.push(blr::SKIP);
+                        emit_val(out, v);
+                    }
+                    if let Some(h) = &f.having {
+                        out.push(blr::BOOLEAN);
+                        emit_bool(out, h);
+                    }
+                } else {
+                    // the OUTER select's FIRST / SKIP / WHERE ride the
+                    // outer rse after the tower, before the shared sort
+                    // (slice 49, measured order: FIRST, SKIP, boolean,
+                    // SORT, PROJECT)
+                    if let Some(v) = &f.first {
+                        out.push(blr::FIRST);
+                        emit_val(out, v);
+                    }
+                    if let Some(v) = &f.skip {
+                        out.push(blr::SKIP);
+                        emit_val(out, v);
+                    }
+                    if let Some(b) = &f.boolean {
+                        out.push(blr::BOOLEAN);
+                        emit_bool(out, b);
+                    }
                 }
             } else if f.aggregate && f.windows.is_empty() {
                 out.push(blr::AGGREGATE);
@@ -13256,16 +13449,18 @@ impl<'a> P<'a> {
             return None;
         }
         self.i += 1;
-        // ---- the outer select over the cte (slice 49): the whole
-        // single-stream surface - FIRST / SKIP, DISTINCT, item
-        // expressions, star, WHERE, ORDER BY, the ROWS / OFFSET /
-        // FETCH trailer - compiled by the general leaf parsers over
-        // a derived scope whose columns read fid(recurse ctx, slot).
-        // Aggregates, GROUP BY / HAVING, joins, windows, PLAN, LOCK,
-        // AS CURSOR, qualified stars and boolean items stay refused
-        // (the engine answers all but LOCK - unmeasured shapes,
-        // named gaps); the long direction spellings refuse with the
-        // general parser's shared gap
+        // ---- the outer select over the cte (slices 49-50): the
+        // whole single-stream surface - FIRST / SKIP, DISTINCT, item
+        // expressions, star, WHERE, ORDER BY, GROUP BY / HAVING,
+        // whole-item aggregates, the ROWS / OFFSET / FETCH trailer -
+        // compiled by the general leaf parsers over a derived scope
+        // whose columns read fid(recurse ctx, slot). Joins, windows,
+        // PLAN, LOCK, AS CURSOR, qualified stars, boolean items,
+        // LIST, statistical verbs, aggregates inside expressions and
+        // FILTER over column args stay refused (the engine answers
+        // all but LOCK - unmeasured shapes, named gaps); the long
+        // direction spellings refuse with the general parser's
+        // shared gap
         if !self.kw("SELECT") {
             return None;
         }
@@ -13308,7 +13503,9 @@ impl<'a> P<'a> {
                                 k += 1;
                             }
                             if let Some(Tok::Ident(a)) = self.t.get(k) {
-                                if !is_keyword(a) {
+                                if !is_keyword(a)
+                                    && !matches!(a.as_str(), "OVER" | "TO" | "ROW")
+                                {
                                     outer_alias = Some(a.clone());
                                 }
                             }
@@ -13358,46 +13555,61 @@ impl<'a> P<'a> {
         );
         let saved_sub = self.sub.replace(cte_idx);
         let saved_agg_mode = std::mem::replace(&mut self.agg_mode, false);
-        // items + aliases; star expands the cte columns (probed:
-        // byte-identical to enumerating them)
-        let mut outs: Vec<Val> = Vec::new();
+        // items + aliases; star stands ALONE (the engine's -104 on
+        // `*, 1`); a whole-item aggregate takes the Agg arm (LIST,
+        // statistical verbs and aggregates inside expressions refuse
+        // - unmeasured; OVER after the call is the window gap)
+        enum RecItem {
+            Col(Val),
+            Agg(u8, Option<Val>),
+        }
+        let mut items: Vec<RecItem> = Vec::new();
         let mut item_names: Vec<Option<String>> = Vec::new();
         loop {
             if matches!(self.t.get(self.i), Some(Tok::Star)) {
+                if !items.is_empty() {
+                    return None;
+                }
                 self.i += 1;
                 for v in self.star_fields(cte_idx)? {
-                    outs.push(v);
+                    items.push(RecItem::Col(v));
                 }
                 for c in &acols {
                     item_names.push(Some(c.clone()));
                 }
+                break;
+            }
+            let agg_head = match self.t.get(self.i) {
+                Some(Tok::Ident(w))
+                    if matches!(w.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+                        && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) =>
+                {
+                    Some(w.clone())
+                }
+                _ => None,
+            };
+            let (item, mut iname) = if let Some(w) = agg_head {
+                self.i += 1;
+                // parse_agg refuses OVER itself (the window gap) and
+                // takes FILTER (COUNT(*) FILTER serves - structural)
+                let (verb, arg) = self.parse_agg(&w)?;
+                (RecItem::Agg(verb, arg), None)
             } else {
                 let v = self.val()?;
                 // the item's NAME as ORDER BY sees it: its alias,
                 // else the column a bare/qualified column reference
                 // names, else none (the general law)
-                let mut iname = match &v {
+                let iname = match &v {
                     Val::Fid(_, s) => acols.get(*s as usize).cloned(),
                     _ => None,
                 };
-                if self.kw("AS") {
-                    let Some(Tok::Ident(a)) = self.t.get(self.i) else {
-                        return None;
-                    };
-                    if is_keyword(a) {
-                        return None;
-                    }
-                    iname = Some(a.clone());
-                    self.i += 1;
-                } else if let Some(Tok::Ident(a)) = self.t.get(self.i) {
-                    if !is_keyword(a) {
-                        iname = Some(a.clone());
-                        self.i += 1;
-                    }
-                }
-                outs.push(v);
-                item_names.push(iname);
+                (RecItem::Col(v), iname)
+            };
+            if let Some(a) = self.rec_alias()? {
+                iname = Some(a);
             }
+            items.push(item);
+            item_names.push(iname);
             if matches!(self.t.get(self.i), Some(Tok::Comma)) {
                 self.i += 1;
             } else {
@@ -13413,22 +13625,7 @@ impl<'a> P<'a> {
         self.i += 1;
         // the outer alias for real (bare or AS - both probed); it
         // must be the one the lookahead found
-        let mut found_alias: Option<String> = None;
-        if self.kw("AS") {
-            let Some(Tok::Ident(a)) = self.t.get(self.i) else {
-                return None;
-            };
-            if is_keyword(a) {
-                return None;
-            }
-            found_alias = Some(a.clone());
-            self.i += 1;
-        } else if let Some(Tok::Ident(a)) = self.t.get(self.i) {
-            if !is_keyword(a) {
-                found_alias = Some(a.clone());
-                self.i += 1;
-            }
-        }
+        let found_alias = self.rec_alias()?;
         if found_alias != outer_alias {
             return None;
         }
@@ -13437,10 +13634,180 @@ impl<'a> P<'a> {
         } else {
             None
         };
+        // GROUP BY: a WHOLE bare-name key looks at the select list
+        // first (one hit groups that item, two are the engine's
+        // 42702), positions name plain items (an aggregate's is the
+        // engine's error), anything else groups raw (the general law)
+        let mut group_keys: Vec<Val> = Vec::new();
+        let grouped = self.kw("GROUP");
+        if grouped {
+            if !self.kw("BY") {
+                return None;
+            }
+            loop {
+                let named = match self.t.get(self.i) {
+                    Some(Tok::Ident(w)) if whole_sort_key(&self.t, self.i) => {
+                        let hits: Vec<usize> = item_names
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, n)| n.as_deref() == Some(w.as_str()))
+                            .map(|(k, _)| k)
+                            .collect();
+                        if hits.len() > 1 {
+                            return None;
+                        }
+                        hits.first().copied()
+                    }
+                    _ => None,
+                };
+                if named.is_some() {
+                    self.i += 1;
+                }
+                let key = if let Some(k) = named {
+                    match items.get(k)? {
+                        RecItem::Col(v) => v.clone(),
+                        RecItem::Agg(..) => return None,
+                    }
+                } else {
+                    self.val()?
+                };
+                let key = match key {
+                    Val::Int(n) => {
+                        match items.get(usize::try_from(n).ok()?.checked_sub(1)?)? {
+                            RecItem::Col(v) => v.clone(),
+                            RecItem::Agg(..) => return None,
+                        }
+                    }
+                    Val::Int64(n) => {
+                        match items.get(usize::try_from(n).ok()?.checked_sub(1)?)? {
+                            RecItem::Col(v) => v.clone(),
+                            RecItem::Agg(..) => return None,
+                        }
+                    }
+                    other => other,
+                };
+                group_keys.push(key);
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        let has_aggs = items.iter().any(|it| matches!(it, RecItem::Agg(..)));
+        let having_ahead =
+            matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "HAVING");
+        let aggregate = has_aggs || grouped || having_ahead;
+        // unlike over tables, an item alias inside HAVING is simply
+        // invisible over the cte: the name resolves as a column
+        // (measured G42/G53 store, G41/G51 refuse for missing or
+        // ungrouped columns) - no misuse scan, natural resolution
+        // matches all four
+        let (col_vals, outer_having) = if !aggregate {
+            let mut col_vals = Vec::new();
+            for it in &items {
+                match it {
+                    RecItem::Col(v) => col_vals.push(v.clone()),
+                    RecItem::Agg(..) => return None,
+                }
+            }
+            (col_vals, None)
+        } else {
+            // the aggregate node takes the NEXT context (measured:
+            // ctx 3 over the tower); claim its slot
+            self.agg_fid_ctx = self.streams.len() as u8 + self.base;
+            self.streams.push(Stream {
+                name: String::new(),
+                alias: None,
+                using: Vec::new(),
+                proc_args: None,
+                derived: None,
+                sub: self.in_sub,
+                cur: None,
+            });
+            let fid_ctx = self.agg_fid_ctx;
+            let mut gfields: Vec<Val> = Vec::new();
+            for k in &group_keys {
+                collect_rec_group_fields(k, &mut gfields);
+            }
+            // coverage: past bare keys every non-aggregated item
+            // matches a key, reads nothing, or reads only bare-field
+            // keys (the general law over recurse fids)
+            let bare_or_const = |k: &Val| -> bool {
+                if matches!(k, Val::Fid(c, _) if *c == ctx) {
+                    return true;
+                }
+                let mut f = Vec::new();
+                collect_rec_group_fields(k, &mut f);
+                f.is_empty()
+            };
+            if !group_keys.iter().all(bare_or_const) {
+                let bare_keys: Vec<&Val> = group_keys
+                    .iter()
+                    .filter(|k| matches!(k, Val::Fid(c, _) if *c == ctx))
+                    .collect();
+                for it in &items {
+                    match it {
+                        RecItem::Agg(..) => {}
+                        RecItem::Col(v) => {
+                            if group_keys.iter().any(|k| k == v) {
+                                continue;
+                            }
+                            let mut f = Vec::new();
+                            collect_rec_group_fields(v, &mut f);
+                            if f.is_empty() {
+                                continue;
+                            }
+                            if !f.iter().all(|x| bare_keys.contains(&x)) {
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+            // the map in select-list order: group fields take key
+            // slots, whole-item aggregates dedup by verb+arg
+            let mut map: Vec<MapEntry> = Vec::new();
+            let mut vals: Vec<Val> = Vec::new();
+            for it in &items {
+                match it {
+                    RecItem::Col(v) => {
+                        vals.push(rebuild_rec_keys(&mut map, v, &gfields, fid_ctx)?);
+                    }
+                    RecItem::Agg(verb, arg) => {
+                        let entry = MapEntry::Agg(*verb, arg.clone());
+                        let slot = match map.iter().position(|e| *e == entry) {
+                            Some(i) => i as u16,
+                            None => {
+                                map.push(entry);
+                                (map.len() - 1) as u16
+                            }
+                        };
+                        vals.push(Val::Fid(fid_ctx, slot));
+                    }
+                }
+            }
+            self.agg_map = map;
+            let having = if self.kw("HAVING") {
+                self.agg_mode = true;
+                let b = self.bool_or();
+                self.agg_mode = false;
+                let map = std::mem::take(&mut self.agg_map);
+                let mut map = map;
+                let h = map_rec_bool_to_fids(&mut map, &gfields, b?, fid_ctx, ctx)?;
+                self.agg_map = map;
+                Some(h)
+            } else {
+                None
+            };
+            (vals, having)
+        };
         // ORDER BY: a WHOLE bare-name key looks at the select list
         // first (one hit sorts on that item, two are the engine's
         // 42702), else positions name items and everything else
-        // reads the columns (measured E1-E4); the general shape
+        // reads the columns (measured E1-E4); over aggregates the
+        // keys read the map, an unselected group field taking a new
+        // slot after the items (measured G28)
         let mut outer_sort: Vec<(bool, Val)> = Vec::new();
         if self.kw("ORDER") {
             if !self.kw("BY") {
@@ -13466,23 +13833,41 @@ impl<'a> P<'a> {
                     self.i += 1;
                 }
                 let key = if let Some(k) = named {
-                    outs.get(k).cloned()?
+                    col_vals.get(k).cloned()?
+                } else if aggregate {
+                    self.agg_mode = true;
+                    let k = self.val();
+                    self.agg_mode = false;
+                    k?
                 } else {
                     self.val()?
                 };
                 // a bare integer is a POSITION in the select list;
                 // a scaled literal is no position (the general law)
-                let key = match key {
-                    Val::Int(n) => {
-                        let idx = usize::try_from(n).ok()?.checked_sub(1)?;
-                        outs.get(idx).cloned()?
+                let position = match &key {
+                    Val::Int(n) => Some(*n as i64),
+                    Val::Int64(n) => Some(*n),
+                    _ => None,
+                };
+                if matches!(key, Val::Dec(..)) {
+                    return None;
+                }
+                let key = if let Some(n) = position {
+                    let idx = usize::try_from(n).ok()?.checked_sub(1)?;
+                    col_vals.get(idx).cloned()?
+                } else if aggregate {
+                    let mut gf = Vec::new();
+                    for k in &group_keys {
+                        collect_rec_group_fields(k, &mut gf);
                     }
-                    Val::Int64(n) => {
-                        let idx = usize::try_from(n).ok()?.checked_sub(1)?;
-                        outs.get(idx).cloned()?
-                    }
-                    Val::Dec(..) => return None,
-                    other => other,
+                    let map = std::mem::take(&mut self.agg_map);
+                    let mut map = map;
+                    let k =
+                        map_rec_val_to_fid(&mut map, &gf, &key, self.agg_fid_ctx, ctx)?;
+                    self.agg_map = map;
+                    k
+                } else {
+                    key
                 };
                 let descending = if self.kw("DESC") {
                     true
@@ -13499,6 +13884,7 @@ impl<'a> P<'a> {
                 }
             }
         }
+        let outer_map = std::mem::take(&mut self.agg_map);
         // OFFSET n ROW[S] / FETCH FIRST|NEXT n ROW[S] ONLY / ROWS m
         // [TO n] - the standard and legacy spellings of SKIP and
         // FIRST, same rse clauses in the same probed order
@@ -13628,16 +14014,16 @@ impl<'a> P<'a> {
             distinct: outer_distinct,
             plan: None,
             union_: None,
-            aggregate: false,
+            aggregate,
             agg_ctx: self.agg_fid_ctx,
-            map: Vec::new(),
-            group_keys: Vec::new(),
+            map: outer_map,
+            group_keys,
             boolean: outer_boolean,
-            having: None,
+            having: outer_having,
             sort: outer_sort,
             first: outer_first,
             skip: outer_skip,
-            col_vals: outs,
+            col_vals,
             into,
             do_stmt,
             recurse: Some(RecCte {
@@ -13662,6 +14048,33 @@ impl<'a> P<'a> {
                 rec_items,
             }),
         })))
+    }
+
+    /// An [AS] alias in the outer select over a recursion: OVER /
+    /// TO / ROW refuse beside the keywords (the engine's -104 as
+    /// one); FIRST and SKIP the engine accepts (measured G37-G48)
+    fn rec_alias(&mut self) -> Option<Option<String>> {
+        if self.kw("AS") {
+            let Some(Tok::Ident(a)) = self.t.get(self.i) else {
+                return None;
+            };
+            if is_keyword(a) || matches!(a.as_str(), "OVER" | "TO" | "ROW") {
+                return None;
+            }
+            let a = a.clone();
+            self.i += 1;
+            Some(Some(a))
+        } else if let Some(Tok::Ident(a)) = self.t.get(self.i) {
+            if is_keyword(a) || matches!(a.as_str(), "OVER" | "TO" | "ROW") {
+                Some(None)
+            } else {
+                let a = a.clone();
+                self.i += 1;
+                Some(Some(a))
+            }
+        } else {
+            Some(None)
+        }
     }
 
     /// A value inside the recursive cte's scope: [<cte>.]<col> reads
@@ -18450,13 +18863,52 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_fifty_shapes_byte_for_byte() {
+        // aggregates and GROUP BY over a recursion (flips
+        // seventy-four and seventy-five): the aggregate node stands
+        // as the outer rse's stream over an inner rse whose stream
+        // is the tower - group keys raw, the map in select-list
+        // order, HAVING/SORT over the aggregate fids
+        pin_proc(
+            "CREATE PROCEDURE RR3 RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT COUNT(*) FROM NUMS INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0343014301B9010002430192015413224E554D532220225055424C4943222E22542202472F170202494415080001000000FF4D010000008310001702024944430047331801000015080005000000FF4D01000000221801000015080001000000FFFF4E004D0100000053FF0201180300001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE RR4 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID, COUNT(*) FROM NUMS GROUP BY NUMS.ID INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014F0343014301B9010002430192015413224E554D532220225055424C4943222E22542202472F170202494415080001000000FF4D010000008310001702024944430047331801000015080005000000FF4D01000000221801000015080001000000FFFF4E01180100004D0200000018010000010053FF0201180300001A000001180301001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+    }
+
+    #[test]
+    fn slice_fifty_refusals() {
+        for sql in [
+            // LIST over the recursion: the engine answers - unmeasured
+            "CREATE PROCEDURE X RETURNS (R1 VARCHAR(100)) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT LIST(NUMS.ID) FROM NUMS INTO :R1 DO SUSPEND; END",
+            // an aggregate inside an expression: the engine answers - unmeasured
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT COUNT(*) + 1 FROM NUMS INTO :R1 DO SUSPEND; END",
+            // FILTER over a column arg: the engine answers -
+            // unification needs catalog types
+            "CREATE PROCEDURE X RETURNS (R1 BIGINT) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT SUM(NUMS.ID) FILTER (WHERE NUMS.ID > 1) FROM NUMS INTO :R1 DO SUSPEND; END",
+            // star beside another item: the engine's -104 too
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT *, 1 FROM NUMS INTO :R1, :R2 DO SUSPEND; END",
+            // OVER / TO / ROW as an alias: the engine's -104 too
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID OVER FROM NUMS INTO :R1 DO SUSPEND; END",
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID TO FROM NUMS INTO :R1 DO SUSPEND; END",
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID ROW FROM NUMS INTO :R1 DO SUSPEND; END",
+            // an out-of-range GROUP position: the engine's error too
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT COUNT(*) FROM NUMS GROUP BY 2 INTO :R1 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
+    }
+
+    #[test]
     fn slice_forty_nine_refusals() {
         for sql in [
-            // an aggregate over the recursion: the engine answers
-            // with a blr_aggregate over the tower - unmeasured
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT COUNT(*) FROM NUMS INTO :R1 DO SUSPEND; END",
-            // GROUP BY over the recursion: unmeasured
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID FROM NUMS GROUP BY NUMS.ID INTO :R1 DO SUSPEND; END",
+            // (an aggregate over the recursion flipped in slice 50 -
+            // pinned in compiles_slice_fifty above)
+            // (GROUP BY over the recursion flipped in slice 50 -
+            // pinned in compiles_slice_fifty above)
             // a join to the recursion: unmeasured
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID FROM NUMS JOIN U ON U.UID = NUMS.ID INTO :R1 DO SUSPEND; END",
             // an out-of-range ORDER position: the engine's -104 too

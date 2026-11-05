@@ -611,6 +611,11 @@ route "49 outer ORDER BY declines" declined "WITH RECURSIVE N AS (SELECT ID FROM
 route "49 outer DISTINCT declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT DISTINCT N.ID FROM N"
 route "49 outer FIRST declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT FIRST 2 N.ID FROM N"
 
+echo "--- 50 aggregates over a recursion (slice 50): the BLR path declines, the interpreter serves"
+route "50 COUNT declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT COUNT(*) FROM N"
+route "50 GROUP BY declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT N.ID, COUNT(*) FROM N GROUP BY N.ID"
+route "50 HAVING declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT COUNT(*) FROM N HAVING COUNT(*) > 1"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
