@@ -47,7 +47,8 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 47 limits in recursion (anchor/member FIRST / SKIP; the member ROWS trailer is traceless),
    slice 48 ORDER BY on the recursive member (parses syntactically, no BLR trace),
    slice 49 the outer select over the recursion (WHERE / ORDER BY / DISTINCT / limits over the recurse fids),
-   slice 50 aggregates and GROUP BY over the recursion (the aggregate node over the tower).
+   slice 50 aggregates and GROUP BY over the recursion (the aggregate node over the tower),
+   slice 51 joins with the recursion (the tower in the cte's FROM slot).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -162,6 +163,17 @@ replacement of the C++ engine is below, in priority order. Full text:
    aggregates inside expressions, FILTER over column args and IN / LIKE / subqueries in HAVING stay refused - named gaps, pinned.
    Pre-existing reds re-confirmed at HEAD by stash-compare (identical cells: exe EP101/EP158, exeselect §17, the two view DIFFs);
    branchtype 69/69, unit tests 86+5.
+   DONE (slice 51): joins with the recursion on the BLR path - the tower stands in the cte's FROM slot (a join node's
+   stream or a flat comma stream), the triple wherever the cte reference sits (table-first binds 1/2/3), the outer clauses
+   riding after the scaffolding (WHERE, SORT, PROJECT, FIRST/SKIP, the trailer); USING desugars in FROM order with the merged
+   column as COALESCE, the cte's star is its columns (byte-identical to the hand-written list, single and joined) - all
+   byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +84 net with the slice-49 join and qualified-star gaps flipped,
+   exe-run-blr +6 execution refusals (fcexe reports join stream verb 67 / 2-stream rse unconverted - a later exe slice's
+   surface, no executor change); the route declines, three new cells in exeselect §51 - the interpreter serves every join
+   shape). Bare names disambiguate through the catalog, an ambiguous bare is the engine's 42702 too. Twin-tower self-joins,
+   NATURAL, CROSS, comma+JOIN mixing, derived tables beside the cte, ON subqueries and chained USING stay refused - named
+   gaps, pinned. Pre-existing reds re-confirmed at HEAD by stash-compare (identical cells: exe EP101/EP158, exeselect §17,
+   the two view DIFFs); branchtype 69/69, unit tests 88+5.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

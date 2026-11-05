@@ -6349,6 +6349,135 @@ fn emit_join_chain(out: &mut Vec<u8>, first: &Stream, ctx: u8, joins: &[(u8, Str
     }
 }
 
+/// The recursion tower: a wrapper rse whose stream is blr_recurse
+/// - context, the SECONDARY recursive context byte, branch count -
+/// then the anchor branch (a real rse + map, the cte name riding
+/// the relation2 alias) and the STREAM-LESS recursive branch (rse
+/// 0, its boolean over fids, map); no terminator of its own - the
+/// wrapper's END closes it, the caller's END the enclosing rse
+/// (probed).
+fn emit_rec_tower(out: &mut Vec<u8>, rc: &RecCte) {
+    out.push(blr::RSE);
+    out.push(1);
+    out.push(0xB9); // blr_recurse
+    out.push(rc.ctx);
+    out.push(rc.secondary);
+    out.push(2);
+    // anchor
+    out.push(blr::RSE);
+    out.push(1);
+    if is_system_relation(&rc.anchor_table) {
+        emit_relation3(out, &rc.anchor_table);
+    } else {
+        out.push(0x92); // blr_relation2
+        out.push(rc.anchor_table.len() as u8);
+        out.extend_from_slice(rc.anchor_table.as_bytes());
+    }
+    out.push(rc.anchor_alias.len() as u8);
+    out.extend_from_slice(rc.anchor_alias.as_bytes());
+    out.push(rc.anchor_ctx);
+    if let Some(v) = &rc.anchor_first {
+        out.push(blr::FIRST);
+        emit_val(out, v);
+    }
+    if let Some(v) = &rc.anchor_skip {
+        out.push(blr::SKIP);
+        emit_val(out, v);
+    }
+    if let Some(b) = &rc.anchor_wher {
+        out.push(blr::BOOLEAN);
+        emit_bool(out, b);
+    }
+    if rc.anchor_distinct {
+        out.push(blr::PROJECT);
+        out.push(rc.anchor_items.len() as u8);
+        for (item, _) in &rc.anchor_items {
+            emit_val(out, item);
+        }
+    }
+    out.push(blr::END);
+    out.push(0x4D); // blr_map
+    out.extend_from_slice(&(rc.anchor_items.len() as u16).to_le_bytes());
+    for (i, (item, cast)) in rc.anchor_items.iter().enumerate() {
+        out.extend_from_slice(&(i as u16).to_le_bytes());
+        if *cast {
+            // this COLUMN's recursive item is integer arithmetic: it
+            // types int64 and the anchor field casts (per-column
+            // unification, probed)
+            out.push(0x83); // blr_cast
+            out.push(0x10); // blr_int64
+            out.push(0);
+        }
+        emit_val(out, item);
+    }
+    // the recursive branch: ZERO streams
+    out.push(blr::RSE);
+    out.push(0);
+    if let Some(v) = &rc.rec_first {
+        out.push(blr::FIRST);
+        emit_val(out, v);
+    }
+    if let Some(v) = &rc.rec_skip {
+        out.push(blr::SKIP);
+        emit_val(out, v);
+    }
+    if let Some(b) = &rc.rec_wher {
+        out.push(blr::BOOLEAN);
+        emit_bool(out, b);
+    }
+    out.push(blr::END);
+    out.push(0x4D);
+    out.extend_from_slice(&(rc.rec_items.len() as u16).to_le_bytes());
+    for (i, item) in rc.rec_items.iter().enumerate() {
+        out.extend_from_slice(&(i as u16).to_le_bytes());
+        emit_val(out, item);
+    }
+    out.push(blr::END); // the wrapper rse's end
+}
+
+/// The FROM streams over a recursion (slice 51): a flat comma list
+/// or the left-nested JOIN chain, the tower standing in the cte's
+/// slot - the general [emit_join_chain] shape (measured J1-J17).
+fn emit_rec_join_streams(
+    out: &mut Vec<u8>,
+    rc: &RecCte,
+    first: &Stream,
+    ctx: u8,
+    joins: &[(u8, Stream, u8, Bool)],
+) {
+    let mut slot = 0usize;
+    let mut emit_slot = |out: &mut Vec<u8>, st: &Stream, c: u8| {
+        if slot == rc.cte_pos {
+            emit_rec_tower(out, rc);
+        } else {
+            emit_stream(out, st, c);
+        }
+        slot += 1;
+    };
+    if joins.iter().all(|j| j.0 == JOIN_COMMA) {
+        emit_slot(out, first, ctx);
+        for (_, st, jctx, _) in joins {
+            emit_slot(out, st, *jctx);
+        }
+        return;
+    }
+    for _ in joins {
+        out.push(blr::JOIN);
+        out.push(2);
+    }
+    emit_slot(out, first, ctx);
+    for (jt, st, jctx, on) in joins {
+        emit_slot(out, st, *jctx);
+        if *jt != 0 {
+            out.push(blr::JOIN_TYPE);
+            out.push(*jt);
+        }
+        out.push(blr::BOOLEAN);
+        emit_bool(out, on);
+        out.push(blr::END);
+    }
+}
+
 /// The window list after a blr_window's source rse: the count, then each
 /// window - blr_partition_by (or the v4 framed verb) with its keys, the
 /// remapped keys, the sort and the map.
@@ -7840,9 +7969,296 @@ fn map_bool_to_fids(map: &[MapEntry], b: Bool, fid_ctx: u8) -> Option<Bool> {
 /// collect_group_fields over RECURSE fids: the aggregate path over a
 /// recursive cte reads fid(recurse ctx, slot) where a table's reads
 /// fields - same descent, Fid leaves (slice 50, measured G4/G10/G31)
+/// One FROM item over a recursion (slice 51): the cte reference
+/// or a plain table, each with its [AS] alias.
+struct RecFromItem {
+    cte: bool,
+    name: String,
+    alias: Option<String>,
+}
+
+/// One join step after the first FROM item: the join type (0/1/2/3
+/// like the general path, JOIN_COMMA for a comma) and the USING
+/// columns when the step joins with USING instead of ON.
+struct RecJoinStep {
+    jt: u8,
+    using: Option<Vec<String>>,
+}
+
+/// The outer select's FROM clause over a recursion, scanned ahead
+/// so the table streams take their contexts in FROM order - the
+/// tower's triple sits wherever the cte reference sits (measured
+/// J1/J2: cte-first binds 0/1/2, table-first 1/2/3).
+struct RecFromPlan {
+    items: Vec<RecFromItem>,
+    joins: Vec<RecJoinStep>,
+}
+
+/// A pure [AS] alias peek: what [P::rec_alias] consumes, as a
+/// lookahead - (refusal, next index). The FROM scan and the FROM
+/// walk share it, so a FROM the scan plans is one the walk parses.
+fn rec_alias_at(t: &[Tok], j: usize) -> (Option<Option<String>>, usize) {
+    if matches!(t.get(j), Some(Tok::Ident(a)) if a == "AS") {
+        let Some(Tok::Ident(a)) = t.get(j + 1) else {
+            return (None, j + 1);
+        };
+        if is_keyword(a) || matches!(a.as_str(), "OVER" | "TO" | "ROW") {
+            return (None, j + 1);
+        }
+        (Some(Some(a.clone())), j + 2)
+    } else if let Some(Tok::Ident(a)) = t.get(j) {
+        if is_keyword(a) || matches!(a.as_str(), "OVER" | "TO" | "ROW") {
+            (Some(None), j)
+        } else {
+            (Some(Some(a.clone())), j + 1)
+        }
+    } else {
+        (Some(None), j)
+    }
+}
+
+/// One FROM item at a lookahead index: the cte reference or a plain
+/// `TABLE [[AS] alias]` - a derived table, procedure call or
+/// subquery refuses (slice 51, measured J48).
+fn rec_from_item_at(t: &[Tok], j: usize, cte: &str) -> Option<(RecFromItem, usize)> {
+    let Tok::Ident(name) = t.get(j)? else {
+        return None;
+    };
+    if is_keyword(name) {
+        return None;
+    }
+    let (alias, next) = rec_alias_at(t, j + 1);
+    Some((
+        RecFromItem {
+            cte: name.as_str() == cte,
+            name: name.clone(),
+            alias: alias?,
+        },
+        next,
+    ))
+}
+
+/// Scan the outer select's FROM clause ahead, from the cte name:
+/// past the cte body's parens and the select list to the depth-0
+/// FROM, then the items and join steps - ON bodies skipped
+/// depth-aware, USING columns recorded. None whenever the FROM is
+/// not exactly servable: no cte reference, a second one (the twin
+/// towers stay refused - measured J9/J10), CROSS or NATURAL (the
+/// general path's shared gaps - J14/J16/J26). A comma mixed with an
+/// explicit JOIN scans but refuses in the walk, like the general
+/// path (measured J47).
+fn rec_from_plan(t: &[Tok], mut j: usize, cte: &str) -> Option<RecFromPlan> {
+    if !matches!(t.get(j), Some(Tok::Ident(w)) if w.as_str() == cte) {
+        return None;
+    }
+    j += 1;
+    if !matches!(t.get(j), Some(Tok::Ident(w)) if w == "AS") {
+        return None;
+    }
+    j += 1;
+    if !matches!(t.get(j), Some(Tok::LParen)) {
+        return None;
+    }
+    j += 1;
+    let mut depth = 1i32;
+    while depth > 0 {
+        match t.get(j)? {
+            Tok::LParen => depth += 1,
+            Tok::RParen => depth -= 1,
+            _ => {}
+        }
+        j += 1;
+    }
+    if !matches!(t.get(j), Some(Tok::Ident(w)) if w == "SELECT") {
+        return None;
+    }
+    j += 1;
+    // the select list to the depth-0 FROM (a subquery's or
+    // EXTRACT's FROM sits deeper)
+    let mut depth = 0i32;
+    loop {
+        match t.get(j)? {
+            Tok::LParen => depth += 1,
+            Tok::RParen => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            Tok::Ident(w) if depth == 0 && w == "FROM" => {
+                j += 1;
+                break;
+            }
+            Tok::Semi => return None,
+            _ => {}
+        }
+        j += 1;
+    }
+    let (first, next) = rec_from_item_at(t, j, cte)?;
+    j = next;
+    let mut plan = RecFromPlan {
+        items: vec![first],
+        joins: Vec::new(),
+    };
+    loop {
+        if matches!(t.get(j), Some(Tok::Comma)) {
+            j += 1;
+            let (it, next) = rec_from_item_at(t, j, cte)?;
+            j = next;
+            plan.items.push(it);
+            plan.joins.push(RecJoinStep {
+                jt: JOIN_COMMA,
+                using: None,
+            });
+            continue;
+        }
+        let jt = if matches!(t.get(j), Some(Tok::Ident(w)) if w == "INNER") {
+            j += 1;
+            if !matches!(t.get(j), Some(Tok::Ident(w)) if w == "JOIN") {
+                return None;
+            }
+            j += 1;
+            0u8
+        } else if matches!(t.get(j), Some(Tok::Ident(w)) if w == "JOIN") {
+            j += 1;
+            0u8
+        } else if matches!(t.get(j), Some(Tok::Ident(w)) if w == "LEFT") {
+            j += 1;
+            if matches!(t.get(j), Some(Tok::Ident(w)) if w == "OUTER") {
+                j += 1;
+            }
+            if !matches!(t.get(j), Some(Tok::Ident(w)) if w == "JOIN") {
+                return None;
+            }
+            j += 1;
+            1u8
+        } else if matches!(t.get(j), Some(Tok::Ident(w)) if w == "RIGHT") {
+            j += 1;
+            if matches!(t.get(j), Some(Tok::Ident(w)) if w == "OUTER") {
+                j += 1;
+            }
+            if !matches!(t.get(j), Some(Tok::Ident(w)) if w == "JOIN") {
+                return None;
+            }
+            j += 1;
+            2u8
+        } else if matches!(t.get(j), Some(Tok::Ident(w)) if w == "FULL") {
+            j += 1;
+            if matches!(t.get(j), Some(Tok::Ident(w)) if w == "OUTER") {
+                j += 1;
+            }
+            if !matches!(t.get(j), Some(Tok::Ident(w)) if w == "JOIN") {
+                return None;
+            }
+            j += 1;
+            3u8
+        } else {
+            break;
+        };
+        let (it, next) = rec_from_item_at(t, j, cte)?;
+        j = next;
+        let using = if matches!(t.get(j), Some(Tok::Ident(w)) if w == "USING") {
+            j += 1;
+            if !matches!(t.get(j), Some(Tok::LParen)) {
+                return None;
+            }
+            j += 1;
+            let mut cols = Vec::new();
+            loop {
+                let Some(Tok::Ident(c)) = t.get(j) else {
+                    return None;
+                };
+                cols.push(c.clone());
+                j += 1;
+                if matches!(t.get(j), Some(Tok::Comma)) {
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+            if cols.is_empty() || !matches!(t.get(j), Some(Tok::RParen)) {
+                return None;
+            }
+            j += 1;
+            Some(cols)
+        } else if matches!(t.get(j), Some(Tok::Ident(w)) if w == "ON") {
+            j += 1;
+            // the ON body to its depth-0 terminator: a clause, the
+            // next join step, or the statement's end
+            let mut depth = 0i32;
+            loop {
+                match t.get(j)? {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    Tok::Comma if depth == 0 => break,
+                    Tok::Semi => return None,
+                    Tok::Ident(w)
+                        if depth == 0
+                            && matches!(
+                                w.as_str(),
+                                "WHERE" | "GROUP" | "ORDER" | "HAVING" | "OFFSET" | "FETCH"
+                                    | "ROWS" | "INTO" | "DO" | "UNION" | "JOIN" | "INNER"
+                                    | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "NATURAL"
+                            ) =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        } else {
+            return None;
+        };
+        plan.items.push(it);
+        plan.joins.push(RecJoinStep { jt, using });
+    }
+    // exactly one cte reference: none is not this path, two are the
+    // twin towers (refused)
+    if plan.items.iter().filter(|it| it.cte).count() != 1 {
+        return None;
+    }
+    Some(plan)
+}
+
+/// A FROM position's stream index (slice 51): the cte's triple
+/// occupies three slots at its position, so tables ahead of it sit
+/// at their position and tables past it two further on; the cte
+/// itself answers at its triple's middle slot.
+fn rec_item_index(from_base: usize, cte_pos: usize, cte_idx: usize, k: usize) -> usize {
+    if k < cte_pos {
+        from_base + k
+    } else if k == cte_pos {
+        cte_idx
+    } else {
+        from_base + k + 2
+    }
+}
+
+/// A plain-table FROM stream pre-pushed from the FROM plan (slice 51)
+fn rec_table_stream(name: &str, alias: Option<String>, in_sub: bool) -> Stream {
+    Stream {
+        name: name.to_string(),
+        alias,
+        using: Vec::new(),
+        proc_args: None,
+        derived: None,
+        sub: in_sub,
+        cur: None,
+    }
+}
+
 fn collect_rec_group_fields(k: &Val, out: &mut Vec<Val>) {
     match k {
-        Val::Fid(..) => {
+        Val::Fid(..) | Val::Field(..) => {
+            // a table field groups like a recurse fid (slice 51,
+            // measured J34/J35: the joined table's column as key)
             if !out.contains(k) {
                 out.push(k.clone());
             }
@@ -8797,6 +9213,9 @@ struct RecCte {
     /// slot BELOW it
     ctx: u8,
     secondary: u8,
+    /// the cte's slot in the outer FROM order (slice 51): the
+    /// emitter stands the tower in the cte's slot, tables around it
+    cte_pos: usize,
     /// the anchor: table name, its context, WHERE, the single item
     anchor_table: String,
     /// the alias text: "CTE" "PUBLIC"."TABLE" (the inlined-cte law)
@@ -9677,100 +10096,21 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             // window (rse 2 ..)`)
             out.push(if f.aggregate || !f.windows.is_empty() { 1 } else { rse_stream_count(&f.joins) });
             if let Some(rc) = &f.recurse {
-                // the recursion tower: a wrapper rse whose stream is
-                // blr_recurse - context, the SECONDARY recursive
-                // context byte, branch count - then the anchor branch
-                // (a real rse + map, the cte name riding the
-                // relation2 alias) and the STREAM-LESS recursive
-                // branch (rse 0, its boolean over fids, map); no
-                // terminator of its own - the wrapper's END closes
-                // it, the shared END below closes the outer rse
-                // (probed)
                 if f.aggregate {
                     // the aggregate node stands as the outer rse's
                     // stream, over an inner rse whose stream is the
-                    // tower (slice 50, measured G1)
+                    // tower - or the join scaffolding over it (slice
+                    // 50 measured G1, slice 51 J12/J34)
                     out.push(blr::AGGREGATE);
                     out.push(f.agg_ctx);
                     out.push(blr::RSE);
-                    out.push(1);
+                    out.push(rse_stream_count(&f.joins));
                 }
-                out.push(blr::RSE);
-                out.push(1);
-                out.push(0xB9); // blr_recurse
-                out.push(rc.ctx);
-                out.push(rc.secondary);
-                out.push(2);
-                // anchor
-                out.push(blr::RSE);
-                out.push(1);
-                if is_system_relation(&rc.anchor_table) {
-                    emit_relation3(out, &rc.anchor_table);
+                if f.joins.is_empty() {
+                    emit_rec_tower(out, rc);
                 } else {
-                    out.push(0x92); // blr_relation2
-                    out.push(rc.anchor_table.len() as u8);
-                    out.extend_from_slice(rc.anchor_table.as_bytes());
+                    emit_rec_join_streams(out, rc, &f.stream, f.ctx, &f.joins);
                 }
-                out.push(rc.anchor_alias.len() as u8);
-                out.extend_from_slice(rc.anchor_alias.as_bytes());
-                out.push(rc.anchor_ctx);
-                if let Some(v) = &rc.anchor_first {
-                    out.push(blr::FIRST);
-                    emit_val(out, v);
-                }
-                if let Some(v) = &rc.anchor_skip {
-                    out.push(blr::SKIP);
-                    emit_val(out, v);
-                }
-                if let Some(b) = &rc.anchor_wher {
-                    out.push(blr::BOOLEAN);
-                    emit_bool(out, b);
-                }
-                if rc.anchor_distinct {
-                    out.push(blr::PROJECT);
-                    out.push(rc.anchor_items.len() as u8);
-                    for (item, _) in &rc.anchor_items {
-                        emit_val(out, item);
-                    }
-                }
-                out.push(blr::END);
-                out.push(0x4D); // blr_map
-                out.extend_from_slice(&(rc.anchor_items.len() as u16).to_le_bytes());
-                for (i, (item, cast)) in rc.anchor_items.iter().enumerate() {
-                    out.extend_from_slice(&(i as u16).to_le_bytes());
-                    if *cast {
-                        // this COLUMN's recursive item is integer
-                        // arithmetic: it types int64 and the anchor
-                        // field casts (per-column unification, probed)
-                        out.push(0x83); // blr_cast
-                        out.push(0x10); // blr_int64
-                        out.push(0);
-                    }
-                    emit_val(out, item);
-                }
-                // the recursive branch: ZERO streams
-                out.push(blr::RSE);
-                out.push(0);
-                if let Some(v) = &rc.rec_first {
-                    out.push(blr::FIRST);
-                    emit_val(out, v);
-                }
-                if let Some(v) = &rc.rec_skip {
-                    out.push(blr::SKIP);
-                    emit_val(out, v);
-                }
-                if let Some(b) = &rc.rec_wher {
-                    out.push(blr::BOOLEAN);
-                    emit_bool(out, b);
-                }
-                out.push(blr::END);
-                out.push(0x4D);
-                out.extend_from_slice(&(rc.rec_items.len() as u16).to_le_bytes());
-                for (i, item) in rc.rec_items.iter().enumerate() {
-                    out.extend_from_slice(&(i as u16).to_le_bytes());
-                    emit_val(out, item);
-                }
-                out.push(blr::END); // the wrapper rse's end
                 if f.aggregate {
                     // the WHERE lives in the aggregate's inner rse,
                     // after the tower; then GROUP_BY in clause order,
@@ -13299,6 +13639,88 @@ impl<'a> P<'a> {
         Some(())
     }
 
+    /// One FROM item against the FROM plan: the scanned name and
+    /// alias, nothing else (slice 51). The cte slot takes a
+    /// pseudo-stream - the emitter stands the tower in its place.
+    fn rec_from_walk_item(
+        &mut self,
+        want: &RecFromItem,
+        idx: usize,
+        cte: &str,
+    ) -> Option<(Stream, u8)> {
+        let Some(Tok::Ident(name)) = self.t.get(self.i) else {
+            return None;
+        };
+        if name != &want.name || (want.cte && name.as_str() != cte) {
+            return None;
+        }
+        let name = name.clone();
+        self.i += 1;
+        if self.rec_alias()? != want.alias {
+            return None;
+        }
+        let ctx = idx as u8 + self.base;
+        let st = if want.cte {
+            Stream {
+                name: cte.to_string(),
+                alias: want.alias.clone(),
+                using: Vec::new(),
+                proc_args: None,
+                derived: None,
+                sub: self.in_sub,
+                cur: None,
+            }
+        } else {
+            rec_table_stream(&name, want.alias.clone(), self.in_sub)
+        };
+        Some((st, ctx))
+    }
+
+    /// `JOIN ... USING (cols)` over the FROM scope: the desugared
+    /// ON (`left.col = right.col`, ANDed) and the merge pairs -
+    /// exactly the general path's shape, over the scope's streams
+    /// (slice 51, measured J15/J25/J46).
+    fn rec_using_on(
+        &self,
+        scope_start: usize,
+        right: usize,
+        cols: &[String],
+    ) -> Option<(Bool, Vec<(String, usize)>)> {
+        let mut sorted = cols.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        if sorted.len() != cols.len() {
+            return None; // the engine rejects a doubled column
+        }
+        let has_col = |idx: usize, col: &str| match &self.streams[idx].derived {
+            None => catalog_has(&self.streams[idx].name, col),
+            Some(d) => d.cols.iter().any(|(o, _)| o == col),
+        };
+        let mut pair = Vec::with_capacity(cols.len());
+        for col in cols {
+            if !has_col(right, col) {
+                return None;
+            }
+            let lefts: Vec<usize> = (scope_start..right).filter(|&i| has_col(i, col)).collect();
+            if lefts.len() != 1 {
+                return None;
+            }
+            pair.push((col.clone(), lefts[0]));
+        }
+        let mut eqs = pair.iter().map(|(c, l)| {
+            Some(Bool::Cmp(
+                CmpOp::Eql,
+                self.stream_col_val(*l, c)?,
+                self.stream_col_val(right, c)?,
+            ))
+        });
+        let mut on = eqs.next()??;
+        for e in eqs {
+            on = Bool::And(Box::new(on), Box::new(e?));
+        }
+        Some((on, pair))
+    }
+
     /// blr_recurse tower. Context law (probed): the SECONDARY
     /// recursive context claims the next slot, the recursion context
     /// the one after, the anchor stream the one after that.
@@ -13310,11 +13732,28 @@ impl<'a> P<'a> {
             return None;
         }
         let cte = name.clone();
+        // the outer FROM ahead, planned before any stream binds, so
+        // the table streams take their contexts in FROM order with
+        // the tower's triple wherever the cte reference sits (slice
+        // 51, measured J1/J2). A FROM the scan cannot plan keeps
+        // the legacy triple-first layout and refuses below as before
+        let plan = rec_from_plan(self.t, self.i, &cte);
+        let from_base = self.streams.len();
+        let cte_pos = match &plan {
+            Some(p) => p.items.iter().position(|it| it.cte)?,
+            None => 0,
+        };
         self.i += 1;
         if !self.kw("AS") || !matches!(self.t.get(self.i), Some(Tok::LParen)) {
             return None;
         }
         self.i += 1;
+        if let Some(p) = &plan {
+            for it in p.items.iter().take(cte_pos) {
+                self.streams
+                    .push(rec_table_stream(&it.name, it.alias.clone(), self.in_sub));
+            }
+        }
         // contexts: secondary, recurse, anchor - in that order
         for _ in 0..3 {
             self.streams.push(Stream {
@@ -13330,6 +13769,13 @@ impl<'a> P<'a> {
         let secondary = (self.streams.len() - 3) as u8 + self.base;
         let ctx = secondary + 1;
         let anchor_ctx = secondary + 2;
+        let triple_end = self.streams.len();
+        if let Some(p) = &plan {
+            for it in p.items.iter().skip(cte_pos + 1) {
+                self.streams
+                    .push(rec_table_stream(&it.name, it.alias.clone(), self.in_sub));
+            }
+        }
         // ---- the anchor branch: SELECT <col> [, ...] FROM <table>
         if !self.kw("SELECT") {
             return None;
@@ -13478,11 +13924,13 @@ impl<'a> P<'a> {
         if !outer_distinct {
             let _ = self.kw("ALL");
         }
-        // lookahead: the outer alias (if any) must be known before
-        // the items parse, so a forward scan finds FROM <cte> at
+        // the outer alias comes from the FROM plan (slice 51);
+        // without one the legacy forward scan finds FROM <cte> at
         // depth 0 (a subquery's or EXTRACT's FROM sits deeper)
         let mut outer_alias: Option<String> = None;
-        {
+        if let Some(p) = &plan {
+            outer_alias = p.items[cte_pos].alias.clone();
+        } else {
             let mut j = self.i;
             let mut depth = 0i32;
             while let Some(t) = self.t.get(j) {
@@ -13555,6 +14003,26 @@ impl<'a> P<'a> {
         );
         let saved_sub = self.sub.replace(cte_idx);
         let saved_agg_mode = std::mem::replace(&mut self.agg_mode, false);
+        let saved_scope = self.merge_scope;
+        if let Some(p) = &plan {
+            if !p.joins.is_empty() {
+                // over joins the FROM streams resolve together: bare
+                // names disambiguate through the catalog, USING pairs
+                // merge to COALESCE (slice 51 - the general scope law)
+                self.merge_scope = Some((from_base, self.streams.len()));
+            }
+            // USING pairs ride the streams before the items parse, so
+            // a merged column resolves to its COALESCE (slice 51,
+            // measured J15/J25/J46)
+            for (si, step) in p.joins.iter().enumerate() {
+                let Some(cols) = &step.using else {
+                    continue;
+                };
+                let ri = rec_item_index(from_base, cte_pos, cte_idx, 1 + si);
+                let (_, pair) = self.rec_using_on(from_base, ri, cols)?;
+                self.streams[ri].using = pair;
+            }
+        }
         // items + aliases; star stands ALONE (the engine's -104 on
         // `*, 1`); a whole-item aggregate takes the Agg arm (LIST,
         // statistical verbs and aggregates inside expressions refuse
@@ -13571,13 +14039,102 @@ impl<'a> P<'a> {
                     return None;
                 }
                 self.i += 1;
-                for v in self.star_fields(cte_idx)? {
-                    items.push(RecItem::Col(v));
-                }
-                for c in &acols {
-                    item_names.push(Some(c.clone()));
+                if plan.as_ref().is_some_and(|p| !p.joins.is_empty()) {
+                    // over joins: every FROM stream's columns in
+                    // order, a USING merge riding its left side as
+                    // COALESCE in place - the general star law
+                    // (slice 51, measured J29/J42/J43)
+                    for idx in from_base..self.streams.len() {
+                        for (c, l) in &self.streams[idx].using {
+                            if self.streams[*l].using.iter().any(|(d, _)| d == c) {
+                                return None; // transitive merge: unprobed
+                            }
+                        }
+                    }
+                    for idx in from_base..self.streams.len() {
+                        if self.streams[idx].name.is_empty()
+                            && self.streams[idx].derived.is_none()
+                        {
+                            continue; // the tower's empty placeholders
+                        }
+                        let fields = self.star_fields(idx)?;
+                        for (nm, v) in self.star_names(idx)?.into_iter().zip(fields) {
+                            // right side of a merge: skipped, the pair
+                            // rides on the left
+                            if self.streams[idx].using.iter().any(|(c, _)| c == &nm) {
+                                continue;
+                            }
+                            // left side of a merge: the COALESCE pair
+                            // in place
+                            let pair = (idx + 1..self.streams.len()).find_map(|r| {
+                                self.streams[r]
+                                    .using
+                                    .iter()
+                                    .find(|(c, l)| c == &nm && *l == idx)
+                                    .map(|_| r)
+                            });
+                            let (nm, v) = if let Some(r) = pair {
+                                (
+                                    nm.clone(),
+                                    Val::Coalesce(vec![
+                                        self.stream_col_val(idx, &nm)?,
+                                        self.stream_col_val(r, &nm)?,
+                                    ]),
+                                )
+                            } else {
+                                (nm, v)
+                            };
+                            items.push(RecItem::Col(v));
+                            item_names.push(Some(nm));
+                        }
+                    }
+                } else {
+                    for v in self.star_fields(cte_idx)? {
+                        items.push(RecItem::Col(v));
+                    }
+                    for c in &acols {
+                        item_names.push(Some(c.clone()));
+                    }
                 }
                 break;
+            }
+            // `<stream>.*`, beside other items - the general
+            // qualified-star law over the FROM streams (slice 51,
+            // measured J30/J33/J44/J45/J62: the cte's star is its
+            // columns, byte-identical to the hand-written list)
+            let qstar = match (
+                self.t.get(self.i),
+                self.t.get(self.i + 1),
+                self.t.get(self.i + 2),
+            ) {
+                (Some(Tok::Ident(q)), Some(Tok::Dot), Some(Tok::Star)) => Some(q.clone()),
+                _ => None,
+            };
+            if let Some(q) = qstar {
+                self.i += 3;
+                let hits: Vec<usize> = (from_base..self.streams.len())
+                    .filter(|&k| {
+                        let st = &self.streams[k];
+                        st.alias
+                            .as_deref()
+                            .map_or(st.derived.is_none() && st.name == q, |a| a == q)
+                    })
+                    .collect();
+                if hits.len() != 1 {
+                    return None; // no such stream, or two of them
+                }
+                for (nm, v) in self.star_names(hits[0])?.into_iter().zip(self.star_fields(hits[0])?) {
+                    items.push(RecItem::Col(v));
+                    item_names.push(Some(nm));
+                }
+                match self.t.get(self.i) {
+                    Some(Tok::Comma) => {
+                        self.i += 1;
+                        continue;
+                    }
+                    Some(Tok::Ident(w)) if w == "FROM" => break,
+                    _ => return None,
+                }
             }
             let agg_head = match self.t.get(self.i) {
                 Some(Tok::Ident(w))
@@ -13619,16 +14176,126 @@ impl<'a> P<'a> {
         if !self.kw("FROM") {
             return None;
         }
-        if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if *w == cte) {
-            return None;
-        }
-        self.i += 1;
-        // the outer alias for real (bare or AS - both probed); it
-        // must be the one the lookahead found
-        let found_alias = self.rec_alias()?;
-        if found_alias != outer_alias {
-            return None;
-        }
+        // the FROM clause against the plan (slice 51): each item's
+        // name and alias must be the scanned ones, each ON resolving
+        // across the FROM streams; without a plan the legacy
+        // single-cte FROM refuses joins as before
+        let (first, first_ctx, joins) = if let Some(p) = &plan {
+            let fi = rec_item_index(from_base, cte_pos, cte_idx, 0);
+            let (first, fc) = self.rec_from_walk_item(&p.items[0], fi, &cte)?;
+            let mut joins: Vec<(u8, Stream, u8, Bool)> = Vec::new();
+            for (si, step) in p.joins.iter().enumerate() {
+                let idx = rec_item_index(from_base, cte_pos, cte_idx, 1 + si);
+                if step.jt == JOIN_COMMA {
+                    if !matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        return None;
+                    }
+                    if joins.iter().any(|j: &(u8, Stream, u8, Bool)| j.0 != JOIN_COMMA) {
+                        return None; // comma mixed with a JOIN: unprobed
+                    }
+                    self.i += 1;
+                    let (st2, c2) = self.rec_from_walk_item(&p.items[1 + si], idx, &cte)?;
+                    joins.push((JOIN_COMMA, st2, c2, Bool::Missing(Val::Null)));
+                    continue;
+                }
+                let jt = if self.kw("INNER") {
+                    if !self.kw("JOIN") {
+                        return None;
+                    }
+                    0u8
+                } else if self.kw("JOIN") {
+                    0
+                } else if self.kw("LEFT") {
+                    let _ = self.kw("OUTER");
+                    if !self.kw("JOIN") {
+                        return None;
+                    }
+                    1
+                } else if self.kw("RIGHT") {
+                    let _ = self.kw("OUTER");
+                    if !self.kw("JOIN") {
+                        return None;
+                    }
+                    2
+                } else if self.kw("FULL") {
+                    let _ = self.kw("OUTER");
+                    if !self.kw("JOIN") {
+                        return None;
+                    }
+                    3
+                } else {
+                    return None;
+                };
+                if jt != step.jt {
+                    return None;
+                }
+                if joins.iter().any(|j: &(u8, Stream, u8, Bool)| j.0 == JOIN_COMMA) {
+                    return None; // a JOIN mixed with a comma: unprobed
+                }
+                let (mut st2, c2) = self.rec_from_walk_item(&p.items[1 + si], idx, &cte)?;
+                let on = if self.kw("USING") {
+                    if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                        return None;
+                    }
+                    self.i += 1;
+                    let mut cols = Vec::new();
+                    loop {
+                        let Some(Tok::Ident(c)) = self.t.get(self.i) else {
+                            return None;
+                        };
+                        cols.push(c.clone());
+                        self.i += 1;
+                        if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                            self.i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                        return None;
+                    }
+                    self.i += 1;
+                    if step.using.as_ref() != Some(&cols) {
+                        return None;
+                    }
+                    let (on, pair) = self.rec_using_on(from_base, idx, &cols)?;
+                    st2.using = pair.clone();
+                    self.streams[idx].using = pair;
+                    on
+                } else {
+                    if !self.kw("ON") {
+                        return None;
+                    }
+                    self.bool_or()?
+                };
+                joins.push((jt, st2, c2, on));
+            }
+            (first, fc, joins)
+        } else {
+            if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if *w == cte) {
+                return None;
+            }
+            self.i += 1;
+            // the outer alias for real (bare or AS - both probed); it
+            // must be the one the lookahead found
+            let found_alias = self.rec_alias()?;
+            if found_alias != outer_alias {
+                return None;
+            }
+            (
+                Stream {
+                    name: String::new(),
+                    alias: None,
+                    derived: None,
+                    sub: self.in_sub,
+                    cur: None,
+                    proc_args: None,
+                    using: Vec::new(),
+                },
+                ctx,
+                Vec::new(),
+            )
+        };
         let outer_boolean = if self.kw("WHERE") {
             Some(self.bool_or()?)
         } else {
@@ -13734,7 +14401,9 @@ impl<'a> P<'a> {
             // matches a key, reads nothing, or reads only bare-field
             // keys (the general law over recurse fids)
             let bare_or_const = |k: &Val| -> bool {
-                if matches!(k, Val::Fid(c, _) if *c == ctx) {
+                // a bare table column keys like a bare recurse fid
+                // (slice 51, measured J34)
+                if matches!(k, Val::Fid(c, _) if *c == ctx) || matches!(k, Val::Field(..)) {
                     return true;
                 }
                 let mut f = Vec::new();
@@ -13744,7 +14413,9 @@ impl<'a> P<'a> {
             if !group_keys.iter().all(bare_or_const) {
                 let bare_keys: Vec<&Val> = group_keys
                     .iter()
-                    .filter(|k| matches!(k, Val::Fid(c, _) if *c == ctx))
+                    .filter(|k| {
+                        matches!(k, Val::Fid(c, _) if *c == ctx) || matches!(k, Val::Field(..))
+                    })
                     .collect();
                 for it in &items {
                     match it {
@@ -13964,7 +14635,13 @@ impl<'a> P<'a> {
         // the cte scope ends here: later statements must not see it
         self.streams[cte_idx] = saved_stream;
         self.sub = saved_sub;
+        self.merge_scope = saved_scope;
         self.agg_mode = saved_agg_mode;
+        if plan.is_some() {
+            // the pre-pushed table streams (and the aggregate slot)
+            // leave with the scope; the tower triple stays, as before
+            self.streams.truncate(triple_end);
+        }
         if !self.kw("INTO") {
             return None;
         }
@@ -13998,18 +14675,11 @@ impl<'a> P<'a> {
         let do_stmt = Some(Box::new(body_opt?));
         Some(TrigStmt::ForSel(Box::new(ForSel {
             label: Some(label),
-            stream: Stream {
-                name: String::new(),
-                alias: None,
-                derived: None,
-                sub: self.in_sub,
-                cur: None,
-                proc_args: None,
-                using: Vec::new(),},
-            ctx,
+            stream: first,
+            ctx: first_ctx,
             cursor: None,
             lock: false,
-            joins: Vec::new(),
+            joins,
             windows: Vec::new(),
             distinct: outer_distinct,
             plan: None,
@@ -14029,6 +14699,7 @@ impl<'a> P<'a> {
             recurse: Some(RecCte {
                 ctx,
                 secondary,
+                cte_pos,
                 anchor_table: table.to_ascii_uppercase(),
                 anchor_alias: format!(
                     "\"{}\" \"{}\".\"{}\"",
@@ -14052,29 +14723,13 @@ impl<'a> P<'a> {
 
     /// An [AS] alias in the outer select over a recursion: OVER /
     /// TO / ROW refuse beside the keywords (the engine's -104 as
-    /// one); FIRST and SKIP the engine accepts (measured G37-G48)
+    /// one); FIRST and SKIP the engine accepts (measured G37-G48).
+    /// Shared with the FROM scan as [rec_alias_at], so a FROM the
+    /// scan plans is one the walk parses (slice 51).
     fn rec_alias(&mut self) -> Option<Option<String>> {
-        if self.kw("AS") {
-            let Some(Tok::Ident(a)) = self.t.get(self.i) else {
-                return None;
-            };
-            if is_keyword(a) || matches!(a.as_str(), "OVER" | "TO" | "ROW") {
-                return None;
-            }
-            let a = a.clone();
-            self.i += 1;
-            Some(Some(a))
-        } else if let Some(Tok::Ident(a)) = self.t.get(self.i) {
-            if is_keyword(a) || matches!(a.as_str(), "OVER" | "TO" | "ROW") {
-                Some(None)
-            } else {
-                let a = a.clone();
-                self.i += 1;
-                Some(Some(a))
-            }
-        } else {
-            Some(None)
-        }
+        let (r, next) = rec_alias_at(self.t, self.i);
+        self.i = next;
+        r
     }
 
     /// A value inside the recursive cte's scope: [<cte>.]<col> reads
@@ -18903,14 +19558,81 @@ mod tests {
     }
 
     #[test]
+    fn compiles_slice_fifty_one_shapes_byte_for_byte() {
+        // joins with the recursion (flips seventy-six and
+        // seventy-seven): the tower stands in the cte's FROM slot -
+        // a join node's stream or a flat comma stream - with the
+        // triple wherever the cte reference sits (table-first binds
+        // 1/2/3); the cte's qualified star is its columns,
+        // byte-identical to the hand-written list
+        pin_proc(
+            "CREATE PROCEDURE RR5 RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT NUMS.EMP_NO FROM NUMS JOIN EMPLOYEE E ON E.EMP_NO = NUMS.EMP_NO INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B11000202110107430177024301B901000243019208454D504C4F5945451A224E554D532220225055424C4943222E22454D504C4F5945452202472F170206454D505F4E4F15080001000000FF4D01000000831000170206454D505F4E4F430047331801000015080006000000FF4D01000000221801000015080001000000FF9208454D504C4F5945450322452203472F170306454D505F4E4F18010000FFFF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE RR6 RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT E.EMP_NO FROM EMPLOYEE E JOIN NUMS ON NUMS.EMP_NO = E.EMP_NO INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B11000202110107430177029208454D504C4F59454503224522004301B902010243019208454D504C4F5945451A224E554D532220225055424C4943222E22454D504C4F5945452203472F170306454D505F4E4F15080001000000FF4D01000000831000170306454D505F4E4F430047331802000015080006000000FF4D01000000221802000015080001000000FF472F18020000170006454D505F4E4FFFFF0201170006454D505F4E4F1A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE RR7 RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT E.DEPT_ID, COUNT(*) FROM NUMS JOIN EMPLOYEE E ON E.EMP_NO = NUMS.EMP_NO GROUP BY E.DEPT_ID INTO :R1, :R2 DO SUSPEND; END",
+            "05020401050008000700080007000700020300000800012D1A00000301000800012D1A01009B1100020211010743014F04430177024301B901000243019208454D504C4F5945451A224E554D532220225055424C4943222E22454D504C4F5945452202472F170206454D505F4E4F15080001000000FF4D01000000831000170206454D505F4E4F430047331801000015080006000000FF4D01000000221801000015080001000000FF9208454D504C4F5945450322452203472F170306454D505F4E4F18010000FFFF4E01170307444550545F49444D02000000170307444550545F4944010053FF0201180400001A000001180401001A01000E0102011A0000290100000100011A010029010200030001150700010019010400FFFFFFFFFF0E0102011A0000290100000100011A010029010200030001150700000019010400FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE RR8 RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT NUMS.* FROM NUMS INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014301B901000243019208454D504C4F5945451A224E554D532220225055424C4943222E22454D504C4F5945452202472F170206454D505F4E4F15080001000000FF4D01000000831000170206454D505F4E4F430047331801000015080006000000FF4D01000000221801000015080001000000FFFF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // the flipped slice-49 refusal shape itself: an unaliased
+        // table joins as blr_relation in the tower's slot
+        pin_proc(
+            "CREATE PROCEDURE RR9 RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID FROM NUMS JOIN U ON U.UID = NUMS.ID INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B11000202110107430177024301B9010002430192015413224E554D532220225055424C4943222E22542202472F170202494415080001000000FF4D010000008310001702024944430047331801000015080005000000FF4D01000000221801000015080001000000FF4A015503472F17030355494418010000FFFF0201180100001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
+    fn slice_fifty_one_refusals() {
+        for sql in [
+            // a second cte reference (twin towers): the engine
+            // answers - unmeasured
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT A.EMP_NO FROM NUMS A JOIN NUMS B ON B.EMP_NO = A.EMP_NO INTO :R1 DO SUSPEND; END",
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT A.EMP_NO FROM NUMS A, NUMS B WHERE B.EMP_NO = A.EMP_NO INTO :R1 DO SUSPEND; END",
+            // NATURAL and CROSS beside the cte: the general path's
+            // shared gaps - the engine answers
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT EMP_NO FROM NUMS NATURAL JOIN EMPLOYEE INTO :R1 DO SUSPEND; END",
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT NUMS.EMP_NO FROM NUMS CROSS JOIN EMPLOYEE E INTO :R1 DO SUSPEND; END",
+            // a comma mixed with an explicit JOIN, a derived table
+            // beside the cte: the engine answers - unmeasured
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT NUMS.EMP_NO FROM NUMS, EMPLOYEE E JOIN SRC S ON S.ID = E.EMP_NO WHERE E.EMP_NO = NUMS.EMP_NO INTO :R1 DO SUSPEND; END",
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT NUMS.EMP_NO FROM NUMS JOIN (SELECT ID FROM SRC) D ON D.ID = NUMS.EMP_NO INTO :R1 DO SUSPEND; END",
+            // a subquery inside ON: the general path's shared gap -
+            // the engine answers
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT NUMS.EMP_NO FROM NUMS JOIN EMPLOYEE E ON E.EMP_NO = NUMS.EMP_NO AND E.DEPT_ID IN (SELECT ID FROM SRC) INTO :R1 DO SUSPEND; END",
+            // a chained USING (transitive merge): the engine answers
+            // - unmeasured
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT EMP_NO FROM NUMS JOIN EMPLOYEE E1 USING (EMP_NO) JOIN EMPLOYEE E2 USING (EMP_NO) INTO :R1 DO SUSPEND; END",
+            // HAVING a non-key cte column: the engine's 42000 too
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 BIGINT) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT E.DEPT_ID, SUM(E.SALARY) FROM NUMS JOIN EMPLOYEE E ON E.EMP_NO = NUMS.EMP_NO GROUP BY E.DEPT_ID HAVING NUMS.EMP_NO > 1 INTO :R1, :R2 DO SUSPEND; END",
+            // USING a column the cte lacks: the engine's 42S22 too
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER, R2 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT * FROM NUMS JOIN SRC S USING (ID) INTO :R1, :R2 DO SUSPEND; END",
+            // OVER as a table alias: the engine's -104 too
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT OVER.EMP_NO FROM NUMS JOIN EMPLOYEE OVER ON OVER.EMP_NO = NUMS.EMP_NO INTO :R1 DO SUSPEND; END",
+            // the outer alias shadows the cte name over a join too:
+            // the engine's 42S22 on the original
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT NUMS.EMP_NO FROM NUMS N JOIN SRC S ON S.ID = N.EMP_NO INTO :R1 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
+    }
+
+    #[test]
     fn slice_forty_nine_refusals() {
         for sql in [
             // (an aggregate over the recursion flipped in slice 50 -
             // pinned in compiles_slice_fifty above)
             // (GROUP BY over the recursion flipped in slice 50 -
             // pinned in compiles_slice_fifty above)
-            // a join to the recursion: unmeasured
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID FROM NUMS JOIN U ON U.UID = NUMS.ID INTO :R1 DO SUSPEND; END",
+            // (a join to the recursion flipped in slice 51 -
+            // pinned in compiles_slice_fifty_one above)
             // an out-of-range ORDER position: the engine's -104 too
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT NUMS.ID FROM NUMS ORDER BY 2 INTO :R1 DO SUSPEND; END",
             // an unknown ORDER column: the engine's 42S22 too
