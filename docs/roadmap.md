@@ -42,7 +42,8 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 42 UNION branch expressions (value expressions in branch lists, unified per column — arithmetic to INT64, exacts beside texts to a common
    VARYING; the route serves them), slice 43 GROUP BY keys (aliases resolve the select list first, function calls group by the raw call; uncovered
    items refuse), slice 44 JOIN ... USING (ON equalities, COALESCE merged names, merged star),
-   slice 45 UNION branch FIRST / SKIP (in-rse, before each branch's boolean; the leading limit is the first branch's).
+   slice 45 UNION branch FIRST / SKIP (in-rse, before each branch's boolean; the leading limit is the first branch's),
+   slice 46 UNION branch DISTINCT (in-rse project over the raw items; SELECT ALL is traceless).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -111,6 +112,14 @@ replacement of the C++ engine is below, in priority order. Full text:
    stays refused (the branch-DISTINCT gap, whose transcript pins FIRST before the branch project for its own slice), as do parenthesised
    branches and `DISTINCT FIRST` (the engine's error too). Pre-existing reds: exe EP101/EP158 and exeselect 17 unchanged from slice 44,
    the two view DIFFs re-confirmed at HEAD by stash-compare (identical cells); branchtype 69/69, unit tests 82+5.
+   DONE (slice 46): UNION branch DISTINCT on the BLR path - a DISTINCT branch carries a blr_project inside its rse, after its boolean,
+   over the RAW pre-unification items (a wrapped branch projects the raw value while its map casts - body FOR SELECTs, view unions,
+   IN-subquery unions, derived-table unions and the recursive anchor alike), all byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +28,
+   dsql-view-blr +7, exe-run-blr +9 with no executor change; the route serves four new shapes in exeselect §46). SELECT ALL is accepted
+   as the traceless default spelling at every branch head, the anchor and the plain body select. DISTINCT ALL / ALL DISTINCT and
+   DISTINCT in the recursive member are the engine's error too; FIRST / SKIP in the anchor is the engine's answer and stays a gap.
+   Pre-existing reds: exe EP101/EP158 and exeselect 17 unchanged from slice 45, the two view DIFFs re-confirmed at HEAD by stash-compare
+   (identical cells); branchtype 69/69, unit tests 82+5.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

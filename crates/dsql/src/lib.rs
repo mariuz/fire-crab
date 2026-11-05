@@ -1169,8 +1169,18 @@ enum Bool {
 #[derive(Clone, Debug, PartialEq)]
 struct SubUnion {
     /// per branch: the stream, its context, its WHERE, the single
-    /// select item, and the branch's own FIRST / SKIP (slice 45)
-    branches: Vec<(Stream, u8, Option<Box<Bool>>, Val, Option<Val>, Option<Val>)>,
+    /// select item, the branch's own FIRST / SKIP (slice 45), and -
+    /// for a DISTINCT branch - the RAW pre-wrap item its project
+    /// carries (slice 46)
+    branches: Vec<(
+        Stream,
+        u8,
+        Option<Box<Bool>>,
+        Val,
+        Option<Val>,
+        Option<Val>,
+        Option<Val>,
+    )>,
 }
 
 /// A single-stream subquery: its stream (already holding a context id
@@ -1643,9 +1653,19 @@ struct Derived {
 #[derive(Clone, Debug, PartialEq)]
 struct DerivedUnion {
     all: bool,
-    /// per branch: its relation, context, WHERE, map values, and
-    /// the branch's own FIRST / SKIP (slice 45)
-    branches: Vec<(String, u8, Option<Bool>, Vec<Val>, Option<Val>, Option<Val>)>,
+    /// per branch: its relation, context, WHERE, map values, the
+    /// branch's own FIRST / SKIP (slice 45), and - for a DISTINCT
+    /// branch - the RAW pre-unification items its project carries
+    /// (slice 46)
+    branches: Vec<(
+        String,
+        u8,
+        Option<Bool>,
+        Vec<Val>,
+        Option<Val>,
+        Option<Val>,
+        Option<Vec<Val>>,
+    )>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2963,8 +2983,15 @@ impl<'a> P<'a> {
             using: Vec::new(),
         });
         let ctx = (self.streams.len() - 1) as u8 + self.base;
-        let mut branches: Vec<(Stream, u8, Option<Box<Bool>>, Val, Option<Val>, Option<Val>)> =
-            Vec::new();
+        let mut branches: Vec<(
+            Stream,
+            u8,
+            Option<Box<Bool>>,
+            Val,
+            Option<Val>,
+            Option<Val>,
+            Option<Val>,
+        )> = Vec::new();
         loop {
             // one branch: [FIRST n] [SKIP n] <col> FROM <stream>
             // [WHERE ...] - the limit prefix is the branch's own
@@ -2979,6 +3006,12 @@ impl<'a> P<'a> {
             } else {
                 None
             };
+            // a branch's own DISTINCT (slice 46), or the
+            // traceless ALL
+            let bdistinct = self.kw("DISTINCT");
+            if !bdistinct {
+                let _ = self.kw("ALL");
+            }
             let Some(Tok::Ident(a)) = self.t.get(self.i) else {
                 return None;
             };
@@ -3053,7 +3086,10 @@ impl<'a> P<'a> {
             };
             self.sub = saved;
             self.host = saved_host;
-            branches.push((stream, bctx, wher, item, bfirst, bskip));
+            // a DISTINCT branch projects its RAW item - cloned
+            // before the int64 wrap below (measured W7)
+            let bproj = bdistinct.then(|| item.clone());
+            branches.push((stream, bctx, wher, item, bfirst, bskip, bproj));
             if self.kw("UNION") {
                 if !self.kw("ALL") {
                     return None; // the distinct form: unprobed
@@ -3076,9 +3112,9 @@ impl<'a> P<'a> {
         // int64, and every PLAIN branch wraps in cast(int64)
         let unified = branches
             .iter()
-            .any(|(_, _, _, item, _, _)| matches!(item, Val::Add(..) | Val::Sub(..) | Val::Mul(..)));
+            .any(|(_, _, _, item, _, _, _)| matches!(item, Val::Add(..) | Val::Sub(..) | Val::Mul(..)));
         if unified {
-            for (_, _, _, item, _, _) in branches.iter_mut() {
+            for (_, _, _, item, _, _, _) in branches.iter_mut() {
                 if matches!(item, Val::Field(..)) {
                     let taken = std::mem::replace(item, Val::Int(0));
                     *item = Val::CastInt64(Box::new(taken));
@@ -4073,8 +4109,15 @@ impl<'a> P<'a> {
     }
 
     fn derived_union_inner(&mut self, alias: String, dctx: u8) -> Option<Stream> {
-        let mut branches: Vec<(String, u8, Option<Bool>, Vec<Val>, Option<Val>, Option<Val>)> =
-            Vec::new();
+        let mut branches: Vec<(
+            String,
+            u8,
+            Option<Bool>,
+            Vec<Val>,
+            Option<Val>,
+            Option<Val>,
+            Option<Vec<Val>>,
+        )> = Vec::new();
         let mut names: Vec<String> = Vec::new();
         let mut all: Option<bool> = None;
         loop {
@@ -4083,7 +4126,8 @@ impl<'a> P<'a> {
             }
             // a branch's own FIRST / SKIP prefix (slice 45 -
             // measured inside the branch's rse, before its
-            // boolean); DISTINCT / ALL after it stay refused
+            // boolean), then the branch's DISTINCT or ALL
+            // (slice 46 - ALL leaves no trace)
             let bfirst = if self.kw("FIRST") {
                 Some(self.limit_operand()?)
             } else {
@@ -4094,8 +4138,9 @@ impl<'a> P<'a> {
             } else {
                 None
             };
-            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if matches!(w.as_str(), "DISTINCT" | "ALL")) {
-                return None;
+            let bdistinct = self.kw("DISTINCT");
+            if !bdistinct {
+                let _ = self.kw("ALL");
             }
             // branch items are columns AND value expressions (slice 42)
             // - split, then resolved at the branch scope once the
@@ -4151,7 +4196,10 @@ impl<'a> P<'a> {
                 return None;
             }
             let cols: Vec<Val> = resolved.into_iter().map(|(v, _)| v).collect();
-            branches.push((table, bctx, wher, cols, bfirst, bskip));
+            // a DISTINCT branch projects its RAW items - cloned
+            // before the unify below (measured H2/HR)
+            let bproj = bdistinct.then(|| cols.clone());
+            branches.push((table, bctx, wher, cols, bfirst, bskip, bproj));
             if !self.kw("UNION") {
                 break;
             }
@@ -6147,7 +6195,7 @@ fn emit_bool(out: &mut Vec<u8>, b: &Bool) {
                 out.push(0x4C); // blr_union
                 out.push(sub.ctx);
                 out.push(u.branches.len() as u8);
-                for (st, bctx, wher, item, bfirst, bskip) in &u.branches {
+                for (st, bctx, wher, item, bfirst, bskip, bproj) in &u.branches {
                     out.push(blr::RSE);
                     out.push(1);
                     emit_stream(out, st, *bctx);
@@ -6162,6 +6210,11 @@ fn emit_bool(out: &mut Vec<u8>, b: &Bool) {
                     if let Some(w) = wher {
                         out.push(blr::BOOLEAN);
                         emit_bool(out, w);
+                    }
+                    if let Some(raw) = bproj {
+                        out.push(blr::PROJECT);
+                        out.push(1);
+                        emit_val(out, raw);
                     }
                     out.push(blr::END);
                     out.push(0x4D); // blr_map
@@ -6341,7 +6394,7 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
             out.push(blr::UNION);
             out.push(ctx);
             out.push(u.branches.len() as u8);
-            for (table, bctx, wher, cols, bfirst, bskip) in &u.branches {
+            for (table, bctx, wher, cols, bfirst, bskip, bproj) in &u.branches {
                 out.push(blr::RSE);
                 out.push(1);
                 match &st.alias {
@@ -6375,6 +6428,13 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
                 if let Some(w) = wher {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, w);
+                }
+                if let Some(raw) = bproj {
+                    out.push(blr::PROJECT);
+                    out.push(raw.len() as u8);
+                    for v in raw {
+                        emit_val(out, v);
+                    }
                 }
                 out.push(blr::END);
                 out.push(blr::MAP);
@@ -6981,6 +7041,9 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
         wher: Option<Bool>,
         first: Option<Val>,
         skip: Option<Val>,
+        /// a DISTINCT branch's project: its RAW pre-unification
+        /// items (slice 46)
+        proj: Option<Vec<Val>>,
     }
     let mut branches: Vec<Branch> = Vec::new();
     let mut all: Option<bool> = None;
@@ -7000,8 +7063,11 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
         } else {
             None
         };
-        if p.kw("DISTINCT") {
-            return None; // DISTINCT inside a union branch: unprobed
+        // a branch's own DISTINCT (slice 46), or the traceless
+        // ALL; the project carries the RAW items (measured H2/HR)
+        let bdistinct = p.kw("DISTINCT");
+        if !bdistinct {
+            let _ = p.kw("ALL");
         }
         // branch items are columns AND value expressions (slice 42) -
         // split, then resolved at the branch scope once the stream is
@@ -7038,11 +7104,13 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
             None
         };
         p.sub = saved;
+        let proj = bdistinct.then(|| vals.clone());
         branches.push(Branch {
             cols: vals,
             wher,
             first,
             skip,
+            proj,
         });
         if p.i == p.t.len() {
             break;
@@ -7127,6 +7195,13 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
         if let Some(w) = &b.wher {
             out.push(blr::BOOLEAN);
             emit_bool(&mut out, w);
+        }
+        if let Some(raw) = &b.proj {
+            out.push(blr::PROJECT);
+            out.push(raw.len() as u8);
+            for v in raw {
+                emit_val(&mut out, v);
+            }
         }
         out.push(blr::END);
         out.push(blr::MAP);
@@ -8519,6 +8594,9 @@ struct RecCte {
     anchor_alias: String,
     anchor_ctx: u8,
     anchor_wher: Option<Bool>,
+    /// the anchor's own DISTINCT (slice 46): its project carries
+    /// the RAW anchor fields, before any per-column int64 cast
+    anchor_distinct: bool,
     /// one entry per cte column: the anchor's item and whether it
     /// wraps in cast(int64). The unification is PER COLUMN (probed
     /// on a two-column recursion): only the column whose RECURSIVE
@@ -8626,14 +8704,23 @@ enum PlanKind {
 }
 
 /// A body FOR SELECT's UNION: the union context, ALL or distinct,
-/// and per branch its stream, context, WHERE, select columns, and
-/// the branch's own FIRST / SKIP (slice 45: a LEADING limit is the
+/// and per branch its stream, context, WHERE, select columns, the
+/// branch's own FIRST / SKIP (slice 45: a LEADING limit is the
 /// FIRST branch's - a trailing ROWS / OFFSET / FETCH stays the
-/// statement's, after the union)
+/// statement's, after the union), and - for a DISTINCT branch -
+/// the RAW pre-unification items its project carries (slice 46)
 struct BodyUnion {
     ctx: u8,
     all: bool,
-    branches: Vec<(Stream, u8, Option<Bool>, Vec<Val>, Option<Val>, Option<Val>)>,
+    branches: Vec<(
+        Stream,
+        u8,
+        Option<Bool>,
+        Vec<Val>,
+        Option<Val>,
+        Option<Val>,
+        Option<Vec<Val>>,
+    )>,
 }
 
 /// One window of a windowed select: blr_partition_by's operands -
@@ -9407,6 +9494,13 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, b);
                 }
+                if rc.anchor_distinct {
+                    out.push(blr::PROJECT);
+                    out.push(rc.anchor_items.len() as u8);
+                    for (item, _) in &rc.anchor_items {
+                        emit_val(out, item);
+                    }
+                }
                 out.push(blr::END);
                 out.push(0x4D); // blr_map
                 out.extend_from_slice(&(rc.anchor_items.len() as u16).to_le_bytes());
@@ -9472,14 +9566,15 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 }
             } else if let Some(u) = &f.union_ {
                 // blr_union at the FIRST slot: count, per branch its
-                // rse (the branch's FIRST / SKIP, then WHERE, inside)
-                // and map; a DISTINCT union appends blr_project over
-                // the fids; the shared rse END below closes it
-                // (probed)
+                // rse (the branch's FIRST / SKIP, then WHERE, then a
+                // DISTINCT branch's project over its RAW items,
+                // inside) and map; a DISTINCT union appends
+                // blr_project over the fids; the shared rse END below
+                // closes it (probed)
                 out.push(blr::UNION);
                 out.push(u.ctx);
                 out.push(u.branches.len() as u8);
-                for (st, bctx, bwher, cols, bfirst, bskip) in &u.branches {
+                for (st, bctx, bwher, cols, bfirst, bskip, bproj) in &u.branches {
                     out.push(blr::RSE);
                     out.push(1);
                     emit_stream(out, st, *bctx);
@@ -9494,6 +9589,13 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                     if let Some(b) = bwher {
                         out.push(blr::BOOLEAN);
                         emit_bool(out, b);
+                    }
+                    if let Some(raw) = bproj {
+                        out.push(blr::PROJECT);
+                        out.push(raw.len() as u8);
+                        for v in raw {
+                            emit_val(out, v);
+                        }
                     }
                     out.push(blr::END);
                     out.push(blr::MAP);
@@ -9769,9 +9871,14 @@ impl<'a> P<'a> {
             return None; // FIRST/SKIP in the singular form: unprobed
         }
         // SELECT DISTINCT - blr_project over the select columns
-        // after the boolean (probed); beside everything structured
-        // it refuses below
-        let distinct = self.kw("DISTINCT");
+        // after the boolean (probed); beside a UNION it is the
+        // FIRST branch's (slice 46), beside everything else
+        // structured it refuses below. SELECT ALL is the default
+        // spelling and leaves no trace (measured)
+        let mut distinct = self.kw("DISTINCT");
+        if !distinct {
+            let _ = self.kw("ALL");
+        }
         // two-phase select list: fields need the stream's context
         let list_start = self.i;
         let mut depth = 0i32;
@@ -10586,9 +10693,13 @@ impl<'a> P<'a> {
             // the LEADING limit is the FIRST branch's (slice 45 -
             // measured: it lands inside the first branch's rse, while
             // a trailing ROWS / OFFSET / FETCH lands after the whole
-            // union); the locals go back to None for the trailer
+            // union); the locals go back to None for the trailer.
+            // DISTINCT is the first branch's too (slice 46): its
+            // project carries the RAW pre-unification items
             let b0first = first.take();
             let b0skip = skip.take();
+            let b0proj = distinct.then(|| first_cols.clone());
+            distinct = false;
             let mut branches = vec![(
                 stream.clone(),
                 ctx,
@@ -10596,6 +10707,7 @@ impl<'a> P<'a> {
                 first_cols.clone(),
                 b0first,
                 b0skip,
+                b0proj,
             )];
             loop {
                 if !self.kw("SELECT") {
@@ -10603,7 +10715,8 @@ impl<'a> P<'a> {
                 }
                 // a branch's own FIRST / SKIP prefix (slice 45 -
                 // measured inside the branch's rse, before its
-                // boolean); DISTINCT after it stays refused here
+                // boolean), then the branch's DISTINCT or ALL
+                // (slice 46 - ALL leaves no trace)
                 let bfirst = if self.kw("FIRST") {
                     Some(self.limit_operand()?)
                 } else {
@@ -10614,6 +10727,10 @@ impl<'a> P<'a> {
                 } else {
                     None
                 };
+                let bdistinct = self.kw("DISTINCT");
+                if !bdistinct {
+                    let _ = self.kw("ALL");
+                }
                 // the branch select list, positionally: columns AND
                 // value expressions (slice 42), or a `*` / `<stream>.*`
                 // standing for the branch stream's columns - split,
@@ -10643,7 +10760,11 @@ impl<'a> P<'a> {
                     None
                 };
                 self.sub = saved_b;
-                branches.push((bst, bctx, bwher, cols, bfirst, bskip));
+                // a DISTINCT branch projects its RAW items - the
+                // pre-unification values, cloned before the unify
+                // below wraps any branch in casts (measured H2/HR)
+                let bproj = bdistinct.then(|| cols.clone());
+                branches.push((bst, bctx, bwher, cols, bfirst, bskip, bproj));
                 if !self.kw("UNION") {
                     break;
                 }
@@ -11547,14 +11668,10 @@ impl<'a> P<'a> {
         // DISTINCT beside the structured shapes: unprobed
         // (DISTINCT over a DERIVED table: probed - the project's
         // fields translate through the derived list like any other
-        // reference, so the guard term fell in slice 43)
-        if distinct
-            && (aggregate
-                || union_.is_some()
-                || !joins.is_empty()
-                || cursor.is_some()
-                || lock)
-        {
+        // reference, so the guard term fell in slice 43; DISTINCT
+        // as a UNION branch's own fell in slice 46 - it moved into
+        // the branch above, so the union term is gone too)
+        if distinct && (aggregate || !joins.is_empty() || cursor.is_some() || lock) {
             return None;
         }
         Some(TrigStmt::ForSel(Box::new(ForSel {
@@ -12558,6 +12675,14 @@ impl<'a> P<'a> {
         if !self.kw("SELECT") {
             return None;
         }
+        // the anchor's own DISTINCT (slice 46 - measured in the
+        // anchor rse, after its boolean, over the raw fields), or
+        // the traceless ALL; FIRST / SKIP in the anchor stay
+        // refused (measured WD, unserved)
+        let anchor_distinct = self.kw("DISTINCT");
+        if !anchor_distinct {
+            let _ = self.kw("ALL");
+        }
         let mut acols: Vec<String> = Vec::new();
         loop {
             let Some(Tok::Ident(c)) = self.t.get(self.i) else {
@@ -12735,6 +12860,7 @@ impl<'a> P<'a> {
                 ),
                 anchor_ctx,
                 anchor_wher,
+                anchor_distinct,
                 anchor_items,
                 rec_wher,
                 rec_items,
@@ -17992,9 +18118,10 @@ mod tests {
             "SELECT A FROM T UNION SELECT UA FROM U2 UNION ALL SELECT VID FROM V3T",
             // column-count mismatch is an engine error
             "SELECT A FROM T UNION SELECT UA, UID FROM U2",
-            // DISTINCT in union branches, DISTINCT *, DISTINCT over
-            // expressions: unprobed shapes
-            "SELECT DISTINCT A FROM T UNION SELECT UA FROM U2",
+            // DISTINCT *, DISTINCT over expressions: unprobed
+            // shapes (DISTINCT in union branches flipped in Phase-1
+            // slice 46 - a branch's own project over its raw items,
+            // pinned byte-identical in qa/dsql-view-blr.sh)
             "SELECT DISTINCT * FROM T",
             "SELECT DISTINCT UPPER(S) FROM T",
             // derived tables need an alias; derived union branches

@@ -589,6 +589,12 @@ route "45 FIRST in the second branch" served "SELECT G FROM T WHERE ID = 1 UNION
 route "45 SKIP empties a single-row branch" served "SELECT SKIP 1 G FROM T WHERE ID = 4 UNION ALL SELECT ID FROM U WHERE ID = 10 ORDER BY 1"
 route "45 FIRST beside a DISTINCT union" served "SELECT FIRST 2 G FROM T WHERE ID = 4 UNION SELECT ID FROM U WHERE ID = 10 ORDER BY 1"
 
+echo "--- 46 UNION branch DISTINCT (slice 46): a branch's own project over its raw items"
+route "46 DISTINCT in the first branch" served "SELECT DISTINCT G FROM T WHERE ID >= 3 UNION ALL SELECT ID FROM U ORDER BY 1"
+route "46 DISTINCT in the second branch" served "SELECT G FROM T WHERE ID = 1 UNION ALL SELECT DISTINCT ID FROM U ORDER BY 1"
+route "46 FIRST beside a branch DISTINCT" served "SELECT FIRST 2 DISTINCT G FROM T WHERE ID >= 3 UNION ALL SELECT ID FROM U WHERE ID = 10 ORDER BY 1"
+route "46 the traceless ALL" served "SELECT ALL G FROM T WHERE ID = 1 UNION ALL SELECT ID FROM U WHERE ID = 10 ORDER BY 1"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
