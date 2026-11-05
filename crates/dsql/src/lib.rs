@@ -1737,6 +1737,13 @@ struct P<'a> {
     /// the current select's aggregate context (stream ctx + 1) -
     /// what HAVING/ORDER BY fids address
     agg_fid_ctx: u8,
+    /// the open recursion's recurse contexts (one tower middle per
+    /// cte reference) and its columns' descriptors off the anchor's
+    /// catalog row - what FILTER's CAST and CASE/IN unification type
+    /// recurse fids through (slice 53, measured L11/L19: the RAW
+    /// anchor type, not the union's int64)
+    rec_fid_ctxs: Vec<u8>,
+    rec_col_dsc: Vec<Option<Dsc>>,
     /// domain-validation mode: VALUE means blr_fid(0, 0)
     domain_value: bool,
     /// declared cursor names in declaration order (their numbers)
@@ -1831,6 +1838,8 @@ impl<'a> P<'a> {
             pending_loop_label: None,
             proc: None,
             agg_fid_ctx: 1,
+            rec_fid_ctxs: Vec::new(),
+            rec_col_dsc: Vec::new(),
             domain_value: false,
             cursors: Vec::new(),
             cursor_decls: Vec::new(),
@@ -1983,11 +1992,15 @@ impl<'a> P<'a> {
                     if bare > 1 && alias == 0 {
                         return None;
                     }
-                    let idx = v
-                        .last()
-                        .copied()
-                        .or_else(|| self.host.filter(|&hi| hit(&self.streams[hi])))
-                        .or_else(|| self.sub.filter(|&si| hit(&self.streams[si])))?;
+                    // innermost-scope-first: the subquery's own
+                    // stream answers before any outer match (SL70:
+                    // `SRC.AMT` two levels down binds the inner SRC,
+                    // not the outer one)
+                    let idx = self
+                        .sub
+                        .filter(|&si| hit(&self.streams[si]))
+                        .or_else(|| v.last().copied())
+                        .or_else(|| self.host.filter(|&hi| hit(&self.streams[hi])))?;
                     let st = &self.streams[idx];
                     if st.derived.is_none()
                         && catalog_columns(&st.name)
@@ -4532,6 +4545,15 @@ impl<'a> P<'a> {
                 let d = typing_of(v).or_else(|| self.field_dsc(*ctx, name))?;
                 dsc_to_branch(d)?
             }
+            // a recurse fid types through the open recursion's
+            // anchor row (slice 53); any other fid stays untyped
+            Val::Fid(c, s) => {
+                if !self.rec_fid_ctxs.contains(c) {
+                    return None;
+                }
+                let d = self.rec_col_dsc.get(*s as usize)?.clone()?;
+                dsc_to_branch(d)?
+            }
             _ => return None,
         })
     }
@@ -6976,6 +6998,8 @@ pub fn compile_view_columns(sql: &str) -> Option<Vec<Option<Vec<u8>>>> {
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
+        rec_fid_ctxs: Vec::new(),
+        rec_col_dsc: Vec::new(),
         domain_value: false,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
@@ -7136,6 +7160,8 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
+        rec_fid_ctxs: Vec::new(),
+        rec_col_dsc: Vec::new(),
         domain_value: false,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
@@ -7607,6 +7633,561 @@ fn contains_fid_ctx(v: &Val, ctx: u8) -> bool {
             });
             hit
         }
+    }
+}
+
+/// A recursive select's subqueries in ENGINE order (slice 53,
+/// SL50-SL82): the engine does not allocate subquery streams in parse
+/// order. Clauses run WHERE, ITEMS, ORDER, GROUP, HAVING; a clause's
+/// LISTS run forward (SL53, SL59, SL66) while a boolean's COMBINATORS
+/// run right-first (SL50, SL57, SL69) with each comparison's
+/// comparands left-to-right (SL79, SL82); an aggregate (outer or
+/// inner) lands after its whole subtree (L14, L39, SL62, SL70). The
+/// collector walks one clause in traversal order; a fid into the
+/// aggregate map descends into its slot (an entry's subqueries sit at
+/// the fid's textual position - SL82), group keys walk first so a key
+/// entry's clone never double-counts.
+struct SubqCollector<'a> {
+    entries: &'a [MapEntry],
+    slot_ctx: u8,
+    descend_slots: bool,
+    seen: Vec<u8>,
+    seen_slots: Vec<usize>,
+    out: Vec<&'a SubQ>,
+}
+
+impl<'a> SubqCollector<'a> {
+    fn push(&mut self, sub: &'a SubQ) {
+        if !self.seen.contains(&sub.ctx) {
+            self.seen.push(sub.ctx);
+            self.out.push(sub);
+        }
+    }
+    fn val(&mut self, v: &'a Val) {
+        match v {
+            Val::ScalarSub(sub) => self.push(sub),
+            Val::Fid(c, s) if self.descend_slots && *c == self.slot_ctx => {
+                let s = *s as usize;
+                if !self.seen_slots.contains(&s) {
+                    self.seen_slots.push(s);
+                    if let Some(e) = self.entries.get(s) {
+                        self.entry(e);
+                    }
+                }
+            }
+            Val::Add(x, y) | Val::Sub(x, y) | Val::Mul(x, y) | Val::Div(x, y)
+            | Val::Concat(x, y) => {
+                self.val(x);
+                self.val(y);
+            }
+            Val::Neg(x) | Val::Upper(x) | Val::Lower(x) | Val::Extract(_, x)
+            | Val::StrLen(_, x) | Val::Cast(_, x) | Val::CastInt64(x)
+            | Val::NullsPlaced(_, x) | Val::GenId(_, x) | Val::DerivedWrap(_, x)
+            | Val::DerivedWrapN(_, x) => self.val(x),
+            Val::Substring(x, y, z) => {
+                self.val(x);
+                self.val(y);
+                self.val(z);
+            }
+            Val::Trim(_, what, x) => {
+                if let Some(w) = what {
+                    self.val(w);
+                }
+                self.val(x);
+            }
+            Val::Coalesce(vs) | Val::SysFn(_, vs) | Val::Fn(_, vs) | Val::SubFn(_, vs) => {
+                for x in vs {
+                    self.val(x);
+                }
+            }
+            Val::PkgFn(_, _, vs) => {
+                for x in vs {
+                    self.val(x);
+                }
+            }
+            Val::Decode(sel, cs, rs) => {
+                self.val(sel);
+                let mut ci = cs.iter();
+                let mut ri = rs.iter();
+                loop {
+                    match (ci.next(), ri.next()) {
+                        (None, None) => break,
+                        (c, r) => {
+                            if let Some(c) = c {
+                                self.val(c);
+                            }
+                            if let Some(r) = r {
+                                self.val(r);
+                            }
+                        }
+                    }
+                }
+            }
+            Val::BoolVal(b) => self.bool(b),
+            Val::ValueIf(cond, then, els) => {
+                self.bool(cond);
+                self.val(then);
+                self.val(els);
+            }
+            Val::ArrayElem(arr, idxs) => {
+                self.val(arr);
+                for x in idxs {
+                    self.val(x);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn bool(&mut self, b: &'a Bool) {
+        match b {
+            Bool::And(l, r) | Bool::Or(l, r) => {
+                self.bool(r);
+                self.bool(l);
+            }
+            Bool::Not(x) => self.bool(x),
+            Bool::Cmp(_, a, c) | Bool::Equiv(a, c) | Bool::Like(a, c)
+            | Bool::Starting(a, c) | Bool::Containing(a, c) => {
+                self.val(a);
+                self.val(c);
+            }
+            Bool::Similar(a, c, e) => {
+                self.val(a);
+                self.val(c);
+                if let Some(e) = e {
+                    self.val(e);
+                }
+            }
+            Bool::AnsiLike(a, c, e) => {
+                self.val(a);
+                self.val(c);
+                self.val(e);
+            }
+            Bool::Missing(v) => self.val(v),
+            Bool::Between(v, lo, hi) => {
+                self.val(v);
+                self.val(lo);
+                self.val(hi);
+            }
+            Bool::InList(v, items) => {
+                self.val(v);
+                for x in items {
+                    self.val(x);
+                }
+            }
+            Bool::Any(sub) | Bool::Unique(sub) => self.push(sub),
+            Bool::AnsiAny(_, left, sub) | Bool::AnsiAll(_, left, sub) => {
+                self.val(left);
+                self.push(sub);
+            }
+        }
+    }
+    fn entry(&mut self, e: &'a MapEntry) {
+        match e {
+            MapEntry::Key(v) => self.val(v),
+            MapEntry::Agg(_, arg) => {
+                if let Some(a) = arg {
+                    self.val(a);
+                }
+            }
+            MapEntry::Fn(_, args) => {
+                for x in args {
+                    self.val(x);
+                }
+            }
+            MapEntry::List(_, v, s, order) => {
+                self.val(v);
+                self.val(s);
+                for (_, k) in order {
+                    self.val(k);
+                }
+            }
+        }
+    }
+}
+
+/// One subquery's contexts in ENGINE order: its own table slot, then
+/// its nested subqueries' (each in the same shape, in clause order),
+/// then its aggregate slot (SL62, SL70). A UNION subquery lays its
+/// branches forward with each branch's nested glued after it (SL71);
+/// two or more nested inside a union is unprobed and refuses.
+fn engine_slots_subq(sub: &SubQ) -> Option<Vec<u8>> {
+    if let Some(u) = &sub.union_ {
+        let mut nested_total = 0;
+        for (_, _, wher, item, f1, sk, raw) in &u.branches {
+            nested_total += count_subqs_bool_opt(wher)
+                + count_subqs_val(item)
+                + [f1, sk, raw].iter().map(|x| count_subqs_val_opt(x)).sum::<usize>();
+        }
+        if nested_total > 1 {
+            return None;
+        }
+        let mut flat = vec![sub.ctx];
+        for (_, bctx, wher, item, f1, sk, raw) in &u.branches {
+            flat.push(*bctx);
+            let mut c = SubqCollector {
+                entries: &[],
+                slot_ctx: 0,
+                descend_slots: false,
+                seen: Vec::new(),
+                seen_slots: Vec::new(),
+                out: Vec::new(),
+            };
+            if let Some(w) = wher {
+                c.bool(w);
+            }
+            c.val(item);
+            for v in [f1, sk, raw].into_iter().flatten() {
+                c.val(v);
+            }
+            for s in c.out {
+                flat.extend(engine_slots_subq(s)?);
+            }
+        }
+        if let Some((_, _, actx)) = sub.agg {
+            flat.push(actx);
+        }
+        return Some(flat);
+    }
+    let mut slots = vec![sub.ctx];
+    for n in nested_engine_subs(sub) {
+        slots.extend(engine_slots_subq(n)?);
+    }
+    if let Some((_, _, actx)) = sub.agg {
+        slots.push(actx);
+    }
+    Some(slots)
+}
+
+/// A subquery's nested subqueries in engine clause order: its WHERE's
+/// (boolean rules), then its select items' (the column, the
+/// expression, the aggregate argument) forward.
+fn nested_engine_subs(sub: &SubQ) -> Vec<&SubQ> {
+    let mut c = SubqCollector {
+        entries: &[],
+        slot_ctx: 0,
+        descend_slots: false,
+        seen: Vec::new(),
+        seen_slots: Vec::new(),
+        out: Vec::new(),
+    };
+    if let Some(w) = &sub.wher {
+        c.bool(w);
+    }
+    for v in [&sub.col, &sub.expr]
+        .into_iter()
+        .flatten()
+        .chain(sub.agg.as_ref().and_then(|(_, a, _)| a.as_ref()))
+    {
+        c.val(v);
+    }
+    c.out
+}
+
+fn count_subqs_val(v: &Val) -> usize {
+    let mut c = SubqCollector {
+        entries: &[],
+        slot_ctx: 0,
+        descend_slots: false,
+        seen: Vec::new(),
+        seen_slots: Vec::new(),
+        out: Vec::new(),
+    };
+    c.val(v);
+    let mut n = c.out.len();
+    for s in c.out {
+        n += count_subqs_subq(s);
+    }
+    n
+}
+
+fn count_subqs_val_opt(v: &Option<Val>) -> usize {
+    v.as_ref().map(count_subqs_val).unwrap_or(0)
+}
+
+fn count_subqs_bool_opt(w: &Option<Box<Bool>>) -> usize {
+    let mut c = SubqCollector {
+        entries: &[],
+        slot_ctx: 0,
+        descend_slots: false,
+        seen: Vec::new(),
+        seen_slots: Vec::new(),
+        out: Vec::new(),
+    };
+    if let Some(w) = w {
+        c.bool(w);
+    }
+    let mut n = c.out.len();
+    for s in c.out {
+        n += count_subqs_subq(s);
+    }
+    n
+}
+
+fn count_subqs_subq(sub: &SubQ) -> usize {
+    let mut n = 0;
+    n += count_subqs_bool_opt(&sub.wher);
+    n += count_subqs_val_opt(&sub.col);
+    n += count_subqs_val_opt(&sub.expr);
+    if let Some((_, a, _)) = &sub.agg {
+        n += count_subqs_val_opt(a);
+    }
+    if let Some(u) = &sub.union_ {
+        for (_, _, wher, item, f1, sk, raw) in &u.branches {
+            n += count_subqs_bool_opt(wher)
+                + count_subqs_val(item)
+                + [f1, sk, raw].iter().map(|x| count_subqs_val_opt(x)).sum::<usize>();
+        }
+    }
+    n
+}
+
+/// Rewrite every stored context onto the engine's allocation: a
+/// subquery interior follows the slot map everywhere, while at the
+/// top level only the provisional aggregate marker moves (it
+/// collides with the first subquery context by design - L39's claim
+/// is 3 and the subquery's stream is 3 too). Contexts outside the
+/// map stand.
+struct Reslot {
+    slot: [u8; 256],
+    incr: u8,
+    final_: u8,
+}
+
+fn reslot_rec_val(v: &Val, r: &Reslot, top: bool) -> Val {
+    let m = |c: u8| if top {
+        if c == r.incr { r.final_ } else { c }
+    } else {
+        r.slot[c as usize]
+    };
+    match v {
+        Val::Fid(c, s) => Val::Fid(m(*c), *s),
+        Val::Field(c, n) => Val::Field(if top { *c } else { r.slot[*c as usize] }, n.clone()),
+        Val::DerivedWrap(c, x) => Val::DerivedWrap(m(*c), Box::new(reslot_rec_val(x, r, top))),
+        Val::DerivedWrapN(cs, x) => Val::DerivedWrapN(
+            cs.iter().map(|c| m(*c)).collect(),
+            Box::new(reslot_rec_val(x, r, top)),
+        ),
+        Val::ScalarSub(sub) => Val::ScalarSub(Box::new(reslot_rec_subq(sub, r))),
+        Val::BoolVal(b) => Val::BoolVal(Box::new(reslot_rec_bool(b, r, top))),
+        Val::ValueIf(cond, then, els) => Val::ValueIf(
+            Box::new(reslot_rec_bool(cond, r, top)),
+            Box::new(reslot_rec_val(then, r, top)),
+            Box::new(reslot_rec_val(els, r, top)),
+        ),
+        // map_children covers no generator, array element or
+        // subroutine call: recurse explicitly
+        Val::GenId(n, x) => Val::GenId(n.clone(), Box::new(reslot_rec_val(x, r, top))),
+        Val::ArrayElem(arr, idxs) => Val::ArrayElem(
+            Box::new(reslot_rec_val(arr, r, top)),
+            idxs.iter().map(|x| reslot_rec_val(x, r, top)).collect(),
+        ),
+        Val::SubFn(n, vs) => Val::SubFn(
+            n.clone(),
+            vs.iter().map(|x| reslot_rec_val(x, r, top)).collect(),
+        ),
+        v if is_leaf_val(v) => v.clone(),
+        _ => map_children(v, &mut |c| Some(reslot_rec_val(c, r, top))).unwrap_or_else(|| v.clone()),
+    }
+}
+
+fn reslot_rec_bool(b: &Bool, rs: &Reslot, top: bool) -> Bool {
+    let b2 = |x: Bool| Box::new(x);
+    match b {
+        Bool::And(l, r) => Bool::And(b2(reslot_rec_bool(l, rs, top)), b2(reslot_rec_bool(r, rs, top))),
+        Bool::Or(l, r) => Bool::Or(b2(reslot_rec_bool(l, rs, top)), b2(reslot_rec_bool(r, rs, top))),
+        Bool::Not(x) => Bool::Not(b2(reslot_rec_bool(x, rs, top))),
+        Bool::Cmp(op, a, c) => Bool::Cmp(*op, reslot_rec_val(a, rs, top), reslot_rec_val(c, rs, top)),
+        Bool::Missing(v) => Bool::Missing(reslot_rec_val(v, rs, top)),
+        Bool::Between(v, lo, hi) => Bool::Between(
+            reslot_rec_val(v, rs, top),
+            reslot_rec_val(lo, rs, top),
+            reslot_rec_val(hi, rs, top),
+        ),
+        Bool::Like(a, c) => Bool::Like(reslot_rec_val(a, rs, top), reslot_rec_val(c, rs, top)),
+        Bool::InList(v, items) => Bool::InList(
+            reslot_rec_val(v, rs, top),
+            items.iter().map(|x| reslot_rec_val(x, rs, top)).collect(),
+        ),
+        Bool::Any(sub) => Bool::Any(reslot_rec_subq(sub, rs)),
+        Bool::Unique(sub) => Bool::Unique(reslot_rec_subq(sub, rs)),
+        Bool::Starting(a, c) => Bool::Starting(reslot_rec_val(a, rs, top), reslot_rec_val(c, rs, top)),
+        Bool::Equiv(a, c) => Bool::Equiv(reslot_rec_val(a, rs, top), reslot_rec_val(c, rs, top)),
+        Bool::Containing(a, c) => Bool::Containing(reslot_rec_val(a, rs, top), reslot_rec_val(c, rs, top)),
+        Bool::Similar(a, c, e) => Bool::Similar(
+            reslot_rec_val(a, rs, top),
+            reslot_rec_val(c, rs, top),
+            e.as_ref().map(|x| reslot_rec_val(x, rs, top)),
+        ),
+        Bool::AnsiLike(a, c, e) => Bool::AnsiLike(
+            reslot_rec_val(a, rs, top),
+            reslot_rec_val(c, rs, top),
+            reslot_rec_val(e, rs, top),
+        ),
+        Bool::AnsiAny(op, left, sub) => {
+            Bool::AnsiAny(*op, reslot_rec_val(left, rs, top), reslot_rec_subq(sub, rs))
+        }
+        Bool::AnsiAll(op, left, sub) => {
+            Bool::AnsiAll(*op, reslot_rec_val(left, rs, top), reslot_rec_subq(sub, rs))
+        }
+    }
+}
+
+fn reslot_rec_subq(sub: &SubQ, r: &Reslot) -> SubQ {
+    let m = |c: u8| r.slot[c as usize];
+    let mut s = sub.clone();
+    s.ctx = m(s.ctx);
+    s.stream = reslot_rec_stream(&s.stream, r);
+    if let Some(w) = &mut s.wher {
+        *w = Box::new(reslot_rec_bool(w, r, false));
+    }
+    if let Some(c) = &mut s.col {
+        *c = reslot_rec_val(c, r, false);
+    }
+    if let Some(e) = &mut s.expr {
+        *e = reslot_rec_val(e, r, false);
+    }
+    if let Some((_, arg, actx)) = &mut s.agg {
+        if let Some(a) = arg {
+            *a = reslot_rec_val(a, r, false);
+        }
+        *actx = m(*actx);
+    }
+    if let Some(u) = &mut s.union_ {
+        for (st, bctx, wher, item, f1, sk, raw) in &mut u.branches {
+            *st = reslot_rec_stream(st, r);
+            *bctx = m(*bctx);
+            if let Some(w) = wher {
+                *w = Box::new(reslot_rec_bool(w, r, false));
+            }
+            *item = reslot_rec_val(item, r, false);
+            for slot in [f1, sk, raw] {
+                if let Some(x) = slot {
+                    *x = reslot_rec_val(x, r, false);
+                }
+            }
+        }
+    }
+    s
+}
+
+fn reslot_rec_stream(st: &Stream, r: &Reslot) -> Stream {
+    let mut s = st.clone();
+    if let Some(args) = &mut s.proc_args {
+        for a in args.iter_mut() {
+            *a = reslot_rec_val(a, r, false);
+        }
+    }
+    if let Some(d) = &mut s.derived {
+        *d = Box::new(reslot_rec_derived(d, r));
+    }
+    s
+}
+
+fn reslot_rec_derived(d: &Derived, r: &Reslot) -> Derived {
+    let mut o = d.clone();
+    if let Some(w) = &mut o.wher {
+        *w = reslot_rec_bool(w, r, false);
+    }
+    for (_, dc) in o.cols.iter_mut() {
+        match dc {
+            DCol::Col(_) => {}
+            DCol::Expr(v) | DCol::Fid(v) => *v = reslot_rec_val(v, r, false),
+        }
+    }
+    if let Some(v) = &mut o.first {
+        *v = reslot_rec_val(v, r, false);
+    }
+    if let Some(v) = &mut o.skip {
+        *v = reslot_rec_val(v, r, false);
+    }
+    for (_, k) in o.sort.iter_mut() {
+        *k = reslot_rec_val(k, r, false);
+    }
+    if let Some(p) = &mut o.project {
+        for v in p.iter_mut() {
+            *v = reslot_rec_val(v, r, false);
+        }
+    }
+    if let Some(a) = &mut o.agg {
+        for k in a.group_keys.iter_mut() {
+            *k = reslot_rec_val(k, r, false);
+        }
+        for e in a.map.iter_mut() {
+            *e = reslot_rec_map_entry(e, r, false);
+        }
+        if let Some(h) = &mut a.having {
+            *h = reslot_rec_bool(h, r, false);
+        }
+    }
+    for w in o.wins.iter_mut() {
+        *w = reslot_rec_win(w, r);
+    }
+    if let Some(u) = &mut o.union {
+        for (_, bctx, wher, vals, f1, sk, raw) in &mut u.branches {
+            *bctx = r.slot[*bctx as usize];
+            if let Some(w) = wher {
+                *w = reslot_rec_bool(w, r, false);
+            }
+            for v in vals.iter_mut() {
+                *v = reslot_rec_val(v, r, false);
+            }
+            for slot in [f1, sk] {
+                if let Some(x) = slot {
+                    *x = reslot_rec_val(x, r, false);
+                }
+            }
+            if let Some(rawv) = raw {
+                for v in rawv.iter_mut() {
+                    *v = reslot_rec_val(v, r, false);
+                }
+            }
+        }
+    }
+    o
+}
+
+fn reslot_rec_win(w: &Win, r: &Reslot) -> Win {
+    let mut o = w.clone();
+    o.ctx = r.slot[o.ctx as usize];
+    for v in o.part.iter_mut().chain(o.remap.iter_mut()) {
+        *v = reslot_rec_val(v, r, false);
+    }
+    for (_, k) in o.ord.iter_mut() {
+        *k = reslot_rec_val(k, r, false);
+    }
+    for e in o.map.iter_mut() {
+        *e = reslot_rec_map_entry(e, r, false);
+    }
+    if let Some((_, a, b)) = &mut o.frame {
+        for slot in [a, b] {
+            if let Some(v) = &mut slot.1 {
+                *v = reslot_rec_val(v, r, false);
+            }
+        }
+    }
+    o
+}
+
+fn reslot_rec_map_entry(e: &MapEntry, r: &Reslot, top: bool) -> MapEntry {
+    match e {
+        MapEntry::Key(v) => MapEntry::Key(reslot_rec_val(v, r, top)),
+        MapEntry::Agg(vb, arg) => MapEntry::Agg(
+            *vb,
+            arg.as_ref().map(|a| reslot_rec_val(a, r, top)),
+        ),
+        MapEntry::Fn(n, args) => MapEntry::Fn(
+            n.clone(),
+            args.iter().map(|a| reslot_rec_val(a, r, top)).collect(),
+        ),
+        MapEntry::List(d, v, s, order) => MapEntry::List(
+            *d,
+            reslot_rec_val(v, r, top),
+            reslot_rec_val(s, r, top),
+            order
+                .iter()
+                .map(|(b, k)| (*b, reslot_rec_val(k, r, top)))
+                .collect(),
+        ),
     }
 }
 
@@ -8528,6 +9109,57 @@ fn rebuild_rec_keys(
     }
 }
 
+/// The provisional context expression-item aggregates take
+/// while the items parse (slice 53): the aggregate context is
+/// claimed after the FROM walk, so local markers read a context
+/// no stream reaches and renumber after
+const REC_PROV_CTX: u8 = u8::MAX;
+
+/// rebuild_agg_item over RECURSE fids: provisional markers
+/// translate through the item's local map as the select-order map
+/// rebuilds, recurse fids and table fields take key slots (group
+/// fields only) - the tree walk puts keys before the item's
+/// aggregates (slice 53, measured L15)
+fn rebuild_rec_expr(
+    map: &mut Vec<MapEntry>,
+    v: &Val,
+    gfields: &[Val],
+    fid_ctx: u8,
+    parse_entries: &[MapEntry],
+) -> Option<Val> {
+    match v {
+        Val::Fid(c, s) if *c == REC_PROV_CTX => {
+            let e = parse_entries.get(*s as usize)?.clone();
+            let slot = match map.iter().position(|x| *x == e) {
+                Some(i) => i,
+                None => {
+                    map.push(e);
+                    map.len() - 1
+                }
+            };
+            Some(Val::Fid(fid_ctx, slot as u16))
+        }
+        Val::Fid(..) | Val::Field(..) => {
+            if !gfields.contains(v) {
+                return None;
+            }
+            let entry = MapEntry::Key(v.clone());
+            let slot = match map.iter().position(|e| *e == entry) {
+                Some(i) => i,
+                None => {
+                    map.push(entry);
+                    map.len() - 1
+                }
+            };
+            Some(Val::Fid(fid_ctx, slot as u16))
+        }
+        v if is_leaf_val(v) => Some(v.clone()),
+        _ => map_children(v, &mut |c| {
+            rebuild_rec_expr(map, c, gfields, fid_ctx, parse_entries)
+        }),
+    }
+}
+
 /// map_val_to_fid over RECURSE fids: a recurse fid reads its key
 /// slot - an unselected GROUP field takes a new slot after the
 /// items, at any depth (measured G28/G53/G60/G61) - and the
@@ -8568,12 +9200,218 @@ fn map_rec_val_to_fid(
         | Val::Null
         | Val::InParam(_)
         | Val::LocalVar(_) => Some(v.clone()),
+        Val::ScalarSub(sub) => Some(Val::ScalarSub(Box::new(map_rec_subq(
+            map, gfields, sub, fid_ctx, rec_ctx,
+        )?))),
+        // a searched CASE in HAVING/ORDER: the condition maps as a
+        // boolean, the branches as values (slice 53, measured SL74;
+        // the simple CASE already rides map_children)
+        Val::ValueIf(cond, then, els) => Some(Val::ValueIf(
+            Box::new(map_rec_bool_to_fids(
+                map,
+                gfields,
+                (**cond).clone(),
+                fid_ctx,
+                rec_ctx,
+            )?),
+            Box::new(map_rec_val_to_fid(map, gfields, then, fid_ctx, rec_ctx)?),
+            Box::new(map_rec_val_to_fid(map, gfields, els, fid_ctx, rec_ctx)?),
+        )),
         v if is_leaf_val(v) => Some(v.clone()),
         _ => map_children(
             v,
             &mut |c| map_rec_val_to_fid(map, gfields, c, fid_ctx, rec_ctx),
         ),
     }
+}
+
+/// Rebuild a subquery inside HAVING/ORDER over the recursion (slice
+/// 53, measured L14): the subquery's own references stand (its
+/// scopes are self-contained - every context it claims sits above
+/// the aggregate's), outer references map exactly as HAVING-level
+/// ones do (recurse fids take gated key slots, outer table fields
+/// read existing ones). A derived table inside refuses: walking
+/// its whole body is a later slice (named gap)
+fn map_rec_subq(
+    map: &mut Vec<MapEntry>,
+    gfields: &[Val],
+    sub: &SubQ,
+    fid_ctx: u8,
+    rec_ctx: u8,
+) -> Option<SubQ> {
+    let mut s = sub.clone();
+    if s.stream.derived.is_some() {
+        return None;
+    }
+    if let Some(args) = &mut s.stream.proc_args {
+        let rebuilt: Option<Vec<Val>> = args
+            .iter()
+            .map(|a| map_rec_subq_val(map, gfields, a, fid_ctx, rec_ctx))
+            .collect();
+        *args = rebuilt?;
+    }
+    if let Some(w) = &mut s.wher {
+        *w = Box::new(map_rec_subq_bool(map, gfields, w, fid_ctx, rec_ctx)?);
+    }
+    if let Some(c) = &mut s.col {
+        *c = map_rec_subq_val(map, gfields, c, fid_ctx, rec_ctx)?;
+    }
+    if let Some(e) = &mut s.expr {
+        *e = map_rec_subq_val(map, gfields, e, fid_ctx, rec_ctx)?;
+    }
+    if let Some((_, arg, _)) = &mut s.agg {
+        if let Some(a) = arg {
+            *a = map_rec_subq_val(map, gfields, a, fid_ctx, rec_ctx)?;
+        }
+    }
+    if let Some(u) = &mut s.union_ {
+        for (st, _, wher, item, f1, sk, raw) in &mut u.branches {
+            if st.derived.is_some() {
+                return None;
+            }
+            if let Some(args) = &mut st.proc_args {
+                let rebuilt: Option<Vec<Val>> = args
+                    .iter()
+                    .map(|a| map_rec_subq_val(map, gfields, a, fid_ctx, rec_ctx))
+                    .collect();
+                *args = rebuilt?;
+            }
+            if let Some(w) = wher {
+                *w = Box::new(map_rec_subq_bool(map, gfields, w, fid_ctx, rec_ctx)?);
+            }
+            *item = map_rec_subq_val(map, gfields, item, fid_ctx, rec_ctx)?;
+            for slot in [f1, sk, raw] {
+                if let Some(x) = slot {
+                    *x = map_rec_subq_val(map, gfields, x, fid_ctx, rec_ctx)?;
+                }
+            }
+        }
+    }
+    Some(s)
+}
+
+/// A value inside that subquery: inner references (field contexts
+/// at or above the aggregate's, fids of neither the recursion nor
+/// the aggregate) stand, everything else maps as HAVING-level
+fn map_rec_subq_val(
+    map: &mut Vec<MapEntry>,
+    gfields: &[Val],
+    v: &Val,
+    fid_ctx: u8,
+    rec_ctx: u8,
+) -> Option<Val> {
+    if let Val::Field(c, _) = v {
+        if *c >= fid_ctx {
+            return Some(v.clone());
+        }
+    }
+    if let Val::Fid(c, _) = v {
+        if *c != rec_ctx && *c != fid_ctx {
+            return Some(v.clone());
+        }
+    }
+    if matches!(v, Val::ScalarSub(_)) || is_leaf_val(v) {
+        return map_rec_val_to_fid(map, gfields, v, fid_ctx, rec_ctx);
+    }
+    if let Val::ValueIf(cond, then, els) = v {
+        return Some(Val::ValueIf(
+            Box::new(map_rec_subq_bool(map, gfields, cond, fid_ctx, rec_ctx)?),
+            Box::new(map_rec_subq_val(map, gfields, then, fid_ctx, rec_ctx)?),
+            Box::new(map_rec_subq_val(map, gfields, els, fid_ctx, rec_ctx)?),
+        ));
+    }
+    map_children(v, &mut |c| {
+        map_rec_subq_val(map, gfields, c, fid_ctx, rec_ctx)
+    })
+}
+
+/// A boolean inside that subquery: the map_bool_children walk with
+/// subqueries routing through the full rebuild (not the
+/// conditions-only map_subq_children - an outer reference in a
+/// nested select item maps too)
+fn map_rec_subq_bool(
+    map: &mut Vec<MapEntry>,
+    gfields: &[Val],
+    b: &Bool,
+    fid_ctx: u8,
+    rec_ctx: u8,
+) -> Option<Bool> {
+    let b2 = |x: Bool| Box::new(x);
+    Some(match b {
+        Bool::And(l, r) => Bool::And(
+            b2(map_rec_subq_bool(map, gfields, l, fid_ctx, rec_ctx)?),
+            b2(map_rec_subq_bool(map, gfields, r, fid_ctx, rec_ctx)?),
+        ),
+        Bool::Or(l, r) => Bool::Or(
+            b2(map_rec_subq_bool(map, gfields, l, fid_ctx, rec_ctx)?),
+            b2(map_rec_subq_bool(map, gfields, r, fid_ctx, rec_ctx)?),
+        ),
+        Bool::Not(x) => Bool::Not(b2(map_rec_subq_bool(map, gfields, x, fid_ctx, rec_ctx)?)),
+        Bool::Cmp(op, a, c) => Bool::Cmp(
+            *op,
+            map_rec_subq_val(map, gfields, a, fid_ctx, rec_ctx)?,
+            map_rec_subq_val(map, gfields, c, fid_ctx, rec_ctx)?,
+        ),
+        Bool::Like(a, c) => Bool::Like(
+            map_rec_subq_val(map, gfields, a, fid_ctx, rec_ctx)?,
+            map_rec_subq_val(map, gfields, c, fid_ctx, rec_ctx)?,
+        ),
+        Bool::Starting(a, c) => Bool::Starting(
+            map_rec_subq_val(map, gfields, a, fid_ctx, rec_ctx)?,
+            map_rec_subq_val(map, gfields, c, fid_ctx, rec_ctx)?,
+        ),
+        Bool::Equiv(a, c) => Bool::Equiv(
+            map_rec_subq_val(map, gfields, a, fid_ctx, rec_ctx)?,
+            map_rec_subq_val(map, gfields, c, fid_ctx, rec_ctx)?,
+        ),
+        Bool::Containing(a, c) => Bool::Containing(
+            map_rec_subq_val(map, gfields, a, fid_ctx, rec_ctx)?,
+            map_rec_subq_val(map, gfields, c, fid_ctx, rec_ctx)?,
+        ),
+        Bool::Similar(a, c, e) => {
+            let e = match e {
+                Some(x) => Some(map_rec_subq_val(map, gfields, x, fid_ctx, rec_ctx)?),
+                None => None,
+            };
+            Bool::Similar(
+                map_rec_subq_val(map, gfields, a, fid_ctx, rec_ctx)?,
+                map_rec_subq_val(map, gfields, c, fid_ctx, rec_ctx)?,
+                e,
+            )
+        }
+        Bool::AnsiLike(a, c, e) => Bool::AnsiLike(
+            map_rec_subq_val(map, gfields, a, fid_ctx, rec_ctx)?,
+            map_rec_subq_val(map, gfields, c, fid_ctx, rec_ctx)?,
+            map_rec_subq_val(map, gfields, e, fid_ctx, rec_ctx)?,
+        ),
+        Bool::Missing(x) => {
+            Bool::Missing(map_rec_subq_val(map, gfields, x, fid_ctx, rec_ctx)?)
+        }
+        Bool::Between(x, lo, hi) => Bool::Between(
+            map_rec_subq_val(map, gfields, x, fid_ctx, rec_ctx)?,
+            map_rec_subq_val(map, gfields, lo, fid_ctx, rec_ctx)?,
+            map_rec_subq_val(map, gfields, hi, fid_ctx, rec_ctx)?,
+        ),
+        Bool::InList(x, items) => Bool::InList(
+            map_rec_subq_val(map, gfields, x, fid_ctx, rec_ctx)?,
+            items
+                .iter()
+                .map(|i| map_rec_subq_val(map, gfields, i, fid_ctx, rec_ctx))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        Bool::Any(sub) => Bool::Any(map_rec_subq(map, gfields, sub, fid_ctx, rec_ctx)?),
+        Bool::Unique(sub) => Bool::Unique(map_rec_subq(map, gfields, sub, fid_ctx, rec_ctx)?),
+        Bool::AnsiAny(op, left, sub) => Bool::AnsiAny(
+            *op,
+            map_rec_subq_val(map, gfields, left, fid_ctx, rec_ctx)?,
+            map_rec_subq(map, gfields, sub, fid_ctx, rec_ctx)?,
+        ),
+        Bool::AnsiAll(op, left, sub) => Bool::AnsiAll(
+            *op,
+            map_rec_subq_val(map, gfields, left, fid_ctx, rec_ctx)?,
+            map_rec_subq(map, gfields, sub, fid_ctx, rec_ctx)?,
+        ),
+    })
 }
 
 fn map_rec_bool_to_fids(
@@ -8608,7 +9446,31 @@ fn map_rec_bool_to_fids(
             map_rec_val_to_fid(map, gfields, &lo, fid_ctx, rec_ctx)?,
             map_rec_val_to_fid(map, gfields, &hi, fid_ctx, rec_ctx)?,
         ),
-        // LIKE / IN / subqueries over aggregate output: unprobed
+        Bool::InList(v, items) => Bool::InList(
+            map_rec_val_to_fid(map, gfields, &v, fid_ctx, rec_ctx)?,
+            items
+                .iter()
+                .map(|x| map_rec_val_to_fid(map, gfields, x, fid_ctx, rec_ctx))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        Bool::Like(a, c) => Bool::Like(
+            map_rec_val_to_fid(map, gfields, &a, fid_ctx, rec_ctx)?,
+            map_rec_val_to_fid(map, gfields, &c, fid_ctx, rec_ctx)?,
+        ),
+        Bool::Any(sub) => Bool::Any(map_rec_subq(map, gfields, &sub, fid_ctx, rec_ctx)?),
+        Bool::Unique(sub) => Bool::Unique(map_rec_subq(map, gfields, &sub, fid_ctx, rec_ctx)?),
+        Bool::AnsiAny(op, left, sub) => Bool::AnsiAny(
+            op,
+            map_rec_val_to_fid(map, gfields, &left, fid_ctx, rec_ctx)?,
+            map_rec_subq(map, gfields, &sub, fid_ctx, rec_ctx)?,
+        ),
+        Bool::AnsiAll(op, left, sub) => Bool::AnsiAll(
+            op,
+            map_rec_val_to_fid(map, gfields, &left, fid_ctx, rec_ctx)?,
+            map_rec_subq(map, gfields, &sub, fid_ctx, rec_ctx)?,
+        ),
+        // STARTING / CONTAINING / SIMILAR / the equiv forms over
+        // aggregate output: unprobed
         _ => return None,
     })
 }
@@ -14234,6 +15096,13 @@ impl<'a> P<'a> {
         let saved_sub = self.sub.replace(cte_idx);
         let saved_agg_mode = std::mem::replace(&mut self.agg_mode, false);
         let saved_scope = self.merge_scope;
+        // the recurse fids' descriptors for FILTER/CASE/IN
+        // unification (slice 53): one tower middle per reference,
+        // each column the anchor's raw catalog type
+        let saved_rec_fid = std::mem::take(&mut self.rec_fid_ctxs);
+        let saved_rec_dsc = std::mem::take(&mut self.rec_col_dsc);
+        self.rec_fid_ctxs = tower_idx.iter().map(|t| t.1 as u8 + self.base).collect();
+        self.rec_col_dsc = acols.iter().map(|c| catalog_type(&table, c)).collect();
         if let Some(p) = &plan {
             if !p.joins.is_empty() {
                 // over joins the FROM streams resolve together: bare
@@ -14259,7 +15128,11 @@ impl<'a> P<'a> {
         // - unmeasured; OVER after the call is the window gap)
         enum RecItem {
             Col(Val),
-            Agg(u8, Option<Val>),
+            Agg(MapEntry),
+            /// an expression holding aggregate calls: the value with
+            /// provisional-slot markers plus the local map they index
+            /// (rebuilt in select order after, like the table path)
+            Expr(Val, Vec<MapEntry>),
         }
         let mut items: Vec<RecItem> = Vec::new();
         let mut item_names: Vec<Option<String>> = Vec::new();
@@ -14366,31 +15239,123 @@ impl<'a> P<'a> {
                     _ => return None,
                 }
             }
-            let agg_head = match self.t.get(self.i) {
+            // a whole-item aggregate: the call (with its WITHIN
+            // and FILTER trailers) must END the item - anything past
+            // it is an expression item (the Expr arm below)
+            let agg_arm = match self.t.get(self.i) {
                 Some(Tok::Ident(w))
-                    if matches!(w.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
-                        && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) =>
+                    if matches!(self.t.get(self.i + 1), Some(Tok::LParen))
+                        && (matches!(w.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "LIST")
+                            || stat_agg_arity(w).is_some()) =>
                 {
                     Some(w.clone())
                 }
                 _ => None,
-            };
-            let (item, mut iname) = if let Some(w) = agg_head {
+            }
+            .filter(|w| {
+                let mut end = self.paren_close(self.i + 1).map_or(self.t.len(), |c| c + 1);
+                if w == "LIST"
+                    && matches!(self.t.get(end), Some(Tok::Ident(x)) if x == "WITHIN")
+                    && matches!(self.t.get(end + 1), Some(Tok::Ident(x)) if x == "GROUP")
+                    && matches!(self.t.get(end + 2), Some(Tok::LParen))
+                {
+                    end = self.paren_close(end + 2).map_or(self.t.len(), |c| c + 1);
+                }
+                if matches!(self.t.get(end), Some(Tok::Ident(x)) if x == "FILTER")
+                    && matches!(self.t.get(end + 1), Some(Tok::LParen))
+                {
+                    end = self.paren_close(end + 1).map_or(self.t.len(), |c| c + 1);
+                }
+                end >= self.t.len()
+                    || matches!(self.t.get(end), Some(Tok::Comma))
+                    || matches!(self.t.get(end), Some(Tok::Ident(x)) if x == "FROM" || x == "AS" || !is_keyword(x))
+            });
+            let (item, mut iname) = if let Some(w) = agg_arm {
                 self.i += 1;
                 // parse_agg refuses OVER itself (the window gap) and
-                // takes FILTER (COUNT(*) FILTER serves - structural)
-                let (verb, arg) = self.parse_agg(&w)?;
-                (RecItem::Agg(verb, arg), None)
-            } else {
-                let v = self.val()?;
-                // the item's NAME as ORDER BY sees it: its alias,
-                // else the column a bare/qualified column reference
-                // names, else none (the general law)
-                let iname = match &v {
-                    Val::Fid(_, s) => acols.get(*s as usize).cloned(),
-                    _ => None,
+                // takes FILTER (COUNT(*) FILTER serves - structural;
+                // a column arg unifies through the anchor row - slice
+                // 53, measured L11)
+                let entry = if w == "LIST" {
+                    self.rec_list_agg()?
+                } else if stat_agg_arity(&w).is_some() {
+                    self.rec_stat_agg(&w)?
+                } else {
+                    let (verb, arg) = self.parse_agg(&w)?;
+                    MapEntry::Agg(verb, arg)
                 };
-                (RecItem::Col(v), iname)
+                (RecItem::Agg(entry), None)
+            } else {
+                // an aggregate call inside the item (outside any
+                // subquery, not a window call - the table
+                // agg_expr_ahead scan): the Expr arm parses it
+                // against a LOCAL map (slice 53)
+                let mut k = self.i;
+                let mut stack: Vec<bool> = Vec::new();
+                let mut expr_agg = false;
+                loop {
+                    match self.t.get(k) {
+                        None => break,
+                        Some(Tok::Comma) if stack.is_empty() => break,
+                        Some(Tok::RParen) if stack.is_empty() => break,
+                        Some(Tok::Ident(w))
+                            if stack.is_empty()
+                                && matches!(
+                                    w.as_str(),
+                                    "FROM" | "WHERE" | "GROUP" | "HAVING" | "ORDER" | "INTO"
+                                ) =>
+                        {
+                            break;
+                        }
+                        Some(Tok::LParen) => stack.push(matches!(
+                            self.t.get(k + 1),
+                            Some(Tok::Ident(w)) if w == "SELECT"
+                        )),
+                        Some(Tok::RParen) => {
+                            stack.pop();
+                        }
+                        Some(Tok::Ident(w))
+                            if !stack.iter().any(|x| *x)
+                                && (matches!(
+                                    w.as_str(),
+                                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "LIST"
+                                ) || stat_agg_arity(w).is_some())
+                                && matches!(self.t.get(k + 1), Some(Tok::LParen))
+                                && self.window_call_end(k).is_none() =>
+                        {
+                            expr_agg = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if expr_agg {
+                    let saved_map = std::mem::take(&mut self.agg_map);
+                    let saved_mode = self.agg_mode;
+                    let saved_fid = self.agg_fid_ctx;
+                    self.agg_mode = true;
+                    // the aggregate context is claimed after the FROM
+                    // walk, so local markers take a provisional
+                    // context no stream reaches (renumbered after)
+                    self.agg_fid_ctx = REC_PROV_CTX;
+                    let v = self.val()?;
+                    let entries = std::mem::take(&mut self.agg_map);
+                    self.agg_map = saved_map;
+                    self.agg_mode = saved_mode;
+                    self.agg_fid_ctx = saved_fid;
+                    (RecItem::Expr(v, entries), None)
+                } else {
+                    let v = self.val()?;
+                    // the item's NAME as ORDER BY sees it: its alias,
+                    // else the column a bare/qualified column reference
+                    // names, else none (the general law)
+                    let iname = match &v {
+                        Val::Fid(_, s) => acols.get(*s as usize).cloned(),
+                        _ => None,
+                    };
+                    (RecItem::Col(v), iname)
+                }
             };
             if let Some(a) = self.rec_alias()? {
                 iname = Some(a);
@@ -14525,7 +15490,7 @@ impl<'a> P<'a> {
                 Vec::new(),
             )
         };
-        let outer_boolean = if self.kw("WHERE") {
+        let mut outer_boolean = if self.kw("WHERE") {
             Some(self.bool_or()?)
         } else {
             None
@@ -14562,7 +15527,7 @@ impl<'a> P<'a> {
                 let key = if let Some(k) = named {
                     match items.get(k)? {
                         RecItem::Col(v) => v.clone(),
-                        RecItem::Agg(..) => return None,
+                        RecItem::Agg(..) | RecItem::Expr(..) => return None,
                     }
                 } else {
                     self.val()?
@@ -14571,13 +15536,13 @@ impl<'a> P<'a> {
                     Val::Int(n) => {
                         match items.get(usize::try_from(n).ok()?.checked_sub(1)?)? {
                             RecItem::Col(v) => v.clone(),
-                            RecItem::Agg(..) => return None,
+                            RecItem::Agg(..) | RecItem::Expr(..) => return None,
                         }
                     }
                     Val::Int64(n) => {
                         match items.get(usize::try_from(n).ok()?.checked_sub(1)?)? {
                             RecItem::Col(v) => v.clone(),
-                            RecItem::Agg(..) => return None,
+                            RecItem::Agg(..) | RecItem::Expr(..) => return None,
                         }
                     }
                     other => other,
@@ -14590,7 +15555,9 @@ impl<'a> P<'a> {
                 }
             }
         }
-        let has_aggs = items.iter().any(|it| matches!(it, RecItem::Agg(..)));
+        let has_aggs = items.iter().any(|it| {
+            matches!(it, RecItem::Agg(..)) || matches!(it, RecItem::Expr(_, e) if !e.is_empty())
+        });
         let having_ahead =
             matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "HAVING");
         let aggregate = has_aggs || grouped || having_ahead;
@@ -14599,28 +15566,24 @@ impl<'a> P<'a> {
         // (measured G42/G53 store, G41/G51 refuse for missing or
         // ungrouped columns) - no misuse scan, natural resolution
         // matches all four
-        let (col_vals, outer_having) = if !aggregate {
+        let (mut col_vals, mut outer_having) = if !aggregate {
             let mut col_vals = Vec::new();
             for it in &items {
                 match it {
                     RecItem::Col(v) => col_vals.push(v.clone()),
-                    RecItem::Agg(..) => return None,
+                    RecItem::Agg(..) | RecItem::Expr(..) => return None,
                 }
             }
             (col_vals, None)
         } else {
-            // the aggregate node takes the NEXT context (measured:
-            // ctx 3 over the tower); claim its slot
+            // the aggregate node takes the next context as a
+            // PROVISIONAL marker (slice 53): the engine allocates the
+            // outer aggregate context last, after every subquery stream
+            // parsed later (L14, L39), so no stream record is pushed
+            // here and the markers are renumbered once the whole
+            // select is parsed (the scope truncate below keeps the
+            // removal invisible outside)
             self.agg_fid_ctx = self.streams.len() as u8 + self.base;
-            self.streams.push(Stream {
-                name: String::new(),
-                alias: None,
-                using: Vec::new(),
-                proc_args: None,
-                derived: None,
-                sub: self.in_sub,
-                cur: None,
-            });
             let fid_ctx = self.agg_fid_ctx;
             let mut gfields: Vec<Val> = Vec::new();
             for k in &group_keys {
@@ -14662,6 +15625,19 @@ impl<'a> P<'a> {
                                 return None;
                             }
                         }
+                        RecItem::Expr(v, _) => {
+                            // provisional markers are aggregates, not
+                            // groupable leaves (slice 53)
+                            let mut f = Vec::new();
+                            collect_rec_group_fields(v, &mut f);
+                            f.retain(|x| !matches!(x, Val::Fid(c, _) if *c == REC_PROV_CTX));
+                            if f.is_empty() {
+                                continue;
+                            }
+                            if !f.iter().all(|x| bare_keys.contains(&x)) {
+                                return None;
+                            }
+                        }
                     }
                 }
             }
@@ -14674,12 +15650,14 @@ impl<'a> P<'a> {
                     RecItem::Col(v) => {
                         vals.push(rebuild_rec_keys(&mut map, v, &gfields, fid_ctx)?);
                     }
-                    RecItem::Agg(verb, arg) => {
-                        let entry = MapEntry::Agg(*verb, arg.clone());
-                        let slot = match map.iter().position(|e| *e == entry) {
+                    RecItem::Expr(v, entries) => {
+                        vals.push(rebuild_rec_expr(&mut map, v, &gfields, fid_ctx, entries)?);
+                    }
+                    RecItem::Agg(entry) => {
+                        let slot = match map.iter().position(|e| e == entry) {
                             Some(i) => i as u16,
                             None => {
-                                map.push(entry);
+                                map.push(entry.clone());
                                 (map.len() - 1) as u16
                             }
                         };
@@ -14784,6 +15762,125 @@ impl<'a> P<'a> {
                 }
             }
         }
+        // the engine's subquery allocation order (SL50-SL82):
+        // collect every clause's subqueries in engine order, lay
+        // their slots from the first taken context, and rewrite every
+        // stored context through the map; the outer aggregate context
+        // lands after them all (L14, L39). With no subquery anywhere
+        // the map is the identity (plus the aggregate marker).
+        let final_ctx = self.streams.len() as u8 + self.base;
+        let slots = {
+            let mut c = SubqCollector {
+                entries: &self.agg_map,
+                slot_ctx: self.agg_fid_ctx,
+                descend_slots: aggregate,
+                seen: Vec::new(),
+                seen_slots: Vec::new(),
+                out: Vec::new(),
+            };
+            // group keys first: a key entry's clone shares its
+            // subquery's contexts, so the originals must win
+            for k in &group_keys {
+                c.val(k);
+            }
+            let group_subs = std::mem::take(&mut c.out);
+            if let Some(w) = &outer_boolean {
+                c.bool(w);
+            }
+            let where_subs = std::mem::take(&mut c.out);
+            for v in &col_vals {
+                c.val(v);
+            }
+            let item_subs = std::mem::take(&mut c.out);
+            for (_, k) in &outer_sort {
+                c.val(k);
+            }
+            let order_subs = std::mem::take(&mut c.out);
+            if let Some(h) = &outer_having {
+                c.bool(h);
+            }
+            let having_subs = std::mem::take(&mut c.out);
+            let mut slots = Vec::new();
+            for g in [where_subs, item_subs, order_subs, group_subs, having_subs] {
+                for s in g {
+                    // a union with two nested inside refuses (unprobed)
+                    slots.extend(engine_slots_subq(s)?);
+                }
+            }
+            slots
+        };
+        if aggregate || !slots.is_empty() {
+            let mut map = [0u8; 256];
+            for (i, m) in map.iter_mut().enumerate() {
+                *m = i as u8;
+            }
+            if !slots.is_empty() {
+                let minctx = slots.iter().copied().min().unwrap();
+                // contiguity backstop: the parse assigns sequentially,
+                // so anything else means the model is wrong - refuse
+                let mut sorted = slots.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                if sorted.len() != final_ctx.saturating_sub(minctx) as usize
+                    || sorted.first() != Some(&minctx)
+                    || sorted.last() != Some(&final_ctx.saturating_sub(1))
+                {
+                    return None;
+                }
+                let mut cursor = minctx;
+                for old in &slots {
+                    map[*old as usize] = cursor;
+                    cursor = cursor.wrapping_add(1);
+                }
+            }
+            let incr = self.agg_fid_ctx;
+            if aggregate {
+                self.agg_fid_ctx = final_ctx;
+            }
+            let r = Reslot {
+                slot: map,
+                // no marker outside aggregates: map the final
+                // context onto itself (the identity)
+                incr: if aggregate { incr } else { final_ctx },
+                final_: final_ctx,
+            };
+            for v in col_vals.iter_mut() {
+                *v = reslot_rec_val(v, &r, true);
+            }
+            if let Some(h) = outer_having.as_mut() {
+                *h = reslot_rec_bool(h, &r, true);
+            }
+            for (_, k) in outer_sort.iter_mut() {
+                *k = reslot_rec_val(k, &r, true);
+            }
+            if let Some(w) = outer_boolean.as_mut() {
+                *w = reslot_rec_bool(w, &r, true);
+            }
+            for k in group_keys.iter_mut() {
+                *k = reslot_rec_val(k, &r, true);
+            }
+            for e in self.agg_map.iter_mut() {
+                *e = reslot_rec_map_entry(e, &r, true);
+            }
+            // found windows ride (entry, partition keys, sort
+            // keys, frame) - remap the values through
+            for (e, part, ord, frame) in self.win_found.iter_mut() {
+                *e = reslot_rec_map_entry(e, &r, true);
+                for v in part.iter_mut() {
+                    *v = reslot_rec_val(v, &r, true);
+                }
+                for (_, k) in ord.iter_mut() {
+                    *k = reslot_rec_val(k, &r, true);
+                }
+                if let Some((_, a, b)) = frame {
+                    for slot in [a, b] {
+                        if let Some(v) = &mut slot.1 {
+                            *v = reslot_rec_val(v, &r, true);
+                        }
+                    }
+                }
+            }
+        }
         let outer_map = std::mem::take(&mut self.agg_map);
         // OFFSET n ROW[S] / FETCH FIRST|NEXT n ROW[S] ONLY / ROWS m
         // [TO n] - the standard and legacy spellings of SKIP and
@@ -14868,6 +15965,8 @@ impl<'a> P<'a> {
         self.sub = saved_sub;
         self.merge_scope = saved_scope;
         self.agg_mode = saved_agg_mode;
+        self.rec_fid_ctxs = saved_rec_fid;
+        self.rec_col_dsc = saved_rec_dsc;
         if plan.is_some() {
             // the pre-pushed FROM streams (tower triples, tables,
             // the aggregate slot) leave with the scope
@@ -14984,6 +16083,112 @@ impl<'a> P<'a> {
         let (r, next) = rec_alias_at(self.t, self.i);
         self.i = next;
         r
+    }
+
+    /// A whole-item LIST over the recursion (slice 53, measured
+    /// L1-L4/L18/L19): the table shape - DISTINCT, the value, the
+    /// separator (a written default `','` when omitted), WITHIN
+    /// GROUP's order keys reading the source rows - and FILTER's
+    /// CAST(CASE...) desugar on the VALUE (the arg unifies through
+    /// the anchor row, like parse_agg's)
+    fn rec_list_agg(&mut self) -> Option<MapEntry> {
+        self.i += 1; // (
+        let distinct = self.kw("DISTINCT");
+        let v = self.val()?;
+        let d = if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+            self.i += 1;
+            self.val()?
+        } else {
+            Val::Str(",".to_string())
+        };
+        if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+            return None;
+        }
+        self.i += 1;
+        let mut order = Vec::new();
+        if self.kw("WITHIN") {
+            if !self.kw("GROUP") || !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                return None;
+            }
+            self.i += 1;
+            if !self.kw("ORDER") || !self.kw("BY") {
+                return None;
+            }
+            loop {
+                let k = self.val()?;
+                let desc = if self.kw("DESC") {
+                    true
+                } else {
+                    let _ = self.kw("ASC");
+                    false
+                };
+                let k = self.nulls_placement(k)?;
+                order.push((desc, k));
+                if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+            if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                return None;
+            }
+            self.i += 1;
+        }
+        let v = if self.kw("FILTER") {
+            if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                return None;
+            }
+            self.i += 1;
+            if !self.kw("WHERE") {
+                return None;
+            }
+            let cond = self.bool_or()?;
+            if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                return None;
+            }
+            self.i += 1;
+            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "OVER") {
+                return None;
+            }
+            let d = self.unify_branches(&[&v, &Val::Null])?;
+            Val::Cast(
+                d,
+                Box::new(Val::ValueIf(
+                    Box::new(cond),
+                    Box::new(v),
+                    Box::new(Val::Null),
+                )),
+            )
+        } else {
+            v
+        };
+        Some(MapEntry::List(distinct, v, d, order))
+    }
+
+    /// A whole-item statistical aggregate over the recursion (slice
+    /// 53, measured L5-L7): blr_agg_function with the counted name,
+    /// the argument count and the arguments - the table shape. A
+    /// trailing FILTER refuses: the engine answers 42S22 itself
+    /// (measured L20)
+    fn rec_stat_agg(&mut self, name: &str) -> Option<MapEntry> {
+        self.i += 1; // (
+        let mut args = Vec::new();
+        loop {
+            args.push(self.val()?);
+            match self.t.get(self.i)? {
+                Tok::Comma => self.i += 1,
+                Tok::RParen => {
+                    self.i += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        if Some(args.len()) != stat_agg_arity(name) {
+            return None;
+        }
+        Some(MapEntry::Fn(name.to_string(), args))
     }
 
     /// A value inside the recursive cte's scope: [<cte>.]<col> reads
@@ -16542,6 +17747,8 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
+        rec_fid_ctxs: Vec::new(),
+        rec_col_dsc: Vec::new(),
         domain_value: false,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
@@ -16630,6 +17837,8 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
+        rec_fid_ctxs: Vec::new(),
+        rec_col_dsc: Vec::new(),
         domain_value: false,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
@@ -16705,6 +17914,8 @@ pub fn compile_index_condition(sql: &str) -> Option<Vec<u8>> {
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
+        rec_fid_ctxs: Vec::new(),
+        rec_col_dsc: Vec::new(),
         domain_value: false,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
@@ -16800,6 +18011,8 @@ fn compile_check_inner(sql: &str, table: &str) -> Option<Vec<u8>> {
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
+        rec_fid_ctxs: Vec::new(),
+        rec_col_dsc: Vec::new(),
         domain_value: false,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
@@ -17083,6 +18296,8 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
+        rec_fid_ctxs: Vec::new(),
+        rec_col_dsc: Vec::new(),
         domain_value: true,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
@@ -17192,6 +18407,8 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
+        rec_fid_ctxs: Vec::new(),
+        rec_col_dsc: Vec::new(),
         domain_value: false,
         cursors: Vec::new(),
         cursor_decls: Vec::new(),
@@ -19791,10 +21008,10 @@ mod tests {
     #[test]
     fn slice_fifty_refusals() {
         for sql in [
-            // LIST over the recursion: the engine answers - unmeasured
-            "CREATE PROCEDURE X RETURNS (R1 VARCHAR(100)) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT LIST(NUMS.ID) FROM NUMS INTO :R1 DO SUSPEND; END",
-            // an aggregate inside an expression: the engine answers - unmeasured
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT COUNT(*) + 1 FROM NUMS INTO :R1 DO SUSPEND; END",
+            // (LIST over the recursion flipped in slice 53 - pinned
+            // in compiles_slice_fifty_three below)
+            // (an aggregate inside an expression flipped in slice 53 -
+            // pinned in compiles_slice_fifty_three below)
             // FILTER over a column arg: the engine answers -
             // unification needs catalog types
             "CREATE PROCEDURE X RETURNS (R1 BIGINT) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT NUMS.ID + 1 FROM NUMS WHERE NUMS.ID < 5) SELECT SUM(NUMS.ID) FILTER (WHERE NUMS.ID > 1) FROM NUMS INTO :R1 DO SUSPEND; END",
@@ -19952,6 +21169,72 @@ mod tests {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }
         set_catalog(Vec::new());
+    }
+
+    #[test]
+    fn compiles_slice_fifty_three_shapes_byte_for_byte() {
+        // aggregate completeness over the recursion (L1-L39): LIST
+        // takes a List entry, statistical verbs blr_agg_function, an
+        // aggregate inside an expression a local-map Expr item, HAVING
+        // IN-lists and subqueries map through the outer map, and the
+        // outer aggregate context lands AFTER every subquery stream
+        // (RR19: HAVING's takes 3, the inner aggregate 4, the outer 5;
+        // RR20: ORDER's alike)
+        pin_proc(
+            "CREATE PROCEDURE RR15 RETURNS (R1 BLOB SUB_TYPE TEXT) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT LIST(A.EMP_NO) FROM NUMS A INTO :R1 DO SUSPEND; END",
+            "050204010300110100000007000700020300001101000000012D1A00009B1100020211010743014F0343014301B901000243019208454D504C4F5945451A224E554D532220225055424C4943222E22454D504C4F5945452202472F170206454D505F4E4F15080001000000FF4D01000000831000170206454D505F4E4F430047331801000015080006000000FF4D01000000221801000015080001000000FFFF4E004D01000000AA18010000150F000001002CFF0201180300001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE RR16 RETURNS (R1 DOUBLE PRECISION) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT VAR_SAMP(A.EMP_NO) FROM NUMS A INTO :R1 DO SUSPEND; END",
+            "0502040103001B07000700020300001B012D1A00009B1100020211010743014F0343014301B901000243019208454D504C4F5945451A224E554D532220225055424C4943222E22454D504C4F5945452202472F170206454D505F4E4F15080001000000FF4D01000000831000170206454D505F4E4F430047331801000015080006000000FF4D01000000221801000015080001000000FFFF4E004D01000000C7085641525F53414D500118010000FF0201180300001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE RR17 RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT COUNT(*) + 1 FROM NUMS A INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0343014301B901000243019208454D504C4F5945451A224E554D532220225055424C4943222E22454D504C4F5945452202472F170206454D505F4E4F15080001000000FF4D01000000831000170206454D505F4E4F430047331801000015080006000000FF4D01000000221801000015080001000000FFFF4E004D0100000053FF02012218030000150800010000001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE RR18 RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT COUNT(*) FROM NUMS A HAVING COUNT(*) IN (1, 2) INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0343014301B901000243019208454D504C4F5945451A224E554D532220225055424C4943222E22454D504C4F5945452202472F170206454D505F4E4F15080001000000FF4D01000000831000170206454D505F4E4F430047331801000015080006000000FF4D01000000221801000015080001000000FFFF4E004D010000005347401803000002001508000100000015080002000000FF0201180300001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE RR19 RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT COUNT(*) FROM NUMS A HAVING COUNT(*) > (SELECT COUNT(*) FROM SRC) INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0543014301B901000243019208454D504C4F5945451A224E554D532220225055424C4943222E22454D504C4F5945452202472F170206454D505F4E4F15080001000000FF4D01000000831000170206454D505F4E4F430047331801000015080006000000FF4D01000000221801000015080001000000FFFF4E004D01000000534731180500002B7F43014F0443014A0353524303FF4E004D0100000053FF180400002DFF0201180500001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE RR20 RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT COUNT(*) FROM NUMS A ORDER BY (SELECT COUNT(*) FROM SRC) INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0543014301B901000243019208454D504C4F5945451A224E554D532220225055424C4943222E22454D504C4F5945452202472F170206454D505F4E4F15080001000000FF4D01000000831000170206454D505F4E4F430047331801000015080006000000FF4D01000000221801000015080001000000FFFF4E004D01000000534601482B7F43014F0443014A0353524303FF4E004D0100000053FF180400002DFF0201180500001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        // two HAVING subqueries allocate right-first (the SUM takes
+        // 3,4, the COUNT 5,6, the outer 7); three nested levels lay
+        // tables down (3,4,5) and aggregates up (6,7,8, outer 9)
+        pin_proc(
+            "CREATE PROCEDURE RR21 RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT COUNT(*) FROM NUMS A HAVING COUNT(*) > (SELECT COUNT(*) FROM SRC) AND COUNT(*) < (SELECT SUM(ID) FROM SRC) INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0743014301B901000243019208454D504C4F5945451A224E554D532220225055424C4943222E22454D504C4F5945452202472F170206454D505F4E4F15080001000000FF4D01000000831000170206454D505F4E4F430047331801000015080006000000FF4D01000000221801000015080001000000FFFF4E004D0100000053473A31180700002B7F43014F0643014A0353524305FF4E004D0100000053FF180600002D33180700002B7F43014F0443014A0353524303FF4E004D01000000561703024944FF180400002DFF0201180700001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+        pin_proc(
+            "CREATE PROCEDURE RR22 RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT COUNT(*) FROM NUMS A HAVING COUNT(*) > (SELECT COUNT(*) FROM SRC WHERE SRC.ID > (SELECT SUM(ID) FROM SRC WHERE SRC.AMT > (SELECT MAX(ID) FROM SRC))) INTO :R1 DO SUSPEND; END",
+            "050204010300080007000700020300000800012D1A00009B1100020211010743014F0943014301B901000243019208454D504C4F5945451A224E554D532220225055424C4943222E22454D504C4F5945452202472F170206454D505F4E4F15080001000000FF4D01000000831000170206454D505F4E4F430047331801000015080006000000FF4D01000000221801000015080001000000FFFF4E004D01000000534731180900002B7F43014F0843014A0353524303473117030249442B7F43014F0743014A03535243044731170403414D542B7F43014F0643014A0353524305FF4E004D01000000541705024944FF180600002DFF4E004D01000000561704024944FF180700002DFF4E004D0100000053FF180800002DFF0201180900001A00000E0102011A000029010000010001150700010019010200FFFFFFFFFF0E0102011A000029010000010001150700000019010200FFFF4C",
+        );
+    }
+
+    #[test]
+    fn slice_fifty_three_refusals() {
+        for sql in [
+            // FILTER on a statistical verb: the engine's 42S22 too
+            "CREATE PROCEDURE X RETURNS (R1 DOUBLE PRECISION) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT VAR_SAMP(A.EMP_NO) FILTER (WHERE A.EMP_NO > 1) FROM NUMS A INTO :R1 DO SUSPEND; END",
+            // an aggregate inside an aggregate: the engine's 42000 too
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT COUNT(*) FROM NUMS A HAVING SUM(COUNT(*)) > 1 INTO :R1 DO SUSPEND; END",
+            // an aggregate inside a FILTER condition: the engine's
+            // 42000 too
+            "CREATE PROCEDURE X RETURNS (R1 BIGINT) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT SUM(A.EMP_NO) FILTER (WHERE COUNT(*) > 0) FROM NUMS A INTO :R1 DO SUSPEND; END",
+            // two nested inside a union subquery: unprobed, refused
+            // (the engine stores it - named gap)
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT COUNT(*) FROM NUMS A HAVING COUNT(*) IN (SELECT ID FROM SRC WHERE SRC.ID > (SELECT COUNT(*) FROM SRC) UNION ALL SELECT AMT FROM SRC WHERE SRC.AMT > (SELECT COUNT(*) FROM SRC)) INTO :R1 DO SUSPEND; END",
+            // a CASE with subqueries in HAVING: the engine's 42000 too
+            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS BEGIN FOR WITH RECURSIVE NUMS AS (SELECT EMP_NO FROM EMPLOYEE WHERE EMP_NO = 1 UNION ALL SELECT NUMS.EMP_NO + 1 FROM NUMS WHERE NUMS.EMP_NO < 6) SELECT COUNT(*) FROM NUMS A HAVING COUNT(*) > CASE WHEN A.EMP_NO IN (SELECT ID FROM SRC) THEN (SELECT COUNT(*) FROM SRC) ELSE 0 END INTO :R1 DO SUSPEND; END",
+        ] {
+            assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
+        }
     }
 
     #[test]

@@ -626,6 +626,15 @@ route "52 twin JOIN declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WH
 route "52 twin comma declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT A.ID FROM N A, N B WHERE B.ID = A.ID"
 route "52 twin USING declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT ID FROM N A JOIN N B USING (ID)"
 
+echo "--- 53 aggregate completeness over the recursion (slice 53): the BLR path declines, the interpreter serves"
+# (LIST over the recursion and aggregates inside expressions decline too,
+#  but the interpreter mis-serves both - a flagged blob id for LIST, a bare
+#  42000 for the expression - so no route cells pin them; the compiler side
+#  is pinned byte-identical in qa/dsql-proc-blr.sh)
+route "53 a statistical verb over the recursion declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT VAR_SAMP(A.ID) FROM N A"
+route "53 FILTER over the recursion declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT SUM(A.ID) FILTER (WHERE A.ID > 1) FROM N A"
+route "53 a HAVING subquery over the recursion declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT COUNT(*) FROM N A HAVING COUNT(*) > (SELECT COUNT(*) FROM T)"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1

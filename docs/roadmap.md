@@ -49,7 +49,9 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 49 the outer select over the recursion (WHERE / ORDER BY / DISTINCT / limits over the recurse fids),
    slice 50 aggregates and GROUP BY over the recursion (the aggregate node over the tower),
    slice 51 joins with the recursion (the tower in the cte's FROM slot),
-   slice 52 twin-tower self-joins (N towers at (0-2),(3,4,5),+3k; last-wins mixed resolution).
+   slice 52 twin-tower self-joins (N towers at (0-2),(3,4,5),+3k; last-wins mixed resolution),
+   slice 53 aggregate completeness over the recursion (LIST, statistical verbs, FILTER, aggregates in expressions,
+   HAVING predicates, the subquery allocation order).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -186,6 +188,23 @@ replacement of the C++ engine is below, in priority order. Full text:
    (boolean literals, both paths) and NATURAL/CROSS beside twins stay refused - named gaps, pinned; a plain duplicate-alias
    pair is the plain path's known served-wrong, documented. Pre-existing reds re-confirmed at HEAD by stash-compare
    (identical cells: exe EP101/EP158, exeselect §17, the two view DIFFs); branchtype 69/69, unit tests 91+5.
+   DONE (slice 53): aggregate completeness over the recursion on the BLR path - LIST (separator, DISTINCT, twin-grouped,
+   WITHIN GROUP, FILTER), the statistical verbs, FILTER over a column, aggregates inside expressions (a local-map Expr
+   item), and HAVING predicates (IN-lists, comparisons, subqueries, searched CASE - the simple CASE already rode the
+   shared walk) - all byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +51 checks/+5 refuses net with the five
+   slice-50 aggregate gaps flipped, exe-run-blr +0 with no executor change; the route declines, three new cells in
+   exeselect §53). The slice's second half is the SUBQUERY ALLOCATION ORDER the gate's own double-subquery row exposed:
+   clauses allocate WHERE, ITEMS, ORDER, GROUP, HAVING; a clause's lists run forward while a boolean's combinators run
+   right-first with each comparison's comparands left-to-right; an aggregate lands after its whole subtree - implemented
+   as one end-of-parse context permutation over every stored slot (a union with two nested inside refuses, unprobed).
+   With it came a shared fix the three-level probe demanded: a qualified name asks the subquery's OWN stream before any
+   outer match (innermost-scope-first, as the comment always said). FILTER on a statistical verb (42S22), an aggregate
+   inside an aggregate or a FILTER condition, and a CASE with subqueries in HAVING (42000) refuse with the engine's
+   error. Named gaps, pinned: a grouped item subquery, a union branch aggregate, CASE-branch subqueries (shared with
+   the plain path), an IN-list on a key over a plain table, the interpreter's LIST rendering (a flagged blob id) and
+   its bare 42000 on aggregates in expressions. Diagnosis in passing: the two carried view DIFFs are the plain path's
+   boolean-reversal - the same allocation law, deferred to its own slice. Pre-existing reds re-confirmed identical at
+   the slice-52 base (exe EP101/EP158, exeselect §17 + SKIP7, the two view DIFFs); branchtype 69/69, unit tests 93+5.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).
