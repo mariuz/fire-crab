@@ -51,7 +51,9 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 51 joins with the recursion (the tower in the cte's FROM slot),
    slice 52 twin-tower self-joins (N towers at (0-2),(3,4,5),+3k; last-wins mixed resolution),
    slice 53 aggregate completeness over the recursion (LIST, statistical verbs, FILTER, aggregates in expressions,
-   HAVING predicates, the subquery allocation order).
+   HAVING predicates, the subquery allocation order),
+   slice 54 the plain-path subquery allocation order (mains fixed; WHERE/ITEMS/ORDER plain, WHERE/ORDER/GROUP/HAVING
+   with the aggregate node last, right-first union branches).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -205,6 +207,23 @@ replacement of the C++ engine is below, in priority order. Full text:
    its bare 42000 on aggregates in expressions. Diagnosis in passing: the two carried view DIFFs are the plain path's
    boolean-reversal - the same allocation law, deferred to its own slice. Pre-existing reds re-confirmed identical at
    the slice-52 base (exe EP101/EP158, exeselect §17 + SKIP7, the two view DIFFs); branchtype 69/69, unit tests 93+5.
+   DONE (slice 54): the plain-path subquery allocation order on the BLR path - the slice-53 diagnosis cashed. A plain
+   select holds its mains fixed and orders subqueries WHERE, ITEMS, ORDER; an aggregate keeps the main stream first,
+   numbers WHERE, ORDER, GROUP, HAVING subqueries next, and the aggregate node last (its claimed slot moves; outer
+   fids of the colliding marker land through the reslot's marker arm); a union holds every branch stream fixed and
+   orders each branch's WHERE subqueries right-first, branches forward. AND/OR run right-first, every list forward, a
+   comparison's comparands and BETWEEN's bounds left-to-right - one end-of-parse permutation shared by FOR SELECT,
+   views, view unions (whose branch-index stream miscount the first union probe exposed), DECLAREd cursors, and
+   searched UPDATE/DELETE. HAVING and ORDER-over-aggregate take scalar, quantified and EXISTS subqueries (correlated
+   references map; an ungrouped outer ref refuses with the engine's 42000). Nested subqueries refuse (the flat
+   permutation cannot reach their order) as do subqueries inside derived tables (the engine numbers their streams
+   relation2-with-schema-alias, an emission gap for its own slice); a select item beside an aggregate or an ORDER BY
+   refuses with the engine's 07002. All byte-identical off `RDB$PROCEDURE_BLR`/`RDB$VIEW_BLR` (dsql-proc-blr +8/+3 to
+   1359, the view gate fully green with the two carried DIFFs fixed; exe-run-blr +0 with no executor change). Method
+   note: a reused probe database served one stale blob mid-slice (SP3's body had been reworded after storing) - every
+   probe source is now verified against `RDB$PROCEDURE_SOURCE` before decoding. Pre-existing reds re-confirmed
+   identical at the slice-53 base (exe EP101/EP158, exeselect §17 + SKIP7); branchtype 69/69, unit tests 93+5 with
+   one stale EXISTS-pair pin re-read off the engine.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

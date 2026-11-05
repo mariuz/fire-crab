@@ -7268,7 +7268,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
     } else {
         None
     };
-    let boolean = if p.kw("WHERE") {
+    let mut boolean = if p.kw("WHERE") {
         Some(p.bool_or()?)
     } else {
         None
@@ -7278,6 +7278,66 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
     }
 
     let n_outer = p.outer.unwrap_or(p.streams.len());
+    // the engine's plain-path subquery allocation (slice 54): the
+    // outer streams stay fixed and the WHERE's subqueries order
+    // right-first; a subquery inside a derived table refuses
+    // ([plain_slot_map]), as does a second subquery beside a JOIN
+    // .. ON one (their relative order is unprobed)
+    {
+        for st in p.streams.iter().take(n_outer) {
+            if stream_has_subq(st) {
+                return None;
+            }
+        }
+        let mut c = SubqCollector {
+            entries: &[],
+            slot_ctx: 0,
+            descend_slots: false,
+            seen: Vec::new(),
+            seen_slots: Vec::new(),
+            out: Vec::new(),
+        };
+        if let Some(w) = &boolean {
+            c.bool(w);
+        }
+        let where_subs = std::mem::take(&mut c.out);
+        for (_, on) in &joins {
+            c.bool(on);
+        }
+        let on_subs = std::mem::take(&mut c.out);
+        let total = where_subs.len() + on_subs.len();
+        if total > 1 && !on_subs.is_empty() {
+            return None;
+        }
+        if total > 0
+            && p.streams.iter().take(n_outer).any(|st| st.derived.is_some())
+            && total > 1
+        {
+            return None;
+        }
+        if total > 0 {
+            let groups = vec![where_subs, on_subs];
+            let min_sub = groups
+                .iter()
+                .flat_map(|g| g.iter().map(|s| s.ctx))
+                .min()
+                .unwrap();
+            let mains: Vec<u8> = (1..min_sub).collect();
+            let (slot, _) = plain_slot_map(&mains, &groups, None)?;
+            let r = Reslot {
+                slot,
+                incr: 0,
+                final_: 0,
+                marker: None,
+            };
+            if let Some(w) = boolean.as_mut() {
+                *w = reslot_rec_bool(w, &r, false);
+            }
+            for (_, on) in joins.iter_mut() {
+                *on = reslot_rec_bool(on, &r, false);
+            }
+        }
+    }
     let mut out = vec![blr::VERSION5, blr::RSE];
     if joins.is_empty() {
         // plain OUTER streams, side by side (subquery streams live
@@ -7358,6 +7418,12 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
     // current branch's stream, bare names bind to it
     p.outer = Some(0);
     struct Branch {
+        /// the branch stream's index into `p.streams` and its context
+        /// (slice 54: branch streams number in parse order, so a
+        /// subquery in an earlier branch's WHERE shifts every later
+        /// branch's - the branch-index shortcut miscounted them)
+        si: usize,
+        bctx: u8,
         cols: Vec<Val>,
         wher: Option<Bool>,
         first: Option<Val>,
@@ -7427,6 +7493,8 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
         p.sub = saved;
         let proj = bdistinct.then(|| vals.clone());
         branches.push(Branch {
+            si,
+            bctx: si as u8 + p.base,
             cols: vals,
             wher,
             first,
@@ -7499,12 +7567,106 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
             b.cols = c;
         }
     }
+    // the engine's plain-path subquery allocation (slice 54): each
+    // branch stream holds its parse context while the branch's WHERE
+    // subqueries order right-first, branches forward
+    // ([plain_slot_map]); a subquery anywhere else in a branch
+    // refuses once a second subquery exists (their relative order is
+    // unprobed)
+    {
+        let mut total = 0usize;
+        let mut nonwher = 0usize;
+        for b in &branches {
+            let mut c = SubqCollector {
+                entries: &[],
+                slot_ctx: 0,
+                descend_slots: false,
+                seen: Vec::new(),
+                seen_slots: Vec::new(),
+                out: Vec::new(),
+            };
+            if let Some(w) = &b.wher {
+                c.bool(w);
+            }
+            total += c.out.len();
+            for v in &b.cols {
+                total += count_subqs_val(v);
+                nonwher += count_subqs_val(v);
+            }
+            for v in [&b.first, &b.skip].into_iter().flatten() {
+                total += count_subqs_val(v);
+                nonwher += count_subqs_val(v);
+            }
+            if let Some(pr) = &b.proj {
+                for v in pr {
+                    total += count_subqs_val(v);
+                    nonwher += count_subqs_val(v);
+                }
+            }
+            if stream_has_subq(&p.streams[b.si]) {
+                return None;
+            }
+        }
+        if total > 1 {
+            if nonwher > 0 {
+                return None;
+            }
+            let mut global = [0u8; 256];
+            for (i, m) in global.iter_mut().enumerate() {
+                *m = i as u8;
+            }
+            for b in &branches {
+                let mut c = SubqCollector {
+                    entries: &[],
+                    slot_ctx: 0,
+                    descend_slots: false,
+                    seen: Vec::new(),
+                    seen_slots: Vec::new(),
+                    out: Vec::new(),
+                };
+                if let Some(w) = &b.wher {
+                    c.bool(w);
+                }
+                let (bmap, _) = plain_slot_map(&[b.bctx], &[c.out], None)?;
+                for (i, m) in bmap.iter().enumerate() {
+                    if *m as usize != i {
+                        global[i] = *m;
+                    }
+                }
+            }
+            let r = Reslot {
+                slot: global,
+                incr: 0,
+                final_: 0,
+                marker: None,
+            };
+            for b in branches.iter_mut() {
+                b.bctx = r.slot[b.bctx as usize];
+                if let Some(w) = b.wher.as_mut() {
+                    *w = reslot_rec_bool(w, &r, false);
+                }
+                for v in b.cols.iter_mut() {
+                    *v = reslot_rec_val(v, &r, false);
+                }
+                for slot in [&mut b.first, &mut b.skip] {
+                    if let Some(x) = slot {
+                        *x = reslot_rec_val(x, &r, false);
+                    }
+                }
+                if let Some(pr) = b.proj.as_mut() {
+                    for v in pr.iter_mut() {
+                        *v = reslot_rec_val(v, &r, false);
+                    }
+                }
+            }
+        }
+    }
     let mut out = vec![blr::VERSION5, blr::RSE, 1, blr::UNION, 1];
     out.push(branches.len() as u8);
-    for (bi, b) in branches.iter().enumerate() {
+    for b in branches.iter() {
         out.push(blr::RSE);
         out.push(1);
-        emit_stream(&mut out, &p.streams[bi + 1], (bi + 2) as u8);
+        emit_stream(&mut out, &p.streams[b.si], b.bctx);
         if let Some(v) = &b.first {
             out.push(blr::FIRST);
             emit_val(&mut out, v);
@@ -7951,6 +8113,13 @@ struct Reslot {
     slot: [u8; 256],
     incr: u8,
     final_: u8,
+    /// the plain-path aggregate marker (slice 54): the outer fids
+    /// address `agg_fid_ctx`, which collides with a subquery context
+    /// by design - while the map below moves every REAL context,
+    /// a fid of the marker means the aggregate and lands on the new
+    /// main context instead. None on the recursive path (its top
+    /// flag already separates the marker from the interiors).
+    marker: Option<(u8, u8)>,
 }
 
 fn reslot_rec_val(v: &Val, r: &Reslot, top: bool) -> Val {
@@ -7960,7 +8129,13 @@ fn reslot_rec_val(v: &Val, r: &Reslot, top: bool) -> Val {
         r.slot[c as usize]
     };
     match v {
-        Val::Fid(c, s) => Val::Fid(m(*c), *s),
+        Val::Fid(c, s) => {
+            let n = match r.marker {
+                Some((i, f)) if *c == i => f,
+                _ => m(*c),
+            };
+            Val::Fid(n, *s)
+        }
         Val::Field(c, n) => Val::Field(if top { *c } else { r.slot[*c as usize] }, n.clone()),
         Val::DerivedWrap(c, x) => Val::DerivedWrap(m(*c), Box::new(reslot_rec_val(x, r, top))),
         Val::DerivedWrapN(cs, x) => Val::DerivedWrapN(
@@ -8189,6 +8364,189 @@ fn reslot_rec_map_entry(e: &MapEntry, r: &Reslot, top: bool) -> MapEntry {
                 .collect(),
         ),
     }
+}
+
+/// Slice 54: does this value hold a subquery at any depth (a nested
+/// one counts too - the nested check below runs separately)?
+fn val_has_subq(v: &Val) -> bool {
+    count_subqs_val(v) > 0
+}
+
+fn bool_has_subq(b: &Bool) -> bool {
+    let mut c = SubqCollector {
+        entries: &[],
+        slot_ctx: 0,
+        descend_slots: false,
+        seen: Vec::new(),
+        seen_slots: Vec::new(),
+        out: Vec::new(),
+    };
+    c.bool(b);
+    !c.out.is_empty()
+}
+
+fn entry_has_subq(e: &MapEntry) -> bool {
+    match e {
+        MapEntry::Key(v) => val_has_subq(v),
+        MapEntry::Agg(_, arg) => arg.as_ref().map(val_has_subq).unwrap_or(false),
+        MapEntry::Fn(_, args) => args.iter().any(val_has_subq),
+        MapEntry::List(_, v, s, order) => {
+            val_has_subq(v) || val_has_subq(s) || order.iter().any(|(_, k)| val_has_subq(k))
+        }
+    }
+}
+
+fn win_has_subq(w: &Win) -> bool {
+    w.part.iter().any(val_has_subq)
+        || w.remap.iter().any(val_has_subq)
+        || w.ord.iter().any(|(_, k)| val_has_subq(k))
+        || w.map.iter().any(entry_has_subq)
+        || w
+            .frame
+            .as_ref()
+            .map(|(_, a, b)| {
+                [a, b]
+                    .iter()
+                    .any(|slot| slot.1.as_ref().map(val_has_subq).unwrap_or(false))
+            })
+            .unwrap_or(false)
+}
+
+/// A subquery anywhere inside a derived table's inner query (its
+/// WHERE, columns, limits, sort, projection, aggregate, windows, or
+/// union branches): the engine numbers the subquery's stream
+/// relation2-with-schema-alias where the plain path emits a bare
+/// relation (measured SP17/SP20/SP21/SP22), so every caller refuses
+/// the shape until an emission slice teaches the form.
+fn derived_has_subq(d: &Derived) -> bool {
+    d.wher.as_ref().map(bool_has_subq).unwrap_or(false)
+        || d.cols.iter().any(|(_, c)| match c {
+            DCol::Col(_) => false,
+            DCol::Expr(v) | DCol::Fid(v) => val_has_subq(v),
+        })
+        || d.first.as_ref().map(val_has_subq).unwrap_or(false)
+        || d.skip.as_ref().map(val_has_subq).unwrap_or(false)
+        || d.sort.iter().any(|(_, k)| val_has_subq(k))
+        || d
+            .project
+            .as_ref()
+            .map(|p| p.iter().any(val_has_subq))
+            .unwrap_or(false)
+        || d
+            .agg
+            .as_ref()
+            .map(|a| {
+                a.group_keys.iter().any(val_has_subq)
+                    || a.map.iter().any(entry_has_subq)
+                    || a.having.as_ref().map(bool_has_subq).unwrap_or(false)
+            })
+            .unwrap_or(false)
+        || d.wins.iter().any(win_has_subq)
+        || d
+            .union
+            .as_ref()
+            .map(|u| {
+                u.branches.iter().any(|(_, _, wher, vals, f1, sk, raw)| {
+                    wher.as_ref().map(bool_has_subq).unwrap_or(false)
+                        || vals.iter().any(val_has_subq)
+                        || [f1, sk].iter().any(|x| x.as_ref().map(val_has_subq).unwrap_or(false))
+                        || raw
+                            .as_ref()
+                            .map(|vs| vs.iter().any(val_has_subq))
+                            .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+}
+
+fn stream_has_subq(st: &Stream) -> bool {
+    st.proc_args
+        .as_ref()
+        .map(|args| args.iter().any(val_has_subq))
+        .unwrap_or(false)
+        || st.derived.as_ref().map(|d| derived_has_subq(d)).unwrap_or(false)
+}
+
+/// Slice 54: the plain-path subquery allocation order. `mains` are
+/// the statement's own contexts in stream order - they stay fixed,
+/// leading and contiguous; `groups` are the clauses' subqueries in
+/// ENGINE order (each walked by SubqCollector: AND/OR right-first,
+/// every list forward); `marker` is the aggregate node's own slot,
+/// which the engine numbers after every subquery. Lays the engine
+/// slot order and returns the old-to-new map plus the marker's new
+/// context (mains[0] when there is no marker) - or None to refuse: a
+/// nested subquery (SP12: the flat permutation cannot reach the
+/// engine's order), a union subquery with two nested inside (the
+/// recursive backstop), or a non-contiguous parse (the model is
+/// wrong).
+///
+/// Measured (RDB$PROCEDURE_BLR pins SP1-SP22, AQ1-AQ24, U1/U2, CU1,
+/// DML1): a plain select numbers main-first then WHERE, ITEMS, ORDER;
+/// an aggregate keeps the main stream first, numbers WHERE, ORDER,
+/// GROUP, HAVING subqueries next, and the aggregate node last; a
+/// union holds every branch stream fixed and orders each branch's
+/// WHERE subqueries right-first, branches forward.
+fn plain_slot_map(
+    mains: &[u8],
+    groups: &[Vec<&SubQ>],
+    marker: Option<u8>,
+) -> Option<([u8; 256], u8)> {
+    for g in groups {
+        for s in g {
+            if count_subqs_subq(s) > 0 {
+                return None;
+            }
+        }
+    }
+    let mut slots = Vec::new();
+    for g in groups {
+        for s in g {
+            slots.extend(engine_slots_subq(s)?);
+        }
+    }
+    let mut map = [0u8; 256];
+    for (i, m) in map.iter_mut().enumerate() {
+        *m = i as u8;
+    }
+    if slots.is_empty() {
+        return Some((map, mains.first().copied().unwrap_or(0)));
+    }
+    if mains.is_empty() {
+        return None;
+    }
+    let all = mains
+        .iter()
+        .chain(slots.iter())
+        .chain(marker.iter())
+        .copied();
+    let minctx = all.clone().min().unwrap();
+    let maxctx = all.clone().max().unwrap();
+    let mut sorted: Vec<u8> = all.collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() != (maxctx - minctx + 1) as usize || sorted[0] != minctx {
+        return None;
+    }
+    if mains[0] != minctx {
+        return None;
+    }
+    for (k, m) in mains.iter().enumerate() {
+        if *m != minctx + k as u8 {
+            return None;
+        }
+    }
+    let mut cursor = minctx + mains.len() as u8;
+    for old in &slots {
+        map[*old as usize] = cursor;
+        cursor = cursor.wrapping_add(1);
+    }
+    let final_ = if let Some(m) = marker {
+        map[m as usize] = cursor;
+        cursor
+    } else {
+        mains[0]
+    };
+    Some((map, final_))
 }
 
 /// An aggregate statement's item rebuilt over the map IN ORDER OF
@@ -8588,6 +8946,10 @@ fn lift_over_agg(map: &mut Vec<MapEntry>, v: &Val, gfields: &[Val], fid_ctx: u8)
     match v {
         Val::Fid(..) | Val::Int(_) | Val::Int64(_) | Val::Dec(..) | Val::Str(_) | Val::Null | Val::InParam(_) | Val::LocalVar(_) => Some(v.clone()),
         Val::Field(..) => rebuild_over_keys(map, v, gfields, fid_ctx),
+        // a scalar subquery in an ORDER key over an aggregate (slice
+        // 54, measured SP9): it keeps its shape, its correlated
+        // references map
+        Val::ScalarSub(sub) => Some(Val::ScalarSub(Box::new(map_plain_subq(map, sub, fid_ctx)?))),
         v if is_leaf_val(v) => Some(v.clone()),
         _ => map_children(v, &mut |c| lift_over_agg(map, c, gfields, fid_ctx)),
     }
@@ -8619,6 +8981,9 @@ fn map_val_to_fid(map: &[MapEntry], v: &Val, fid_ctx: u8) -> Option<Val> {
         | Val::Null
         | Val::InParam(_)
         | Val::LocalVar(_) => Some(v.clone()),
+        // a scalar subquery over aggregate output (slice 54, measured
+        // SP7): it keeps its shape, its correlated references map
+        Val::ScalarSub(sub) => Some(Val::ScalarSub(Box::new(map_plain_subq(map, sub, fid_ctx)?))),
         v if is_leaf_val(v) => Some(v.clone()),
         // a pure function over the aggregate's output maps its operands
         // (measured: `.. GROUP BY G HAVING ABS(G) > 1`, `ORDER BY ABS(G)`)
@@ -8650,8 +9015,187 @@ fn map_bool_to_fids(map: &[MapEntry], b: Bool, fid_ctx: u8) -> Option<Bool> {
             map_val_to_fid(map, &lo, fid_ctx)?,
             map_val_to_fid(map, &hi, fid_ctx)?,
         ),
-        // LIKE / IN / subqueries over aggregate output: unprobed
+        // quantified subqueries over aggregate output (slice 54,
+        // measured SP14/SP15): the comparator maps, the subquery
+        // rebuilds its correlated references
+        Bool::Any(sub) => Bool::Any(map_plain_subq(map, &sub, fid_ctx)?),
+        Bool::Unique(sub) => Bool::Unique(map_plain_subq(map, &sub, fid_ctx)?),
+        Bool::AnsiAny(op, left, sub) => Bool::AnsiAny(
+            op,
+            map_val_to_fid(map, &left, fid_ctx)?,
+            map_plain_subq(map, &sub, fid_ctx)?,
+        ),
+        Bool::AnsiAll(op, left, sub) => Bool::AnsiAll(
+            op,
+            map_val_to_fid(map, &left, fid_ctx)?,
+            map_plain_subq(map, &sub, fid_ctx)?,
+        ),
+        // LIKE / IN-lists over aggregate output: unprobed
         _ => return None,
+    })
+}
+
+/// A subquery inside a plain HAVING / ORDER key: correlated
+/// references (field contexts below the aggregate's) read their
+/// group-key slot, inner references stand (slice 54, measured SP16;
+/// an ungrouped outer ref refuses with the engine's 42000 - SP13)
+fn map_plain_subq(map: &[MapEntry], sub: &SubQ, fid_ctx: u8) -> Option<SubQ> {
+    let mut s = sub.clone();
+    if s.stream.derived.is_some() {
+        return None;
+    }
+    if let Some(args) = &mut s.stream.proc_args {
+        let rebuilt: Option<Vec<Val>> = args
+            .iter()
+            .map(|a| map_plain_subq_val(map, a, fid_ctx))
+            .collect();
+        *args = rebuilt?;
+    }
+    if let Some(w) = &mut s.wher {
+        *w = Box::new(map_plain_subq_bool(map, w, fid_ctx)?);
+    }
+    if let Some(c) = &mut s.col {
+        *c = map_plain_subq_val(map, c, fid_ctx)?;
+    }
+    if let Some(e) = &mut s.expr {
+        *e = map_plain_subq_val(map, e, fid_ctx)?;
+    }
+    if let Some((_, arg, _)) = &mut s.agg {
+        if let Some(a) = arg {
+            *a = map_plain_subq_val(map, a, fid_ctx)?;
+        }
+    }
+    if let Some(u) = &mut s.union_ {
+        for (st, _, wher, item, f1, sk, raw) in &mut u.branches {
+            if st.derived.is_some() {
+                return None;
+            }
+            if let Some(args) = &mut st.proc_args {
+                let rebuilt: Option<Vec<Val>> = args
+                    .iter()
+                    .map(|a| map_plain_subq_val(map, a, fid_ctx))
+                    .collect();
+                *args = rebuilt?;
+            }
+            if let Some(w) = wher {
+                *w = Box::new(map_plain_subq_bool(map, w, fid_ctx)?);
+            }
+            *item = map_plain_subq_val(map, item, fid_ctx)?;
+            for slot in [f1, sk, raw] {
+                if let Some(x) = slot {
+                    *x = map_plain_subq_val(map, x, fid_ctx)?;
+                }
+            }
+        }
+    }
+    Some(s)
+}
+
+fn map_plain_subq_val(map: &[MapEntry], v: &Val, fid_ctx: u8) -> Option<Val> {
+    if let Val::Field(c, _) = v {
+        if *c >= fid_ctx {
+            return Some(v.clone());
+        }
+        let idx = map
+            .iter()
+            .position(|e| matches!(e, MapEntry::Key(k) if k == v))?;
+        return Some(Val::Fid(fid_ctx, idx as u16));
+    }
+    if matches!(v, Val::Fid(..)) {
+        return Some(v.clone());
+    }
+    if let Val::ScalarSub(sub) = v {
+        return Some(Val::ScalarSub(Box::new(map_plain_subq(map, sub, fid_ctx)?)));
+    }
+    if let Val::ValueIf(cond, then, els) = v {
+        return Some(Val::ValueIf(
+            Box::new(map_plain_subq_bool(map, cond, fid_ctx)?),
+            Box::new(map_plain_subq_val(map, then, fid_ctx)?),
+            Box::new(map_plain_subq_val(map, els, fid_ctx)?),
+        ));
+    }
+    if matches!(v, Val::Int(_) | Val::Int64(_) | Val::Dec(..) | Val::Str(_) | Val::Null | Val::InParam(_) | Val::LocalVar(_))
+        || is_leaf_val(v)
+    {
+        return Some(v.clone());
+    }
+    map_children(v, &mut |c| map_plain_subq_val(map, c, fid_ctx))
+}
+
+fn map_plain_subq_bool(map: &[MapEntry], b: &Bool, fid_ctx: u8) -> Option<Bool> {
+    let b2 = |x: Bool| Box::new(x);
+    Some(match b {
+        Bool::And(l, r) => Bool::And(
+            b2(map_plain_subq_bool(map, l, fid_ctx)?),
+            b2(map_plain_subq_bool(map, r, fid_ctx)?),
+        ),
+        Bool::Or(l, r) => Bool::Or(
+            b2(map_plain_subq_bool(map, l, fid_ctx)?),
+            b2(map_plain_subq_bool(map, r, fid_ctx)?),
+        ),
+        Bool::Not(x) => Bool::Not(b2(map_plain_subq_bool(map, x, fid_ctx)?)),
+        Bool::Cmp(op, a, c) => Bool::Cmp(
+            *op,
+            map_plain_subq_val(map, a, fid_ctx)?,
+            map_plain_subq_val(map, c, fid_ctx)?,
+        ),
+        Bool::Like(a, c) => Bool::Like(
+            map_plain_subq_val(map, a, fid_ctx)?,
+            map_plain_subq_val(map, c, fid_ctx)?,
+        ),
+        Bool::Starting(a, c) => Bool::Starting(
+            map_plain_subq_val(map, a, fid_ctx)?,
+            map_plain_subq_val(map, c, fid_ctx)?,
+        ),
+        Bool::Equiv(a, c) => Bool::Equiv(
+            map_plain_subq_val(map, a, fid_ctx)?,
+            map_plain_subq_val(map, c, fid_ctx)?,
+        ),
+        Bool::Containing(a, c) => Bool::Containing(
+            map_plain_subq_val(map, a, fid_ctx)?,
+            map_plain_subq_val(map, c, fid_ctx)?,
+        ),
+        Bool::Similar(a, c, e) => {
+            let e = match e {
+                Some(x) => Some(map_plain_subq_val(map, x, fid_ctx)?),
+                None => None,
+            };
+            Bool::Similar(
+                map_plain_subq_val(map, a, fid_ctx)?,
+                map_plain_subq_val(map, c, fid_ctx)?,
+                e,
+            )
+        }
+        Bool::AnsiLike(a, c, e) => Bool::AnsiLike(
+            map_plain_subq_val(map, a, fid_ctx)?,
+            map_plain_subq_val(map, c, fid_ctx)?,
+            map_plain_subq_val(map, e, fid_ctx)?,
+        ),
+        Bool::Missing(x) => Bool::Missing(map_plain_subq_val(map, x, fid_ctx)?),
+        Bool::Between(v, lo, hi) => Bool::Between(
+            map_plain_subq_val(map, v, fid_ctx)?,
+            map_plain_subq_val(map, lo, fid_ctx)?,
+            map_plain_subq_val(map, hi, fid_ctx)?,
+        ),
+        Bool::InList(v, items) => Bool::InList(
+            map_plain_subq_val(map, v, fid_ctx)?,
+            items
+                .iter()
+                .map(|x| map_plain_subq_val(map, x, fid_ctx))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        Bool::Any(sub) => Bool::Any(map_plain_subq(map, sub, fid_ctx)?),
+        Bool::Unique(sub) => Bool::Unique(map_plain_subq(map, sub, fid_ctx)?),
+        Bool::AnsiAny(op, left, sub) => Bool::AnsiAny(
+            *op,
+            map_plain_subq_val(map, left, fid_ctx)?,
+            map_plain_subq(map, sub, fid_ctx)?,
+        ),
+        Bool::AnsiAll(op, left, sub) => Bool::AnsiAll(
+            *op,
+            map_plain_subq_val(map, left, fid_ctx)?,
+            map_plain_subq(map, sub, fid_ctx)?,
+        ),
     })
 }
 
@@ -11645,10 +12189,10 @@ impl<'a> P<'a> {
         } else {
             None
         };
-        let stream = self.stream_item()?;
+        let mut stream = self.stream_item()?;
         self.streams.push(stream.clone());
         let sidx = self.streams.len() - 1;
-        let ctx = sidx as u8 + self.base;
+        let mut ctx = sidx as u8 + self.base;
         self.claim_derived_agg_slot(&stream);
         // JOIN chain - the view laws at body numbering (probed):
         // each ON resolves across the accumulated statement streams
@@ -12760,7 +13304,7 @@ impl<'a> P<'a> {
             self.agg_map = map;
             agg_vals = Some(vals);
         }
-        let having = if self.kw("HAVING") {
+        let mut having = if self.kw("HAVING") {
             if !aggregate {
                 return None;
             }
@@ -13100,7 +13644,7 @@ impl<'a> P<'a> {
         } else {
             Vec::new()
         };
-        let col_vals: Vec<Val> = if let Some(u) = &union_ {
+        let mut col_vals: Vec<Val> = if let Some(u) = &union_ {
             (0..cols_n)
                 .map(|i| Val::Fid(u.ctx, i as u16))
                 .collect()
@@ -13351,7 +13895,7 @@ impl<'a> P<'a> {
             self.i += 1;
             (None, None)
         };
-        let map = std::mem::take(&mut self.agg_map);
+        let mut map = std::mem::take(&mut self.agg_map);
         if union_.is_some() && (lock || cursor.is_some()) {
             return None;
         }
@@ -13376,6 +13920,276 @@ impl<'a> P<'a> {
         // the branch above, so the union term is gone too)
         if distinct && (aggregate || !joins.is_empty() || cursor.is_some() || lock) {
             return None;
+        }
+        // the engine's plain-path subquery allocation (slice 54): a
+        // plain select holds its mains fixed and orders subqueries
+        // WHERE, ITEMS, ORDER; an aggregate keeps the main stream
+        // first, orders them WHERE, ORDER, GROUP, HAVING, and numbers
+        // the aggregate node last; a union
+        // holds every branch stream fixed and orders each branch's
+        // WHERE subqueries right-first, branches forward. Clauses the
+        // probes never reached refuse with company (joins, windows,
+        // limits, the aggregate map's non-clone entries, procedure
+        // arguments), as do nested subqueries and subqueries inside
+        // derived tables ([plain_slot_map]).
+        if union_.is_some() {
+            if aggregate {
+                return None;
+            }
+            let mut global = [0u8; 256];
+            for (i, m) in global.iter_mut().enumerate() {
+                *m = i as u8;
+            }
+            let mut total = 0usize;
+            let mut nonwher = 0usize;
+            if let Some(u) = &union_ {
+                for (_, _, wher, cols, f1, sk, proj) in &u.branches {
+                    let mut c = SubqCollector {
+                        entries: &[],
+                        slot_ctx: 0,
+                        descend_slots: false,
+                        seen: Vec::new(),
+                        seen_slots: Vec::new(),
+                        out: Vec::new(),
+                    };
+                    if let Some(w) = wher {
+                        c.bool(w);
+                    }
+                    total += c.out.len();
+                    for v in cols {
+                        total += count_subqs_val(v);
+                        nonwher += count_subqs_val(v);
+                    }
+                    for v in [f1, sk].into_iter().flatten() {
+                        total += count_subqs_val(v);
+                        nonwher += count_subqs_val(v);
+                    }
+                    if let Some(p) = proj {
+                        for v in p {
+                            total += count_subqs_val(v);
+                            nonwher += count_subqs_val(v);
+                        }
+                    }
+                }
+            }
+            if boolean.as_ref().map(bool_has_subq).unwrap_or(false)
+                || group_keys.iter().any(val_has_subq)
+                || having.as_ref().map(bool_has_subq).unwrap_or(false)
+                || sort.iter().any(|(_, k)| val_has_subq(k))
+                || col_vals.iter().any(val_has_subq)
+                || first.as_ref().map(val_has_subq).unwrap_or(false)
+                || skip.as_ref().map(val_has_subq).unwrap_or(false)
+                || map.iter().any(entry_has_subq)
+                || windows.iter().any(win_has_subq)
+            {
+                return None;
+            }
+            if total > 1 {
+                if nonwher > 0 {
+                    return None;
+                }
+                if let Some(u) = &union_ {
+                    for (_, bctx, wher, _, _, _, _) in &u.branches {
+                        let mut c = SubqCollector {
+                            entries: &[],
+                            slot_ctx: 0,
+                            descend_slots: false,
+                            seen: Vec::new(),
+                            seen_slots: Vec::new(),
+                            out: Vec::new(),
+                        };
+                        if let Some(w) = wher {
+                            c.bool(w);
+                        }
+                        let (bmap, _) = plain_slot_map(&[*bctx], &[c.out], None)?;
+                        for (i, m) in bmap.iter().enumerate() {
+                            if *m as usize != i {
+                                global[i] = *m;
+                            }
+                        }
+                    }
+                }
+                let r = Reslot {
+                    slot: global,
+                    incr: 0,
+                    final_: 0,
+                    marker: None,
+                };
+                if let Some(u) = union_.as_mut() {
+                    for (st, bctx, wher, cols, f1, sk, proj) in &mut u.branches {
+                        if stream_has_subq(st) {
+                            return None;
+                        }
+                        *st = reslot_rec_stream(st, &r);
+                        *bctx = r.slot[*bctx as usize];
+                        if let Some(w) = wher {
+                            *w = reslot_rec_bool(w, &r, false);
+                        }
+                        for v in cols.iter_mut() {
+                            *v = reslot_rec_val(v, &r, false);
+                        }
+                        for slot in [f1, sk] {
+                            if let Some(x) = slot {
+                                *x = reslot_rec_val(x, &r, false);
+                            }
+                        }
+                        if let Some(p) = proj {
+                            for v in p.iter_mut() {
+                                *v = reslot_rec_val(v, &r, false);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            if stream_has_subq(&stream) {
+                return None;
+            }
+            for (_, st, _, on) in &joins {
+                if stream_has_subq(st) || bool_has_subq(on) {
+                    return None;
+                }
+            }
+            if first.as_ref().map(val_has_subq).unwrap_or(false)
+                || skip.as_ref().map(val_has_subq).unwrap_or(false)
+                || windows.iter().any(win_has_subq)
+            {
+                return None;
+            }
+            let mut c = SubqCollector {
+                entries: &[],
+                slot_ctx: 0,
+                descend_slots: false,
+                seen: Vec::new(),
+                seen_slots: Vec::new(),
+                out: Vec::new(),
+            };
+            if let Some(w) = &boolean {
+                c.bool(w);
+            }
+            let where_subs = std::mem::take(&mut c.out);
+            for v in &col_vals {
+                c.val(v);
+            }
+            let item_subs = std::mem::take(&mut c.out);
+            for (_, k) in &sort {
+                c.val(k);
+            }
+            let order_subs = std::mem::take(&mut c.out);
+            for k in &group_keys {
+                c.val(k);
+            }
+            let group_subs = std::mem::take(&mut c.out);
+            if let Some(h) = &having {
+                c.bool(h);
+            }
+            let having_subs = std::mem::take(&mut c.out);
+            if !aggregate && (!group_subs.is_empty() || !having_subs.is_empty()) {
+                return None;
+            }
+            let groups: Vec<Vec<&SubQ>> = if aggregate {
+                vec![where_subs, order_subs, group_subs, having_subs]
+            } else {
+                vec![where_subs, item_subs, order_subs]
+            };
+            let total: usize = groups.iter().map(|g| g.len()).sum();
+            if !joins.is_empty() && total > 0 {
+                return None;
+            }
+            if stream.derived.is_some() && total > 0 && (aggregate || total > 1) {
+                return None;
+            }
+            // the aggregate map's entries share their group keys'
+            // (and lifted sort keys') subqueries by context - those
+            // clones are collected above; any other entry subquery
+            // is an unprobed placement and refuses
+            let owned: Vec<u8> = groups.iter().flat_map(|g| g.iter().map(|s| s.ctx)).collect();
+            for e in &map {
+                let mut ce = SubqCollector {
+                    entries: &[],
+                    slot_ctx: 0,
+                    descend_slots: false,
+                    seen: Vec::new(),
+                    seen_slots: Vec::new(),
+                    out: Vec::new(),
+                };
+                ce.entry(e);
+                if ce.out.iter().any(|s| !owned.contains(&s.ctx)) {
+                    return None;
+                }
+            }
+            if aggregate && has_wins && total > 0 {
+                return None;
+            }
+            if total > 0 {
+                // non-aggregate mains run from the stream to the
+                // first subquery (a derived main's inner slots ride
+                // along); an aggregate's is the lone stream - the
+                // marker slot lays separately, after every subquery
+                let mains: Vec<u8> = if aggregate {
+                    vec![ctx]
+                } else {
+                    let min_sub = groups
+                        .iter()
+                        .flat_map(|g| g.iter().map(|s| s.ctx))
+                        .min()
+                        .unwrap();
+                    (ctx..min_sub).collect()
+                };
+                let marker = if aggregate {
+                    Some(self.agg_fid_ctx)
+                } else {
+                    None
+                };
+                let (slot, final_) = plain_slot_map(&mains, &groups, marker)?;
+                let r = Reslot {
+                    slot,
+                    incr: 0,
+                    final_: 0,
+                    marker: if aggregate {
+                        Some((self.agg_fid_ctx, final_))
+                    } else {
+                        None
+                    },
+                };
+                for v in col_vals.iter_mut() {
+                    *v = reslot_rec_val(v, &r, false);
+                }
+                if let Some(h) = having.as_mut() {
+                    *h = reslot_rec_bool(h, &r, false);
+                }
+                for (_, k) in sort.iter_mut() {
+                    *k = reslot_rec_val(k, &r, false);
+                }
+                if let Some(w) = boolean.as_mut() {
+                    *w = reslot_rec_bool(w, &r, false);
+                }
+                for k in group_keys.iter_mut() {
+                    *k = reslot_rec_val(k, &r, false);
+                }
+                for e in map.iter_mut() {
+                    *e = reslot_rec_map_entry(e, &r, false);
+                }
+                if let Some(v) = first.as_mut() {
+                    *v = reslot_rec_val(v, &r, false);
+                }
+                if let Some(v) = skip.as_mut() {
+                    *v = reslot_rec_val(v, &r, false);
+                }
+                for w in windows.iter_mut() {
+                    *w = reslot_rec_win(w, &r);
+                }
+                stream = reslot_rec_stream(&stream, &r);
+                ctx = r.slot[ctx as usize];
+                for (_, st, jctx, on) in joins.iter_mut() {
+                    *st = reslot_rec_stream(st, &r);
+                    *jctx = r.slot[*jctx as usize];
+                    *on = reslot_rec_bool(on, &r, false);
+                }
+                if aggregate {
+                    self.agg_fid_ctx = final_;
+                }
+            }
         }
         Some(TrigStmt::ForSel(Box::new(ForSel {
             label,
@@ -14060,6 +14874,73 @@ impl<'a> P<'a> {
             return None;
         }
         self.i += 1;
+        // the engine's plain-path subquery allocation (slice 54):
+        // the cursor's streams stay fixed and the WHERE's subqueries
+        // order right-first ([plain_slot_map]); an aggregate cursor
+        // with subqueries refuses (its node placement is unprobed),
+        // as does a second subquery beside a JOIN .. ON one
+        {
+            for (_, st, _, _) in &joins {
+                if stream_has_subq(st) {
+                    return None;
+                }
+            }
+            if group_keys.iter().any(val_has_subq)
+                || sort.iter().any(|(_, k)| val_has_subq(k))
+                || outs.iter().any(val_has_subq)
+                || map.iter().any(entry_has_subq)
+            {
+                return None;
+            }
+            let mut c = SubqCollector {
+                entries: &[],
+                slot_ctx: 0,
+                descend_slots: false,
+                seen: Vec::new(),
+                seen_slots: Vec::new(),
+                out: Vec::new(),
+            };
+            if let Some(w) = &boolean {
+                c.bool(w);
+            }
+            let where_subs = std::mem::take(&mut c.out);
+            for (_, _, _, on) in &joins {
+                c.bool(on);
+            }
+            let on_subs = std::mem::take(&mut c.out);
+            let total = where_subs.len() + on_subs.len();
+            if agg.is_some() && total > 0 {
+                return None;
+            }
+            if !joins.is_empty() && total > 0 {
+                return None;
+            }
+            if total > 1 && !on_subs.is_empty() {
+                return None;
+            }
+            if total > 0 {
+                let groups = vec![where_subs, on_subs];
+                let min_sub = groups
+                    .iter()
+                    .flat_map(|g| g.iter().map(|s| s.ctx))
+                    .min()
+                    .unwrap();
+                let mains: Vec<u8> = (ctx..min_sub).collect();
+                let (slot, _) = plain_slot_map(&mains, &groups, None)?;
+                let r = Reslot {
+                    slot,
+                    incr: 0,
+                    final_: 0,
+                    marker: None,
+                };
+                if let Some(w) = boolean.as_mut() {
+                    *w = reslot_rec_bool(w, &r, false);
+                }
+                for (_, _, _, on) in joins.iter_mut() {
+                    *on = reslot_rec_bool(on, &r, false);
+                }
+            }
+        }
         let num = self.cursors.len() as u16;
         self.cursors.push(name.clone());
         self.cursor_decls.push(CursorDecl {
@@ -15843,6 +16724,7 @@ impl<'a> P<'a> {
                 // context onto itself (the identity)
                 incr: if aggregate { incr } else { final_ctx },
                 final_: final_ctx,
+                marker: None,
             };
             for v in col_vals.iter_mut() {
                 *v = reslot_rec_val(v, &r, true);
@@ -17190,7 +18072,7 @@ impl<'a> P<'a> {
             let idx = self.streams.len() - 1;
             let ctx = idx as u8 + self.base;
             let saved = self.sub.replace(idx);
-            let wher = if self.kw("WHERE") {
+            let mut wher = if self.kw("WHERE") {
                 Some(self.bool_or()?)
             } else {
                 None
@@ -17201,6 +18083,42 @@ impl<'a> P<'a> {
                 return None;
             }
             self.i += 1;
+            // the engine's plain-path subquery allocation (slice 54):
+            // the target stream stays fixed and the WHERE's
+            // subqueries order right-first ([plain_slot_map])
+            if stream_has_subq(&st) {
+                return None;
+            }
+            {
+                let mut c = SubqCollector {
+                    entries: &[],
+                    slot_ctx: 0,
+                    descend_slots: false,
+                    seen: Vec::new(),
+                    seen_slots: Vec::new(),
+                    out: Vec::new(),
+                };
+                if let Some(w) = &wher {
+                    c.bool(w);
+                }
+                if !c.out.is_empty() {
+                    if st.derived.is_some() && c.out.len() > 1 {
+                        return None;
+                    }
+                    let min_sub = c.out.iter().map(|s| s.ctx).min().unwrap();
+                    let mains: Vec<u8> = (ctx..min_sub).collect();
+                    let (slot, _) = plain_slot_map(&mains, &[c.out], None)?;
+                    let r = Reslot {
+                        slot,
+                        incr: 0,
+                        final_: 0,
+                        marker: None,
+                    };
+                    if let Some(w) = wher.as_mut() {
+                        *w = reslot_rec_bool(w, &r, false);
+                    }
+                }
+            }
             return Some(TrigStmt::Delete(st, ctx, wher, ret));
         }
         if self.kw("MERGE") {
@@ -17674,7 +18592,7 @@ impl<'a> P<'a> {
                     break;
                 }
             }
-            let wher = if self.kw("WHERE") {
+            let mut wher = if self.kw("WHERE") {
                 Some(self.bool_or()?)
             } else {
                 None
@@ -17685,6 +18603,58 @@ impl<'a> P<'a> {
                 return None;
             }
             self.i += 1;
+            // the engine's plain-path subquery allocation (slice 54):
+            // the target streams stay fixed and the WHERE's
+            // subqueries order right-first ([plain_slot_map]); a SET
+            // subquery beside any other refuses (their relative order
+            // is unprobed - a lone one is trivially placed)
+            if stream_has_subq(&st) {
+                return None;
+            }
+            {
+                let mut c = SubqCollector {
+                    entries: &[],
+                    slot_ctx: 0,
+                    descend_slots: false,
+                    seen: Vec::new(),
+                    seen_slots: Vec::new(),
+                    out: Vec::new(),
+                };
+                if let Some(w) = &wher {
+                    c.bool(w);
+                }
+                let where_subs = std::mem::take(&mut c.out);
+                for (_, v) in &sets {
+                    c.val(v);
+                }
+                let set_subs = std::mem::take(&mut c.out);
+                let total = where_subs.len() + set_subs.len();
+                if total > 1 && !set_subs.is_empty() {
+                    return None;
+                }
+                if total > 0 {
+                    if st.derived.is_some() && total > 1 {
+                        return None;
+                    }
+                    let groups = vec![where_subs, set_subs];
+                    let min_sub = groups
+                        .iter()
+                        .flat_map(|g| g.iter().map(|s| s.ctx))
+                        .min()
+                        .unwrap();
+                    let mains: Vec<u8> = (org_ctx..min_sub).collect();
+                    let (slot, _) = plain_slot_map(&mains, &groups, None)?;
+                    let r = Reslot {
+                        slot,
+                        incr: 0,
+                        final_: 0,
+                        marker: None,
+                    };
+                    if let Some(w) = wher.as_mut() {
+                        *w = reslot_rec_bool(w, &r, false);
+                    }
+                }
+            }
             return Some(TrigStmt::Update(st, org_ctx, new_ctx, sets, wher, ret));
         }
         // NEW.col = <value>;
@@ -19355,7 +20325,7 @@ mod tests {
         );
         pin(
             "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U2 WHERE U2.UID = T.ID) OR EXISTS (SELECT 1 FROM V3T WHERE V3T.VID = T.ID)",
-            "0543014A01540147393C43014A02553202472F1702035549441701024944FF3C43014A0356335403472F1703035649441701024944FFFF4C",
+            "0543014A01540147393C43014A02553203472F1703035549441701024944FF3C43014A0356335402472F1702035649441701024944FFFF4C",
         );
         // subqueries compose with plain terms
         pin(
