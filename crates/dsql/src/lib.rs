@@ -5745,6 +5745,64 @@ fn is_keyword(w: &str) -> bool {
     )
 }
 
+/// Words the engine refuses as a member-ORDER name (slice 48):
+/// every one probe-stored REFUSED as a bare key (128 cells across
+/// four rounds, against the engine's own ParserTokens reserved set
+/// minus what is_keyword already covers)
+fn is_rec_order_reserved(w: &str) -> bool {
+    matches!(
+        w,
+         | "ADD" | "ADMIN" | "ALTER" | "AT" | "AVG" | "BIGINT"
+         | "BINARY" | "BIT_LENGTH" | "BLOB" | "BOOLEAN" | "BTRIM" | "CALL"
+         | "CAST" | "CHAR" | "CHARACTER" | "CHARACTER_LENGTH" | "CHAR_LENGTH" | "COLLATE"
+         | "COLUMN" | "COMMIT" | "CONNECT" | "CONSTRAINT" | "CORR" | "COUNT"
+         | "COVAR_POP" | "COVAR_SAMP" | "CROSS" | "CURRENT" | "DATE" | "DAY"
+         | "DEC" | "DECFLOAT" | "DECIMAL" | "DETERMINISTIC" | "DISCONNECT" | "DOUBLE"
+         | "DROP" | "EXTERNAL" | "EXTRACT" | "FLOAT" | "FOREIGN" | "FUNCTION"
+         | "GLOBAL" | "GRANT" | "GREATEST" | "GROUPS" | "HOUR" | "INDEX"
+         | "INSENSITIVE" | "INT" | "INT128" | "INTEGER" | "LATERAL" | "LEAST"
+         | "LISTAGG" | "LOCAL" | "LONG" | "LOWER" | "LTRIM" | "MAX"
+         | "MIN" | "MINUTE" | "MONTH" | "NATIONAL" | "NCHAR" | "NO"
+         | "NUMERIC" | "OCTET_LENGTH" | "OF" | "OVER" | "PARAMETER" | "PERCENTILE_CONT"
+         | "PERCENTILE_DISC" | "PRECISION" | "PRIMARY" | "PUBLICATION" | "REAL" | "RECORD_VERSION"
+         | "RECREATE" | "RECURSIVE" | "REFERENCES" | "REGR_AVGX" | "REGR_AVGY" | "REGR_COUNT"
+         | "REGR_INTERCEPT" | "REGR_R2" | "REGR_SLOPE" | "REGR_SXX" | "REGR_SXY" | "REGR_SYY"
+         | "RELEASE" | "RETURN" | "RETURNING_VALUES" | "REVOKE" | "ROLLBACK" | "ROW"
+         | "RTRIM" | "SAVEPOINT" | "SCROLL" | "SECOND" | "SENSITIVE" | "SMALLINT"
+         | "START" | "STDDEV_POP" | "STDDEV_SAMP" | "SUM" | "TABLE" | "TIME"
+         | "TIMESTAMP" | "TIMEZONE_HOUR" | "TIMEZONE_MINUTE" | "TO" | "TRIM" | "TRUNCATE"
+         | "UNBOUNDED" | "UNIQUE" | "UPPER" | "VARBINARY" | "VARCHAR" | "VARIABLE"
+         | "VARYING" | "VAR_POP" | "VAR_SAMP" | "VIEW" | "WINDOW" | "WITHIN"
+         | "WITHOUT" | "YEAR"
+    )
+}
+
+/// Builtins usable as a member-ORDER call head (slice 48): every one
+/// verified against the engine (SELECT NAME(...) succeeds or fails
+/// argument matching, never "unknown"). Unknown, special-syntax and
+/// reserved heads stay refused
+fn is_rec_order_fn(w: &str) -> bool {
+    matches!(
+        w,
+         | "ABS" | "ACOS" | "ASCII_CHAR" | "ASCII_VAL" | "ASIN" | "ATAN"
+         | "ATAN2" | "AVG" | "BASE64_DECODE" | "BASE64_ENCODE" | "BIN_AND" | "BIN_NOT"
+         | "BIN_OR" | "BIN_SHL" | "BIN_SHR" | "BIN_XOR" | "BIT_LENGTH" | "BTRIM"
+         | "CEIL" | "CEILING" | "CHARACTER_LENGTH" | "CHAR_LENGTH" | "CHAR_TO_UUID" | "COALESCE"
+         | "CORR" | "COS" | "COSH" | "COT" | "COUNT" | "COVAR_POP"
+         | "COVAR_SAMP" | "CRYPT_HASH" | "DECODE" | "EXP" | "FLOOR" | "GEN_ID"
+         | "GEN_UUID" | "GREATEST" | "HASH" | "HEX_DECODE" | "HEX_ENCODE" | "IIF"
+         | "LEAST" | "LEFT" | "LISTAGG" | "LN" | "LOG" | "LOG10"
+         | "LOWER" | "LPAD" | "LTRIM" | "MAKE_DBKEY" | "MAX" | "MIN"
+         | "MOD" | "NULLIF" | "OCTET_LENGTH" | "PI" | "POWER" | "RAND"
+         | "RDB$GET_CONTEXT" | "REGR_AVGX" | "REGR_AVGY" | "REGR_COUNT" | "REGR_INTERCEPT" | "REGR_R2"
+         | "REGR_SLOPE" | "REGR_SXX" | "REGR_SXY" | "REGR_SYY" | "REPLACE" | "REVERSE"
+         | "RIGHT" | "ROUND" | "RPAD" | "RTRIM" | "SIGN" | "SIN"
+         | "SINH" | "SQRT" | "STDDEV_POP" | "STDDEV_SAMP" | "SUM" | "TAN"
+         | "TANH" | "TRIM" | "TRUNC" | "UNICODE_CHAR" | "UNICODE_VAL" | "UPPER"
+         | "UUID_TO_CHAR" | "VAR_POP" | "VAR_SAMP"
+    )
+}
+
 // -------------------------------------------------------------- emitter
 
 fn emit_val(out: &mut Vec<u8>, v: &Val) {
@@ -12662,6 +12720,307 @@ impl<'a> P<'a> {
     /// FOR WITH RECURSIVE <name> AS (SELECT <col> FROM <table>
     /// [WHERE ...] UNION ALL SELECT <item> FROM <name> [WHERE ...])
     /// SELECT [<name>.]<col> FROM <name> INTO :v DO <stmt> - the
+    /// ORDER BY on the recursive member: the keys parse
+    /// SYNTACTICALLY and are discarded (slice 48 - the engine
+    /// stores no trace and never resolves a name: positions,
+    /// unknown columns all store). A bare name must read as one
+    /// (is_keyword plus the engine-refused set below); a call head
+    /// must be a known plain-call builtin (verified list below).
+    /// Gaps, all engine-legal: unknown/user call heads, CAST and
+    /// the special-syntax builtins, subqueries, EXISTS,
+    /// IN-subqueries, WITHIN/FILTER/OVER continuations, params and
+    /// brackets. Keys are literals, names, arithmetic,
+    /// concatenation, parens, plain calls and CASE with ASC/DESC
+    /// and NULLS FIRST/LAST suffixes; CASE's WHEN takes full
+    /// conditions
+    fn rec_order(&mut self) -> Option<()> {
+        if !self.kw("ORDER") {
+            return Some(());
+        }
+        if !self.kw("BY") {
+            return None;
+        }
+        loop {
+            self.rec_order_key()?;
+            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if matches!(w.as_str(), "ASC" | "ASCENDING" | "DESC" | "DESCENDING"))
+            {
+                self.i += 1;
+            }
+            if self.kw("NULLS") {
+                if !(self.kw("FIRST") || self.kw("LAST")) {
+                    return None;
+                }
+            }
+            if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                self.i += 1;
+                continue;
+            }
+            break;
+        }
+        Some(())
+    }
+
+    /// One ORDER key: a binary tree over primaries - precedence is
+    /// irrelevant to a recognizer, so one flat level
+    fn rec_order_key(&mut self) -> Option<()> {
+        self.rec_order_unary()?;
+        while matches!(
+            self.t.get(self.i),
+            Some(Tok::Plus | Tok::Minus | Tok::Star | Tok::Slash | Tok::Concat)
+        ) {
+            self.i += 1;
+            self.rec_order_unary()?;
+        }
+        Some(())
+    }
+
+    /// A sign (both spellings store) over a primary
+    fn rec_order_unary(&mut self) -> Option<()> {
+        if matches!(self.t.get(self.i), Some(Tok::Plus | Tok::Minus)) {
+            self.i += 1;
+        }
+        self.rec_order_primary()
+    }
+
+    /// A WHEN condition: NOT, AND/OR over predicates (flat -
+    /// precedence is irrelevant to a recognizer)
+    fn rec_order_bool(&mut self) -> Option<()> {
+        let _ = self.kw("NOT");
+        self.rec_order_pred()?;
+        while matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "AND" || w == "OR") {
+            self.i += 1;
+            let _ = self.kw("NOT");
+            self.rec_order_pred()?;
+        }
+        Some(())
+    }
+
+    /// One predicate: a key with an optional comparison, BETWEEN,
+    /// IN-list, LIKE, CONTAINING/STARTING/SIMILAR, or IS test -
+    /// EXISTS and IN-subqueries stay refused (the subquery gap)
+    fn rec_order_pred(&mut self) -> Option<()> {
+        // a parenthesised condition (a value paren falls out of the
+        // key below when no combiner follows)
+        if matches!(self.t.get(self.i), Some(Tok::LParen)) {
+            self.i += 1;
+            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "SELECT") {
+                return None;
+            }
+            self.rec_order_bool()?;
+            if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                return None;
+            }
+            self.i += 1;
+            return Some(());
+        }
+        self.rec_order_key()?;
+        if matches!(self.t.get(self.i), Some(Tok::Cmp(_))) {
+            self.i += 1;
+            return self.rec_order_key();
+        }
+        let neg = self.kw("NOT");
+        match self.t.get(self.i) {
+            Some(Tok::Ident(w)) if w == "BETWEEN" => {
+                self.i += 1;
+                self.rec_order_key()?;
+                if !self.kw("AND") {
+                    return None;
+                }
+                self.rec_order_key()
+            }
+            Some(Tok::Ident(w)) if w == "IN" => {
+                // NOT IN takes the same list rule
+                self.i += 1;
+                if !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                    return None;
+                }
+                self.i += 1;
+                if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "SELECT") {
+                    return None;
+                }
+                loop {
+                    self.rec_order_key()?;
+                    if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        self.i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                    return None;
+                }
+                self.i += 1;
+                Some(())
+            }
+            Some(Tok::Ident(w)) if w == "LIKE" || w == "CONTAINING" => {
+                self.i += 1;
+                self.rec_order_key()?;
+                if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ESCAPE") {
+                    self.i += 1;
+                    self.rec_order_key()?;
+                }
+                Some(())
+            }
+            Some(Tok::Ident(w)) if w == "STARTING" => {
+                self.i += 1;
+                if !self.kw("WITH") {
+                    return None;
+                }
+                self.rec_order_key()
+            }
+            Some(Tok::Ident(w)) if w == "SIMILAR" => {
+                self.i += 1;
+                if !self.kw("TO") {
+                    return None;
+                }
+                self.rec_order_key()?;
+                if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "ESCAPE") {
+                    self.i += 1;
+                    self.rec_order_key()?;
+                }
+                Some(())
+            }
+            Some(Tok::Ident(w)) if w == "IS" => {
+                if neg {
+                    return None; // NOT IS: not a spelling
+                }
+                self.i += 1;
+                let _ = self.kw("NOT");
+                if self.kw("DISTINCT") {
+                    if !self.kw("FROM") {
+                        return None;
+                    }
+                    return self.rec_order_key();
+                }
+                if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if matches!(w.as_str(), "NULL" | "TRUE" | "FALSE" | "UNKNOWN"))
+                {
+                    return None;
+                }
+                self.i += 1;
+                Some(())
+            }
+            _ => {
+                if neg {
+                    return None; // a dangling NOT
+                }
+                Some(())
+            }
+        }
+    }
+
+    /// An ORDER-key primary: literals, NULL, bare and dotted names,
+    /// plain function calls, CASE, and non-SELECT parens
+    fn rec_order_primary(&mut self) -> Option<()> {
+        match self.t.get(self.i)? {
+            Tok::Int(_) | Tok::Dec(..) | Tok::Double(_) | Tok::Hex(_) | Tok::Str(_) => {
+                self.i += 1;
+                Some(())
+            }
+            Tok::Ident(w) if w == "NULL" => {
+                self.i += 1;
+                Some(())
+            }
+            Tok::Ident(w) if w == "CASE" => {
+                self.i += 1;
+                // an optional simple-CASE operand - WHEN opens the
+                // searched form (peeking past it would eat the WHEN)
+                if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "WHEN") {
+                    self.rec_order_key()?;
+                }
+                loop {
+                    if !self.kw("WHEN") {
+                        return None;
+                    }
+                    // WHEN takes a CONDITION, not a value key
+                    self.rec_order_bool()?;
+                    if !self.kw("THEN") {
+                        return None;
+                    }
+                    self.rec_order_key()?;
+                    if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "WHEN") {
+                        continue;
+                    }
+                    break;
+                }
+                if self.kw("ELSE") {
+                    self.rec_order_key()?;
+                }
+                if !self.kw("END") {
+                    return None;
+                }
+                Some(())
+            }
+            Tok::Ident(_) => {
+                // a bare or dotted name, or a call over one: collect
+                // the chain, then test it by position - qualifiers
+                // must read as names, a call head must be a known
+                // plain-call builtin (unresolved bare names store,
+                // unknown call heads are gaps)
+                let mut parts: Vec<String> = Vec::new();
+                loop {
+                    let Some(Tok::Ident(n)) = self.t.get(self.i) else {
+                        return None;
+                    };
+                    parts.push(n.clone());
+                    self.i += 1;
+                    if matches!(self.t.get(self.i), Some(Tok::Dot)) {
+                        self.i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                let (head, quals) = parts.split_last().unwrap();
+                if quals
+                    .iter()
+                    .any(|p| is_keyword(p) || is_rec_order_reserved(p))
+                {
+                    return None;
+                }
+                if matches!(self.t.get(self.i), Some(Tok::LParen)) {
+                    if !is_rec_order_fn(head) {
+                        return None;
+                    }
+                    self.i += 1;
+                    let set_q = self.kw("DISTINCT") || self.kw("ALL");
+                    if !set_q && matches!(self.t.get(self.i), Some(Tok::Star)) {
+                        self.i += 1;
+                    } else {
+                        loop {
+                            self.rec_order_key()?;
+                            if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                                self.i += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                        return None;
+                    }
+                    self.i += 1;
+                } else if is_keyword(head) || is_rec_order_reserved(head) {
+                    return None;
+                }
+                Some(())
+            }
+            Tok::LParen => {
+                self.i += 1;
+                // a subquery key is the engine's answer and stays a
+                // gap (S24) - anything SELECT-led refuses here
+                if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "SELECT") {
+                    return None;
+                }
+                self.rec_order_key()?;
+                if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                    return None;
+                }
+                self.i += 1;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
     /// A ROWS / OFFSET / FETCH trailer on the recursive member:
     /// consumed and DROPPED (slice 47 - the engine parses it and
     /// stores no trace, measured byte-identical to the untrailered
@@ -12671,6 +13030,8 @@ impl<'a> P<'a> {
     /// but unlike a statement, beside member FIRST / SKIP it stays
     /// accepted (measured C2))
     fn rec_trailer(&mut self) -> Option<()> {
+        // the dropped ORDER BY comes first (measured S3/S11)
+        self.rec_order()?;
         let mut seen = false;
         if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "OFFSET") {
             self.i += 1;

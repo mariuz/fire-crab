@@ -602,6 +602,8 @@ route "47 anchor FIRST declines" declined "WITH RECURSIVE N AS (SELECT FIRST 2 I
 # recursive MEMBER raise the interpreter's 42000 (the engine accepts all
 # three) - no route cells until that gap closes; the BLR bytes and the
 # executor's per-wave application are pinned in dsql-proc-blr / exe-run-blr.
+# Slice 48 measured the same 42000 for ORDER BY on the member (the engine
+# answers the walk as if it were not there) - still no route cells.
 
 echo "--- panic check"
 ran=$((ran + 1))

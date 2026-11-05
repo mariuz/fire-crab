@@ -44,7 +44,8 @@ replacement of the C++ engine is below, in priority order. Full text:
    items refuse), slice 44 JOIN ... USING (ON equalities, COALESCE merged names, merged star),
    slice 45 UNION branch FIRST / SKIP (in-rse, before each branch's boolean; the leading limit is the first branch's),
    slice 46 UNION branch DISTINCT (in-rse project over the raw items; SELECT ALL is traceless),
-   slice 47 limits in recursion (anchor/member FIRST / SKIP; the member ROWS trailer is traceless).
+   slice 47 limits in recursion (anchor/member FIRST / SKIP; the member ROWS trailer is traceless),
+   slice 48 ORDER BY on the recursive member (parses syntactically, no BLR trace).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -129,6 +130,16 @@ replacement of the C++ engine is below, in priority order. Full text:
    C2); ROWS on the anchor, DISTINCT FIRST, and OFFSET beside ROWS are the engine's error too. ORDER BY on the member is the engine's
    answer and stays a gap, as do member limits in the interpreter (its 42000 where the engine answers - the anchor ones it serves).
    Pre-existing reds unchanged from slice 46 (exe EP101/EP158, exeselect 17, the two view DIFFs); branchtype 69/69, unit tests 82+5.
+   DONE (slice 48): ORDER BY on the recursive member on the BLR path - it parses SYNTACTICALLY and leaves NO trace (the engine never
+   resolves a name there: unknown columns, unknown functions, out-of-range positions and aggregates all store byte-identical to the
+   untrailered recursion), all byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +35 net with the slice-47 C5 gap flipped, exe-run-blr
+   +5 with no executor change; no view pins, the slice-47 policy). The recognizer takes full sort keys (expressions, 93 verified plain-call
+   builtins, searched/simple CASE with full WHEN conditions, COUNT(*)/COUNT(DISTINCT x), unary signs, NULLs ordering, ASCENDING) with an
+   engine-probed 128-word reserved list for bare keys; subquery keys, CAST, special-syntax builtins (SUBSTRING/EXTRACT/YEAR...), WITHIN /
+   FILTER / OVER and unknown call heads stay refused though the engine stores them - named gaps, pinned as refusals. The executor runs the
+   walks as if the trailer were not there (a member ROWS 3 changes no row, re-confirming slice 47's traceless law against the live engine).
+   The interpreter raises its 42000 on member ORDER BY, as for member limits - no route cells. Pre-existing reds re-confirmed at HEAD by
+   stash-compare (identical cells: exe EP101/EP158, exeselect §17, the two view DIFFs); branchtype 69/69, unit tests 82+5.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).
