@@ -48,7 +48,8 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 48 ORDER BY on the recursive member (parses syntactically, no BLR trace),
    slice 49 the outer select over the recursion (WHERE / ORDER BY / DISTINCT / limits over the recurse fids),
    slice 50 aggregates and GROUP BY over the recursion (the aggregate node over the tower),
-   slice 51 joins with the recursion (the tower in the cte's FROM slot).
+   slice 51 joins with the recursion (the tower in the cte's FROM slot),
+   slice 52 twin-tower self-joins (N towers at (0-2),(3,4,5),+3k; last-wins mixed resolution).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -174,6 +175,17 @@ replacement of the C++ engine is below, in priority order. Full text:
    NATURAL, CROSS, comma+JOIN mixing, derived tables beside the cte, ON subqueries and chained USING stay refused - named
    gaps, pinned. Pre-existing reds re-confirmed at HEAD by stash-compare (identical cells: exe EP101/EP158, exeselect §17,
    the two view DIFFs); branchtype 69/69, unit tests 88+5.
+   DONE (slice 52): twin-tower self-joins on the BLR path - N cte references stand N towers at (0-2),(3,4,5),+3k, each
+   tower self-contained (per-ref derived scopes, ctx-remap emission), the outer clauses riding after the scaffolding as in
+   slice 51 (WHERE, SORT, PROJECT, FIRST/SKIP, GROUP BY, the trailer); a mixed alias/bare qualifier takes the LAST match
+   (lone bare pairs are the engine's 42702, a catalog-known winner missing the column its 42S22), the cte name answering
+   bare only last - all byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +79 net with the four slice-51 twin gaps
+   flipped, exe-run-blr +6 execution refusals (the same verb-67 / 2-stream-rse surface, no executor change); the route
+   declines, three new cells in exeselect §52 - the interpreter serves every twin shape). Duplicate explicit aliases, bare
+   pairs beside an alias spelling the cte name, and non-last cte exposures refuse at bind with the engine's 42000. ON TRUE
+   (boolean literals, both paths) and NATURAL/CROSS beside twins stay refused - named gaps, pinned; a plain duplicate-alias
+   pair is the plain path's known served-wrong, documented. Pre-existing reds re-confirmed at HEAD by stash-compare
+   (identical cells: exe EP101/EP158, exeselect §17, the two view DIFFs); branchtype 69/69, unit tests 91+5.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

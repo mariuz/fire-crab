@@ -621,11 +621,16 @@ route "51 JOIN declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE I
 route "51 comma declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT N.ID FROM N, U WHERE U.T_ID = N.ID"
 route "51 USING declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT ID FROM N JOIN U USING (ID)"
 
+echo "--- 52 twin towers (slice 52): the BLR path declines, the interpreter serves"
+route "52 twin JOIN declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT A.ID FROM N A JOIN N B ON B.ID = A.ID"
+route "52 twin comma declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT A.ID FROM N A, N B WHERE B.ID = A.ID"
+route "52 twin USING declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT ID FROM N A JOIN N B USING (ID)"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
 elif ! kill -0 $srv 2>/dev/null; then echo "FAIL the server is gone"; fail=1
 else echo "OK   no panic and the server is still up"; fi
 echo "ran $ran checks"
-if [ "$ran" -lt 171 ]; then echo "FAIL only $ran checks ran (floor 171) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 174 ]; then echo "FAIL only $ran checks ran (floor 174) - cells went missing"; fail=1; fi
 exit $fail
