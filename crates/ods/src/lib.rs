@@ -28,6 +28,8 @@ pub mod blr;
 pub mod btr;
 pub mod btw;
 pub mod catalog;
+pub mod catalog_format;
+pub mod catalog_init;
 pub mod coll;
 pub mod data;
 pub mod ddl;

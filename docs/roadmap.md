@@ -13,7 +13,33 @@ replacement of the C++ engine is below, in priority order. Full text:
 **Phase 0 — stop depending on the C++ engine**
 1. ~~Create databases natively~~ done (`bd324f3`): `op_create` writes the
    engine's empty database from `crates/ods/templates`, no `isql`. Next: write
-   the catalog itself (`INI_format`).
+   the catalog itself (`INI_format`) - the epic is sliced in
+   `docs/full-conversion-plan.md` (static tables, page skeleton, relations,
+   core rows, indexes, remaining rows, validation + flip).
+   Slice 1 done 2026-11-06 (`qa/gen-catalog-init.py` ->
+   `crates/ods/src/catalog_init.rs`): the skeleton tables ported with
+   every macro resolved (463 names, 187 global fields, 60 relations /
+   598 fields), pinned by 5 tests against the 2196 template's RDB$ rows
+   read on 2182 (counts 60/598/187, full id->name order, per-relation
+   field counts, field length/subtype sums 118184/207, 4 default BLRs).
+   No behavior change.
+   Slice 2 done 2026-11-06 (`crates/ods/src/catalog_format.rs`):
+   format_header_page / format_pip_page / format_scn_page after
+   `PAG_format_header` / `PAG_format_pip` (pag.cpp:773-880), pinned by 5
+   tests (full static header bytes 0..160, decode round-trip, PIP bits
+   0-2 clear, 3-page skeleton for all sizes) against a fresh 2182
+   create. Generations stay 0 (masked in compares, as the engine's own
+   creations vary them). No behavior change.
+   Slice 3 done 2026-11-06 (`catalog_format::create_system_storage`):
+   pointer + root pages for the 40 persistent relations in relfields
+   order with the 80 `RDB$PAGES` rows under the system transaction
+   (`DPM_create_relation` + `DPM_pages`), descriptors computed from the
+   ported tables (cross-checked against the bootstrap pins), pinned by
+   3 tests (offsets, all 80 rows with page numbers, page-type sequence
+   0..83). Fresh files carry no `RDB$FORMATS` rows, so none are
+   written. Accepted delta, documented: the engine RLE-packs only 4 of
+   these records, this path packs every record that shrinks - the
+   engine reads both. No behavior change.
 2. ~~Choose one reference engine build; re-measure the backlog (it is stale).~~ done 2026-11-05: the reference is LI-T6.0.0.2182 (`/opt/firebird`, binary 2026-09-19; the only other builds on the box are older tarballs: 6.0.0.1930/1941 and 5.0.4.1812). All 34 live backlog bullets re-measured against it on master `1f6ca06`: 17 struck stale, 16 confirmed live (4 narrowed), the hunt list closed (all 12 clusters' gates re-run green), and 3 NEW regressions bisected to one commit each (own HIGH bullets below the environment-finding entry).
 
 **Phase 1 — architecture (largest risk; do first)**

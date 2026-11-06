@@ -11,8 +11,9 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
 - [x] **P0** Create databases natively; stop calling the C++ `isql` - op_create writes the engine's own empty database
       (crates/ods/templates, per page size) with a fresh GUID / creation time, the engine's page-size rounding and the
       DEFAULT CHARACTER SET; the client's re-sent CREATE DATABASE text and ALTER DATABASE SET DEFAULT CHARACTER SET apply
-      it (`qa/serve-real-nativecreate.sh`, a server with no Firebird on its PATH). Next: write the catalog itself
-      (INI_format) instead of the engine's empty file. With it: MON$OWNER / MON$CREATION_DATE answer (they were NULL), and
+      it (`qa/serve-real-nativecreate.sh`, a server with no Firebird on its PATH).
+- [ ] **P0** Write the catalog itself (`INI_format` epic, sliced in `docs/full-conversion-plan.md` Phase 0.1)
+      instead of the engine's empty file. With it: MON$OWNER / MON$CREATION_DATE answer (they were NULL), and
       a view's text column carries its set in the view's format (a UTF8 database's view described NONE to the engine).
 - [x] **P0** Pick the reference engine build (LI-T6.0.0.2182, 2026-11-05); re-measure the stale backlog (34 bullets: 17 struck stale, 16 confirmed live, hunt list closed, 3 NEW regressions bisected - see roadmap)
 - [ ] **P1** Move SQL execution out of `wire::server` into `dsql` → `opt` → `exe`, one statement family at a time.

@@ -15,7 +15,21 @@ execution out of the `wire` server.
    `isql`. It writes the engine's own empty database (`crates/ods/templates`,
    one per page size) with a fresh GUID and creation time, the engine's
    page-size rounding and the DEFAULT CHARACTER SET. **Next:** write the
-   catalog itself (`INI_format`) instead of copying the engine's empty file.
+   catalog itself (`INI_format`, `src/jrd/ini.epp:678`) instead of copying
+   the engine's empty file, in slices, each gated against the template
+   and the live engine (the nativecreate gate already compares
+   engine-made vs server-made creates): 1. port the skeleton tables
+   (`names.h` 463, `fields.h` 187, `relations.h` 60) and pin their
+   content against the template's RDB$ rows; 2. the page skeleton (header, PIP, TIP,
+   generator pages) byte-compared modulo GUID/time/counters; 3. the
+   system relations with formats; 4. the core rows (RELATIONS,
+   RELATION_FIELDS, FIELDS, DATABASE, generators, schemas); 5. the
+   system index builds; 6. the remaining rows (TYPES, charsets,
+   collations, generators, packages, publication, roles, grants);
+   7. formats, engine validation (open, `gfix`, `gbak`, MON$), the flip
+   behind `FC_NATIVE_CATALOG`, then delete the templates. All three
+   page sizes throughout. (Each area ports the tables it writes when it
+   writes them: `types.h`/intl/generators/packages land with slice 6.)
 2. **Choose one reference engine build and re-measure.** Several test gates
    fail on the engine's side, and the roadmap's backlog is marked stale
    ("re-measure before planning"). Rebuild the backlog from a fresh hunt.
