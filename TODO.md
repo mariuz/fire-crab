@@ -14,7 +14,7 @@ The plan, in order, is the top of [`docs/roadmap.md`](docs/roadmap.md) and the
       it (`qa/serve-real-nativecreate.sh`, a server with no Firebird on its PATH). Next: write the catalog itself
       (INI_format) instead of the engine's empty file. With it: MON$OWNER / MON$CREATION_DATE answer (they were NULL), and
       a view's text column carries its set in the view's format (a UTF8 database's view described NONE to the engine).
-- [ ] **P0** Pick the reference engine build; re-measure the stale backlog
+- [x] **P0** Pick the reference engine build (LI-T6.0.0.2182, 2026-11-05); re-measure the stale backlog (34 bullets: 17 struck stale, 16 confirmed live, hunt list closed, 3 NEW regressions bisected - see roadmap)
 - [ ] **P1** Move SQL execution out of `wire::server` into `dsql` → `opt` → `exe`, one statement family at a time.
       Slice 1 (`qa/serve-real-exeselect.sh`): under FC_EXEC_SELECT a parameterless SELECT whose outputs are exact
       numerics or temporals is compiled as `FOR <select> INTO .. DO SUSPEND` by dsql and served from exe's record
