@@ -1810,6 +1810,11 @@ struct P<'a> {
     /// source interpreter cannot call a function), so the server refuses it
     /// if exe cannot convert the compiled BLR (a generator, etc.)
     saw_user_fn: bool,
+    /// tables locked by a body SELECT ... WITH LOCK (single-table
+    /// shapes only - the lock sites refuse the rest), for the
+    /// server's system/virtual/temporary-table refusal, which needs
+    /// catalog flags this crate does not carry
+    locked_tables: Vec<String>,
 }
 
 impl<'a> P<'a> {
@@ -1835,6 +1840,7 @@ impl<'a> P<'a> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            locked_tables: Vec::new(),
             pending_loop_label: None,
             proc: None,
             agg_fid_ctx: 1,
@@ -6995,6 +7001,7 @@ pub fn compile_view_columns(sql: &str) -> Option<Vec<Option<Vec<u8>>>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -7157,6 +7164,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -13789,6 +13797,10 @@ impl<'a> P<'a> {
             {
                 return None;
             }
+            // a locked single table for the server's refusal (the
+            // shapes above already refused joins, aggregates and
+            // derived streams, and bodies take no UNION chains)
+            self.locked_tables.push(stream.name.clone());
             true
         } else {
             false
@@ -14862,6 +14874,9 @@ impl<'a> P<'a> {
             {
                 return None;
             }
+            // a locked single table for the server's refusal (joins
+            // and aggregates refused above)
+            self.locked_tables.push(tbl.clone());
             true
         } else {
             false
@@ -18714,6 +18729,7 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -18804,6 +18820,7 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -18881,6 +18898,7 @@ pub fn compile_index_condition(sql: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -18978,6 +18996,7 @@ fn compile_check_inner(sql: &str, table: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -19263,6 +19282,7 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -19374,6 +19394,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -19658,6 +19679,9 @@ pub struct ProcCompiled {
     /// the body binds a bare plain user-function call - it must run via
     /// exe (see [P::saw_user_fn]); the server checks exe can convert the BLR
     pub calls_user_fn: bool,
+    /// tables a body SELECT locks (WITH LOCK, single-table shapes),
+    /// for the server's system/virtual/temporary refusal
+    pub locked_tables: Vec<String>,
 }
 
 /// [compile_procedure] with the catalog metadata kept - None exactly
@@ -19740,6 +19764,7 @@ fn compile_routine_full(
         selectable: bo.selectable,
         source,
         calls_user_fn: p.saw_user_fn,
+        locked_tables: std::mem::take(&mut p.locked_tables),
     })
 }
 

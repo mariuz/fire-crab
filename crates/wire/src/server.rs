@@ -31924,6 +31924,26 @@ fn routine_names_ok(sql: &str, db: &Option<Database>, blr: &[u8], own: &str, par
     !bare_var_in_dml(&sql[begin_kw..], &names, &columns_of)
 }
 
+/// A ROUTINE BODY's locked tables against the catalog: WITH LOCK over
+/// a system, virtual or temporary table is the engine's HY000 at
+/// CREATE (the top-level law, [with_lock_relation_refusal]) - the
+/// routine widening that made INTO's colon optional started accepting
+/// such bodies (913d191 regression). Posts the engine's own vector
+/// and refuses.
+fn routine_locked_ok(db: &Option<Database>, locked: &[String]) -> bool {
+    let Some(dbr) = db.as_ref() else { return true };
+    if locked.is_empty() {
+        return true;
+    }
+    for name in locked {
+        if let Some(e) = with_lock_relation_refusal(dbr, name) {
+            PREPARE_REFUSAL.with(|r| *r.borrow_mut() = Some(e));
+            return false;
+        }
+    }
+    true
+}
+
 fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let up = sql.trim_start().to_ascii_uppercase();
     if find_word(&up, "CREATE", 0) != Some(0)
@@ -31940,6 +31960,9 @@ fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<
     let mut c = c?;
     let params: Vec<String> = c.ins.iter().chain(c.outs.iter()).map(|m| m.name.clone()).collect();
     if !routine_names_ok(sql, db, &c.blob, &c.name, &params) {
+        return None;
+    }
+    if !routine_locked_ok(db, &c.locked_tables) {
         return None;
     }
     // the stored source is the client's text, comments included
@@ -32888,6 +32911,9 @@ fn plan_create_function(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
     let c = with_routine_default_cs(|| fire_crab_dsql::compile_function_full_with_funcs(s, &__pf))?;
     let params: Vec<String> = c.ins.iter().map(|m| m.name.clone()).collect();
     if !routine_names_ok(s, db, &c.blob, &c.name, &params) {
+        return None;
+    }
+    if !routine_locked_ok(db, &c.locked_tables) {
         return None;
     }
     if c.calls_user_fn && !exe_can_run(&c.blob) {
@@ -66965,6 +66991,9 @@ fn plan_query_inner_at_body(
             return refused;
         }
         if names_bad {
+            return None;
+        }
+        if c.as_ref().is_some_and(|c| !routine_locked_ok(db, &c.locked_tables)) {
             return None;
         }
         return Some(Plan::ExecBlock { source, body_at, in_names, in_descs });
@@ -130957,6 +130986,51 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     Some(ProcMeta { ins, outs, source, body_at, prc_type: None, is_function: true })
 }
 
+/// A UNION THE EXECUTOR WOULD SERVE UNMOVED - a text column where a
+/// branch's bytes need the union set's reading. The interpreter moves
+/// a NONE branch into a real set and raises 22000 for untranscodable
+/// bytes ([union_branch_transcode]); the executor delivers branch
+/// values as they are, so fromloc §12 answered Ã© for é and missed
+/// the raise (slice-42 regression). Same-set unions (exeselect §42's
+/// UPPER(S)/S shapes) serve as before - only a converting branch, or
+/// a fixed column padded across differing sets, declines.
+fn union_serves_unmoved(p: &Plan) -> bool {
+    let mut p = p;
+    loop {
+        match p {
+            Plan::Modified { inner, .. } | Plan::Derived { inner, .. } => p = inner,
+            Plan::Union { cols, branches, .. } => {
+                use fire_crab_ods::intl;
+                let att = CURRENT_ATT_CS.with(|a| a.get());
+                return branches.iter().any(|b| {
+                    let bcols = union_branch_cols(b);
+                    cols.iter().enumerate().any(|(i, c)| {
+                        if !matches!(c.wire, Wire::Varying | Wire::Text) {
+                            return false;
+                        }
+                        let Some(bc) = bcols.get(i) else {
+                            return false;
+                        };
+                        if !matches!(bc.sql_type & !1, 448 | 452) {
+                            return false;
+                        }
+                        let src = union_text_cs(bc.sub_type, att);
+                        let dst = union_text_cs(c.sub_type, att);
+                        // the interpreter's move, plus a fixed column's
+                        // pad where the sets differ (same-set CHAR unions
+                        // ride the executor's CHAR delivery, as non-union
+                        // CHAR outputs do)
+                        (src == intl::CS_NONE && bc.sub_type >= 0 && !intl::byte_carrier(dst))
+                            || (dst == intl::CS_OCTETS && src != intl::CS_OCTETS)
+                            || (c.wire == Wire::Text && src != dst)
+                    })
+                });
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// A SELECT SERVED BY THE BLR PATH - SQL -> fire-crab-dsql's BLR ->
 /// fire-crab-exe's record sources -> rows - instead of this crate's
 /// interpreter: item 3 of docs/full-conversion-plan.md, moving SQL
@@ -131105,6 +131179,14 @@ fn exe_select(
             // compile default, not the column's set
             520 => {
                 let (st, cs) = (c.sub_type, c.scale);
+                // A COMPUTED BLOB (slice-38 regression): the executor
+                // mints temp blobs with no content attached, so a raw
+                // computed blob delivered empty (builtins §13:
+                // BLOB_APPEND's 0:0) - only a STORED column's blob,
+                // which the id fetches from the file, serves
+                if c.relation.is_none() {
+                    return decline("a computed blob output");
+                }
                 if st == 0 && cs == 0 {
                     "BLOB".to_string()
                 } else if st == 1 {
@@ -131158,6 +131240,12 @@ fn exe_select(
         };
         decls.push(format!("FC$O{} {}", i, ty));
         slots.push(format!(":FC$O{}", i));
+    }
+    // A UNION WITH A CONVERTING TEXT BRANCH (slice-42 regression):
+    // the executor has no branch transcode - decline to the
+    // interpreter, which moves NONE bytes into the union's set
+    if union_serves_unmoved(plan) {
+        return decline("a union branch the executor would not move");
     }
     let ins = if in_decls.is_empty() { String::new() } else { format!("({}) ", in_decls.join(", ")) };
     let synth = format!(

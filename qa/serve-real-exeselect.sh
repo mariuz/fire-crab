@@ -566,6 +566,11 @@ route "42 two columns, one an expression" served "SELECT B + 1, S FROM T UNION A
 # concatenation over an integer (the BLR executor evaluates it - pinned
 # in exe-run-blr - but the route's CONCATENATE needs text operands).
 route "42 an integer beside text in || declines to the interpreter" declined "SELECT (ID || '-') FROM T UNION ALL SELECT S FROM T ORDER BY 1"
+# Boundary the interpreter serves: a UNION with a converting text
+# branch (slice-42 regression - the executor delivered branch values
+# unmoved, fromloc §12: Ã© for é, the 22000 missing) declines, while
+# same-set text unions serve above.
+route "42 a converting text union declines to the interpreter" declined "SELECT S FROM T UNION ALL SELECT V FROM W ORDER BY 1"
 
 echo "--- 43 GROUP BY aliases and function-call keys (slice 43): a whole key resolves the select list first"
 route "43 GROUP BY an alias" served "SELECT G AS X, COUNT(*) FROM T GROUP BY X ORDER BY X"
