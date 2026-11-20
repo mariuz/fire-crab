@@ -6113,20 +6113,6 @@ fn classify_attach_failure(path: &str) -> AttachRefusal {
     }
 }
 
-/// THE ENGINE'S OWN EMPTY DATABASE, one per page size it creates: a bare
-/// `CREATE DATABASE '<p>' USER 'SYSDBA' .. PAGE_SIZE <n>` on 6.0.0.2196,
-/// zlib-compressed (crates/ods/templates). Two creations differ only in
-/// the header's transaction counters, its GUID and its creation time, the
-/// index roots' and the TIP's page generations, and - under DEFAULT
-/// CHARACTER SET - one RDB$DATABASE record version (measured byte for
-/// byte, 2026-10-05), so op_create writes this and makes it its own
-/// ([create_database_file]) rather than spawning the engine's isql.
-const EMPTY_DATABASES: [(usize, &[u8]); 3] = [
-    (8192, include_bytes!("../../ods/templates/empty-8192.fdb.z")),
-    (16384, include_bytes!("../../ods/templates/empty-16384.fdb.z")),
-    (32768, include_bytes!("../../ods/templates/empty-32768.fdb.z")),
-];
-
 /// The page size the engine creates for an `isc_dpb_page_size` of `asked`:
 /// the NEAREST of 8192 / 16384 / 32768, a tie going up, nothing below 8192
 /// or above 32768, 0 or none the default 8192 (measured on 2196: 1, 4096,
@@ -6150,18 +6136,20 @@ fn header_guid() -> [u8; 16] {
     g
 }
 
-/// Materialise an empty real database at `path` (op_create), natively:
-/// the engine's own empty database for the page size asked
-/// ([EMPTY_DATABASES], [engine_page_size]) made this database's - a new
-/// GUID (header bytes 84..100) and creation time (100..108, an
+/// Materialise an empty real database at `path` (op_create): the native
+/// catalog assembly ([catalog_assemble]) for the page size asked
+/// ([engine_page_size]) with a new GUID and creation time (an
 /// ISC_TIMESTAMP in UTC) - and, for a DEFAULT CHARACTER SET, its name in
 /// RDB$DATABASE, spelled as the client spelled it (upper-cased: `utf8` is
 /// UTF8, the alias `WIN_1252` stays WIN_1252, measured). A set the catalog
 /// does not name leaves NONE, as the engine's create leaves the file it
-/// made before its own ALTER DATABASE refused. The client's own DDL/DML
-/// then runs through fire-crab against the file. No Firebird install is
-/// needed: this once spawned the engine's `isql` ($FC_ISQL).
-fn create_database_file(path: &str, want: CreateDpb) -> Result<(), String> {
+/// made before its own ALTER DATABASE refused. `owner` is the creating
+/// user, stored uppercased as the engine stores usernames. The client's
+/// own DDL/DML then runs through fire-crab against the file. No Firebird
+/// install is needed: this once spawned the engine's `isql` ($FC_ISQL),
+/// then inflated engine-made template files (deleted with slice 7 -
+/// the flip rode `FC_NATIVE_CATALOG=0` while both paths were validated).
+fn create_database_file(path: &str, want: CreateDpb, owner: &str) -> Result<(), String> {
     let p = path.trim();
     if p.is_empty() {
         return Err("empty database path".into());
@@ -6173,24 +6161,16 @@ fn create_database_file(path: &str, want: CreateDpb) -> Result<(), String> {
     let _ = std::fs::remove_file(p);
     fire_crab_cch::pool::forget(p);
     let page_size = engine_page_size(want.page_size);
-    let packed = EMPTY_DATABASES
-        .iter()
-        .find(|(n, _)| *n == page_size)
-        .map(|(_, b)| *b)
-        .ok_or_else(|| format!("no empty database for page size {}", page_size))?;
-    let mut inflater = crate::zlib::Inflater::new();
-    inflater.feed(packed)?;
-    let mut image: Vec<u8> = inflater.out.drain(..).collect();
-    if image.len() < page_size || image.len() % page_size != 0 {
-        return Err("the empty database did not inflate whole".into());
-    }
-    image[84..100].copy_from_slice(&header_guid());
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     // days since 1858-11-17 (the Unix epoch is day 40587) and 1/10000 s
     let date = (now.as_secs() / 86400) as i32 + 40587;
     let ticks = ((now.as_secs() % 86400) * 10_000 + u64::from(now.subsec_micros()) / 100) as u32;
-    image[100..104].copy_from_slice(&date.to_le_bytes());
-    image[104..108].copy_from_slice(&ticks.to_le_bytes());
+    let image: Vec<u8> = fire_crab_ods::catalog_assemble::assemble_fresh_database(
+        page_size,
+        &header_guid(),
+        (date, ticks),
+        &owner.to_ascii_uppercase(),
+    )?;
     std::fs::write(p, &image).map_err(|e| format!("write {}: {}", p, os_error_text(&e)))?;
     if let Some(cs) = want.db_charset.as_deref().map(|c| c.trim().to_ascii_uppercase()).filter(|c| c != "NONE") {
         set_default_charset(p, &cs)?;
@@ -7106,7 +7086,7 @@ fn run_gbak_restore_core(
     }
     // the SERVICE restore makes its own shell: no client DPB reaches
     // here, so the defaults stand
-    create_database_file(&db, CreateDpb::default()).map_err(|e| {
+    create_database_file(&db, CreateDpb::default(), "SYSDBA").map_err(|e| {
         if std::env::var("FC_SRV_TRACE").is_ok() {
             eprintln!("[srv] gbak restore cannot create {}: {}", db, e);
         }
@@ -139311,11 +139291,10 @@ fn after_auth(
     }
 
     // op_attach and op_create share the wire layout (database id, file,
-    // dpb). op_create additionally MATERIALISES the file first: rather
-    // than synthesise a valid ODS from nothing (a separate large
-    // conversion), fire-crab has the engine create an empty database,
-    // then serves and mutates it - the same real-file basis every gate
-    // uses. Both then run the identical attachment loop below.
+    // dpb). op_create additionally MATERIALISES the file first: the
+    // native catalog assembly ([create_database_file]), then serves and
+    // mutates it - the same real-file basis every gate uses. Both then
+    // run the identical attachment loop below.
     if attach_op != OP_ATTACH && attach_op != OP_CREATE {
         return Ok(());
     }
@@ -139343,7 +139322,7 @@ fn after_auth(
         None => attach_name.clone(),
     };
     if attach_op == OP_CREATE {
-        if let Err(e) = create_database_file(&db_path, parse_create_dpb(&dpb)) {
+        if let Err(e) = create_database_file(&db_path, parse_create_dpb(&dpb), user) {
             if std::env::var("FC_SRV_TRACE").is_ok() {
                 eprintln!("[srv] create_database failed: {}", e);
             }
@@ -163764,7 +163743,7 @@ mod tests {
         assert!(!path.exists(), "a refused attach creates no file");
 
         // op_create materialises it, and then the SAME path loads
-        if create_database_file(p, CreateDpb::default()).is_ok() {
+        if create_database_file(p, CreateDpb::default(), "SYSDBA").is_ok() {
             assert!(path.exists(), "op_create leaves the file it named");
             assert!(
                 load_database(p).is_some(),

@@ -62,6 +62,9 @@ pub fn format_header_page(
 /// header + PIP + SCN, every bit set (free) except 0, 1 and 2.
 pub fn format_pip_page(page_size: usize) -> Vec<u8> {
     let mut page = blank_page(page_size, PageType::PageInventory);
+    // the skeleton's PIP is always page 1; every formatted page stamps
+    // its number (the TIP walk reads pageno@12, not the position)
+    page[12..16].copy_from_slice(&1u32.to_le_bytes());
     let used = FIRST_SCN_PAGE + 1;
     page[16..20].copy_from_slice(&used.to_le_bytes());
     page[20..24].copy_from_slice(&0u32.to_le_bytes());
@@ -74,9 +77,12 @@ pub fn format_pip_page(page_size: usize) -> Vec<u8> {
 }
 
 /// The first SCN page (`PAG_format_pip`'s non-temporary branch): type
-/// and sequence 0, the rest zero.
+/// and sequence 0, the rest zero - plus the page number every
+/// formatted page stamps (the TIP walk reads pageno@12).
 pub fn format_scn_page(page_size: usize) -> Vec<u8> {
-    blank_page(page_size, PageType::ScnInventory)
+    let mut page = blank_page(page_size, PageType::ScnInventory);
+    page[12..16].copy_from_slice(&FIRST_SCN_PAGE.to_le_bytes());
+    page
 }
 
 /// The file `PAG_format_pip` leaves behind: header, PIP, SCN.

@@ -25,11 +25,27 @@ execution out of the `wire` server.
    system relations with formats; 4. the core rows (RELATIONS,
    RELATION_FIELDS, FIELDS, DATABASE, generators, schemas); 5. the
    system index builds; 6. the remaining rows (TYPES, charsets,
-   collations, generators, packages, publication, roles, grants);
+   collations, packages, publication, roles, grants, DDL security);
    7. formats, engine validation (open, `gfix`, `gbak`, MON$), the flip
    behind `FC_NATIVE_CATALOG`, then delete the templates. All three
    page sizes throughout. (Each area ports the tables it writes when it
-   writes them: `types.h`/intl/generators/packages land with slice 6.)
+   writes them: `types.h`/intl/packages land with slice 6; the
+   generators table landed with slice 4.) Slices 1-4 done; slice 5 done
+   including 5b, the 25 `RDB$RUNTIME` blobs (`catalog_runtime.rs`, every
+   payload segment pinned): `jrd_rel::scan` loads field lists only from
+   runtime, so without them the engine attach dies at -206/col 328 in
+   `findGrantedRoles` (proven by nulling one runtime on an oracle copy).
+   Slice 6 done (`catalog_remaining.rs`): the remaining rows (298 TYPES,
+   52 charsets + 149 collations with the replayed intl classes,
+   4 packages with their routines and constants, the publication, the
+   admin role, 26 DDL classes, the 3 additional grants) plus the
+   `DPM_gen_id` end values, every row keyed through `maintain_row`.
+   The pipeline file now passes `gfix -v -full` and `gbak -b`.
+   Slice 7 done (`catalog_assemble.rs`): the flip behind
+   `FC_NATIVE_CATALOG` (both paths gate-green, then the templates,
+   the flag and the fallback deleted), formats confirmed empty on
+   both sides, MON$/32k covered by the gate, and the pageno@12 fix
+   the validation caught. The epic is done.
 2. **Choose one reference engine build and re-measure.** Several test gates
    fail on the engine's side, and the roadmap's backlog is marked stale
    ("re-measure before planning"). Rebuild the backlog from a fresh hunt.

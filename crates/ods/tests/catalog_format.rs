@@ -97,7 +97,11 @@ fn scn_page_is_type_and_zeros() {
     let s = format_scn_page(32768);
     assert_eq!(s.len(), 32768);
     assert_eq!(s[0], PageType::ScnInventory as u8);
-    assert!(s[1..].iter().all(|b| *b == 0));
+    // pageno@12 carries 2 (the engine stamps it; fire-crab's TIP walk
+    // reads page numbers, so a zeroed stamp breaks DDL) - the rest zero
+    assert_eq!(u32::from_le_bytes([s[12], s[13], s[14], s[15]]), 2);
+    assert!(s[1..12].iter().all(|b| *b == 0));
+    assert!(s[16..].iter().all(|b| *b == 0));
 }
 
 #[test]

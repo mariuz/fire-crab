@@ -40,6 +40,62 @@ replacement of the C++ engine is below, in priority order. Full text:
    written. Accepted delta, documented: the engine RLE-packs only 4 of
    these records, this path packs every record that shrinks - the
    engine reads both. No behavior change.
+   Slice 4 done 2026-11-10 (`crates/ods/src/catalog_rows.rs`): the core
+   rows - 60 relations + 598 relation-fields with their SQL$n /
+   SQL$DEFAULT$n pairs and 360 grants, 187 global fields (+374
+   grants), the DATABASE row, 2 schemas, 13 generators - with 322
+   security classes and 764 privilege rows, pinned by 11 tests against
+   a fresh 2182 create (row counts, exact sample rows, class numbering
+   1..60/61..247/248..249/451..463, ACL bytes scanned off the file:
+   26B relation, 23B non-relation/schema, 17B DDL; blob headers (3,1)
+   ACL / (2,1) defaults / (1,4) descriptions). Two folds documented in
+   the module: DATABASE carries SQL$DATABASE from the start (the DDL
+   patch value is constant), and the intl 250..450 gap is a reserved
+   constant slice 6 replays. No behavior change. (A third fold arrived
+   with slice 6: the 6 recomputed relation ACLs are written final
+   here - 39/40B, not 26B - because the recompute's page is full by
+   slice-6 time.)
+   Slice 5 done 2026-11-10 (`catalog_index.rs` + `catalog_index_def.rs`,
+   100 indices / 177 segments / 32 constraints, per-relation INDEX_IDs
+   pinned by 5 tests) including 5b, the 25 `RDB$RUNTIME` blobs
+   (`catalog_runtime.rs`, every payload segment pinned by 3 tests):
+   without them the engine attach dies at -206/col 328 in
+   `findGrantedRoles` (`jrd_rel::scan` reads field lists only from
+   runtime - proven by nulling one runtime on an oracle copy). The
+   pipeline file now attaches and reads back join/group/order output
+   byte-identical to the oracle.
+   Slice 6 done 2026-11-20 (`crates/ods/src/catalog_remaining.rs`):
+   the remaining rows - 298 TYPES (`types.h` + SystemPrivileges,
+   every macro resolved), 52 character sets + 149 collations with
+   the replayed `SQL$250..450` classes (the slice-4 reservation
+   asserted, not trusted), 4 packages (12 procedures / 36 params /
+   7 functions / 21 args / 3 constants), the publication, the admin
+   role, 26 DDL classes, the 3 additional system-privilege grants -
+   232 classes and 480 privilege rows, every row keyed through
+   `maintain_row`, pinned by 10 tests. Two engine-computed values
+   land as pinned literals: the 7 ICU-resolved collation attribute
+   strings and the 6 `GRANT_privileges`-recomputed relation ACLs
+   (written final where the classes were stored - slice 4's third
+   fold - because the recompute's page is full by slice-6 time).
+   The pipeline file now passes `gfix -v -full` and `gbak -b`
+   (same backup size as the oracle's; restore verified),
+   closing slice 5's carryover. (The 4k bulk-build failure noted
+   here turned out to be out of scope: 4096 was never a template
+   size and `engine_page_size` maps it to 8192.)
+   Slice 7 done 2026-11-20 (`crates/ods/src/catalog_assemble.rs`):
+   the flip. `op_create` assembles the catalog natively (owner is
+   the creating user, as the engine stores it); the flip rode
+   `FC_NATIVE_CATALOG=0` while the nativecreate gate passed 71/71
+   on BOTH paths, then the templates, the flag and the template
+   branch were deleted. Validation caught one real bug: the
+   skeleton never stamped pageno@12 on its PIP/SCN/TIP/generator
+   pages, which the engine tolerates but fire-crab's own TIP walk
+   (and every DDL through it) reads - fixed, with a pageno
+   invariant test and a patch-on-assembly regression test. Fresh
+   files carry no RDB$FORMATS rows (0 on both sides, now pinned in
+   the gate CAT). Post-flip: nativecreate 71/71, gbakrestore 39/39,
+   ODS 191+4+8+6+5+10+11+3, wire 417. The epic is done; Phase-0
+   item 1 closes with this commit.
 2. ~~Choose one reference engine build; re-measure the backlog (it is stale).~~ done 2026-11-05: the reference is LI-T6.0.0.2182 (`/opt/firebird`, binary 2026-09-19; the only other builds on the box are older tarballs: 6.0.0.1930/1941 and 5.0.4.1812). All 34 live backlog bullets re-measured against it on master `1f6ca06`: 17 struck stale, 16 confirmed live (4 narrowed), the hunt list closed (all 12 clusters' gates re-run green), and 3 NEW regressions bisected to one commit each (own HIGH bullets below the environment-finding entry).
 
 **Phase 1 — architecture (largest risk; do first)**

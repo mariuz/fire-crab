@@ -9654,7 +9654,7 @@ pub fn create_expression_index(
 /// the page tail below the lowest in use, an empty root bucket
 /// allocated, the repeat written `irt_normal`. Returns the slot -
 /// `RDB$INDEX_ID - 1`.
-fn allocate_index_slot(
+pub(crate) fn allocate_index_slot(
     file: &mut crate::Image,
     page_size: usize,
     rel: u16,
@@ -9740,7 +9740,7 @@ fn allocate_index_slot(
 /// in record order had each key decode and re-encode its leaf, split
 /// pages mid-way, and (descending) descend the wrong child.
 #[allow(clippy::too_many_arguments)]
-fn backfill_index(
+pub(crate) fn backfill_index(
     file: &mut crate::Image,
     page_size: usize,
     rel: u16,

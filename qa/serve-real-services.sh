@@ -9,8 +9,8 @@
 #      directories, security database and architecture this way. The
 #      response byte format was captured from the real Firebird server
 #      ([tag][u16 len][string], SvcInfoCode 55/56/58/59/60) and mirrored.
-#   2. create_database() -> op_create: fire-crab writes the engine's own
-#      empty database from its templates (no isql on PATH needed -
+#   2. create_database() -> op_create: fire-crab assembles the catalog
+#      natively (no isql on PATH needed -
 #      qa/serve-real-nativecreate.sh proves it), then serves and mutates
 #      it - the same real-file basis every gate uses. The driver then runs
 #      CREATE TABLE / INSERT / SELECT against the fresh database, and the

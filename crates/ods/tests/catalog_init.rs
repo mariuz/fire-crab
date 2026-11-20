@@ -1,7 +1,8 @@
-//! The generated skeleton tables against the reference template's RDB$
-//! rows: every (id, name, field count) and the global fields' shapes.
-//! Oracle: `crates/ods/templates/empty-8192.fdb.z` (made by 6.0.0.2196),
-//! read with the 2182 isql on 2026-11-06.
+//! The generated skeleton tables against a reference empty database's
+//! RDB$ rows: every (id, name, field count) and the global fields'
+//! shapes. Oracle: an empty 8192 database made by 6.0.0.2196 (the
+//! slice-1 template, deleted with slice 7), read with the 2182 isql
+//! on 2026-11-06.
 
 use fire_crab_ods::catalog_init::{SYS_FIELDS, SYS_RELATIONS};
 

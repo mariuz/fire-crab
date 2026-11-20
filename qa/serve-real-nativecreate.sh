@@ -1,10 +1,11 @@
 #!/bin/bash
-# CREATE DATABASE WITHOUT A FIREBIRD INSTALL - op_create writes the
-# engine's own empty database (crates/ods/templates, made by 6.0.0.2196)
-# and makes it its own: a fresh GUID, the creation time, the page size the
+# CREATE DATABASE WITHOUT A FIREBIRD INSTALL - op_create assembles the
+# catalog natively (crates/ods/catalog_assemble, the INI_format epic) and
+# makes it its own: a fresh GUID, the creation time, the page size the
 # engine would pick, the DEFAULT CHARACTER SET. It once spawned the engine's
-# `isql`; this gate runs the server with a PATH holding no Firebird tool
-# and no $FC_ISQL, so a create that still needed one fails here.
+# `isql`, then inflated engine-made templates; this gate runs the server
+# with a PATH holding no Firebird tool and no $FC_ISQL, so a create that
+# still needed one fails here.
 #
 # Every database is made twice, by the engine and by this server, from the
 # same CREATE DATABASE text, and the ENGINE reads both: the same catalog
@@ -63,7 +64,7 @@ create() {
 CAT="SELECT MON\$PAGE_SIZE, MON\$ODS_MAJOR, MON\$ODS_MINOR, MON\$SQL_DIALECT, MON\$READ_ONLY, MON\$FORCED_WRITES, MON\$SWEEP_INTERVAL, MON\$RESERVE_SPACE FROM MON\$DATABASE;
 SELECT RDB\$CHARACTER_SET_NAME, RDB\$SECURITY_CLASS, RDB\$LINGER, RDB\$DESCRIPTION FROM RDB\$DATABASE;
 SELECT R.RDB\$RELATION_NAME, (SELECT COUNT(*) FROM RDB\$RELATION_FIELDS F WHERE F.RDB\$RELATION_NAME = R.RDB\$RELATION_NAME) FROM RDB\$RELATIONS R ORDER BY 1;
-SELECT 'F', COUNT(*) FROM RDB\$FIELDS UNION ALL SELECT 'TY', COUNT(*) FROM RDB\$TYPES UNION ALL SELECT 'IX', COUNT(*) FROM RDB\$INDICES UNION ALL SELECT 'SEG', COUNT(*) FROM RDB\$INDEX_SEGMENTS UNION ALL SELECT 'CO', COUNT(*) FROM RDB\$COLLATIONS UNION ALL SELECT 'CS', COUNT(*) FROM RDB\$CHARACTER_SETS UNION ALL SELECT 'UP', COUNT(*) FROM RDB\$USER_PRIVILEGES UNION ALL SELECT 'SC', COUNT(*) FROM RDB\$SCHEMAS UNION ALL SELECT 'PK', COUNT(*) FROM RDB\$PACKAGES UNION ALL SELECT 'PR', COUNT(*) FROM RDB\$PROCEDURES UNION ALL SELECT 'FN', COUNT(*) FROM RDB\$FUNCTIONS UNION ALL SELECT 'SEC', COUNT(*) FROM RDB\$SECURITY_CLASSES UNION ALL SELECT 'GEN', COUNT(*) FROM RDB\$GENERATORS UNION ALL SELECT 'BF', COUNT(*) FROM RDB\$BACKUP_HISTORY;"
+SELECT 'F', COUNT(*) FROM RDB\$FIELDS UNION ALL SELECT 'TY', COUNT(*) FROM RDB\$TYPES UNION ALL SELECT 'IX', COUNT(*) FROM RDB\$INDICES UNION ALL SELECT 'SEG', COUNT(*) FROM RDB\$INDEX_SEGMENTS UNION ALL SELECT 'CO', COUNT(*) FROM RDB\$COLLATIONS UNION ALL SELECT 'CS', COUNT(*) FROM RDB\$CHARACTER_SETS UNION ALL SELECT 'UP', COUNT(*) FROM RDB\$USER_PRIVILEGES UNION ALL SELECT 'SC', COUNT(*) FROM RDB\$SCHEMAS UNION ALL SELECT 'PK', COUNT(*) FROM RDB\$PACKAGES UNION ALL SELECT 'PR', COUNT(*) FROM RDB\$PROCEDURES UNION ALL SELECT 'FN', COUNT(*) FROM RDB\$FUNCTIONS UNION ALL SELECT 'SEC', COUNT(*) FROM RDB\$SECURITY_CLASSES UNION ALL SELECT 'GEN', COUNT(*) FROM RDB\$GENERATORS UNION ALL SELECT 'BF', COUNT(*) FROM RDB\$BACKUP_HISTORY UNION ALL SELECT 'FM', COUNT(*) FROM RDB\$FORMATS;"
 # the ENGINE reads both files: the same catalog
 engine_reads() { # <name>
     check "engine reads $1: the catalog of this server's file is the engine's own" "$(run "127.0.0.1/$REAL:$D/e-$1.fdb" "$CAT")" "$(run "127.0.0.1/$REAL:$D/f-$1.fdb" "$CAT")"

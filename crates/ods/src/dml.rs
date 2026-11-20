@@ -425,6 +425,103 @@ fn write_at_spot(file: &mut crate::Image, page_size: usize, spot: &Spot, rec: &[
     clear_fill_bits(file, page_size, spot.page_no, 0x10); // ppg_dp_empty
 }
 
+/// Rewrite one slot's bytes without moving its record number: same
+/// page, same slot, only the directory entry changes. When the new
+/// record fits the old extent it lands in place; otherwise it moves to
+/// the page's free gap (directory end to lowest live offset - the
+/// `find_space` measure scoped to this page) and the old bytes go stale
+/// but unread. The caller owns transactional meaning: this is the
+/// create-time catalog poke, no back version, no transaction id - the
+/// `RDB$RUNTIME` repoint slice 5b does after the index builds (record
+/// numbers stable, so no index maintenance).
+pub(crate) fn rewrite_slot_same_page(
+    file: &mut crate::Image,
+    page_size: usize,
+    page_no: u32,
+    slot: u16,
+    new_rec: &[u8],
+) -> Result<(), String> {
+    let page = crate::page_at(file, page_size, page_no).ok_or("rewrite page out of range")?;
+    let count = u16_at(page, 22) as usize;
+    if slot as usize >= count {
+        return Err("rewrite slot out of range".into());
+    }
+    let dir = DPG_RPT_OFFSET + slot as usize * 4;
+    let (old_off, old_len) = (u16_at(page, dir) as usize, u16_at(page, dir + 2) as usize);
+    if new_rec.len() <= old_len {
+        let page = crate::page_mut(file, page_size, page_no).ok_or("rewrite page out of range")?;
+        page[old_off..old_off + new_rec.len()].copy_from_slice(new_rec);
+        put_u16(page, dir + 2, new_rec.len() as u16);
+        return Ok(());
+    }
+    let aligned = (new_rec.len() + 3) & !3;
+    let gap = |page: &[u8]| {
+        let mut bottom = page_size;
+        for i in 0..count {
+            let at = DPG_RPT_OFFSET + i * 4;
+            let (off, len) = (u16_at(page, at) as usize, u16_at(page, at + 2) as usize);
+            if i == slot as usize || len == 0 {
+                continue;
+            }
+            if off < bottom {
+                bottom = off;
+            }
+        }
+        bottom
+    };
+    let dir_top = DPG_RPT_OFFSET + count * 4;
+    let mut bottom = gap(page);
+    if bottom < dir_top + aligned {
+        // Reclaim this session's stale extents (previous rewrites left
+        // their old bytes behind) before giving up.
+        compact_data_page(file, page_size, page_no, count)?;
+        let page = crate::page_at(file, page_size, page_no).ok_or("rewrite page out of range")?;
+        bottom = gap(page);
+        if bottom < dir_top + aligned {
+            return Err("no room on the page for the rewritten slot".into());
+        }
+    }
+    let offset = (bottom - aligned) & !3;
+    let page = crate::page_mut(file, page_size, page_no).ok_or("rewrite page out of range")?;
+    page[offset..offset + new_rec.len()].copy_from_slice(new_rec);
+    put_u16(page, dir, offset as u16);
+    put_u16(page, dir + 2, new_rec.len() as u16);
+    Ok(())
+}
+
+/// Defragment one data page: repack every live slot's bytes
+/// contiguously from the page end down (4-aligned, as placed),
+/// updating directory offsets. Slot NUMBERS never move, so record
+/// numbers - and every index over them - are untouched; only the byte
+/// offsets change. Reclaims the stale extents `rewrite_slot_same_page`
+/// leaves behind.
+fn compact_data_page(
+    file: &mut crate::Image,
+    page_size: usize,
+    page_no: u32,
+    count: usize,
+) -> Result<(), String> {
+    let page = crate::page_at(file, page_size, page_no).ok_or("compact page out of range")?;
+    let mut live: Vec<(u16, usize, usize)> = Vec::new();
+    for i in 0..count {
+        let at = DPG_RPT_OFFSET + i * 4;
+        let (off, len) = (u16_at(page, at) as usize, u16_at(page, at + 2) as usize);
+        if len > 0 {
+            live.push((i as u16, off, len));
+        }
+    }
+    live.sort_by(|a, b| b.1.cmp(&a.1));
+    let snapshot = page.to_vec();
+    let page = crate::page_mut(file, page_size, page_no).ok_or("compact page out of range")?;
+    let mut cursor = page_size;
+    for (slot, off, len) in live {
+        cursor -= (len + 3) & !3;
+        page[cursor..cursor + len].copy_from_slice(&snapshot[off..off + len]);
+        put_u16(page, DPG_RPT_OFFSET + slot as usize * 4, cursor as u16);
+    }
+    Ok(())
+}
+
 /// Find `page_no`'s slot on its relation's pointer pages and clear
 /// `mask` in the fill-bits byte (ods.h:841-853: one byte per slot
 /// after the full page-number vector capacity).
@@ -1116,6 +1213,20 @@ pub fn insert_blob_cs(
     sub_type: u16,
     charset: u8,
 ) -> Result<u64, String> {
+    let rec = build_level0_blh(segments, sub_type, charset)?;
+    insert_blob_slot(file, page_size, rel, &rec)
+}
+
+/// The level-0 blh bytes `insert_blob_cs` lays down: header plus the
+/// `[u16 len]`-framed segments inline. Split out so callers with their
+/// own placement (the `RDB$RUNTIME` store, which keeps blobs off the
+/// row pages its rewrites need room on) can build here and place via
+/// [insert_blob_slot_after].
+pub(crate) fn build_level0_blh(
+    segments: &[Vec<u8>],
+    sub_type: u16,
+    charset: u8,
+) -> Result<Vec<u8>, String> {
     let payload: usize = segments.iter().map(|s| s.len()).sum();
     let max_segment = segments.iter().map(|s| s.len()).max().unwrap_or(0);
     if max_segment > u16::MAX as usize {
@@ -1135,7 +1246,79 @@ pub fn insert_blob_cs(
         rec.extend_from_slice(&(seg.len() as u16).to_le_bytes());
         rec.extend_from_slice(seg);
     }
-    insert_blob_slot(file, page_size, rel, &rec)
+    Ok(rec)
+}
+
+/// [insert_blob_slot], but only onto data pages past `after_page`
+/// (extending the relation when none has room) - the `RDB$RUNTIME`
+/// store passes the last row page so its blobs never eat the free gap
+/// the row rewrites that follow need.
+pub(crate) fn insert_blob_slot_after(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel: u16,
+    blh: &[u8],
+    after_page: u32,
+) -> Result<u64, String> {
+    if blh.len() > page_size - DPG_RPT_OFFSET - 4 {
+        return Err("blob header larger than a data-page slot".into());
+    }
+    let spot = match find_space_after(file, page_size, rel, blh.len(), after_page) {
+        Some(s) => s,
+        None => {
+            extend_relation(file, page_size, rel)?;
+            find_space_after(file, page_size, rel, blh.len(), after_page)
+                .ok_or("no room for the blob even on a fresh data page")?
+        }
+    };
+    write_at_spot(file, page_size, &spot, blh);
+    let seq = crate::u32_at(
+        crate::page_at(file, page_size, spot.page_no).ok_or("blob page out of range")?,
+        16,
+    ) as u64;
+    Ok(seq * crate::format::max_recs_per_dp(page_size) + spot.slot as u64)
+}
+
+/// [find_space] restricted to data pages past `after_page`.
+fn find_space_after(
+    file: &crate::Image,
+    page_size: usize,
+    rel: u16,
+    rec_len: usize,
+    after_page: u32,
+) -> Option<Spot> {
+    let aligned = (rec_len + 3) & !3;
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        if dp_no <= after_page {
+            continue;
+        }
+        let page = crate::page_at(file, page_size, dp_no)?;
+        let dp = DataPage::decode(page)?;
+        let count = dp.count;
+        let mut bottom = page_size;
+        let mut reuse: Option<u16> = None;
+        for i in 0..count {
+            let at = DPG_RPT_OFFSET + i as usize * 4;
+            let (off, len) = (u16_at(page, at) as usize, u16_at(page, at + 2) as usize);
+            if len == 0 {
+                if reuse.is_none() {
+                    reuse = Some(i);
+                }
+            } else if off < bottom {
+                bottom = off;
+            }
+        }
+        let (slot, append) = match reuse {
+            Some(i) => (i, false),
+            None => (count, true),
+        };
+        let dir_top = DPG_RPT_OFFSET + (count as usize + if append { 1 } else { 0 }) * 4;
+        if bottom >= dir_top + aligned {
+            let offset = (bottom - aligned) & !3;
+            return Some(Spot { page_no: dp_no, slot, append, offset });
+        }
+    }
+    None
 }
 
 /// Write a fully built blh (header + inline payload or page vector)
