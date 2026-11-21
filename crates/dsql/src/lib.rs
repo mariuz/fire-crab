@@ -1697,6 +1697,17 @@ enum MapEntry {
     /// `.. WITHIN GROUP (ORDER BY ..)` adds `EB <n> <sort keys>` after the
     /// delimiter (measured)
     List(bool, Val, Val, Vec<(bool, Val)>),
+    /// An ordered-set / hypothetical-set aggregate (slice 55):
+    /// blr_agg_function (C7) with the engine's counted name
+    /// (`PERCENTILE_CONT`, `PERCENTILE_DISC`, `RANK_AGG`,
+    /// `DENSE_RANK_AGG`, `PERCENT_RANK_AGG`, `CUME_DIST_AGG`), the
+    /// direct-argument count
+    /// and values, then the WITHIN GROUP ordering exactly as LIST's
+    /// (`EB <n> <sort keys>`). A percentile carries its fraction and
+    /// its single sort key as the two direct arguments; a hypothetical
+    /// carries its values (any count - an arity mismatch stores and
+    /// raises at run time, measured).
+    Hypo(String, Vec<Val>, Vec<(bool, Val)>),
 }
 
 struct P<'a> {
@@ -1810,6 +1821,11 @@ struct P<'a> {
     /// source interpreter cannot call a function), so the server refuses it
     /// if exe cannot convert the compiled BLR (a generator, etc.)
     saw_user_fn: bool,
+    /// set when the body holds an ordered-set / hypothetical-set
+    /// aggregate (slice 55) - the BLR executor converts no
+    /// blr_agg_function it does not know, so the server declines (the
+    /// route) or refuses to store (a routine) such a body
+    saw_hypo_agg: bool,
     /// tables locked by a body SELECT ... WITH LOCK (single-table
     /// shapes only - the lock sites refuse the rest), for the
     /// server's system/virtual/temporary-table refusal, which needs
@@ -1840,6 +1856,7 @@ impl<'a> P<'a> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            saw_hypo_agg: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
             proc: None,
@@ -2660,7 +2677,9 @@ impl<'a> P<'a> {
                 // an AGGREGATE in a view's select list is outside this
                 // surface (the RSE would need a group) - refuse, as before
                 Tok::Ident(w)
-                    if matches!(w.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "LIST")
+                    if (matches!(w.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "LIST")
+                        || (within_agg_blr_name(w).is_some()
+                            && self.paren_close(self.i + 1).is_some_and(|c| self.within_follows(c))))
                         && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) =>
                 {
                     return None;
@@ -3619,6 +3638,25 @@ impl<'a> P<'a> {
                 return None; // an aggregate inside an aggregate: the engine's 42000
             }
             let entry = MapEntry::Fn(name.to_string(), args);
+            let slot = match self.agg_map.iter().position(|e| *e == entry) {
+                Some(i) => i,
+                None => {
+                    self.agg_map.push(entry);
+                    self.agg_map.len() - 1
+                }
+            };
+            return Some(Val::Fid(self.agg_fid_ctx, slot as u16));
+        }
+        // an ordered-set / hypothetical-set call (slice 55): only
+        // with its WITHIN GROUP trailer - anything else falls through
+        // (a bare `RANK(5)` is the engine's -104, `RANK() OVER (..)`
+        // belongs to the window path)
+        if self.agg_mode
+            && within_agg_blr_name(name).is_some()
+            && self.paren_close(self.i).is_some_and(|c| self.within_follows(c))
+        {
+            let entry = self.parse_within_agg(name)?;
+            self.saw_hypo_agg = true;
             let slot = match self.agg_map.iter().position(|e| *e == entry) {
                 Some(i) => i,
                 None => {
@@ -5289,6 +5327,97 @@ impl<'a> P<'a> {
         }
         self.agg_map.push(entry);
         (self.agg_map.len() - 1) as u16
+    }
+
+    /// Slice 55: `WITHIN GROUP (` follows the call closing at `close`.
+    fn within_follows(&self, close: usize) -> bool {
+        matches!(self.t.get(close + 1), Some(Tok::Ident(w)) if w == "WITHIN")
+            && matches!(self.t.get(close + 2), Some(Tok::Ident(w)) if w == "GROUP")
+            && matches!(self.t.get(close + 3), Some(Tok::LParen))
+    }
+
+    /// Slice 55: an ordered-set / hypothetical-set call with self.i ON
+    /// its opening paren (the name already read): the direct arguments
+    /// (literals, or one CAST over one - measured), then the required
+    /// WITHIN GROUP ordering. A percentile takes exactly one argument
+    /// and one sort key and carries the key as its second direct
+    /// argument; a hypothetical takes one or more values. FILTER and
+    /// OVER after the call refuse (measured: the engine's 42000 - a
+    /// percentile window stores on the engine, unprobed here).
+    fn parse_within_agg(&mut self, name: &str) -> Option<MapEntry> {
+        let blr_name = within_agg_blr_name(name)?.to_string();
+        let percentile = matches!(name, "PERCENTILE_CONT" | "PERCENTILE_DISC");
+        self.i += 1; // (
+        let mut args = Vec::new();
+        loop {
+            let a = self.val()?;
+            if !within_direct_arg(&a) {
+                return None;
+            }
+            args.push(a);
+            match self.t.get(self.i)? {
+                Tok::Comma => self.i += 1,
+                Tok::RParen => {
+                    self.i += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        if percentile && args.len() != 1 {
+            return None;
+        }
+        if !self.kw("WITHIN") || !self.kw("GROUP") || !matches!(self.t.get(self.i), Some(Tok::LParen)) {
+            return None;
+        }
+        self.i += 1;
+        if !self.kw("ORDER") || !self.kw("BY") {
+            return None;
+        }
+        // the keys read the source rows, as LIST's do
+        let saved = self.agg_mode;
+        self.agg_mode = false;
+        let mut order = Vec::new();
+        // a percentile's second direct argument is the sort key
+        // UNWRAPPED (measured: no B2/B4 placement travels in it)
+        let mut first_raw: Option<Val> = None;
+        loop {
+            let k = self.val()?;
+            let desc = if self.kw("DESC") {
+                true
+            } else {
+                let _ = self.kw("ASC");
+                false
+            };
+            if percentile && first_raw.is_none() {
+                first_raw = Some(k.clone());
+            }
+            let k = self.nulls_placement(k)?;
+            order.push((desc, k));
+            if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        self.agg_mode = saved;
+        if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+            return None;
+        }
+        self.i += 1;
+        if percentile && order.len() != 1 {
+            return None;
+        }
+        if order.iter().any(|(_, k)| val_has_subq(k)) {
+            return None;
+        }
+        if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "FILTER" || w == "OVER") {
+            return None;
+        }
+        if percentile {
+            args.push(first_raw?);
+        }
+        Some(MapEntry::Hypo(blr_name, args, order))
     }
 
     fn bool_or(&mut self) -> Option<Bool> {
@@ -7001,6 +7130,7 @@ pub fn compile_view_columns(sql: &str) -> Option<Vec<Option<Vec<u8>>>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            saw_hypo_agg: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -7164,6 +7294,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            saw_hypo_agg: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -7971,6 +8102,14 @@ impl<'a> SubqCollector<'a> {
                     self.val(k);
                 }
             }
+            MapEntry::Hypo(_, args, order) => {
+                for x in args {
+                    self.val(x);
+                }
+                for (_, k) in order {
+                    self.val(k);
+                }
+            }
         }
     }
 }
@@ -8371,6 +8510,14 @@ fn reslot_rec_map_entry(e: &MapEntry, r: &Reslot, top: bool) -> MapEntry {
                 .map(|(b, k)| (*b, reslot_rec_val(k, r, top)))
                 .collect(),
         ),
+        MapEntry::Hypo(n, args, order) => MapEntry::Hypo(
+            n.clone(),
+            args.iter().map(|a| reslot_rec_val(a, r, top)).collect(),
+            order
+                .iter()
+                .map(|(b, k)| (*b, reslot_rec_val(k, r, top)))
+                .collect(),
+        ),
     }
 }
 
@@ -8400,6 +8547,9 @@ fn entry_has_subq(e: &MapEntry) -> bool {
         MapEntry::Fn(_, args) => args.iter().any(val_has_subq),
         MapEntry::List(_, v, s, order) => {
             val_has_subq(v) || val_has_subq(s) || order.iter().any(|(_, k)| val_has_subq(k))
+        }
+        MapEntry::Hypo(_, args, order) => {
+            args.iter().any(val_has_subq) || order.iter().any(|(_, k)| val_has_subq(k))
         }
     }
 }
@@ -8649,6 +8799,51 @@ fn stat_agg_arity(n: &str) -> Option<usize> {
         | "REGR_INTERCEPT" | "REGR_R2" | "REGR_SLOPE" | "REGR_SXX" | "REGR_SXY" | "REGR_SYY" => 2,
         _ => return None,
     })
+}
+
+/// Slice 55: the ordered-set / hypothetical-set aggregate verbs and the
+/// counted name the engine stores for each (measured: the hypothetical
+/// verbs travel with an `_AGG` suffix).
+fn within_agg_blr_name(n: &str) -> Option<&'static str> {
+    Some(match n {
+        "PERCENTILE_CONT" => "PERCENTILE_CONT",
+        "PERCENTILE_DISC" => "PERCENTILE_DISC",
+        "RANK" => "RANK_AGG",
+        "DENSE_RANK" => "DENSE_RANK_AGG",
+        "PERCENT_RANK" => "PERCENT_RANK_AGG",
+        "CUME_DIST" => "CUME_DIST_AGG",
+        _ => return None,
+    })
+}
+
+/// Slice 55: a direct argument the engine stores as written - a plain
+/// literal, or one CAST over a plain literal (measured: a column, a
+/// parameter, or a CAST over a column is the engine's 42000 / 2F000).
+/// Constant-folded expressions (`1 + 1`, `UPPER('a')`) store on the
+/// engine too, unprobed here - they refuse, the interpreter serves.
+fn within_direct_arg(v: &Val) -> bool {
+    match v {
+        Val::Int(_)
+        | Val::Int64(_)
+        | Val::Dec(..)
+        | Val::Str(_)
+        | Val::DoubleLit(_)
+        | Val::Bool(_)
+        | Val::TemporalLit(_)
+        | Val::Null => true,
+        Val::Cast(_, inner) => matches!(
+            inner.as_ref(),
+            Val::Int(_)
+                | Val::Int64(_)
+                | Val::Dec(..)
+                | Val::Str(_)
+                | Val::DoubleLit(_)
+                | Val::Bool(_)
+                | Val::TemporalLit(_)
+                | Val::Null
+        ),
+        _ => false,
+    }
 }
 
 fn contains_winref(v: &Val) -> bool {
@@ -10949,6 +11144,20 @@ fn emit_map_entries(out: &mut Vec<u8>, map: &[MapEntry]) {
                     }
                 }
             }
+            MapEntry::Hypo(name, args, order) => {
+                out.push(blr::AGG_FUNCTION);
+                out.push(name.len() as u8);
+                out.extend_from_slice(name.as_bytes());
+                out.push(args.len() as u8);
+                for a in args {
+                    emit_val(out, a);
+                }
+                out.push(0xEB); // the WITHIN GROUP ordering, as LIST's
+                out.push(order.len() as u8);
+                for (desc, k) in order {
+                    emit_sort_key(out, *desc, k);
+                }
+            }
         }
     }
 }
@@ -12415,6 +12624,17 @@ impl<'a> P<'a> {
                     {
                         found = true;
                     }
+                    // slice 55: a hypothetical-set call needs the local
+                    // map too - but only WITH its trailer (`RANK() OVER`
+                    // is a window, a bare `RANK(5)` refuses elsewhere)
+                    Some(Tok::Ident(w))
+                        if within_agg_blr_name(w).is_some()
+                            && matches!(self.t.get(k + 1), Some(Tok::LParen))
+                            && !stack.iter().any(|x| *x)
+                            && self.paren_close(k + 1).is_some_and(|c| self.within_follows(c)) =>
+                    {
+                        found = true;
+                    }
                     Some(Tok::Ident(w))
                         if matches!(w.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
                             && matches!(self.t.get(k + 1), Some(Tok::LParen))
@@ -12462,6 +12682,13 @@ impl<'a> P<'a> {
                     || matches!(self.t.get(e), Some(Tok::Comma))
                     || matches!(self.t.get(e), Some(Tok::Ident(a)) if a == "AS" || !is_keyword(a))
             });
+            // slice 55: a hypothetical-set call (`RANK(5) WITHIN
+            // GROUP ..`) is an aggregate, not a window - keep it off
+            // the window arm so the value path parses it
+            let hypo_ahead = matches!(self.t.get(self.i), Some(Tok::Ident(w))
+                if within_agg_blr_name(w).is_some())
+                && matches!(self.t.get(self.i + 1), Some(Tok::LParen))
+                && self.paren_close(self.i + 1).is_some_and(|c| self.within_follows(c));
             // an aggregate call that is the WHOLE item takes its own arm;
             // inside an expression it is a value of the aggregate's map
             let agg_whole = !agg_expr_ahead || self.window_call_end(self.i).is_some() || {
@@ -12525,7 +12752,7 @@ impl<'a> P<'a> {
                             | "NTH_VALUE"
                             | "LAG"
                             | "LEAD"
-                    ) && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) && win_whole =>
+                    ) && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) && win_whole && !hypo_ahead =>
                 {
                     let w = w.clone();
                     self.i += 2;
@@ -18729,6 +18956,7 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            saw_hypo_agg: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -18820,6 +19048,7 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            saw_hypo_agg: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -18898,6 +19127,7 @@ pub fn compile_index_condition(sql: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            saw_hypo_agg: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -18996,6 +19226,7 @@ fn compile_check_inner(sql: &str, table: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            saw_hypo_agg: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -19282,6 +19513,7 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            saw_hypo_agg: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -19394,6 +19626,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
             pkg_members: Vec::new(),
             plain_funcs: Vec::new(),
             saw_user_fn: false,
+            saw_hypo_agg: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -19679,6 +19912,10 @@ pub struct ProcCompiled {
     /// the body binds a bare plain user-function call - it must run via
     /// exe (see [P::saw_user_fn]); the server checks exe can convert the BLR
     pub calls_user_fn: bool,
+    /// the body holds an ordered-set / hypothetical-set aggregate (slice
+    /// 55) - exe converts no such blr_agg_function yet (see
+    /// [P::saw_hypo_agg]); the server declines or refuses to store it
+    pub uses_hypo_agg: bool,
     /// tables a body SELECT locks (WITH LOCK, single-table shapes),
     /// for the server's system/virtual/temporary refusal
     pub locked_tables: Vec<String>,
@@ -19764,6 +20001,7 @@ fn compile_routine_full(
         selectable: bo.selectable,
         source,
         calls_user_fn: p.saw_user_fn,
+        uses_hypo_agg: p.saw_hypo_agg,
         locked_tables: std::mem::take(&mut p.locked_tables),
     })
 }

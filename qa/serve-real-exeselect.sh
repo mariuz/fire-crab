@@ -640,6 +640,26 @@ route "53 a statistical verb over the recursion declines" declined "WITH RECURSI
 route "53 FILTER over the recursion declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT SUM(A.ID) FILTER (WHERE A.ID > 1) FROM N A"
 route "53 a HAVING subquery over the recursion declines" declined "WITH RECURSIVE N AS (SELECT ID FROM T WHERE ID = 1 UNION ALL SELECT N.ID + 1 FROM N WHERE N.ID < 5) SELECT COUNT(*) FROM N A HAVING COUNT(*) > (SELECT COUNT(*) FROM T)"
 
+echo "--- 55 ordered-set / hypothetical-set aggregates (slice 55): the BLR path declines, the interpreter serves"
+route "55 PERCENTILE_CONT over a scaled column with a NULL" declined "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY N) FROM T"
+route "55 PERCENTILE_DISC over a BIGINT with a NULL" declined "SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY B) FROM T"
+route "55 RANK over a BIGINT" declined "SELECT RANK(25) WITHIN GROUP (ORDER BY B) FROM T"
+route "55 DENSE_RANK and CUME_DIST side by side" declined "SELECT DENSE_RANK(2) WITHIN GROUP (ORDER BY G), CUME_DIST(7) WITHIN GROUP (ORDER BY B) FROM T"
+route "55 PERCENT_RANK over a BIGINT" declined "SELECT PERCENT_RANK(25) WITHIN GROUP (ORDER BY B) FROM T"
+route "55 a grouped percentile" declined "SELECT G, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY N) FROM T GROUP BY G ORDER BY G"
+route "55 a percentile in HAVING" declined "SELECT G FROM T GROUP BY G HAVING PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY N) > 0 ORDER BY G"
+route "55 a two-key hypothetical" declined "SELECT RANK(2, 'x') WITHIN GROUP (ORDER BY G, S) FROM T"
+route "55 PERCENTILE_DISC over text" declined "SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY S) FROM T"
+route "55 an expression order key" declined "SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY B + 0) FROM T"
+route "55 a folded direct argument refuses in the compiler, the interpreter serves" declined "SELECT RANK(1 + 1) WITHIN GROUP (ORDER BY B) FROM T"
+route "55 an out-of-range fraction raises on both" declined "SELECT PERCENTILE_CONT(2) WITHIN GROUP (ORDER BY B) FROM T"
+# (no route cell for a percentile window: the compiler refuses it and the
+#  interpreter answers 42000 where the engine serves the rows; no cell for
+#  an arity mismatch either: both raise the engine's 42000 text, but fc
+#  raises at prepare with no described column where the engine describes
+#  RANK_AGG first - the compiler side of both is pinned byte-identical in
+#  qa/dsql-proc-blr.sh, refusal and stored mismatch respectively)
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1

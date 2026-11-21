@@ -135,7 +135,9 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 53 aggregate completeness over the recursion (LIST, statistical verbs, FILTER, aggregates in expressions,
    HAVING predicates, the subquery allocation order),
    slice 54 the plain-path subquery allocation order (mains fixed; WHERE/ITEMS/ORDER plain, WHERE/ORDER/GROUP/HAVING
-   with the aggregate node last, right-first union branches).
+   with the aggregate node last, right-first union branches),
+   slice 55 ordered-set / hypothetical-set aggregates (PERCENTILE_CONT/DISC, RANK/DENSE_RANK/PERCENT_RANK/CUME_DIST WITHIN GROUP -
+   the compiler holds them byte-identical, the route honestly declines, the interpreter serves).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -306,6 +308,27 @@ replacement of the C++ engine is below, in priority order. Full text:
    probe source is now verified against `RDB$PROCEDURE_SOURCE` before decoding. Pre-existing reds re-confirmed
    identical at the slice-53 base (exe EP101/EP158, exeselect §17 + SKIP7); branchtype 69/69, unit tests 93+5 with
    one stale EXISTS-pair pin re-read off the engine.
+   DONE (slice 55): ordered-set / hypothetical-set aggregates on the BLR path - PERCENTILE_CONT / PERCENTILE_DISC
+   (the fraction plus the single sort key as the two direct arguments) and RANK / DENSE_RANK / PERCENT_RANK / CUME_DIST (any count
+   of direct values): blr_agg_function with the engine's counted name (the hypothetical verbs with an `_AGG` suffix)
+   and the WITHIN GROUP ordering exactly as LIST's (`EB <n> <sort keys>`), all byte-identical off `RDB$PROCEDURE_BLR`
+   (dsql-proc-blr +30/+22 to 1411, dsql-view-blr +2 refuses; exe-run-blr +0 with no executor change - `fcexe` refuses
+   the unknown verb cleanly). Direct arguments are literals or one CAST over one (a column, a parameter or a CAST over
+   a column is the engine's 42000/2F000); an arity mismatch, an out-of-range fraction and a folded constant all STORE
+   (the first two raise at run time; the constants refuse here, unprobed); FILTER / OVER after the call, a bare call,
+   a multi-key or two-argument percentile, a zero-argument hypothetical, subqueries in the keys, and the shape in a
+   union branch, a recursion, a WHERE clause, a window partition or a view all refuse. The route declines every
+   compiled shape under its own honest bucket (`uses_hypo_agg` - before the flag they fell into the byteish-text
+   bucket through the octet_length default-true) and the interpreter serves (exeselect §55: twelve cells; percentile and
+   hypoagg gates green). Two interpreter boundaries recorded, not fixed: a percentile window (the compiler refuses and
+   the interpreter answers 42000 where the engine serves the rows) and an arity mismatch (both raise the engine's
+   42000 text, but fc raises at prepare with no described column where the engine describes RANK_AGG first). Stored
+   routines holding a hypothetical refuse at CREATE beside the user-function guard (the executor could not run the
+   stored BLR). Compile declines 1448 → 1387 with the 73-line WITHIN cluster moved to the new bucket (4 lines stay:
+   two pre-existing HAVING-composition limits - an INT128 literal, an IN-list - and two folded-constant boundaries);
+   every other cluster bit-stable except two traffic-jittered ones (attachment's-set +17, bound-rounds +23 from
+   red/green flips between runs - neither holds a hypothetical). Pre-existing reds re-confirmed at HEAD by
+   stash-compare (identical cells): exeselect §17, exe EP101/EP158; branchtype 69/69, unit tests 93+5.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).
