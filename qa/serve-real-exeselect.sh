@@ -660,6 +660,18 @@ route "55 an out-of-range fraction raises on both" declined "SELECT PERCENTILE_C
 #  RANK_AGG first - the compiler side of both is pinned byte-identical in
 #  qa/dsql-proc-blr.sh, refusal and stored mismatch respectively)
 
+echo "--- 56 AT TIME ZONE / AT LOCAL (slice 56): the BLR path declines, the interpreter serves"
+route "56 a TIMESTAMP column at a fixed offset" declined "SELECT TS AT TIME ZONE '+02:00' FROM T ORDER BY ID"
+route "56 a TIME column at a fixed offset" declined "SELECT TM AT TIME ZONE '-05:30' FROM T ORDER BY ID"
+route "56 a DATE column at UTC" declined "SELECT D AT TIME ZONE 'UTC' FROM T ORDER BY ID"
+route "56 two AT values side by side" declined "SELECT TS AT TIME ZONE '+02:00', TM AT TIME ZONE '+02:00' FROM T ORDER BY ID"
+route "56 an AT comparison in WHERE" declined "SELECT ID FROM T WHERE TS AT TIME ZONE '+02:00' = TIMESTAMP '2024-01-02 12:00:00 UTC' ORDER BY ID"
+route "56 a chained AT" declined "SELECT TS AT TIME ZONE '+02:00' AT TIME ZONE '-03:00' FROM T ORDER BY ID"
+route "56 AT LOCAL" declined "SELECT TS AT LOCAL FROM T ORDER BY ID"
+# (no route cell for a ruled named zone: the compiler holds it
+#  byte-identical, but the interpreter refuses what it cannot place
+#  without tzdata rules - the attimezone gate's recorded boundary)
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1

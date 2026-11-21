@@ -31947,7 +31947,7 @@ fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<
     }
     // the stored source is the client's text, comments included
     c.source = raw_source(sql, &c.source);
-    if (c.calls_user_fn || c.uses_hypo_agg) && !exe_can_run(&c.blob) {
+    if (c.calls_user_fn || c.uses_hypo_agg || c.uses_at_tz) && !exe_can_run(&c.blob) {
         return None; // stores BLR fc could not itself run - refuse instead
     }
     // a parameter DEFAULT this server cannot encode (an integer outside
@@ -32896,7 +32896,7 @@ fn plan_create_function(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
     if !routine_locked_ok(db, &c.locked_tables) {
         return None;
     }
-    if (c.calls_user_fn || c.uses_hypo_agg) && !exe_can_run(&c.blob) {
+    if (c.calls_user_fn || c.uses_hypo_agg || c.uses_at_tz) && !exe_can_run(&c.blob) {
         return None; // stores BLR fc could not itself run - refuse instead
     }
     if c.outs.len() != 1 {
@@ -131248,6 +131248,12 @@ fn exe_select(
     // blr_agg_function yet - the interpreter serves the decline
     if compiled.uses_hypo_agg {
         return decline("a WITHIN GROUP aggregate");
+    }
+    // An AT TIME ZONE / AT LOCAL value (slice 56): the compiler holds
+    // the shape byte-identical, but the BLR executor converts no verb
+    // 216 yet - the interpreter serves the decline
+    if compiled.uses_at_tz {
+        return decline("an AT TIME ZONE expression");
     }
     // THE EXECUTOR COMPARES TEXT BY CODE POINT, blank-trimmed: right for
     // NONE, OCTETS, ASCII, UNICODE_FSS and UTF8's own collation, wrong for

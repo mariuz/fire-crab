@@ -352,4 +352,15 @@ refuse "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY SALARY) FROM EMPLOYEE
 refuse "SELECT RANK(5) WITHIN GROUP (ORDER BY SALARY) FROM EMPLOYEE"
 # (2 refuses above)
 
+# --- slice 56: AT TIME ZONE in a view. A union-free view stores the
+#     rse skeleton only (the projection lives in RDB$FIELDS, which this
+#     compiler does not emit), so only unions pin the operator - and the
+#     fixture's only temporal is a DATE, whose AT the engine rejects in
+#     a view ("expression evaluation not supported" - measured), so the
+#     pins refuse exactly as the engine does
+FCDSQL_CATALOG="$U42CAT" refuse "SELECT HIRED AT TIME ZONE 'UTC' AS X FROM EMPLOYEE UNION ALL SELECT HIRED AT TIME ZONE 'UTC' FROM EMPLOYEE"
+FCDSQL_CATALOG="$U42CAT" refuse "SELECT HIRED AT LOCAL AS X FROM EMPLOYEE UNION ALL SELECT HIRED AT LOCAL FROM EMPLOYEE"
+FCDSQL_CATALOG="$U42CAT" refuse "SELECT HIRED AT TIME ZONE 'UTC' AS X FROM EMPLOYEE UNION ALL SELECT HIRED AT TIME ZONE 'Europe/Berlin' FROM EMPLOYEE"
+# (3 refuses above)
+
 exit $fail

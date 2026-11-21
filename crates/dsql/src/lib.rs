@@ -317,6 +317,9 @@ mod blr {
     pub const CURRENT_TIME: u8 = 0xA2;
     /// blr_equiv - null-safe equality, MATCHING's comparator (probed)
     pub const EQUIV: u8 = 0x2E;
+    /// `<value> AT TIME ZONE <zone>` / `AT LOCAL` (slice 56): verb +
+    /// operand + has-zone byte + optional zone (probed)
+    pub const AT_TZ: u8 = 0xD8;
     /// IN AUTONOMOUS TRANSACTION DO: blr_auto_trans, a sub-code byte
     /// (0), the statement (probed)
     pub const AUTO_TRANS: u8 = 0xBB;
@@ -439,6 +442,14 @@ enum Val {
     /// the literal 0xFFFFFFFF, no negate verb)
     Neg(Box<Val>),
     Concat(Box<Val>, Box<Val>),
+    /// `<operand> AT TIME ZONE <zone>` (slice 56): verb 0xD8, the
+    /// operand, a has-zone byte, the zone - `AT LOCAL` travels with
+    /// no zone (None) and a 00 byte (all measured). The operand is a
+    /// tight value and so is a bare zone (no `||`, no binary
+    /// operators, no unary signs except a folded literal's); a
+    /// parenthesised zone is a full expression. The operator chains
+    /// left.
+    AtTz(Box<Val>, Option<Box<Val>>),
     /// a literal past blr_long's 32 bits: blr_int64
     Int64(i64),
     Upper(Box<Val>),
@@ -1271,6 +1282,12 @@ fn stamp_val(v: &mut Val, cn: &str) {
             stamp_val(a, cn);
             stamp_val(b, cn);
         }
+        Val::AtTz(x, z) => {
+            stamp_val(x, cn);
+            if let Some(zz) = z {
+                stamp_val(zz, cn);
+            }
+        }
         Val::Neg(a) | Val::Upper(a) | Val::Lower(a) | Val::Extract(_, a) | Val::NullsPlaced(_, a) => stamp_val(a, cn),
         _ => {}
     }
@@ -1826,6 +1843,11 @@ struct P<'a> {
     /// blr_agg_function it does not know, so the server declines (the
     /// route) or refuses to store (a routine) such a body
     saw_hypo_agg: bool,
+    /// set when the body holds an `AT TIME ZONE` / `AT LOCAL` value
+    /// (slice 56) - the BLR executor converts no verb 216 yet, so the
+    /// server declines (the route) or refuses to store (a routine)
+    /// such a body
+    saw_at_tz: bool,
     /// tables locked by a body SELECT ... WITH LOCK (single-table
     /// shapes only - the lock sites refuse the rest), for the
     /// server's system/virtual/temporary-table refusal, which needs
@@ -1857,6 +1879,7 @@ impl<'a> P<'a> {
             plain_funcs: Vec::new(),
             saw_user_fn: false,
             saw_hypo_agg: false,
+            saw_at_tz: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
             proc: None,
@@ -3015,37 +3038,47 @@ impl<'a> P<'a> {
         let saved = self.sub.replace(si);
         let saved_host = self.host;
         self.host = saved;
-        let col = match col {
-            None => None,
-            Some((q, n)) => Some(self.field(q.as_deref(), &n)?),
-        };
-        let expr = match expr_span {
-            None => None,
-            Some((start, end)) => {
-                let cur = self.i;
-                self.i = start;
-                let v = self.val()?;
-                if self.i != end {
-                    return None; // the item did not parse to FROM
+        // the scope restores on failure too: a `?` below once leaked
+        // the subquery's `sub` into the enclosing parse, and a
+        // select-item retry (which rewinds the cursor and truncates
+        // the streams, but not the scope) then resolved the item's
+        // first bare field against a dead stream index (measured:
+        // `... || (SELECT FIRST 1 U FROM TU)` panicked the compiler)
+        let r = (|| {
+            let col = match col {
+                None => None,
+                Some((q, n)) => Some(self.field(q.as_deref(), &n)?),
+            };
+            let expr = match expr_span {
+                None => None,
+                Some((start, end)) => {
+                    let cur = self.i;
+                    self.i = start;
+                    let v = self.val()?;
+                    if self.i != end {
+                        return None; // the item did not parse to FROM
+                    }
+                    self.i = cur;
+                    Some(Val::DerivedWrap(ctx, Box::new(v)))
                 }
-                self.i = cur;
-                Some(Val::DerivedWrap(ctx, Box::new(v)))
-            }
-        };
-        let agg = match agg_raw {
-            None => None,
-            Some((verb, None)) => Some((verb, None, agg_slot)),
-            Some((verb, Some((q, n)))) => {
-                Some((verb, Some(self.field(q.as_deref(), &n)?), agg_slot))
-            }
-        };
-        let wher = if self.kw("WHERE") {
-            Some(Box::new(self.bool_or()?))
-        } else {
-            None
-        };
+            };
+            let agg = match agg_raw {
+                None => None,
+                Some((verb, None)) => Some((verb, None, agg_slot)),
+                Some((verb, Some((q, n)))) => {
+                    Some((verb, Some(self.field(q.as_deref(), &n)?), agg_slot))
+                }
+            };
+            let wher = if self.kw("WHERE") {
+                Some(Box::new(self.bool_or()?))
+            } else {
+                None
+            };
+            Some((col, expr, agg, wher))
+        })();
         self.sub = saved;
         self.host = saved_host;
+        let (col, expr, agg, wher) = r?;
         if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
             return None; // joins, comma-FROM etc. in a subquery: unconverted
         }
@@ -3325,6 +3358,89 @@ impl<'a> P<'a> {
     /// 04 03 28 00 <field>`; a CHAR keeps blr_text2). A literal's COLLATE
     /// is the engine's 22021, an expression's unprobed: both refuse.
     fn val_atom(&mut self) -> Option<Val> {
+        let mut v = self.val_collated()?;
+        // `<value> AT TIME ZONE <zone>` / `<value> AT LOCAL` (slice 56):
+        // a tight postfix (measured: tighter than `||` and than unary
+        // minus, chains left). An `AT` that starts something else (an
+        // alias, a keyword) gives the text back untouched, as the
+        // interpreter's twin does; past a matched `TIME ZONE` a bad
+        // zone fails hard
+        loop {
+            let save = self.i;
+            if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "AT") {
+                break;
+            }
+            self.i += 1;
+            if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "LOCAL") {
+                self.i += 1;
+                // a window under the operator (measured: the engine
+                // stores it) refuses - an unbuilt WinRef must never
+                // reach the emitter's unreachable
+                if contains_winref(&v) || contains_attz_param(&v) {
+                    return None;
+                }
+                // a DATE-typed operand refuses (measured: the engine
+                // stores it in a procedure but rejects it in a view -
+                // "expression evaluation not supported" - and the
+                // compiler cannot tell the two apart here)
+                if matches!(self.branch_dsc(&v), Some(BranchDsc::Date)) {
+                    return None;
+                }
+                v = Val::AtTz(Box::new(v), None);
+                self.saw_at_tz = true;
+                continue;
+            }
+            if !(self.kw("TIME") && self.kw("ZONE")) {
+                self.i = save;
+                break;
+            }
+            let z = self.at_tz_zone()?;
+            if matches!(self.branch_dsc(&v), Some(BranchDsc::Date)) {
+                return None;
+            }
+            let w = Val::AtTz(Box::new(v), Some(Box::new(z)));
+            if contains_winref(&w) || contains_attz_param(&w) {
+                return None;
+            }
+            v = w;
+            self.saw_at_tz = true;
+        }
+        Some(v)
+    }
+
+    /// `<operand> AT TIME ZONE <zone>`'s zone (slice 56): a bare tight
+    /// value (no `||`, no binary operators - measured: an
+    /// unparenthesised `||` binds outside the operator), or a
+    /// parenthesised full expression (measured: `||`, arithmetic, a
+    /// nested AT, a scalar subquery all store). A sign folds into a
+    /// numeric literal only (a negated anything-else is unprobed on
+    /// the engine and refuses)
+    fn at_tz_zone(&mut self) -> Option<Val> {
+        let neg = matches!(self.t.get(self.i), Some(Tok::Minus));
+        let plus = !neg && matches!(self.t.get(self.i), Some(Tok::Plus));
+        if neg || plus {
+            self.i += 1;
+        }
+        let z = self.val_atom_inner()?;
+        if neg || plus {
+            match z {
+                Val::Int(n) => Some(if neg { Val::Int(n.checked_neg()?) } else { Val::Int(n) }),
+                Val::Int64(n) => Some(if neg { Val::Int64(n.checked_neg()?) } else { Val::Int64(n) }),
+                Val::Dec(r, sc) => Some(if neg {
+                    Val::Dec(r.checked_neg()?, sc)
+                } else {
+                    Val::Dec(r, sc)
+                }),
+                _ => None,
+            }
+        } else {
+            Some(z)
+        }
+    }
+
+    /// A [P::val_atom_inner] with its `COLLATE <name>` postfix split out
+    /// (slice 56), so the `AT TIME ZONE` loop sits above the collation
+    fn val_collated(&mut self) -> Option<Val> {
         let v = self.val_atom_inner()?;
         if !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "COLLATE") {
             return Some(v);
@@ -4690,6 +4806,17 @@ impl<'a> P<'a> {
                 Some(x) if *x == blr::DATE => Some(BranchDsc::Date),
                 Some(x) if *x == blr::TIME => Some(BranchDsc::Time),
                 Some(x) if *x == blr::TIMESTAMP => Some(BranchDsc::Timestamp),
+                _ => None,
+            },
+            // `<x> AT TIME ZONE <z>` (slice 56): TIME-ish stays TIME WITH
+            // TIME ZONE, a TIMESTAMP, DATE or zoned stamp becomes TIMESTAMP
+            // WITH TIME ZONE (measured B7/B8/A8); anything else (text,
+            // numerics, NULL) refuses - unprobed in a union
+            Val::AtTz(a, _) => match self.union_branch_dsc(a)? {
+                BranchDsc::Time | BranchDsc::TimeTz => Some(BranchDsc::TimeTz),
+                BranchDsc::Timestamp | BranchDsc::TimestampTz | BranchDsc::Date => {
+                    Some(BranchDsc::TimestampTz)
+                }
                 _ => None,
             },
             // a hex literal is text in OCTETS
@@ -6066,6 +6193,17 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             emit_val(out, a);
             emit_val(out, b);
         }
+        Val::AtTz(x, z) => {
+            out.push(blr::AT_TZ);
+            emit_val(out, x);
+            match z {
+                Some(zz) => {
+                    out.push(1);
+                    emit_val(out, zz);
+                }
+                None => out.push(0),
+            }
+        }
         Val::Int64(n) => {
             out.push(blr::LITERAL);
             out.push(blr::INT64);
@@ -7131,6 +7269,7 @@ pub fn compile_view_columns(sql: &str) -> Option<Vec<Option<Vec<u8>>>> {
             plain_funcs: Vec::new(),
             saw_user_fn: false,
             saw_hypo_agg: false,
+            saw_at_tz: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -7295,6 +7434,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
             plain_funcs: Vec::new(),
             saw_user_fn: false,
             saw_hypo_agg: false,
+            saw_at_tz: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -7876,6 +8016,12 @@ fn collect_fields(v: &Val, out: &mut Vec<Val>) {
             collect_fields(a, out);
             collect_fields(b, out);
         }
+        Val::AtTz(x, z) => {
+            collect_fields(x, out);
+            if let Some(zz) = z {
+                collect_fields(zz, out);
+            }
+        }
         Val::Neg(a) => collect_fields(a, out),
         _ => {}
     }
@@ -7902,6 +8048,12 @@ fn collect_group_fields(k: &Val, out: &mut Vec<Val>) {
         | Val::Concat(a, b) => {
             collect_group_fields(a, out);
             collect_group_fields(b, out);
+        }
+        Val::AtTz(x, z) => {
+            collect_group_fields(x, out);
+            if let Some(zz) = z {
+                collect_group_fields(zz, out);
+            }
         }
         Val::Neg(a) => collect_group_fields(a, out),
         Val::Upper(a) | Val::Lower(a) => collect_group_fields(a, out),
@@ -7995,6 +8147,12 @@ impl<'a> SubqCollector<'a> {
                     self.val(w);
                 }
                 self.val(x);
+            }
+            Val::AtTz(x, z) => {
+                self.val(x);
+                if let Some(zz) = z {
+                    self.val(zz);
+                }
             }
             Val::Coalesce(vs) | Val::SysFn(_, vs) | Val::Fn(_, vs) | Val::SubFn(_, vs) => {
                 for x in vs {
@@ -8860,6 +9018,24 @@ fn contains_winref(v: &Val) -> bool {
     }
 }
 
+/// a `:name` input or a body local anywhere under the value (slice
+/// 56: the engine rejects a parameter on either side of `AT TIME
+/// ZONE` with 2F000 - measured - so the operator refuses one rather
+/// than emit BLR the engine would not store)
+fn contains_attz_param(v: &Val) -> bool {
+    match v {
+        Val::InParam(_) | Val::LocalVar(_) => true,
+        _ => {
+            let mut hit = false;
+            let _ = map_children(v, &mut |c| {
+                hit |= contains_attz_param(c);
+                Some(c.clone())
+            });
+            hit
+        }
+    }
+}
+
 /// A branch-item value reaching outside its own branch scope - a
 /// subquery, a generator step, a user-function call, an aggregate /
 /// window / union slot, a derived-table wrapper, a sort-only
@@ -9000,6 +9176,13 @@ fn map_children(v: &Val, f: &mut dyn FnMut(&Val) -> Option<Val>) -> Option<Val> 
         Val::Mul(x, y) => Val::Mul(b(f(x)?), b(f(y)?)),
         Val::Div(x, y) => Val::Div(b(f(x)?), b(f(y)?)),
         Val::Concat(x, y) => Val::Concat(b(f(x)?), b(f(y)?)),
+        Val::AtTz(x, z) => Val::AtTz(
+            b(f(x)?),
+            match z {
+                Some(zz) => Some(b(f(zz)?)),
+                None => None,
+            },
+        ),
         Val::Neg(x) => Val::Neg(b(f(x)?)),
         Val::Upper(x) => Val::Upper(b(f(x)?)),
         Val::Lower(x) => Val::Lower(b(f(x)?)),
@@ -9807,6 +9990,12 @@ fn collect_rec_group_fields(k: &Val, out: &mut Vec<Val>) {
         | Val::Concat(a, b) => {
             collect_rec_group_fields(a, out);
             collect_rec_group_fields(b, out);
+        }
+        Val::AtTz(x, z) => {
+            collect_rec_group_fields(x, out);
+            if let Some(zz) = z {
+                collect_rec_group_fields(zz, out);
+            }
         }
         Val::Neg(a) => collect_rec_group_fields(a, out),
         Val::Upper(a) | Val::Lower(a) => collect_rec_group_fields(a, out),
@@ -12930,6 +13119,8 @@ impl<'a> P<'a> {
                     }
                     let save_streams = self.streams.len();
                     let save_wins = self.win_found.len();
+                    let save_sub = self.sub;
+                    let save_host = self.host;
                     let v = self.val();
                     self.agg_mode = saved_mode;
                     self.win_cap = None;
@@ -12950,6 +13141,8 @@ impl<'a> P<'a> {
                             self.i = item_start;
                             self.streams.truncate(save_streams);
                             self.win_found.truncate(save_wins);
+                            self.sub = save_sub;
+                            self.host = save_host;
                             if !grouped_ahead && !agg_expr_ahead {
                                 self.win_cap = Some((self.streams.len(), ctx));
                             }
@@ -18957,6 +19150,7 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
             plain_funcs: Vec::new(),
             saw_user_fn: false,
             saw_hypo_agg: false,
+            saw_at_tz: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -19049,6 +19243,7 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
             plain_funcs: Vec::new(),
             saw_user_fn: false,
             saw_hypo_agg: false,
+            saw_at_tz: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -19128,6 +19323,7 @@ pub fn compile_index_condition(sql: &str) -> Option<Vec<u8>> {
             plain_funcs: Vec::new(),
             saw_user_fn: false,
             saw_hypo_agg: false,
+            saw_at_tz: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -19227,6 +19423,7 @@ fn compile_check_inner(sql: &str, table: &str) -> Option<Vec<u8>> {
             plain_funcs: Vec::new(),
             saw_user_fn: false,
             saw_hypo_agg: false,
+            saw_at_tz: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -19514,6 +19711,7 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
             plain_funcs: Vec::new(),
             saw_user_fn: false,
             saw_hypo_agg: false,
+            saw_at_tz: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -19627,6 +19825,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
             plain_funcs: Vec::new(),
             saw_user_fn: false,
             saw_hypo_agg: false,
+            saw_at_tz: false,
             locked_tables: Vec::new(),
             pending_loop_label: None,
         proc: None,
@@ -19916,6 +20115,10 @@ pub struct ProcCompiled {
     /// 55) - exe converts no such blr_agg_function yet (see
     /// [P::saw_hypo_agg]); the server declines or refuses to store it
     pub uses_hypo_agg: bool,
+    /// the body holds an `AT TIME ZONE` / `AT LOCAL` value (slice 56) -
+    /// exe converts no verb 216 yet (see [P::saw_at_tz]); the server
+    /// declines or refuses to store it
+    pub uses_at_tz: bool,
     /// tables a body SELECT locks (WITH LOCK, single-table shapes),
     /// for the server's system/virtual/temporary refusal
     pub locked_tables: Vec<String>,
@@ -20002,6 +20205,7 @@ fn compile_routine_full(
         source,
         calls_user_fn: p.saw_user_fn,
         uses_hypo_agg: p.saw_hypo_agg,
+        uses_at_tz: p.saw_at_tz,
         locked_tables: std::mem::take(&mut p.locked_tables),
     })
 }

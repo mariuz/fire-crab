@@ -137,7 +137,9 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 54 the plain-path subquery allocation order (mains fixed; WHERE/ITEMS/ORDER plain, WHERE/ORDER/GROUP/HAVING
    with the aggregate node last, right-first union branches),
    slice 55 ordered-set / hypothetical-set aggregates (PERCENTILE_CONT/DISC, RANK/DENSE_RANK/PERCENT_RANK/CUME_DIST WITHIN GROUP -
-   the compiler holds them byte-identical, the route honestly declines, the interpreter serves).
+   the compiler holds them byte-identical, the route honestly declines, the interpreter serves),
+   slice 56 AT TIME ZONE / AT LOCAL (blr 0xD8 with the has-zone byte and the operand-kind law - the compiler
+   holds every stored shape byte-identical, the route declines, the interpreter serves).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -329,6 +331,33 @@ replacement of the C++ engine is below, in priority order. Full text:
    every other cluster bit-stable except two traffic-jittered ones (attachment's-set +17, bound-rounds +23 from
    red/green flips between runs - neither holds a hypothetical). Pre-existing reds re-confirmed at HEAD by
    stash-compare (identical cells): exeselect §17, exe EP101/EP158; branchtype 69/69, unit tests 93+5.
+   DONE (slice 56): AT TIME ZONE / AT LOCAL on the BLR path - blr 0xD8 (`D8 <operand> 01 <zone>`,
+   `D8 <operand> 00` for AT LOCAL), a tight postfix above COLLATE (measured: tighter than `||` and
+   than unary minus, chains left), with the operand-kind law in the bytes (a TIME-ish operand takes
+   a TIME WITH TIME ZONE result, a TIMESTAMP / DATE / zoned one a TIMESTAMP WITH TIME ZONE) and a
+   bare tight zone beside a parenthesised full-expression zone (measured: `||`, arithmetic, a nested
+   AT and a scalar subquery all store), all byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr
+   +23/+11 to 1445, dsql-view-blr +3 refuses; exe-run-blr +0 with no executor change - `fcexe`
+   refuses verb 216 cleanly). A parameter on either side is the engine's 2F000 and a bare aggregate
+   in the zone its -104, so both refuse rather than emit BLR the engine would not store; a window
+   under the operator, a ROWS / FIRST / SKIP subquery on either side (all measured to store), a
+   DATE-typed operand (the engine stores it in a procedure but rejects it in a view - "expression
+   evaluation not supported" - and the compiler cannot tell the two apart here), and a zoned
+   literal anywhere (the tz-literal gap, AT-orthogonal) refuse as boundaries. The slice also fixed
+   a pre-existing compiler panic the new shapes detonated: a failed subselect leaked its scope into
+   the enclosing parse, and a select-item retry (which rewinds the cursor and truncates the streams,
+   but not the scope) then resolved the item's first bare field against a dead stream index
+   (`... || (SELECT FIRST 1 U FROM TU)` panicked with no AT anywhere) - both sites now restore, with
+   three panic-regression pins. The route declines every compiled shape under its own bucket
+   (`uses_at_tz`) and the interpreter serves (exeselect §56: seven decline cells). Stored
+   routines holding an AT refuse at CREATE beside the user-function guard (the
+   executor could not run the stored BLR). The recount sweep is bit-stable: 527 gates, 53 red
+   with the red set and all 223 failing cells identical to the slice-55 recount (OK 24917 vs 24985:
+   cmpparam's documented timeout cut 76 checks earlier on a slower run - an exact prefix - against
+   the 7 new §56 cells and one §55 cell added after that recount). The 35 parsed-AT decline lines
+   moved to the new `uses_at_tz` bucket; 25 zoned-literal AT lines stay in `compile` (the
+   tz-literal gap) and 2 decline earlier on a text output. Pre-existing reds re-confirmed at HEAD by
+   stash-compare (identical cells): exeselect §17, exe EP101/EP158; branchtype 69/69, unit tests green.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).
