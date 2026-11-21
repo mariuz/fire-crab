@@ -844,6 +844,61 @@ fn charset_by_name(name: &str) -> Option<(u16, u16)> {
 /// `HH:MM[:SS[.ffff]]` for a TIME, both (one blank between) for a
 /// TIMESTAMP. The engine reads many more spellings (month names, other
 /// separators, TODAY / NOW); every one of them refuses here.
+/// A trailing time-zone designator inside a temporal literal (slice
+/// 57): the zone id plus the displacement in minutes. Mirrors
+/// `TimeZoneUtil::parse` (strict): `±HH:MM` (spaces tolerated around
+/// the parts - measured) validates per `isValidOffset` (`tzm <= 59`,
+/// `tzh < 14 || == 14:00`) and encodes as 1439 + displacement
+/// (`displacementToOffsetZone`); `UTC` / `GMT` (any case) are the
+/// pinned `fb_tzid_utc` / `fb_tzid_gmt` at displacement 0. Any other
+/// region refuses: its id comes from the engine's tzdata copy and its
+/// instant needs DST rules, neither of which this compiler carries
+/// (the interpreter's boundary, unchanged)
+fn temporal_zone_id(z: &str) -> Option<(u16, i32)> {
+    let z = z.trim();
+    if z.eq_ignore_ascii_case("utc") {
+        return Some((64909, 0));
+    }
+    if z.eq_ignore_ascii_case("gmt") {
+        return Some((65535, 0));
+    }
+    let b = z.as_bytes();
+    let (sign, mut i) = match b.first() {
+        Some(b'+') => (1i32, 1),
+        Some(b'-') => (-1i32, 1),
+        _ => return None,
+    };
+    let skip = |i: &mut usize| {
+        while *i < b.len() && (b[*i] == b' ' || b[*i] == b'\t') {
+            *i += 1;
+        }
+    };
+    let number = |i: &mut usize| -> Option<u32> {
+        let start = *i;
+        let mut n: u32 = 0;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            n = n.checked_mul(10)?.checked_add((b[*i] - b'0') as u32)?;
+            *i += 1;
+        }
+        (*i > start).then_some(n)
+    };
+    skip(&mut i);
+    let tzh = number(&mut i)?;
+    skip(&mut i);
+    if b.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    skip(&mut i);
+    let tzm = number(&mut i)?;
+    skip(&mut i);
+    if i != b.len() || tzm > 59 || !(tzh < 14 || (tzh == 14 && tzm == 0)) {
+        return None;
+    }
+    let minutes = sign * (tzh * 60 + tzm) as i32;
+    Some((u16::try_from(1439 + minutes).ok()?, minutes))
+}
+
 fn temporal_literal_bytes(kind: &str, text: &str) -> Option<Vec<u8>> {
     let date = |t: &str| -> Option<i32> {
         let b = t.as_bytes();
@@ -901,14 +956,54 @@ fn temporal_literal_bytes(kind: &str, text: &str) -> Option<Vec<u8>> {
             out.extend_from_slice(&date(text)?.to_le_bytes());
         }
         "TIME" => {
-            out.push(blr::TIME);
-            out.extend_from_slice(&time(text)?.to_le_bytes());
+            let mut parts = text.split_whitespace();
+            let t = parts.next()?;
+            let zone: Vec<&str> = parts.collect();
+            match zone.first() {
+                None => {
+                    out.push(blr::TIME);
+                    out.extend_from_slice(&time(t)?.to_le_bytes());
+                }
+                // a zoned TIME (slice 57): dtype 28, the UTC instant
+                // wrapped into the day (measured: 00:30 +05:00 keeps
+                // 19:30), the zone id
+                Some(_) => {
+                    let (id, minutes) = temporal_zone_id(&zone.join(" "))?;
+                    let wall = time(t)? as i64;
+                    let ticks = (wall - minutes as i64 * 600000).rem_euclid(864000000);
+                    out.push(blr::TIME_TZ);
+                    out.extend_from_slice(&(ticks as u32).to_le_bytes());
+                    out.extend_from_slice(&id.to_le_bytes());
+                }
+            }
         }
         _ => {
-            let (d, t) = text.split_once(' ')?;
-            out.push(blr::TIMESTAMP);
-            out.extend_from_slice(&date(d)?.to_le_bytes());
-            out.extend_from_slice(&time(t)?.to_le_bytes());
+            let mut parts = text.split_whitespace();
+            let d = parts.next()?;
+            let t = parts.next()?;
+            let zone: Vec<&str> = parts.collect();
+            let mjd = date(d)?;
+            let wall = time(t)? as i64;
+            match zone.first() {
+                None => {
+                    out.push(blr::TIMESTAMP);
+                    out.extend_from_slice(&mjd.to_le_bytes());
+                    out.extend_from_slice(&(wall as u32).to_le_bytes());
+                }
+                // a zoned TIMESTAMP (slice 57): dtype 29, the UTC
+                // instant in C-truncated day arithmetic (measured:
+                // forward overflow carries a day, a negative total
+                // keeps its day with a negative time - year 1 +14:00
+                // stores day 0001-01-01 with -14h), the zone id
+                Some(_) => {
+                    let (id, minutes) = temporal_zone_id(&zone.join(" "))?;
+                    let total = mjd as i64 * 864000000 + wall - minutes as i64 * 600000;
+                    out.push(blr::TIMESTAMP_TZ);
+                    out.extend_from_slice(&((total / 864000000) as i32).to_le_bytes());
+                    out.extend_from_slice(&((total % 864000000) as i32).to_le_bytes());
+                    out.extend_from_slice(&id.to_le_bytes());
+                }
+            }
         }
     }
     Some(out)
@@ -3382,8 +3477,10 @@ impl<'a> P<'a> {
                 // a DATE-typed operand refuses (measured: the engine
                 // stores it in a procedure but rejects it in a view -
                 // "expression evaluation not supported" - and the
-                // compiler cannot tell the two apart here)
-                if matches!(self.branch_dsc(&v), Some(BranchDsc::Date)) {
+                // compiler cannot tell the two apart here). The union
+                // typer sees DATE literals and CURRENT_DATE too, which
+                // the CASE/IN typer does not (slice 57)
+                if matches!(self.union_branch_dsc(&v), Some(BranchDsc::Date)) {
                     return None;
                 }
                 v = Val::AtTz(Box::new(v), None);
@@ -3395,7 +3492,7 @@ impl<'a> P<'a> {
                 break;
             }
             let z = self.at_tz_zone()?;
-            if matches!(self.branch_dsc(&v), Some(BranchDsc::Date)) {
+            if matches!(self.union_branch_dsc(&v), Some(BranchDsc::Date)) {
                 return None;
             }
             let w = Val::AtTz(Box::new(v), Some(Box::new(z)));
@@ -4801,11 +4898,16 @@ impl<'a> P<'a> {
             // CURRENT_TIME / CURRENT_TIMESTAMP carry the zone (X13, X14)
             Val::CurrentTime => Some(BranchDsc::TimeTz),
             Val::CurrentTimestamp => Some(BranchDsc::TimestampTz),
-            // a temporal literal's first byte is its dtype (X15)
+            // a temporal literal's first byte is its dtype (X15) -
+            // zoned dtypes (slice 57) carry the zone like the
+            // CURRENT_* forms above (measured: unions of zoned
+            // literals store)
             Val::TemporalLit(b) => match b.first() {
                 Some(x) if *x == blr::DATE => Some(BranchDsc::Date),
                 Some(x) if *x == blr::TIME => Some(BranchDsc::Time),
                 Some(x) if *x == blr::TIMESTAMP => Some(BranchDsc::Timestamp),
+                Some(x) if *x == blr::TIME_TZ => Some(BranchDsc::TimeTz),
+                Some(x) if *x == blr::TIMESTAMP_TZ => Some(BranchDsc::TimestampTz),
                 _ => None,
             },
             // `<x> AT TIME ZONE <z>` (slice 56): TIME-ish stays TIME WITH

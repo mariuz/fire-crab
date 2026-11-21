@@ -139,7 +139,9 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 55 ordered-set / hypothetical-set aggregates (PERCENTILE_CONT/DISC, RANK/DENSE_RANK/PERCENT_RANK/CUME_DIST WITHIN GROUP -
    the compiler holds them byte-identical, the route honestly declines, the interpreter serves),
    slice 56 AT TIME ZONE / AT LOCAL (blr 0xD8 with the has-zone byte and the operand-kind law - the compiler
-   holds every stored shape byte-identical, the route declines, the interpreter serves).
+   holds every stored shape byte-identical, the route declines, the interpreter serves),
+   slice 57 zoned temporal literals (dtype 28/29 with the UTC instant and the zone id - offsets and UTC/GMT
+   compile byte-identical, named regions refuse without tzdata, the route declines, the interpreter serves).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -358,6 +360,29 @@ replacement of the C++ engine is below, in priority order. Full text:
    moved to the new `uses_at_tz` bucket; 25 zoned-literal AT lines stay in `compile` (the
    tz-literal gap) and 2 decline earlier on a text output. Pre-existing reds re-confirmed at HEAD by
    stash-compare (identical cells): exeselect §17, exe EP101/EP158; branchtype 69/69, unit tests green.
+   DONE (slice 57): zoned temporal literals on the BLR path - dtype 28/29, the UTC instant, the zone
+   id. Offsets validate per `isValidOffset` and encode as 1439 + displacement minutes
+   (`displacementToOffsetZone`); UTC / GMT (any case) are the pinned `fb_tzid_utc` / `fb_tzid_gmt`
+   at displacement 0. A TIMESTAMP normalises in C-truncated day arithmetic (forward overflow
+   carries a day, a negative total keeps its day with a negative time); a TIME wraps into the day
+   - all byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +22/+8 to 1476 with one slice-56
+   pin each flipped and added, dsql-view-blr +2 checks; exe-run-blr +0 with no executor change -
+   `fcexe` refuses dtypes 28/29 cleanly). Named regions and Etc/GMT+5 refuse (their ids come from
+   the engine's tzdata copy, their instants need DST rules); `Z`, colonless and out-of-range
+   offsets and zoned DATEs are the engine's own 22009s, matched exactly. The DATE-operand AT
+   guard now types through `union_branch_dsc`, closing the DATE-literal and CURRENT_DATE holes
+   the CASE/IN typer could not see. The route declines every compiled shape (the executor
+   converts no zoned literal yet) and the interpreter serves (exeselect §57: seven decline
+   cells). The recount sweep is bit-stable: 527 gates, 53 red with the red set and all 223 failing
+   cells identical to the slice-55 recount (OK 25045 vs 24985: +15 exeselect cells, +45 cmpparam
+   timeout-prefix). The compile bucket falls 1358 → 1271 with 68 offset/UTC-literal lines moved to
+   the new parse (literal dtype 28/29 unconverted) bucket and the AT bucket up 35 → 52 on the
+   newly-parsing zoned operands; 19 region-literal lines stay in compile, as do offset-literal
+   statements declined for neighboring gaps (TIMEZONE_* EXTRACT, CASE/CAST over temporals). (The
+   first sweep died on transient infra - the engine stopped answering mid-run with 398 reds; a
+   failing gate passes standalone, and the rerun is the record.) Pre-existing reds re-confirmed
+   at HEAD by stash-compare (identical cells):
+   exeselect §17, exe EP101/EP158; branchtype 69/69, unit tests green.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

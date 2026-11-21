@@ -363,4 +363,10 @@ FCDSQL_CATALOG="$U42CAT" refuse "SELECT HIRED AT LOCAL AS X FROM EMPLOYEE UNION 
 FCDSQL_CATALOG="$U42CAT" refuse "SELECT HIRED AT TIME ZONE 'UTC' AS X FROM EMPLOYEE UNION ALL SELECT HIRED AT TIME ZONE 'Europe/Berlin' FROM EMPLOYEE"
 # (3 refuses above)
 
+# --- slice 57: zoned literals in a view union (union-free views keep
+#     the unparsed skeleton, so only unions pin the dtypes)
+check "SELECT TIMESTAMP '2020-06-15 12:00:00 +05:00' AS X FROM EMPLOYEE UNION ALL SELECT TIMESTAMP '2020-06-15 12:00:00 +05:00' FROM EMPLOYEE"
+check "SELECT TIME '12:00:00 UTC' AS X FROM EMPLOYEE UNION ALL SELECT TIME '12:00:00 UTC' FROM EMPLOYEE"
+# (2 checks above)
+
 exit $fail

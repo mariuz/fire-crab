@@ -672,6 +672,18 @@ route "56 AT LOCAL" declined "SELECT TS AT LOCAL FROM T ORDER BY ID"
 #  byte-identical, but the interpreter refuses what it cannot place
 #  without tzdata rules - the attimezone gate's recorded boundary)
 
+echo "--- 57 zoned temporal literals (slice 57): the BLR path declines, the interpreter serves"
+route "57 a zoned TIMESTAMP literal" declined "SELECT TIMESTAMP '2020-06-15 12:00:00 +05:00' FROM T ORDER BY ID"
+route "57 a zoned TIME literal" declined "SELECT TIME '12:00:00 UTC' FROM T ORDER BY ID"
+route "57 a zoned literal in a comparison" declined "SELECT ID FROM T WHERE TS > TIMESTAMP '2024-01-01 00:00:00 +02:00' ORDER BY ID"
+route "57 AT beside a zoned literal" declined "SELECT TS AT TIME ZONE '+02:00', TIMESTAMP '2020-06-15 12:00:00 +05:00' FROM T ORDER BY ID"
+route "57 AT over a zoned literal" declined "SELECT TIMESTAMP '2020-06-15 12:00:00 +05:00' AT TIME ZONE '+02:00' FROM T ORDER BY ID"
+route "57 a day-wrapped zoned TIME" declined "SELECT TIME '00:30:00 +05:00' FROM T ORDER BY ID"
+route "57 a DATE literal AT refuses in the compiler, the interpreter serves" declined "SELECT DATE '2020-06-15' AT TIME ZONE '+02:00' FROM T ORDER BY ID"
+# (no route cell for a named-region literal: the compiler refuses what
+#  it cannot place without tzdata rules - same boundary as the
+#  interpreter's)
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
