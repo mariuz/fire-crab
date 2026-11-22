@@ -716,6 +716,12 @@ route "60 TIMEZONE over a DATE is the engine's prepare-time -105 on both" declin
 #  interpreter's prepare refuses as before - the engine stores the part
 #  literal and fails it at fetch)
 
+echo "--- 61 BIT_LENGTH (slice 61): the BLR path declines, the interpreter serves"
+route "61 BIT_LENGTH over a column" declined "SELECT BIT_LENGTH(S) FROM T ORDER BY ID"
+route "61 BIT_LENGTH over a literal" declined "SELECT BIT_LENGTH('café') FROM T ORDER BY ID"
+route "61 BIT_LENGTH in WHERE" declined "SELECT ID FROM T WHERE BIT_LENGTH(S) > 8 ORDER BY ID"
+route "61 GROUP BY BIT_LENGTH" declined "SELECT BIT_LENGTH(S), COUNT(*) FROM T GROUP BY BIT_LENGTH(S) ORDER BY 1"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1

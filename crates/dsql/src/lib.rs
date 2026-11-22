@@ -4024,11 +4024,13 @@ impl<'a> P<'a> {
             }
             "LOWER" => Val::Lower(Box::new(self.val()?)),
             // blr_strlen's length-type byte: CHAR_LENGTH=1,
-            // OCTET_LENGTH=2 (probed)
+            // OCTET_LENGTH=2 (probed), BIT_LENGTH=0 (blr_strlen_bit,
+            // slice 61)
             "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
                 Val::StrLen(1, Box::new(self.val()?))
             }
             "OCTET_LENGTH" => Val::StrLen(2, Box::new(self.val()?)),
+            "BIT_LENGTH" => Val::StrLen(0, Box::new(self.val()?)),
             "SUBSTRING" => {
                 // SUBSTRING(src FROM a FOR b): blr_substring's start
                 // is 0-BASED and the engine emits subtract(<a>, 1)

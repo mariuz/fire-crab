@@ -148,7 +148,9 @@ replacement of the C++ engine is below, in priority order. Full text:
    the valid shapes),
    slice 60 the TIMEZONE_* parts (blr_extract codes 10/11/12 in EXTRACT and DATEADD /
    DATEDIFF, FIRST_DAY / LAST_DAY keeping the narrow OF set - the compiler holds every
-   shape byte-identical, the route declines, the interpreter serves the valid shapes).
+   shape byte-identical, the route declines, the interpreter serves the valid shapes),
+   slice 61 BIT_LENGTH (blr_strlen kind 0 - the compiler holds every shape byte-identical,
+   the route declines, the interpreter serves).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -452,6 +454,25 @@ replacement of the C++ engine is below, in priority order. Full text:
    / SECOND-in-NULLIF gaps; QUARTER stays out and the 4 DECODE multi-blocker lines
    carry. Pre-existing reds re-confirmed at HEAD by stash-compare (identical cells):
    exeselect §17, exe EP101/EP158; branchtype 69/69, unit tests green.
+   DONE (slice 61): BIT_LENGTH on the BLR path - blr_strlen kind 0 (blr_strlen_bit, not
+   3 - read from blr.h). Items, WHERE and GROUP BY by the raw call like CHAR_LENGTH,
+   blobs included - all byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +5 to
+   1507, dsql-view-blr +2 checks; exe-run-blr +0 with no executor change - `fcexe`
+   parses StrLen but evaluates only kinds 1/2). The route declines at `execute (strlen
+   type 0 unconverted)` (a non-ASCII literal declining earlier on the attachment
+   bucket); the interpreter serves (exeselect §61: four decline cells). The recount
+   sweep is bit-stable: 527 gates, 53 red with the red set identical to the slice-55
+   recount and 224 failing cells - the 223 identical plus one cmpparam flake (the
+   engine answered [2;3] where it and fc stably answer [3]; fc's side matches its
+   documented hex-garbage behavior and the standalone rerun passes OK [3]). OK 24817
+   vs 24985 (+38 exeselect cells against a -206 cmpparam timeout-prefix - this run's
+   1446 an exact prefix of the slice-58 1485, modulo the date and the flaky line).
+   The traced recount doubles as the end census: 1169 compile-decline traces (1050
+   unique) with BIT_LENGTH 16 → 0 - the bucket diff proves exactly the 16 out and
+   zero in, including 2 DECODE-co-occurring lines (DECODE 4 → 2, the TC + COALESCE
+   multi-blockers carrying); TIMEZONE 5 identical, QUARTER 0. Pre-existing reds
+   re-confirmed at HEAD by stash-compare (identical cells): exeselect §17, exe
+   EP101/EP158; branchtype 69/69, unit tests green.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).
