@@ -2010,4 +2010,21 @@ refuse "CREATE PROCEDURE X RETURNS (R TIMESTAMP WITH TIME ZONE) AS BEGIN FOR SEL
 refuse "CREATE PROCEDURE X RETURNS (R DATE) AS BEGIN FOR SELECT DATE '2020-06-15 UTC' FROM PBT INTO :R DO SUSPEND; END"
 # (8 refuses above)
 
+# --- slice 58: the DECODE() function - byte-identical to the simple
+#     CASE (blr_decode; an even arg tail is pairs, an odd tail carries
+#     the default as the last result). Fewer than one pair is the
+#     engine's syntax error; past 254 pairs the engine stores LOSSY
+#     (trailing pairs dropped, counts stuck at 254), so both refuse -
+#     the cap is pinned by unit test (a 255-pair statement would bloat
+#     this battery)
+check "RETURNS (R INTEGER) AS BEGIN FOR SELECT DECODE(ID, 1, 100, 200) FROM SRC INTO :R DO SUSPEND; END"
+check "RETURNS (R INTEGER) AS BEGIN FOR SELECT DECODE(ID, 1, 100) FROM SRC INTO :R DO SUSPEND; END"
+check "RETURNS (R VARCHAR(10)) AS BEGIN FOR SELECT DECODE(C, 'a', 'x', 'y', 'z') FROM TU INTO :R DO SUSPEND; END"
+check "RETURNS (R INTEGER) AS BEGIN FOR SELECT DECODE(DECODE(ID, 1, 2, 3), 2, 20, 30) FROM SRC INTO :R DO SUSPEND; END"
+check "RETURNS (R INTEGER) AS BEGIN FOR SELECT ID FROM SRC WHERE DECODE(ID, 1, 100, 200) > 150 INTO :R DO SUSPEND; END"
+# (5 checks above)
+refuse "CREATE PROCEDURE X RETURNS (R INTEGER) AS BEGIN FOR SELECT DECODE(ID) FROM SRC INTO :R DO SUSPEND; END"
+refuse "CREATE PROCEDURE X RETURNS (R INTEGER) AS BEGIN FOR SELECT DECODE(ID, 1) FROM SRC INTO :R DO SUSPEND; END"
+# (2 refuses above)
+
 exit $fail

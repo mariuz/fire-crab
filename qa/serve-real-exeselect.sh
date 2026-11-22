@@ -684,6 +684,15 @@ route "57 a DATE literal AT refuses in the compiler, the interpreter serves" dec
 #  it cannot place without tzdata rules - same boundary as the
 #  interpreter's)
 
+echo "--- 58 the DECODE() function (slice 58): the BLR path serves"
+route "58 DECODE with a default" served "SELECT DECODE(ID, 1, 100, 200) FROM T ORDER BY ID"
+route "58 DECODE without a default" served "SELECT DECODE(ID, 1, 100) FROM T ORDER BY ID"
+route "58 DECODE in WHERE" served "SELECT ID FROM T WHERE DECODE(ID, 1, 100, 200) > 150 ORDER BY ID"
+route "58 nested DECODE" served "SELECT DECODE(DECODE(ID, 1, 2, 3), 2, 20, 30) FROM T ORDER BY ID"
+route "58 text DECODE declines on the text output" declined "SELECT DECODE(ID, 1, 'aa', 'zz') FROM T ORDER BY ID"
+# (no route cell past 254 pairs: the engine stores lossy there and the
+#  compiler refuses - pinned by unit test)
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1

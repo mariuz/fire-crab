@@ -4160,6 +4160,38 @@ impl<'a> P<'a> {
                     Box::new(Val::ValueIf(Box::new(c), Box::new(a), Box::new(b))),
                 )
             }
+            "DECODE" => {
+                // DECODE(sel, s1, r1, ..., [default]) is byte-identical
+                // to the simple CASE (slice 58, probed): an even arg
+                // tail is pairs, an odd tail carries the default as the
+                // last result. Fewer than one pair is the engine's
+                // syntax error; past 254 pairs the engine stores LOSSY
+                // (trailing pairs dropped, counts stuck at 254 -
+                // measured), so both refuse here
+                let sel = self.val()?;
+                let mut rest = Vec::new();
+                while matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                    self.i += 1;
+                    rest.push(self.val()?);
+                }
+                if rest.len() < 2 {
+                    return None;
+                }
+                let pairs = rest.len() / 2;
+                if pairs > 254 {
+                    return None;
+                }
+                let mut comparands = Vec::with_capacity(pairs);
+                let mut results = Vec::with_capacity(pairs + rest.len() % 2);
+                for i in 0..pairs {
+                    comparands.push(rest[2 * i].clone());
+                    results.push(rest[2 * i + 1].clone());
+                }
+                if rest.len() % 2 == 1 {
+                    results.push(rest[rest.len() - 1].clone());
+                }
+                Val::Decode(Box::new(sel), comparands, results)
+            }
             _ => return None,
         };
         if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
@@ -23254,7 +23286,8 @@ mod tests {
             // an unknown name followed by '(' is a UDF or an
             // unconverted built-in - never a field
             "SELECT ID FROM T WHERE FOO(A) = 1",
-            "SELECT ID FROM T WHERE DECODE(A, 1, 2) = 1",
+            // (DECODE() flipped in slice 58: byte-identical to the
+            // simple CASE)
             "SELECT ID FROM T CROSS JOIN U2",        // no ON clause
             // a FIELD branch in a cast-wrapped conditional: its dsc
             // lives in the catalog - never guess a descriptor
@@ -23356,5 +23389,32 @@ mod employee_sample_bodies {
         let source = source.expect("procedure source compiles");
         assert!(source.blob.contains(&blr::PROCEDURE));
         assert_eq!(parenless.expect("paren-less").blob, paren.expect("paren").blob);
+    }
+
+    /// DECODE past 254 pairs refuses (slice 58): the engine stores
+    /// LOSSY there (trailing pairs dropped, counts stuck at 254 -
+    /// measured), so the compiler holds the truthful range only
+    #[test]
+    fn decode_function_refuses_past_254_pairs() {
+        let pairs = |n: usize| {
+            (1..=n)
+                .map(|i| format!("{i}, {}", i * 10))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let sql = |n: usize| {
+            format!(
+                "SELECT DECODE(1, {}) AS X FROM T UNION ALL SELECT 1 FROM T",
+                pairs(n)
+            )
+        };
+        assert!(
+            compile_view_select_hex(&sql(254)).is_some(),
+            "254 pairs compile"
+        );
+        assert!(
+            compile_view_select_hex(&sql(255)).is_none(),
+            "255 pairs refuse"
+        );
     }
 }

@@ -141,7 +141,8 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 56 AT TIME ZONE / AT LOCAL (blr 0xD8 with the has-zone byte and the operand-kind law - the compiler
    holds every stored shape byte-identical, the route declines, the interpreter serves),
    slice 57 zoned temporal literals (dtype 28/29 with the UTC instant and the zone id - offsets and UTC/GMT
-   compile byte-identical, named regions refuse without tzdata, the route declines, the interpreter serves).
+   compile byte-identical, named regions refuse without tzdata, the route declines, the interpreter serves),
+   slice 58 the DECODE() function (byte-identical to the simple CASE - the BLR path serves).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -383,6 +384,21 @@ replacement of the C++ engine is below, in priority order. Full text:
    failing gate passes standalone, and the rerun is the record.) Pre-existing reds re-confirmed
    at HEAD by stash-compare (identical cells):
    exeselect §17, exe EP101/EP158; branchtype 69/69, unit tests green.
+   DONE (slice 58): the DECODE() function on the BLR path - byte-identical to the simple CASE
+   (`blr_decode`; an even arg tail is pairs, an odd tail carries the default as the last result;
+   NULL matches nothing in both - measured). Fewer than one pair is the engine's syntax error;
+   past 254 pairs the engine stores LOSSY (trailing pairs dropped, counts stuck at 254 -
+   measured), so both refuse - all byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +5/+2
+   to 1483, dsql-view-blr +1 check with one flipped refuse; exe-run-blr +0 with no executor
+   change - `fcexe` already converts and evaluates `blr_decode`). The 254-pair cap is pinned by
+   unit test (a 255-pair statement would bloat the battery). The BLR path SERVES integer
+   DECODEs (exeselect §58: four served cells; text DECODEs decline on the text output as every
+   text value does). The recount sweep is bit-stable: 527 gates, 53 red with the red
+   set and all 223 failing cells identical to the slice-55 recount (OK 24838 vs 24985:
+   +20 exeselect cells against a -167 cmpparam timeout-prefix on a slower run - this
+   run's 1485 an exact prefix of the slice-57 rerun's 1697). Pre-existing reds
+   re-confirmed at HEAD by stash-compare
+   (identical cells): exeselect §17, exe EP101/EP158; branchtype 69/69, unit tests green.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).
