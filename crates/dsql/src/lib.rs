@@ -4007,8 +4007,11 @@ impl<'a> P<'a> {
                         "MILLISECOND" => 8,
                         "WEEK" => 9,
                         // QUARTER is 13, past the TIMEZONE_* parts
-                        // (10/11/12, still refused) - blr.h, slice 59
+                        // (10/11/12) - blr.h, slices 59/60
                         "QUARTER" => 13,
+                        "TIMEZONE_HOUR" => 10,
+                        "TIMEZONE_MINUTE" => 11,
+                        "TIMEZONE_NAME" => 12,
                         _ => return None,
                     },
                     _ => return None,
@@ -4924,7 +4927,10 @@ impl<'a> P<'a> {
                 dsc_to_branch(self.unify_branches_typed(&refs, Self::union_branch_dsc)?)
             }
             // EXTRACT is SMALLINT except SECOND / MILLISECOND (5 / 8),
-            // whose scaled laws are unprobed in unions and refuse (W22)
+            // whose scaled laws are unprobed in unions and refuse (W22) -
+            // and TIMEZONE_NAME (12), which is VARCHAR(32) ASCII (probed
+            // off the view column, slice 60; unifies by the text law)
+            Val::Extract(12, _) => Some(BranchDsc::Text { varying: true, chars: 32, cs: 2 }),
             Val::Extract(part, _) if *part != 5 && *part != 8 => {
                 Some(BranchDsc::Exact(blr::SHORT, 0))
             }
@@ -5134,6 +5140,15 @@ impl<'a> P<'a> {
             p.i += 1;
             Some(Val::Int(code as i32))
         };
+        // FIRST_DAY / LAST_DAY take the narrow OF set, not the full
+        // timestamp_part (parse.y of_first_last_day_part: OF
+        // TIMEZONE_HOUR is the engine's -104) - slice 60
+        let part_code_of = |p: &mut Self| -> Option<Val> {
+            let Some(Tok::Ident(w)) = p.t.get(p.i) else { return None };
+            let code = extract_part_code_of(w)?;
+            p.i += 1;
+            Some(Val::Int(code as i32))
+        };
         let args: Vec<Val> = match name {
             "DATEADD" => {
                 // `<part>, v, d` when a part name is followed by a comma
@@ -5186,7 +5201,7 @@ impl<'a> P<'a> {
                 if !self.kw("OF") {
                     return None;
                 }
-                let part = part_code(self)?;
+                let part = part_code_of(self)?;
                 if !self.kw("FROM") {
                     return None;
                 }
@@ -6098,9 +6113,10 @@ fn sys_function_arity(name: &str) -> Option<(usize, usize)> {
     SYS_FUNCTIONS.iter().find(|(n, ..)| *n == name).map(|(_, lo, hi)| (*lo, *hi))
 }
 
-/// blr_extract's part codes, which DATEADD / DATEDIFF / FIRST_DAY /
-/// LAST_DAY carry as a blr_long literal (measured: DAY 2, MONTH 1, WEEK
-/// 9, MILLISECOND 8, YEAR 0, HOUR 3)
+/// blr_extract's part codes, which DATEADD / DATEDIFF carry as a
+/// blr_long literal (measured: DAY 2, MONTH 1, WEEK 9, MILLISECOND 8,
+/// YEAR 0, HOUR 3) - the engine's full timestamp_part, TIMEZONE_* and
+/// all (DATEADD(TIMEZONE_HOUR, ..) stores - probed, slice 60)
 fn extract_part_code(w: &str) -> Option<u8> {
     Some(match w.to_ascii_uppercase().as_str() {
         "YEAR" => 0,
@@ -6114,8 +6130,23 @@ fn extract_part_code(w: &str) -> Option<u8> {
         "MILLISECOND" => 8,
         "WEEK" => 9,
         // QUARTER is 13, past the TIMEZONE_* parts
-        // (10/11/12, still refused) - blr.h, slice 59
+        // (10/11/12) - blr.h, slices 59/60
         "QUARTER" => 13,
+        "TIMEZONE_HOUR" => 10,
+        "TIMEZONE_MINUTE" => 11,
+        "TIMEZONE_NAME" => 12,
+        _ => return None,
+    })
+}
+
+/// FIRST_DAY / LAST_DAY's narrow OF set (parse.y
+/// of_first_last_day_part - OF TIMEZONE_HOUR is the engine's -104)
+fn extract_part_code_of(w: &str) -> Option<u8> {
+    Some(match w.to_ascii_uppercase().as_str() {
+        "YEAR" => 0,
+        "QUARTER" => 13,
+        "MONTH" => 1,
+        "WEEK" => 9,
         _ => return None,
     })
 }

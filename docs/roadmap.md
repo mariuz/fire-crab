@@ -145,7 +145,10 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 58 the DECODE() function (byte-identical to the simple CASE - the BLR path serves),
    slice 59 the QUARTER part (blr_extract code 13 in EXTRACT, FIRST_DAY / LAST_DAY, DATEADD /
    DATEDIFF - the compiler holds every shape byte-identical, the route declines, the interpreter serves
-   the valid shapes).
+   the valid shapes),
+   slice 60 the TIMEZONE_* parts (blr_extract codes 10/11/12 in EXTRACT and DATEADD /
+   DATEDIFF, FIRST_DAY / LAST_DAY keeping the narrow OF set - the compiler holds every
+   shape byte-identical, the route declines, the interpreter serves the valid shapes).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -427,6 +430,28 @@ replacement of the C++ engine is below, in priority order. Full text:
    ~15% in; no pre-slice total.) Pre-existing reds re-confirmed at HEAD by
    stash-compare (identical cells): exeselect §17, exe EP101/EP158; branchtype 69/69,
    unit tests green.
+   DONE (slice 60): the TIMEZONE_* parts on the BLR path - blr_extract codes 10/11/12.
+   EXTRACT and DATEADD / DATEDIFF take the engine's full timestamp_part
+   (DATEADD(TIMEZONE_HOUR, ..) stores the part literal - probed), while FIRST_DAY /
+   LAST_DAY keep the narrow OF set (YEAR / QUARTER / MONTH / WEEK - OF TIMEZONE_HOUR is
+   the engine's -104, as is OF DAY, which this compiler used to accept) - all
+   byte-identical off `RDB$PROCEDURE_BLR` (dsql-proc-blr +8/+3 with three obsolete
+   refuses retired, to 1502; dsql-view-blr +2 checks; exe-run-blr +0 with no executor
+   change). TIMEZONE_NAME is VARCHAR(32) ASCII and unifies by the text law (probed:
+   same-kind and literal unions). The route declines the EXTRACT-family shapes; the
+   interpreter serves (exeselect §60: seven decline cells, NULL answering NULL and a
+   DATE operand the prepare-time -105 on both). DATEADD / DATEDIFF with a TIMEZONE_*
+   part compile but never reach the route - the interpreter's prepare refuses, as
+   before; the engine fails them at fetch ("Invalid part Unknown ..."). The recount
+   sweep is bit-stable: 527 gates, 53 red with the red set and all 223 failing cells
+   identical to the slice-55 recount (OK 25130 vs 24985: +34 exeselect cells and a
+   +111 cmpparam timeout-prefix - this run's 1763 extends the slice-57 rerun's 1697 on
+   the same prefix, modulo the session date). The traced recount doubles as the end
+   census: 1189 compile-decline traces (1066 unique) with TIMEZONE_* 23 → 5 - 18 moved
+   out, 4 staying on named-region literals and 1 on the pre-existing CASE-over-EXTRACT
+   / SECOND-in-NULLIF gaps; QUARTER stays out and the 4 DECODE multi-blocker lines
+   carry. Pre-existing reds re-confirmed at HEAD by stash-compare (identical cells):
+   exeselect §17, exe EP101/EP158; branchtype 69/69, unit tests green.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

@@ -704,6 +704,18 @@ route "59 QUARTER over a TIME is the engine's prepare-time -105 on both" decline
 # (no route cell for DATEADD / DATEDIFF with QUARTER: the engine raises
 #  its fetch-time Invalid part, the interpreter refuses as before)
 
+echo "--- 60 the TIMEZONE_* parts (slice 60): the BLR path declines, the interpreter serves"
+route "60 TIMEZONE_HOUR over a TIMESTAMP" declined "SELECT EXTRACT(TIMEZONE_HOUR FROM TS) FROM T ORDER BY ID"
+route "60 TIMEZONE_MINUTE over a TIME" declined "SELECT EXTRACT(TIMEZONE_MINUTE FROM TM) FROM T ORDER BY ID"
+route "60 TIMEZONE_NAME over a TIMESTAMP" declined "SELECT EXTRACT(TIMEZONE_NAME FROM TS) FROM T ORDER BY ID"
+route "60 TIMEZONE in WHERE" declined "SELECT ID FROM T WHERE EXTRACT(TIMEZONE_HOUR FROM TS) = 2 ORDER BY ID"
+route "60 TIMEZONE over a zoned literal" declined "SELECT EXTRACT(TIMEZONE_HOUR FROM TIMESTAMP '2020-06-15 12:00:00 +05:00') FROM T ORDER BY ID"
+route "60 TIMEZONE_NAME over NULL answers NULL" declined "SELECT EXTRACT(TIMEZONE_NAME FROM NULL) FROM T ORDER BY ID"
+route "60 TIMEZONE over a DATE is the engine's prepare-time -105 on both" declined "SELECT EXTRACT(TIMEZONE_HOUR FROM D) FROM T ORDER BY ID"
+# (no route cell for DATEADD / DATEDIFF with a TIMEZONE_* part: the
+#  interpreter's prepare refuses as before - the engine stores the part
+#  literal and fails it at fetch)
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
