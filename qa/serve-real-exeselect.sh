@@ -693,6 +693,17 @@ route "58 text DECODE declines on the text output" declined "SELECT DECODE(ID, 1
 # (no route cell past 254 pairs: the engine stores lossy there and the
 #  compiler refuses - pinned by unit test)
 
+echo "--- 59 the QUARTER part (slice 59): the BLR path declines, the interpreter serves"
+route "59 EXTRACT(QUARTER) over a DATE" declined "SELECT EXTRACT(QUARTER FROM D) FROM T ORDER BY ID"
+route "59 EXTRACT(QUARTER) over a TIMESTAMP" declined "SELECT EXTRACT(QUARTER FROM TS) FROM T ORDER BY ID"
+route "59 QUARTER in WHERE" declined "SELECT ID FROM T WHERE EXTRACT(QUARTER FROM D) = 2 ORDER BY ID"
+route "59 FIRST_DAY OF QUARTER" declined "SELECT FIRST_DAY(OF QUARTER FROM D) FROM T ORDER BY ID"
+route "59 LAST_DAY OF QUARTER" declined "SELECT LAST_DAY(OF QUARTER FROM D) FROM T ORDER BY ID"
+route "59 GROUP BY QUARTER" declined "SELECT EXTRACT(QUARTER FROM D), COUNT(*) FROM T GROUP BY EXTRACT(QUARTER FROM D) ORDER BY 1"
+route "59 QUARTER over a TIME is the engine's prepare-time -105 on both" declined "SELECT EXTRACT(QUARTER FROM TM) FROM T ORDER BY ID"
+# (no route cell for DATEADD / DATEDIFF with QUARTER: the engine raises
+#  its fetch-time Invalid part, the interpreter refuses as before)
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1

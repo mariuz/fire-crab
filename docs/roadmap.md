@@ -142,7 +142,10 @@ replacement of the C++ engine is below, in priority order. Full text:
    holds every stored shape byte-identical, the route declines, the interpreter serves),
    slice 57 zoned temporal literals (dtype 28/29 with the UTC instant and the zone id - offsets and UTC/GMT
    compile byte-identical, named regions refuse without tzdata, the route declines, the interpreter serves),
-   slice 58 the DECODE() function (byte-identical to the simple CASE - the BLR path serves).
+   slice 58 the DECODE() function (byte-identical to the simple CASE - the BLR path serves),
+   slice 59 the QUARTER part (blr_extract code 13 in EXTRACT, FIRST_DAY / LAST_DAY, DATEADD /
+   DATEDIFF - the compiler holds every shape byte-identical, the route declines, the interpreter serves
+   the valid shapes).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -399,6 +402,31 @@ replacement of the C++ engine is below, in priority order. Full text:
    run's 1485 an exact prefix of the slice-57 rerun's 1697). Pre-existing reds
    re-confirmed at HEAD by stash-compare
    (identical cells): exeselect §17, exe EP101/EP158; branchtype 69/69, unit tests green.
+   DONE (slice 59): the QUARTER part on the BLR path - blr_extract code 13 (past the
+   TIMEZONE_* 10/11/12, still refused as the follow-up cluster) in EXTRACT, FIRST_DAY /
+   LAST_DAY, DATEADD / DATEDIFF. The engine stores blr_extract/13 (one byte from YEAR -
+   probed) and the sys-function part literal 13 - all byte-identical off
+   `RDB$PROCEDURE_BLR` (dsql-proc-blr +8/+3 to 1494, dsql-view-blr +2 checks;
+   exe-run-blr +0 with no executor change - `fcexe` converts neither verb 159 nor part
+   13). QUARTER is SMALLINT (probed off the view column). The route declines: EXTRACT
+   shapes at the text bucket over byteish relations (`parse (value verb 159 unconverted)`
+   otherwise - the whole EXTRACT family's standing behavior), FIRST_DAY / LAST_DAY at
+   `execute (a date part of another kind unconverted)`; the interpreter serves all of
+   them (exeselect §59: seven decline cells, QUARTER-over-TIME the engine's prepare-time
+   -105 on both). DATEADD / DATEDIFF QUARTER compile but never reach the route - the
+   interpreter's prepare refuses (`take_dd_unit` takes no QUARTER), as before; the
+   engine's fetch-time Invalid part stays a recorded gap (no route cell). The recount
+   sweep is bit-stable: 527 gates, 53 red with the red set and all 223 failing cells
+   identical to the slice-55 recount (OK 24933 vs 24985: +27 exeselect cells against a
+   -79 cmpparam timeout-prefix - this run's 1573 extends the slice-58 1485 on the same
+   prefix toward the slice-57 rerun's 1697, modulo the session date). The traced recount
+   doubles as the end census: 1207 compile-decline traces (1084 unique) with QUARTER
+   fully out - all 14 cluster statements moved to the parse/text/execute buckets
+   (targeted trace runs), the 23 TIMEZONE_* lines byte-identical as the follow-up
+   cluster. (The start census died on transient infra - the engine stopped answering
+   ~15% in; no pre-slice total.) Pre-existing reds re-confirmed at HEAD by
+   stash-compare (identical cells): exeselect §17, exe EP101/EP158; branchtype 69/69,
+   unit tests green.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

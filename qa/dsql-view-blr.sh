@@ -375,4 +375,10 @@ check "SELECT TIME '12:00:00 UTC' AS X FROM EMPLOYEE UNION ALL SELECT TIME '12:0
 check "SELECT DECODE(EMP_NO, 1, 100, 200) AS X FROM EMPLOYEE UNION ALL SELECT 1 FROM EMPLOYEE"
 # (1 check above)
 
+# --- slice 59: the QUARTER part in view WHERE predicates
+#     (the projection leaves no trace, the predicate encodes)
+check "SELECT EMP_NO FROM EMPLOYEE WHERE EXTRACT(QUARTER FROM HIRED) = 2"
+check "SELECT EMP_NO FROM EMPLOYEE WHERE FIRST_DAY(OF QUARTER FROM HIRED) > DATE '2024-01-01'"
+# (2 checks above)
+
 exit $fail

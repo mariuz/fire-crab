@@ -4006,6 +4006,9 @@ impl<'a> P<'a> {
                         "YEARDAY" => 7,
                         "MILLISECOND" => 8,
                         "WEEK" => 9,
+                        // QUARTER is 13, past the TIMEZONE_* parts
+                        // (10/11/12, still refused) - blr.h, slice 59
+                        "QUARTER" => 13,
                         _ => return None,
                     },
                     _ => return None,
@@ -6110,6 +6113,9 @@ fn extract_part_code(w: &str) -> Option<u8> {
         "YEARDAY" => 7,
         "MILLISECOND" => 8,
         "WEEK" => 9,
+        // QUARTER is 13, past the TIMEZONE_* parts
+        // (10/11/12, still refused) - blr.h, slice 59
+        "QUARTER" => 13,
         _ => return None,
     })
 }
