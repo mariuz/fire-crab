@@ -153,7 +153,11 @@ replacement of the C++ engine is below, in priority order. Full text:
    the route declines, the interpreter serves),
    slice 62 JOINs inside derived tables (the nested rse holds the join chain or the flat
    comma list - the compiler holds every shape byte-identical, the route serves the chains
-   through the shared nested-rse machinery with no executor change, the flat comma declines).
+   through the shared nested-rse machinery with no executor change, the flat comma declines),
+   slice 63 FILTER over expression arguments (the desugared CAST takes the union column
+   laws, MOD answers its first operand's dtype at scale 0 - the compiler holds every
+   shape byte-identical, the route serves through the desugared CAST/CASE with no
+   executor change).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -511,6 +515,27 @@ replacement of the C++ engine is below, in priority order. Full text:
    declining by design), and a worktree build of the slice-61 compiler refuses
    all five; the BIT_LENGTH strlen-0 bucket sits stable (3 + the café literal
    on the text bucket, by design).
+   DONE (slice 63): FILTER over expression arguments - the desugared
+   `CAST(CASE WHEN c THEN arg END AS T)` takes the union column laws for
+   arithmetic, negation, case-folding, concatenation and COALESCE (measured
+   FF1-FF6/FF9-FF12, all byte-identical), while MOD answers its first
+   operand's dtype at scale 0 (SHORT/LONG/INT64/INT128 kept, approximate or
+   text firsts widening to INT64, the second operand never mattering -
+   measured FF7/FF8/FF13-FF25, all byte-identical first try). The route
+   serves the desugared form with no executor change; DECODE/EXTRACT/
+   nested-MOD FILTER arguments stay refused as named gaps. Batteries: proc
+   +11/+3 to 1541, view 237 (FILTER refuses in views, pre-existing),
+   unit +1 to 96, exe +3 to 301 (EP101/EP158 the known reds), branchtype
+   69/69, exeselect §63's served cell (330 OK + the §17 known red). The
+   recount ran as ONE serial pass (527 gates, 52 red against 53: cmpparam
+   completed rc=0 this run after timing out in the baseline, fully green;
+   every other red gate's DIFF/FAIL set is byte-identical to slice 62;
+   OK 25271 vs 24802 = +468 cmpparam timeout-tail cells +1 §63 cell;
+   DIFF/FAIL 223 identical; no splicing needed - the in-launch engine copy
+   served 3050 and the installed node-firebird covered the node gates).
+   The traced recount doubles as the end census: 527/527 sourcing logs,
+   426 traces (116 unique, one fewer than slice 62), the derived-join
+   bucket stable (4 served, the comma declining by design).
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

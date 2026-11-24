@@ -5051,6 +5051,42 @@ impl<'a> P<'a> {
         }
     }
 
+    /// What a FILTER aggregate's argument contributes to the desugared
+    /// CAST's target: the union column laws for the shapes FILTER probes
+    /// pin to them (arithmetic, negation, case-folding, concatenation,
+    /// COALESCE - measured FF3-FF6, FF9-FF12, FF23-FF25), plus MOD's own
+    /// law (the first operand's dtype at scale 0 - SHORT/LONG/INT64/INT128
+    /// kept, approximate or text firsts widening to INT64; the second
+    /// operand never matters, not even its kind - measured FF1, FF7, FF8,
+    /// FF13-FF22). Everything else falls back to [P::branch_dsc], keeping
+    /// the existing FILTER surface byte-identical; anything untyped
+    /// refuses (fail-closed).
+    fn filter_branch_dsc(&self, v: &Val) -> Option<BranchDsc> {
+        match v {
+            Val::SysFn(name, args) if name == "MOD" => {
+                let first = args.first()?;
+                match self.union_branch_dsc(first)? {
+                    BranchDsc::Exact(dt @ (blr::SHORT | blr::LONG | blr::INT64 | 26), _) => {
+                        Some(BranchDsc::Exact(dt, 0))
+                    }
+                    BranchDsc::Approx(_) => Some(BranchDsc::Exact(blr::INT64, 0)),
+                    BranchDsc::Text { .. } => Some(BranchDsc::Exact(blr::INT64, 0)),
+                    _ => None,
+                }
+            }
+            Val::Add(..)
+            | Val::Sub(..)
+            | Val::Mul(..)
+            | Val::Div(..)
+            | Val::Neg(..)
+            | Val::Upper(..)
+            | Val::Lower(..)
+            | Val::Concat(..)
+            | Val::Coalesce(..) => self.union_branch_dsc(v),
+            other => self.branch_dsc(other),
+        }
+    }
+
     /// An exact BranchDsc's (rank, scale): SHORT 0, LONG 1, INT64 2,
     /// INT128 (26) 3; anything else refuses
     fn exact_rank(k: BranchDsc) -> Option<(u8, i8)> {
@@ -5663,7 +5699,7 @@ impl<'a> P<'a> {
                     )),
                 ),
                 (verb, Some(arg)) => {
-                    let d = self.unify_branches(&[&arg, &Val::Null])?;
+                    let d = self.unify_branches_typed(&[&arg, &Val::Null], Self::filter_branch_dsc)?;
                     (verb, Some(Val::Cast(d, Box::new(Val::ValueIf(Box::new(cond), Box::new(arg), Box::new(Val::Null))))))
                 }
                 _ => return None,
@@ -23645,5 +23681,34 @@ mod employee_sample_bodies {
         assert!(expr.blob.windows(4).any(|w| w == [0xBF, 2, 0, 1]));
         assert!(star.is_none(), "bare * over an inner join refuses");
         assert!(order.is_none(), "ORDER BY over an inner join refuses");
+    }
+
+    /// FILTER over expression arguments (slice 63, measured FF1..FF25):
+    /// the desugared CAST takes the union column laws (arithmetic here),
+    /// MOD answers its first operand's dtype at scale 0, and anything
+    /// else (DECODE here) refuses
+    #[test]
+    fn filter_over_expression_args() {
+        set_catalog(vec![("IB".into(), vec!["K".into(), "V".into()])]);
+        let modded = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (c BIGINT) AS BEGIN \
+             FOR SELECT COUNT(MOD(7, 2)) FILTER (WHERE K > 1) FROM IB INTO :c DO SUSPEND; END",
+        );
+        let arith = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (c BIGINT) AS BEGIN \
+             FOR SELECT COUNT(7 + 1) FILTER (WHERE K > 1) FROM IB INTO :c DO SUSPEND; END",
+        );
+        let decode = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (c BIGINT) AS BEGIN \
+             FOR SELECT COUNT(DECODE(K, 1, 'a', 'b')) FILTER (WHERE K > 1) FROM IB INTO :c DO SUSPEND; END",
+        );
+        set_catalog(Vec::new());
+        let modded = modded.expect("FILTER over MOD compiles");
+        // COUNT2 over CAST(CASE..) to LONG (measured FF1)
+        assert!(modded.blob.windows(3).any(|w| w == [blr::CAST, blr::LONG, 0]));
+        let arith = arith.expect("FILTER over K + 1 compiles");
+        // dialect-3 arithmetic widens to INT64 (measured FF3)
+        assert!(arith.blob.windows(3).any(|w| w == [blr::CAST, blr::INT64, 0]));
+        assert!(decode.is_none(), "FILTER over DECODE refuses");
     }
 }

@@ -729,6 +729,9 @@ route "62 ...a USING self-join, the merged column bare" served "SELECT G, N FROM
 route "62 ...an expression item over the chain" served "SELECT I, V2 FROM (SELECT T.ID I, U.V * 2 V2 FROM T JOIN U ON U.T_ID = T.ID) D ORDER BY I, V2"
 route "62 ...a comma list declines to the interpreter" declined "SELECT I, V FROM (SELECT T.ID I, U.V V FROM T, U WHERE U.T_ID = T.ID) D ORDER BY I, V"
 
+echo "--- 63 FILTER over expression arguments (slice 63): the desugared CAST serves"
+route "63 COUNT DISTINCT over MOD with FILTER" served "SELECT G, COUNT(DISTINCT MOD(B,2)) FILTER (WHERE B > 3) C FROM T GROUP BY G ORDER BY G"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
