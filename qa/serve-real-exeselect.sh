@@ -722,6 +722,13 @@ route "61 BIT_LENGTH over a literal" declined "SELECT BIT_LENGTH('café') FROM T
 route "61 BIT_LENGTH in WHERE" declined "SELECT ID FROM T WHERE BIT_LENGTH(S) > 8 ORDER BY ID"
 route "61 GROUP BY BIT_LENGTH" declined "SELECT BIT_LENGTH(S), COUNT(*) FROM T GROUP BY BIT_LENGTH(S) ORDER BY 1"
 
+echo "--- 62 JOINs inside derived tables (slice 62): chains serve, the flat comma declines"
+route "62 an inner join in a derived table" served "SELECT I, V FROM (SELECT T.ID I, U.V V FROM T JOIN U ON U.T_ID = T.ID) D ORDER BY I, V"
+route "62 ...a LEFT join, NULL-extended" served "SELECT I, V FROM (SELECT T.ID I, U.V V FROM T LEFT JOIN U ON U.T_ID = T.ID) D ORDER BY I, V"
+route "62 ...a USING self-join, the merged column bare" served "SELECT G, N FROM (SELECT G, A.N N FROM T A JOIN T B USING (G)) D ORDER BY G, N"
+route "62 ...an expression item over the chain" served "SELECT I, V2 FROM (SELECT T.ID I, U.V * 2 V2 FROM T JOIN U ON U.T_ID = T.ID) D ORDER BY I, V2"
+route "62 ...a comma list declines to the interpreter" declined "SELECT I, V FROM (SELECT T.ID I, U.V V FROM T, U WHERE U.T_ID = T.ID) D ORDER BY I, V"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1

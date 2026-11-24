@@ -1760,6 +1760,13 @@ struct Derived {
     wins: Vec<Win>,
     /// a UNION as the body ([P::derived_union])
     union: Option<DerivedUnion>,
+    /// JOIN / comma steps after the inner relation: the nested rse holds
+    /// the join chain (left-nested heads, per-stream alias text, the ONs)
+    /// or the flat stream list, exactly as a statement's rse (measured
+    /// PDJ/PDU/PDL/PDF/PDC/PD3); each step takes the context after the
+    /// previous, so such a stream occupies 1 + joins.len() slots. Plain
+    /// relations only - a derived or procedure step refuses.
+    joins: Vec<(u8, Stream, u8, Bool)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1789,7 +1796,10 @@ struct DerivedAgg {
 
 #[derive(Clone, Debug, PartialEq)]
 enum DCol {
-    Col(String),
+    /// a pass-through column: the inner stream's SLOT (0 for the relation,
+    /// k for join step k) and the column - outer references read it at
+    /// the derived context plus the slot (measured PDJ: W from stream 1)
+    Col(u8, String),
     Expr(Val),
     /// a map fid of the derived table's aggregate, read as is
     Fid(Val),
@@ -2187,8 +2197,15 @@ impl<'a> P<'a> {
             let (_, inner) = d.cols.iter().find(|(o, _)| o == name)?;
             let expr_ctx = if d.agg.is_some() { ctx + 1 } else { ctx };
             return Some(match inner {
-                DCol::Col(n) => Val::Field(ctx, n.clone()),
-                DCol::Expr(e) => Val::DerivedWrap(expr_ctx, Box::new(e.clone())),
+                DCol::Col(slot, n) => Val::Field(ctx + slot, n.clone()),
+                // over a join the expression wraps over EVERY inner
+                // stream context, even one it never names (measured
+                // PDEX: `V || 'x'` wraps over [0, 1])
+                DCol::Expr(e) if d.joins.is_empty() => Val::DerivedWrap(expr_ctx, Box::new(e.clone())),
+                DCol::Expr(e) => Val::DerivedWrapN(
+                    (ctx..ctx + 1 + d.joins.len() as u8).collect(),
+                    Box::new(e.clone()),
+                ),
                 DCol::Fid(v) => v.clone(),
             });
         }
@@ -2411,7 +2428,6 @@ impl<'a> P<'a> {
             }
             _ => None,
         };
-        let after_from = self.i;
         self.streams.push(Stream {
             name: name.clone(),
             alias: inner_alias.clone(),
@@ -2424,6 +2440,14 @@ impl<'a> P<'a> {
         let si = self.streams.len() - 1;
         let saved = self.sub.replace(si);
         let inner_ctx = si as u8 + self.base;
+        // JOIN / comma steps after the inner relation (measured
+        // PDJ/PDU/PDL/PDF/PDC/PD3): each step takes the context after the
+        // previous; the items and WHERE resolve across them all
+        let joins = self.join_rest(si)?;
+        if joins.iter().any(|(_, st, _, _)| st.derived.is_some() || st.proc_args.is_some()) {
+            return None; // a derived or procedure step inside: unprobed
+        }
+        let after_from = self.i;
         // an AGGREGATE inside (an aggregate item, or a GROUP BY after the
         // FROM): the items parse in aggregate mode against a map of their
         // own, the aggregate taking the context after the relation's
@@ -2468,6 +2492,17 @@ impl<'a> P<'a> {
             self.streams.pop();
             return None;
         }
+        if !joins.is_empty() && (agg_inner || win_inner || first.is_some() || skip.is_some() || distinct) {
+            self.sub = saved;
+            self.streams.truncate(si);
+            return None; // an aggregate, windows, FIRST / SKIP / DISTINCT beside an inner join: unprobed
+        }
+        // with a join chain, qualified-only resolution across the inner
+        // streams replaces the single-stream scope (as a statement's)
+        let saved_scope = self.merge_scope;
+        if !joins.is_empty() {
+            self.merge_scope = Some((si, self.streams.len()));
+        }
         let outer_found = std::mem::take(&mut self.win_found);
         let saved_agg = (std::mem::take(&mut self.agg_map), self.agg_fid_ctx, self.agg_mode);
         let agg_ctx = inner_ctx + 1;
@@ -2500,14 +2535,20 @@ impl<'a> P<'a> {
                     None => true,
                     Some(q) => inner_alias.as_deref().map_or(*q == name, |a| a == q),
                 };
-                let ok = !agg_inner && !win_inner && (q.is_some() || bare_alone) && names_it;
+                // a bare `*` over a join would need every stream's columns
+                // (USING-deduped) - unprobed; `first.*` still names one
+                let ok = !agg_inner
+                    && !win_inner
+                    && (q.is_some() || bare_alone)
+                    && names_it
+                    && (q.is_some() || joins.is_empty());
                 let Some(expanded) = catalog_columns(&name).filter(|_| ok) else {
                     restore_agg(self, saved_agg);
                     return None;
                 };
                 for n in expanded {
                     project.push(Val::Field(inner_ctx, n.clone()));
-                    cols.push((n.clone(), DCol::Col(n)));
+                    cols.push((n.clone(), DCol::Col(0, n)));
                 }
                 self.i += width;
                 match self.t.get(self.i) {
@@ -2525,6 +2566,18 @@ impl<'a> P<'a> {
             if win_inner {
                 self.win_cap = Some((self.streams.len(), inner_ctx));
             }
+            // a BARE name item over a USING join compiles to the merged
+            // column's COALESCE but keeps its name (measured PDU) - unlike
+            // a written expression it needs no alias
+            let bare_item = match (self.t.get(self.i), self.t.get(self.i + 1)) {
+                (Some(Tok::Ident(w)), next)
+                    if !is_keyword(w)
+                        && !matches!(next, Some(Tok::Dot) | Some(Tok::LParen)) =>
+                {
+                    Some(w.clone())
+                }
+                _ => None,
+            };
             let v = self.val();
             self.win_cap = None;
             let Some(v) = v else {
@@ -2560,6 +2613,7 @@ impl<'a> P<'a> {
             } else {
                 match &v {
                     Val::Field(_, inner) => inner.clone(),
+                    Val::Coalesce(_) if bare_item.is_some() => bare_item.clone().unwrap(),
                     _ => return None, // an expression needs its name
                 }
             };
@@ -2567,7 +2621,17 @@ impl<'a> P<'a> {
                 raw_items.push((outer, v));
             } else {
                 let dcol = match &v {
-                    Val::Field(_, inner) => DCol::Col(inner.clone()),
+                    // the slot rides from the field's context: the first
+                    // stream's is inner_ctx, join step k's inner_ctx + k
+                    Val::Field(fc, inner)
+                        if *fc >= inner_ctx && (*fc - inner_ctx) as usize <= joins.len() =>
+                    {
+                        DCol::Col(*fc - inner_ctx, inner.clone())
+                    }
+                    Val::Field(..) => {
+                        restore_agg(self, saved_agg);
+                        return None; // a correlated item over an inner join: unprobed
+                    }
                     other => {
                         any_expr = true;
                         DCol::Expr(other.clone())
@@ -2742,8 +2806,14 @@ impl<'a> P<'a> {
             }
         }
         self.sub = saved;
-        self.streams.pop();
+        self.merge_scope = saved_scope;
+        while self.streams.len() > si {
+            self.streams.pop();
+        }
         restore_agg(self, saved_agg);
+        if !joins.is_empty() && !sort.is_empty() {
+            return None; // an ORDER BY beside an inner join: unprobed
+        }
         if agg.is_some() && !sort.is_empty() {
             return None; // an ORDER BY beside an inner aggregate: unprobed
         }
@@ -2775,6 +2845,7 @@ impl<'a> P<'a> {
                 agg,
                 wins,
                 union: None,
+                joins,
             })),
             sub: self.in_sub,
             cur: None,
@@ -4608,6 +4679,7 @@ impl<'a> P<'a> {
                 agg: None,
                 wins: Vec::new(),
                 union: Some(DerivedUnion { all: all.unwrap_or(false), branches }),
+                joins: Vec::new(),
             })),
             sub: self.in_sub,
             cur: None,
@@ -4742,11 +4814,15 @@ impl<'a> P<'a> {
             None => catalog_columns(&st.name)?.into_iter().map(|n| Val::Field(ctx, n)).collect(),
             Some(d) => {
                 let expr_ctx = if d.agg.is_some() { ctx + 1 } else { ctx };
+                let wrap_all: Vec<u8> = (ctx..ctx + 1 + d.joins.len() as u8).collect();
                 d.cols
                     .iter()
                     .map(|(_, inner)| match inner {
-                        DCol::Col(n) => Val::Field(ctx, n.clone()),
-                        DCol::Expr(e) => Val::DerivedWrap(expr_ctx, Box::new(e.clone())),
+                        DCol::Col(slot, n) => Val::Field(ctx + slot, n.clone()),
+                        DCol::Expr(e) if d.joins.is_empty() => {
+                            Val::DerivedWrap(expr_ctx, Box::new(e.clone()))
+                        }
+                        DCol::Expr(e) => Val::DerivedWrapN(wrap_all.clone(), Box::new(e.clone())),
                         DCol::Fid(v) => v.clone(),
                     })
                     .collect()
@@ -4758,9 +4834,10 @@ impl<'a> P<'a> {
     /// its own too (the aggregate node's); claim it so later streams number
     /// past it (measured: a join to such a table takes context 2)
     fn claim_derived_agg_slot(&mut self, st: &Stream) {
-        // a derived table's WINDOWS occupy the contexts after its own
+        // a derived table's WINDOWS occupy the contexts after its own, as
+        // does each inner JOIN step (the steps number past the relation)
         let n_wins = st.derived.as_ref().map_or(0, |d| {
-            d.wins.len() + d.union.as_ref().map_or(0, |u| u.branches.len())
+            d.wins.len() + d.union.as_ref().map_or(0, |u| u.branches.len()) + d.joins.len()
         });
         for _ in 0..n_wins {
             self.streams.push(Stream {
@@ -7124,6 +7201,51 @@ fn emit_window_list(out: &mut Vec<u8>, windows: &[Win]) {
     }
 }
 
+/// One stream of a derived table's nested rse: the relation with the
+/// derived alias text - `"D" "A"` with an inner alias, `"D" "S"."T"`
+/// without (a SYSTEM relation takes blr_relation3, alias-less a plain
+/// blr_relation) - then the context (measured PDJ/PDALX).
+fn emit_derived_inner_stream(
+    out: &mut Vec<u8>,
+    name: &str,
+    inner_alias: Option<&str>,
+    outer: Option<&str>,
+    ctx: u8,
+) {
+    // a SYSTEM relation inside takes blr_relation3 (schema SYSTEM) with
+    // the alias slot always present, and the qualified alias text names
+    // SYSTEM (measured: `"Q" "SYSTEM"."RDB$DATABASE"`)
+    let system = is_system_relation(name);
+    match outer {
+        // alias-less: a plain blr_relation inside (measured)
+        None if system => {
+            emit_relation3(out, name);
+            out.push(0);
+        }
+        None => {
+            out.push(0x4A); // blr_relation
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+        }
+        Some(alias) => {
+            if system {
+                emit_relation3(out, name);
+            } else {
+                out.push(blr::RELATION2);
+                out.push(name.len() as u8);
+                out.extend_from_slice(name.as_bytes());
+            }
+            let text = match inner_alias {
+                Some(ia) => format!("\"{}\" \"{}\"", alias, ia),
+                None => format!("\"{}\" \"{}\".\"{}\"", alias, relation_schema(name), name),
+            };
+            out.push(text.len() as u8);
+            out.extend_from_slice(text.as_bytes());
+        }
+    }
+    out.push(ctx);
+}
+
 fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
     // a selectable procedure source (measured, ALL_LANGS): blr_procedure,
     // the counted name, the context, a u16 input count, the inputs
@@ -7152,7 +7274,42 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
     }
     if let Some(d) = &st.derived {
         out.push(blr::RSE);
-        out.push(1);
+        // a join chain inside counts ONE stream (the heads nest), a comma
+        // list counts flat - as a statement's rse (measured PDC vs PDJ)
+        out.push(if d.joins.is_empty() { 1 } else { rse_stream_count(&d.joins) });
+        if !d.joins.is_empty() {
+            // a JOIN / comma chain inside (measured PDJ/PDU/PDL/PDF/PDC,
+            // PD3, PDALX): the nested heads (absent when flat), each
+            // stream with the derived alias text, the type (absent for
+            // INNER) and the ON per join; the WHERE follows the chain
+            let all_comma = d.joins.iter().all(|j| j.0 == JOIN_COMMA);
+            if !all_comma {
+                for _ in &d.joins {
+                    out.push(blr::JOIN);
+                    out.push(2);
+                }
+            }
+            emit_derived_inner_stream(out, &st.name, d.inner_alias.as_deref(), st.alias.as_deref(), ctx);
+            for (jt, st2, jctx, on) in &d.joins {
+                emit_derived_inner_stream(out, &st2.name, st2.alias.as_deref(), st.alias.as_deref(), *jctx);
+                if all_comma {
+                    continue;
+                }
+                if *jt != 0 {
+                    out.push(blr::JOIN_TYPE);
+                    out.push(*jt);
+                }
+                out.push(blr::BOOLEAN);
+                emit_bool(out, on);
+                out.push(blr::END);
+            }
+            if let Some(w) = &d.wher {
+                out.push(blr::BOOLEAN);
+                emit_bool(out, w);
+            }
+            out.push(blr::END);
+            return;
+        }
         if let Some(u) = &d.union {
             out.push(blr::UNION);
             out.push(ctx);
@@ -7229,38 +7386,7 @@ fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
             out.push(blr::RSE);
             out.push(1);
         }
-        // a SYSTEM relation inside takes blr_relation3 (schema SYSTEM) with
-        // the alias slot always present, and the qualified alias text names
-        // SYSTEM (measured: `"Q" "SYSTEM"."RDB$DATABASE"`)
-        let system = is_system_relation(&st.name);
-        match &st.alias {
-            // alias-less: a plain blr_relation inside (measured)
-            None if system => {
-                emit_relation3(out, &st.name);
-                out.push(0);
-            }
-            None => {
-                out.push(0x4A); // blr_relation
-                out.push(st.name.len() as u8);
-                out.extend_from_slice(st.name.as_bytes());
-            }
-            Some(alias) => {
-                if system {
-                    emit_relation3(out, &st.name);
-                } else {
-                    out.push(blr::RELATION2);
-                    out.push(st.name.len() as u8);
-                    out.extend_from_slice(st.name.as_bytes());
-                }
-                let text = match &d.inner_alias {
-                    Some(ia) => format!("\"{}\" \"{}\"", alias, ia),
-                    None => format!("\"{}\" \"{}\".\"{}\"", alias, relation_schema(&st.name), st.name),
-                };
-                out.push(text.len() as u8);
-                out.extend_from_slice(text.as_bytes());
-            }
-        }
-        out.push(ctx);
+        emit_derived_inner_stream(out, &st.name, d.inner_alias.as_deref(), st.alias.as_deref(), ctx);
         if let Some(agg) = &d.agg {
             // the aggregate's own rse holds the WHERE; its map follows, then
             // the HAVING as the nested rse's boolean (measured)
@@ -8743,9 +8869,16 @@ fn reslot_rec_derived(d: &Derived, r: &Reslot) -> Derived {
     }
     for (_, dc) in o.cols.iter_mut() {
         match dc {
-            DCol::Col(_) => {}
+            // the slot is relative to the derived context - it rides
+            // along while the base moves underneath it
+            DCol::Col(_, _) => {}
             DCol::Expr(v) | DCol::Fid(v) => *v = reslot_rec_val(v, r, false),
         }
+    }
+    for (_, st, jctx, on) in o.joins.iter_mut() {
+        *st = reslot_rec_stream(st, r);
+        *jctx = r.slot[*jctx as usize];
+        *on = reslot_rec_bool(on, r, false);
     }
     if let Some(v) = &mut o.first {
         *v = reslot_rec_val(v, r, false);
@@ -8910,9 +9043,10 @@ fn win_has_subq(w: &Win) -> bool {
 fn derived_has_subq(d: &Derived) -> bool {
     d.wher.as_ref().map(bool_has_subq).unwrap_or(false)
         || d.cols.iter().any(|(_, c)| match c {
-            DCol::Col(_) => false,
+            DCol::Col(_, _) => false,
             DCol::Expr(v) | DCol::Fid(v) => val_has_subq(v),
         })
+        || d.joins.iter().any(|(_, _, _, on)| bool_has_subq(on))
         || d.first.as_ref().map(val_has_subq).unwrap_or(false)
         || d.skip.as_ref().map(val_has_subq).unwrap_or(false)
         || d.sort.iter().any(|(_, k)| val_has_subq(k))
@@ -10128,6 +10262,7 @@ fn rec_scope_stream(
             agg: None,
             wins: Vec::new(),
             union: None,
+            joins: Vec::new(),
         })),
         sub: in_sub,
         cur: None,
@@ -12679,102 +12814,11 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
 }
 
 impl<'a> P<'a> {
-    /// (FOR) SELECT as a body statement, self.i past SELECT. The
-    /// whole probed select machinery: FIRST/SKIP, aggregates,
-    /// GROUP BY/HAVING, ORDER BY, INTO variables, and for the FOR
-    /// form a DO statement (its label numbers with the WHILEs).
-    fn select_stmt(&mut self, is_for: bool) -> Option<TrigStmt> {
-        let mut first: Option<Val> = None;
-        let mut skip: Option<Val> = None;
-        // (also set by the OFFSET/FETCH spelling after the sort)
-        if self.kw("FIRST") {
-            first = Some(self.limit_operand()?);
-        }
-        if self.kw("SKIP") {
-            skip = Some(self.limit_operand()?);
-        }
-        if !is_for && (first.is_some() || skip.is_some()) {
-            return None; // FIRST/SKIP in the singular form: unprobed
-        }
-        // SELECT DISTINCT - blr_project over the select columns
-        // after the boolean (probed); beside a UNION it is the
-        // FIRST branch's (slice 46), beside everything else
-        // structured it refuses below. SELECT ALL is the default
-        // spelling and leaves no trace (measured)
-        let mut distinct = self.kw("DISTINCT");
-        if !distinct {
-            let _ = self.kw("ALL");
-        }
-        // two-phase select list: fields need the stream's context
-        let list_start = self.i;
-        let mut depth = 0i32;
-        let list_end = loop {
-            match self.t.get(self.i)? {
-                Tok::LParen => {
-                    depth += 1;
-                    self.i += 1;
-                }
-                Tok::RParen => {
-                    depth -= 1;
-                    self.i += 1;
-                }
-                Tok::Ident(w)
-                    if w == "FROM" && depth == 0 && !self.from_is_distinct(self.i) =>
-                {
-                    break self.i
-                }
-                _ => self.i += 1,
-            }
-        };
-        self.i = list_end + 1;
-        // a UNION ahead (depth-0, before INTO/DO) claims the
-        // statement's FIRST slot - look ahead and reserve it so the
-        // branch streams number after it (probed)
-        let mut has_union = false;
-        {
-            let mut j = self.i;
-            let mut depth = 0i32;
-            while let Some(t) = self.t.get(j) {
-                match t {
-                    Tok::LParen => depth += 1,
-                    Tok::RParen => depth -= 1,
-                    Tok::Ident(w)
-                        if depth == 0
-                            && (w == "INTO" || w == "DO" || w == "AS") =>
-                    {
-                        break
-                    }
-                    Tok::Ident(w) if depth == 0 && w == "UNION" => {
-                        has_union = true;
-                        break;
-                    }
-                    Tok::Semi => break,
-                    _ => {}
-                }
-                j += 1;
-            }
-        }
-        let union_ctx = if has_union {
-            self.streams.push(Stream {
-                name: String::new(),
-                alias: None,
-                derived: None,
-                sub: self.in_sub,
-                cur: None,
-                proc_args: None,
-                using: Vec::new(),
-            });
-            Some((self.streams.len() - 1) as u8 + self.base)
-        } else {
-            None
-        };
-        let mut stream = self.stream_item()?;
-        self.streams.push(stream.clone());
-        let sidx = self.streams.len() - 1;
-        let mut ctx = sidx as u8 + self.base;
-        self.claim_derived_agg_slot(&stream);
-        // JOIN chain - the view laws at body numbering (probed):
-        // each ON resolves across the accumulated statement streams
+    /// The JOIN chain and comma-list after a FROM stream: each ON resolves
+    /// across the accumulated streams from `sidx` on (the view laws at body
+    /// numbering, probed); USING ≡ AND of equalities (U4==U4C). Shared by
+    /// statements and derived tables (PDJ..PD3 inside).
+    fn join_rest(&mut self, sidx: usize) -> Option<Vec<(u8, Stream, u8, Bool)>> {
         let mut joins: Vec<(u8, Stream, u8, Bool)> = Vec::new();
         loop {
             let jt = if self.kw("INNER") {
@@ -12905,6 +12949,106 @@ impl<'a> P<'a> {
             self.claim_derived_agg_slot(&st2);
             joins.push((JOIN_COMMA, st2, ctx2, Bool::Missing(Val::Null)));
         }
+        Some(joins)
+    }
+
+    /// (FOR) SELECT as a body statement, self.i past SELECT. The
+    /// whole probed select machinery: FIRST/SKIP, aggregates,
+    /// GROUP BY/HAVING, ORDER BY, INTO variables, and for the FOR
+    /// form a DO statement (its label numbers with the WHILEs).
+    fn select_stmt(&mut self, is_for: bool) -> Option<TrigStmt> {
+        let mut first: Option<Val> = None;
+        let mut skip: Option<Val> = None;
+        // (also set by the OFFSET/FETCH spelling after the sort)
+        if self.kw("FIRST") {
+            first = Some(self.limit_operand()?);
+        }
+        if self.kw("SKIP") {
+            skip = Some(self.limit_operand()?);
+        }
+        if !is_for && (first.is_some() || skip.is_some()) {
+            return None; // FIRST/SKIP in the singular form: unprobed
+        }
+        // SELECT DISTINCT - blr_project over the select columns
+        // after the boolean (probed); beside a UNION it is the
+        // FIRST branch's (slice 46), beside everything else
+        // structured it refuses below. SELECT ALL is the default
+        // spelling and leaves no trace (measured)
+        let mut distinct = self.kw("DISTINCT");
+        if !distinct {
+            let _ = self.kw("ALL");
+        }
+        // two-phase select list: fields need the stream's context
+        let list_start = self.i;
+        let mut depth = 0i32;
+        let list_end = loop {
+            match self.t.get(self.i)? {
+                Tok::LParen => {
+                    depth += 1;
+                    self.i += 1;
+                }
+                Tok::RParen => {
+                    depth -= 1;
+                    self.i += 1;
+                }
+                Tok::Ident(w)
+                    if w == "FROM" && depth == 0 && !self.from_is_distinct(self.i) =>
+                {
+                    break self.i
+                }
+                _ => self.i += 1,
+            }
+        };
+        self.i = list_end + 1;
+        // a UNION ahead (depth-0, before INTO/DO) claims the
+        // statement's FIRST slot - look ahead and reserve it so the
+        // branch streams number after it (probed)
+        let mut has_union = false;
+        {
+            let mut j = self.i;
+            let mut depth = 0i32;
+            while let Some(t) = self.t.get(j) {
+                match t {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => depth -= 1,
+                    Tok::Ident(w)
+                        if depth == 0
+                            && (w == "INTO" || w == "DO" || w == "AS") =>
+                    {
+                        break
+                    }
+                    Tok::Ident(w) if depth == 0 && w == "UNION" => {
+                        has_union = true;
+                        break;
+                    }
+                    Tok::Semi => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+        let union_ctx = if has_union {
+            self.streams.push(Stream {
+                name: String::new(),
+                alias: None,
+                derived: None,
+                sub: self.in_sub,
+                cur: None,
+                proc_args: None,
+                using: Vec::new(),
+            });
+            Some((self.streams.len() - 1) as u8 + self.base)
+        } else {
+            None
+        };
+        let mut stream = self.stream_item()?;
+        self.streams.push(stream.clone());
+        let sidx = self.streams.len() - 1;
+        let mut ctx = sidx as u8 + self.base;
+        self.claim_derived_agg_slot(&stream);
+        // JOIN chain - the view laws at body numbering (probed):
+        // each ON resolves across the accumulated statement streams
+        let mut joins = self.join_rest(sidx)?;
         let after_from = self.i;
         self.i = list_start;
         enum Item {
@@ -23455,5 +23599,51 @@ mod employee_sample_bodies {
             compile_view_select_hex(&sql(255)).is_none(),
             "255 pairs refuse"
         );
+    }
+
+    /// JOINs inside derived tables (slice 62, measured PDJ..PDALX): the
+    /// nested rse holds the join chain (heads, per-stream alias text, ONs)
+    /// or the flat comma list; expression items wrap over every inner
+    /// context; `*` and ORDER BY over a join refuse
+    #[test]
+    fn derived_inner_join_shapes() {
+        set_catalog(vec![
+            ("IB".into(), vec!["K".into(), "V".into()]),
+            ("BB".into(), vec!["K".into(), "W".into()]),
+        ]);
+        let join = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (k INTEGER, w VARCHAR(5)) AS BEGIN \
+             FOR SELECT K, W FROM (SELECT IB.K, BB.W FROM IB JOIN BB ON IB.K = BB.K) D INTO :k, :w DO SUSPEND; END",
+        );
+        let comma = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (k INTEGER, w VARCHAR(5)) AS BEGIN \
+             FOR SELECT K, W FROM (SELECT IB.K, BB.W FROM IB, BB WHERE IB.K = BB.K) D INTO :k, :w DO SUSPEND; END",
+        );
+        let expr = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (vx VARCHAR(9)) AS BEGIN \
+             FOR SELECT VX FROM (SELECT IB.V || 'x' VX FROM IB JOIN BB ON IB.K = BB.K) D INTO :vx DO SUSPEND; END",
+        );
+        let star = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (k INTEGER) AS BEGIN \
+             FOR SELECT K FROM (SELECT * FROM IB JOIN BB ON IB.K = BB.K) D INTO :k DO SUSPEND; END",
+        );
+        let order = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (k INTEGER) AS BEGIN \
+             FOR SELECT K FROM (SELECT IB.K FROM IB JOIN BB ON IB.K = BB.K ORDER BY IB.K) D INTO :k DO SUSPEND; END",
+        );
+        set_catalog(Vec::new());
+        let join = join.expect("inner join compiles");
+        assert!(join.blob.windows(2).any(|w| w == [blr::JOIN, 2]));
+        let text = String::from_utf8_lossy(&join.blob);
+        assert!(text.contains("\"D\" \"PUBLIC\".\"IB\""), "first alias text");
+        assert!(text.contains("\"D\" \"PUBLIC\".\"BB\""), "second alias text");
+        let comma = comma.expect("inner comma compiles");
+        assert!(comma.blob.windows(2).any(|w| w == [blr::RSE, 2]));
+        assert!(!comma.blob.contains(&blr::JOIN));
+        let expr = expr.expect("inner expr item compiles");
+        // derived_expr over BOTH inner contexts (measured PDEX)
+        assert!(expr.blob.windows(4).any(|w| w == [0xBF, 2, 0, 1]));
+        assert!(star.is_none(), "bare * over an inner join refuses");
+        assert!(order.is_none(), "ORDER BY over an inner join refuses");
     }
 }

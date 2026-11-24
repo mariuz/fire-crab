@@ -150,7 +150,10 @@ replacement of the C++ engine is below, in priority order. Full text:
    DATEDIFF, FIRST_DAY / LAST_DAY keeping the narrow OF set - the compiler holds every
    shape byte-identical, the route declines, the interpreter serves the valid shapes),
    slice 61 BIT_LENGTH (blr_strlen kind 0 - the compiler holds every shape byte-identical,
-   the route declines, the interpreter serves).
+   the route declines, the interpreter serves),
+   slice 62 JOINs inside derived tables (the nested rse holds the join chain or the flat
+   comma list - the compiler holds every shape byte-identical, the route serves the chains
+   through the shared nested-rse machinery with no executor change, the flat comma declines).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -473,6 +476,41 @@ replacement of the C++ engine is below, in priority order. Full text:
    multi-blockers carrying); TIMEZONE 5 identical, QUARTER 0. Pre-existing reds
    re-confirmed at HEAD by stash-compare (identical cells): exeselect §17, exe
    EP101/EP158; branchtype 69/69, unit tests green.
+   DONE (slice 62): JOINs inside derived tables - the nested rse holds the
+   statement's join chain (left-nested heads, per-stream `"D" "A"` alias text,
+   the type absent for INNER, the ONs, the WHERE after the chain) or the flat
+   comma list; each step takes the context after the previous, pass-through
+   columns carry their stream's slot, expression items wrap in blr_derived_expr
+   over EVERY inner context, and a bare merged USING name keeps its name over
+   its COALESCE (measured PDJ/PDU/PDL/PDF/PDC/PDMX/PDEX/PDW/PD3/PDRX/PDU2X/
+   PDALX/PDWX, all byte-identical, plus outer-join/group/where/`first.*`/
+   outer-USING audits). The route serves the chains through the shared
+   nested-rse machinery with no executor change; the flat comma declines
+   beside its top-level twin (`2-stream rse unconverted`). Bare `*`, ORDER BY,
+   FIRST/SKIP/DISTINCT, aggregates, windows, unions, derived or procedure
+   steps, and comma+JOIN mixing beside a join stay refused as named gaps.
+   Batteries: proc +12/+8 to 1527, view +2 to 237, unit +1 to 95, exe +3/+1
+   to 298 (EP101/EP158 the known reds), branchtype 69/69, exeselect §62's four
+   served cells plus one comma decline (329 OK + the §17 known red; a baseline
+   A/B run gives 324 + §17 - exactly +5, nothing missing). The recount (527
+   gates, 53 red, red set IDENTICAL to slice 61; OK 24802 vs 24817 = +5 §62
+   cells -20 cmpparam timeout-tail cells; DIFF 223 vs 224 - the cmpparam X3
+   flake passes [3] this run; uniqueorder's 3b/4b durability cells flaked in
+   run A and a clean rerun matches base exactly) ran as one serial pass plus
+   segmented reruns: the box has no host engine, so an in-launch copy of the
+   same engine bits served 3050 inside each launch's namespace, `-j 4` hit the
+   sandbox's connection limits (standalone reruns green), and node-firebird
+   had to be installed (a stale NODE_PATH) for the 215 node-driven gates -
+   every rerun gate's section spliced from its sourcing pass. The traced
+   recount doubles as the end census with a methodology fix: earlier totals
+   swept stale same-gate logs from prior runs (ports shuffle every sweep, and
+   only exeselect sets FC_EXEC_SELECT_TRACE), so this census attributes each
+   gate to its sourcing pass - 426 traces (117 unique) from the sourcing
+   exeselect run. The derived-join bucket is new surface: the sweep's only
+   multi-stream-derived SQLs are the five §62 cells (4 served, the comma
+   declining by design), and a worktree build of the slice-61 compiler refuses
+   all five; the BIT_LENGTH strlen-0 bucket sits stable (3 + the café literal
+   on the text bucket, by design).
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).
