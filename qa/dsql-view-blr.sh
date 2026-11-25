@@ -397,4 +397,8 @@ check "SELECT E, B FROM (SELECT EMPLOYEE.EMP_NO E, DEPARTMENT.BUDGET B FROM EMPL
 FCDSQL_CATALOG="$U42CAT" check "SELECT EMP_NO, S FROM (SELECT EMP_NO, F.SALARY S FROM EMPLOYEE E JOIN EMPLOYEE F USING (EMP_NO)) D"
 # (2 checks above)
 
+# --- slice 64: relaxed temporal spellings in views too ---
+check "SELECT EMP_NO FROM EMPLOYEE WHERE HIRED = DATE '2024-2-1'"
+# (1 check above)
+
 exit $fail

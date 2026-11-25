@@ -157,7 +157,11 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 63 FILTER over expression arguments (the desugared CAST takes the union column
    laws, MOD answers its first operand's dtype at scale 0 - the compiler holds every
    shape byte-identical, the route serves through the desugared CAST/CASE with no
-   executor change).
+   executor change),
+   slice 64 relaxed temporal literal spellings (1-2 digit month/day/hour/min/sec, a
+   3-4 digit year, surrounding blanks tolerated - the compiler holds every shape
+   byte-identical, the route serves with no executor change; a 1-2 digit first date
+   component refuses - the engine reads month-day-year there).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -536,6 +540,25 @@ replacement of the C++ engine is below, in priority order. Full text:
    The traced recount doubles as the end census: 527/527 sourcing logs,
    426 traces (116 unique, one fewer than slice 62), the derived-join
    bucket stable (4 served, the comma declining by design).
+   DONE (slice 64): relaxed temporal literal spellings - 1-2 digit
+   month/day/hour/min/sec, a 3-4 digit year, surrounding blanks tolerated
+   (the engine answers `DATE '2024-2-1'`, `TIME '9:3:5'`, `TIMESTAMP
+   '2024-2-1 9:3:5.25'` and 22018s a 3-digit month, a 5-digit year, month
+   13, Feb 30, hour 24 - all measured); the stored bytes are the SAME
+   literal as the padded spelling's. A 1-2 digit FIRST date component
+   refuses: the engine reads month-day-year there (`DATE '12-2-1'` answers
+   2001-12-02, `DATE '13-2-1'` 22018s), a separate law unconverted - as do
+   the trailing-dot frac and the MDY windowing. The route serves with no
+   executor change. Batteries: proc +9/+7 to 1557, view +1 to 238, unit +1
+   to 97, exe +0 (301, EP101/EP158 the known reds), branchtype 69/69, the
+   flipped exeselect §4 cell plus §64's two served cells and one MDY
+   decline (333 OK + the §17 known red). The recount ran as ONE serial
+   pass (527 gates, 52 red with every red gate's DIFF/FAIL set
+   byte-identical to slice 63; OK 25274 vs 25271 = exactly the +3 new
+   exeselect cells; DIFF/FAIL 223 identical). The end census: 527/527
+   sourcing logs, 429 traces (116 unique, stable - the `DATE '2024-2-1'`
+   compile trace serves now, the new MDY decline cell replaces it); the
+   compile bucket names the next gaps (the DECFLOAT union, `RANK(1 + 1)`).
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

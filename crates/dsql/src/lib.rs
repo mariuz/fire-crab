@@ -840,10 +840,14 @@ fn charset_by_name(name: &str) -> Option<(u16, u16)> {
 }
 
 /// A typed temporal literal's blr_literal tail - the dtype byte and the
-/// value - for the STRICT ISO spelling only: `YYYY-MM-DD` for a DATE,
-/// `HH:MM[:SS[.ffff]]` for a TIME, both (one blank between) for a
-/// TIMESTAMP. The engine reads many more spellings (month names, other
-/// separators, TODAY / NOW); every one of them refuses here.
+/// value - for the ISO spelling with 1-2 digit fields (slice 64):
+/// `YYYY-M-D` (the year 3-4 digits) for a DATE, `H:M[:S[.ffff]]` for a
+/// TIME, both (blanks between) for a TIMESTAMP, surrounding blanks
+/// tolerated. The engine reads many more spellings (month names, other
+/// separators, TODAY / NOW); every one of them refuses here - and a
+/// 1-2 digit FIRST date component refuses too, because the engine does
+/// NOT read it as a year there: `DATE '12-2-1'` answers 2001-12-02
+/// (month-day-year with 2-digit windowing), a separate law unconverted.
 /// A trailing time-zone designator inside a temporal literal (slice
 /// 57): the zone id plus the displacement in minutes. Mirrors
 /// `TimeZoneUtil::parse` (strict): `±HH:MM` (spaces tolerated around
@@ -901,13 +905,24 @@ fn temporal_zone_id(z: &str) -> Option<(u16, i32)> {
 
 fn temporal_literal_bytes(kind: &str, text: &str) -> Option<Vec<u8>> {
     let date = |t: &str| -> Option<i32> {
-        let b = t.as_bytes();
-        if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        // (slice 64) one-digit month/day beside the strict spelling:
+        // the engine answers `DATE '2024-2-1'` and rejects a 3-digit
+        // month, a 5-digit year, month 13, Feb 30 (measured 22018s)
+        let t = t.trim();
+        let mut it = t.split('-');
+        let (ys, ms, ds) = (it.next()?, it.next()?, it.next()?);
+        if it.next().is_some() {
             return None;
         }
-        let y: i64 = t.get(0..4)?.parse().ok()?;
-        let m: i64 = t.get(5..7)?.parse().ok()?;
-        let d: i64 = t.get(8..10)?.parse().ok()?;
+        let digits = |s: &str, lo: usize, hi: usize| {
+            (lo..=hi).contains(&s.len()) && s.bytes().all(|c| c.is_ascii_digit())
+        };
+        if !digits(ys, 3, 4) || !digits(ms, 1, 2) || !digits(ds, 1, 2) {
+            return None;
+        }
+        let y: i64 = ys.parse().ok()?;
+        let m: i64 = ms.parse().ok()?;
+        let d: i64 = ds.parse().ok()?;
         if !(1..=12).contains(&m) || d < 1 {
             return None;
         }
@@ -931,7 +946,9 @@ fn temporal_literal_bytes(kind: &str, text: &str) -> Option<Vec<u8>> {
             None => (t, None),
         };
         let parts: Vec<&str> = hms.split(':').collect();
-        if parts.len() < 2 || parts.len() > 3 || parts.iter().any(|p| p.len() != 2 || !p.bytes().all(|c| c.is_ascii_digit())) {
+        // (slice 64) one-digit hour/min/sec: the engine answers
+        // `TIME '9:3:5'` and rejects hour 24, minute 60 (22018s)
+        if parts.len() < 2 || parts.len() > 3 || parts.iter().any(|p| !(1..=2).contains(&p.len()) || !p.bytes().all(|c| c.is_ascii_digit())) {
             return None;
         }
         let h: u32 = parts[0].parse().ok()?;
@@ -23710,5 +23727,36 @@ mod employee_sample_bodies {
         // dialect-3 arithmetic widens to INT64 (measured FF3)
         assert!(arith.blob.windows(3).any(|w| w == [blr::CAST, blr::INT64, 0]));
         assert!(decode.is_none(), "FILTER over DECODE refuses");
+    }
+
+    /// Relaxed temporal literal spellings (slice 64): one-digit
+    /// month/day/hour/min/sec store the SAME literal bytes as the
+    /// padded spelling, while a 1-2 digit first date component
+    /// refuses (the engine reads month-day-year there)
+    #[test]
+    fn relaxed_temporal_literal_spellings() {
+        set_catalog(vec![("IB".into(), vec!["K".into()])]);
+        let bare = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (d DATE) AS BEGIN \
+             FOR SELECT DATE '2024-2-1' FROM IB INTO :d DO SUSPEND; END",
+        );
+        let padded = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (d DATE) AS BEGIN \
+             FOR SELECT DATE '2024-02-01' FROM IB INTO :d DO SUSPEND; END",
+        );
+        let time = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (t TIME) AS BEGIN \
+             FOR SELECT TIME '9:3:5' FROM IB INTO :t DO SUSPEND; END",
+        );
+        let mdy = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (d DATE) AS BEGIN \
+             FOR SELECT DATE '12-2-1' FROM IB INTO :d DO SUSPEND; END",
+        );
+        set_catalog(Vec::new());
+        let bare = bare.expect("one-digit DATE compiles");
+        let padded = padded.expect("padded DATE compiles");
+        assert_eq!(bare.blob, padded.blob, "same literal bytes");
+        assert!(time.is_some(), "one-digit TIME compiles");
+        assert!(mdy.is_none(), "MDY-guessed DATE refuses");
     }
 }

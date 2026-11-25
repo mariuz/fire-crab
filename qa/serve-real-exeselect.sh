@@ -295,7 +295,8 @@ echo "--- 4 DECLINED: the interpreter answers, right"
 route "4 a codepage relation (the executor orders by code point, WIN1252 by byte)" declined "SELECT ID FROM X ORDER BY ID"
 route "4 a DATE literal in the predicate (slice 14: the BLR compiler takes the ISO spelling)" served "SELECT ID FROM T WHERE D > DATE '2024-02-01' ORDER BY ID"
 route "4 ...a TIMESTAMP and a TIME literal" served "SELECT ID FROM T WHERE TS < TIMESTAMP '2024-01-02 10:00:00' OR TM = TIME '23:00:00' ORDER BY ID"
-route "4 ...a spelling outside the ISO subset declines" declined "SELECT ID FROM T WHERE D = DATE '2024-2-1'"
+route "4 ...a one-digit spelling serves (slice 64: the compiler takes 1-2 digit fields)" served "SELECT ID FROM T WHERE D = DATE '2024-3-4' ORDER BY ID"
+route "4 ...a month-day-year guess still declines" declined "SELECT ID FROM T WHERE D = DATE '12-2-1'"
 route "4 a CAST to TIMESTAMP (the executor has no such cast)" declined "SELECT CAST(D AS TIMESTAMP) FROM T ORDER BY ID"
 route "4 a DOUBLE output" served "SELECT CAST(N AS DOUBLE PRECISION) FROM T ORDER BY ID"
 echo "--- 10 the approximate kinds (slice 5): compared and folded as doubles, FLOAT beside FLOAT or exact in SINGLE precision"
@@ -731,6 +732,10 @@ route "62 ...a comma list declines to the interpreter" declined "SELECT I, V FRO
 
 echo "--- 63 FILTER over expression arguments (slice 63): the desugared CAST serves"
 route "63 COUNT DISTINCT over MOD with FILTER" served "SELECT G, COUNT(DISTINCT MOD(B,2)) FILTER (WHERE B > 3) C FROM T GROUP BY G ORDER BY G"
+
+echo "--- 64 relaxed temporal spellings (slice 64): one-digit fields serve, MDY guesses decline"
+route "64 a one-digit TIME literal" served "SELECT ID FROM T WHERE TM = TIME '9:30:0' ORDER BY ID"
+route "64 a one-digit TIMESTAMP literal" served "SELECT ID FROM T WHERE TS < TIMESTAMP '2024-1-2 10:0:0' ORDER BY ID"
 
 echo "--- panic check"
 ran=$((ran + 1))
