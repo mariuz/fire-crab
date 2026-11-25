@@ -165,7 +165,11 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 65 union unification over DECFLOAT (the widest width present wins the
    column, every other branch casting to it; beside text the column is VARYING at
    the widest rendering - the compiler holds every shape byte-identical, the route
-   serves with no executor change; CASE/IN over decfloat refuse - unprobed).
+   serves with no executor change; CASE/IN over decfloat refuse - unprobed),
+   slice 66 group-constant hypothetical direct arguments (arithmetic, casts,
+   system functions, CASE/COALESCE, params, CURRENT_* niladics - the compiler
+   holds every shape byte-identical, the route declines, the interpreter serves;
+   columns, aggregates, stored calls and subqueries refuse).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -581,6 +585,23 @@ replacement of the C++ engine is below, in priority order. Full text:
    traces (115 unique, one fewer - the DECFLOAT-union compile trace serves
    now); the compile bucket is down to the MDY decline cell and
    `RANK(1 + 1)`.
+   DONE (slice 66): group-constant hypothetical direct arguments - the
+   engine's own rule ("constant within each group", its -104 words) as a
+   recursive gate: arithmetic, casts, system functions, searched/simple
+   CASE, COALESCE, params, the CURRENT_* niladics, and the percentile
+   fraction (P66A-P66O); columns, aggregates, stored calls, session
+   values and every subquery refuse. The route declines, the interpreter
+   serves. Batteries: proc +8/+6 net of two flipped slice-55 refuses to
+   1584, unit +1 to 99, view 239 and exe 303 unchanged (EP101/EP158 the
+   known reds), branchtype 69/69, exeselect §66's decline cell (335 OK +
+   the §17 known red). The recount ran as ONE serial pass (527 gates, 52
+   red with every red gate's DIFF/FAIL set byte-identical to slice 65;
+   OK 25276 vs 25275 = exactly the +1 new exeselect cell; DIFF/FAIL 223
+   identical). The end census: 527/527 sourcing logs, 431 traces (115
+   unique, stable - `RANK(1 + 1)` moved from the compile bucket to the
+   WITHIN GROUP bucket); the compile bucket holds exactly one trace -
+   the intentional MDY decline cell. Nothing the sweep throws at the
+   compiler refuses anymore except by design.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

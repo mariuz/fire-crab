@@ -740,6 +740,9 @@ route "64 a one-digit TIMESTAMP literal" served "SELECT ID FROM T WHERE TS < TIM
 echo "--- 65 union unification over DECFLOAT (slice 65): the widest width wins"
 route "65 ...mixed widths across columns" served "SELECT A FROM DF UNION ALL SELECT B FROM DF ORDER BY 1"
 
+echo "--- 66 group-constant direct args (slice 66): the compiler holds them, the route declines"
+route "66 RANK over an arithmetic direct arg" declined "SELECT RANK(1 + 1) WITHIN GROUP (ORDER BY B) FROM T"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1

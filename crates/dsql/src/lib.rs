@@ -5788,8 +5788,9 @@ impl<'a> P<'a> {
 
     /// Slice 55: an ordered-set / hypothetical-set call with self.i ON
     /// its opening paren (the name already read): the direct arguments
-    /// (literals, or one CAST over one - measured), then the required
-    /// WITHIN GROUP ordering. A percentile takes exactly one argument
+    /// (group-constant expressions - [within_direct_arg], widened slice
+    /// 66), then the required WITHIN GROUP ordering. A percentile takes
+    /// exactly one argument
     /// and one sort key and carries the key as its second direct
     /// argument; a hypothetical takes one or more values. FILTER and
     /// OVER after the call refuse (measured: the engine's 42000 - a
@@ -9378,6 +9379,16 @@ fn within_agg_blr_name(n: &str) -> Option<&'static str> {
 /// parameter, or a CAST over a column is the engine's 42000 / 2F000).
 /// Constant-folded expressions (`1 + 1`, `UPPER('a')`) store on the
 /// engine too, unprobed here - they refuse, the interpreter serves.
+/// Slice 66: a hypothetical/ordered-set direct argument must be
+/// CONSTANT WITHIN EACH GROUP (the engine's -104 words): no columns
+/// (P66C), no aggregates (P66G), no correlated subqueries (P66J).
+/// Literals, params (P66K), the CURRENT_* niladics (P66L-P66N) and
+/// pure scalar expressions over them - arithmetic, casts (P66D),
+/// system functions (P66B), CASE/COALESCE (P66H, P66I). Subqueries keep
+/// refusing: literal-item scalars (P66F, P66P) refuse at parse
+/// everywhere - a pre-existing gap, not this slice's - and
+/// field-reading ones fail the constancy check; stored-function calls,
+/// session values, GEN_ID and PSQL variables refuse (unprobed purity)
 fn within_direct_arg(v: &Val) -> bool {
     match v {
         Val::Int(_)
@@ -9387,20 +9398,89 @@ fn within_direct_arg(v: &Val) -> bool {
         | Val::DoubleLit(_)
         | Val::Bool(_)
         | Val::TemporalLit(_)
-        | Val::Null => true,
-        Val::Cast(_, inner) => matches!(
-            inner.as_ref(),
-            Val::Int(_)
-                | Val::Int64(_)
-                | Val::Dec(..)
-                | Val::Str(_)
-                | Val::DoubleLit(_)
-                | Val::Bool(_)
-                | Val::TemporalLit(_)
-                | Val::Null
-        ),
+        | Val::Null
+        | Val::InParam(_)
+        | Val::CurrentDate
+        | Val::CurrentTime
+        | Val::CurrentTimestamp => true,
+        Val::Add(a, b) | Val::Sub(a, b) | Val::Mul(a, b) | Val::Div(a, b) | Val::Concat(a, b) => {
+            within_direct_arg(a) && within_direct_arg(b)
+        }
+        Val::Neg(a)
+        | Val::Upper(a)
+        | Val::Lower(a)
+        | Val::Cast(_, a)
+        | Val::CastInt64(a)
+        | Val::Extract(_, a)
+        | Val::StrLen(_, a) => within_direct_arg(a),
+        Val::Substring(a, b, c) => {
+            within_direct_arg(a) && within_direct_arg(b) && within_direct_arg(c)
+        }
+        Val::Trim(_, w, x) => w.as_ref().map_or(true, |q| within_direct_arg(q)) && within_direct_arg(x),
+        Val::AtTz(a, z) => {
+            within_direct_arg(a) && z.as_ref().map_or(true, |q| within_direct_arg(q))
+        }
+        Val::SysFn(_, args) | Val::Coalesce(args) => args.iter().all(within_direct_arg),
+        Val::Decode(sel, cs, rs) => {
+            within_direct_arg(sel) && cs.iter().all(within_direct_arg) && rs.iter().all(within_direct_arg)
+        }
+        Val::ValueIf(c, a, b) => {
+            within_direct_bool(c) && within_direct_arg(a) && within_direct_arg(b)
+        }
+        Val::BoolVal(b) => within_direct_bool(b),
+        // scalar subqueries refuse (see above); the constancy check
+        // stays for the subquery PREDICATES [within_direct_bool] walks
+        Val::ScalarSub(_) => false,
         _ => false,
     }
+}
+
+/// A boolean inside a direct argument (slice 66): comparisons and
+/// boolean glue over constant values; quantified subqueries recurse
+/// through [direct_subq_const]
+fn within_direct_bool(b: &Bool) -> bool {
+    match b {
+        Bool::And(l, r) | Bool::Or(l, r) => within_direct_bool(l) && within_direct_bool(r),
+        Bool::Not(x) => within_direct_bool(x),
+        Bool::Cmp(_, a, c)
+        | Bool::Like(a, c)
+        | Bool::Starting(a, c)
+        | Bool::Equiv(a, c)
+        | Bool::Containing(a, c)
+        | Bool::AnsiLike(a, c, _) => within_direct_arg(a) && within_direct_arg(c),
+        Bool::Similar(a, c, d) => {
+            within_direct_arg(a) && within_direct_arg(c) && d.as_ref().map_or(true, within_direct_arg)
+        }
+        Bool::Missing(a) => within_direct_arg(a),
+        Bool::Between(a, l, h) => {
+            within_direct_arg(a) && within_direct_arg(l) && within_direct_arg(h)
+        }
+        Bool::InList(a, items) => within_direct_arg(a) && items.iter().all(within_direct_arg),
+        Bool::Any(q) | Bool::Unique(q) => direct_subq_const(q),
+        Bool::AnsiAny(_, a, q) | Bool::AnsiAll(_, a, q) => {
+            within_direct_arg(a) && direct_subq_const(q)
+        }
+    }
+}
+
+/// A subquery inside a direct argument (slice 66): no unions, and
+/// its WHERE / column / expression (plus an aggregate's argument, if
+/// any - P66P's `COUNT(*)` stores) all group-constant themselves -
+/// which bars every field, inner or outer (fail-closed: uncorrelated
+/// field-reading subqueries are group-constant too, but unprobed -
+/// P66F's field-free shape is the measured one)
+fn direct_subq_const(q: &SubQ) -> bool {
+    if q.union_.is_some() {
+        return false;
+    }
+    if let Some((_, arg, _)) = &q.agg {
+        if !arg.as_ref().map_or(true, within_direct_arg) {
+            return false;
+        }
+    }
+    q.wher.as_ref().map_or(true, |w| within_direct_bool(w))
+        && q.col.as_ref().map_or(true, within_direct_arg)
+        && q.expr.as_ref().map_or(true, within_direct_arg)
 }
 
 fn contains_winref(v: &Val) -> bool {
@@ -23823,5 +23903,31 @@ mod employee_sample_bodies {
         assert!(mixed.blob.windows(2).any(|w| w == [blr::CAST, 25]));
         assert!(widths.is_some(), "DECFLOAT(16) beside (34) unifies");
         assert!(case.is_none(), "CASE over DECFLOAT refuses");
+    }
+
+    /// Group-constant hypothetical direct arguments (slice 66, measured
+    /// P66A-P66P): arithmetic over literals stores the raw expression,
+    /// while a column, an aggregate, or a correlated subquery refuses
+    #[test]
+    fn hypothetical_constant_direct_args() {
+        set_catalog(vec![("IB".into(), vec!["K".into()])]);
+        let arith = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (r DOUBLE PRECISION) AS BEGIN \
+             FOR SELECT RANK(1 + 1) WITHIN GROUP (ORDER BY K) FROM IB INTO :r DO SUSPEND; END",
+        );
+        let col = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (r DOUBLE PRECISION) AS BEGIN \
+             FOR SELECT RANK(K) WITHIN GROUP (ORDER BY K) FROM IB INTO :r DO SUSPEND; END",
+        );
+        let corr = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (r DOUBLE PRECISION) AS BEGIN \
+             FOR SELECT RANK((SELECT COUNT(*) FROM IB IB2 WHERE IB2.K = IB.K)) WITHIN GROUP (ORDER BY K) FROM IB INTO :r DO SUSPEND; END",
+        );
+        set_catalog(Vec::new());
+        let arith = arith.expect("RANK(1 + 1) compiles");
+        // the raw blr_add rides as the direct argument (measured P66A)
+        assert!(arith.blob.windows(2).any(|w| w == [blr::ADD, blr::LITERAL]));
+        assert!(col.is_none(), "RANK over a column refuses");
+        assert!(corr.is_none(), "RANK over a correlated subquery refuses");
     }
 }
