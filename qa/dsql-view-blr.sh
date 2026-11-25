@@ -401,4 +401,8 @@ FCDSQL_CATALOG="$U42CAT" check "SELECT EMP_NO, S FROM (SELECT EMP_NO, F.SALARY S
 check "SELECT EMP_NO FROM EMPLOYEE WHERE HIRED = DATE '2024-2-1'"
 # (1 check above)
 
+# --- slice 65: decfloat unions in views ---
+check "SELECT CAST('99' AS DECFLOAT(34)) AS X FROM EMPLOYEE UNION ALL SELECT CAST(1 AS DECFLOAT(16)) FROM EMPLOYEE"
+# (1 check above)
+
 exit $fail

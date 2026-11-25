@@ -161,7 +161,11 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 64 relaxed temporal literal spellings (1-2 digit month/day/hour/min/sec, a
    3-4 digit year, surrounding blanks tolerated - the compiler holds every shape
    byte-identical, the route serves with no executor change; a 1-2 digit first date
-   component refuses - the engine reads month-day-year there).
+   component refuses - the engine reads month-day-year there),
+   slice 65 union unification over DECFLOAT (the widest width present wins the
+   column, every other branch casting to it; beside text the column is VARYING at
+   the widest rendering - the compiler holds every shape byte-identical, the route
+   serves with no executor change; CASE/IN over decfloat refuse - unprobed).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -559,6 +563,24 @@ replacement of the C++ engine is below, in priority order. Full text:
    sourcing logs, 429 traces (116 unique, stable - the `DATE '2024-2-1'`
    compile trace serves now, the new MDY decline cell replaces it); the
    compile bucket names the next gaps (the DECFLOAT union, `RANK(1 + 1)`).
+   DONE (slice 65): union unification over DECFLOAT - the widest width
+   present wins the column with every other branch casting to it (exact,
+   approximate, and the narrower decfloat width alike - P65A-P65H, P65K,
+   P65L; beside text the column is VARYING at the widest rendering,
+   decfloats rendering 23 / 42 - P65I, P65J). The new kind is union-only:
+   CASE, IN-lists, FILTER and decfloat arithmetic keep refusing. The
+   route serves with no executor change - the §40 "value order across
+   exponents" decline cell flipped to served the moment the compiler held
+   it. Batteries: proc +12/+3 to 1572 (plus a DFLT table), view +1 to
+   239, unit +1 to 98, exe +2 to 303 (EP101/EP158 the known reds),
+   branchtype 69/69, the flipped §40 cell plus §65's mixed-width served
+   cell (334 OK + the §17 known red). The recount ran as ONE serial pass
+   (527 gates, 52 red with every red gate's DIFF/FAIL set byte-identical
+   to slice 64; OK 25275 vs 25274 = exactly the +1 new exeselect cell;
+   DIFF/FAIL 223 identical). The end census: 527/527 sourcing logs, 429
+   traces (115 unique, one fewer - the DECFLOAT-union compile trace serves
+   now); the compile bucket is down to the MDY decline cell and
+   `RANK(1 + 1)`.
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

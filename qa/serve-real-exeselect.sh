@@ -505,7 +505,7 @@ route "40 arithmetic over a table, nulls, ordered" served "SELECT A + B, A * B F
 route "40 total order over specials" served "SELECT V FROM DFS ORDER BY 1"
 route "40 total order over specials reversed" served "SELECT V FROM DFS ORDER BY 1 DESC"
 route "40 cohorts order by bytes, plus zero first" served "SELECT V FROM DFC ORDER BY 1"
-route "40 value order across exponents" declined "SELECT CAST('99' AS DECFLOAT(34)) FROM RDB\$DATABASE UNION ALL SELECT CAST('100' AS DECFLOAT(34)) FROM RDB\$DATABASE UNION ALL SELECT CAST('999' AS DECFLOAT(34)) FROM RDB\$DATABASE UNION ALL SELECT CAST('1000' AS DECFLOAT(34)) FROM RDB\$DATABASE ORDER BY 1"
+route "40 value order across exponents (slice 65: the union unifies DECFLOAT)" served "SELECT CAST('99' AS DECFLOAT(34)) FROM RDB\$DATABASE UNION ALL SELECT CAST('100' AS DECFLOAT(34)) FROM RDB\$DATABASE UNION ALL SELECT CAST('999' AS DECFLOAT(34)) FROM RDB\$DATABASE UNION ALL SELECT CAST('1000' AS DECFLOAT(34)) FROM RDB\$DATABASE ORDER BY 1"
 route "40 DISTINCT keeps the MAX cohort" served "SELECT DISTINCT V FROM DFC ORDER BY 1"
 route "40 DISTINCT payloads merge to MAX, sNaN apart" served "SELECT DISTINCT V FROM DFS ORDER BY 1"
 route "40 UNION DISTINCT over three branches" served "SELECT V FROM DFM WHERE W = 100 UNION SELECT V FROM DFM WHERE W = 7 UNION SELECT V FROM DFM WHERE W > 0 ORDER BY 1"
@@ -736,6 +736,9 @@ route "63 COUNT DISTINCT over MOD with FILTER" served "SELECT G, COUNT(DISTINCT 
 echo "--- 64 relaxed temporal spellings (slice 64): one-digit fields serve, MDY guesses decline"
 route "64 a one-digit TIME literal" served "SELECT ID FROM T WHERE TM = TIME '9:30:0' ORDER BY ID"
 route "64 a one-digit TIMESTAMP literal" served "SELECT ID FROM T WHERE TS < TIMESTAMP '2024-1-2 10:0:0' ORDER BY ID"
+
+echo "--- 65 union unification over DECFLOAT (slice 65): the widest width wins"
+route "65 ...mixed widths across columns" served "SELECT A FROM DF UNION ALL SELECT B FROM DF ORDER BY 1"
 
 echo "--- panic check"
 ran=$((ran + 1))

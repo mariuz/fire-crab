@@ -1096,6 +1096,11 @@ enum BranchDsc {
     /// X14 pin same-kind columns answering raw; CASE/IN over one refuse)
     TimeTz,
     TimestampTz,
+    /// DECFLOAT(16) (false) / DECFLOAT(34) (true) - UNION-only (slice
+    /// 65: the widest width present wins the column, other branches
+    /// casting to it; CASE/IN over one refuse - [dsc_to_branch] keeps
+    /// returning None for them)
+    DecFloat(bool),
     /// NULL - shapes nothing
     Skip,
 }
@@ -1143,6 +1148,13 @@ fn branch_dsc_to_dsc(k: BranchDsc) -> Option<Dsc> {
         BranchDsc::Time => Dsc::Time,
         BranchDsc::Timestamp => Dsc::Timestamp,
         BranchDsc::Boolean => Dsc::Boolean,
+        BranchDsc::DecFloat(wide) => {
+            if wide {
+                Dsc::Dec128
+            } else {
+                Dsc::Dec64
+            }
+        }
         BranchDsc::TimeTz | BranchDsc::TimestampTz | BranchDsc::Skip => return None,
     })
 }
@@ -1171,22 +1183,26 @@ fn exact_text_width(dt: u8, sc: i8) -> Option<u16> {
 }
 
 /// The union-only fallback when [P::unify_branches] fails: exacts
-/// beside texts (which CASE refuses) cast to a common VARYING -
-/// always varying (Z1-Z3), the width the widest side's rendering
-/// (the text's characters or [exact_text_width]), the set the one
-/// non-NONE set among the texts. NULL shapes nothing; anything else
-/// refuses
+/// (or decfloats, slice 65) beside texts (which CASE refuses) cast
+/// to a common VARYING - always varying (Z1-Z3), the width the
+/// widest side's rendering (the text's characters, [exact_text_width],
+/// or the decfloat's 23 / 42 - P65I/P65J), the set the one non-NONE
+/// set among the texts. NULL shapes nothing; anything else refuses
 fn union_text_common(kinds: &[BranchDsc]) -> Option<Dsc> {
     let mut width = 0u16;
     let mut sets: Vec<u16> = Vec::new();
-    let mut saw_exact = false;
+    let mut saw_num = false;
     let mut saw_text = false;
     for k in kinds {
         match k {
             BranchDsc::Skip => {}
             BranchDsc::Exact(dt, sc) => {
-                saw_exact = true;
+                saw_num = true;
                 width = width.max(exact_text_width(*dt, *sc)?);
+            }
+            BranchDsc::DecFloat(wide) => {
+                saw_num = true;
+                width = width.max(if *wide { 42 } else { 23 });
             }
             BranchDsc::Text { chars, cs, .. } => {
                 saw_text = true;
@@ -1198,7 +1214,7 @@ fn union_text_common(kinds: &[BranchDsc]) -> Option<Dsc> {
             _ => return None,
         }
     }
-    if !saw_exact || !saw_text {
+    if !saw_num || !saw_text {
         return None;
     }
     let cs = match sets.as_slice() {
@@ -5064,6 +5080,18 @@ impl<'a> P<'a> {
                 chars: u16::try_from(b.len()).ok()?,
                 cs: 1,
             }),
+            // DECFLOAT branch items (slice 65): an explicit CAST to
+            // one, or a catalog-typed decfloat column - UNION-only,
+            // [P::branch_dsc] keeps refusing them for CASE/IN
+            Val::Cast(Dsc::Dec64, _) => Some(BranchDsc::DecFloat(false)),
+            Val::Cast(Dsc::Dec128, _) => Some(BranchDsc::DecFloat(true)),
+            Val::Field(ctx, name) => {
+                match typing_of(v).or_else(|| self.field_dsc(*ctx, name)) {
+                    Some(Dsc::Dec64) => Some(BranchDsc::DecFloat(false)),
+                    Some(Dsc::Dec128) => Some(BranchDsc::DecFloat(true)),
+                    _ => self.branch_dsc(v),
+                }
+            }
             other => self.branch_dsc(other),
         }
     }
@@ -5187,7 +5215,18 @@ impl<'a> P<'a> {
         if kinds.is_empty() {
             return None; // all-NULL: the engine's choice is unprobed
         }
-        if kinds.iter().all(|k| matches!(k, BranchDsc::Exact(..) | BranchDsc::Approx(_))) {
+        if kinds.iter().all(|k| matches!(k, BranchDsc::Exact(..) | BranchDsc::Approx(_) | BranchDsc::DecFloat(_))) {
+            // a decfloat beside exacts / approximates wins at its
+            // widest width present (slice 65: P65D-P65H, P65K, P65L) -
+            // reachable through the union typer only, CASE/IN kinds
+            // never hold one
+            if kinds.iter().any(|k| matches!(k, BranchDsc::DecFloat(_))) {
+                return Some(if kinds.iter().any(|k| matches!(k, BranchDsc::DecFloat(true))) {
+                    Dsc::Dec128
+                } else {
+                    Dsc::Dec64
+                });
+            }
             if kinds.iter().any(|k| matches!(k, BranchDsc::Approx(true))) {
                 return Some(Dsc::Double);
             }
@@ -23758,5 +23797,31 @@ mod employee_sample_bodies {
         assert_eq!(bare.blob, padded.blob, "same literal bytes");
         assert!(time.is_some(), "one-digit TIME compiles");
         assert!(mdy.is_none(), "MDY-guessed DATE refuses");
+    }
+
+    /// Union branch unification over DECFLOAT (slice 65, measured
+    /// P65A-P65L): the widest width present wins the column, every
+    /// other branch casting to it; CASE over a decfloat refuses
+    #[test]
+    fn decfloat_union_unification() {
+        set_catalog(vec![("IB".into(), vec!["K".into()])]);
+        let mixed = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (r DECFLOAT(34)) AS BEGIN \
+             FOR SELECT 1 FROM IB UNION ALL SELECT CAST('100' AS DECFLOAT(34)) FROM IB INTO :r DO SUSPEND; END",
+        );
+        let widths = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (r DECFLOAT(34)) AS BEGIN \
+             FOR SELECT CAST(1 AS DECFLOAT(16)) FROM IB UNION ALL SELECT CAST('100' AS DECFLOAT(34)) FROM IB INTO :r DO SUSPEND; END",
+        );
+        let case = compile_procedure_full(
+            "CREATE PROCEDURE p RETURNS (r DECFLOAT(34)) AS BEGIN \
+             FOR SELECT CASE WHEN K > 1 THEN CAST(1 AS DECFLOAT(34)) ELSE CAST(2 AS DECFLOAT(34)) END FROM IB INTO :r DO SUSPEND; END",
+        );
+        set_catalog(Vec::new());
+        let mixed = mixed.expect("INT beside DECFLOAT(34) unifies");
+        // the INT branch wraps in cast(DECFLOAT(34)) (measured P65E)
+        assert!(mixed.blob.windows(2).any(|w| w == [blr::CAST, 25]));
+        assert!(widths.is_some(), "DECFLOAT(16) beside (34) unifies");
+        assert!(case.is_none(), "CASE over DECFLOAT refuses");
     }
 }
