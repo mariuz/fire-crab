@@ -143,6 +143,7 @@ mod blr {
     pub const DERIVED_EXPR: u8 = 191;
     pub const SEQUENTIAL: u8 = 142;
     pub const INDICES: u8 = 144;
+    pub const AT_TZ: u8 = 216;
     pub const RETRIEVE: u8 = 145;
     pub const RELATION2: u8 = 146;
     /// schema, package, name, alias, context - the engine's form for a
@@ -247,6 +248,11 @@ pub enum Expr {
     /// checks error (never wrap), text width overflows error (never
     /// silently truncate), NULL passes through
     Cast(MsgSlot, Box<Expr>),
+    /// blr_at_tz (216): `<operand> AT TIME ZONE <zone>`, the zone None
+    /// for AT LOCAL - a zoned output (TIME-ish in, TIME TZ; anything
+    /// else, TIMESTAMP TZ), the UTC instant placed by the SESSION ZONE
+    /// when the operand carries none
+    AtTz(Box<Expr>, Option<Box<Expr>>),
     /// blr_coalesce: the first non-NULL of the counted operands
     Coalesce(Vec<Expr>),
     /// blr_decode: the simple CASE - an operand, the counted
@@ -761,6 +767,16 @@ impl<'a> P<'a> {
                 let slot = self.msg_slot()?;
                 Ok(Expr::Cast(slot, Box::new(self.expr()?)))
             }
+            blr::AT_TZ => {
+                let operand = Box::new(self.expr()?);
+                let has_zone = self.u8()?;
+                let zone = match has_zone {
+                    0 => None,
+                    1 => Some(Box::new(self.expr()?)),
+                    _ => return Err(format!("at_tz flag {} unconverted", has_zone)),
+                };
+                Ok(Expr::AtTz(operand, zone))
+            }
             blr::COALESCE => {
                 let n = self.u8()? as usize;
                 let mut ops = Vec::new();
@@ -887,6 +903,25 @@ impl<'a> P<'a> {
                         let d = [self.u8()?, self.u8()?, self.u8()?, self.u8()?];
                         let t = [self.u8()?, self.u8()?, self.u8()?, self.u8()?];
                         Value::Timestamp(i32::from_le_bytes(d), u32::from_le_bytes(t))
+                    }
+                    // the zoned temporal literals (slice 70): the UTC
+                    // instant plus the zone id, bit for bit as the
+                    // compiler stored them (a TIMESTAMP's time reads
+                    // SIGNED - year 1 +14:00 keeps a negative time)
+                    blr::DT_TIME_TZ => {
+                        let t = [self.u8()?, self.u8()?, self.u8()?, self.u8()?];
+                        let z = [self.u8()?, self.u8()?];
+                        Value::TimeTz(u32::from_le_bytes(t), u16::from_le_bytes(z))
+                    }
+                    blr::DT_TIMESTAMP_TZ => {
+                        let d = [self.u8()?, self.u8()?, self.u8()?, self.u8()?];
+                        let t = [self.u8()?, self.u8()?, self.u8()?, self.u8()?];
+                        let z = [self.u8()?, self.u8()?];
+                        Value::TimestampTz(
+                            i32::from_le_bytes(d),
+                            u32::from_le_bytes(t),
+                            u16::from_le_bytes(z),
+                        )
                     }
                     // blr_double: a COUNTED STRING, the literal's source text
                     // (dsql emits `1e0` / `0.1e0` spelled as written) - read
@@ -3074,6 +3109,12 @@ fn collect_sort_fields(rse: &Rse, body: &Stmt) -> SortFields {
                 | Expr::StrLen(_, a)
                 | Expr::Trim(_, a)
                 | Expr::Cast(_, a) => self.expr(a),
+                Expr::AtTz(a, z) => {
+                    self.expr(a);
+                    if let Some(zz) = z {
+                        self.expr(zz);
+                    }
+                }
                 Expr::GenId(_, a) => {
                     if let Some(x) = a {
                         self.expr(x);
@@ -3280,6 +3321,18 @@ fn expr_desc(
         Expr::Variable(n) => var_slots.get(*n as usize)?.as_ref().map(msgslot_desc),
         Expr::Cast(slot, _) => Some(msgslot_desc(slot)),
         Expr::Negate(a) => expr_desc(file, page_size, msg_slots, var_slots, frames, a),
+        // AT TIME ZONE / AT LOCAL: TIME-ish in, TIME TZ - TIMESTAMP-ish
+        // in, TIMESTAMP TZ (AtNode::getDesc; anything else untypes)
+        Expr::AtTz(a, _) => {
+            let da = expr_desc(file, page_size, msg_slots, var_slots, frames, a)?;
+            if da.dtype == dtype::SQL_TIME || da.dtype == dtype::SQL_TIME_TZ {
+                Some(SlotDesc { dtype: dtype::SQL_TIME_TZ, len: 8, charset: 0, coll: 0 })
+            } else if da.dtype == dtype::TIMESTAMP || da.dtype == dtype::TIMESTAMP_TZ {
+                Some(SlotDesc { dtype: dtype::TIMESTAMP_TZ, len: 12, charset: 0, coll: 0 })
+            } else {
+                None
+            }
+        }
         Expr::Arith(v, a, b) => {
             let da = expr_desc(file, page_size, msg_slots, var_slots, frames, a)?;
             let db = expr_desc(file, page_size, msg_slots, var_slots, frames, b)?;
@@ -6974,6 +7027,63 @@ impl<'a> Exec<'a> {
                     self.eval(els)?
                 }
             }
+            Expr::AtTz(operand, zone) => {
+                // `<value> AT TIME ZONE <zone>` / `<value> AT LOCAL`
+                // (slice 70): the interpreter's fold, arm for arm. NULL
+                // in or out is NULL; the zone renders to text and
+                // resolves by the offset grammar then the region table
+                // (whatever the engine raises for - 224133202 /
+                // 336723988 at EXECUTE - refuse for); a value sits in
+                // the zone only when its offset is known (a fixed
+                // displacement, or one host-rules lookup at the
+                // instant - a zoneless TIMESTAMP counts once placed, a
+                // TIME on the engine's base date); a ZONED operand then
+                // re-labels (its instant stands), a zoneless one reads
+                // its wall clock by the SESSION ZONE (AT LOCAL answers
+                // in it). A DATE or a non-temporal never types
+                let v = self.eval(operand)?;
+                if matches!(v, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let zone_id = match zone {
+                    None => SESSION_ZONE.with(|s| s.get()),
+                    Some(z) => {
+                        let zv = self.eval(z)?;
+                        if matches!(zv, Value::Null) {
+                            return Ok(Value::Null);
+                        }
+                        at_zone_id(&zv.render())?
+                    }
+                };
+                let instant_in_rules = match v {
+                    Value::TimestampTz(d, t, _) | Value::Timestamp(d, t) => {
+                        fire_crab_ods::tz::displacement_at(zone_id, d, t).is_some()
+                    }
+                    Value::TimeTz(t, _) | Value::Time(t) => {
+                        fire_crab_ods::tz::time_displacement(zone_id, t).is_some()
+                    }
+                    _ => false,
+                };
+                if !instant_in_rules && fire_crab_ods::tz::displacement(zone_id).is_none() {
+                    return Err("AT TIME ZONE over this zone unconverted".into());
+                }
+                let out = match v {
+                    Value::TimestampTz(d, t, _) => Value::TimestampTz(d, t, zone_id),
+                    Value::TimeTz(t, _) => Value::TimeTz(t, zone_id),
+                    Value::Timestamp(d, t) => {
+                        match at_wall_to_utc_timestamp(d, t, SESSION_ZONE.with(|s| s.get())) {
+                            Some((ud, ut)) => Value::TimestampTz(ud, ut, zone_id),
+                            None => return Err("AT TIME ZONE over this zone unconverted".into()),
+                        }
+                    }
+                    Value::Time(t) => match at_wall_to_utc_time(t, SESSION_ZONE.with(|s| s.get())) {
+                        Some(ut) => Value::TimeTz(ut, zone_id),
+                        None => return Err("AT TIME ZONE over this zone unconverted".into()),
+                    },
+                    _ => return Err("AT TIME ZONE over this value unconverted".into()),
+                };
+                out
+            }
             Expr::Cast(slot, inner) => {
                 let v = self.eval(inner)?;
                 if matches!(v, Value::Null) {
@@ -7773,6 +7883,89 @@ thread_local! {
     static INCOMPARABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// the SESSION ZONE id for AT TIME ZONE / AT LOCAL (slice 70): the
+    /// zone a zoneless operand's wall clock reads by, and the zone AT
+    /// LOCAL answers in. The route sets it from the session before
+    /// every run ([set_session_zone]); the default is GMT (65535),
+    /// the engine's own fallback (TimeZoneUtil::GMT_ZONE)
+    static SESSION_ZONE: std::cell::Cell<u16> = const { std::cell::Cell::new(65535) };
+}
+
+/// Set the session zone id for AT TIME ZONE / AT LOCAL (slice 70).
+/// The route calls this with the session's zone before every run -
+/// unconditionally, since pooled threads would otherwise leak a
+/// previous session's zone into the next run
+pub fn set_session_zone(zone: u16) {
+    SESSION_ZONE.set(zone);
+}
+
+/// A zone tail to its id (slice 70): the engine's
+/// TimeZoneUtil::parse, strict - the AT TIME ZONE form. A leading
+/// sign is an offset `±h+:mm` (inner spaces ride, the `:mm` is
+/// required, no seconds, past ±14:00 or a bad shape the engine
+/// raises 224133202); everything else is a region-table name
+/// (case-insensitive, canonical render; unknown raises 336723988).
+/// There is NO UTC/GMT/UT/Z prefix reading: bare `UTC` keeps its
+/// NAMED id (it renders `UTC`, not `GMT`), bare `GMT` is 65535,
+/// `UT`, `Z`, `UTC+05:00`, `GMT+5` and `AES` all raise in the
+/// engine (each probed), and `MST` is a named region, not an alias
+/// (probed: renders `MST`, UTC-7). Whatever the engine raises for,
+/// the executor refuses for
+fn at_zone_id(tail: &str) -> Result<u16, String> {
+    // the engine skips spaces and tabs only (skipSpaces) - a tab or
+    // newline anywhere else is part of the token and fails the parse
+    let t = tail.trim_matches([' ', '\t']);
+    let err = || "an AT TIME ZONE offset unconverted".to_string();
+    if let Some(rest) = t.strip_prefix('+').or_else(|| t.strip_prefix('-')) {
+        let neg = t.starts_with('-');
+        // the engine's parseNumber: ASCII digits, None when empty
+        fn digits(s: &str) -> Option<(&str, &str)> {
+            let n = s.bytes().take_while(u8::is_ascii_digit).count();
+            if n > 0 { Some((&s[..n], &s[n..])) } else { None }
+        }
+        let (h, s) = digits(rest.trim_start_matches([' ', '\t'])).ok_or_else(err)?;
+        let s = s.trim_start_matches([' ', '\t']).strip_prefix(':').ok_or_else(err)?;
+        let (m, s) = digits(s.trim_start_matches([' ', '\t'])).ok_or_else(err)?;
+        if !s.trim_start_matches([' ', '\t']).is_empty() {
+            return Err(err());
+        }
+        // saturating: a digit run past i64 still fails the range
+        // check below, as the engine's wrapped int fails
+        // isValidOffset (tzm <= 59, tzh < 14 or == 14 with mm == 0)
+        let (h, m): (i64, i64) = (
+            h.bytes().fold(0i64, |a, b| a.saturating_mul(10).saturating_add((b - b'0') as i64)),
+            m.bytes().fold(0i64, |a, b| a.saturating_mul(10).saturating_add((b - b'0') as i64)),
+        );
+        if m > 59 || h > 14 || (h == 14 && m > 0) {
+            return Err(err());
+        }
+        let minutes = (h * 60 + m) as i32;
+        return Ok((1439 + if neg { -minutes } else { minutes }) as u16);
+    }
+    fire_crab_ods::tz::zone_id(t).ok_or_else(|| "an AT TIME ZONE region unconverted".to_string())
+}
+
+/// A zoneless wall clock read by a zone, as the UTC instant (slice 70):
+/// the interpreter's wall_to_utc_timestamp - the zone's displacement
+/// at the LOCAL time (a ruled region's DST reads the wall, not the
+/// answer), days carried past midnight
+fn at_wall_to_utc_timestamp(d: i32, t: u32, zone: u16) -> Option<(i32, u32)> {
+    const DAY_UNITS: i64 = 24 * 60 * 60 * 10_000;
+    let disp = fire_crab_ods::tz::wall_displacement(zone, d, t)?;
+    let ut = t as i64 - disp as i64 * 600_000;
+    Some(((d as i64 + ut.div_euclid(DAY_UNITS)) as i32, ut.rem_euclid(DAY_UNITS) as u32))
+}
+
+/// A zoneless wall TIME read by a zone, as the UTC time-of-day (slice
+/// 70): the interpreter's wall_to_utc_time - the displacement at the
+/// local time on the engine's base date, wrapped into the day
+fn at_wall_to_utc_time(t: u32, zone: u16) -> Option<u32> {
+    const DAY_UNITS: i64 = 24 * 60 * 60 * 10_000;
+    let disp = fire_crab_ods::tz::time_wall_displacement(zone, t)?;
+    Some((t as i64 - disp as i64 * 600_000).rem_euclid(DAY_UNITS) as u32)
+}
+
 /// The contexts an expression reads (blr_field / blr_fid), or None when
 /// it reads something a join step cannot place (a variable, a subquery).
 fn expr_contexts(e: &Expr, out: &mut Vec<u8>) -> Option<()> {
@@ -8353,6 +8546,9 @@ fn expr_has_double_literal(e: &Expr) -> bool {
         | Expr::StrLen(_, a)
         | Expr::Trim(_, a)
         | Expr::Cast(_, a) => expr_has_double_literal(a),
+        Expr::AtTz(a, z) => {
+            expr_has_double_literal(a) || z.as_ref().is_some_and(|x| expr_has_double_literal(x))
+        }
         Expr::GenId(_, s) => s.as_ref().is_some_and(|x| expr_has_double_literal(x)),
         Expr::Substr(a, b, c) => {
             expr_has_double_literal(a) || expr_has_double_literal(b) || expr_has_double_literal(c)

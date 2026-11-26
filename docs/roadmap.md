@@ -183,7 +183,11 @@ replacement of the C++ engine is below, in priority order. Full text:
    base-1 and infinite-operand LOGs refuse; the new reach exposed two
    consumer divergences, both fixed - a DECFLOAT rounds to the CAST
    target's own scale, a double literal beside a DECFLOAT in arithmetic
-   refuses for the interpreter's assignment fold).
+   refuses for the interpreter's assignment fold),
+   slice 70 AT TIME ZONE / AT LOCAL in `exe` (verb 216: a zoned operand
+   re-labels, a zoneless one reads by the session zone, ruled regions by
+   the host rules; whatever the engine raises for refuses; zoned
+   literals read).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -678,6 +682,30 @@ replacement of the C++ engine is below, in priority order. Full text:
    215 vs 223 = the 8 flipped FAILs). The end census: 526/527 sourcing
    logs (cmpparam's traceless log 15s past the window), 430 traces (108
    unique - the 4 new cells' DONE probes plus the LOG-domain decline).
+   DONE (slice 70): AT TIME ZONE / AT LOCAL in `exe` - verb 216 by the
+   interpreter's fold (a zoned operand re-labels, a zoneless one reads
+   its wall clock by the session zone - plumbed per run at the three
+   call sites, defaulting to the host zone as the engine answers it -
+   ruled regions by one host-rules lookup), whatever the engine raises
+   for refuses, zoned literals (dtypes 28/29) read. The recount caught a
+   zone-name bug in the first at_zone_id: it stripped UTC/GMT/UT/Z
+   prefixes (bare UTC answered GMT's id) and carried AES/MST alias plus
+   lax-offset arms the engine never had - twenty-two engine probes
+   rewrote it as strict TimeZoneUtil::parse (a leading sign is an
+   offset, everything else a region-table name; UT/Z/UTC+../AES raise,
+   MST is named). Batteries: exe +9/+7 to 353 (EP101/EP158 the known
+   reds), branchtype 69/69, exeselect's eleven §56/§57 flips plus §70's
+   three cells (357 OK + the §17 known red); dsql untouched (proc 1584,
+   view 239, unit 99). The recount ran as ONE serial pass plus five
+   documented splices (the four AT gates healed solo with the zone-name
+   fix; cmpparam past the 900s gate timeout again, byte-identical
+   direct): 527 gates, 49 red - the SAME 49 as slice 69, every red
+   gate's DIFF/FAIL set byte-identical, zero flips either way (OK 25291
+   vs 25288 = exactly §70's three route cells; DIFF/FAIL 215 identical).
+   The end census over the full sweep window: 524 sourcing logs, 1265
+   traces (98 unique - zero in-window AT TIME ZONE declines, the
+   removal confirmed; slice 69's 430 counted a narrower window and is
+   not comparable).
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

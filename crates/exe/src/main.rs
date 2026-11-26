@@ -28,6 +28,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // AT TIME ZONE reads the session zone from the executor's own
+    // thread-local (slice 70): the host zone, as the engine answers a
+    // session zone from when nothing else names one
+    fire_crab_exe::set_session_zone(fire_crab_ods::tz::host_zone_id());
     let run = || -> Result<(), String> {
         let page_size = page_size_of(&file).ok_or("cannot read the page size")?;
         let image = fire_crab_ods::Image::from_bytes(&file, page_size);

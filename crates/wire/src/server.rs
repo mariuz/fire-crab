@@ -86223,21 +86223,7 @@ fn session_zone_id() -> u16 {
     if let Some(z) = SESSION_ZONE.with(|c| c.get()) {
         return z;
     }
-    // CACHED: the mixed tz/plain comparison arms call this per row,
-    // and the uncached form read /etc/timezone from disk each time
-    // (review-caught). The host zone cannot change under a running
-    // server in any way this server tracks.
-    static ZONE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
-    *ZONE.get_or_init(|| {
-        let name = std::env::var("TZ")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                std::fs::read_to_string("/etc/timezone").ok().map(|s| s.trim().to_string())
-            })
-            .unwrap_or_default();
-        fire_crab_ods::tz::zone_id(name.trim_start_matches(':')).unwrap_or(65535)
-    })
+    fire_crab_ods::tz::host_zone_id()
 }
 
 fn blob_col_cast(inner: &RawExpr, t: &CastTarget, columns: &[RelationColumn], descs: &[Descriptor]) -> Option<usize> {
@@ -129145,6 +129131,9 @@ fn try_procedure_blr_at(
         // generator page back) serves these
         return BlrProcOutcome::Outside;
     }
+    // the executor's AT TIME ZONE reads the session zone from its own
+    // thread-local (slice 70)
+    fire_crab_exe::set_session_zone(session_zone_id());
     let sends =
         match fire_crab_exe::bind_and_execute_mode(&db.bytes(), db.page_size, &req, args, first_only) {
             Ok(s) => s,
@@ -129287,6 +129276,9 @@ fn try_function_blr_at(database: &Option<Database>, name: &str, args: &[Value], 
     if req.uses_generators {
         return FnBlrOutcome::Outside;
     }
+    // the executor's AT TIME ZONE reads the session zone from its own
+    // thread-local (slice 70)
+    fire_crab_exe::set_session_zone(session_zone_id());
     let sends = match fire_crab_exe::bind_and_execute(&db.bytes(), db.page_size, &req, &bound_args)
     {
         Ok(s) => s,
@@ -131249,12 +131241,10 @@ fn exe_select(
     if compiled.uses_hypo_agg {
         return decline("a WITHIN GROUP aggregate");
     }
-    // An AT TIME ZONE / AT LOCAL value (slice 56): the compiler holds
-    // the shape byte-identical, but the BLR executor converts no verb
-    // 216 yet - the interpreter serves the decline
-    if compiled.uses_at_tz {
-        return decline("an AT TIME ZONE expression");
-    }
+    // An AT TIME ZONE / AT LOCAL value converted in the executor
+    // (slice 70): verb 216 evaluates there, refusing whatever the
+    // engine raises for - the interpreter serves the refuse. (The
+    // compiler's uses_at_tz flag stays as the shape's marker.)
     // THE EXECUTOR COMPARES TEXT BY CODE POINT, blank-trimmed: right for
     // NONE, OCTETS, ASCII, UNICODE_FSS and UTF8's own collation, wrong for
     // a COLLATED column ([blr_reads_collated_relation]) and for a codepage
@@ -131465,6 +131455,10 @@ fn exe_select(
         }
     }
     let sends = match fire_crab_exe::with_read_view(db.own_tx(), db.view_snapshot(), || {
+        // the executor's AT TIME ZONE reads the session zone from its
+        // own thread-local (slice 70) - set on EVERY run, since pooled
+        // threads would otherwise leak a previous session's zone
+        fire_crab_exe::set_session_zone(session_zone_id());
         fire_crab_exe::bind_and_execute_mode(&db.bytes(), db.page_size, &req, &in_vals, false)
     }) {
         Ok(s) => s,

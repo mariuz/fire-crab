@@ -231,6 +231,26 @@ pub fn zone_names() -> &'static [&'static str] {
     TIME_ZONE_LIST
 }
 
+/// The HOST zone's id (slice 70): what the engine answers a session
+/// zone from when nothing else names one - TZ first, /etc/timezone
+/// past it, UTC (65535) when neither names a known zone. Cached: the
+/// mixed tz/plain comparison arms call per row, and the uncached form
+/// read /etc/timezone from disk each time. The host zone cannot change
+/// under a running server in any way this server tracks.
+pub fn host_zone_id() -> u16 {
+    static ZONE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *ZONE.get_or_init(|| {
+        let name = std::env::var("TZ")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::fs::read_to_string("/etc/timezone").ok().map(|s| s.trim().to_string())
+            })
+            .unwrap_or_default();
+        zone_id(name.trim_start_matches(':')).unwrap_or(65535)
+    })
+}
+
 pub fn zone_text(zone: u16) -> String {
     if zone <= 2878 {
         let d = zone as i32 - 1439;

@@ -662,24 +662,24 @@ route "55 an out-of-range fraction raises on both" declined "SELECT PERCENTILE_C
 #  qa/dsql-proc-blr.sh, refusal and stored mismatch respectively)
 
 echo "--- 56 AT TIME ZONE / AT LOCAL (slice 56): the BLR path declines, the interpreter serves"
-route "56 a TIMESTAMP column at a fixed offset" declined "SELECT TS AT TIME ZONE '+02:00' FROM T ORDER BY ID"
-route "56 a TIME column at a fixed offset" declined "SELECT TM AT TIME ZONE '-05:30' FROM T ORDER BY ID"
+route "56 a TIMESTAMP column at a fixed offset (slice 70 serves)" served "SELECT TS AT TIME ZONE '+02:00' FROM T ORDER BY ID"
+route "56 a TIME column at a fixed offset (slice 70 serves)" served "SELECT TM AT TIME ZONE '-05:30' FROM T ORDER BY ID"
 route "56 a DATE column at UTC" declined "SELECT D AT TIME ZONE 'UTC' FROM T ORDER BY ID"
-route "56 two AT values side by side" declined "SELECT TS AT TIME ZONE '+02:00', TM AT TIME ZONE '+02:00' FROM T ORDER BY ID"
-route "56 an AT comparison in WHERE" declined "SELECT ID FROM T WHERE TS AT TIME ZONE '+02:00' = TIMESTAMP '2024-01-02 12:00:00 UTC' ORDER BY ID"
-route "56 a chained AT" declined "SELECT TS AT TIME ZONE '+02:00' AT TIME ZONE '-03:00' FROM T ORDER BY ID"
-route "56 AT LOCAL" declined "SELECT TS AT LOCAL FROM T ORDER BY ID"
+route "56 two AT values side by side (slice 70 serves)" served "SELECT TS AT TIME ZONE '+02:00', TM AT TIME ZONE '+02:00' FROM T ORDER BY ID"
+route "56 an AT comparison in WHERE (slice 70 serves)" served "SELECT ID FROM T WHERE TS AT TIME ZONE '+02:00' = TIMESTAMP '2024-01-02 12:00:00 UTC' ORDER BY ID"
+route "56 a chained AT (slice 70 serves)" served "SELECT TS AT TIME ZONE '+02:00' AT TIME ZONE '-03:00' FROM T ORDER BY ID"
+route "56 AT LOCAL (slice 70 serves)" served "SELECT TS AT LOCAL FROM T ORDER BY ID"
 # (no route cell for a ruled named zone: the compiler holds it
 #  byte-identical, but the interpreter refuses what it cannot place
 #  without tzdata rules - the attimezone gate's recorded boundary)
 
 echo "--- 57 zoned temporal literals (slice 57): the BLR path declines, the interpreter serves"
-route "57 a zoned TIMESTAMP literal" declined "SELECT TIMESTAMP '2020-06-15 12:00:00 +05:00' FROM T ORDER BY ID"
-route "57 a zoned TIME literal" declined "SELECT TIME '12:00:00 UTC' FROM T ORDER BY ID"
+route "57 a zoned TIMESTAMP literal (slice 70 serves)" served "SELECT TIMESTAMP '2020-06-15 12:00:00 +05:00' FROM T ORDER BY ID"
+route "57 a zoned TIME literal (slice 70 serves)" served "SELECT TIME '12:00:00 UTC' FROM T ORDER BY ID"
 route "57 a zoned literal in a comparison" declined "SELECT ID FROM T WHERE TS > TIMESTAMP '2024-01-01 00:00:00 +02:00' ORDER BY ID"
-route "57 AT beside a zoned literal" declined "SELECT TS AT TIME ZONE '+02:00', TIMESTAMP '2020-06-15 12:00:00 +05:00' FROM T ORDER BY ID"
-route "57 AT over a zoned literal" declined "SELECT TIMESTAMP '2020-06-15 12:00:00 +05:00' AT TIME ZONE '+02:00' FROM T ORDER BY ID"
-route "57 a day-wrapped zoned TIME" declined "SELECT TIME '00:30:00 +05:00' FROM T ORDER BY ID"
+route "57 AT beside a zoned literal (slice 70 serves)" served "SELECT TS AT TIME ZONE '+02:00', TIMESTAMP '2020-06-15 12:00:00 +05:00' FROM T ORDER BY ID"
+route "57 AT over a zoned literal (slice 70 serves)" served "SELECT TIMESTAMP '2020-06-15 12:00:00 +05:00' AT TIME ZONE '+02:00' FROM T ORDER BY ID"
+route "57 a day-wrapped zoned TIME (slice 70 serves)" served "SELECT TIME '00:30:00 +05:00' FROM T ORDER BY ID"
 route "57 a DATE literal AT refuses in the compiler, the interpreter serves" declined "SELECT DATE '2020-06-15' AT TIME ZONE '+02:00' FROM T ORDER BY ID"
 # (no route cell for a named-region literal: the compiler refuses what
 #  it cannot place without tzdata rules - same boundary as the
@@ -754,6 +754,11 @@ route "69 LOG over a decfloat" served "SELECT LOG(V, 8) FROM DFM ORDER BY 1"
 route "69 SQRT over an INT128" served "SELECT SQRT(CAST(4 AS INT128)) FROM T"
 route "69 mixed POWER computes in DOUBLE" served "SELECT POWER(CAST(2 AS DOUBLE PRECISION), CAST(3 AS DECFLOAT(34))) FROM T"
 route "69 LOG(1, x) declines" declined "SELECT LOG(1, ID) FROM T"
+
+echo "--- 70 AT TIME ZONE in the executor (slice 70): ruled regions serve, bad zones decline to the raise"
+route "70 AT over a ruled region" served "SELECT TS AT TIME ZONE 'Europe/Paris' FROM T ORDER BY ID"
+route "70 AT over a ruled region in summer" served "SELECT TIMESTAMP '2024-07-02 10:00:00' AT TIME ZONE 'Europe/Paris' FROM T ORDER BY ID"
+route "70 AT with a bad zone declines to the raise" declined "SELECT TS AT TIME ZONE 'Mars' FROM T ORDER BY ID"
 
 echo "--- panic check"
 ran=$((ran + 1))
