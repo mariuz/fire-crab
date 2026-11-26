@@ -1835,17 +1835,21 @@ fn sf_first_last_day(part: u8, v: &Value, last: bool) -> Result<Value, String> {
     })
 }
 
-/// Whether DblDec arguments take the DECIMAL128 path (slice 68): a
-/// DECFLOAT among them and none approximate (the engine's
-/// makeDblDecResult; an approximate operand wins outright). INT128-backed
-/// operands refuse (the engine takes them decimal too - unprobed here)
+/// Whether a DblDec operand counts toward the DECIMAL128 path (slices
+/// 68-69): a DECFLOAT or an INT128-backed value (the engine's
+/// isDecOrInt128 inside areParamsDouble - P69A/H/K/S/T). The CALL takes
+/// the decimal path when some operand counts and none is approximate
+/// (an approximate operand wins outright - P69B/C/J/P)
 fn dbldec_decimal(v: &Value) -> bool {
-    matches!(v, Value::DecFloat16(_) | Value::DecFloat34(_))
+    matches!(
+        v,
+        Value::DecFloat16(_) | Value::DecFloat34(_) | Value::Int128(..)
+    )
 }
 
-/// A one-argument DblDec call (slice 68: SQRT, EXP, LN, LOG10):
-/// DECFLOAT(34) via [decmath] for a DECFLOAT operand, DOUBLE
-/// otherwise. Domain violations refuse (SQRT of a negative, LN/LOG10
+/// A one-argument DblDec call (slices 68-69: SQRT, EXP, LN, LOG10):
+/// DECFLOAT(34) via [decmath] for a DECFLOAT or INT128-backed operand,
+/// DOUBLE otherwise. Domain violations refuse (SQRT of a negative, LN/LOG10
 /// of a non-positive - the engine raises 42000; the interpreter
 /// answers), as does a NaN operand to SQRT/LN/LOG10 (the engine's
 /// compare raises 22000 BEFORE the math - only EXP lets a quiet NaN
@@ -1868,6 +1872,9 @@ fn dbldec1(
     let d = match v {
         Value::DecFloat16(b) => dfl::decode_dec64(*b),
         Value::DecFloat34(b) => dfl::decode_dec128(*b),
+        // an INT128 past 34 digits refuses (round_to_dec34's None)
+        Value::Int128(..) => dec_promote_exact(v)
+            .ok_or_else(|| format!("{} over this INT128 unconverted", name))?,
         _ => unreachable!(),
     };
     if d.is_nan() && name != "EXP" {
@@ -2056,26 +2063,18 @@ fn sys_fn(name: &str, args: &[Value]) -> Result<Value, String> {
         "LN" => dbldec1(name, arg(0)?, &|x| if x <= 0.0 { Err("LN of a non-positive".into()) } else { Ok(x.ln()) }, fire_crab_ods::decmath::ln)?,
         "LOG10" => dbldec1(name, arg(0)?, &|x| if x <= 0.0 { Err("LOG10 of a non-positive".into()) } else { Ok(x.log10()) }, fire_crab_ods::decmath::log10)?,
         "LOG" => {
-            let base = sf_f64(arg(0)?)?;
-            let x = sf_f64(arg(1)?)?;
-            if base <= 0.0 || x <= 0.0 || base == 1.0 {
-                return Err("LOG domain".into());
-            }
-            let r = x.ln() / base.ln();
-            if !r.is_finite() {
-                return Err("LOG: a non-finite result".into());
-            }
-            Value::Double(r)
-        }
-        "POWER" => {
             let bv = arg(0)?;
             let ev = arg(1)?;
             let approx = matches!(bv, Value::Double(_) | Value::Float(_))
                 || matches!(ev, Value::Double(_) | Value::Float(_));
-            // a DECFLOAT beside no approximate arg takes the DECIMAL128
-            // path (slice 68 - the engine's makeDblDecResult); an
-            // approximate beside a decfloat refuses inside sf_f64
-            // (unprobed conversion - the interpreter answers)
+            // a DECFLOAT or INT128 beside no approximate arg takes the
+            // DECIMAL128 path (slice 69 - the engine's areParamsDouble):
+            // ln(value)/ln(base) at 34 digits (evlLog). Domain
+            // violations refuse (the engine raises 42000), a NaN
+            // operand refuses (its compare raises 22000), and a zero
+            // ln(base) refuses (22012, P69G/R - 22000 for 0/0, P69W,
+            // the same bucket here) - the executor has no trap to
+            // stand down
             if (dbldec_decimal(bv) || dbldec_decimal(ev)) && !approx {
                 use fire_crab_ods::decfloat as dfl;
                 use fire_crab_ods::decmath as dm;
@@ -2083,8 +2082,82 @@ fn sys_fn(name: &str, args: &[Value]) -> Result<Value, String> {
                     match v {
                         Value::DecFloat16(b) => Ok(dfl::decode_dec64(*b)),
                         Value::DecFloat34(b) => Ok(dfl::decode_dec128(*b)),
-                        Value::Int(_) | Value::Scaled(..) => dec_promote_exact(v)
-                            .ok_or_else(|| "POWER over this exact unconverted".to_string()),
+                        Value::Int(_) | Value::Scaled(..) | Value::Int128(..) => {
+                            dec_promote_exact(v)
+                                .ok_or_else(|| "LOG over this exact unconverted".to_string())
+                        }
+                        _ => Err("LOG over this operand unconverted".into()),
+                    }
+                };
+                let bd = dec_arg(bv)?;
+                let ed = dec_arg(ev)?;
+                if bd.is_nan() || ed.is_nan() {
+                    return Err("LOG of NaN: the engine raises".into());
+                }
+                let zero = dfl::Dec::Finite { neg: false, coeff: 0, exp: 0 };
+                if dfl::cmp(&bd, &zero) != std::cmp::Ordering::Greater
+                    || dfl::cmp(&ed, &zero) != std::cmp::Ordering::Greater
+                {
+                    return Err("LOG domain: the engine raises".into());
+                }
+                match (dm::ln(&ed), dm::ln(&bd)) {
+                    (Ok(a), Ok(b)) => {
+                        if dfl::is_zero(&b) {
+                            return Err("LOG: the engine raises".into());
+                        }
+                        // an infinite operand's special (the engine
+                        // answers, the interpreter answers) is
+                        // unconverted here
+                        if !matches!(a, dfl::Dec::Finite { .. })
+                            || !matches!(b, dfl::Dec::Finite { .. })
+                        {
+                            return Err("LOG over an infinite operand unconverted".into());
+                        }
+                        match dfl::div(&a, &b) {
+                            q @ dfl::Dec::Finite { .. } => {
+                                Value::DecFloat34(dfl::dec_to_bits(&q))
+                            }
+                            _ => return Err("LOG: the engine raises".into()),
+                        }
+                    }
+                    _ => return Err("LOG: the engine raises".into()),
+                }
+            } else {
+                let base = dbldec_f64(bv)?;
+                let x = dbldec_f64(ev)?;
+                // base 1 refuses: the engine answers Infinity (P69F)
+                // or NaN (P69X), the interpreter answers, the executor
+                // refuses non-finite
+                if base <= 0.0 || x <= 0.0 || base == 1.0 {
+                    return Err("LOG domain".into());
+                }
+                let r = x.ln() / base.ln();
+                if !r.is_finite() {
+                    return Err("LOG: a non-finite result".into());
+                }
+                Value::Double(r)
+            }
+        }
+        "POWER" => {
+            let bv = arg(0)?;
+            let ev = arg(1)?;
+            let approx = matches!(bv, Value::Double(_) | Value::Float(_))
+                || matches!(ev, Value::Double(_) | Value::Float(_));
+            // a DECFLOAT or INT128 beside no approximate arg takes the
+            // DECIMAL128 path (slices 68-69 - the engine's
+            // makeDblDecResult); an approximate beside a decfloat or
+            // INT128 computes in DOUBLE below (P69B/C/P)
+            if (dbldec_decimal(bv) || dbldec_decimal(ev)) && !approx {
+                use fire_crab_ods::decfloat as dfl;
+                use fire_crab_ods::decmath as dm;
+                let dec_arg = |v: &Value| -> Result<dfl::Dec, String> {
+                    match v {
+                        Value::DecFloat16(b) => Ok(dfl::decode_dec64(*b)),
+                        Value::DecFloat34(b) => Ok(dfl::decode_dec128(*b)),
+                        Value::Int(_) | Value::Scaled(..) | Value::Int128(..) => {
+                            dec_promote_exact(v)
+                                .ok_or_else(|| "POWER over this exact unconverted".to_string())
+                        }
                         _ => Err("POWER over this operand unconverted".into()),
                     }
                 };
@@ -2095,9 +2168,14 @@ fn sys_fn(name: &str, args: &[Value]) -> Result<Value, String> {
                     Err(_) => return Err("POWER: the engine raises".into()),
                 }
             } else {
-                let b = sf_f64(bv)?;
-                let e = sf_f64(ev)?;
-                if b < 0.0 && e.fract() != 0.0 {
+                let b = dbldec_f64(bv)?;
+                let e = dbldec_f64(ev)?;
+                // an approximate or decfloat exponent counts as
+                // non-integral even when whole (the engine's !isExact
+                // - P69M/U; the interpreter's exp_exact)
+                let exp_exact =
+                    matches!(ev, Value::Int(_) | Value::Scaled(..) | Value::Int128(..));
+                if b < 0.0 && (!exp_exact || e.fract() != 0.0) {
                     return Err("POWER of a negative base to a fraction".into());
                 }
                 if b == 0.0 && e < 0.0 {
@@ -6903,6 +6981,35 @@ impl<'a> Exec<'a> {
                 }
                 match slot.dtype {
                     blr::DT_SHORT | blr::DT_LONG | blr::DT_INT64 => {
+                        // a DECFLOAT rounds to the SLOT's scale (half-up
+                        // on the magnitude - the dec_to_slot_value law,
+                        // widenum 1: truncating to an integer first
+                        // answered 2.000000 for CAST(SQRT(5) AS
+                        // NUMERIC(18,6)) where the engine answers
+                        // 2.236068); a NaN, an Infinity, or a value past
+                        // range refuses for the interpreter's error
+                        if matches!(v, Value::DecFloat16(_) | Value::DecFloat34(_)) {
+                            let d = match &v {
+                                Value::DecFloat16(x) => {
+                                    fire_crab_ods::decfloat::decode_dec64(*x)
+                                }
+                                Value::DecFloat34(x) => {
+                                    fire_crab_ods::decfloat::decode_dec128(*x)
+                                }
+                                _ => unreachable!(),
+                            };
+                            let r = dec_to_scaled(&d, slot.scale)
+                                .ok_or("cast of a DECFLOAT to integer unconverted")?;
+                            let fits = match slot.dtype {
+                                blr::DT_SHORT => i16::try_from(r).is_ok(),
+                                blr::DT_LONG => i32::try_from(r).is_ok(),
+                                _ => i64::try_from(r).is_ok(),
+                            };
+                            if !fits {
+                                return Err("integer overflow".into());
+                            }
+                            return Ok(mk_num(r, slot.scale));
+                        }
                         // text parses (the engine's string-to-number
                         // conversion; a bad string is its 22018)
                         let n = match &v {
@@ -6924,18 +7031,8 @@ impl<'a> Exec<'a> {
                                 // CHAR padding included (the engine's, and
                                 // fc's own main-path, convention)
                                 .map_err(|_| format!("conversion error from string \"{}\"", t))?,
-                            // a DECFLOAT rounds HALF-UP, away from zero on a
-                            // tie (2.5 -> 3, -2.5 -> -3); a NaN, an
-                            // Infinity, or a value past i64 is the
-                            // interpreter's error (22000)
-                            Value::DecFloat16(x) => dec_to_int(
-                                &fire_crab_ods::decfloat::decode_dec64(*x),
-                            )
-                            .ok_or("cast of a DECFLOAT to integer unconverted")?,
-                            Value::DecFloat34(x) => dec_to_int(
-                                &fire_crab_ods::decfloat::decode_dec128(*x),
-                            )
-                            .ok_or("cast of a DECFLOAT to integer unconverted")?,
+                            // (a DECFLOAT returns above, rounded to the
+                            // slot's scale)
                             other => int_of(other)
                                 .ok_or("cast to integer unconverted for this value")?,
                         };
@@ -7066,6 +7163,20 @@ impl<'a> Exec<'a> {
                         }
                         let wide = slot.dtype == blr::DT_DEC128;
                         dec_cast_target(&v, wide)?
+                    }
+                    blr::DT_INT128 => {
+                        // CAST to INT128 over integers (slice 69): the
+                        // value rescales to the slot's scale and stays
+                        // INT128-backed whatever its size (the engine's
+                        // dtype); a fractional source, and every other
+                        // kind, refuse (the rounding unprobed)
+                        let (raw, from) = num_parts(&v)
+                            .ok_or("cast to INT128 unconverted for this value")?;
+                        if from != 0 {
+                            return Err("cast of a fractional value to INT128 unconverted".into());
+                        }
+                        let r = exe_rescale(raw, from, slot.scale).ok_or("integer overflow")?;
+                        Value::Int128(r, slot.scale)
                     }
                     other => {
                         return Err(format!("cast target dtype {} unconverted", other))
@@ -7214,8 +7325,24 @@ impl<'a> Exec<'a> {
                     return Ok(Value::Text(format!("{}{}", text(&lv)?, text(&rv)?)));
                 }
                 // A DECFLOAT OPERAND makes it decimal arithmetic (even
-                // beside a double, which converts - [dec_arith])
+                // beside a double, which converts - [dec_arith]) -
+                // EXCEPT beside a double LITERAL, whose TEXT the engine
+                // folds (the assignment fold) and whose spelling is gone
+                // by eval: the 17-digit conversion of the runtime value
+                // answered 2.10000000000000001 for D34 + 0.1e0 where the
+                // engine answers 2.1 (widenum 10). Refuse to the
+                // interpreter, which owns the fold (the CAST arm's
+                // guard, same rationale); a runtime double still
+                // converts inside dec_arith
                 if dec_of(&lv).is_some() || dec_of(&rv).is_some() {
+                    if (matches!(lv, Value::Double(_) | Value::Float(_))
+                        || matches!(rv, Value::Double(_) | Value::Float(_)))
+                        && (expr_has_double_literal(l) || expr_has_double_literal(r))
+                    {
+                        return Err(
+                            "a double literal beside a DECFLOAT in arithmetic unconverted".into(),
+                        );
+                    }
                     return dec_arith(*verb, &lv, &rv);
                 }
                 // AN APPROXIMATE OPERAND makes it double arithmetic: IEEE,
@@ -8293,34 +8420,39 @@ fn dec_from_double(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
     Some(Dec::Finite { neg, coeff, exp: exp - 16 })
 }
 
-/// A DECFLOAT as the i64 a CAST to integer answers: HALF-UP on the
-/// magnitude (away from zero: 2.5 -> 3, -2.5 -> -3). None for a NaN,
-/// an Infinity, or a value past i64 (the interpreter raises 22000).
-fn dec_to_int(d: &fire_crab_ods::decfloat::Dec) -> Option<i64> {
+/// A DblDec operand as an f64 (slice 69): [sf_f64] first, then the two
+/// shapes the engine's MOV_get_double takes past it - a DECFLOAT by
+/// its decimal value (a mixed approximate+decfloat call computes in
+/// DOUBLE, P69B/C/J), an INT128-backed value gated like the other
+/// exacts (P69P). NaN/Infinity pass through as f64 and die in the
+/// arm's non-finite-result refuse
+fn dbldec_f64(v: &Value) -> Result<f64, String> {
+    if let Ok(x) = sf_f64(v) {
+        return Ok(x);
+    }
+    match v {
+        Value::DecFloat16(b) => Ok(dec_to_f64(&fire_crab_ods::decfloat::decode_dec64(*b))),
+        Value::DecFloat34(b) => Ok(dec_to_f64(&fire_crab_ods::decfloat::decode_dec128(*b))),
+        Value::Int128(raw, s) if raw.unsigned_abs() < 1u128 << 53 => {
+            Ok(*raw as f64 / 10f64.powi(-(*s as i32)))
+        }
+        _ => Err("a double function over this operand unconverted".into()),
+    }
+}
+
+/// A decimal as the f64 nearest its value (slice 69): the coefficient
+/// scaled by the exponent, specials straight across
+fn dec_to_f64(d: &fire_crab_ods::decfloat::Dec) -> f64 {
     use fire_crab_ods::decfloat::Dec;
-    let Dec::Finite { neg, coeff, exp } = d else { return None };
-    let mag: u128 = if *exp >= 0 {
-        coeff.checked_mul(10u128.checked_pow(*exp as u32)?)?
-    } else {
-        let div = 10u128.checked_pow((-*exp) as u32)?;
-        let (q, r) = (coeff / div, coeff % div);
-        // twice the remainder against the divisor: an exact half
-        // rounds UP (half-up, on the magnitude)
-        if r.checked_mul(2)? >= div {
-            q.checked_add(1)?
-        } else {
-            q
+    match *d {
+        Dec::Finite { neg, coeff, exp } => {
+            let m = coeff as f64 * 10f64.powi(exp);
+            if neg { -m } else { m }
         }
-    };
-    if *neg {
-        if mag == i64::MAX as u128 + 1 {
-            // i64::MIN's own magnitude
-            Some(i64::MIN)
-        } else {
-            i64::try_from(mag).ok().and_then(|m| m.checked_neg())
+        Dec::Infinity { neg } => {
+            if neg { f64::NEG_INFINITY } else { f64::INFINITY }
         }
-    } else {
-        i64::try_from(mag).ok()
+        Dec::Nan { .. } => f64::NAN,
     }
 }
 

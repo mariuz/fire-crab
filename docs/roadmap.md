@@ -176,7 +176,14 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 68 decimal SQRT/POWER/EXP/LN/LOG10 in `exe` (DECFLOAT operands take
    the DECIMAL128 path via decmath and answer DECFLOAT(34); domain violations
    and math errors refuse so the interpreter raises the engine's error; LOG,
-   INT128-backed and mixed approximate+decfloat operands refuse).
+   INT128-backed and mixed approximate+decfloat operands refuse),
+   slice 69 LOG/INT128/mixed DblDec in `exe` (LOG's ln(value)/ln(base) decimal
+   arm, INT128-backed operands counting decimal, mixed approximate+decfloat
+   computing in DOUBLE, a non-exact exponent with a negative base refusing;
+   base-1 and infinite-operand LOGs refuse; the new reach exposed two
+   consumer divergences, both fixed - a DECFLOAT rounds to the CAST
+   target's own scale, a double literal beside a DECFLOAT in arithmetic
+   refuses for the interpreter's assignment fold).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -644,6 +651,33 @@ replacement of the C++ engine is below, in priority order. Full text:
    OK 25278 vs 25277 = exactly the +1 new exeselect cell; DIFF/FAIL 223
    identical). The end census: 527/527 sourcing logs, 425 traces (107
    unique, six fewer - the double-function bucket drained).
+   DONE (slice 69): LOG/INT128/mixed DblDec in `exe` - LOG's ln(value) /
+   ln(base) DECIMAL128 arm (evlLog: domain and NaN pre-checks, a zero
+   ln(base) refusing for the engine's 22012/22000), INT128-backed
+   operands counting decimal (areParamsDouble's isDecOrInt128, fed by a
+   minimal CAST to INT128 over integers), mixed approximate+decfloat /
+   INT128 computing in DOUBLE (approximate wins outright), and a
+   non-exact exponent with a negative base refusing (the P69M/U
+   served-wrong fix - the engine's !isExact); base-1 LOGs (the engine
+   answers Infinity/NaN) and infinite-operand decimal LOGs refuse. The
+   new reach exposed two consumer divergences, both fixed: a DECFLOAT
+   rounds to the CAST target's own scale (dec_to_scaled - the integer
+   truncation answered 2.000000 for NUMERIC(18,6)), and a double literal
+   beside a DECFLOAT in arithmetic refuses (the engine folds the
+   literal's text; the 17-digit conversion answered 2.10000000000000001
+   for D34 + 0.1e0). Batteries: exe +12/+8 to 337 (EP101/EP158 the known
+   reds), branchtype 69/69, exeselect §69's four cells (341 OK + the §17
+   known red); dsql untouched (proc 1584, view 239, unit 99). The recount
+   ran as ONE serial pass plus two documented splices (cmpparam: 916s
+   past the 900s gate timeout on today's box, byte-identical direct;
+   concurrency: an engine lock-timing flake, green solo): 527 gates, 49
+   red - THREE gates flipped green (math on the P69M fix,
+   castfromdecfloat on the cast fix, decfloatdoublearith on the arith
+   guard; every other red gate's DIFF/FAIL set byte-identical to slice
+   68; OK 25288 vs 25278 = the 4 new cells + 6 flipped pins; DIFF/FAIL
+   215 vs 223 = the 8 flipped FAILs). The end census: 526/527 sourcing
+   logs (cmpparam's traceless log 15s past the window), 430 traces (108
+   unique - the 4 new cells' DONE probes plus the LOG-domain decline).
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

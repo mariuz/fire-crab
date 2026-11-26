@@ -749,6 +749,12 @@ route "67 ...multi-key with a decfloat declines" declined "SELECT A, ID, COUNT(*
 echo "--- 68 decimal SQRT/POWER/EXP/LN/LOG10 (slice 68): valid serves, domain raises stay declined"
 route "68 LOG10 over a decfloat" served "SELECT LOG10(V) FROM DFM WHERE W > 0 ORDER BY 1"
 
+echo "--- 69 LOG/INT128/mixed DblDec (slice 69): decimal LOG and INT128 serve, mixed computes in DOUBLE, base-1 declines"
+route "69 LOG over a decfloat" served "SELECT LOG(V, 8) FROM DFM ORDER BY 1"
+route "69 SQRT over an INT128" served "SELECT SQRT(CAST(4 AS INT128)) FROM T"
+route "69 mixed POWER computes in DOUBLE" served "SELECT POWER(CAST(2 AS DOUBLE PRECISION), CAST(3 AS DECFLOAT(34))) FROM T"
+route "69 LOG(1, x) declines" declined "SELECT LOG(1, ID) FROM T"
+
 echo "--- panic check"
 ran=$((ran + 1))
 if grep -aq 'panicked at' "$LOG"; then echo "FAIL the server PANICKED"; fail=1
