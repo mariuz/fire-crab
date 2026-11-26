@@ -169,7 +169,10 @@ replacement of the C++ engine is below, in priority order. Full text:
    slice 66 group-constant hypothetical direct arguments (arithmetic, casts,
    system functions, CASE/COALESCE, params, CURRENT_* niladics - the compiler
    holds every shape byte-identical, the route declines, the interpreter serves;
-   columns, aggregates, stored calls and subqueries refuse).
+   columns, aggregates, stored calls and subqueries refuse),
+   slice 67 GROUP BY a DECFLOAT in `exe` (cohorts merge by value with the
+   record-greatest spelling surviving, NaN boundaries refuse so the interpreter
+   traps 22000 like the engine; multi-key and mixed-width groups refuse).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -602,6 +605,23 @@ replacement of the C++ engine is below, in priority order. Full text:
    WITHIN GROUP bucket); the compile bucket holds exactly one trace -
    the intentional MDY decline cell. Nothing the sweep throws at the
    compiler refuses anymore except by design.
+   DONE (slice 67): GROUP BY a DECFLOAT in `exe` (phase-2 item 7's first
+   half) - cohorts merge by value with the record-greatest spelling
+   surviving (the grouping sort's LAST row, cmp_total over the native
+   record bytes, in g.keys and the Pass fold alike); a NaN on either
+   side of a boundary comparison trips INCOMPARABLE and the run refuses
+   (the engine traps 22000 there - the interpreter answers it), while a
+   lone NaN row groups with no boundary to trip on; multi-key groups
+   with a decfloat and mixed widths refuse. Batteries: exe +3 and one
+   flipped refuse to 306 (EP101/EP158 the known reds), branchtype 69/69,
+   the flipped exeselect §13 + two §40 cells plus §67's multi-key
+   decline (336 OK + the §17 known red); dsql untouched (proc 1584,
+   view 239, unit 99). The recount ran as ONE serial pass (527 gates, 52
+   red with every red gate's DIFF/FAIL set byte-identical to slice 66;
+   OK 25277 vs 25276 = exactly the +1 new exeselect cell; DIFF/FAIL 223
+   identical). The end census: 527/527 sourcing logs, 430 traces (113
+   unique, two fewer - the GROUP-BY-DECFLOAT bucket is down to the
+   intentional multi-key decline cell).
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

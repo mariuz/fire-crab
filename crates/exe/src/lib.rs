@@ -6222,9 +6222,18 @@ impl<'a> Exec<'a> {
             for k in &agg.group_by {
                 keys.push(self.eval(k)?);
             }
-            // GROUP BY a DECFLOAT: the group's representative and NaN's
-            // grouping are the engine's cohort laws - unconverted here
-            if keys.iter().any(|k| matches!(k, Value::DecFloat16(_) | Value::DecFloat34(_))) {
+            // GROUP BY a DECFLOAT (slice 67): cohorts merge by value
+            // ([value_cmp]'s decfloat arm - the dedup law for
+            // everything non-NaN), a NaN on either side of a boundary
+            // comparison trips INCOMPARABLE and the run refuses (the
+            // engine's MOV_compare traps 22000 there instead - the
+            // interpreter answers it), while a lone NaN row groups
+            // with no boundary to trip on. Multi-key groups with a
+            // decfloat stay unconverted: the representative below is
+            // only sound for one key (a per-position greatest would
+            // stitch positions from different rows)
+            let dec_key = keys.iter().any(|k| matches!(k, Value::DecFloat16(_) | Value::DecFloat34(_)));
+            if dec_key && keys.len() != 1 {
                 return Err("GROUP BY a DECFLOAT unconverted".into());
             }
             // GROUP BY a WITH TIME ZONE key: the group's representative is
@@ -6237,7 +6246,46 @@ impl<'a> Exec<'a> {
                 g.keys.len() == keys.len()
                     && g.keys.iter().zip(&keys).all(|(a, b)| group_eq(a, b))
             }) {
-                Some(i) => i,
+                Some(i) => {
+                    // (slice 67) the single decfloat key's representative
+                    // is the record-greatest cohort member (the grouping
+                    // sort's LAST row, [cmp_total_64]/[cmp_total_128] over
+                    // the native record bytes); mixed widths refuse (the
+                    // engine widens before its sort - unprobed here)
+                    if dec_key && keys.len() == 1 {
+                        use fire_crab_ods::decfloat as dfl;
+                        use std::cmp::Ordering::Less;
+                        let take = match (&groups[i].keys[0], &keys[0]) {
+                            (Value::DecFloat16(a), Value::DecFloat16(b)) => {
+                                dfl::cmp_total_64(
+                                    &dfl::decode_dec64(*a),
+                                    *a,
+                                    &dfl::decode_dec64(*b),
+                                    *b,
+                                    false,
+                                ) == Less
+                            }
+                            (Value::DecFloat34(a), Value::DecFloat34(b)) => {
+                                dfl::cmp_total_128(
+                                    &dfl::decode_dec128(*a),
+                                    *a,
+                                    &dfl::decode_dec128(*b),
+                                    *b,
+                                    false,
+                                ) == Less
+                            }
+                            (Value::DecFloat16(_), Value::DecFloat34(_))
+                            | (Value::DecFloat34(_), Value::DecFloat16(_)) => {
+                                return Err("GROUP BY a DECFLOAT unconverted".into());
+                            }
+                            _ => false,
+                        };
+                        if take {
+                            groups[i].keys[0] = keys[0].clone();
+                        }
+                    }
+                    i
+                }
                 None => {
                     groups.push(new_acc(keys.clone(), &agg.map));
                     groups.len() - 1
@@ -6485,7 +6533,47 @@ impl<'a> Exec<'a> {
                             }
                         }
                     }
-                    (Fold::Pass(p), _, Some(v)) => *p = v,
+                    (Fold::Pass(p), _, Some(v)) => {
+                        // (slice 67) a GROUPED decfloat key item outputs
+                        // the group's representative - the record-greatest
+                        // spelling, like g.keys above - never the last
+                        // scan row; ungrouped and other kinds keep the
+                        // last row (unchanged), mixed widths refuse
+                        if !agg.group_by.is_empty() {
+                            use fire_crab_ods::decfloat as dfl;
+                            use std::cmp::Ordering::Less;
+                            let take = match (&*p, &v) {
+                                (Value::DecFloat16(a), Value::DecFloat16(b)) => {
+                                    dfl::cmp_total_64(
+                                        &dfl::decode_dec64(*a),
+                                        *a,
+                                        &dfl::decode_dec64(*b),
+                                        *b,
+                                        false,
+                                    ) == Less
+                                }
+                                (Value::DecFloat34(a), Value::DecFloat34(b)) => {
+                                    dfl::cmp_total_128(
+                                        &dfl::decode_dec128(*a),
+                                        *a,
+                                        &dfl::decode_dec128(*b),
+                                        *b,
+                                        false,
+                                    ) == Less
+                                }
+                                (Value::DecFloat16(_), Value::DecFloat34(_))
+                                | (Value::DecFloat34(_), Value::DecFloat16(_)) => {
+                                    return Err("GROUP BY a DECFLOAT unconverted".into());
+                                }
+                                _ => true,
+                            };
+                            if take {
+                                *p = v;
+                            }
+                        } else {
+                            *p = v;
+                        }
+                    }
                     _ => {}
                 }
             }

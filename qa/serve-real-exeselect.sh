@@ -380,7 +380,7 @@ route "13 DECFLOAT(16) / (34) outputs, their cohorts kept" served "SELECT ID, A,
 route "13 = an exact literal: 1.0 and 1.00 are 1" served "SELECT ID FROM DF WHERE A = 1 ORDER BY ID"
 route "13 beside an exact column" served "SELECT ID FROM DF WHERE A > N ORDER BY ID"
 route "13 MAX / MIN at the exponent extremes" served "SELECT MAX(B), MIN(B) FROM DF"
-route "13 GROUP BY a DECFLOAT declines (the cohort law)" declined "SELECT A, COUNT(*) FROM DF GROUP BY A"
+route "13 GROUP BY a DECFLOAT serves (slice 67: the cohort law)" served "SELECT A, COUNT(*) FROM DF GROUP BY A"
 route "13 arithmetic over DECFLOAT (slice 40 serves it)" served "SELECT A * 2 FROM DF WHERE ID = 2"
 echo "--- 14 INDEX retrieval (slice 13): an equality or a range on an indexed exact column"
 route "14 the PRIMARY KEY by equality" served "SELECT ID, N FROM T WHERE ID = 2"
@@ -518,7 +518,7 @@ route "40 MIN/MAX over NaN signals" declined "SELECT MIN(V), MAX(V) FROM DFS"
 route "40 SUM/AVG propagate quiet NaN" served "SELECT SUM(V), AVG(V) FROM DFN"
 route "40 SUM over sNaN signals" declined "SELECT SUM(V) FROM DFS"
 route "40 COUNT DISTINCT over cohorts and NaN" served "SELECT COUNT(DISTINCT V) FROM DFC"
-route "40 GROUP BY decfloat over cohorts and zeros (NaN-free)" declined "SELECT V, COUNT(*) FROM DFC GROUP BY V ORDER BY 1"
+route "40 GROUP BY decfloat over cohorts and zeros (NaN-free, slice 67 serves)" served "SELECT V, COUNT(*) FROM DFC GROUP BY V ORDER BY 1"
 route "40 GROUP BY decfloat signals on a NaN boundary (NaN)" declined "SELECT V, COUNT(*) FROM DFS WHERE V IS NOT NULL GROUP BY V ORDER BY 1"
 route "40 ABS CEIL FLOOR" served "SELECT ABS(V), CEIL(V), FLOOR(V) FROM DFC ORDER BY 1"
 route "40 ROUND half up TRUNC SIGN" declined "SELECT ROUND(V), TRUNC(V), SIGN(V) FROM DFC ORDER BY 1"
@@ -549,7 +549,7 @@ route "40 combination field never decides" served "SELECT V FROM DFO WHERE V = C
 route "40 exotic cohorts order and cohort-match" served "SELECT V FROM DFO ORDER BY 1"
 route "40 exotic cohorts reversed" served "SELECT V FROM DFO ORDER BY 1 DESC"
 route "40 exotic DISTINCT keeps record-greatest" served "SELECT DISTINCT V FROM DFO ORDER BY 1"
-route "40 exotic GROUP BY merges by value" declined "SELECT V, COUNT(*) FROM DFO GROUP BY V ORDER BY 1"
+route "40 exotic GROUP BY merges by value (slice 67 serves)" served "SELECT V, COUNT(*) FROM DFO GROUP BY V ORDER BY 1"
 route "40 dec16 column orders natively" served "SELECT A FROM DF ORDER BY 1"
 route "40 33-digit payload renders" served "SELECT CAST('NaN123456789012345678901234567890123' AS DECFLOAT(34)) FROM RDB\$DATABASE"
 route "40 34-digit payload is 22018" declined "SELECT CAST('NaN1234567890123456789012345678901234' AS DECFLOAT(34)) FROM RDB\$DATABASE"
@@ -742,6 +742,9 @@ route "65 ...mixed widths across columns" served "SELECT A FROM DF UNION ALL SEL
 
 echo "--- 66 group-constant direct args (slice 66): the compiler holds them, the route declines"
 route "66 RANK over an arithmetic direct arg" declined "SELECT RANK(1 + 1) WITHIN GROUP (ORDER BY B) FROM T"
+
+echo "--- 67 GROUP BY a DECFLOAT (slice 67): single-key serves, multi-key declines"
+route "67 ...multi-key with a decfloat declines" declined "SELECT A, ID, COUNT(*) FROM DF GROUP BY A, ID ORDER BY 1, 2"
 
 echo "--- panic check"
 ran=$((ran + 1))
