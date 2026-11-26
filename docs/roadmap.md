@@ -172,7 +172,11 @@ replacement of the C++ engine is below, in priority order. Full text:
    columns, aggregates, stored calls and subqueries refuse),
    slice 67 GROUP BY a DECFLOAT in `exe` (cohorts merge by value with the
    record-greatest spelling surviving, NaN boundaries refuse so the interpreter
-   traps 22000 like the engine; multi-key and mixed-width groups refuse).
+   traps 22000 like the engine; multi-key and mixed-width groups refuse),
+   slice 68 decimal SQRT/POWER/EXP/LN/LOG10 in `exe` (DECFLOAT operands take
+   the DECIMAL128 path via decmath and answer DECFLOAT(34); domain violations
+   and math errors refuse so the interpreter raises the engine's error; LOG,
+   INT128-backed and mixed approximate+decfloat operands refuse).
    INNER-join equalities hash (`3828117`). THE ROUTE IS ON BY DEFAULT (`3356c9b`, 2026-10-06; `FC_EXEC_SELECT=0` turns it off): it serves ~7,250 statements
    and the interpreter answers every decline. Next: the remaining compile declines, wider index use in `exe`.
    RESOLVED (slice 39): the recorded UNION [ALL] + ORDER BY served-wrong was never the union's — plan + row probes show the engine SORTS the concatenation,
@@ -622,6 +626,24 @@ replacement of the C++ engine is below, in priority order. Full text:
    identical). The end census: 527/527 sourcing logs, 430 traces (113
    unique, two fewer - the GROUP-BY-DECFLOAT bucket is down to the
    intentional multi-key decline cell).
+   DONE (slice 68): decimal SQRT/POWER/EXP/LN/LOG10 in `exe` - a DECFLOAT
+   operand beside none approximate takes the DECIMAL128 path (the
+   engine's makeDblDecResult, not a double round-trip: evlPower at
+   SysFunction.cpp:6167, sqrt/ln via decNumber at DecFloat.cpp:950,977),
+   answered in DECFLOAT(34) by the interpreter-proven `decmath`; the
+   domain pre-check mirrors the engine raising BEFORE the math (SQRT of
+   a negative, LN/LOG10 of a non-positive), a NaN operand refuses except
+   through EXP (the engine's compare raises 22000 first), and every
+   math error refuses so the interpreter raises the engine's error;
+   LOG, INT128-backed and mixed approximate+decfloat operands refuse.
+   Batteries: exe +5/+4 to 315 (EP101/EP158 the known reds), branchtype
+   69/69, the flipped exeselect §40 SQRT/POWER + EXP/LN cells plus §68's
+   LOG10 cell (337 OK + the §17 known red); dsql untouched (proc 1584,
+   view 239, unit 99). The recount ran as ONE serial pass (527 gates, 52
+   red with every red gate's DIFF/FAIL set byte-identical to slice 67;
+   OK 25278 vs 25277 = exactly the +1 new exeselect cell; DIFF/FAIL 223
+   identical). The end census: 527/527 sourcing logs, 425 traces (107
+   unique, six fewer - the double-function bucket drained).
 4. Concurrency: the typed lock series (`jrd/lck.cpp`) for per-row writer
    conflicts, `-w` wait-for cycles, `PIO_open` file locking, a lock table
    shared across processes (Classic/SuperClassic).

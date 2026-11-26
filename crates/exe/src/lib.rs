@@ -1835,6 +1835,64 @@ fn sf_first_last_day(part: u8, v: &Value, last: bool) -> Result<Value, String> {
     })
 }
 
+/// Whether DblDec arguments take the DECIMAL128 path (slice 68): a
+/// DECFLOAT among them and none approximate (the engine's
+/// makeDblDecResult; an approximate operand wins outright). INT128-backed
+/// operands refuse (the engine takes them decimal too - unprobed here)
+fn dbldec_decimal(v: &Value) -> bool {
+    matches!(v, Value::DecFloat16(_) | Value::DecFloat34(_))
+}
+
+/// A one-argument DblDec call (slice 68: SQRT, EXP, LN, LOG10):
+/// DECFLOAT(34) via [decmath] for a DECFLOAT operand, DOUBLE
+/// otherwise. Domain violations refuse (SQRT of a negative, LN/LOG10
+/// of a non-positive - the engine raises 42000; the interpreter
+/// answers), as does a NaN operand to SQRT/LN/LOG10 (the engine's
+/// compare raises 22000 BEFORE the math - only EXP lets a quiet NaN
+/// through, sNaN raising inside dm), and any [decmath] error
+/// (overflow, invalid) refuses for the interpreter's engine error
+fn dbldec1(
+    name: &str,
+    v: &Value,
+    dbl_f: &dyn Fn(f64) -> Result<f64, String>,
+    dec_f: fn(&fire_crab_ods::decfloat::Dec) -> Result<fire_crab_ods::decfloat::Dec, fire_crab_ods::decmath::MathErr>,
+) -> Result<Value, String> {
+    use fire_crab_ods::decfloat as dfl;
+    if !dbldec_decimal(v) {
+        let r = dbl_f(sf_f64(v)?)?;
+        if !r.is_finite() {
+            return Err(format!("{}: a non-finite result", name));
+        }
+        return Ok(Value::Double(r));
+    }
+    let d = match v {
+        Value::DecFloat16(b) => dfl::decode_dec64(*b),
+        Value::DecFloat34(b) => dfl::decode_dec128(*b),
+        _ => unreachable!(),
+    };
+    if d.is_nan() && name != "EXP" {
+        return Err(format!("{} of NaN: the engine raises", name));
+    }
+    // the domain pre-check (the interpreter's dcmp/le0): dm::ln(0) would
+    // answer -Infinity, but the engine raises 42000 BEFORE the math
+    if matches!(name, "SQRT" | "LN" | "LOG10") {
+        let zero = dfl::Dec::Finite { neg: false, coeff: 0, exp: 0 };
+        let ord = dfl::cmp(&d, &zero);
+        let bad = if name == "SQRT" {
+            ord == std::cmp::Ordering::Less
+        } else {
+            ord != std::cmp::Ordering::Greater
+        };
+        if bad {
+            return Err(format!("{} domain: the engine raises", name));
+        }
+    }
+    match dec_f(&d) {
+        Ok(r) => Ok(Value::DecFloat34(dfl::dec_to_bits(&r))),
+        Err(_) => Err(format!("{}: the engine raises", name)),
+    }
+}
+
 /// A system function over its evaluated arguments; NULL in, NULL out.
 fn sys_fn(name: &str, args: &[Value]) -> Result<Value, String> {
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -1993,10 +2051,10 @@ fn sys_fn(name: &str, args: &[Value]) -> Result<Value, String> {
             }
             mk_num(a % b, 0)
         }
-        "SQRT" => dbl(&|x| if x < 0.0 { Err("SQRT of a negative".into()) } else { Ok(x.sqrt()) })?,
-        "EXP" => dbl(&|x| Ok(x.exp()))?,
-        "LN" => dbl(&|x| if x <= 0.0 { Err("LN of a non-positive".into()) } else { Ok(x.ln()) })?,
-        "LOG10" => dbl(&|x| if x <= 0.0 { Err("LOG10 of a non-positive".into()) } else { Ok(x.log10()) })?,
+        "SQRT" => dbldec1(name, arg(0)?, &|x| if x < 0.0 { Err("SQRT of a negative".into()) } else { Ok(x.sqrt()) }, fire_crab_ods::decmath::sqrt)?,
+        "EXP" => dbldec1(name, arg(0)?, &|x| Ok(x.exp()), fire_crab_ods::decmath::exp)?,
+        "LN" => dbldec1(name, arg(0)?, &|x| if x <= 0.0 { Err("LN of a non-positive".into()) } else { Ok(x.ln()) }, fire_crab_ods::decmath::ln)?,
+        "LOG10" => dbldec1(name, arg(0)?, &|x| if x <= 0.0 { Err("LOG10 of a non-positive".into()) } else { Ok(x.log10()) }, fire_crab_ods::decmath::log10)?,
         "LOG" => {
             let base = sf_f64(arg(0)?)?;
             let x = sf_f64(arg(1)?)?;
@@ -2010,19 +2068,47 @@ fn sys_fn(name: &str, args: &[Value]) -> Result<Value, String> {
             Value::Double(r)
         }
         "POWER" => {
-            let b = sf_f64(arg(0)?)?;
-            let e = sf_f64(arg(1)?)?;
-            if b < 0.0 && e.fract() != 0.0 {
-                return Err("POWER of a negative base to a fraction".into());
+            let bv = arg(0)?;
+            let ev = arg(1)?;
+            let approx = matches!(bv, Value::Double(_) | Value::Float(_))
+                || matches!(ev, Value::Double(_) | Value::Float(_));
+            // a DECFLOAT beside no approximate arg takes the DECIMAL128
+            // path (slice 68 - the engine's makeDblDecResult); an
+            // approximate beside a decfloat refuses inside sf_f64
+            // (unprobed conversion - the interpreter answers)
+            if (dbldec_decimal(bv) || dbldec_decimal(ev)) && !approx {
+                use fire_crab_ods::decfloat as dfl;
+                use fire_crab_ods::decmath as dm;
+                let dec_arg = |v: &Value| -> Result<dfl::Dec, String> {
+                    match v {
+                        Value::DecFloat16(b) => Ok(dfl::decode_dec64(*b)),
+                        Value::DecFloat34(b) => Ok(dfl::decode_dec128(*b)),
+                        Value::Int(_) | Value::Scaled(..) => dec_promote_exact(v)
+                            .ok_or_else(|| "POWER over this exact unconverted".to_string()),
+                        _ => Err("POWER over this operand unconverted".into()),
+                    }
+                };
+                let bd = dec_arg(bv)?;
+                let ed = dec_arg(ev)?;
+                match dm::pow(&bd, &ed) {
+                    Ok(r) => Value::DecFloat34(dfl::dec_to_bits(&r)),
+                    Err(_) => return Err("POWER: the engine raises".into()),
+                }
+            } else {
+                let b = sf_f64(bv)?;
+                let e = sf_f64(ev)?;
+                if b < 0.0 && e.fract() != 0.0 {
+                    return Err("POWER of a negative base to a fraction".into());
+                }
+                if b == 0.0 && e < 0.0 {
+                    return Err("POWER of zero to a negative".into());
+                }
+                let r = b.powf(e);
+                if !r.is_finite() {
+                    return Err("POWER: a non-finite result".into());
+                }
+                Value::Double(r)
             }
-            if b == 0.0 && e < 0.0 {
-                return Err("POWER of zero to a negative".into());
-            }
-            let r = b.powf(e);
-            if !r.is_finite() {
-                return Err("POWER: a non-finite result".into());
-            }
-            Value::Double(r)
         }
         "PI" => Value::Double(std::f64::consts::PI),
         "SIN" => dbl(&|x| Ok(x.sin()))?,

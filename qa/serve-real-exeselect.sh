@@ -522,8 +522,8 @@ route "40 GROUP BY decfloat over cohorts and zeros (NaN-free, slice 67 serves)" 
 route "40 GROUP BY decfloat signals on a NaN boundary (NaN)" declined "SELECT V, COUNT(*) FROM DFS WHERE V IS NOT NULL GROUP BY V ORDER BY 1"
 route "40 ABS CEIL FLOOR" served "SELECT ABS(V), CEIL(V), FLOOR(V) FROM DFC ORDER BY 1"
 route "40 ROUND half up TRUNC SIGN" declined "SELECT ROUND(V), TRUNC(V), SIGN(V) FROM DFC ORDER BY 1"
-route "40 SQRT POWER" declined "SELECT SQRT(V), POWER(V, 2) FROM DFM WHERE W > 0 ORDER BY 1"
-route "40 EXP LN" declined "SELECT EXP(V), LN(V) FROM DFM WHERE W > 0 ORDER BY 1"
+route "40 SQRT POWER (slice 68 serves)" served "SELECT SQRT(V), POWER(V, 2) FROM DFM WHERE W > 0 ORDER BY 1"
+route "40 EXP LN (slice 68 serves)" served "SELECT EXP(V), LN(V) FROM DFM WHERE W > 0 ORDER BY 1"
 route "40 MOD is half-up integer-cast" declined "SELECT MOD(CAST('5.5' AS DECFLOAT(34)), CAST(2 AS DECFLOAT(34))), MOD(CAST(5.5 AS DOUBLE PRECISION), CAST(2 AS DOUBLE PRECISION)) FROM RDB\$DATABASE"
 route "40 SQRT of negative is 42000" declined "SELECT SQRT(CAST(-1 AS DECFLOAT(34))) FROM RDB\$DATABASE"
 route "40 LN of zero is 42000" declined "SELECT LN(CAST(0 AS DECFLOAT(34))) FROM RDB\$DATABASE"
@@ -745,6 +745,9 @@ route "66 RANK over an arithmetic direct arg" declined "SELECT RANK(1 + 1) WITHI
 
 echo "--- 67 GROUP BY a DECFLOAT (slice 67): single-key serves, multi-key declines"
 route "67 ...multi-key with a decfloat declines" declined "SELECT A, ID, COUNT(*) FROM DF GROUP BY A, ID ORDER BY 1, 2"
+
+echo "--- 68 decimal SQRT/POWER/EXP/LN/LOG10 (slice 68): valid serves, domain raises stay declined"
+route "68 LOG10 over a decfloat" served "SELECT LOG10(V) FROM DFM WHERE W > 0 ORDER BY 1"
 
 echo "--- panic check"
 ran=$((ran + 1))
